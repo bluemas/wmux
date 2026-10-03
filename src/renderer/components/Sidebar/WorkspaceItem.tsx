@@ -299,6 +299,13 @@ const REST_HIDDEN =
  * precedes the item — `-ml-2` for the row (`gap-2`), `-ml-1` for the name line
  * (`gap-1`) — and return it the moment the item is shown.
  */
+// Shortcut number colour: a blue that contrasts with the sidebar's own tone —
+// light on a dark sidebar, deep on a light one — and never white, whatever the
+// theme's accent is (Zinc's accent is near-white). L flips on the sidebar's
+// lightness; chroma and hue stay fixed.
+const SHORTCUT_NUMBER_STYLE = {
+  color: 'oklch(from var(--bg-mantle) calc(0.4 + 0.38 * (1 - round(l))) 0.13 250)',
+} as const;
 const REST_HIDDEN_GAP_ROW = '-ml-2 group-hover:ml-0 group-focus-within:ml-0';
 const REST_HIDDEN_GAP_NAME_LINE = '-ml-1 group-hover:ml-0 group-focus-within:ml-0';
 
@@ -981,7 +988,8 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, onSelect, on
                   // (selection, copy, accessible name).
                   <span
                     aria-hidden
-                    className="flex-none text-[11px] tabular-nums text-[var(--text-muted)] before:content-[attr(data-shortcut-number)]"
+                    className="flex-none text-[11px] font-semibold tabular-nums before:content-[attr(data-shortcut-number)]"
+                    style={SHORTCUT_NUMBER_STYLE}
                     data-shortcut-number={index + 1}
                   />
                 )}

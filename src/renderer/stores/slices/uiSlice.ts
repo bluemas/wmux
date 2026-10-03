@@ -1576,7 +1576,7 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
     state.sidebarPosition = position;
   }),
 
-  sidebarAttentionFirst: true,
+  sidebarAttentionFirst: false,
 
   setSidebarAttentionFirst: (enabled) => set((state) => {
     state.sidebarAttentionFirst = enabled;
@@ -1584,7 +1584,7 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
     state.sidebarSortModeChosen = true;
   }),
 
-  sidebarSortMode: 'attention',
+  sidebarSortMode: 'manual',
   sidebarSortModeChosen: false,
   sidebarSortMigrated: false,
   clearSidebarSortMigrated: () => set((state) => { state.sidebarSortMigrated = false; }),

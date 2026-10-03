@@ -2316,6 +2316,29 @@ app.on('window-all-closed', () => {
 // session state is flushed the same way the darwin before-quit pass flushes it
 // (the renderer-side save already ran in AutoUpdater.performInstall, but that
 // does not cover the main process's pending debounced write).
+// Alt+F4: ask before quitting. A normal Quit only detaches from the daemon, so
+// live sessions keep running and reattach on the next launch.
+let quitConfirmOpen = false;
+async function confirmQuit(win: BrowserWindow): Promise<void> {
+  if (quitConfirmOpen) return;
+  quitConfirmOpen = true;
+  try {
+    const { response } = await dialog.showMessageBox(win, {
+      type: 'question',
+      title: 'Quit wmux',
+      message: 'Quit wmux?',
+      detail: 'Your terminal sessions keep running in the background and reattach the next time you open wmux.',
+      buttons: ['Quit', 'Cancel'],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true,
+    });
+    if (response === 0) app.quit();
+  } finally {
+    quitConfirmOpen = false;
+  }
+}
+
 // Wiring every main window needs, wherever it was created. Boot, the Dock
 // 'activate' path and the aborted-install recovery all built windows their own
 // way, and only boot attached the hide-to-tray close intercept — a window from
@@ -2329,10 +2352,20 @@ function adoptMainWindow(win: BrowserWindow): void {
     if (mainWindow === win) mainWindow = null;
   });
 
-  // Intercept window close — hide to tray instead of destroying
+  // Intercept window close — hide to tray instead of destroying, except for
+  // Alt+F4, which asks to quit. The OS delivers Alt+F4 and the title-bar X as the
+  // same close request, so the key is noted from the input event just before it.
+  let altF4At = 0;
+  win.webContents.on('before-input-event', (_event, input) => {
+    if (input.type === 'keyDown' && input.alt && input.key === 'F4') altF4At = Date.now();
+  });
   win.on('close', (e) => {
-    if (!isQuitting) {
-      e.preventDefault();
+    if (isQuitting) return;
+    e.preventDefault();
+    if (Date.now() - altF4At < 1000) {
+      altF4At = 0;
+      void confirmQuit(win);
+    } else {
       win.hide();
     }
   });
