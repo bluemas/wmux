@@ -152,6 +152,8 @@ interface NativeBindings {
   Process32NextW: (snapshot: Handle, entry: Buffer) => number;
   CloseHandle: (handle: Handle) => number;
   GetLastError: () => number;
+  OpenProcess: (access: number, inherit: number, pid: number) => Handle;
+  GetProcessTimes: (handle: Handle, creation: Buffer, exit: Buffer, kernel: Buffer, user: Buffer) => number;
 }
 
 /** undefined = load not attempted yet; null = attempted and unavailable. */
@@ -204,6 +206,12 @@ function loadBindings(): NativeBindings | null {
       ]) as NativeBindings['Process32NextW'],
       CloseHandle: kernel32.func('CloseHandle', 'int', ['int64']) as NativeBindings['CloseHandle'],
       GetLastError: kernel32.func('GetLastError', 'uint32', []) as NativeBindings['GetLastError'],
+      OpenProcess: kernel32.func('OpenProcess', 'int64', [
+        'uint32', 'int', 'uint32',
+      ]) as NativeBindings['OpenProcess'],
+      GetProcessTimes: kernel32.func('GetProcessTimes', 'int', [
+        'int64', 'void *', 'void *', 'void *', 'void *',
+      ]) as NativeBindings['GetProcessTimes'],
     };
   } catch (err) {
     warn(`koffi load failed — native snapshot disabled: ${err instanceof Error ? err.message : String(err)}`);
@@ -329,6 +337,60 @@ export function tryNativeSnapshot(): NativeSnapshot | null {
         (consecutiveCallFailures === CALL_FAILURE_LOG_LIMIT ? ' — silencing further call-failure logs' : ''),
       );
     }
+    return null;
+  }
+}
+
+const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+
+/**
+ * Cumulative CPU time (kernel + user, in 100 ns units) of every process in the
+ * trees rooted at `rootPids`, roots included. Used to turn two samples into a
+ * CPU percentage for wmux and everything it started. A process that cannot be
+ * opened (protected, or gone since the table was read) is skipped. Returns null
+ * when the native path is unavailable, like {@link tryNativeSnapshot}.
+ */
+export function tryProcessTreeCpuTimes(rootPids: readonly number[]): Map<number, bigint> | null {
+  if (loadFailed) return null;
+  const b = loadBindings();
+  if (!b) {
+    loadFailed = true;
+    return null;
+  }
+  try {
+    const children = new Map<number, number[]>();
+    for (const { pid, ppid } of readProcessTable(b)) {
+      const list = children.get(ppid);
+      if (list) list.push(pid);
+      else children.set(ppid, [pid]);
+    }
+    // Walk down from each root; `seen` also guards against a pid reused as its
+    // own ancestor in a stale table.
+    const seen = new Set<number>();
+    const queue = [...rootPids];
+    const times = new Map<number, bigint>();
+    const creation = Buffer.alloc(8);
+    const exit = Buffer.alloc(8);
+    const kernel = Buffer.alloc(8);
+    const user = Buffer.alloc(8);
+    for (let pid = queue.shift(); pid !== undefined; pid = queue.shift()) {
+      if (seen.has(pid)) continue;
+      seen.add(pid);
+      for (const child of children.get(pid) ?? []) queue.push(child);
+      const raw = b.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+      const handle = typeof raw === 'bigint' ? raw : BigInt(raw);
+      if (handle === 0n) continue;
+      try {
+        if (b.GetProcessTimes(raw, creation, exit, kernel, user)) {
+          times.set(pid, kernel.readBigUInt64LE(0) + user.readBigUInt64LE(0));
+        }
+      } finally {
+        b.CloseHandle(raw);
+      }
+    }
+    return times;
+  } catch (err) {
+    warn(`process CPU times failed: ${err instanceof Error ? err.message : String(err)}`);
     return null;
   }
 }

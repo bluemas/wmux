@@ -129,6 +129,7 @@ import { ClaudeWorker } from './a2a/ClaudeWorker';
 import { AutoUpdater } from './updater/AutoUpdater';
 import { warnOnInstallIntegrityGap } from './updater/installIntegrity';
 import { readDaemonPid } from './updater/installTeardown';
+import { isAltF4Held } from './altF4';
 import { McpRegistrar } from './mcp/McpRegistrar';
 import { BrokerSupervisor, isMcpBrokerEnabled } from './mcp/BrokerSupervisor';
 import { WebviewCdpManager } from './browser-session/WebviewCdpManager';
@@ -2354,7 +2355,8 @@ function adoptMainWindow(win: BrowserWindow): void {
 
   // Intercept window close — hide to tray instead of destroying, except for
   // Alt+F4, which asks to quit. The OS delivers Alt+F4 and the title-bar X as the
-  // same close request, so the key is noted from the input event just before it.
+  // same close request (and Chromium never reports the key), so the key state is
+  // read from the OS when the request arrives; the input event is a second hint.
   let altF4At = 0;
   win.webContents.on('before-input-event', (_event, input) => {
     if (input.type === 'keyDown' && input.alt && input.key === 'F4') altF4At = Date.now();
@@ -2362,7 +2364,7 @@ function adoptMainWindow(win: BrowserWindow): void {
   win.on('close', (e) => {
     if (isQuitting) return;
     e.preventDefault();
-    if (Date.now() - altF4At < 1000) {
+    if (isAltF4Held() || Date.now() - altF4At < 1000) {
       altF4At = 0;
       void confirmQuit(win);
     } else {
