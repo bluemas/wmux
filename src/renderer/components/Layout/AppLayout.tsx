@@ -50,6 +50,7 @@ import { useAgentActivityClock } from '../../hooks/useAgentActivityClock';
 import { useTerminalCopyShortcut } from '../../hooks/useTerminalCopyShortcut';
 import { useNotificationListener } from '../../hooks/useNotificationListener';
 import { useRpcBridge } from '../../hooks/useRpcBridge';
+import { useCloseTabOnShellExit } from '../../hooks/useCloseTabOnShellExit';
 import AgentMentionPicker from '../Palette/AgentMentionPicker';
 import { useWorkspaceMirrorPush } from '../../hooks/useWorkspaceMirrorPush';
 import { useResizeGuard } from '../../hooks/useResizeGuard';
@@ -831,6 +832,8 @@ export default function AppLayout() {
   useTerminalCopyShortcut();
   useNotificationListener();
   useRpcBridge();
+  // `exit` in a shell closes its tab (clean exit only).
+  useCloseTabOnShellExit();
   // Keep the main-process WorkspaceMirror warm: push the workspace tree +
   // per-pane agent status whenever it changes, so main resolves hooks/routing
   // locally instead of round-tripping workspace.list back to the renderer.
