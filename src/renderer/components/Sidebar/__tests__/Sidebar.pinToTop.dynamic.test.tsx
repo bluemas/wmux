@@ -96,9 +96,9 @@ describe('Pin to top — order', () => {
     seed({ pa: 'idle', pb: 'awaiting_input', idle: 'idle', x: 'awaiting_input' }, 'attention', ['pa', 'pb']);
     act(() => root.render(<Sidebar />));
     expect(shown()).toEqual(['pa', 'pb', 'x', 'idle']);
-    // Pinned rows show their Ctrl+N hint even in a sorted order: it matches.
-    expect(row('pa').textContent).toContain('^1');
-    expect(row('idle').textContent).not.toContain('^');
+    // Every row shows its real Ctrl+N number (stored position) in a sorted order.
+    expect(row('pa').querySelector('[data-shortcut-number]')?.getAttribute('data-shortcut-number')).toBe('1');
+    expect(row('idle').querySelector('[data-shortcut-number]')?.getAttribute('data-shortcut-number')).toBe('3');
   });
 
   it('the rail shows the same pinned-first order, numbered as stored', () => {

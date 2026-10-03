@@ -119,12 +119,12 @@ describe('Sidebar — Attention order (render)', () => {
     expect(shown()).toEqual(['cold']);
   });
 
-  // Review #9 — Ctrl+N hints only in Manual.
-  it('draws no Ctrl+N hints outside Manual', () => {
+  // Ctrl+N follows the stored order: every row always shows its number, in
+  // every sort mode.
+  it('always shows the Ctrl+N number on each row', () => {
     seed({ a: 'idle', b: 'idle' });
     act(() => root.render(<Sidebar />));
-    expect(container.textContent).not.toContain('^1');
-    act(() => useStore.setState({ sidebarSortMode: 'manual', sidebarAttentionFirst: false } as never));
-    expect(container.textContent).toContain('^1');
+    const nums = [...container.querySelectorAll('[data-shortcut-number]')].map((n) => n.getAttribute('data-shortcut-number'));
+    expect(nums.sort()).toEqual(['1', '2']);
   });
 });

@@ -973,6 +973,18 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, onSelect, on
                     <IconFanOut size={10} />
                   </span>
                 )}
+                {/* Ctrl+N follows the stored order, so each row always shows the
+                    number its shortcut jumps to, left of the name (owner decision
+                    2026-10-04). A nested task row has none. */}
+                {!taskRow && index >= 0 && index < 9 && (
+                  // Drawn by CSS so the digit is not part of the row's text
+                  // (selection, copy, accessible name).
+                  <span
+                    aria-hidden
+                    className="flex-none text-[11px] tabular-nums text-[var(--text-muted)] before:content-[attr(data-shortcut-number)]"
+                    data-shortcut-number={index + 1}
+                  />
+                )}
                 <span
                   className="wmux-row-title font-sans text-[13px] leading-snug truncate font-semibold text-[var(--text-main)]"
                   title={idleLabel ? `${displayName} · ${t('workspace.idleTooltip', { time: idleLabel })}` : displayName}
@@ -1110,23 +1122,6 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, onSelect, on
         {needsYou && !taskRow && (
           <span className={`font-sans text-[11px] font-medium text-[var(--accent-yellow)] flex-shrink-0 mt-0.5 ${isActive ? '' : hover.hideOnHover}`}>
             {t('workspace.needsYou')}
-          </span>
-        )}
-
-        {/* Shortcut hint */}
-        {/* #1481 — a nested task row is indented, so even the active one gives
-            the hint back to its name at rest. */}
-        {/* #1481 review — Ctrl+N follows the stored order, which nesting no
-            longer mirrors on screen; a nested task row would show a hint out
-            of sequence with the rows around it, so it shows none. */}
-        {/* Ctrl+N follows the stored (manual) order, which only Manual shows
-            on screen; in the other orders a hint would name a shortcut out of
-            sequence with the rows around it, so none is drawn — except on a
-            pinned row: the pinned group leads the stored order and is shown
-            as stored, so its numbers match the screen. */}
-        {!taskRow && (!sortPaused || pinned) && (
-          <span className={`text-[11px] tabular-nums text-[color-mix(in_srgb,var(--text-main)_35%,transparent)] flex-shrink-0 mt-0.5 ${restHidden}`}>
-            {index < 9 ? `^${index + 1}` : ''}
           </span>
         )}
 
