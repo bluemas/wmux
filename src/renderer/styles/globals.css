@@ -356,6 +356,30 @@
   --bg-base-rgb: 26, 10, 10;
 }
 
+[data-theme="gruvbox-dark-hard"] {
+  --bg-base: #1D2021;
+  --bg-mantle: #181A1B;
+  --bg-surface: #3C3836;
+  --bg-overlay: #504945;
+  --text-muted: #7C6F64;
+  --text-subtle: #928374;
+  --text-sub: #BDAE93;
+  --text-sub2: #A89984;
+  --text-main: #EBDBB2;
+  --accent: #FE8019;
+  --accent-cursor: #FE8019;
+  --accent-blue: #83A598;
+  --accent-green: #B8BB26;
+  --accent-red: #FB4934;
+  --accent-yellow: #FABD2F;
+  --bg-overlay-scrim: rgba(0, 0, 0, 0.55);
+  --surface-highlight: #FFFFFF;
+  --accent-rgb: 254, 128, 25;
+  --accent-blue-rgb: 131, 165, 152;
+  --bg-surface-rgb: 60, 56, 54;
+  --bg-base-rgb: 29, 32, 33;
+}
+
 [data-theme="nightowl"] {
   --bg-base: #1E1B16;
   --bg-mantle: #161310;
