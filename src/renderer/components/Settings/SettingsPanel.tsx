@@ -2674,6 +2674,7 @@ const BASE_ON_OPTIONS: { value: BuiltinThemeId; label: string }[] = [
   { value: 'stars-and-stripes', label: 'Stars & Stripes' },
   { value: 'red-dynasty', label: 'Red Dynasty' },
   { value: 'nightowl', label: 'Nightowl' },
+  { value: 'gruvbox-dark-hard', label: 'Gruvbox Dark Hard' },
   { value: 'void', label: 'Void' },
   { value: 'monochrome', label: 'Monochrome' },
   { value: 'hinomaru', label: 'Hinomaru' },

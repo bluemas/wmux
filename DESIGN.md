@@ -48,7 +48,8 @@ for a session that never chose a theme; a saved choice is always kept.
 
 Two neutral themes ship beside them, Mono and Mono Light (zero-saturation
 greys, one blue accent). The other themes (Amber, Catppuccin, Stars &
-Stripes, Red Dynasty, Nightowl, Void, Monochrome, Hinomaru, Taegeuk) and
+Stripes, Red Dynasty, Nightowl, Gruvbox Dark Hard, Void, Monochrome, Hinomaru,
+Taegeuk) and
 Custom stay selectable with their own colours and take the `:root` knob
 defaults; the frame, sheet, type, dialog and icon rules below apply to every
 theme.

@@ -11,7 +11,7 @@ export type BuiltinThemeId =
   | 'mono' | 'mono-light'
   | 'amber'
   | 'catppuccin-mocha' | 'monochrome' | 'stars-and-stripes'
-  | 'red-dynasty' | 'nightowl' | 'void'
+  | 'red-dynasty' | 'nightowl' | 'gruvbox-dark-hard' | 'void'
   | 'hinomaru' | 'taegeuk';
 
 export type ThemeId = BuiltinThemeId | 'custom';
@@ -31,6 +31,7 @@ export type XtermPaletteId =
   | 'tokyo-night'
   | 'one-dark'
   | 'gruvbox-dark'
+  | 'gruvbox-dark-hard'
   | 'solarized-dark'
   | 'nord'
   | 'monochrome'
@@ -132,6 +133,14 @@ export const XTERM_PALETTES: Record<XtermPaletteId, XtermThemeColors> = {
     black: '#3C3836', red: '#FB4934', green: '#B8BB26', yellow: '#FABD2F',
     blue: '#83A598', magenta: '#D3869B', cyan: '#8EC07C', white: '#A89984',
     brightBlack: '#665C54', brightRed: '#FB4934', brightGreen: '#B8BB26', brightYellow: '#FABD2F',
+    brightBlue: '#83A598', brightMagenta: '#D3869B', brightCyan: '#8EC07C', brightWhite: '#EBDBB2',
+  },
+  // Gruvbox Dark, hard contrast: the same palette on bg0_h (#1D2021).
+  'gruvbox-dark-hard': {
+    background: '#1D2021', foreground: '#EBDBB2', cursor: '#FE8019', selectionBackground: '#504945',
+    black: '#282828', red: '#FB4934', green: '#B8BB26', yellow: '#FABD2F',
+    blue: '#83A598', magenta: '#D3869B', cyan: '#8EC07C', white: '#A89984',
+    brightBlack: '#928374', brightRed: '#FB4934', brightGreen: '#B8BB26', brightYellow: '#FABD2F',
     brightBlue: '#83A598', brightMagenta: '#D3869B', brightCyan: '#8EC07C', brightWhite: '#EBDBB2',
   },
   'solarized-dark': {
@@ -300,6 +309,13 @@ export const UI_THEME_TOKENS: Record<BuiltinThemeId, UIThemeTokens> = {
     textMain: '#C8BFA8', textSub: '#9A9080', textMuted: '#5A5340', // SSOT: matches shipped globals.css
     accent: '#C4A055', accentSecondary: '#7FA6C9', success: '#8AAA70', danger: '#CC6B5A', warning: '#C89060', // 2-accent: gold alive / cool-blue nav (--accent-blue)
   },
+  'gruvbox-dark-hard': {
+    // Gruvbox Dark, hard contrast. bg0_h is the pane surface, bg1 the raised
+    // fill; orange is the alive/attention accent, aqua-blue the navigation one.
+    bgBase: '#1D2021', bgSurface: '#3C3836', bgMantle: '#181A1B',
+    textMain: '#EBDBB2', textSub: '#BDAE93', textMuted: '#7C6F64',
+    accent: '#FE8019', accentSecondary: '#83A598', success: '#B8BB26', danger: '#FB4934', warning: '#FABD2F',
+  },
   void: {
     bgBase: '#000000', bgSurface: '#0A0A0A', bgMantle: '#000000',
     textMain: '#C0C0C0', textSub: '#909090', textMuted: '#333333', // SSOT: matches shipped globals.css
@@ -349,6 +365,7 @@ export const ATTENTION_COLORS: Record<BuiltinThemeId, AttentionColors> = {
   'stars-and-stripes': { fill: '#FF9248', text: '#FF9C5A', ink: '#0C1428' },
   'red-dynasty': { fill: '#FF9A3C', text: '#FFA552', ink: '#1A0A0A' },
   nightowl: { fill: '#F08A3E', text: '#F59A55', ink: '#1E1B16' },
+  'gruvbox-dark-hard': { fill: '#FE8019', text: '#FE9040', ink: '#1D2021' },
   void: { fill: '#FF8A3D', text: '#FF9550', ink: '#000000' },
   hinomaru: { fill: '#CA5510', text: '#9A3B08', ink: '#000000' },
   taegeuk: { fill: '#CE530B', text: '#983A08', ink: '#000000' },
@@ -375,6 +392,7 @@ export const BUILTIN_XTERM_PALETTE: Record<BuiltinThemeId, XtermPaletteId> = {
   'stars-and-stripes': 'one-dark',
   'red-dynasty': 'gruvbox-dark',
   nightowl: 'gruvbox-dark',
+  'gruvbox-dark-hard': 'gruvbox-dark-hard',
   void: 'monochrome',
   hinomaru: 'sandstone-light',
   taegeuk: 'paper-light',
@@ -579,6 +597,7 @@ export const BUILTIN_CSS_OVERRIDES: Partial<Record<BuiltinThemeId, Partial<FullC
   'stars-and-stripes': { bgOverlay: '#2A3E5A', textSubtle: '#4A6080', textSub2: '#8090A8', accentCursor: '#E89B4A' }, // 2-accent: orange-gold alive, distinct from pale-gold warning (accent stays blue = nav)
   'red-dynasty': { bgOverlay: '#4A2A2A', textSubtle: '#6A4A3E', textSub2: '#A08878' },
   nightowl: { bgOverlay: '#38332A', textSubtle: '#6B6350', textSub2: '#847A68' },
+  'gruvbox-dark-hard': { bgOverlay: '#504945', textSubtle: '#928374', textSub2: '#A89984' },
   void: { bgOverlay: '#141414', textSubtle: '#505050', textSub2: '#707070', accentCursor: '#FFFFFF' },
   hinomaru: { bgOverlay: '#D4CFC6', textSubtle: '#5C5651' },
   taegeuk: { textSubtle: '#4F4F62', textSub2: '#2A2A40', accentCursor: '#B87500' }, // 2-accent: rich gold alive, distinct from dark-gold warning (accent stays navy = nav)
@@ -639,6 +658,7 @@ export const THEME_OPTIONS: Array<{ value: ThemeId; label: string }> = [
   { value: 'stars-and-stripes', label: 'Stars & Stripes' },
   { value: 'red-dynasty',       label: 'Red Dynasty' },
   { value: 'nightowl',          label: 'Nightowl' },
+  { value: 'gruvbox-dark-hard', label: 'Gruvbox Dark Hard' },
   { value: 'void',              label: 'Void' },
   { value: 'monochrome',        label: 'Monochrome' },
   { value: 'hinomaru',          label: 'Hinomaru' },
@@ -659,6 +679,7 @@ export const XTERM_PALETTE_OPTIONS: Array<{ value: XtermPaletteId; label: string
   { value: 'tokyo-night',      label: 'Tokyo Night' },
   { value: 'one-dark',         label: 'One Dark' },
   { value: 'gruvbox-dark',     label: 'Gruvbox Dark' },
+  { value: 'gruvbox-dark-hard', label: 'Gruvbox Dark Hard' },
   { value: 'solarized-dark',   label: 'Solarized Dark' },
   { value: 'nord',             label: 'Nord' },
   { value: 'monochrome',       label: 'Monochrome' },
