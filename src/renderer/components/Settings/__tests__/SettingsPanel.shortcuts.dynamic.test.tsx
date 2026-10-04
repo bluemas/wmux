@@ -163,3 +163,35 @@ describe('Settings → Shortcuts (#1455)', () => {
     expect(container.textContent).toContain('Already used by “Next workspace”');
   });
 });
+
+describe('Settings → Shortcuts search', () => {
+  const search = () => container.querySelector<HTMLInputElement>('[data-testid="shortcut-search"]')!;
+  const type = (value: string) => act(() => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set?.call(search(), value);
+    search().dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  const shown = () => [...container.querySelectorAll('button[aria-label]')]
+    .map((b) => b.getAttribute('aria-label') ?? '')
+    .filter((label) => / \(/.test(label));
+
+  it('filters by the action name', () => {
+    type('previous work');
+    expect(shown().every((l) => l.toLowerCase().includes('previous work'))).toBe(true);
+    expect(shown().length).toBeGreaterThan(0);
+  });
+
+  it('filters by the key combo, ignoring case, spaces and "+"', () => {
+    type('alt arrowup');
+    expect(shown().some((l) => l.startsWith(`${PREV} (`))).toBe(true);
+    expect(shown().some((l) => l.startsWith('Next workspace ('))).toBe(false);
+  });
+
+  it('says so when nothing matches, and shows every row again when cleared', () => {
+    const all = shown().length;
+    type('zzzz-no-such-shortcut');
+    expect(shown()).toEqual([]);
+    expect(container.textContent).toContain('No shortcuts match');
+    type('');
+    expect(shown().length).toBe(all);
+  });
+});

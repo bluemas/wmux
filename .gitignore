@@ -144,3 +144,6 @@ vite.*.dev.tmp.config.ts
 # Local investigation write-ups (never commit) — see the plans/ note above.
 FIX_REPORT.md
 EPIPE_ROOT_CAUSE.md
+
+# Locally built installers copied to the project root
+/*.exe
