@@ -31,7 +31,7 @@ import SurfaceTabs, {
 import { PANE_CORNER_GUTTER } from './paneChrome';
 import { useElementWidth } from '../../hooks/useElementWidth';
 import { ErrorBoundary } from '../ErrorBoundary';
-import { agentSupportsPermissionFlag, permissionFlagFor, resumeGrammarFor } from '../../../shared/agentResume';
+import { agentSupportsPermissionFlag, normalizeResumeCwd, permissionFlagFor, resumeGrammarFor } from '../../../shared/agentResume';
 import { applyRoleBinding, type RoleBinding } from '../../../shared/orchestratorRole';
 import { ResumeInfoChipGate } from './ResumeInfoChip';
 import { tokenAttrs } from '../../themes';
@@ -262,6 +262,47 @@ export function planRecoveryPillType(args: {
   // launcher-prefixed, so it is never independently rewritten (the model is
   // already on the base line typed in stage 0).
   return { text: ` ${grammar.withId(sessionId)}`, clearHint: true, advanceStage: false, rewritten: false };
+}
+
+/** Ptys whose Claude session was already resumed automatically this run. */
+const autoResumedPtys = new Set<string>();
+
+/**
+ * The line to run when a recovered Claude pane is resumed on app start, or null
+ * when it should be left alone. Same assembly as the Resume pill — the exact
+ * conversation when the saved binding still matches the pane's cwd, otherwise
+ * the cwd-relative `claude --continue` — with the permission mode that session
+ * had restored. `--dangerously-skip-permissions` is never added here: that is
+ * the pill toggle's explicit choice, not something to grant on every start.
+ */
+export function planAutoResume(args: {
+  agent: string | undefined;
+  binding: { agent?: string; cwd: string; sessionId?: string; permissionMode?: Parameters<typeof permissionFlagFor>[0] } | undefined;
+  paneCwds: ReadonlyArray<string | undefined>;
+  roleBinding: RoleBinding | undefined;
+}): string | null {
+  if (args.agent !== 'claude') return null;
+  const { binding } = args;
+  const exact = !!binding && binding.agent === 'claude' &&
+    args.paneCwds.some((c) => !!c && normalizeResumeCwd(binding.cwd) === normalizeResumeCwd(c));
+  const plan = planRecoveryPillType({
+    launcher: 'claude',
+    sessionId: exact ? binding?.sessionId : undefined,
+    permFlag: exact ? permissionFlagFor(binding?.permissionMode) : '',
+    forceSkip: false,
+    // Both flags land on one line: the staged click flow does not apply here.
+    resumeStage: 0,
+    roleBinding: args.roleBinding,
+  });
+  if (!plan) return null;
+  // With a permission flag and an exact id the plan types only the base line
+  // first; build the whole line instead.
+  if (plan.advanceStage) {
+    const grammar = resumeGrammarFor('claude');
+    if (!grammar || !binding?.sessionId) return null;
+    return `${plan.text} ${grammar.withId(binding.sessionId)}`;
+  }
+  return plan.text;
 }
 
 export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVisible = true, isZoomHidden = false }: PaneProps) {
@@ -588,6 +629,35 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
   // on the same conversation. Asked only for panes that offer a resume.
   const chatV2Binding = usePaneChatV2Binding(activeSurfacePtyId || undefined, !!resumeBinding || !!resumeHint);
   const chatV2OwnsPane = !!chatV2Binding && chatV2Binding.status !== 'handed-off';
+  // Resume Claude Code panes automatically on app start: a pane recovered this
+  // boot that was running Claude gets its resume line typed and submitted once
+  // its shell is interactive, instead of waiting for the pill's click + Enter.
+  const autoResumeCwds = [
+    pane.surfaces.find((s) => s.id === pane.activeSurfaceId)?.cwd,
+    workspace.metadata?.cwd,
+  ];
+  useEffect(() => {
+    const ptyId = activeSurfacePtyId;
+    if (!ptyId || !resumePtyReady || supervision || chatV2OwnsPane) return;
+    if (autoResumedPtys.has(ptyId)) return;
+    const line = planAutoResume({
+      agent: resumeHint,
+      binding: resumeBinding,
+      paneCwds: autoResumeCwds,
+      roleBinding: paneRoleBinding,
+    });
+    if (!line) return;
+    // A beat after the first output, so the prompt is up and reading input.
+    const timer = setTimeout(() => {
+      if (autoResumedPtys.has(ptyId)) return;
+      if (useStore.getState().resumeHintByPtyId[ptyId] !== 'claude') return; // typed into / dismissed meanwhile
+      autoResumedPtys.add(ptyId);
+      window.electronAPI.pty.write(ptyId, `${line}\r`);
+      useStore.getState().clearResumeHint(ptyId);
+    }, 400);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSurfacePtyId, resumePtyReady, resumeHint, resumeBinding, supervision, chatV2OwnsPane]);
   // The persistent resume chip's "is this pane's agent busy?" gate — and the
   // store-wide `agentClockMs` decay-clock subscription it needs — lives in the
   // <ResumeInfoChipGate> leaf below, NOT here: Pane mounts that leaf only when a

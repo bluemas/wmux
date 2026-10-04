@@ -14,7 +14,7 @@
  * rather than mounting the component and spying on window.electronAPI.pty.write.
  */
 import { describe, it, expect } from 'vitest';
-import { planRecoveryPillType } from '../Pane';
+import { planAutoResume, planRecoveryPillType } from '../Pane';
 import type { RoleBinding } from '../../../../shared/orchestratorRole';
 
 const SID = 'a1b2c3d4-0000-0000-0000-9f8e7d6c5b4a';
@@ -247,5 +247,40 @@ describe('planRecoveryPillType — gates that must NOT rewrite', () => {
         roleBinding: reviewer,
       }),
     ).toBeNull();
+  });
+});
+
+describe('planAutoResume — Claude panes resume themselves on app start', () => {
+  const binding = { agent: 'claude', cwd: 'C:/git/wmux', sessionId: SID };
+
+  it('resumes the exact conversation when the binding matches the pane cwd', () => {
+    expect(planAutoResume({ agent: 'claude', binding, paneCwds: ['c:/git/wmux/'], roleBinding: undefined }))
+      .toBe(`claude --resume ${SID}`);
+  });
+
+  it('falls back to cwd-relative --continue without a matching binding', () => {
+    expect(planAutoResume({ agent: 'claude', binding: undefined, paneCwds: ['C:/git/wmux'], roleBinding: undefined }))
+      .toBe('claude --continue');
+    expect(planAutoResume({ agent: 'claude', binding, paneCwds: ['C:/elsewhere'], roleBinding: undefined }))
+      .toBe('claude --continue');
+  });
+
+  it('restores the captured permission mode on one line, and never adds bypass', () => {
+    const line = planAutoResume({
+      agent: 'claude',
+      binding: { ...binding, permissionMode: 'acceptEdits' },
+      paneCwds: ['C:/git/wmux'],
+      roleBinding: undefined,
+    });
+    expect(line).toContain(`--resume ${SID}`);
+    expect(line).toContain('acceptEdits');
+    expect(line).not.toContain('--dangerously-skip-permissions');
+    expect(planAutoResume({ agent: 'claude', binding, paneCwds: [], roleBinding: undefined }))
+      .not.toContain('--dangerously-skip-permissions');
+  });
+
+  it('leaves other agents and non-agent panes alone', () => {
+    expect(planAutoResume({ agent: 'codex', binding: undefined, paneCwds: [], roleBinding: undefined })).toBeNull();
+    expect(planAutoResume({ agent: undefined, binding: undefined, paneCwds: [], roleBinding: undefined })).toBeNull();
   });
 });
