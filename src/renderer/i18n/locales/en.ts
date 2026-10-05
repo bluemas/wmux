@@ -2041,6 +2041,7 @@ export const en = {
   'settings.sc.newWorkspace': 'New workspace',
   'settings.sc.newTerminalInPane': 'New terminal in this pane',
   'settings.sc.closeSurface': 'Close active tab',
+  'surface.closeConfirm': 'Close this tab? Anything running in it will be stopped.',
   'settings.sc.closePane': 'Close split pane',
   'settings.sc.searchTerminal': 'Search in terminal',
   'settings.sc.commandPalette': 'Command palette',

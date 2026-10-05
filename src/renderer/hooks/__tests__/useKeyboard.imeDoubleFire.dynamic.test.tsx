@@ -122,6 +122,8 @@ beforeEach(() => {
     window: { hide: vi.fn() },
     pty: { dispose: vi.fn(), create: vi.fn(), write: vi.fn() },
   };
+  // Ctrl+W asks before closing; accept so the count reflects the shortcut.
+  vi.spyOn(window, 'confirm').mockReturnValue(true);
   seed();
   mount();
 });
@@ -129,6 +131,7 @@ beforeEach(() => {
 afterEach(() => {
   act(() => root.unmount());
   container.remove();
+  vi.restoreAllMocks();
 });
 
 describe('Windows IME: one physical press runs a shortcut once', () => {

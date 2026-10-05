@@ -2018,6 +2018,7 @@ export const pl = {
   'settings.sc.newWorkspace': 'Nowy obszar roboczy',
   'settings.sc.newTerminalInPane': 'Nowy terminal w tym panelu',
   'settings.sc.closeSurface': 'Zamknij aktywną kartę',
+  'surface.closeConfirm': 'Zamknąć tę kartę? Wszystko, co w niej działa, zostanie zatrzymane.',
   'settings.sc.closePane': 'Zamknij podzielony panel',
   'settings.sc.searchTerminal': 'Szukaj w terminalu',
   'settings.sc.commandPalette': 'Paleta poleceń',
