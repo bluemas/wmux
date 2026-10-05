@@ -199,7 +199,7 @@ export const th = {
   'settings.installUpdate': 'ติดตั้งการอัปเดต',
   'settings.retryCheck': 'ลองอีกครั้ง',
   'settings.fontSize': 'ขนาดฟอนต์',
-  'settings.fontSizeRange': 'ช่วง 12~24',
+  'settings.fontSizeRange': 'ช่วง 8~24',
   'settings.fontFamily': 'ตระกูลฟอนต์',
   'settings.fontFamilyDesc': 'ฟอนต์ความกว้างคงที่สำหรับเทอร์มินัล',
   'settings.layout': 'เลย์เอาต์',

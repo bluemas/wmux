@@ -199,7 +199,7 @@ export const nb = {
   'settings.installUpdate': 'Installer oppdatering',
   'settings.retryCheck': 'Prøv igjen',
   'settings.fontSize': 'Skriftstørrelse',
-  'settings.fontSizeRange': 'område 12~24',
+  'settings.fontSizeRange': 'område 8~24',
   'settings.fontFamily': 'Skriftfamilie',
   'settings.fontFamilyDesc': 'Monospace-skrift for terminal',
   'settings.layout': 'Oppsett',

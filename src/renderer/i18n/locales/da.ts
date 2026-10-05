@@ -199,7 +199,7 @@ export const da = {
   'settings.installUpdate': 'Installer opdatering',
   'settings.retryCheck': 'Prøv igen',
   'settings.fontSize': 'Skriftstørrelse',
-  'settings.fontSizeRange': 'interval 12~24',
+  'settings.fontSizeRange': 'interval 8~24',
   'settings.fontFamily': 'Skriftfamilie',
   'settings.fontFamilyDesc': 'Monospace-skrift til terminalen',
   'settings.layout': 'Layout',

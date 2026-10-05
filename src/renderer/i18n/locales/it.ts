@@ -199,7 +199,7 @@ export const it = {
   'settings.installUpdate': 'Installa aggiornamento',
   'settings.retryCheck': 'Riprova',
   'settings.fontSize': 'Dimensione carattere',
-  'settings.fontSizeRange': 'intervallo 12~24',
+  'settings.fontSizeRange': 'intervallo 8~24',
   'settings.fontFamily': 'Famiglia di caratteri',
   'settings.fontFamilyDesc': 'Carattere monospazio per il terminale',
   'settings.layout': 'Layout',

@@ -199,7 +199,7 @@ export const ru = {
   'settings.installUpdate': 'Установить обновление',
   'settings.retryCheck': 'Повторить проверку',
   'settings.fontSize': 'Размер шрифта',
-  'settings.fontSizeRange': 'диапазон 12~24',
+  'settings.fontSizeRange': 'диапазон 8~24',
   'settings.fontFamily': 'Семейство шрифтов',
   'settings.fontFamilyDesc': 'Моноширинный шрифт для терминала',
   'settings.layout': 'Макет',

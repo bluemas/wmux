@@ -199,7 +199,7 @@ export const ar = {
   'settings.installUpdate': 'تثبيت التحديث',
   'settings.retryCheck': 'إعادة المحاولة',
   'settings.fontSize': 'حجم الخط',
-  'settings.fontSizeRange': 'النطاق 12~24',
+  'settings.fontSizeRange': 'النطاق 8~24',
   'settings.fontFamily': 'عائلة الخط',
   'settings.fontFamilyDesc': 'خط ثابت العرض للطرفية',
   'settings.layout': 'التخطيط',

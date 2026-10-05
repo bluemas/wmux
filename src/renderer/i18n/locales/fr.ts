@@ -199,7 +199,7 @@ export const fr = {
   'settings.installUpdate': 'Installer la mise à jour',
   'settings.retryCheck': 'Réessayer',
   'settings.fontSize': 'Taille de police',
-  'settings.fontSizeRange': 'plage 12~24',
+  'settings.fontSizeRange': 'plage 8~24',
   'settings.fontFamily': 'Famille de police',
   'settings.fontFamilyDesc': 'Police à chasse fixe pour le terminal',
   'settings.layout': 'Disposition',

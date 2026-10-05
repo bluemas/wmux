@@ -199,7 +199,7 @@ export const ptBR = {
   'settings.installUpdate': 'Instalar atualização',
   'settings.retryCheck': 'Tentar novamente',
   'settings.fontSize': 'Tamanho da fonte',
-  'settings.fontSizeRange': 'faixa 12~24',
+  'settings.fontSizeRange': 'faixa 8~24',
   'settings.fontFamily': 'Família de fonte',
   'settings.fontFamilyDesc': 'Fonte monoespaçada para o terminal',
   'settings.layout': 'Layout',

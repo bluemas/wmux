@@ -199,7 +199,7 @@ export const id = {
   'settings.installUpdate': 'Pasang pembaruan',
   'settings.retryCheck': 'Coba periksa lagi',
   'settings.fontSize': 'Ukuran font',
-  'settings.fontSizeRange': 'rentang 12~24',
+  'settings.fontSizeRange': 'rentang 8~24',
   'settings.fontFamily': 'Keluarga font',
   'settings.fontFamilyDesc': 'Font monospace untuk terminal',
   'settings.layout': 'Tata letak',

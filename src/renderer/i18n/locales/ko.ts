@@ -1430,7 +1430,7 @@ export const ko = {
   'settings.installUpdate': '업데이트 설치',
   'settings.retryCheck': '다시 확인',
   'settings.fontSize': '글꼴 크기',
-  'settings.fontSizeRange': '12~24 범위',
+  'settings.fontSizeRange': '8~24 범위',
   'settings.fontFamily': '글꼴 모음',
   'settings.fontFamilyDesc': '설치된 글꼴 사용 — 이름을 입력하거나 선택하세요',
   'settings.fontFamilyPlaceholder': '글꼴 입력 또는 선택…',

@@ -495,7 +495,7 @@ export const zh = {
   'settings.installUpdate': '安装更新',
   'settings.retryCheck': '重新检查',
   'settings.fontSize': '字体大小',
-  'settings.fontSizeRange': '范围 12~24',
+  'settings.fontSizeRange': '范围 8~24',
   'settings.fontFamily': '字体族',
   'settings.fontFamilyDesc': '终端等宽字体',
   'settings.layout': '布局',

@@ -199,7 +199,7 @@ export const uk = {
   'settings.installUpdate': 'Встановити оновлення',
   'settings.retryCheck': 'Повторити',
   'settings.fontSize': 'Розмір шрифту',
-  'settings.fontSizeRange': 'діапазон 12~24',
+  'settings.fontSizeRange': 'діапазон 8~24',
   'settings.fontFamily': 'Сімейство шрифтів',
   'settings.fontFamilyDesc': 'Моноширинний шрифт для термінала',
   'settings.layout': 'Макет',

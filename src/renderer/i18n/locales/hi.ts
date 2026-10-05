@@ -199,7 +199,7 @@ export const hi = {
   'settings.installUpdate': 'अपडेट इंस्टॉल करें',
   'settings.retryCheck': 'पुनः जाँचें',
   'settings.fontSize': 'फ़ॉन्ट आकार',
-  'settings.fontSizeRange': 'सीमा 12~24',
+  'settings.fontSizeRange': 'सीमा 8~24',
   'settings.fontFamily': 'फ़ॉन्ट परिवार',
   'settings.fontFamilyDesc': 'टर्मिनल के लिए मोनोस्पेस फ़ॉन्ट',
   'settings.layout': 'लेआउट',

@@ -203,7 +203,7 @@ export const ja = {
   'settings.installUpdate': 'アップデートをインストール',
   'settings.retryCheck': '再確認',
   'settings.fontSize': 'フォントサイズ',
-  'settings.fontSizeRange': '12~24の範囲',
+  'settings.fontSizeRange': '8~24の範囲',
   'settings.fontFamily': 'フォントファミリー',
   'settings.fontFamilyDesc': 'ターミナル用等幅フォント',
   'settings.layout': 'レイアウト',

@@ -1920,7 +1920,7 @@ export const pl = {
   'settings.installUpdate': 'Zainstaluj aktualizację',
   'settings.retryCheck': 'Spróbuj ponownie',
   'settings.fontSize': 'Rozmiar czcionki',
-  'settings.fontSizeRange': 'zakres 12~24',
+  'settings.fontSizeRange': 'zakres 8~24',
   'settings.fontFamily': 'Rodzina czcionek',
   'settings.fontFamilyDesc': 'Dowolna zainstalowana czcionka — wpisz nazwę lub wybierz jedną',
   'settings.fontFamilyPlaceholder': 'Wpisz lub wybierz czcionkę…',

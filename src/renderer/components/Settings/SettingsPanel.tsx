@@ -3788,7 +3788,7 @@ function TabAppearance() {
           <div className="flex items-center gap-2">
             <input
               type="range"
-              min={12}
+              min={8}
               max={24}
               value={terminalFontSize}
               onChange={(e) => setTerminalFontSize(Number(e.target.value))}
