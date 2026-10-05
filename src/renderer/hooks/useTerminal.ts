@@ -3353,8 +3353,15 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
           // more frequent at the 256KB cap; the daemon resync replays the PTY's
           // real final screen, which conveys the exit, just not the localized
           // bracket.
+          // Not for an alt-screen pane (a full-screen agent TUI): the daemon
+          // cannot snapshot the alternate buffer, so the resync ships the raw
+          // ring (measured 1–7 MB) and the pane sits blank between reset() and
+          // the end of that parse. The budgeted catch-up below parses only
+          // the backlog and keeps the old frame up meanwhile.
+          const altScreen = terminalRef.current.buffer.active.type === 'alternate';
           if (
             queued > REVEAL_FLUSH_MAX_CHARS &&
+            !altScreen &&
             isTerminalRetained(terminalRef.current) &&
             isDaemonModeActive()
           ) {
@@ -3362,11 +3369,11 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
             markTerminalDirty(terminalRef.current);
             void startResync('reveal-backlog-cap');
           } else if (queued > REVEAL_FLUSH_MAX_CHARS) {
-            // Large but NON-retained (or daemon down): we can't discard it (the
-            // queue is the only copy), but flushing it inline would burst. Hand
+            // Large but NON-retained (or daemon down, or alt-screen): we can't
+            // usefully discard it, but flushing it inline would burst. Hand
             // it to the budgeted priority drain so it catches up over frames
             // instead of one giant parse — data-loss-safe, order preserved.
-            console.log(`[wmux:reveal] ptyId=${ptyIdRef.current} mechanism=reveal-budgeted-catchup queuedChars=${queued}`);
+            console.log(`[wmux:reveal] ptyId=${ptyIdRef.current} mechanism=reveal-budgeted-catchup queuedChars=${queued}${altScreen ? ' altScreen=1' : ''}`);
             promoteTerminalToPriorityDrain(terminalRef.current);
           } else {
             if (queued > 0) {

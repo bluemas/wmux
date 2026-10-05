@@ -67,7 +67,7 @@ describe('Phase 3 PR-A — useTerminal hidden-pane retention wiring (source-leve
     expect(idx).toBeGreaterThan(0);
     // Window widened for the P0-5 retained-catchup mechanism log AND the
     // reveal-backlog-cap branch (2026-07-21) between the dirty check and the flush.
-    const body = src.slice(idx, idx + 3400);
+    const body = src.slice(idx, idx + 4000);
     expect(body).toMatch(/startResync\('dirty-reveal'\)/);
     expect(body).toMatch(/flushTerminalOutput\(terminalRef\.current\)/);
     // Reveal-backlog-cap two-part gate (review-team 2026-07-21): per-pane
@@ -79,6 +79,10 @@ describe('Phase 3 PR-A — useTerminal hidden-pane retention wiring (source-leve
     expect(body).toMatch(/isTerminalRetained\(terminalRef\.current\)/);
     expect(body).toMatch(/isDaemonModeActive\(\)/);
     expect(body).toMatch(/startResync\('reveal-backlog-cap'\)/);
+    // An alt-screen pane never takes the cap: the daemon cannot snapshot the
+    // alternate buffer, so the resync would replay the whole raw ring.
+    expect(body).toMatch(/buffer\.active\.type === 'alternate'/);
+    expect(body).toMatch(/!altScreen &&/);
     // Large NON-retained backlog can't be discarded (no daemon authority) but
     // must not burst — hand it to the budgeted priority drain instead.
     expect(body).toMatch(/promoteTerminalToPriorityDrain\(terminalRef\.current\)/);
