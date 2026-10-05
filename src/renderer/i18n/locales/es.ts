@@ -199,7 +199,7 @@ export const es = {
   'settings.installUpdate': 'Instalar actualización',
   'settings.retryCheck': 'Reintentar',
   'settings.fontSize': 'Tamaño de fuente',
-  'settings.fontSizeRange': 'rango 12~24',
+  'settings.fontSizeRange': 'rango 8~24',
   'settings.fontFamily': 'Familia de fuente',
   'settings.fontFamilyDesc': 'Fuente monoespaciada para el terminal',
   'settings.layout': 'Diseño',

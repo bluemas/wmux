@@ -199,7 +199,7 @@ export const ms = {
   'settings.installUpdate': 'Pasang kemas kini',
   'settings.retryCheck': 'Cuba semula',
   'settings.fontSize': 'Saiz fon',
-  'settings.fontSizeRange': 'julat 12~24',
+  'settings.fontSizeRange': 'julat 8~24',
   'settings.fontFamily': 'Keluarga fon',
   'settings.fontFamilyDesc': 'Fon monoruang untuk terminal',
   'settings.layout': 'Susun atur',

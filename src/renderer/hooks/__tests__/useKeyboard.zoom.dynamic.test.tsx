@@ -111,9 +111,9 @@ describe('#171 zoom — real key events move the live font size', () => {
     expect(fontSize()).toBe(24);
   });
 
-  it('clamps at the minimum (12) — extra zoom-outs do not undershoot', () => {
+  it('clamps at the minimum (8) — extra zoom-outs do not undershoot', () => {
     for (let i = 0; i < 20; i++) press({ ctrlKey: true, key: '-', code: 'Minus' });
-    expect(fontSize()).toBe(12);
+    expect(fontSize()).toBe(8);
   });
 
   it('does not zoom without Ctrl (bare "=" is a normal keystroke)', () => {

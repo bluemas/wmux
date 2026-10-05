@@ -199,7 +199,7 @@ export const vi = {
   'settings.installUpdate': 'Cài đặt cập nhật',
   'settings.retryCheck': 'Thử lại',
   'settings.fontSize': 'Cỡ chữ',
-  'settings.fontSizeRange': 'phạm vi 12~24',
+  'settings.fontSizeRange': 'phạm vi 8~24',
   'settings.fontFamily': 'Họ phông chữ',
   'settings.fontFamilyDesc': 'Phông chữ đều cho terminal',
   'settings.layout': 'Bố cục',

@@ -199,7 +199,7 @@ export const bs = {
   'settings.installUpdate': 'Instaliraj ažuriranje',
   'settings.retryCheck': 'Pokušaj ponovo',
   'settings.fontSize': 'Veličina fonta',
-  'settings.fontSizeRange': 'opseg 12~24',
+  'settings.fontSizeRange': 'opseg 8~24',
   'settings.fontFamily': 'Familija fonta',
   'settings.fontFamilyDesc': 'Monospace font za terminal',
   'settings.layout': 'Izgled',

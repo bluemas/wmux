@@ -199,7 +199,7 @@ export const zhTW = {
   'settings.installUpdate': '安裝更新',
   'settings.retryCheck': '重新檢查',
   'settings.fontSize': '字型大小',
-  'settings.fontSizeRange': '範圍 12~24',
+  'settings.fontSizeRange': '範圍 8~24',
   'settings.fontFamily': '字型',
   'settings.fontFamilyDesc': '終端機使用的等寬字型',
   'settings.layout': '版面',

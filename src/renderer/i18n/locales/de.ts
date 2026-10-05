@@ -199,7 +199,7 @@ export const de = {
   'settings.installUpdate': 'Update installieren',
   'settings.retryCheck': 'Erneut prüfen',
   'settings.fontSize': 'Schriftgröße',
-  'settings.fontSizeRange': 'Bereich 12~24',
+  'settings.fontSizeRange': 'Bereich 8~24',
   'settings.fontFamily': 'Schriftart',
   'settings.fontFamilyDesc': 'Monospace-Schrift für Terminal',
   'settings.layout': 'Layout',

@@ -199,7 +199,7 @@ export const tr = {
   'settings.installUpdate': 'Güncellemeyi yükle',
   'settings.retryCheck': 'Yeniden dene',
   'settings.fontSize': 'Yazı tipi boyutu',
-  'settings.fontSizeRange': '12~24 aralığı',
+  'settings.fontSizeRange': '8~24 aralığı',
   'settings.fontFamily': 'Yazı tipi ailesi',
   'settings.fontFamilyDesc': 'Terminal için sabit genişlikli yazı tipi',
   'settings.layout': 'Düzen',

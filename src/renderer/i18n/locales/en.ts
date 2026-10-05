@@ -1528,7 +1528,7 @@ export const en = {
   'settings.installUpdate': 'Install update',
   'settings.retryCheck': 'Retry check',
   'settings.fontSize': 'Font size',
-  'settings.fontSizeRange': 'range 12~24',
+  'settings.fontSizeRange': 'range 8~24',
   'settings.fontFamily': 'Font family',
   'settings.fontFamilyDesc': 'Any installed font — type a name or pick one',
   'settings.fontFamilyPlaceholder': 'Type or pick a font…',
