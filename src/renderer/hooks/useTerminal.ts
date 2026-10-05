@@ -540,21 +540,16 @@ export async function hydrateTerminalForRead(ptyId: string): Promise<void> {
 // the pool's accounting must treat them as distinct slots.
 let webglTokenSeq = 0;
 
-// RCA (2026-05-29 view-switch lag): when a terminal is hidden we DEFER releasing
-// its WebGL context (back to the shared pool) by this delay instead of freeing
-// it immediately. A hidden terminal usually reappears within seconds (workspace
-// switch back, multiview<->single toggle); immediate release+reload thrashes GPU
-// context creation, which is the main source of the view-switch lag the user
-// reported. If the terminal becomes visible again before the timer fires, the
-// release is cancelled and the live context reused. The HARD ceiling on
-// simultaneous contexts is enforced by webglContextPool (LRU eviction under
-// Chromium's ~16 cap); this timer is only the no-pressure cleanup.
-// 2026-07 perf pass (TASK-8): 10s → 5s. 10s effectively pinned contexts on
-// hidden panes long enough that >12-pane fleets leaned on LRU eviction (the
-// expensive path) instead of this cheap timer. 5s still covers the common
-// quick switch-back; if rapid workspace cycling ever shows blank-pane thrash,
-// revert toward 7s.
-export const WEBGL_HIDDEN_DISPOSE_DELAY_MS = 5_000;
+// A hidden terminal KEEPS its WebGL context. It gives the context back only
+// when webglContextPool evicts it (LRU, once more terminals want one than the
+// budget allows) or when it unmounts. Rebuilding the renderer on reveal is the
+// expensive part of a view switch: context creation plus a synchronous shader
+// compile, measured at ~225 ms per terminal (2026-10-06), and it runs inside
+// the switch's input task, so the pane paints only after it. A 5 s hidden-release
+// timer used to free contexts with no budget pressure, which made every reveal
+// of a pane hidden longer than that pay this cost (switch input-to-paint
+// 300–600 ms, against 40–70 ms with the context kept). A hidden xterm does not
+// render, so a held context costs GPU memory only, and the pool bounds it.
 
 // RCA A1 — reconnect-with-retry policy lives in its own module so it can be
 // unit-tested without xterm/zustand/electron. Bound to the live deps here.
@@ -791,8 +786,6 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
   // Stable unique token for this terminal's slot in the shared WebGL pool.
   const webglTokenRef = useRef<string>('');
   if (!webglTokenRef.current) webglTokenRef.current = `wgl-${++webglTokenSeq}`;
-  // Pending deferred-WebGL-release timer (see WEBGL_HIDDEN_DISPOSE_DELAY_MS).
-  const webglDisposeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Glyph-corruption repair scheduler (issue #166) — created by the main
   // effect, also poked by the visibility effect on regain.
   const glyphRepaintRef = useRef<GlyphRepaintScheduler | null>(null);
@@ -3088,10 +3081,6 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       removeDaemonConnectedForRestore?.();
       removeFlushListener?.();
       terminalRegistry.delete(ptyId);
-      if (webglDisposeTimerRef.current) {
-        clearTimeout(webglDisposeTimerRef.current);
-        webglDisposeTimerRef.current = null;
-      }
       // Release our pool slot (disposes the addon if we held a context) so the
       // budget frees for other terminals. The backstop teardown covers the
       // unlikely case of an addon created outside a pool grant (e.g. the
@@ -3308,8 +3297,8 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
   }, [fixedCols, fixedRows, fit]);
 
   // Manage WebGL lifecycle based on visibility.
-  // Load WebGL when visible (GPU-accelerated rendering), dispose when hidden
-  // to free the WebGL context for other terminals.  Also re-fit so a terminal
+  // Request a WebGL context when visible (GPU-accelerated rendering); a hidden
+  // terminal keeps it until the pool evicts it. Also re-fit so a terminal
   // that was initialized while hidden displays at the correct size.
   useEffect(() => {
     const token = webglTokenRef.current;
@@ -3376,14 +3365,6 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
           }
         }
       }
-      // Cancel any pending deferred release — the terminal is visible again
-      // (fast workspace switch / multiview<->single toggle), so keep our slot
-      // instead of freeing and rebuilding it. This is the de-thrash that
-      // removes the view-switch lag.
-      if (webglDisposeTimerRef.current) {
-        clearTimeout(webglDisposeTimerRef.current);
-        webglDisposeTimerRef.current = null;
-      }
       // Ask the shared pool for a context. Under budget → granted immediately;
       // at budget → the pool evicts the least-recently-shown terminal (it drops
       // to the DOM renderer) and grants us. This hard-bounds the live context
@@ -3412,20 +3393,10 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         fit();
       });
       return () => cancelAnimationFrame(id);
-    } else {
-      // DEFER the pool release rather than freeing the instant the terminal is
-      // hidden (see WEBGL_HIDDEN_DISPOSE_DELAY_MS). A hidden terminal usually
-      // reappears within seconds; releasing immediately is the view-switch lag.
-      // If another terminal needs the budget sooner, the pool evicts us anyway
-      // (we are the least-recently-shown), so this timer is only the no-pressure
-      // cleanup that frees the slot when nothing else is contending for it.
-      if (!webglDisposeTimerRef.current) {
-        webglDisposeTimerRef.current = setTimeout(() => {
-          webglDisposeTimerRef.current = null;
-          webglContextPool.release(token);
-        }, WEBGL_HIDDEN_DISPOSE_DELAY_MS);
-      }
     }
+    // Hidden: keep the WebGL context ("A hidden terminal KEEPS its WebGL
+    // context", near the top of this file). The pool evicts it if a visible
+    // terminal needs the slot.
   }, [isVisible, fit, startResync]);
 
   // #766 — visibility-based size ownership. Report to the daemon whether this
