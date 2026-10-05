@@ -497,6 +497,7 @@ export const zh = {
   'settings.sc.splitVertical': '垂直分割面板',
   'settings.sc.newWorkspace': '新建工作区',
   'settings.sc.closeSurface': '关闭当前标签',
+  'surface.closeConfirm': '关闭此标签？其中正在运行的内容将被终止。',
   'settings.sc.closePane': '关闭分割面板',
   'settings.sc.searchTerminal': '在终端中搜索',
   'settings.sc.commandPalette': '命令面板',

@@ -696,6 +696,13 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
     }
   }, [pane.id, pane.surfaces, closeSurface, closePane]);
 
+  // The tab strip's X asks first, like the close-tab shortcut. A browser
+  // panel closing itself (window.close) goes straight to handleCloseSurface.
+  const handleCloseSurfaceFromTab = useCallback((surfaceId: string) => {
+    if (!window.confirm(t('surface.closeConfirm'))) return;
+    handleCloseSurface(surfaceId);
+  }, [handleCloseSurface, t]);
+
   return (
     <div
       ref={paneRootRef}
@@ -854,7 +861,7 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
         actionsMode={actionsMode}
         usageLimitCompact={usageLimitCompact}
         onSelect={(surfaceId) => setActiveSurface(pane.id, surfaceId)}
-        onClose={handleCloseSurface}
+        onClose={handleCloseSurfaceFromTab}
         onSplitHorizontal={handleSplitHorizontal}
         onSplitVertical={handleSplitVertical}
         onAddTerminal={handleAddTerminal}

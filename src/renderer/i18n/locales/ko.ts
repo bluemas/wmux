@@ -1065,6 +1065,7 @@ export const ko = {
   'settings.sc.splitVertical': '세로 분할',
   'settings.sc.newWorkspace': '새 작업공간',
   'settings.sc.closeSurface': '현재 탭 닫기',
+  'surface.closeConfirm': '이 탭을 닫을까요? 탭에서 실행 중인 작업은 종료됩니다.',
   'settings.sc.closePane': '분할된 창 닫기',
   'settings.sc.searchTerminal': '터미널에서 검색',
   'settings.sc.commandPalette': '명령 팔레트',

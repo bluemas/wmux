@@ -414,6 +414,9 @@ export function useKeyboard() {
         if (!ws) return;
         const activePane = findLeaf(ws.rootPane, ws.activePaneId);
         if (activePane && activePane.activeSurfaceId) {
+          // The shortcut sits next to everyday keys, so a stray press must not
+          // kill a running session without asking.
+          if (!window.confirm(t('surface.closeConfirm'))) return;
           const surface = activePane.surfaces.find((s) => s.id === activePane.activeSurfaceId);
           if (surface?.ptyId) {
             window.electronAPI.pty.dispose(surface.ptyId);
