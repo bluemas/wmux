@@ -607,9 +607,13 @@ export function selectFleetPanes(state: FleetSelectorState): FleetPane[] {
       // #1509 — 'awaiting_input' is vetoed for the same reason as 'running':
       // the per-pty scan above carries it on the pane that raised it, so the
       // shared slot could only add it to a same-named sibling as well.
+      // 'complete' is vetoed too: its per-pty carrier is cleared when the user
+      // focuses the pane, but this slot keeps it until the next turn, so
+      // inheriting it pinned a seen pane in Ready to review.
       const metaStatus =
         isActivePane && metaMatchesPane
           && wsMeta?.agentStatus !== 'running' && wsMeta?.agentStatus !== 'awaiting_input'
+          && wsMeta?.agentStatus !== 'complete'
           && !isQuietUsageLimitError(state.usageLimitWaiting, ptyId, wsMeta?.agentStatus)
           ? wsMeta?.agentStatus
           : undefined;

@@ -225,6 +225,26 @@ describe('selectFleetPanes', () => {
     expect(btop.agentStatus).toBe('idle');    // must NOT show "waiting"
   });
 
+  it("a seen finished turn does NOT come back from the workspace 'complete' slot", () => {
+    // Focusing the pane clears its per-pty 'complete' ("the user has seen
+    // this"), but the workspace-wide slot keeps 'complete' until the next
+    // turn. Inheriting it pinned the active pane in Ready to review forever.
+    const ws = workspace(
+      'ws-seen', 'seen',
+      leaf('p-seen', [surface('s-seen', 'pty-seen')]),
+      'p-seen',
+      { agentName: 'Claude Code', agentStatus: 'complete' },
+    );
+    const [pane] = selectFleetPanes({
+      workspaces: [ws],
+      surfaceAgentStatus: {}, // focus-cleared
+      surfaceActivity: {},
+      surfaceAgent: { 'pty-seen': { name: 'Claude Code', status: 'complete' } },
+    });
+    expect(pane.isActivePane).toBe(true);
+    expect(pane.agentStatus).toBe('idle');
+  });
+
   it("a confirmed agent pane still does NOT borrow workspace 'running' from a same-named sibling (#837 + #850)", () => {
     // The shape #850's name match cannot distinguish: orchestrator and worker
     // are both "Claude Code", so the name matches on BOTH panes. The worker's
