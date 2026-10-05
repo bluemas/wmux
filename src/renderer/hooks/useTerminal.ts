@@ -34,6 +34,7 @@ import {
 import { terminalFontFamilyCss } from '../utils/terminalFont';
 import { createPathLinkProvider } from '../terminal/pathLinkProvider';
 import { resolveNewlineKeyByte } from '../terminal/newlineKeys';
+import { resolveMacWordDeleteByte } from '../terminal/macWordDeleteKey';
 import { encodeEscape, isBareEscape } from '../terminal/escapeKeys';
 import { resolveCtrlLetterByte } from '../terminal/ctrlLetterKeys';
 import { isComposeChord, composeOwnerHost, TERMINAL_PTY_ATTR, COMPOSE_OWNER_ATTR } from '../terminal/composeChord';
@@ -2037,6 +2038,16 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         if (customKeybindings.some((kb) => kb.key === combo)) {
           return false; // let useKeyboard handle it
         }
+      }
+
+      // ⌘Backspace deletes the previous word (xterm encodes no ⌘ chord).
+      // Below the shortcut checks so a user binding on it still wins.
+      const wordDeleteByte = resolveMacWordDeleteByte(e, isMac);
+      if (wordDeleteByte !== null) {
+        e.preventDefault();
+        window.electronAPI.pty.write(ptyId, wordDeleteByte);
+        noteUserKeystroke(wordDeleteByte);
+        return false;
       }
 
       // macOS-native clipboard: ⌘C copies the selection, ⌘V pastes. The Ctrl
