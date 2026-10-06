@@ -51,14 +51,15 @@ describe('scrollback restore — chain instrumentation', () => {
     expect(recoverySnippet).toMatch(/exists=\$\{scrollbackData/);
   });
 
-  it('logs SessionPipe flush bytes from the same readAll() result we send on the wire', () => {
+  it('logs SessionPipe flush bytes from the same ring read we send on the wire', () => {
     // The log must reference `buffered.length`, not `this.ringBuffer.size`,
     // so the printed number is what actually went down the socket — even
     // if a future refactor changes the readAll() path.
     const flushLog = sessionPipeSrc.indexOf('[SessionPipe.flush]');
     expect(flushLog).toBeGreaterThan(0);
 
-    const readAllMatch = sessionPipeSrc.indexOf('this.ringBuffer.readAll()');
+    // readAllWithGeometry() is readAll() plus the sizes the bytes were written at.
+    const readAllMatch = sessionPipeSrc.indexOf('this.ringBuffer.readAllWithGeometry()');
     expect(readAllMatch).toBeGreaterThan(0);
     // The log comes after we computed `buffered` from readAll() and
     // before the conditional socket.write that actually emits the bytes.
