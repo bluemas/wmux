@@ -265,6 +265,26 @@ describe('comboFromEvent — recording a new binding', () => {
   it('waits while only modifiers are held', () => {
     expect(comboFromEvent(ev({ key: 'Control', code: 'ControlLeft' }))).toBeNull();
   });
+
+  it('records a shifted symbol by its key, so the conflict check sees it', () => {
+    // Windows reports '}' for Ctrl+Shift+] (#1422). Recorded by the glyph it
+    // was 'Ctrl+Shift+}', which next tab's 'Ctrl+Shift+]' never matched.
+    const e = ev({ key: '}', code: 'BracketRight', shiftKey: true });
+    const combo = comboFromEvent(e);
+    expect(combo).toBe('Ctrl+Shift+]');
+    expect(rebindProblem('toggleSidebar', combo as string, win, 'win32', 'KeyB'))
+      .toEqual({ kind: 'taken', by: 'nextSurface' });
+    expect(comboFromEvent(ev({ key: '!', code: 'Digit1', shiftKey: true }))).toBe('Ctrl+Shift+1');
+    // Still the key the resolver matches.
+    expect(resolveShortcut(e, [{ action: 'toggleSidebar', combo: combo as string }])).toBe('toggleSidebar');
+    // Letters and digits are unchanged by Shift.
+    expect(comboFromEvent(ev({ key: 'D', code: 'KeyD', shiftKey: true }))).toBe('Ctrl+Shift+D');
+  });
+
+  it('keeps resolving a shifted-glyph combo recorded before', () => {
+    const e = ev({ key: '}', code: 'BracketRight', shiftKey: true });
+    expect(resolveShortcut(e, [{ action: 'toggleSidebar', combo: 'Ctrl+Shift+}' }])).toBe('toggleSidebar');
+  });
 });
 
 describe('override validation', () => {
