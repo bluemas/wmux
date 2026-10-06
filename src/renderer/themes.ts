@@ -365,7 +365,7 @@ export const ATTENTION_COLORS: Record<BuiltinThemeId, AttentionColors> = {
   'stars-and-stripes': { fill: '#FF9248', text: '#FF9C5A', ink: '#0C1428' },
   'red-dynasty': { fill: '#FF9A3C', text: '#FFA552', ink: '#1A0A0A' },
   nightowl: { fill: '#F08A3E', text: '#F59A55', ink: '#1E1B16' },
-  'gruvbox-dark-hard': { fill: '#FE8019', text: '#FE8019', ink: '#1D2021' },
+  'gruvbox-dark-hard': { fill: '#FE8019', text: '#FE9040', ink: '#1D2021' },
   void: { fill: '#FF8A3D', text: '#FF9550', ink: '#000000' },
   hinomaru: { fill: '#CA5510', text: '#9A3B08', ink: '#000000' },
   taegeuk: { fill: '#CE530B', text: '#983A08', ink: '#000000' },

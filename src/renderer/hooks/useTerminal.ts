@@ -35,8 +35,8 @@ import {
 } from '../terminal/replayMute';
 import { terminalFontFamilyCss } from '../utils/terminalFont';
 import { createPathLinkProvider } from '../terminal/pathLinkProvider';
-import { resolveMacWordDeleteByte } from '../terminal/macWordDeleteKey';
 import { resolveNewlineKeyByte, wantsAltEnterNewline, foldAtPromptCarry, noteCodexEndedByPrompt } from '../terminal/newlineKeys';
+import { resolveMacWordDeleteByte } from '../terminal/macWordDeleteKey';
 import { isWslShell } from '../../shared/imagePaste';
 import { encodeEscape, isBareEscape } from '../terminal/escapeKeys';
 import { resolveCtrlLetterByte } from '../terminal/ctrlLetterKeys';

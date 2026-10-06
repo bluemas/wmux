@@ -398,6 +398,9 @@ const REST_HIDDEN =
  * precedes the item — `-ml-2` for the row (`gap-2`), `-ml-1` for the name line
  * (`gap-1`) — and return it the moment the item is shown.
  */
+const REST_HIDDEN_GAP_ROW = '-ml-2 group-hover:ml-0 group-focus-within:ml-0';
+const REST_HIDDEN_GAP_NAME_LINE = '-ml-1 group-hover:ml-0 group-focus-within:ml-0';
+
 // Shortcut number colour: a blue that contrasts with the sidebar's own tone —
 // light on a dark sidebar, deep on a light one — and never white, whatever the
 // theme's accent is (Zinc's accent is near-white). L flips on the sidebar's
@@ -405,8 +408,6 @@ const REST_HIDDEN =
 const SHORTCUT_NUMBER_STYLE = {
   color: 'oklch(from var(--bg-mantle) calc(0.4 + 0.38 * (1 - round(l))) 0.13 250)',
 } as const;
-const REST_HIDDEN_GAP_ROW = '-ml-2 group-hover:ml-0 group-focus-within:ml-0';
-const REST_HIDDEN_GAP_NAME_LINE = '-ml-1 group-hover:ml-0 group-focus-within:ml-0';
 
 /**
  * 2026-09-27 — a task row renders INSIDE its owner's row (under the pane that
@@ -1294,9 +1295,11 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutInde
                   </span>
                 )}
                 {/* Ctrl+N follows the stored order, so each row always shows the
-                    number its shortcut jumps to, left of the name (owner decision
-                    2026-10-04). A nested task row has none. */}
-                {!taskRow && !moaHq && shortcutIndex >= 0 && shortcutIndex < 9 && (
+                    number its shortcut jumps to, left of the name, in every sort
+                    mode — the numbers may read out of sequence in a sorted order.
+                    A nested task row, Moa's HQ and a row in the Snoozed/Settled
+                    group have none. */}
+                {!taskRow && !moaHq && !shortcutHintHidden && shortcutIndex >= 0 && shortcutIndex < 9 && (
                   // Drawn by CSS so the digit is not part of the row's text
                   // (selection, copy, accessible name).
                   <span
@@ -1452,7 +1455,6 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutInde
                     {t('workspace.agentError')}
                   </span>
                 )}
-
                 </span>
               </div>
               {(metadata || question) && (

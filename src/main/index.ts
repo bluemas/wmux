@@ -2417,23 +2417,6 @@ app.on('window-all-closed', () => {
   // Actual quit is triggered from the tray "Quit" menu item.
 });
 
-// quitAndInstall() closes every window and only installs once the window list
-// empties. With isQuitting still false the hide-to-tray close intercept above
-// cancels that close, so the window list never empties, the install never runs,
-// and ShipIt waits forever on a process that will not exit. Flipping the flag
-// here is what lets the windows close through.
-//
-// This used to hang off `app.on('before-quit-for-update')`. That listener never
-// fired: the event belongs to Electron's `autoUpdater`, not to `app`, and the
-// `as unknown as NodeJS.EventEmitter` cast that was added to "work around the
-// missing type" silenced the very error that said so. The updater now calls
-// this directly, so there is no event name left to get wrong.
-//
-// The full before-quit teardown is skipped on this path, so anything it
-// guarantees has to be done here: the broker is stopped explicitly, and the
-// session state is flushed the same way the darwin before-quit pass flushes it
-// (the renderer-side save already ran in AutoUpdater.performInstall, but that
-// does not cover the main process's pending debounced write).
 // Alt+F4: ask before quitting. A normal Quit only detaches from the daemon, so
 // live sessions keep running and reattach on the next launch.
 let quitConfirmOpen = false;
@@ -2457,6 +2440,23 @@ async function confirmQuit(win: BrowserWindow): Promise<void> {
   }
 }
 
+// quitAndInstall() closes every window and only installs once the window list
+// empties. With isQuitting still false the hide-to-tray close intercept above
+// cancels that close, so the window list never empties, the install never runs,
+// and ShipIt waits forever on a process that will not exit. Flipping the flag
+// here is what lets the windows close through.
+//
+// This used to hang off `app.on('before-quit-for-update')`. That listener never
+// fired: the event belongs to Electron's `autoUpdater`, not to `app`, and the
+// `as unknown as NodeJS.EventEmitter` cast that was added to "work around the
+// missing type" silenced the very error that said so. The updater now calls
+// this directly, so there is no event name left to get wrong.
+//
+// The full before-quit teardown is skipped on this path, so anything it
+// guarantees has to be done here: the broker is stopped explicitly, and the
+// session state is flushed the same way the darwin before-quit pass flushes it
+// (the renderer-side save already ran in AutoUpdater.performInstall, but that
+// does not cover the main process's pending debounced write).
 // Wiring every main window needs, wherever it was created. Boot, the Dock
 // 'activate' path and the aborted-install recovery all built windows their own
 // way, and only boot attached the hide-to-tray close intercept — a window from
