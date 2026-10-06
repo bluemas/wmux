@@ -139,6 +139,7 @@ import { ClaudeWorker } from './a2a/ClaudeWorker';
 import { AutoUpdater } from './updater/AutoUpdater';
 import { warnOnInstallIntegrityGap } from './updater/installIntegrity';
 import { readDaemonPid } from './updater/installTeardown';
+import { isAltF4Held } from './altF4';
 import { McpRegistrar } from './mcp/McpRegistrar';
 import { BrokerSupervisor, isMcpBrokerEnabled } from './mcp/BrokerSupervisor';
 import { WebviewCdpManager } from './browser-session/WebviewCdpManager';
@@ -2416,6 +2417,29 @@ app.on('window-all-closed', () => {
   // Actual quit is triggered from the tray "Quit" menu item.
 });
 
+// Alt+F4: ask before quitting. A normal Quit only detaches from the daemon, so
+// live sessions keep running and reattach on the next launch.
+let quitConfirmOpen = false;
+async function confirmQuit(win: BrowserWindow): Promise<void> {
+  if (quitConfirmOpen) return;
+  quitConfirmOpen = true;
+  try {
+    const { response } = await dialog.showMessageBox(win, {
+      type: 'question',
+      title: 'Quit wmux',
+      message: 'Quit wmux?',
+      detail: 'Your terminal sessions keep running in the background and reattach the next time you open wmux.',
+      buttons: ['Quit', 'Cancel'],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true,
+    });
+    if (response === 0) app.quit();
+  } finally {
+    quitConfirmOpen = false;
+  }
+}
+
 // quitAndInstall() closes every window and only installs once the window list
 // empties. With isQuitting still false the hide-to-tray close intercept above
 // cancels that close, so the window list never empties, the install never runs,
@@ -2447,10 +2471,21 @@ function adoptMainWindow(win: BrowserWindow): void {
     if (mainWindow === win) mainWindow = null;
   });
 
-  // Intercept window close — hide to tray instead of destroying
+  // Intercept window close — hide to tray instead of destroying, except for
+  // Alt+F4, which asks to quit. The OS delivers Alt+F4 and the title-bar X as the
+  // same close request (and Chromium never reports the key), so the key state is
+  // read from the OS when the request arrives; the input event is a second hint.
+  let altF4At = 0;
+  win.webContents.on('before-input-event', (_event, input) => {
+    if (input.type === 'keyDown' && input.alt && input.key === 'F4') altF4At = Date.now();
+  });
   win.on('close', (e) => {
-    if (!isQuitting) {
-      e.preventDefault();
+    if (isQuitting) return;
+    e.preventDefault();
+    if (isAltF4Held() || Date.now() - altF4At < 1000) {
+      altF4At = 0;
+      void confirmQuit(win);
+    } else {
       win.hide();
     }
   });
