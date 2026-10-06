@@ -96,6 +96,7 @@ import { SettingsSection, SettingRow, SettingNote } from './SettingsLayout';
 import { MAX_WORKSPACE_IDLE_DAYS, MIN_WORKSPACE_IDLE_DAYS } from '../../../shared/workspaceSettle';
 import { sendWorkspaceSettleIdleDays } from '../../hooks/useWorkspaceSettleBridge';
 import { TabMoa } from './MoaTab';
+import { matchesShortcutQuery } from './shortcutSearch';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -4431,12 +4432,9 @@ export function TabShortcuts() {
 
   const hasOverrides = Object.keys(shortcutOverrides).length > 0;
 
-  // Case-insensitive; spaces and '+' are ignored so "ctrl n", "ctrl+n" and
-  // "ctrln" all find Ctrl+N.
-  const squash = (text: string) => text.toLowerCase().replace(/[\s+]/g, '');
-  const shortcutNeedle = squash(shortcutQuery);
+  const shortcutNeedle = shortcutQuery.trim();
   const matchesShortcut = (description: string, keys: string) =>
-    !shortcutNeedle || squash(description).includes(shortcutNeedle) || squash(keys).includes(shortcutNeedle);
+    matchesShortcutQuery(shortcutQuery, description, keys);
   const visibleShortcuts = ADVERTISED_SHORTCUTS.filter((entry) => {
     const override = shortcutOverrides[entry.action];
     const combo = typeof override === 'string' ? override : concreteCombo(entry, platform);
