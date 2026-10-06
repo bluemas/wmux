@@ -722,6 +722,11 @@ export interface UISlice {
   // default; each pane can override it from its limit chip.
   usageLimitAutoResume: boolean;
   setUsageLimitAutoResume: (enabled: boolean) => void;
+  // #1826: when on, a pane recovered at app start that was running Claude Code
+  // gets its resume line typed and submitted instead of only showing the
+  // Resume pill. Off by default.
+  claudeResumeOnStart: boolean;
+  setClaudeResumeOnStart: (enabled: boolean) => void;
   anthropicUsage: {
     status:
       | 'idle'
@@ -1802,6 +1807,10 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
   usageLimitAutoResume: false,
   setUsageLimitAutoResume: (enabled) => set((state) => {
     state.usageLimitAutoResume = enabled;
+  }),
+  claudeResumeOnStart: false,
+  setClaudeResumeOnStart: (enabled) => set((state) => {
+    state.claudeResumeOnStart = enabled;
   }),
   anthropicUsageEnabled: false,
   setAnthropicUsageEnabled: (enabled) => {

@@ -1441,6 +1441,9 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       if (typeof data.usageLimitAutoResume === 'boolean') {
         state.usageLimitAutoResume = data.usageLimitAutoResume;
       }
+      if (typeof data.claudeResumeOnStart === 'boolean') {
+        state.claudeResumeOnStart = data.claudeResumeOnStart;
+      }
       if (data.customKeybindings) {
         // Merge saved keybindings with current built-in defaults (mirrors the
         // layoutTemplates merge below). Built-in defaults (id 'kb-default-*')

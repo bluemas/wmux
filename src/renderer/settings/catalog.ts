@@ -135,6 +135,7 @@ export const SETTINGS_CATALOG: SettingsCatalogEntry[] = [
   { id: 'setup', tab: 'claude-integration', labelKey: 'integrationSetup.title', descKey: 'integrationSetup.description', synonyms: 'hooks hook bridge statusline status line mcp install setup 훅 설치' },
   { id: 'usage', tab: 'claude-integration', labelKey: 'claudeIntegration.usage.title', descKey: 'claudeIntegration.usage.description', synonyms: 'usage quota limit 5h 7d meter anthropic 사용량' },
   { id: 'usagelimitresume', tab: 'claude-integration', labelKey: 'claudeIntegration.usageLimit.autoResume', descKey: 'claudeIntegration.usageLimit.autoResumeDesc', synonyms: 'usage limit rate resume continue reset pause codex 한도 이어가기 재개' },
+  { id: 'clauderesumeonstart', tab: 'claude-integration', labelKey: 'claudeIntegration.resumeOnStart', descKey: 'claudeIntegration.resumeOnStartDesc', synonyms: 'resume restart recover continue launch boot session 재시작 이어가기 복원' },
   { id: 'mcp', tab: 'claude-integration', labelKey: 'settings.mcpServers', synonyms: 'mcp plugin tools broker register codex' },
 
   { id: 'claudeacct', tab: 'accounts', labelKey: 'accounts.title', synonyms: 'claude account login subscription max usage quota 계정' },

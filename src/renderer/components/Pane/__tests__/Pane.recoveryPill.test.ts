@@ -14,6 +14,8 @@
  * rather than mounting the component and spying on window.electronAPI.pty.write.
  */
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { planAutoResume, planRecoveryPillType } from '../Pane';
 import type { RoleBinding } from '../../../../shared/orchestratorRole';
 
@@ -254,19 +256,20 @@ describe('planAutoResume — Claude panes resume themselves on app start', () =>
   const binding = { agent: 'claude', cwd: 'C:/git/wmux', sessionId: SID };
 
   it('resumes the exact conversation when the binding matches the pane cwd', () => {
-    expect(planAutoResume({ agent: 'claude', binding, paneCwds: ['c:/git/wmux/'], roleBinding: undefined }))
+    expect(planAutoResume({ enabled: true, agent: 'claude', binding, paneCwds: ['c:/git/wmux/'], roleBinding: undefined }))
       .toBe(`claude --resume ${SID}`);
   });
 
   it('falls back to cwd-relative --continue without a matching binding', () => {
-    expect(planAutoResume({ agent: 'claude', binding: undefined, paneCwds: ['C:/git/wmux'], roleBinding: undefined }))
+    expect(planAutoResume({ enabled: true, agent: 'claude', binding: undefined, paneCwds: ['C:/git/wmux'], roleBinding: undefined }))
       .toBe('claude --continue');
-    expect(planAutoResume({ agent: 'claude', binding, paneCwds: ['C:/elsewhere'], roleBinding: undefined }))
+    expect(planAutoResume({ enabled: true, agent: 'claude', binding, paneCwds: ['C:/elsewhere'], roleBinding: undefined }))
       .toBe('claude --continue');
   });
 
   it('restores the captured permission mode on one line, and never adds bypass', () => {
     const line = planAutoResume({
+      enabled: true,
       agent: 'claude',
       binding: { ...binding, permissionMode: 'acceptEdits' },
       paneCwds: ['C:/git/wmux'],
@@ -275,12 +278,32 @@ describe('planAutoResume — Claude panes resume themselves on app start', () =>
     expect(line).toContain(`--resume ${SID}`);
     expect(line).toContain('acceptEdits');
     expect(line).not.toContain('--dangerously-skip-permissions');
-    expect(planAutoResume({ agent: 'claude', binding, paneCwds: [], roleBinding: undefined }))
+    expect(planAutoResume({ enabled: true, agent: 'claude', binding, paneCwds: [], roleBinding: undefined }))
       .not.toContain('--dangerously-skip-permissions');
   });
 
   it('leaves other agents and non-agent panes alone', () => {
-    expect(planAutoResume({ agent: 'codex', binding: undefined, paneCwds: [], roleBinding: undefined })).toBeNull();
-    expect(planAutoResume({ agent: undefined, binding: undefined, paneCwds: [], roleBinding: undefined })).toBeNull();
+    expect(planAutoResume({ enabled: true, agent: 'codex', binding: undefined, paneCwds: [], roleBinding: undefined })).toBeNull();
+    expect(planAutoResume({ enabled: true, agent: undefined, binding: undefined, paneCwds: [], roleBinding: undefined })).toBeNull();
+  });
+});
+
+describe('planAutoResume — the opt-in setting (#1826)', () => {
+  const binding = { agent: 'claude', cwd: 'C:/git/wmux', sessionId: SID };
+
+  it('types nothing into a recovered Claude pane while the setting is off', () => {
+    expect(planAutoResume({ enabled: false, agent: 'claude', binding, paneCwds: ['C:/git/wmux'], roleBinding: undefined }))
+      .toBeNull();
+    expect(planAutoResume({ enabled: false, agent: 'claude', binding: undefined, paneCwds: ['C:/git/wmux'], roleBinding: undefined }))
+      .toBeNull();
+  });
+
+  it('the Pane effect feeds the store setting into planAutoResume and re-checks it before writing', () => {
+    // No Pane mount harness exists; pin the wiring so the only pty.write path
+    // of this feature cannot bypass the setting.
+    const source = readFileSync(resolve(__dirname, '../Pane.tsx'), 'utf8');
+    expect(source).toMatch(/const claudeResumeOnStart = useStore\(\(s\) => s\.claudeResumeOnStart\);/);
+    expect(source).toMatch(/planAutoResume\(\{\s*enabled: claudeResumeOnStart,/);
+    expect(source).toMatch(/if \(!useStore\.getState\(\)\.claudeResumeOnStart\) return;[^\n]*\n\s*if \(useStore\.getState\(\)\.resumeHintByPtyId/);
   });
 });

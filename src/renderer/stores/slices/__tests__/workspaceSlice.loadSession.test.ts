@@ -32,6 +32,7 @@ type TestState = WorkspaceSlice & {
   notificationRingEnabled: boolean;
   anthropicUsageEnabled: boolean;
   usageLimitAutoResume: boolean;
+  claudeResumeOnStart: boolean;
   customKeybindings: unknown[];
   autoUpdateEnabled: boolean;
   sidebarMode: 'workspaces' | 'company';
@@ -91,6 +92,7 @@ function createTestStore() {
       notificationRingEnabled: true,
       anthropicUsageEnabled: false,
       usageLimitAutoResume: false,
+      claudeResumeOnStart: false,
       customKeybindings: [],
       autoUpdateEnabled: true,
       sidebarMode: 'workspaces',
@@ -1482,5 +1484,38 @@ describe('WorkspaceSlice.loadSession — first-run system locale detection', () 
     } finally {
       (globalThis.window as unknown as { electronAPI?: unknown }).electronAPI = saved;
     }
+  });
+});
+
+describe('loadSession — Claude resume-on-start setting (#1826)', () => {
+  function sessionWith(value: unknown): SessionData {
+    const ws: Workspace = {
+      id: 'ws-resume',
+      name: 'Resume',
+      rootPane: makeBrowserSurfaceTree('https://example.com'),
+      activePaneId: 'pane-root',
+    };
+    return {
+      workspaces: [ws],
+      activeWorkspaceId: ws.id,
+      sidebarVisible: true,
+      ...(value !== undefined ? { claudeResumeOnStart: value } : {}),
+    } as unknown as SessionData;
+  }
+
+  it('stays off for a session saved before the setting existed', () => {
+    const store = createTestStore();
+    store.getState().loadSession(sessionWith(undefined));
+    expect(store.getState().claudeResumeOnStart).toBe(false);
+  });
+
+  it('restores a saved boolean and ignores a malformed value', () => {
+    const store = createTestStore();
+    store.getState().loadSession(sessionWith(true));
+    expect(store.getState().claudeResumeOnStart).toBe(true);
+    store.getState().loadSession(sessionWith('false'));
+    expect(store.getState().claudeResumeOnStart).toBe(true);
+    store.getState().loadSession(sessionWith(false));
+    expect(store.getState().claudeResumeOnStart).toBe(false);
   });
 });

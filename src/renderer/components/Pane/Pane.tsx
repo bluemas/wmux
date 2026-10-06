@@ -276,12 +276,14 @@ const autoResumedPtys = new Set<string>();
  * the pill toggle's explicit choice, not something to grant on every start.
  */
 export function planAutoResume(args: {
+  /** The user's opt-in setting (`claudeResumeOnStart`); off means the pill only. */
+  enabled: boolean;
   agent: string | undefined;
   binding: { agent?: string; cwd: string; sessionId?: string; permissionMode?: Parameters<typeof permissionFlagFor>[0] } | undefined;
   paneCwds: ReadonlyArray<string | undefined>;
   roleBinding: RoleBinding | undefined;
 }): string | null {
-  if (args.agent !== 'claude') return null;
+  if (!args.enabled || args.agent !== 'claude') return null;
   const { binding } = args;
   const exact = !!binding && binding.agent === 'claude' &&
     args.paneCwds.some((c) => !!c && normalizeResumeCwd(binding.cwd) === normalizeResumeCwd(c));
@@ -629,9 +631,11 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
   // on the same conversation. Asked only for panes that offer a resume.
   const chatV2Binding = usePaneChatV2Binding(activeSurfacePtyId || undefined, !!resumeBinding || !!resumeHint);
   const chatV2OwnsPane = !!chatV2Binding && chatV2Binding.status !== 'handed-off';
-  // Resume Claude Code panes automatically on app start: a pane recovered this
+  // Resume Claude Code panes automatically on app start, when the user opted
+  // in (`claudeResumeOnStart`, off by default; off keeps the pill): a pane recovered this
   // boot that was running Claude gets its resume line typed and submitted once
   // its shell is interactive, instead of waiting for the pill's click + Enter.
+  const claudeResumeOnStart = useStore((s) => s.claudeResumeOnStart);
   const autoResumeCwds = [
     pane.surfaces.find((s) => s.id === pane.activeSurfaceId)?.cwd,
     workspace.metadata?.cwd,
@@ -641,6 +645,7 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
     if (!ptyId || !resumePtyReady || supervision || chatV2OwnsPane) return;
     if (autoResumedPtys.has(ptyId)) return;
     const line = planAutoResume({
+      enabled: claudeResumeOnStart,
       agent: resumeHint,
       binding: resumeBinding,
       paneCwds: autoResumeCwds,
@@ -650,6 +655,7 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
     // A beat after the first output, so the prompt is up and reading input.
     const timer = setTimeout(() => {
       if (autoResumedPtys.has(ptyId)) return;
+      if (!useStore.getState().claudeResumeOnStart) return; // turned off meanwhile
       if (useStore.getState().resumeHintByPtyId[ptyId] !== 'claude') return; // typed into / dismissed meanwhile
       autoResumedPtys.add(ptyId);
       window.electronAPI.pty.write(ptyId, `${line}\r`);
@@ -657,7 +663,7 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
     }, 400);
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeSurfacePtyId, resumePtyReady, resumeHint, resumeBinding, supervision, chatV2OwnsPane]);
+  }, [activeSurfacePtyId, resumePtyReady, resumeHint, resumeBinding, supervision, chatV2OwnsPane, claudeResumeOnStart]);
   // The persistent resume chip's "is this pane's agent busy?" gate — and the
   // store-wide `agentClockMs` decay-clock subscription it needs — lives in the
   // <ResumeInfoChipGate> leaf below, NOT here: Pane mounts that leaf only when a

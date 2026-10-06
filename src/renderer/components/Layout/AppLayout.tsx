@@ -441,6 +441,7 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
     notificationRingEnabled: state.notificationRingEnabled,
     anthropicUsageEnabled: state.anthropicUsageEnabled,
     usageLimitAutoResume: state.usageLimitAutoResume,
+    claudeResumeOnStart: state.claudeResumeOnStart,
     mutedNotificationCategories: state.mutedNotificationCategories,
     customKeybindings: state.customKeybindings,
     shortcutOverrides: state.shortcutOverrides,

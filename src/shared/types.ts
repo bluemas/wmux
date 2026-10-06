@@ -963,6 +963,8 @@ export interface SessionData {
   anthropicUsageEnabled?: boolean;
   /** Arm a pane held at a usage limit to continue after the reset, unless the pane decided otherwise. */
   usageLimitAutoResume?: boolean;
+  /** #1826 — type the resume line into Claude Code panes recovered at app start. Opt-in. */
+  claudeResumeOnStart?: boolean;
   /** Categories whose surface actions are suppressed (#516). */
   mutedNotificationCategories?: NotificationCategory[];
   customKeybindings?: CustomKeybinding[];

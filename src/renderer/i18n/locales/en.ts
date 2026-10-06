@@ -2422,6 +2422,8 @@ export const en = {
   'claudeIntegration.usage.enableLabel': 'Show 5h / 7d utilization in status bar',
   'claudeIntegration.usageLimit.autoResume': 'Continue after a usage limit resets',
   'claudeIntegration.usageLimit.autoResumeDesc': 'Send a short continue message to a paused agent once its limit resets. Off by default; each pane can override it.',
+  'claudeIntegration.resumeOnStart': 'Resume Claude Code panes automatically on start',
+  'claudeIntegration.resumeOnStartDesc': 'After a restart, type the resume line into panes that were running Claude Code instead of waiting for the Resume pill. Off by default.',
   'usageLimit.waiting': 'Waiting',
   'usageLimit.label': 'Limit',
   'usageLimit.title': 'Usage limit reached',
