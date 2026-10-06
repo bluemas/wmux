@@ -55,9 +55,9 @@ function dot(tone: TaskDotTone, labelKey?: string): TaskStatusDot {
 
 /**
  * Worker states that mean "somebody has to answer". `waiting` counts with
- * `awaiting_input` for the same reason the titlebar's "N need you" chip counts
- * it (stores/selectors/fleet.ts countNeedsAttention): the turn ended and the
- * agent is idle ON YOU. `error` counts too — a worker that died mid-task is the
+ * `awaiting_input`: a worker whose turn ended is idle on whoever dispatched it.
+ * (The titlebar's "N need you" chip is narrower — see countNeedsAttention in
+ * stores/selectors/fleet.ts.) `error` counts too — a worker that died mid-task is the
  * loudest thing the panel can be asked to show.
  */
 function workerNeedsSomebody(workerStatus: AgentStatus | null): boolean {

@@ -382,15 +382,19 @@ describe('countNeedsAttention', () => {
     expect(countNeedsAttention(panes)).toBe(1); // only p1 (awaiting_input)
   });
 
-  it('counts both awaiting_input and waiting states', () => {
+  it('counts awaiting_input, and waiting only when a question is pending', () => {
     const base: FleetPane = { workspaceId: 'w', workspaceName: 'w', paneId: 'x', surfaceId: 'x', ptyId: 'x', agentStatus: 'idle', title: 'x', surfaceType: 'terminal', isActivePane: false, unverifiable: false };
     const panes: FleetPane[] = [
-      { ...base, paneId: '1', agentStatus: 'awaiting_input' },
-      { ...base, paneId: '2', agentStatus: 'waiting' },
-      { ...base, paneId: '3', agentStatus: 'running' },
-      { ...base, paneId: '4', agentStatus: 'complete' },
+      { ...base, paneId: '1', ptyId: 'pty-1', agentStatus: 'awaiting_input' },
+      { ...base, paneId: '2', ptyId: 'pty-2', agentStatus: 'waiting' },
+      { ...base, paneId: '3', ptyId: 'pty-3', agentStatus: 'running' },
+      { ...base, paneId: '4', ptyId: 'pty-4', agentStatus: 'complete' },
+      { ...base, paneId: '5', ptyId: 'pty-5', agentStatus: 'waiting' },
     ];
-    expect(countNeedsAttention(panes)).toBe(2);
+    // A turn that ended at an idle prompt is idle on the Fleet board, so it
+    // must not light the chip either.
+    expect(countNeedsAttention(panes)).toBe(1);
+    expect(countNeedsAttention(panes, { 'pty-5': 'Proceed?' })).toBe(2);
   });
 });
 

@@ -160,7 +160,7 @@ export default function StatusBar() {
       }).filter(isFleetAgentRow);
       return {
         running: panes.filter((p) => p.agentStatus === 'running').length,
-        needsYou: countNeedsAttention(panes),
+        needsYou: countNeedsAttention(panes, s.surfacePendingQuestion),
       };
     }),
   );
