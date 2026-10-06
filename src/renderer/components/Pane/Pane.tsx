@@ -636,10 +636,11 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
   const chatV2Binding = usePaneChatV2Binding(activeSurfacePtyId || undefined, !!resumeBinding || !!resumeHint);
   const chatV2OwnsPane = !!chatV2Binding && chatV2Binding.status !== 'handed-off';
   // Resume Claude Code panes automatically on app start, when the user opted
-  // in (`claudeResumeOnStart`, off by default; off keeps the pill): a pane recovered this
+  // in (`claudeResumeOnStart`, off by default; off keeps the pill). The setting
+  // is read when the pane becomes ready, not subscribed to: turning it on must
+  // not type into panes already showing the pill. A pane recovered this
   // boot that was running Claude gets its resume line typed and submitted once
   // its shell is interactive, instead of waiting for the pill's click + Enter.
-  const claudeResumeOnStart = useStore((s) => s.claudeResumeOnStart);
   const autoResumeCwds = [
     pane.surfaces.find((s) => s.id === pane.activeSurfaceId)?.cwd,
     workspace.metadata?.cwd,
@@ -649,7 +650,7 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
     if (!ptyId || !resumePtyReady || supervision || chatV2OwnsPane) return;
     if (autoResumedPtys.has(ptyId)) return;
     const line = planAutoResume({
-      enabled: claudeResumeOnStart,
+      enabled: useStore.getState().claudeResumeOnStart,
       agent: resumeHint,
       binding: resumeBinding,
       paneCwds: autoResumeCwds,
@@ -667,7 +668,7 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
     }, 400);
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeSurfacePtyId, resumePtyReady, resumeHint, resumeBinding, supervision, chatV2OwnsPane, claudeResumeOnStart]);
+  }, [activeSurfacePtyId, resumePtyReady, resumeHint, resumeBinding, supervision, chatV2OwnsPane]);
   // The persistent resume chip's "is this pane's agent busy?" gate — and the
   // store-wide `agentClockMs` decay-clock subscription it needs — lives in the
   // <ResumeInfoChipGate> leaf below, NOT here: Pane mounts that leaf only when a

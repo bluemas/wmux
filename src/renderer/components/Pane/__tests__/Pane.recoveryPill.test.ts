@@ -309,12 +309,15 @@ describe('planAutoResume — the opt-in setting (#1826)', () => {
       .toBeNull();
   });
 
-  it('the Pane effect feeds the store setting into planAutoResume and re-checks it before writing', () => {
+  it('the Pane effect reads the setting at decision time and re-checks it before writing', () => {
     // No Pane mount harness exists; pin the wiring so the only pty.write path
     // of this feature cannot bypass the setting.
     const source = readFileSync(resolve(__dirname, '../Pane.tsx'), 'utf8');
-    expect(source).toMatch(/const claudeResumeOnStart = useStore\(\(s\) => s\.claudeResumeOnStart\);/);
-    expect(source).toMatch(/planAutoResume\(\{\s*enabled: claudeResumeOnStart,/);
+    expect(source).toMatch(/planAutoResume\(\{\s*enabled: useStore\.getState\(\)\.claudeResumeOnStart,/);
+    // Not a subscription: flipping the switch on must not type into panes
+    // that already show the pill.
+    expect(source).not.toMatch(/useStore\(\(s\) => s\.claudeResumeOnStart\)/);
+    expect(source).toMatch(/\[activeSurfacePtyId, resumePtyReady, resumeHint, resumeBinding, supervision, chatV2OwnsPane\]\);/);
     expect(source).toMatch(/if \(!useStore\.getState\(\)\.claudeResumeOnStart\) return;[^\n]*\n\s*if \(useStore\.getState\(\)\.resumeHintByPtyId/);
   });
 });
