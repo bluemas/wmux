@@ -2080,6 +2080,8 @@ export const pl = {
   'settings.sc.changeKey': 'Kliknij, aby zmienić klawisz',
   'settings.sc.reset': 'Resetuj',
   'settings.sc.resetAll': 'Resetuj wszystkie skróty',
+  'settings.sc.searchPlaceholder': 'Szukaj skrótów',
+  'settings.sc.noMatches': 'Brak skrótów pasujących do „{query}”.',
   'settings.sc.resetAllConfirm': 'Przywrócić domyślne klawisze wszystkich skrótów?',
   'settings.sc.pressNewKey': 'Naciśnij nowy skrót dla „{name}”',
   'settings.sc.conflict': 'Już używany przez „{name}”',

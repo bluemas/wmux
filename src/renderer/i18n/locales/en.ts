@@ -2103,6 +2103,8 @@ export const en = {
   'settings.sc.changeKey': 'Click to change the key',
   'settings.sc.reset': 'Reset',
   'settings.sc.resetAll': 'Reset all shortcuts',
+  'settings.sc.searchPlaceholder': 'Search shortcuts',
+  'settings.sc.noMatches': 'No shortcuts match “{query}”.',
   'settings.sc.resetAllConfirm': 'Put every shortcut back on its default key?',
   'settings.sc.pressNewKey': 'Press the new shortcut for “{name}”',
   'settings.sc.conflict': 'Already used by “{name}”',

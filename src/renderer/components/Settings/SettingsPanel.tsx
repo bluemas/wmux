@@ -4376,6 +4376,8 @@ export function TabShortcuts() {
   // #1455 — the built-in being moved to a new key, and why the last change
   // to a row was refused.
   const [rebinding, setRebinding] = useState<ShortcutActionId | null>(null);
+  // Filter for the shortcut list: matches the action's name or its key combo.
+  const [shortcutQuery, setShortcutQuery] = useState('');
   const [shortcutNote, setShortcutNote] = useState<{ action: ShortcutActionId; text: string } | null>(null);
 
   const platform: NodeJS.Platform = window.electronAPI?.platform === 'darwin'
@@ -4429,6 +4431,19 @@ export function TabShortcuts() {
 
   const hasOverrides = Object.keys(shortcutOverrides).length > 0;
 
+  // Case-insensitive; spaces and '+' are ignored so "ctrl n", "ctrl+n" and
+  // "ctrln" all find Ctrl+N.
+  const squash = (text: string) => text.toLowerCase().replace(/[\s+]/g, '');
+  const shortcutNeedle = squash(shortcutQuery);
+  const matchesShortcut = (description: string, keys: string) =>
+    !shortcutNeedle || squash(description).includes(shortcutNeedle) || squash(keys).includes(shortcutNeedle);
+  const visibleShortcuts = ADVERTISED_SHORTCUTS.filter((entry) => {
+    const override = shortcutOverrides[entry.action];
+    const combo = typeof override === 'string' ? override : concreteCombo(entry, platform);
+    return matchesShortcut(describe(entry.action), displayCombo(combo, platform));
+  });
+  const prefixRowVisible = matchesShortcut(t('settings.prefixMode'), prefixKeyDisplay);
+
   return (
     <div className="settings-page">
       <QuickLaunchSection
@@ -4451,9 +4466,22 @@ export function TabShortcuts() {
           </Button>
         ) : undefined}
       >
+        <Input
+          type="search"
+          value={shortcutQuery}
+          onChange={(e) => setShortcutQuery(e.target.value)}
+          placeholder={t('settings.sc.searchPlaceholder')}
+          aria-label={t('settings.sc.searchPlaceholder')}
+          data-testid="shortcut-search"
+        />
+        {shortcutNeedle && !prefixRowVisible && visibleShortcuts.length === 0 && (
+          <p className="settings-nav-count" aria-live="polite">
+            {t('settings.sc.noMatches', { query: shortcutQuery.trim() })}
+          </p>
+        )}
         {/* The prefix row keeps its own config below — no toggle. */}
-        <KbdRow keys={prefixKeyDisplay} description={t('settings.prefixMode')} />
-        {ADVERTISED_SHORTCUTS.map((entry) => {
+        {prefixRowVisible && <KbdRow keys={prefixKeyDisplay} description={t('settings.prefixMode')} />}
+        {visibleShortcuts.map((entry) => {
           const override = shortcutOverrides[entry.action];
           const disabled = override === null;
           const combo = typeof override === 'string' ? override : concreteCombo(entry, platform);

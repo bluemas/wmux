@@ -599,6 +599,8 @@ export const zh = {
   'settings.sc.changeKey': '点击更改按键',
   'settings.sc.reset': '重置',
   'settings.sc.resetAll': '重置所有快捷键',
+  'settings.sc.searchPlaceholder': '搜索快捷键',
+  'settings.sc.noMatches': '没有与“{query}”匹配的快捷键。',
   'settings.sc.resetAllConfirm': '将所有快捷键恢复为默认按键？',
   'settings.sc.pressNewKey': '按下“{name}”的新快捷键',
   'settings.sc.conflict': '已被“{name}”使用',

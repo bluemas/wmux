@@ -1551,6 +1551,8 @@ export const ko = {
   'settings.sc.changeKey': '클릭해서 키 변경',
   'settings.sc.reset': '초기화',
   'settings.sc.resetAll': '모든 단축키 초기화',
+  'settings.sc.searchPlaceholder': '단축키 검색',
+  'settings.sc.noMatches': '“{query}”와 일치하는 단축키가 없습니다.',
   'settings.sc.resetAllConfirm': '모든 단축키를 기본 키로 되돌릴까요?',
   'settings.sc.pressNewKey': '“{name}”에 쓸 새 단축키를 누르세요',
   'settings.sc.conflict': '이미 “{name}”에서 사용 중',
