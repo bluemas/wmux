@@ -5,7 +5,7 @@ describe('RingBuffer geometry log', () => {
   it('has no geometry until a size is recorded', () => {
     const ring = new RingBuffer(64);
     ring.write(Buffer.from('abc'));
-    expect(ring.readAllWithGeometry()).toEqual({ data: Buffer.from('abc'), geometry: undefined });
+    expect(ring.readAllWithGeometry()).toEqual({ data: Buffer.from('abc'), geometry: undefined, writtenAt: 3 });
   });
 
   it('reports size changes as offsets into the readAll copy', () => {
