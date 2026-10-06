@@ -69,6 +69,7 @@ import {
 import { parseDecisionAnswerBody } from './decisionAnswer';
 import { askOtherMaxWidth } from '../approvals/askPicker';
 import { decisionForChoiceLabel } from '../approvals/terminalPromptParse';
+import { TERMINAL_PROMPT_MIN_ANSWER_AGE_MS } from '../approvals/ApprovalRegistry';
 // Type only — the projector's implementation (transcript parsing, watch state,
 // fs watching) stays out of this module. The web server is a STATELESS consumer
 // of its `delta()` for the phone turn view (#782); it must never `subscribe()`.
@@ -93,6 +94,7 @@ import {
   type SkillCatalogEntry,
 } from '../../main/deck/skillCatalogScan';
 import { ENV_KEYS, isBrainPty } from '../../shared/constants';
+import { resolveMoaPane, type MoaPaneFact } from './moaPane';
 import {
   DEVICE_KIND_HEADER,
   normalizeDeviceKind,
@@ -698,6 +700,20 @@ interface WebTerminalServerDeps {
    */
   auditSentFile?: (entry: { deviceId: string; sessionId: string; file: string; bytes: number }) => void;
   /**
+   * The Moa (HQ brain) pane main last pushed (`daemon.moa.set`), or null: Moa
+   * off, no HQ, HQ missing, no brain TUI, or no main connected. Read on every
+   * check; `moaSession` re-validates it against the live session.
+   */
+  moaPane?: () => MoaPaneFact | null;
+  /** Records one phone send to the Moa pane (the device audit log). */
+  auditMoaSend?: (entry: { deviceId: string; sessionId: string; route: 'chat' | 'input' }) => void;
+  /**
+   * #1772 — an answer or decline to the Moa pane's `terminal_prompt` was
+   * refused as `prompt-changed`: the daemon looks at the screen once, so a
+   * dialog declined in the terminal (Esc sends no hook) loses its card.
+   */
+  moaPromptRefused?: (sessionId: string) => void;
+  /**
    * Overrides for the upload bounds. Test seam only — production takes the
    * module constants, and there is no operator surface for these. Filling a
    * quota honestly is the only way to test the refusal, and 200 MB of temp
@@ -978,6 +994,8 @@ const CHAT_CANCEL_MAX_BODY_BYTES = 4 * 1024;
 const CHAT_DELIVERY_SKEW_MS = 5_000;
 /** Same 1 Hz floor as the nudge: a blocked badge must be right, not instant. */
 const CHAT_BLOCKED_COALESCE_MS = 1000;
+/** Moa card ids remembered until they settle (see `moaCardIds`). */
+const MOA_CARD_IDS_MAX = 32;
 /**
  * N7 — a bridge watch outlives its last reader by at most this long: four of
  * the client's 30 s stale windows (contract §5.5). A visible chat reads every
@@ -1332,6 +1350,13 @@ export class WebTerminalServer {
   private chatV2PushOff: (() => void) | null = null;
   /** Per-pane coalescing timers for the non-recording liveness event. */
   private readonly livenessTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /**
+   * #1772 — approval ids published as Moa cards, until they settle. Moa can
+   * be switched off (or the HQ change) before a card settles, and the phone
+   * that was shown it must still hear it close. Bounded: a pane holds one
+   * pending prompt at a time, so a handful is all this ever holds.
+   */
+  private readonly moaCardIds = new Set<string>();
   /**
    * N3 — the last read-time `chat.blocked` value per pane, as a comparable
    * key ('' = not blocked). Only transitions become live events; the value
@@ -1888,6 +1913,7 @@ export class WebTerminalServer {
     for (const timer of this.chatBlockedTimers.values()) clearTimeout(timer);
     this.chatBlockedTimers.clear();
     this.chatBlockedState.clear();
+    this.moaCardIds.clear();
     // A restarted server asks the desktop afresh rather than serving a
     // snapshot (or a remembered miss) from before the stop, and a refresh
     // still in flight from before it lands in a dead generation.
@@ -2453,6 +2479,11 @@ export class WebTerminalServer {
       // through the same helper, at request time. The getter is always wired,
       // so testing it for `undefined` advertised routes that answered 503.
       const desktopAvailable = this.availableDesktop() !== null;
+      // `moa` comes from the desktop sidebar snapshot the list routes share:
+      // immediate while one is cached, and on a cold start bounded by the same
+      // first-paint wait — this is the first call a phone makes, so a
+      // cache-only read would leave `moa` out of exactly the answer it keeps.
+      const sidebar = await this.desktopSidebar();
       return this.json(res, 200, {
         // THIS CALLER's effective grant, not the server flag. A phone paired
         // read-only asks the same question a phone paired with input does, and
@@ -2556,6 +2587,19 @@ export class WebTerminalServer {
         // that they are present now: each field is omitted while the desktop
         // is away. Omitted without a bridge, and by an older daemon.
         ...(this.deps.desktop ? { fleetSidebar: true } : {}),
+        // `/api/workspaces` can carry Moa's delegated jobs (`moaDelegations`).
+        // Same meaning as `fleetSidebar`: supported here, present only while
+        // a desktop new enough to compute it answers.
+        ...(this.deps.desktop ? { moaDelegations: true } : {}),
+        // Moa (the desktop's HQ main bot) is on and its HQ workspace exists.
+        // OMITTED, not false, otherwise — Moa off, no HQ, no desktop attached,
+        // or an older desktop or daemon: the phone reads all of them as "no Moa".
+        ...(sidebar?.moa === true ? { moa: true } : {}),
+        // The Moa pane's session id, for its turns, chat and input routes.
+        // Only beside `moa` and only while main vouches for a live HQ brain
+        // TUI (see moaSession): omitted with Moa off, the HQ missing or
+        // changed, or before the brain's first turn has started its TUI.
+        ...(sidebar?.moa === true ? this.moaSessionIdField() : {}),
         // Phone channel Inbox (§9): the four `/api/channels*` routes answer
         // here. OMITTED, not false, exactly when they would answer 503
         // `channels-unavailable` — the shape a pre-channels daemon serves.
@@ -3078,7 +3122,7 @@ export class WebTerminalServer {
     // NUL-delimited: a path may contain anything a filename may contain, and
     // concatenating without a separator lets two different (path, size) pairs
     // collide into one key.
-    const key = `${transcriptPath} ${stat.size} ${stat.mtimeMs}`;
+    const key = `${transcriptPath}\u0000${stat.size}\u0000${stat.mtimeMs}`;
     const cached = this.lastAssistantCache.get(sessionId);
     if (cached?.key === key) {
       return cached.text === null ? {} : { lastAssistantText: cached.text };
@@ -3225,8 +3269,9 @@ export class WebTerminalServer {
             ...sidebarWorkspaceFields(extra, nesting.nested.get(w.id), nesting.summaries.get(w.id), nesting.placement.get(w.id)),
             // The tree may name only this row's own sessions (see phoneWorkspaceLayout).
             ...(extra.layout ? { layout: phoneWorkspaceLayout(extra.layout, w.panes.map((pane) => pane.sessionId)) } : {}),
+            ...hqRole(sidebar, w.id),
           }
-        : { ...w, panes };
+        : { ...w, panes, ...hqRole(sidebar, w.id) };
     });
     // Only an id this reply lists, so the active workspace cannot name one the
     // phone is not allowed to see (a brain-only workspace, for one).
@@ -3234,6 +3279,9 @@ export class WebTerminalServer {
     return this.json(res, 200, {
       workspaces: merged,
       ...(active && byId.has(active) ? { activeWorkspaceId: active } : {}),
+      // Not limited to the listed rows: a finished job's workspace is often
+      // closed by then, and its id names nothing the phone may not see.
+      ...(sidebar.moaDelegations !== undefined ? { moaDelegations: sidebar.moaDelegations } : {}),
     });
   }
 
@@ -3251,7 +3299,9 @@ export class WebTerminalServer {
     return this.json(res, 200, {
       sessions: sessions.map((s) => {
         const pane = labels.get(s.id);
-        if (!pane) return s;
+        // By the daemon's own record of the session's workspace, label or not.
+        const role = hqRole(sidebar, s.workspaceId);
+        if (!pane) return { ...s, ...role };
         return {
           ...s,
           // Same rule as /api/workspaces: a pane id only where the desktop and
@@ -3259,6 +3309,7 @@ export class WebTerminalServer {
           ...(pane.paneId !== undefined && pane.workspaceId === s.workspaceId ? { paneId: pane.paneId } : {}),
           ...(pane.surfaceTitle !== undefined ? { surfaceTitle: pane.surfaceTitle } : {}),
           ...(pane.paneName !== undefined ? { paneName: pane.paneName } : {}),
+          ...role,
         };
       }),
     });
@@ -3682,8 +3733,15 @@ export class WebTerminalServer {
         if (command === 'workspaces.list' && result && typeof result === 'object') {
           const rows = (result as {workspaces?: unknown}).workspaces;
           if (!Array.isArray(rows)) throw new Error('invalid workspaces');
+          // The HQ id rides in the sidebar projection; the projection itself
+          // is not part of this reply.
+          const sidebar = parsePhoneSidebarSnapshot((result as {sidebar?: unknown}).sidebar);
           result = {workspaces: rows.map(row => ({id:row.id,name:row.name,
-            sessionId: typeof row.sessionId === 'string' && this.attachableSession(principal,row.sessionId) ? row.sessionId : null}))};
+            sessionId: typeof row.sessionId === 'string' && this.attachableSession(principal,row.sessionId) ? row.sessionId : null,
+            // Additive settle state (visibility only, desktop-owned).
+            ...(row.settled === true ? {settled:true} : {}),
+            ...(typeof row.snoozedUntil === 'number' && Number.isFinite(row.snoozedUntil) ? {snoozedUntil:row.snoozedUntil} : {}),
+            ...hqRole(sidebar,row.id)}))};
         }
         this.json(res,200,result,{'Cache-Control':'no-store'});
       }).catch(() => this.json(res,503,{error:'workspace-request-unconfirmed'}));
@@ -4032,13 +4090,16 @@ export class WebTerminalServer {
   private handleSessionCommands(res: http.ServerResponse, rawId: string, url: URL, principal: WebPrincipal): void {
     const id = decodePathSegment(rawId);
     if (id === null) return this.json(res, 404, { error: 'session not found' });
-    const managed = this.attachableSession(principal, id);
-    if (!managed) return this.json(res, 404, { error: 'session not found' });
     const agent = url.searchParams.get('agent');
+    // The composer's skill list is part of the Moa pane's chat; the legacy
+    // command list (a directory read) is not.
+    const managed = this.attachableSession(principal, id) ?? (agent !== null ? this.moaSession(id) : undefined);
+    if (!managed) return this.json(res, 404, { error: 'session not found' });
     if (agent !== null) {
       // Same pane rule as the other chat routes: the brain pane is nobody's
-      // chat, whatever the credential. The legacy list keeps its old rule.
-      if (!this.readableSession(id)) return this.json(res, 404, { error: 'session not found' });
+      // chat, whatever the credential, the Moa pane aside. The legacy list
+      // keeps its old rule.
+      if (!this.conversableSession(id)) return this.json(res, 404, { error: 'session not found' });
       void this.handleChatSkills(res, id, agent).catch((err: unknown) => this.failRequest(res, err));
       return;
     }
@@ -4139,7 +4200,7 @@ export class WebTerminalServer {
     // routes: a phone that fetched a pane id the daemon no longer owns learns the
     // pane is gone, not that its conversation is unavailable. A brain pty answers
     // the same way — see readableSession.
-    if (!this.readableSession(sessionId)) {
+    if (!this.conversableSession(sessionId)) {
       this.json(res, 404, { error: 'session not found' });
       return;
     }
@@ -4239,14 +4300,24 @@ export class WebTerminalServer {
     const rawCursor = url.searchParams.get('cursor');
     const carried = !!rawCursor;
     const cursor = decodeChatCursor(rawCursor);
+    // Admitted as the Moa pane: Moa can be switched off (or the HQ change)
+    // during either await below, and the page must not go out after that.
+    const viaMoa = !this.readableSession(sessionId);
+    const moaWithdrawn = (): boolean => {
+      if (!viaMoa || this.moaSession(sessionId)) return false;
+      this.json(res, 404, { error: 'session not found' });
+      return true;
+    };
 
     const resolution = await chat.resolve(sessionId);
+    if (moaWithdrawn()) return;
     // The page is read before the blocked await (a screen render): a binding
     // that moved meanwhile must not have its rows served under this identity.
     const body = this.readChatTurnsPage(res, sessionId, principal, chat, resolution, dir, carried, cursor);
     if (!body) return;
     const blocked = await this.readChatBlocked(chat, sessionId, resolution);
     if (res.destroyed || res.writableEnded) return;
+    if (moaWithdrawn()) return;
     this.noteChatBlocked(sessionId, resolution.status.terminal?.agent, blocked);
     const caps = clientCaps(req);
     // A file binding's episode is daemon-tracked; an OpenCode one comes from
@@ -4257,8 +4328,13 @@ export class WebTerminalServer {
     const owner = chatOwner(principal);
     const queue = caps.chatQueue === true && chat.queueEnabled?.() === true ? chat.queue?.(owner, sessionId) ?? [] : undefined;
     const events = queue !== undefined ? this.tagDeliveredRows(chat, sessionId, owner, body.events) : body.events;
+    // Only a terminal binding whose agent is not alive can be resumable; skip the lookup otherwise.
+    const resumable = resolution.source === 'file' && resolution.status.agentAlive !== true
+      ? await chat.resumable?.(sessionId).catch(() => false) ?? false : false;
+    if (res.destroyed || res.writableEnded) return;
+    if (moaWithdrawn()) return;
     this.json(res, 200, { ...body, ...(events !== undefined ? { events } : {}), chat: buildChatObject(resolution, projectChatBlocked(blocked, caps),
-      { ...(turn ? { turn } : {}), chatCancel: caps.chatCancel === true, ...(queue ? { queue } : {}),
+      { ...(turn ? { turn } : {}), resumable, chatCancel: caps.chatCancel === true, ...(queue ? { queue } : {}),
         accountStatus: this.opts?.allowTranscript === true && process.platform !== 'win32' &&
           this.deps.codexAccountStatus?.accountHome(sessionId) !== undefined }) });
   }
@@ -4471,9 +4547,25 @@ export class WebTerminalServer {
    * itself, so a missed badge costs a refused send, not a wrong one.
    */
   private async readChatBlocked(chat: ChatBridge, sessionId: string, resolution: ChatResolution): Promise<ChatBlocked | undefined> {
-    // Producer-side brain gate (#1397/#1402): computed for no brain pane,
-    // whichever path asks.
-    if (this.isBrainApproval(sessionId)) return undefined;
+    // The Moa pane's permission dialog: the bridge computes nothing for a
+    // brain pane, so its record (#1772) is read here, shaped like any other
+    // pane's — a capable caller sees `{by:'approval', approvalId}`. Main's
+    // dialog flag alone, with no record yet, is the bare terminal block.
+    if (this.moaSession(sessionId)) {
+      const pending = this.deps.approvals?.list().pending
+        .find((r) => r.sessionId === sessionId && r.kind === 'terminal_prompt' && !isNativeDecision(r));
+      if (pending) {
+        this.rememberMoaCard(pending.id);
+        // Never answerable here: this also feeds the chat.blocked broadcast
+        // every device hears, and a device never presses a Moa-pane record
+        // (#1786); the desktop answers through its own RPC.
+        return { by: 'terminal', terminalPrompt: { approvalId: pending.id, answerable: false } };
+      }
+      if (this.moaDialogUp(sessionId)) return { by: 'terminal' };
+    }
+    // Producer-side brain gate (#1397/#1402): computed for no brain pane but
+    // the Moa pane, whichever path asks.
+    if (this.isBrainApproval(sessionId) && !this.moaSession(sessionId)) return undefined;
     try {
       return await chat.blocked(sessionId, resolution);
     } catch (err) {
@@ -4488,7 +4580,7 @@ export class WebTerminalServer {
    * without an event: whoever made it just read the value in `/turns`.
    */
   private noteChatBlocked(sessionId: string, agent: string | undefined, blocked: ChatBlocked | undefined): void {
-    if (this.isBrainApproval(sessionId)) return;
+    if (this.isBrainApproval(sessionId) && !this.moaSession(sessionId)) return;
     // Two views of one state: a capable client may see a `terminal_prompt` as
     // an approval, an older one sees the terminal. A transition in either view
     // is an event; each watcher gets its own view.
@@ -4516,6 +4608,29 @@ export class WebTerminalServer {
     const legacy = bodyOf(views.legacy);
     const capable = bodyOf(views.capable);
     this.deliverChatEvent(sessionId, (caps) => (caps.terminalPromptAnswer ? capable : legacy));
+  }
+
+  /** #1772 — a card a phone was shown as the Moa pane's (see `moaCardIds`). */
+  private rememberMoaCard(id: string): void {
+    if (this.moaCardIds.has(id)) return;
+    this.moaCardIds.add(id);
+    while (this.moaCardIds.size > MOA_CARD_IDS_MAX) {
+      const oldest = this.moaCardIds.values().next();
+      if (oldest.done) break;
+      this.moaCardIds.delete(oldest.value);
+    }
+  }
+
+  /**
+   * #1772 — a Moa card settled after Moa was switched off: the recompute no
+   * longer runs for the pane (it is a brain pane like any other now), so a
+   * watcher that was told it is blocked hears `chat.unblocked` from here, once.
+   */
+  private releaseMoaChatBlocked(sessionId: string): void {
+    if (!this.chatBlockedState.get(sessionId)) return;
+    this.chatBlockedState.delete(sessionId);
+    const body = JSON.stringify({ sessionId, at: this.now() });
+    this.deliverChatEvent(sessionId, () => ({ event: 'chat.unblocked', body }));
   }
 
   /**
@@ -4562,7 +4677,7 @@ export class WebTerminalServer {
    */
   private scheduleChatBlockedCheck(sessionId: string): void {
     if (this.opts?.allowTranscript !== true || this.chatBlockedTimers.has(sessionId)) return;
-    if (this.isBrainApproval(sessionId) || !this.readableSession(sessionId)) return;
+    if (!this.conversableSession(sessionId)) return;
     if ((!(this.deps.chat?.() ?? null) && !this.chatV2For(sessionId)) || !this.hasLiveChatWatcher(sessionId)) return;
     const timer = setTimeout(() => {
       this.chatBlockedTimers.delete(sessionId);
@@ -4576,7 +4691,7 @@ export class WebTerminalServer {
 
   private async recomputeChatBlocked(sessionId: string): Promise<void> {
     if (this.opts?.allowTranscript !== true) return;
-    if (!this.readableSession(sessionId)) {
+    if (!this.conversableSession(sessionId)) {
       this.chatBlockedState.delete(sessionId);
       return;
     }
@@ -4659,6 +4774,11 @@ export class WebTerminalServer {
           }
         : {}),
       chatSkills: true,
+      // Launch body capabilities: `prompt` may be omitted, and `resume: true` is accepted.
+      chatLaunchBare: true,
+      chatLaunchResume: true,
+      // `resume: true` also continues a pane's own binding once its agent exited (`chat.resumable`).
+      chatResumeBound: true,
       chatVersion: 1,
     };
   }
@@ -4674,9 +4794,9 @@ export class WebTerminalServer {
    * §3.3 steps 3–5, after the body: the credential that sent the headers must
    * still be the same caller, still hold input, and the pane must still be the
    * SAME incarnation. Answers the request itself and returns null on refusal.
-   * Every chat route resolves its pane with `readableSession`, whatever the
-   * principal: `/turns` 404s a brain pane for the operator too, so a chat
-   * write or receipt must not reach one either.
+   * Every chat route resolves its pane with `conversableSession`, whatever
+   * the principal: `/turns` 404s a brain pane for the operator too (the Moa
+   * pane aside), so a chat write or receipt must not reach one either.
    */
   private async reauthorizeChatWrite(
     req: http.IncomingMessage,
@@ -4696,7 +4816,7 @@ export class WebTerminalServer {
       this.refuseInput(res, fresh.principal, 'Input permission changed');
       return null;
     }
-    if (this.readableSession(id) !== pane || pane.meta.incarnationId !== incarnation) {
+    if (this.conversableSession(id) !== pane || pane.meta.incarnationId !== incarnation) {
       this.json(res, 409, { error: 'pane-incarnation-changed' });
       return null;
     }
@@ -4720,15 +4840,39 @@ export class WebTerminalServer {
     pane: ManagedSession,
     incarnation: string | undefined,
     extra?: () => boolean,
+    kind: MoaWriteKind = 'send',
   ): (stage?: 'first-write' | 'submit') => Promise<boolean> {
     return async (stage) => {
       if (stage !== 'submit' && (res.destroyed || res.writableEnded)) return false;
       if (this.opts?.allowTranscript !== true) return false;
       if (extra && !extra()) return false;
       const now = await this.authenticate(req, url, false).catch(() => ({ ok: false as const }));
-      return now.ok && sameCaller(principal, now.principal) && this.mayInput(now.principal) &&
-        this.readableSession(id) === pane && pane.meta.incarnationId === incarnation;
+      const ok = now.ok && sameCaller(principal, now.principal) && this.mayInput(now.principal) &&
+        this.conversableSession(id) === pane && pane.meta.incarnationId === incarnation;
+      return this.moaWriteCleared(ok, principal, id, pane, stage, kind);
     };
+  }
+
+  /**
+   * The Moa pane's part of a chat write check, after the caller's own: a send
+   * is refused while Moa's permission dialog is up (Enter would answer it; a
+   * cancel is ESC, which only declines it), and a cleared write to the Moa
+   * pane is audited at its write boundary — a send at `submit`, after its text
+   * is in the composer and nothing but Enter follows; a cancel at
+   * `first-write`, immediately before the ESC. A queue drain's pre-check and a
+   * write refused before anything was typed log nothing.
+   */
+  private moaWriteCleared(
+    ok: boolean, principal: WebPrincipal, id: string, pane: ManagedSession,
+    stage: 'first-write' | 'submit' | undefined, kind: MoaWriteKind,
+  ): boolean {
+    if (!ok || this.readableSession(id) === pane) return ok;
+    // Captured with the check, so a withdrawal after it cannot drop the line.
+    const viaMoa = this.moaSession(id) === pane;
+    if (!viaMoa) return false;
+    if (kind === 'send' && this.moaDialogUp(id)) return false;
+    if (stage === (kind === 'send' ? 'submit' : 'first-write')) this.auditMoaSend(principal, id, 'chat');
+    return true;
   }
 
   /**
@@ -4745,14 +4889,15 @@ export class WebTerminalServer {
     incarnation: string | undefined,
   ): (stage?: 'first-write' | 'submit') => Promise<boolean> {
     const opts = this.opts;
-    return async () => {
+    return async (stage) => {
       if (!this.server || !opts || this.opts !== opts || opts.allowTranscript !== true || opts.allowInput !== true) return false;
       if (principal.kind === 'device') {
         let row: WebDeviceSummary | undefined;
         try { row = this.deps.devices?.list?.().find((d) => d.deviceId === principal.deviceId); } catch { return false; }
         if (!row || row.revokedAt !== undefined || !row.allowInput) return false;
       }
-      return this.readableSession(id) === pane && pane.meta.incarnationId === incarnation;
+      const ok = this.conversableSession(id) === pane && pane.meta.incarnationId === incarnation;
+      return this.moaWriteCleared(ok, principal, id, pane, stage, 'send');
     };
   }
 
@@ -4767,7 +4912,7 @@ export class WebTerminalServer {
     if (refusal === 'transcript') return this.refuseTranscript(res);
     if (refusal === 'input') return this.refuseInput(res, principal, 'Canceling a queued message changes what is typed into this pane');
     const id = decodePathSegment(rawId);
-    if (id === null || !this.readableSession(id)) return this.json(res, 404, { error: 'pane-not-found' });
+    if (id === null || !this.conversableSession(id)) return this.json(res, 404, { error: 'pane-not-found' });
     const chat = this.deps.chat?.() ?? null;
     if (!chat?.dequeue) return this.json(res, 503, { error: 'chat-unavailable' });
     const clientMessageId = decodePathSegment(rawMessageId) ?? '';
@@ -4792,7 +4937,7 @@ export class WebTerminalServer {
     if (refusal === 'transcript') return this.refuseTranscript(res);
     if (refusal === 'input') return this.refuseInput(res, principal, 'Sending to a chat types into this pane');
     const id = decodePathSegment(rawId);
-    const pane = id === null ? undefined : this.readableSession(id);
+    const pane = id === null ? undefined : this.conversableSession(id);
     if (!pane || id === null) return this.json(res, 404, { error: 'session not found' });
     const chat = this.deps.chat?.() ?? null;
     if (!chat && !this.chatV2For(id)) return this.json(res, 503, { error: 'chat-unavailable' });
@@ -4818,6 +4963,12 @@ export class WebTerminalServer {
           return this.json(res, refused.status, refused.body);
         }
         if (!chat) return this.json(res, 503, { error: 'chat-unavailable' });
+        // Moa's own permission dialog is up: Enter would answer it, and its only
+        // answer path is the desktop. Same refusal as a dialog the screen shows.
+        if (this.moaDialogUp(id)) {
+          const blocked = sendResponse({ clientMessageId, replayed: false, result: 'blocked', effect: 'none', error: 'chat-blocked', blockedBy: 'terminal' }, clientMessageId);
+          return this.json(res, blocked.status, blocked.body);
+        }
         let outcome;
         try {
           // The cap on THIS request opts it into the daemon queue.
@@ -4861,7 +5012,7 @@ export class WebTerminalServer {
     if (refusal === 'transcript') return this.refuseTranscript(res);
     if (refusal === 'input') return this.refuseInput(res, principal, 'Stopping a turn types into this pane');
     const id = decodePathSegment(rawId);
-    const pane = id === null ? undefined : this.readableSession(id);
+    const pane = id === null ? undefined : this.conversableSession(id);
     if (!pane || id === null) return this.json(res, 404, { error: 'pane-not-found' });
     const chat = this.deps.chat?.() ?? null;
     if (!chat && !this.chatV2For(id)) return this.json(res, 503, { error: 'chat-unavailable' });
@@ -4881,7 +5032,7 @@ export class WebTerminalServer {
           });
         }
         const { clientCancelId } = parsed.value;
-        const authorize = this.chatWriteAuthorizer(req, res, url, principal, id, pane, incarnation);
+        const authorize = this.chatWriteAuthorizer(req, res, url, principal, id, pane, incarnation, undefined, 'cancel');
         const v2 = this.chatV2For(id);
         if (v2) {
           const v2Outcome = await this.chatV2Cancels.cancel({
@@ -4928,7 +5079,7 @@ export class WebTerminalServer {
     res.setHeader('Cache-Control', 'no-store');
     if (this.opts?.allowTranscript !== true) return this.refuseTranscript(res);
     const id = decodePathSegment(rawId);
-    if (id === null || !this.readableSession(id)) return this.json(res, 404, { error: 'pane-not-found' });
+    if (id === null || !this.conversableSession(id)) return this.json(res, 404, { error: 'pane-not-found' });
     const clientCancelId = decodePathSegment(rawCancelId) ?? '';
     const v2Progress = this.chatV2Cancels.progress(chatOwner(principal), id, clientCancelId);
     if (v2Progress) return this.json(res, 200, { clientCancelId, ...v2Progress });
@@ -4946,7 +5097,7 @@ export class WebTerminalServer {
     res.setHeader('Cache-Control', 'no-store');
     if (this.opts?.allowTranscript !== true) return this.refuseTranscript(res);
     const id = decodePathSegment(rawId);
-    if (id === null || !this.readableSession(id)) return this.json(res, 404, { error: 'session not found' });
+    if (id === null || !this.conversableSession(id)) return this.json(res, 404, { error: 'session not found' });
     const chat = this.deps.chat?.() ?? null;
     if (!chat) return this.json(res, 503, { error: 'chat-unavailable' });
     const clientMessageId = decodePathSegment(rawMessageId) ?? '';
@@ -5002,7 +5153,7 @@ export class WebTerminalServer {
             ...(parsed.clientLaunchId !== undefined ? { clientLaunchId: parsed.clientLaunchId } : {}),
           });
         }
-        const { agent, mode, prompt, clientLaunchId } = parsed.value;
+        const { agent, mode, prompt, resume, clientLaunchId } = parsed.value;
         const age = checkChatId(clientLaunchId, this.now(), CHAT_LAUNCH_RETENTION_MS);
         if (age === 'invalid') {
           return this.json(res, 400, {
@@ -5046,7 +5197,7 @@ export class WebTerminalServer {
           return this.json(res, 428, { error: 'dangerous-mode-unconfirmed', effect: 'none', clientLaunchId });
         }
 
-        const fingerprint = JSON.stringify([id, incarnation ?? null, agent, mode, prompt]);
+        const fingerprint = JSON.stringify([id, incarnation ?? null, agent, mode, prompt ?? null, resume]);
         const begun = this.chatLaunchReceipts.begin(owner, clientLaunchId, id, fingerprint, this.now());
         if (begun.kind === 'conflict') return this.json(res, 409, { error: 'launch-id-conflict', effect: 'none', clientLaunchId });
         if (begun.kind === 'pending') return this.json(res, 202, { state: 'pending', replayed: true, clientLaunchId });
@@ -5067,7 +5218,7 @@ export class WebTerminalServer {
         let wire: WireResponse;
         let effect: 'none' | 'uncertain' | 'submitted';
         try {
-          const outcome = await chat.launch({ id, agent, prompt, mode, refuseConversation: true, authorized });
+          const outcome = await chat.launch({ id, agent, ...(prompt !== undefined ? { prompt } : {}), resume, mode, refuseConversation: true, authorized });
           wire = claimedByChatV2 && !outcome.ok ? chatV2LaunchResponse(clientLaunchId) : launchResponse(outcome, clientLaunchId);
           effect = outcome.ok ? 'submitted' : outcome.effect;
           if (outcome.ok) trace('submitted');
@@ -5173,6 +5324,56 @@ export class WebTerminalServer {
   }
 
   /**
+   * The Moa (HQ brain) pane, when `sessionId` names it and main still vouches
+   * for it: Moa on, its HQ present, and this live session that HQ's brain
+   * (see moaPane.ts). Undefined otherwise, including for every other brain.
+   *
+   * The ONE brain pane a paired device may reach, and only through the routes
+   * that resolve with `conversableSession` / `inputSession`: turns, chat and
+   * raw input. Every other per-pane route keeps `readableSession` /
+   * `attachableSession`, so stream, resize, delete, files, git, diff and the
+   * rest still 404 it. Re-read on every check, so the in-flight re-checks see
+   * a withdrawal the moment main pushes it.
+   */
+  private moaSession(sessionId: string): ManagedSession | undefined {
+    const fact = this.deps.moaPane?.() ?? null;
+    if (fact?.sessionId !== sessionId) return undefined;
+    return resolveMoaPane(fact, (id) => this.deps.sessionManager.getSession(id));
+  }
+
+  /** `{moaSessionId}` while the Moa pane resolves, else nothing. */
+  private moaSessionIdField(): { moaSessionId?: string } {
+    const sessionId = this.deps.moaPane?.()?.sessionId;
+    return sessionId !== undefined && this.moaSession(sessionId) ? { moaSessionId: sessionId } : {};
+  }
+
+  /** The Moa pane's own permission dialog is on screen (main's flag, see moaPane.ts). */
+  private moaDialogUp(sessionId: string): boolean {
+    return this.deps.moaPane?.()?.dialog !== undefined && !!this.moaSession(sessionId);
+  }
+
+  /** `readableSession`, plus the Moa pane: the turn and chat routes only. */
+  private conversableSession(sessionId: string): ManagedSession | undefined {
+    return this.readableSession(sessionId) ?? this.moaSession(sessionId);
+  }
+
+  /** `attachableSession`, plus the Moa pane: `POST /api/input` only. */
+  private inputSession(principal: WebPrincipal, sessionId: string): ManagedSession | undefined {
+    return this.attachableSession(principal, sessionId) ?? this.moaSession(sessionId);
+  }
+
+  /** One device-audit line for a phone send that reached the Moa pane. */
+  private auditMoaSend(principal: WebPrincipal, sessionId: string, route: 'chat' | 'input'): void {
+    // The caller decided the write went to the Moa pane, before the write.
+    if (principal.kind !== 'device') return;
+    try {
+      this.deps.auditMoaSend?.({ deviceId: principal.deviceId, sessionId, route });
+    } catch {
+      // Best-effort, like every other audit line.
+    }
+  }
+
+  /**
    * `GET /api/sessions/:id/turns/block?srcOffset=&n=&eventId=` — the body behind
    * a code-block or tool-body chip, the phone's half of what the desktop does
    * over `daemon.transcript.codeBlock`.
@@ -5198,7 +5399,7 @@ export class WebTerminalServer {
       });
       return;
     }
-    if (!this.readableSession(sessionId)) {
+    if (!this.conversableSession(sessionId)) {
       this.json(res, 404, { error: 'session not found' });
       return;
     }
@@ -6345,6 +6546,9 @@ export class WebTerminalServer {
    */
   private terminalPromptBlocksInput(sessionId: string, body: string): boolean {
     if (body === '\x1b' || body === '\x03') return false;
+    // The Moa pane's own permission dialog has no approval record, so typed
+    // keys could answer it; only cancelling it (ESC / ^C above) gets through.
+    if (this.moaDialogUp(sessionId)) return true;
     const approvals = this.deps.approvals;
     if (!approvals) return false;
     // A native decision is not a dialog typed keys can answer behind the
@@ -6365,8 +6569,9 @@ export class WebTerminalServer {
     }
     const sessionId = url.searchParams.get('session') ?? '';
     // Same class gate as the stream (#1388): a device must not be able to
-    // type into the orchestrator's pane either.
-    const managed = this.attachableSession(principal, sessionId);
+    // type into the orchestrator's pane either — except the Moa pane, while
+    // main vouches for it (see moaSession).
+    const managed = this.inputSession(principal, sessionId);
     if (!managed) {
       return this.json(res, 404, { error: 'session not found' });
     }
@@ -6404,9 +6609,12 @@ export class WebTerminalServer {
         const fresh = await this.authenticate(req, url, false);
         if (!fresh.ok) return this.json(res,401,{error:'authorization-expired'});
         if (!this.mayInput(fresh.principal)) return this.refuseInput(res,fresh.principal,'Input permission changed');
-        if (this.attachableSession(fresh.principal,sessionId) !== managed || managed.meta.incarnationId !== incarnation) {
+        if (this.inputSession(fresh.principal,sessionId) !== managed || managed.meta.incarnationId !== incarnation) {
           return this.json(res,409,{error:'pane-incarnation-changed'});
         }
+        // Decided with the check above, before the write, so the audit line
+        // cannot be lost to a withdrawal between the write and the log.
+        const viaMoa = this.attachableSession(fresh.principal,sessionId) !== managed;
         // Decided in the same synchronous run as the write, never earlier: the
         // dialog can appear while the body is on the wire.
         const promptActive = () => this.terminalPromptBlocksInput(sessionId, body);
@@ -6416,6 +6624,7 @@ export class WebTerminalServer {
           // must not be held behind a recovery mute nobody will lift.
           if (managed.deferred) this.deps.sessionManager.activateDeferred(sessionId);
           managed.ptyProcess.write(body);
+          if (viaMoa) this.auditMoaSend(fresh.principal, sessionId, 'input');
         // A phone can paste drafts containing newlines; bridge.noteInput keeps
         // bracketed-paste bodies inert and only re-arms on a submitted CR/LF.
           managed.bridge.noteInput?.(body);
@@ -6937,8 +7146,10 @@ export class WebTerminalServer {
     // to drop; it is here because the producer is one path and this route is
     // what a device actually reads. Same credential split as
     // `attachableSession`: the operator's own surfaces keep the full list.
+    // #1772 — the Moa pane's own prompt is the one brain record a device sees,
+    // while main vouches for the Moa pane (see deviceBarredApproval).
     const visible = (r: ApprovalRequest): boolean =>
-      principal.kind === 'operator' || !this.isBrainApproval(r.sessionId);
+      principal.kind === 'operator' || !this.deviceBarredApproval(r.sessionId);
     // A settled `terminal_prompt` is history only when a phone ANSWERED it
     // (`pressedAt`: approved or declined remotely), decided from the record
     // alone — whatever this caller is shown of it (an older client sees no
@@ -6959,9 +7170,14 @@ export class WebTerminalServer {
       const managed = this.deps.sessionManager.getSession(r.sessionId);
       return askOtherMaxWidth(managed?.ptyProcess.cols ?? managed?.meta.cols);
     };
+    // #1772 — a Moa card first seen here (raised before this server subscribed
+    // to the registry) must still hear its close once Moa is off.
+    for (const r of listed.pending) {
+      if (this.isBrainApproval(r.sessionId) && this.moaSession(r.sessionId)) this.rememberMoaCard(r.id);
+    }
     return this.json(res, 200, {
-      pending: listed.pending.filter(visible).map((r) => approvalWire(r, caps, otherMaxCells(r))),
-      recentlyResolved: listed.recentlyResolved.filter(visible).filter(answeredHere).map((r) => approvalWire(r, caps)),
+      pending: listed.pending.filter(visible).map((r) => approvalWire(this.deviceView(principal, r), caps, otherMaxCells(r))),
+      recentlyResolved: listed.recentlyResolved.filter(visible).filter(answeredHere).map((r) => approvalWire(this.deviceView(principal, r), caps)),
     });
   }
 
@@ -6978,6 +7194,51 @@ export class WebTerminalServer {
   private isBrainApproval(sessionId: string): boolean {
     const managed = this.deps.sessionManager.getSession(sessionId);
     return isBrainPty({ id: sessionId, env: managed?.meta.env });
+  }
+
+  /**
+   * May a DEVICE not see or answer this pane's approvals? Every brain pane's,
+   * except the Moa pane's while main vouches for it (#1772: its own
+   * permission prompt is a `terminal_prompt` record a phone may answer). The
+   * one check for the device list, every device route and their `authorize`
+   * re-checks, so Moa switched off mid-request refuses there too.
+   */
+  private deviceBarredApproval(sessionId: string): boolean {
+    return this.isBrainApproval(sessionId) && !this.moaSession(sessionId);
+  }
+
+  /**
+   * #1772 — the record as this caller may see it. A device never presses a
+   * Moa-pane record (devicePressBarred), so it gets the informational card
+   * only — no choices, fingerprint, question, reason or decision-v2 form,
+   * plan mode included — rather than buttons that always fail.
+   */
+  private deviceView(principal: WebPrincipal, r: ApprovalRequest): ApprovalRequest {
+    if (!this.devicePressBarred(principal, r)) return r;
+    const view: Partial<ApprovalRequest> = { ...r };
+    delete view.choices;
+    delete view.promptFingerprint;
+    delete view.question;
+    delete view.reason;
+    delete view.form;
+    delete view.formFingerprint;
+    return view as ApprovalRequest;
+  }
+
+  /** A device's `authorize` verdict on the record's pane, re-read at call time. */
+  private moaAuthorizeVerdict(principal: WebPrincipal, record: ApprovalRequest): 'ok' | 'expired' {
+    return principal.kind === 'device' && this.deviceBarredApproval(record.sessionId) ? 'expired' : 'ok';
+  }
+
+  /**
+   * #1772 — may this caller not PRESS the record (answer or decline it)? A
+   * device sees the Moa pane's own prompt but never presses it until the
+   * parser binds Moa's dialog shapes (#1786); the desktop's Moa chat answers
+   * it. Asked after `deviceBarredApproval`, so a brain record a device still
+   * reaches is the Moa pane's.
+   */
+  private devicePressBarred(principal: WebPrincipal, record: ApprovalRequest): boolean {
+    return principal.kind === 'device' && this.isBrainApproval(record.sessionId);
   }
 
   /**
@@ -7035,8 +7296,12 @@ export class WebTerminalServer {
     // same 404 as an unknown id, and BEFORE the gate check below: a 403 here
     // would confirm the record exists, which is half of what the exclusion is
     // for. The operator path is untouched.
-    if (record && principal.kind === 'device' && this.isBrainApproval(record.sessionId)) {
+    if (record && principal.kind === 'device' && this.deviceBarredApproval(record.sessionId)) {
       return this.json(res, 404, { error: 'not-found' });
+    }
+    // Moa's own prompt: the same 501 as a record nobody can answer remotely.
+    if (record && this.devicePressBarred(principal, record)) {
+      return this.json(res, 501, { error: 'answer-in-terminal', reason: 'unsupported-shape' });
     }
     // The agent's own terminal dialog is answerable only by a client that
     // declared it understands one. An older client (the shipped iOS app among
@@ -7122,7 +7387,7 @@ export class WebTerminalServer {
       const fresh = await this.authenticate(req, url, false).catch(() => ({ ok: false as const }));
       if (!fresh.ok || !sameCaller(fresh.principal)) return this.json(res, 401, { error: 'authorization-expired' });
       const current = approvals.list().pending.find((r) => r.id === id);
-      if (current && fresh.principal.kind === 'device' && this.isBrainApproval(current.sessionId)) {
+      if (current && fresh.principal.kind === 'device' && this.deviceBarredApproval(current.sessionId)) {
         return this.json(res, 404, { error: 'not-found' });
       }
       if (current && needsInputGrant(current) && !this.mayInput(fresh.principal)) {
@@ -7135,6 +7400,7 @@ export class WebTerminalServer {
       const authorize = async (record: ApprovalRequest): Promise<'ok' | 'expired' | 'read-only'> => {
         const now = await this.authenticate(req, url, false).catch(() => ({ ok: false as const }));
         if (!now.ok || !sameCaller(now.principal)) return 'expired';
+        if (this.moaAuthorizeVerdict(now.principal, record) === 'expired') return 'expired';
         if (needsInputGrant(record) && !this.mayInput(now.principal)) {
           return 'read-only';
         }
@@ -7157,6 +7423,7 @@ export class WebTerminalServer {
           authorize,
         })
         .then((result) => {
+          if (!result.ok && result.reason === 'prompt-changed' && current) this.deps.moaPromptRefused?.(current.sessionId);
           if (result.ok) {
             // 200 with `durable:false` rather than an error: the keystroke IS in
             // the terminal, so the answer landed and the caller must not retry.
@@ -7305,7 +7572,7 @@ export class WebTerminalServer {
     if (!record || record.kind !== 'terminal_prompt' || isNativeDecision(record)) {
       return this.json(res, 404, { error: 'not-found' });
     }
-    if (principal.kind === 'device' && this.isBrainApproval(record.sessionId)) {
+    if (principal.kind === 'device' && this.deviceBarredApproval(record.sessionId)) {
       return this.json(res, 404, { error: 'not-found' });
     }
     // `decision-v2` alone opens the plan dialog's detail (its record says `hasDetail`).
@@ -7353,7 +7620,7 @@ export class WebTerminalServer {
       return listed.pending.find((r) => r.id === id) ?? listed.recentlyResolved.find((r) => r.id === id);
     };
     const record = find();
-    if (!record || (principal.kind === 'device' && this.isBrainApproval(record.sessionId))) {
+    if (!record || (principal.kind === 'device' && this.deviceBarredApproval(record.sessionId))) {
       return this.json(res, 404, { error: 'not-found' });
     }
     // A native decision (a permission or a question) is declined by the
@@ -7390,13 +7657,24 @@ export class WebTerminalServer {
         const fresh = await this.authenticate(req, url, false).catch(() => ({ ok: false as const }));
         if (!fresh.ok || !sameCaller(fresh.principal)) return this.json(res, 401, { error: 'authorization-expired' });
         const current = find();
-        if (!current || (fresh.principal.kind === 'device' && this.isBrainApproval(current.sessionId))) {
+        if (!current || (fresh.principal.kind === 'device' && this.deviceBarredApproval(current.sessionId))) {
           return this.json(res, 404, { error: 'not-found' });
         }
         if (!this.mayInput(fresh.principal)) return this.refuseInput(res, fresh.principal, 'Input permission changed');
-        const authorize = async (): Promise<'ok' | 'expired' | 'read-only'> => {
+        // Moa's own prompt: no Esc from a device either. Refused with what the
+        // registry answers a card it cannot prove, in its order; nothing typed.
+        // A settled record goes on to the registry, which refuses it as such.
+        if (current.state === 'pending' && this.devicePressBarred(fresh.principal, current)) {
+          if (current.pressedAt !== undefined || current.step) return this.json(res, 409, { error: 'already-answered', effect: 'none' });
+          if (this.now() - current.createdAt < TERMINAL_PROMPT_MIN_ANSWER_AGE_MS) {
+            return this.json(res, 425, { error: 'answer-too-soon', effect: 'none' });
+          }
+          return this.json(res, 409, { error: 'prompt-unverified', effect: 'none' });
+        }
+        const authorize = async (r: ApprovalRequest): Promise<'ok' | 'expired' | 'read-only'> => {
           const now = await this.authenticate(req, url, false).catch(() => ({ ok: false as const }));
           if (!now.ok || !sameCaller(now.principal)) return 'expired';
+          if (this.moaAuthorizeVerdict(now.principal, r) === 'expired') return 'expired';
           return this.mayInput(now.principal) ? 'ok' : 'read-only';
         };
         const result = await approvals.resolve({
@@ -7408,6 +7686,7 @@ export class WebTerminalServer {
           terminalPromptDecline: TERMINAL_PROMPT_WEB_DECLINE,
           authorize,
         });
+        if (!result.ok && result.reason === 'prompt-changed') this.deps.moaPromptRefused?.(current.sessionId);
         if (result.ok) {
           return this.json(res, 200, {
             state: result.request.state,
@@ -7517,8 +7796,12 @@ export class WebTerminalServer {
     // A record that is gone is NOT refused yet: its receipt may still replay
     // (the history keeps a few records, a receipt keeps a day).
     const record = find();
-    if (record && principal.kind === 'device' && this.isBrainApproval(record.sessionId)) {
+    if (record && principal.kind === 'device' && this.deviceBarredApproval(record.sessionId)) {
       return this.json(res, 404, { error: 'not-found' });
+    }
+    // Moa's own prompt (an ExitPlanMode form included): never from a device.
+    if (record && this.devicePressBarred(principal, record)) {
+      return this.json(res, 501, { error: 'answer-in-terminal', reason: 'unsupported-shape' });
     }
     if (!clientCaps(req).decisionV2) {
       return this.json(res, 501, { error: 'answer-in-terminal', reason: 'no-capability' });
@@ -7571,7 +7854,7 @@ export class WebTerminalServer {
         if (seen) return replyTo(seen);
         // A new execution needs a live record.
         const current = find();
-        if (!current || (fresh.principal.kind === 'device' && this.isBrainApproval(current.sessionId))) {
+        if (!current || (fresh.principal.kind === 'device' && this.deviceBarredApproval(current.sessionId))) {
           return this.json(res, 404, { error: 'not-found' });
         }
         let begun: AnswerReceiptBegin;
@@ -7585,6 +7868,7 @@ export class WebTerminalServer {
         const authorize = async (r: ApprovalRequest): Promise<'ok' | 'expired' | 'read-only'> => {
           const now = await this.authenticate(req, url, false).catch(() => ({ ok: false as const }));
           if (!now.ok || !sameCaller(now.principal)) return 'expired';
+          if (this.moaAuthorizeVerdict(now.principal, r) === 'expired') return 'expired';
           return needsInputGrant(r, 'answer') && !this.mayInput(now.principal) ? 'read-only' : 'ok';
         };
         let response: AnswerReceiptResponse;
@@ -7777,7 +8061,7 @@ export class WebTerminalServer {
     if (!id || !/^[A-Za-z0-9-]{16,128}$/.test(clientAnswerId)) return this.json(res, 404, { error: 'not-found' });
     const listed = approvals.list();
     const record = listed.pending.find((r) => r.id === id) ?? listed.recentlyResolved.find((r) => r.id === id);
-    if (record && principal.kind === 'device' && this.isBrainApproval(record.sessionId)) {
+    if (record && principal.kind === 'device' && this.deviceBarredApproval(record.sessionId)) {
       return this.json(res, 404, { error: 'not-found' });
     }
     let receipt;
@@ -7870,9 +8154,26 @@ export class WebTerminalServer {
     // `toolInputSummary` — and a brain pane id a device can then try elsewhere
     // — sitting in the replay window. FLAT, like the liveness gate: the desk
     // drives the brain over RPC, not this fan-out.
-    if (this.isBrainApproval(r.sessionId)) return;
-    // N3 — an approval opening or closing moves the pane's blocked state.
-    this.scheduleChatBlockedCheck(r.sessionId);
+    //
+    // #1772 — the Moa pane's own prompt is the exception while main vouches for
+    // the Moa pane, and a card published that way keeps its later events
+    // (press, resolve, expire, supersede) after Moa is off, so the phone that
+    // showed it can close it — and its chat badge with it.
+    const settles = e.type === 'resolve' || e.type === 'expire' || e.type === 'supersede';
+    if (this.isBrainApproval(r.sessionId)) {
+      const known = this.moaCardIds.has(r.id);
+      if (!known && !this.moaSession(r.sessionId)) return;
+      if (settles) this.moaCardIds.delete(r.id);
+      else this.rememberMoaCard(r.id);
+      if (!this.moaSession(r.sessionId)) {
+        if (settles) this.releaseMoaChatBlocked(r.sessionId);
+      } else {
+        this.scheduleChatBlockedCheck(r.sessionId);
+      }
+    } else {
+      // N3 — an approval opening or closing moves the pane's blocked state.
+      this.scheduleChatBlockedCheck(r.sessionId);
+    }
     this.publish('approval', {
       sessionId: r.sessionId,
       // NOT `id`: the envelope's own `id` is the replay cursor, and identity
@@ -8046,6 +8347,10 @@ export class WebTerminalServer {
   private deliverTranscriptNudge(sessionId: string): void {
     const watchers = this.transcriptWatchers.get(sessionId);
     if (!watchers || watchers.size === 0) return;
+    // A device watching the Moa pane keeps its watcher entry after Moa is
+    // withdrawn; from then on it is a brain pane like any other.
+    const managed = this.deps.sessionManager.getSession(sessionId);
+    if (managed && isBrainPty({ id: sessionId, env: managed.meta.env }) && !this.moaSession(sessionId)) return;
     const body = JSON.stringify({ sessionId });
     for (const client of this.eventClients) {
       if (!watchers.has(this.watcherKey(client.principal))) continue;
@@ -9027,6 +9332,7 @@ function sidebarWorkspaceFields(
     ...(row.gitBranch !== undefined ? { gitBranch: row.gitBranch } : {}),
     ...(row.gitIsWorktree !== undefined ? { gitIsWorktree: row.gitIsWorktree } : {}),
     ...(row.gitSync !== undefined ? { gitSync: row.gitSync } : {}),
+    ...(row.moaHandoff !== undefined ? { moaHandoff: row.moaHandoff } : {}),
     ...(taskSummary !== undefined ? { taskSummary } : {}),
     ...(task
       ? {
@@ -9043,6 +9349,17 @@ function sidebarWorkspaceFields(
         }
       : {}),
   };
+}
+
+/** Which chat write a Moa pane check is for (see `moaWriteCleared`). */
+type MoaWriteKind = 'send' | 'cancel';
+
+/**
+ * `role: "hq"` for a row of the desktop's Moa HQ workspace, nothing for any
+ * other row or without a snapshot. The phone hides HQ rows by this key alone.
+ */
+function hqRole(sidebar: PhoneSidebarSnapshot | null, workspaceId: unknown): { role?: 'hq' } {
+  return sidebar?.hqWorkspaceId !== undefined && workspaceId === sidebar.hqWorkspaceId ? { role: 'hq' } : {};
 }
 
 /** A pane's extracted scrollback is current while nothing was written and the geometry held. */

@@ -93,6 +93,7 @@ vi.mock('../../../deck/deckDecisionStore', async (orig) => {
     loadDeckDecisions: vi.fn(() => ({})),
     loadWorkspaceDecision: vi.fn(() => null),
     hasPendingDecision: vi.fn(() => pendingRef.current),
+    hasBrainBlockingDecision: vi.fn(() => pendingRef.current),
     raiseDecision: vi.fn(async (workspaceId: string, args: Omit<RaisedDecision, 'workspaceId'>) => {
       raised.push({ workspaceId, ...args });
       return null;
@@ -101,6 +102,7 @@ vi.mock('../../../deck/deckDecisionStore', async (orig) => {
 });
 
 import { registerDeckHandler } from '../deck.handler';
+import { setMoaEnabled } from '../../../deck/deckHqStore';
 import { IPC } from '../../../../shared/constants';
 import {
   beginOrContinueDeckWork,
@@ -148,6 +150,12 @@ const delegate = (taskId: string, state: 'working' | 'completed' = 'working'): v
   recordDeckWorkA2aTask(WS, { taskId, to: 'ws-worker', state, ts: Date.now() + 1_000 });
 };
 
+// These suites exercise the deck brain itself: start with Moa's master
+// switch on (a fresh data dir would otherwise read as a new install, off).
+beforeEach(async () => {
+  await setMoaEnabled(true);
+});
+
 beforeEach(() => {
   captured.clear();
   raised.length = 0;
@@ -170,7 +178,8 @@ afterEach(() => {
 });
 
 describe('deck handler — a human turn against a PARKED record', () => {
-  it('starts a NEW record and surfaces the one it superseded', async () => {
+  // Exercises the real durable work store through several record writes and a handler turn on Windows.
+  it('starts a NEW record and surfaces the one it superseded', { timeout: 30_000 }, async () => {
     beginOrContinueDeckWork(WS, 'Recover my agents after the reboot');
     delegate('task-orphan');
     const before = loadActiveDeckWork(WS)!;
@@ -193,7 +202,8 @@ describe('deck handler — a human turn against a PARKED record', () => {
     expect(raised[0].context).not.toContain('You OWN');
   });
 
-  it('does not raise for a superseded record with nothing outstanding', async () => {
+  // Exercises the real durable work store through several record writes and a handler turn on Windows.
+  it('does not raise for a superseded record with nothing outstanding', { timeout: 30_000 }, async () => {
     // A decision blocks autonomous follow-through on the request the human JUST
     // made, so it is charged only where delegated work would be orphaned.
     beginOrContinueDeckWork(WS, 'yesterday, and it finished');
@@ -259,5 +269,23 @@ describe('deck handler — New session with delegated work outstanding', () => {
     clearActiveDeckWork(WS);
     expect(await newSession()).toEqual({ ok: true });
     expect(raised).toEqual([]);
+  });
+});
+
+describe('deck handler — small talk is not work', () => {
+  it('a thank-you opens no request, so there is nothing for Moa to report done', async () => {
+    await send('고마워');
+    expect(loadActiveDeckWork(WS)).toBeNull();
+  });
+
+  it('a thank-you mid-job is not filed as a follow-up of the live request', async () => {
+    beginOrContinueDeckWork(WS, 'math.js에 빼기 함수 추가해줘');
+    await send('고마워요!');
+    expect(loadActiveDeckWork(WS)).toMatchObject({ objective: 'math.js에 빼기 함수 추가해줘', followUps: [] });
+  });
+
+  it('a request still opens one', async () => {
+    await send('math.js에 빼기 함수 추가해줘');
+    expect(loadActiveDeckWork(WS)?.objective).toBe('math.js에 빼기 함수 추가해줘');
   });
 });

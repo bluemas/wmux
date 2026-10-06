@@ -33,6 +33,7 @@ function mount(props: {
   commanderModelOptions?: { value: string; label: string }[];
   commanderModelValue?: string;
   onCommanderModelSelect?: (v: string) => void;
+  moa?: { commanderTitle: string; commanderSubtitle: string; commanderIcon: React.ReactNode; commanderStatusLabel?: string };
 }): void {
   act(() => {
     root.render(
@@ -47,6 +48,7 @@ function mount(props: {
         ...(props.commanderModelOptions !== undefined ? { commanderModelOptions: props.commanderModelOptions } : {}),
         ...(props.commanderModelValue !== undefined ? { commanderModelValue: props.commanderModelValue } : {}),
         ...(props.onCommanderModelSelect !== undefined ? { onCommanderModelSelect: props.onCommanderModelSelect } : {}),
+        ...(props.moa ?? {}),
         t: (k: string) => k,
       }),
     );
@@ -104,12 +106,12 @@ describe('DeckTabs', () => {
     expect(badge?.textContent).toContain('3');
   });
 
-  it('renders Orchestrator·Git·Channels tabs (owner 2026-07-20: 덱 복귀, Review는 Git에 병합)', () => {
+  it('renders Orchestrator·Channels tabs — Git is a rail page (2026-10-03)', () => {
     mount({ active: 'commander' });
     const ids = Array.from(container.querySelectorAll('[data-deck-tab]')).map((el) =>
       el.getAttribute('data-deck-tab'),
     );
-    expect(ids).toEqual(['commander', 'git', 'channels']);
+    expect(ids).toEqual(['commander', 'channels']);
   });
 
   it('hides the Channels tab (and its badge) when showChannels is false', () => {
@@ -134,7 +136,7 @@ describe('DeckTabs', () => {
     expect(list.querySelector('[data-test-chip]')).toBeNull();
     // Every direct child of the list is a tab.
     const kids = Array.from(list.children);
-    expect(kids.length).toBe(3);
+    expect(kids.length).toBe(2);
     for (const kid of kids) {
       const isTab = kid.getAttribute('role') === 'tab' || kid.querySelector('[role="tab"]') !== null;
       expect(isTab).toBe(true);
@@ -178,7 +180,7 @@ describe('DeckTabs', () => {
     // deck.tabCommander (identity translator returns the key) + ` (Sonnet 5)`.
     expect(tab('commander').getAttribute('aria-label')).toBe('deck.tabCommander (Sonnet 5)');
     expect(tab('commander').getAttribute('title')).toBe('deck.tabCommander (Sonnet 5)');
-    expect(tab('git').getAttribute('aria-label')).toBe('deck.tabGit');
+    expect(tab('channels').getAttribute('aria-label')).toBe('deck.tabChannels');
   });
 
   it('opens the model menu on active-tab re-click and fires the select callback', () => {
@@ -227,5 +229,63 @@ describe('DeckTabs', () => {
     });
     expect(onSelect).toHaveBeenCalledWith('commander');
     expect(container.querySelector('[data-commander-model-menu]')).toBeNull();
+  });
+
+  it('names the conversation tab for Moa when Moa owns the panel', () => {
+    mount({
+      active: 'commander',
+      commanderModelLabel: 'Default',
+      moa: {
+        commanderTitle: 'Moa',
+        commanderSubtitle: 'Main bot',
+        commanderIcon: createElement('svg', { 'data-moa-mascot': 'needs-you' }),
+        commanderStatusLabel: 'needs you',
+      },
+    });
+    const el = tab('commander');
+    expect(el.querySelector('.wmux-deck-tab-label')?.textContent).toBe('Moa');
+    expect(el.querySelector('[data-deck-tab-subtitle]')?.textContent).toBe('Main bot');
+    expect(el.querySelector('[data-moa-mascot="needs-you"]')).not.toBeNull();
+    // The mascot's state reaches the accessible name, not only the picture.
+    expect(el.getAttribute('aria-label')).toBe('Moa · Main bot (Default) — needs you');
+  });
+
+  it('keeps the mascot state in the Moa tab name while channels have unread', () => {
+    mount({
+      active: 'commander',
+      channelsUnread: 3,
+      moa: {
+        commanderTitle: 'Moa',
+        commanderSubtitle: 'Main bot',
+        commanderIcon: createElement('svg', { 'data-moa-mascot': 'needs-you' }),
+        commanderStatusLabel: 'needs you',
+      },
+    });
+    expect(tab('commander').getAttribute('aria-label')).toBe('Moa · Main bot — needs you');
+    expect(tab('channels').getAttribute('aria-label')).toBe('deck.tabChannels (3 unread)');
+  });
+
+  it("Moa's tab is a plain label: no second model menu (Model lives in its ⋯ menu)", () => {
+    const onCommanderModelSelect = vi.fn();
+    mount({
+      active: 'commander',
+      commanderModelLabel: 'Default',
+      commanderModelOptions: [...MODEL_OPTIONS],
+      onCommanderModelSelect,
+      moa: { commanderTitle: 'Moa', commanderSubtitle: 'Main bot', commanderIcon: createElement('svg') },
+    });
+    const el = tab('commander');
+    expect(el.getAttribute('aria-haspopup')).toBeNull();
+    expect(el.querySelector('.wmux-deck-tab-chevron')).toBeNull();
+    act(() => el.click());
+    expect(container.querySelector('[data-commander-model-menu]')).toBeNull();
+    // The current model stays readable in the name.
+    expect(el.getAttribute('aria-label')).toBe('Moa · Main bot (Default)');
+  });
+
+  it('keeps the Orchestrator name and glyph without Moa', () => {
+    mount({ active: 'commander' });
+    expect(tab('commander').querySelector('[data-deck-tab-subtitle]')).toBeNull();
+    expect(tab('commander').querySelector('.wmux-deck-tab-label')?.textContent).toBe('deck.tabCommander');
   });
 });

@@ -52,13 +52,35 @@ export interface WorkspaceDecision {
    *  survive to the next resume turn (the human's answer — never droppable).
    *  Absent on legacy records ⇒ treated as 'human' (the conservative read). */
   resolvedBy?: DecisionResolvedBy;
+  /** The operator closed the card as not needed instead of answering it
+   *  (resolvedBy 'human'). The brain must act on none of its options. */
+  dismissed?: true;
   raisedAt: number;
   resolvedAt?: number;
+  /** Who raised it, when not the workspace's brain. `issue-proposal`: Moa's
+   *  issue and PR proposals lane (moaIssueProposals.ts), whose answers main
+   *  handles. Such a card is never shown to a brain (loadBrainDecision). */
+  origin?: DecisionOrigin;
+  /** The raiser's own key for the card (the proposal's item key), stored with
+   *  it so the owner can be recovered after a crash. */
+  ref?: string;
 }
+
+/** `issue-proposal`: Moa's issue and PR proposals lane. `moa-handoff`: a
+ *  hand-off Moa proposed (moaHandoff.ts). Both are main-owned: main acts on the
+ *  answer, no brain ever sees or resolves the card. */
+export type DecisionOrigin = 'issue-proposal' | 'moa-handoff';
+
+/** Origins whose cards main answers. Never set from the wire (deck.requestDecision
+ *  takes no origin), never shown to a brain, never resolvable by one. */
+export const MAIN_OWNED_ORIGINS: readonly DecisionOrigin[] = ['issue-proposal', 'moa-handoff'];
 
 export type DecisionResolvedBy = 'human' | 'brain';
 
 const WORKSPACE_ID_RE = /^[A-Za-z0-9._-]{1,80}$/;
+
+/** The resolution text a dismissed card is stored with. */
+export const DISMISSED_RESOLUTION = 'Not needed (dismissed by the operator)';
 
 export const DECISION_LIMITS = {
   MAX_QUESTION_CHARS: 1000,
@@ -106,10 +128,15 @@ function sanitizeDecision(raw: unknown): WorkspaceDecision | null {
     ...(status === 'resolved' && (o.resolvedBy === 'human' || o.resolvedBy === 'brain')
       ? { resolvedBy: o.resolvedBy as DecisionResolvedBy }
       : {}),
+    ...(status === 'resolved' && o.dismissed === true ? { dismissed: true as const } : {}),
     raisedAt: typeof o.raisedAt === 'number' && Number.isFinite(o.raisedAt) ? o.raisedAt : 0,
     ...(typeof o.resolvedAt === 'number' && Number.isFinite(o.resolvedAt)
       ? { resolvedAt: o.resolvedAt }
       : {}),
+    ...(typeof o.origin === 'string' && (MAIN_OWNED_ORIGINS as readonly string[]).includes(o.origin)
+      ? { origin: o.origin as DecisionOrigin }
+      : {}),
+    ...(typeof o.ref === 'string' && o.ref.length <= 256 ? { ref: o.ref } : {}),
   };
 }
 
@@ -162,12 +189,53 @@ export function loadWorkspaceDecision(workspaceId: string, dir?: string): Worksp
   }
 }
 
+/** A card raised by Moa's issue proposals lane. */
+export function isIssueProposalDecision(d: Pick<WorkspaceDecision, 'origin'> | null | undefined): boolean {
+  return d?.origin === 'issue-proposal';
+}
+
+/** A card main answers (issue proposals, Moa's hand-offs): never shown to a
+ *  brain, never re-examined, never resolvable through deck.resolveDecision. */
+export function isMainOwnedDecision(d: Pick<WorkspaceDecision, 'origin'> | null | undefined): boolean {
+  return !!d?.origin && MAIN_OWNED_ORIGINS.includes(d.origin);
+}
+
 /** The wake-suppression predicate: a workspace with a PENDING decision must not
  *  be auto-woken. Never throws (a torn store reads as "no pending decision" —
  *  fail open so a corrupt file can't wedge every wake). */
 export function hasPendingDecision(workspaceId: string, dir?: string): boolean {
   const d = loadWorkspaceDecision(workspaceId, dir);
   return d !== null && d.status === 'pending';
+}
+
+/** The wake-suppression predicate: a pending decision the workspace's BRAIN is
+ *  waiting on. A main-owned card (an issue proposal, a Moa hand-off) waits on
+ *  the operator, not on this workspace's brain, so it blocks no wake, loop,
+ *  schedule or heartbeat. (hasPendingDecision still counts it, so nothing
+ *  raises over it.) Never throws. */
+export function hasBrainBlockingDecision(workspaceId: string, dir?: string): boolean {
+  const d = loadWorkspaceDecision(workspaceId, dir);
+  return d !== null && d.status === 'pending' && !isMainOwnedDecision(d);
+}
+
+// Told after every decision write (raise, replace, resolve, clear), so a
+// reader that mirrors decision state (work links) never keeps a stale copy.
+// A listener cannot break a write.
+const changeListeners = new Set<() => void>();
+
+export function onDecisionsChanged(fn: () => void): () => void {
+  changeListeners.add(fn);
+  return () => changeListeners.delete(fn);
+}
+
+function notifyDecisionsChanged(): void {
+  for (const fn of changeListeners) {
+    try {
+      fn();
+    } catch {
+      /* best-effort */
+    }
+  }
 }
 
 function mutate(
@@ -188,6 +256,7 @@ function mutate(
       all[workspaceId] = next;
     }
     await atomicWriteJSON(getDeckDecisionPath(dir), all);
+    notifyDecisionsChanged();
     return next;
   });
 }
@@ -248,6 +317,44 @@ export async function raiseDecision(
 }
 
 /**
+ * Raise a decision only while the workspace has none pending, checked inside
+ * the store's serialization (a load-then-raise could clobber a question raised
+ * in between). A resolved one not consumed yet is left alone too: its answer
+ * still has to reach whoever asked. Returns the new decision, or null when the
+ * slot was taken or nothing was written.
+ */
+export async function raiseDecisionIfFree(
+  workspaceId: string,
+  args: { question: string; options?: string[]; context?: string; origin?: DecisionOrigin; ref?: string },
+  dir?: string,
+): Promise<WorkspaceDecision | null> {
+  const question = args.question.trim();
+  if (!question) return null;
+  // Fast no-op without a disk write; the mutate re-checks under the lock.
+  if (loadWorkspaceDecision(workspaceId, dir)) return null;
+  let raised = false;
+  const result = await mutate(
+    workspaceId,
+    (prev) => {
+      if (prev) return prev;
+      raised = true;
+      return {
+        id: randomUUID(),
+        question: question.slice(0, DECISION_LIMITS.MAX_QUESTION_CHARS),
+        options: sanitizeOptions(args.options),
+        context: typeof args.context === 'string' ? args.context.trim().slice(0, DECISION_LIMITS.MAX_CONTEXT_CHARS) : '',
+        status: 'pending',
+        raisedAt: Date.now(),
+        ...(args.origin ? { origin: args.origin } : {}),
+        ...(typeof args.ref === 'string' && args.ref.length <= 256 ? { ref: args.ref } : {}),
+      };
+    },
+    dir,
+  );
+  return raised ? result : null;
+}
+
+/**
  * REPLACE a STALE pending decision with a sharper question — compare-and-swap
  * inside ONE serialized mutation (3-way review round 2): the existing record
  * must still be the expected id, still pending, and still stale under `ttlMs`
@@ -275,6 +382,7 @@ export async function replaceStaleDecision(
         !prev ||
         prev.status !== 'pending' ||
         prev.id !== expectedId ||
+        isMainOwnedDecision(prev) ||
         !isDecisionStale(prev, ttlMs)
       ) {
         return prev; // CAS failed — leave whatever is there (incl. a human resolve) intact
@@ -306,8 +414,11 @@ export async function resolveDecision(
   resolution: string,
   dir?: string,
   resolvedBy: DecisionResolvedBy = 'human',
+  opts: { dismissed?: boolean } = {},
 ): Promise<WorkspaceDecision | null> {
-  const answer = resolution.trim();
+  // Only the operator dismisses: a brain resolve never carries the flag.
+  const dismissed = opts.dismissed === true && resolvedBy === 'human';
+  const answer = dismissed ? DISMISSED_RESOLUTION : resolution.trim();
   if (!answer) return null;
   // Fast no-op WITHOUT a disk write for a stale resolve (wrong id / already
   // resolved / no decision); the serialized mutate below re-checks
@@ -329,6 +440,7 @@ export async function resolveDecision(
         status: 'resolved',
         resolution: answer.slice(0, DECISION_LIMITS.MAX_RESOLUTION_CHARS),
         resolvedBy,
+        ...(dismissed ? { dismissed: true as const } : {}),
         resolvedAt: Date.now(),
       };
     },
@@ -341,6 +453,30 @@ export async function resolveDecision(
  *  as a hard reset). */
 export async function clearDecision(workspaceId: string, dir?: string): Promise<void> {
   await mutate(workspaceId, () => null, dir);
+}
+
+/** Remove a PENDING decision only while it is still exactly `expected` (same
+ *  id, still pending, same content), inside the store's serialization. A
+ *  decision answered or replaced since `expected` was read is left alone.
+ *  Returns true when it was removed. */
+export async function clearPendingDecisionIfUnchanged(
+  workspaceId: string,
+  expected: WorkspaceDecision,
+  dir?: string,
+): Promise<boolean> {
+  let removed = false;
+  await mutate(
+    workspaceId,
+    (prev) => {
+      if (prev && prev.status === 'pending' && JSON.stringify(prev) === JSON.stringify(expected)) {
+        removed = true;
+        return null;
+      }
+      return prev;
+    },
+    dir,
+  );
+  return removed;
 }
 
 /** Consume-once: drop a decision ONLY if it is already resolved (its resolution
@@ -383,6 +519,13 @@ export async function clearResolvedDecision(
  */
 export function renderDecisionBlock(d: WorkspaceDecision): string {
   if (d.status === 'resolved') {
+    if (d.dismissed) {
+      return [
+        `[decision] DISMISSED — the operator closed this decision as not needed: ${d.question}`,
+        'They chose none of its options. Do NOT act on any of them; carry on from the',
+        'current state, and raise a fresh decision only if a real fork remains.',
+      ].join('\n');
+    }
     // Provenance-aware (round-3 review P2): a brain self-resolution must never
     // be presented as the human's answer — a stranded self-resolve that resumes
     // later (turn errored after the resolve landed) says so honestly.
@@ -408,6 +551,7 @@ export function renderDecisionBlock(d: WorkspaceDecision): string {
   if (d.context) parts.push(`  context: ${d.context}`);
   parts.push(
     'Do not act until the human resolves this. If they just messaged you, they may be answering — otherwise wait.',
+    'If their message or a lookup already answers it, say so in one line and ask them to close the card with Not needed.',
   );
   return parts.join('\n');
 }

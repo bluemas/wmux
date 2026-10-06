@@ -630,7 +630,7 @@ export class TranscriptProjector {
     );
     if (!check.ok) {
       this.warnOnce(
-        `${sessionId} ${binding.transcriptPath}`,
+        `${sessionId}\u0000${binding.transcriptPath}`,
         `[transcript] refused transcript path for ${sessionId}: ${check.reason}`,
       );
       return { ok: false, reason: 'unsafe-transcript-path' };
@@ -653,7 +653,12 @@ export class TranscriptProjector {
    * Without a detector wired this degrades to `no-hook`, the pre-split behaviour.
    */
   private absentBindingReason(sessionId: string): string {
-    return this.deps.getDetectedAgent?.(sessionId) ? 'stale-session' : 'no-hook';
+    const detected = this.deps.getDetectedAgent?.(sessionId);
+    // A Codex pane binds only once its rollout is known (#1764): until the cwd
+    // bind or the exact-id search lands, it is waiting for its record, not a
+    // pane that moved on, so it keeps the reason it reported before #1764.
+    if (detected === 'codex') return 'no-transcript-path';
+    return detected ? 'stale-session' : 'no-hook';
   }
 
   /**

@@ -1,27 +1,33 @@
 // Adapted from MonoCode (hardbeat920/monocode@6bd432ca, src/app/shell/Sidebar.tsx), MIT License, Copyright (c) 2026 Nick
-import { useCallback, useRef, useState, type KeyboardEvent } from 'react';
+import { useCallback, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { useStore } from '../../stores';
 import { selectWorkspaceRailSummary } from '../../stores/selectors/workspaceProjections';
-import { formatStaleMinutes, selectAllWorkspaceAgentStatus, selectAllWorkspaceUnverifiableMinutes } from '../../stores/selectors/fleet';
+import { formatStaleMinutes, selectAllWorkspaceAgentStatus, selectAllWorkspaceUnverifiableMinutes, selectWorkspaceAttentionClasses } from '../../stores/selectors/fleet';
+import { StatusMarkView } from './AgentMarks';
 import { useT } from '../../hooks/useT';
 import { AGENT_STATUS_ICON } from './agentStatusIcon';
 import { useGlanceBoardOrder } from './useGlanceBoardOrder';
+import { partitionWorkspaceSettle, workspaceSettleGroupOf } from './workspaceSettleGroups';
+import { resolveTaskLink } from '../../utils/fanoutProvenance';
 import { tokenAttrs } from '../../themes';
-import { collapseDirection, expandDirection } from './sidebarGlyphs';
+import { expandDirection } from './sidebarGlyphs';
 import { IconPlus, IconChevronDir, IconGear } from '../icons';
 import { FOCUS_RING } from '../focusRing';
 import SidebarNavigation from './SidebarNavigation';
 import { workspaceColorHex } from '../../../shared/workspaceColors';
 import PresetPicker from './PresetPicker';
+import RailMoreMenu from './RailMoreMenu';
+import { listedWorkspaces, moaHqId as selectMoaHqId } from '../Moa/moaHqGuard';
 
 /** PresetPicker width (w-52), used to keep the flyout on-screen. */
 const PICKER_MENU_WIDTH = 208;
 
 /**
  * `rail` (desktop): the icon rail on the window frame, beside the sheet —
- * the pages Workspaces, Fleet, Schedules and Remote on top, the sidebar
- * toggle alone at the foot (Settings and Search live in the titlebar). While the in-sheet sidebar is open (`collapsed` false) the
+ * the pages Workspaces, Fleet, Schedules and Remote on top, the More menu
+ * alone at the foot (Settings lives in it; the sidebar toggle and Search live
+ * in the titlebar). While the in-sheet sidebar is open (`collapsed` false) the
  * rail carries no workspace list; collapsed, it adds the workspace avatars,
  * so the collapsed mode and the rail are one column. Arrow keys move focus
  * between its buttons. Adapted from MonoCode (hardbeat920/monocode@6bd432ca,
@@ -33,7 +39,12 @@ export default function MiniSidebar({ rail = false, collapsed = true }: { rail?:
   const sidebarPosition = useStore((s) => s.sidebarPosition);
   // A1: 레일은 id/name + 에이전트 상태만 그린다 — 요약 투영만 구독해 cwd/git/
   // port 변경에는 리렌더되지 않게 한다.
-  const workspaces = useStore(useShallow(selectWorkspaceRailSummary));
+  const allWorkspaces = useStore(useShallow(selectWorkspaceRailSummary));
+  // Moa's HQ is not one of the operator's workspaces: the rail lists (and
+  // numbers) the same rows as the full sidebar. It is reached from its own
+  // rail entry instead.
+  const moaHqId = useStore(selectMoaHqId);
+  const workspaces = useMemo(() => listedWorkspaces(allWorkspaces, moaHqId), [allWorkspaces, moaHqId]);
   // Dot source (agent-status-dot fix): whole-workspace roll-up, same derivation
   // as WorkspaceItem — not the active-pane-only `ws.agentStatus` projection.
   const agentStatusById = useStore(useShallow(selectAllWorkspaceAgentStatus));
@@ -41,6 +52,9 @@ export default function MiniSidebar({ rail = false, collapsed = true }: { rail?:
   // window, in whole minutes of silence. Same roll-up, minute-granular so the
   // shallow compare holds between clock ticks.
   const unverifiableMinutesById = useStore(useShallow(selectAllWorkspaceUnverifiableMinutes));
+  // The full row's rule: plain `waiting` with no question is idle, so the rail
+  // draws it as idle too.
+  const attentionClassById = useStore(useShallow(selectWorkspaceAttentionClasses));
   // Needs-you-first ordering (attentionOrder.ts) — display only, same setting
   // and same roll-up as the full sidebar so the two surfaces never disagree.
   // #1481 — the same three-way order as the full sidebar; reorder pauses for
@@ -52,8 +66,28 @@ export default function MiniSidebar({ rail = false, collapsed = true }: { rail?:
   // rows stay draggable among themselves while the rest is sorted.
   const pinnedIds = useStore((s) => s.sidebarPinnedIds);
   // Same glance-board order and settle rule as the full sidebar.
-  const { ordered: orderedWorkspaces, onPointerEnter: onRailPointerEnter, onPointerLeave: onRailPointerLeave, onFocusCapture: onRailFocus, onBlurCapture: onRailBlur } =
+  const { ordered: boardWorkspaces, onPointerEnter: onRailPointerEnter, onPointerLeave: onRailPointerLeave, onFocusCapture: onRailFocus, onBlurCapture: onRailBlur } =
     useGlanceBoardOrder(workspaces);
+  // Snoozed and settled workspaces have no groups on the rail: they just move
+  // to the end of it, in the same order. Same placement rule as the sidebar:
+  // pinned wins, and a fan-out task goes where its live owner goes.
+  const settleStates = useStore((s) => s.workspaceSettle.states);
+  const missionByPaneGroup = useStore((s) => s.missionByPaneGroup);
+  const fanoutLineage = useStore((s) => s.fanoutLineage);
+  const fanoutSpawnOwner = useStore((s) => s.fanoutSpawnOwner);
+  const orderedWorkspaces = useMemo(() => {
+    const now = Date.now();
+    const liveIds = new Set(workspaces.map((w) => w.id));
+    const split = partitionWorkspaceSettle(boardWorkspaces, {
+      groupOf: (id) => workspaceSettleGroupOf(settleStates[id], now),
+      pinned: new Set(pinnedIds),
+      nestedOwnerOf: (id) => {
+        const link = resolveTaskLink(missionByPaneGroup[id], fanoutLineage[id], fanoutSpawnOwner[id]);
+        return link && !link.detached && link.ownerId && link.ownerId !== id && liveIds.has(link.ownerId) ? link.ownerId : undefined;
+      },
+    });
+    return [...split.main, ...split.snoozed, ...split.settled];
+  }, [boardWorkspaces, workspaces, settleStates, pinnedIds, missionByPaneGroup, fanoutLineage, fanoutSpawnOwner]);
   const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
   const setActiveWorkspace = useStore((s) => s.setActiveWorkspace);
   const toggleSidebar = useStore((s) => s.toggleSidebar);
@@ -160,8 +194,8 @@ export default function MiniSidebar({ rail = false, collapsed = true }: { rail?:
           const dropAllowed = (fromId: string) =>
             !sidebarAttentionFirst || (isPinned && pinnedIds.includes(fromId));
           const unreadCount = notifications.filter((n) => !n.read && n.workspaceId === ws.id).length;
-          const agentStatus = agentStatusById[ws.id] ?? 'idle';
-          const agentIcon = agentStatus !== 'idle' ? AGENT_STATUS_ICON[agentStatus] : null;
+          const rolled = agentStatusById[ws.id] ?? 'idle';
+          const agentStatus = rolled === 'waiting' && attentionClassById[ws.id] !== 'needsYou' ? 'idle' : rolled;
           // Unverifiable: the rail's filled glyph goes hollow and stops
           // pulsing — the same "running, but nobody has heard from it" ring the
           // full sidebar draws, in the one glyph this 48px rail can afford.
@@ -170,6 +204,13 @@ export default function MiniSidebar({ rail = false, collapsed = true }: { rail?:
           // remain distinguishable in the 48px rail.
           const label = `${ws.name.charAt(0).toUpperCase()}${railIndex + 1}`;
           const railColor = workspaceColorHex(ws.color);
+          // Status by shape (the sidebar's StatusMarkView), and in words for
+          // the accessible name: "name, status".
+          const statusText = unverifiableMinutes
+            ? t('workspace.agentUnverifiable', { time: formatStaleMinutes(unverifiableMinutes) })
+            : attentionClassById[ws.id] === 'needsYou' && (agentStatus === 'waiting' || agentStatus === 'awaiting_input') ? t('workspace.needsYou')
+              : agentStatus !== 'idle' ? t(AGENT_STATUS_ICON[agentStatus].labelKey) : undefined;
+          const railName = [ws.name, statusText].filter(Boolean).join(', ');
 
           const handleClick = (e: React.MouseEvent<HTMLButtonElement>) => {
             // Suppress click that fires immediately after a drag.
@@ -280,7 +321,10 @@ export default function MiniSidebar({ rail = false, collapsed = true }: { rail?:
                 onDragOver={handleDragOver}
                 onDragLeave={handleDragLeave}
                 onDrop={handleDrop}
-                title={`${ws.name} (Ctrl+${railIndex + 1})`}
+                title={`${railName} (Ctrl+${railIndex + 1})`}
+                aria-label={railName}
+                aria-current={isActive ? 'true' : undefined}
+                data-rail-workspace={ws.id}
               >
                 {label}
                 {unreadCount > 0 && (
@@ -293,19 +337,9 @@ export default function MiniSidebar({ rail = false, collapsed = true }: { rail?:
                     {unreadCount > 9 ? '9+' : unreadCount}
                   </span>
                 )}
-                {agentIcon && (
-                  <span
-                    // The cross gets a box sized to its own glyph, mirroring the
-                    // full row: the dot's footprint is 6px and the ✕ is 10px.
-                    className={`absolute -bottom-0.5 -right-0.5 text-[10px] leading-none ${agentIcon.shape === 'cross' ? 'w-2.5 h-2.5 flex items-center justify-center font-bold' : ''} ${agentIcon.className} ${agentStatus === 'running' && !unverifiableMinutes ? 'animate-pulse' : ''}`}
-                    title={unverifiableMinutes
-                      ? t('workspace.agentUnverifiable', { time: formatStaleMinutes(unverifiableMinutes) })
-                      : `${ws.agentName ? `${ws.agentName} — ` : ''}${t(agentIcon.labelKey)}`}
-                  >
-                    {/* Error is the one red status told apart by FORM, not hue
-                        (agentStatusIcon.ts) — the rail mirrors that ✕. A silent
-                        running agent is the hollow ring. */}
-                    {unverifiableMinutes ? '○' : agentIcon.shape === 'cross' ? '✕' : agentIcon.dot}
+                {statusText && (
+                  <span className="absolute -bottom-0.5 -right-0.5 flex items-center justify-center rounded-full bg-[var(--bg-mantle)]" data-rail-status>
+                    <StatusMarkView status={agentStatus} unverifiable={unverifiableMinutes > 0} />
                   </span>
                 )}
               </button>
@@ -321,9 +355,11 @@ export default function MiniSidebar({ rail = false, collapsed = true }: { rail?:
 
       {/* Footer — expand + status */}
       <div className="flex flex-col items-center gap-2 py-2 border-t border-[var(--bg-surface)]" style={{ borderColor: 'var(--border-soft)' }}>
-        {/* The rail's foot holds only the sidebar toggle; Settings is in the
-            titlebar (SettingsButton). The web mirror keeps its own. */}
-        {!readOnly && !rail && <button
+        {/* The rail's foot holds the More menu (Settings, shortcuts, updates,
+            version); the sidebar toggle lives in the titlebar. The web
+            mirror has no titlebar, so it keeps its gear and chevron. */}
+        {rail ? <RailMoreMenu /> : <>
+        {!readOnly && <button
           type="button"
           className={`ui-icon-btn w-8 h-8 ${FOCUS_RING}`}
           aria-label={t('settings.title')}
@@ -334,18 +370,15 @@ export default function MiniSidebar({ rail = false, collapsed = true }: { rail?:
         >
           <IconGear size={16} />
         </button>}
-
-        {/* Sidebar toggle — expands when collapsed; on the rail beside an open
-            sidebar it collapses it (the sidebar's own footer is gone). */}
         <button
           className={`w-8 h-8 rounded-md flex items-center justify-center text-[var(--text-muted)] hover:text-[var(--text-main)] hover:bg-[var(--hover-fill)] transition-colors duration-150 font-mono text-caption ${FOCUS_RING}`}
           onClick={toggleSidebar}
-          data-sidebar-collapse={collapsed ? undefined : ''}
-          title={collapsed ? t('sidebar.expandTooltip') : t('sidebar.hideTooltip')}
-          aria-label={collapsed ? t('sidebar.expandTooltip') : t('sidebar.hideTooltip')}
+          title={t('sidebar.expandTooltip')}
+          aria-label={t('sidebar.expandTooltip')}
         >
-          <IconChevronDir dir={collapsed ? expandDirection(sidebarPosition) : collapseDirection(sidebarPosition)} />
+          <IconChevronDir dir={expandDirection(sidebarPosition)} />
         </button>
+        </>}
       </div>
     </div>
   );

@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { BrowserWindow } from 'electron';
 import { sendToRenderer } from '../pipe/handlers/_bridge';
+import { getWorkspaceSettleService } from '../workspace/settle/workspaceSettleHost';
 import { createSidebarDropLog, parsePhoneSidebarSnapshot, type PhoneSidebarSnapshot, type SidebarDropReporter } from '../../shared/phoneFleetSidebar';
 
 /** How long the list waits for the optional sidebar projection. */
@@ -40,9 +41,13 @@ export async function handlePhoneWorkspaces(command: string, payload: Record<str
       }),
     ]);
     if (!Array.isArray(rows)) throw new Error('Workspace list unavailable');
-    const reply: { workspaces: Array<{ id: string; name: string; sessionId: string | null }>; sidebar?: PhoneSidebarSnapshot } = {
+    // Settle state is main's own (no renderer round-trip); fields are additive.
+    const settle = getWorkspaceSettleService()?.snapshot().states ?? {};
+    const reply: { workspaces: Array<{ id: string; name: string; sessionId: string | null; settled?: true; snoozedUntil?: number }>; sidebar?: PhoneSidebarSnapshot } = {
       workspaces: rows.filter(row => row && typeof row.id === 'string' && typeof row.name === 'string').map(row => ({
         id: row.id, name: row.name, sessionId: typeof row.activePtyId === 'string' ? row.activePtyId : null,
+        ...(settle[row.id]?.settled ? { settled: true as const } : {}),
+        ...(settle[row.id]?.snoozedUntil !== undefined ? { snoozedUntil: settle[row.id].snoozedUntil } : {}),
       })),
     };
     const sidebar = parsePhoneSidebarSnapshot(sidebarRaw, drops.report);
@@ -75,7 +80,8 @@ export async function handlePhoneWorkspaces(command: string, payload: Record<str
  * The daemon drops a reply over its per-request byte cap without answering,
  * which would turn every list call into a timeout, so the sidebar must fit.
  * It degrades in steps, cheapest loss first. The per-workspace layout trees
- * go first (largest first; the phone draws that workspace flat). The pane placement (every pane
+ * go first (largest first; the phone draws that workspace flat), then Moa's
+ * delegated-job list, then the pending hand-off notices (both bounded). The pane placement (every pane
  * id and every task's pane group) goes before anything the reply carried
  * before it existed, so a sidebar that fit without it still arrives whole;
  * then tab titles, then the pane rows, and only then the whole sidebar. With
@@ -115,10 +121,22 @@ export function fitSidebarToBudget(
     }
     if (fits(withoutLayout)) return withoutLayout;
   }
+  // Moa's delegated jobs next (bounded, and the newest field), whole: a cut
+  // list would read as jobs that are not there.
+  const { moaDelegations: _moaDelegations, ...withoutDelegations } = withoutLayout;
+  if (withoutLayout.moaDelegations !== undefined) {
+    onDrop('budget.moaDelegations');
+    if (fits(withoutDelegations)) return withoutDelegations;
+  }
+  const withoutHandoff: PhoneSidebarSnapshot = { ...withoutDelegations, workspaces: withoutDelegations.workspaces.map(({ moaHandoff: _moaHandoff, ...row }) => row) };
+  if (withoutDelegations.workspaces.some((row) => row.moaHandoff !== undefined)) {
+    onDrop('budget.moaHandoff');
+    if (fits(withoutHandoff)) return withoutHandoff;
+  }
   onDrop('budget.panePlacement');
   const withoutPlacement: PhoneSidebarSnapshot = {
-    ...withoutLayout,
-    workspaces: withoutLayout.workspaces.map((row) => {
+    ...withoutHandoff,
+    workspaces: withoutHandoff.workspaces.map((row) => {
       if (row.task?.paneGroup === undefined && row.task?.requesterPaneId === undefined) return row;
       const { paneGroup: _paneGroup, requesterPaneId: _requesterPaneId, ...task } = row.task;
       return { ...row, task };

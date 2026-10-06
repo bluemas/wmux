@@ -17,6 +17,10 @@ interface RemoteWorkspaceItemProps {
   workspace: AttachedRemoteWorkspace;
   isActive: boolean;
   onSelect: (key: string) => void;
+  /** The row's id in the sidebar's keyboard list (data-sidebar-row). */
+  rowId?: string;
+  /** The list's one Tab stop (roving tabindex, owned by Sidebar). */
+  tabStop?: boolean;
   onDetach: (key: string) => void;
 }
 
@@ -28,7 +32,7 @@ interface RemoteWorkspaceItemProps {
  * LOCAL by design: Rename and Color tag are aliases this desktop keeps on the
  * attachment descriptor; the remote host still owns the real name.
  */
-export default function RemoteWorkspaceItem({ workspace, isActive, onSelect, onDetach }: RemoteWorkspaceItemProps) {
+export default function RemoteWorkspaceItem({ workspace, isActive, onSelect, onDetach, rowId, tabStop = true }: RemoteWorkspaceItemProps) {
   const t = useT();
   const renameRemoteWorkspace = useStore((s) => s.renameRemoteWorkspace);
   const setRemoteWorkspaceColor = useStore((s) => s.setRemoteWorkspaceColor);
@@ -72,25 +76,37 @@ export default function RemoteWorkspaceItem({ workspace, isActive, onSelect, onD
   const tagHex = workspaceColorHex(normalizeWorkspaceColor(workspace.color));
   // The row sorts by this class (Sidebar), so it must also say it: a mirror
   // lifted to the top with no visible reason reads as a sorting bug.
-  const needsYou = remoteWorkspaceAttentionClass(workspace) === 'needsYou';
+  const attentionClass = remoteWorkspaceAttentionClass(workspace);
+  const needsYou = attentionClass === 'needsYou';
+  const errored = attentionClass === 'error';
+  // A stale mirror says so in words, not only by its dimmed tone.
+  const disconnected = workspace.stale && !rejectedText;
 
   return (
     <div className="relative mx-2">
       <div
-        role="button"
-        tabIndex={0}
-        aria-pressed={isActive}
-        aria-label={rejectedText ? `${displayName} — ${rejectedText}` : `${displayName} — ${hostName}`}
+        role="treeitem"
+        aria-level={1}
+        tabIndex={tabStop ? 0 : -1}
+        aria-selected={isActive}
+        data-sidebar-row={rowId}
+        aria-label={rejectedText ? `${displayName} — ${rejectedText}`
+          : `${displayName} — ${hostName}${disconnected ? `, ${t('remote.disconnectedShort')}` : ''}`}
         // Card states are painted by the .wmux-sidebar .sidebar-row rules (ui.css).
         className={`group sidebar-row px-2.5 py-2 cursor-pointer rounded-md select-none ${needsYou ? 'sidebar-row-needs' : ''} ${
           isActive ? 'sidebar-row-active' : ''
         }`}
         onClick={() => { if (!editing) onSelect(workspace.key); }}
         onKeyDown={(e) => {
-          if (editing) return;
+          if (editing || e.target !== e.currentTarget) return;
           if (e.key === 'Enter' || e.key === ' ') {
             e.preventDefault();
             onSelect(workspace.key);
+          } else if ((e.key === 'F10' && e.shiftKey) || e.key === 'ContextMenu') {
+            // The row menu from the keyboard, as on a local row.
+            e.preventDefault();
+            const r = e.currentTarget.getBoundingClientRect();
+            setMenuPos({ x: r.left + 24, y: r.bottom - 4 });
           }
         }}
         onDoubleClick={() => {
@@ -115,7 +131,7 @@ export default function RemoteWorkspaceItem({ workspace, isActive, onSelect, onD
             className="w-1.5 h-1.5 rounded-full flex-shrink-0"
             style={tagHex
               ? { backgroundColor: tagHex }
-              : { backgroundColor: needsYou ? 'var(--accent-yellow)' : isActive && !workspace.stale ? 'var(--accent)' : 'var(--text-muted)' }}
+              : { backgroundColor: needsYou ? 'var(--attention)' : isActive && !workspace.stale ? 'var(--accent)' : 'var(--text-muted)' }}
           />
           <div className="flex-1 min-w-0">
             {editing ? (
@@ -154,12 +170,18 @@ export default function RemoteWorkspaceItem({ workspace, isActive, onSelect, onD
                 {/* Not only a tooltip: a host that refused this computer will not
                     come back on its own, so the row says so where it is read. */}
                 {rejectedText && ` · ${workspace.insecureTransport ? t('remote.needsHttps') : t('remote.needsPairing')}`}
+                {disconnected && <span data-remote-disconnected>{` · ${t('remote.disconnectedShort')}`}</span>}
               </span>
             </div>
           </div>
           {needsYou && (
-            <span className={`font-sans text-[11px] font-medium text-[var(--accent-yellow)] flex-shrink-0 ${isActive ? '' : 'group-hover:hidden'}`} data-remote-needs-you>
+            <span className="font-sans text-[11px] font-medium text-[var(--attention-text)] flex-shrink-0" data-remote-needs-you>
               {t('workspace.needsYou')}
+            </span>
+          )}
+          {errored && (
+            <span className="font-sans text-[11px] font-medium text-[var(--accent-red)] flex-shrink-0" data-remote-error>
+              {t('workspace.agentError')}
             </span>
           )}
         </div>

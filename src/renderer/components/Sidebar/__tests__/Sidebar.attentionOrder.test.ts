@@ -54,8 +54,9 @@ describe('MiniSidebar — ordering wiring', () => {
     expect(miniSrc).not.toMatch(/fromIndex\s*===?\s*i\b/);
   });
 
-  it('mirrors the error cross instead of a second red dot', () => {
-    expect(miniSrc).toContain("agentIcon.shape === 'cross'");
+  it('draws status by shape with the sidebar\'s own mark, never a text glyph', () => {
+    expect(miniSrc).toContain('<StatusMarkView status={agentStatus}');
+    expect(miniSrc).not.toMatch(/'✕'|'○'|agentIcon\.dot/);
   });
 });
 
@@ -67,9 +68,10 @@ describe('drag reorder is paused while the ordering is on', () => {
   // the pinned group (2026-09-26): it shows as stored, so there the two orders
   // agree and pinned rows stay draggable among themselves.
   it('gates draggable on the setting, on both surfaces', () => {
-    // WorkspaceItem folds the sort mode, pin and task rows into one flag.
+    // WorkspaceItem folds the sort mode, pin, task rows and Moa's HQ row
+    // (never a reorder source or target) into one flag.
     expect(itemSrc).toContain("const sortPaused = sortMode !== 'manual';");
-    expect(itemSrc).toContain('const reorderOff = taskRow || (sortPaused && !pinned);');
+    expect(itemSrc).toContain('const reorderOff = taskRow || moaHq || (sortPaused && !pinned);');
     // The row itself always drags (its markdown hand-off to an agent pane);
     // reorderOff only withholds the reorder source.
     expect(itemSrc).toContain('draggable={!!workspace && !editing && !readOnly}');

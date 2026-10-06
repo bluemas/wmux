@@ -514,6 +514,8 @@ describe('WebTerminalServer', () => {
   let settingsCalls: Array<{id:string;choice:unknown}>;
   /** What the server handed its sent-file audit hook. */
   let sentFileAudits: Array<{ deviceId: string; sessionId: string; file: string; bytes: number }>;
+  /** The Moa pane main last pushed (`daemon.moa.set`). */
+  let moaFact: { sessionId: string; workspaceId: string } | null;
   let settingsHook: ((authorized:()=>Promise<boolean>)=>Promise<void>) | undefined;
   const settingsRevision = 'a'.repeat(64)+'.'+'b'.repeat(64);
 
@@ -528,6 +530,7 @@ describe('WebTerminalServer', () => {
     agentLaunchEnv = undefined;
     settingsCalls = []; settingsHook = undefined;
     sentFileAudits = [];
+    moaFact = null;
     gateArmed = true;
     decisionFormKinds = [];
     liveActivityPushEnabled = true;
@@ -572,6 +575,7 @@ describe('WebTerminalServer', () => {
       git: deps.git,
       uploadsDir: deps.uploadsDir,
       auditSentFile: (entry) => { sentFileAudits.push(entry); },
+      moaPane: () => moaFact,
       runHistory: () => new RunHistoryStore(deps.uploadsDir),
       inputReceipts: () => new InputReceiptStore(deps.uploadsDir),
       answerReceipts: () => answerReceiptStore,
@@ -4274,7 +4278,9 @@ describe('WebTerminalServer', () => {
       expect(JSON.parse(text)).toMatchObject({accountId:'c2'});
       expect(text).not.toContain('/acct/second');
       expect(lifecycleCalls.at(-1)).toMatchObject({op:'create',arg:{workspaceId:'ws-1',account:{vendor:'codex',dir:'/acct/second'}}});
-      expect(calls).toEqual([{command:'accounts.envForAccount',payload:{workspaceId:'ws-1',accountId:'c2'}}]);
+      // `/api/config` also reads the sidebar snapshot (`workspaces.list`) for `moa`.
+      expect(calls.filter((c) => (c as {command:string}).command !== 'workspaces.list'))
+        .toEqual([{command:'accounts.envForAccount',payload:{workspaceId:'ws-1',accountId:'c2'}}]);
     });
 
     it('validates the launch catalog against the chosen account', async () => {
@@ -9466,6 +9472,35 @@ describe('WebTerminalServer', () => {
       }
     });
 
+    it('passes a pending Moa hand-off notice through on its workspace row only, never a body', async () => {
+      const notice = { agentName: 'Claude Code', title: 'Fix the login redirect', raisedAt: 1_700_000_000_500 };
+      const plain = sidebar();
+      const base = { ...plain, workspaces: plain.workspaces.map((w, i) => (i === 0 ? { ...w, moaHandoff: notice, body: 'x'.repeat(64) } : w)) };
+      attachDesktop(() => ({ workspaces: [], sidebar: base }));
+      const info = await startRO();
+      const body = await getJson(info.token as string, '/api/workspaces');
+      const workspaces = body.workspaces as Row[];
+      expect(workspaces.find((w) => w.id === 'ws-1')).toMatchObject({ moaHandoff: notice });
+      expect(workspaces.filter((w) => 'moaHandoff' in w).map((w) => w.id)).toEqual(['ws-1']);
+      expect(JSON.stringify(body)).not.toContain('x'.repeat(64));
+    });
+
+    it("passes Moa's delegated jobs through at the top level, including a closed workspace's, and nothing when the desktop sent none", async () => {
+      const jobs = [
+        { taskId: 'task-2', workspaceId: 'ws-closed', agentName: 'Codex CLI', title: 'Done job', state: 'done', since: 1_700_000_000_900 },
+        { taskId: 'task-1', workspaceId: 'ws-1', agentName: 'Claude Code', title: 'Open job', state: 'blocked', since: 1_700_000_000_500 },
+      ];
+      attachDesktop(() => ({ workspaces: [], sidebar: { ...sidebar(), moaDelegations: [...jobs].reverse().map((j) => ({ ...j, result: 'secret report' })) } }));
+      const info = await startRO();
+      const body = await getJson(info.token as string, '/api/workspaces');
+      expect(body.moaDelegations).toEqual(jobs);
+      expect(JSON.stringify(body)).not.toContain('secret report');
+      await server.stop();
+      attachDesktop(() => ({ workspaces: [], sidebar: sidebar() }));
+      const older = await startRO();
+      expect(await getJson(older.token as string, '/api/workspaces')).not.toHaveProperty('moaDelegations');
+    });
+
     it('merges the layout tree narrowed to the row\'s own live sessions, and lists the rest as unplaced', async () => {
       const s1b = { ...live[0], id: 's1b' };
       live.push({ ...brainRow }, s1b);
@@ -9914,6 +9949,189 @@ describe('WebTerminalServer', () => {
       expect(JSON.stringify(body)).not.toMatch(/secret-extra|secret-cwd/);
     });
 
+    describe('the Moa HQ (role: "hq", /api/config moa)', () => {
+      /** The desktop's registry rows `/api/desktop-workspaces` forwards. */
+      const registryRows = [
+        { id: 'ws-1', name: 'Workspace 1', sessionId: 's1' },
+        { id: 'ws-legacy', name: 'Legacy', sessionId: 's2' },
+        { id: 'empty', name: 'Empty workspace', sessionId: null },
+      ];
+      const hqReply = (hqWorkspaceId: string, extra: Record<string, unknown> = {}, rows = sidebar().workspaces) => ({
+        workspaces: registryRows,
+        sidebar: { ...sidebar(), workspaces: rows, hqWorkspaceId, ...extra },
+      });
+      const roles = (rows: Row[]) => Object.fromEntries(rows.map((r) => [r.id, r.role ?? null]));
+
+      it('stamps role "hq" on the HQ\'s rows on all three routes, and on no other row', async () => {
+        attachDesktop(() => hqReply('ws-1'));
+        const info = await startRW();
+        const token = info.token as string;
+        const workspaces = (await getJson(token, '/api/workspaces')).workspaces as Row[];
+        expect(roles(workspaces)).toEqual({ 'ws-1': 'hq', 'ws-legacy': null });
+        const sessions = (await getJson(token, '/api/sessions')).sessions as Row[];
+        expect(roles(sessions)).toEqual({ s1: 'hq', s2: null, s3: null });
+        const registry = (await getJson(token, '/api/desktop-workspaces')).workspaces as Row[];
+        expect(roles(registry)).toEqual({ 'ws-1': 'hq', 'ws-legacy': null, empty: null });
+        // The projection itself is not part of the registry reply.
+        expect(registry.every((r) => !('sidebar' in r) && !('hqWorkspaceId' in r))).toBe(true);
+        for (const body of [workspaces, sessions, registry]) expect(JSON.stringify(body)).not.toContain('hqWorkspaceId');
+      });
+
+      it('stamps a session with no desktop label and a row with no sidebar entry by the daemon\'s own workspace record', async () => {
+        // ws-legacy is the HQ; the desktop sends no row for it and s2 has no pane label.
+        attachDesktop(() => hqReply('ws-legacy', {}, sidebar().workspaces.filter((w) => w.id !== 'ws-legacy')));
+        const info = await startRO();
+        const token = info.token as string;
+        const workspaces = (await getJson(token, '/api/workspaces')).workspaces as Row[];
+        expect(roles(workspaces)).toEqual({ 'ws-1': null, 'ws-legacy': 'hq' });
+        const sessions = (await getJson(token, '/api/sessions')).sessions as Row[];
+        expect(roles(sessions)).toEqual({ s1: null, s2: 'hq', s3: null });
+      });
+
+      it('tags every session of a multi-pane HQ, and never a task workspace the HQ delegated to', async () => {
+        const HQ = 'ws-hq';
+        const TASK = 't-from-hq';
+        const PLAIN = 'ws-plain';
+        const snapshot = {
+          activeWorkspaceId: HQ,
+          hqWorkspaceId: HQ,
+          workspaces: [
+            { id: PLAIN, order: 0, pinned: false },
+            { id: HQ, order: 1, pinned: false },
+            // A fan-out task the HQ started: owned by the HQ, nested under it.
+            { id: TASK, order: 2, pinned: false, task: { ownerWorkspaceId: HQ, detached: false, nested: true, paneGroup: 'pane', requesterPaneId: 'pane-h1' } },
+          ],
+          panes: [
+            { ptyId: 'h-1', workspaceId: HQ, paneId: 'pane-h1', paneName: 'w2-1' },
+            { ptyId: 'h-2', workspaceId: HQ, paneId: 'pane-h2', paneName: 'w2-2' },
+            { ptyId: 'h-3', workspaceId: HQ, paneId: 'pane-h2', paneName: 'w2-2' },
+            { ptyId: 't-1', workspaceId: TASK, paneId: 'pane-t1', paneName: 'w3-1' },
+            { ptyId: 'p-1', workspaceId: PLAIN, paneId: 'pane-p1', paneName: 'w1-1' },
+          ],
+        };
+        const sessions = [['h-1', HQ], ['h-2', HQ], ['h-3', HQ], ['t-1', TASK], ['p-1', PLAIN]].map(([id, ws]) => ({
+          id, cwd: '/repo', cols: 80, rows: 24, state: 'attached',
+          agent: undefined, lastDetectedAgent: undefined, lastActivity: '2020-01-01T00:00:00.000Z',
+          env: { WMUX_WORKSPACE_ID: ws, WMUX_WORKSPACE_NAME: ws }, cmd: '/bin/zsh',
+        }));
+        const fixture = live.splice(0, live.length, ...sessions);
+        try {
+          attachDesktop(() => ({
+            workspaces: [
+              { id: HQ, name: 'Moa', sessionId: 'h-1' },
+              { id: TASK, name: 'task', sessionId: 't-1' },
+              { id: PLAIN, name: 'plain', sessionId: 'p-1' },
+            ],
+            sidebar: snapshot,
+          }));
+          const info = await startRW();
+          const token = info.token as string;
+          const listed = (await getJson(token, '/api/sessions')).sessions as Row[];
+          expect(roles(listed)).toEqual({ 'h-1': 'hq', 'h-2': 'hq', 'h-3': 'hq', 't-1': null, 'p-1': null });
+          const workspaces = (await getJson(token, '/api/workspaces')).workspaces as Row[];
+          expect(roles(workspaces)).toEqual({ [PLAIN]: null, [HQ]: 'hq', [TASK]: null });
+          // The task still says who owns it, so the phone can nest it — just not as HQ.
+          expect(workspaces.find((w) => w.id === TASK)).toMatchObject({ ownerWorkspaceId: HQ, nested: true });
+          const registry = (await getJson(token, '/api/desktop-workspaces')).workspaces as Row[];
+          expect(roles(registry)).toEqual({ [HQ]: 'hq', [TASK]: null, [PLAIN]: null });
+        } finally {
+          live.splice(0, live.length, ...fixture);
+        }
+      });
+
+      it('carries no role without an HQ, without a desktop, or for a malformed HQ id', async () => {
+        attachDesktop(() => ({ workspaces: registryRows, sidebar: sidebar() }));
+        let info = await startRW();
+        for (const route of ['/api/workspaces', '/api/sessions', '/api/desktop-workspaces']) {
+          expect(JSON.stringify(await getJson(info.token as string, route))).not.toContain('"role"');
+        }
+        await server.stop();
+        attachDesktop(() => hqReply('ws-1\u202e'));
+        info = await startRW();
+        for (const route of ['/api/workspaces', '/api/sessions', '/api/desktop-workspaces']) {
+          expect(JSON.stringify(await getJson(info.token as string, route))).not.toContain('"role"');
+        }
+        await server.stop();
+        desktopBridge = null;
+        info = await startRW();
+        for (const route of ['/api/workspaces', '/api/sessions']) {
+          expect(JSON.stringify(await getJson(info.token as string, route))).not.toContain('"role"');
+        }
+      });
+
+      it('advertises moa only while the desktop says Moa is on, even on the first, cold /api/config', async () => {
+        attachDesktop(() => hqReply('ws-1', { moa: true }));
+        let info = await startRO();
+        // No list route polled first: the config answer waits for the first snapshot.
+        expect((await getJson(info.token as string, '/api/config')).moa).toBe(true);
+        await server.stop();
+        // HQ designated, Moa off (or HQ missing): the row is still HQ, moa is omitted.
+        attachDesktop(() => hqReply('ws-1'));
+        info = await startRO();
+        expect('moa' in (await getJson(info.token as string, '/api/config'))).toBe(false);
+        expect(roles((await getJson(info.token as string, '/api/workspaces')).workspaces as Row[])['ws-1']).toBe('hq');
+        await server.stop();
+        // A desktop that sends anything but true.
+        attachDesktop(() => hqReply('ws-1', { moa: 'yes' }));
+        info = await startRO();
+        expect('moa' in (await getJson(info.token as string, '/api/config'))).toBe(false);
+        await server.stop();
+        desktopBridge = null;
+        info = await startRO();
+        expect('moa' in (await getJson(info.token as string, '/api/config'))).toBe(false);
+      });
+
+      it('names the Moa pane in /api/config only beside moa and only while main vouches for a live HQ brain', async () => {
+        const hqBrain = { ...brainRow, id: 'brain-hq', env: { WMUX_BRAIN_PTY: '1', WMUX_WORKSPACE_ID: 'ws-1' } };
+        live.push(hqBrain);
+        try {
+          attachDesktop(() => hqReply('ws-1', { moa: true }));
+          moaFact = { sessionId: 'brain-hq', workspaceId: 'ws-1' };
+          let info = await startRO();
+          const phone = await pairDevice('Phone');
+          const config = await getJson(phone.token, '/api/config');
+          expect(config).toMatchObject({ moa: true, moaSessionId: 'brain-hq' });
+          // Never the brain's env, cwd or anything else about the pane.
+          expect(JSON.stringify(config)).not.toContain('WMUX_BRAIN_PTY');
+          // The pane itself stays out of the session list.
+          expect(((await getJson(phone.token, '/api/sessions')).sessions as Row[]).map((r) => r.id)).not.toContain('brain-hq');
+          // Withdrawn by main (Moa off, HQ changed or missing, brain gone): gone at once,
+          // even while the sidebar snapshot still says moa.
+          moaFact = null;
+          expect('moaSessionId' in (await getJson(phone.token, '/api/config'))).toBe(false);
+          // A fact that no longer matches a live HQ brain names nothing.
+          for (const fact of [{ sessionId: 'brain-gone', workspaceId: 'ws-1' }, { sessionId: 'brain-hq', workspaceId: 'ws-2' }, { sessionId: 'brain-abc', workspaceId: 'ws-1' }]) {
+            moaFact = fact;
+            expect('moaSessionId' in (await getJson(phone.token, '/api/config'))).toBe(false);
+          }
+          await server.stop();
+          // The desktop says Moa is off: no moaSessionId even with a fact standing.
+          attachDesktop(() => hqReply('ws-1'));
+          moaFact = { sessionId: 'brain-hq', workspaceId: 'ws-1' };
+          info = await startRO();
+          const off = await getJson(info.token as string, '/api/config');
+          expect('moa' in off || 'moaSessionId' in off).toBe(false);
+        } finally {
+          live.splice(live.indexOf(hqBrain), 1);
+        }
+      });
+
+      it('still delivers an approval raised in the HQ to a paired phone, on /api/approvals and /api/events', async () => {
+        attachDesktop(() => hqReply('ws-1', { moa: true }));
+        await startRW();
+        const phone = await pairDevice('Phone');
+        // The HQ is known to the daemon before the approval lands.
+        expect(roles((await getJson(phone.token, '/api/sessions')).sessions as Row[]).s1).toBe('hq');
+        approvalRecords.push(mkApproval({ id: 'ap-hq', sessionId: 's1', kind: 'awaiting_permission', toolName: 'Bash' }));
+        emitApproval('create', mkApproval({ id: 'ap-hq-event', sessionId: 's1' }));
+        const approvals = (await getJson(phone.token, '/api/approvals')) as { pending?: Row[] };
+        expect(approvals.pending?.map((r) => r.id)).toEqual(['ap-hq']);
+        expect(approvals.pending?.[0]).toMatchObject({ sessionId: 's1', toolName: 'Bash' });
+        const backlog = JSON.stringify(await getJson(phone.token, '/api/events'));
+        expect(backlog).toContain('ap-hq-event');
+      });
+    });
+
     it('advertises fleetSidebar when a desktop bridge is wired, attached or not', async () => {
       // Wired, nothing attached (the getter returns no bridge right now).
       desktopBridge = null;
@@ -9923,6 +10141,7 @@ describe('WebTerminalServer', () => {
       attachDesktop(() => ({ workspaces: [], sidebar: sidebar() }));
       info = await startRO();
       expect((await getJson(info.token as string, '/api/config')).fleetSidebar).toBe(true);
+      expect((await getJson(info.token as string, '/api/config')).moaDelegations).toBe(true);
     });
 
     it('omits fleetSidebar from a daemon with no desktop bridge wired', async () => {
@@ -9935,7 +10154,9 @@ describe('WebTerminalServer', () => {
       try {
         const res = await fetch(`http://127.0.0.1:${info.port}/api/config`, { headers: bearer(info.token as string) });
         expect(res.status).toBe(200);
-        expect('fleetSidebar' in ((await res.json()) as Record<string, unknown>)).toBe(false);
+        const config = (await res.json()) as Record<string, unknown>;
+        expect('fleetSidebar' in config).toBe(false);
+        expect('moaDelegations' in config).toBe(false);
       } finally {
         await bare.stop();
       }

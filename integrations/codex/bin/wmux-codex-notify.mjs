@@ -8,20 +8,18 @@
 // `{ type, thread-id, turn-id, cwd, input-messages, last-assistant-message }`;
 // older Codex builds may use
 // `{ session_id, transcript_path, cwd, hook_event_name, model, ... }`.
-// Spawned by the Codex process in the pane, it inherits the pane env, so
-// WMUX_PTY_ID pins the capture to the exact pane and WMUX_DATA_SUFFIX pins every
-// endpoint/file to that instance. Spawned by a SHARED Codex app-server, it
-// inherits the env of whichever pane started that server instead; when that
-// env claims a pane, the notification is refused (see "Notifier origin"
-// below, #1523).
+// Pane-side SessionStart records thread ownership in the account's
+// wmux-thread-owners directory. Shared app-server notifications use that
+// record's pane and instance, never the server's inherited identity. Unknown
+// shared threads are dropped, with no cwd fallback or resume spool.
 //
 // This script:
 //   1. Parses the LAST argv as the Codex notify JSON payload.
 //   2. Ignores unrelated official lifecycle event types.
-//   3. Refuses a notification spawned by a shared Codex app-server whose env
-//      claims a wmux pane: nothing is sent or spooled under that identity.
+//   3. Resolves shared-server notifications through recorded TUI ownership.
 //   4. Builds a canonical, metadata-only AgentSignal envelope
-//      (agent:'codex', kind:'agent.stop'); prompt and assistant content is never
+//      (agent:'codex', kind:'agent.stop', or 'agent.subagent_stop' without a
+//      resume-binding id for a sub-agent thread); prompt and assistant content is never
 //      logged or forwarded.
 //   5. Sends the envelope to the first wmux endpoint that owns the request: the
 //      DAEMON control pipe (`daemon.hooks.signal`, suffix-scoped daemon token —
@@ -33,7 +31,7 @@
 //   6. On failure, spools a suffix-scoped resume-binding record for daemon boot.
 //   7. Exits 0 ALWAYS, under a hard timeout, so a wmux problem never stalls Codex.
 //
-// SELF-CONTAINED: JS-only, Node built-ins only — no imports from src/ or
+// JS-only with a sibling wmux-codex-thread.mjs; no imports from src/ or
 // integrations/shared/ (mirrors integrations/claude/bin/wmux-bridge.mjs; the
 // Claude bridge's plugin constraint blocks a shared import, so full DRY across
 // the two is impossible — the shared infra is duplicated by design). This
@@ -54,7 +52,9 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createConnection } from 'node:net';
 import { randomUUID } from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+import {
+  classifyCodexThread, codexSessionsRoot, notifierOrigin, attributeThread,
+} from './wmux-codex-thread.mjs';
 
 const HOOK_TIMEOUT_MS = 2000; // hard cap so we never stall a Codex turn
 const AGENT_TURN_COMPLETE = 'agent-turn-complete';
@@ -63,7 +63,16 @@ const AGENT_TURN_COMPLETE = 'agent-turn-complete';
 //   0.3.0 — official payload routing + suffix-isolated endpoint/state paths.
 //   0.4.0 — refuse a notification spawned by a shared Codex app-server whose
 //           env claims a wmux pane (#1523).
-const BRIDGE_VERSION = '0.4.0';
+//   0.5.0 — a sub-agent thread's turn-complete is sent as agent.subagent_stop
+//           under its root thread's id, not as the pane's own turn (#1696).
+//   0.6.0 — #1697 review: a root is only ever a CONFIRMED top-level thread
+//           (own id verified in its own session_meta, cycle-guarded) — never
+//           an unresolved or unverified intermediate; a sub-agent completion
+//           carries no agentSessionId and is never spooled, so an imperfect
+//           root can no longer rebind or replace a pane's resume binding
+//           either way; the rollout scan runs after the shared-server origin
+//           check and reads a bounded number of directory entries.
+const BRIDGE_VERSION = '0.6.0';
 const CONNECT_RETRY_BACKOFFS_MS = [100, 250];
 const TRANSIENT_CONNECT_CODES = new Set([
   'EPERM', 'ECONNREFUSED', 'ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'EBUSY', 'EAGAIN',
@@ -334,278 +343,12 @@ async function sendToTargets(targets, buildRequest) {
   return { result, target };
 }
 
-// ----- Notifier origin (#1523) --------------------------------------------
-//
-// Codex CLI 0.157+ runs turns in one shared, detached background server per
-// account (`codex app-server --listen unix:// --managed-daemon`) instead of in
-// the TUI. The first Codex to start that server hands it its environment, and
-// this program is spawned FROM that server — so when that first Codex ran in a
-// wmux pane, its WMUX_* variables name that pane (maybe closed, maybe in
-// another wmux instance), not the pane whose turn finished. The payload names
-// no pane either. Such a notification has no provable pane identity, and even
-// its instance (WMUX_DATA_SUFFIX) is someone else's: it is dropped — not sent,
-// not spooled. All three must hold:
-//   - the spawner's argv has the SHAPE of a Codex app-server: `app-server` is
-//     its subcommand, not a word in a prompt or an option value;
-//   - that server is SHARED: `--managed-daemon`, or a `--listen` other than
-//     `stdio://`. A stdio server belongs to the one client that started it —
-//     wmux's own Chat composer runs one per pane with that pane's environment;
-//   - the environment CLAIMS a pane. A shared server wmux started itself has
-//     every WMUX_* variable removed, so it names no pane to get wrong; its
-//     notification goes out without one, as before, and wmux places it by cwd.
-//
-// Older Codex builds, `--no-daemon` (what wmux's bash/zsh `codex` wrapper
-// runs), `exec` and `review` spawn this program from the Codex process in the
-// pane, where the inherited identity is exact. That path is unchanged, and so
-// is a parent this program cannot inspect: its environment is trusted as
-// before. The guarantee is "a notification from a shared server never carries
-// its starter's pane", not "every attribution is proven".
-
-const SELF_BASENAME = 'wmux-codex-notify.mjs';
-// This program's own wrappers (a version-manager shim such as Volta's `node`
-// re-runs the same command line as a child) plus the Codex process above them.
-const MAX_ORIGIN_HOPS = 4;
-// One budget for the whole ancestor walk, well under the 1.5 s the hook
-// harmlessness gate allows a bridge over a no-op hook. A PowerShell start is
-// ~300 ms; a lookup that runs out is 'unknown', and the environment is trusted.
-const ORIGIN_LOOKUP_BUDGET_MS = 900;
-// On WSL this bridge is a Windows process and cannot see the Linux Codex that
-// spawned the launcher; the launcher (WSL_CODEX_HOOK in
-// src/shared/wslIntegration.ts) hands that argv over (parseHandedArgv). It
-// sets the variable only for its own `exec` of this bridge.
-const HANDED_ARGV_ENV = 'WMUX_CODEX_NOTIFIER_ARGV';
-
-// Codex global options that take a value (codex-cli 0.158 `--help`; the
-// bash/zsh `codex` wrapper in src/daemon/shell-integration.ts skips the same).
-const CODEX_VALUE_OPTIONS = new Set([
-  '-c', '--config', '--enable', '--disable', '--remote', '--remote-auth-token-env',
-  '-m', '--model', '--local-provider', '-p', '--profile', '-s', '--sandbox',
-  '-C', '--cd', '--add-dir', '-a', '--ask-for-approval',
-]);
-
-function isSelfToken(token) {
-  return typeof token === 'string'
-    && (token.split(/[\\/]/).pop() ?? '').toLowerCase() === SELF_BASENAME;
-}
-
-/**
- * Split a Windows `CommandLine` the way CommandLineToArgvW does: whitespace
- * outside double quotes separates arguments, 2n backslashes before a quote
- * are n backslashes and the quote toggles quoting, 2n+1 are n backslashes and
- * a literal quote, other backslashes are literal, and `""` inside quotes is a
- * literal quote. Single quotes are ordinary characters on Windows.
- * Exported for tests.
- */
-export function tokenizeCommandLine(cmdline) {
-  const s = typeof cmdline === 'string' ? cmdline : '';
-  const tokens = [];
-  let cur = '';
-  let inToken = false;
-  let quoted = false;
-  for (let i = 0; i < s.length; i++) {
-    const ch = s[i];
-    if (ch === '\\') {
-      let n = 0;
-      while (s[i] === '\\') { n++; i++; }
-      if (s[i] === '"') {
-        cur += '\\'.repeat(n >> 1);
-        if (n % 2 === 1) cur += '"';
-        else quoted = !quoted;
-      } else {
-        cur += '\\'.repeat(n);
-        i--; // the character after the run is read by the next iteration
-      }
-      inToken = true;
-    } else if (ch === '"') {
-      if (quoted && s[i + 1] === '"') { cur += '"'; i++; }
-      else quoted = !quoted;
-      inToken = true;
-    } else if ((ch === ' ' || ch === '\t') && !quoted) {
-      if (inToken) tokens.push(cur);
-      cur = '';
-      inToken = false;
-    } else {
-      cur += ch;
-      inToken = true;
-    }
-  }
-  if (inToken) tokens.push(cur);
-  return tokens;
-}
-
-/**
- * Index of a Codex command line's subcommand: the first positional after the
- * executable, past global options and their values. -1 when there is none —
- * after `--` every word is a prompt, and after `-i/--image` (which takes any
- * number of files) a word cannot be told apart from one more file.
- */
-function codexSubcommandIndex(argv) {
-  for (let i = 1; i < argv.length; i++) {
-    const arg = argv[i];
-    if (arg === '--') return -1;
-    if (CODEX_VALUE_OPTIONS.has(arg)) { i++; continue; }
-    if (arg === '-i' || arg === '--image' || arg.startsWith('--image=') || /^-i./.test(arg)) return -1;
-    if (arg.startsWith('-')) continue; // a flag, or an option with its value attached
-    return i;
-  }
-  return -1;
-}
-
-/**
- * Is this argv a SHARED Codex app-server — one that serves more than the one
- * client that started it? `app-server` must be the subcommand, and the server
- * a managed daemon or listening anywhere but stdio. The executable's name is
- * not checked: release binaries carry a target suffix and `ps` splits a spaced
- * path. That splitting also shifts positions, so `--managed-daemon` next to an
- * `app-server` word counts on its own. Exported for tests.
- */
-export function isSharedServerArgv(argv) {
-  if (!Array.isArray(argv)) return false;
-  if (argv.includes('--managed-daemon') && argv.includes('app-server')) return true;
-  const sub = codexSubcommandIndex(argv);
-  if (sub < 0 || argv[sub] !== 'app-server') return false;
-  for (let i = sub + 1; i < argv.length; i++) {
-    const arg = argv[i];
-    if (arg === '--') break;
-    if (arg === '--managed-daemon') return true;
-    const listen = arg === '--listen' ? argv[i + 1] : arg.startsWith('--listen=') ? arg.slice('--listen='.length) : undefined;
-    if (listen !== undefined && listen !== 'stdio://') return true;
-  }
-  return false;
-}
-
-/**
- * Who asked for this notification, from the argv of this process's ancestors,
- * nearest first. An ancestor whose argv runs this script is a wrapper of this
- * same command and is skipped; the first other ancestor spawned the
- * notification and decides:
- *   'shared-server'  a shared Codex app-server (isSharedServerArgv).
- *   'process'        anything else — the Codex process in the pane, or a
- *                    stdio app-server that one client started.
- *   'unknown'        no readable ancestor, or only wrappers.
- * Exported for tests.
- */
-export function classifyNotifierOrigin(chain) {
-  for (const argv of Array.isArray(chain) ? chain : []) {
-    if (!Array.isArray(argv) || argv.length === 0) return 'unknown';
-    if (argv.some(isSelfToken)) continue;
-    return isSharedServerArgv(argv) ? 'shared-server' : 'process';
-  }
-  return 'unknown';
-}
-
-/**
- * Does this environment claim a pane or an instance? Only then can a shared
- * server's notification be attributed to the wrong one. Exported for tests.
- */
-export function claimsPaneIdentity(env) {
-  return ['WMUX_PTY_ID', 'WMUX_WORKSPACE_ID', 'WMUX_SURFACE_ID', 'WMUX_DATA_SUFFIX']
-    .some((key) => typeof env?.[key] === 'string' && env[key].length > 0);
-}
-
-/**
- * Linux `/proc/<pid>/cmdline` + `/proc/<pid>/stat` → `{ argv, ppid }`. The
- * stat line is `pid (comm) state ppid …`, and comm may itself hold spaces and
- * parentheses, so the fields are read after the LAST `)`. Exported for tests.
- */
-export function parseProcEntry(cmdline, stat) {
-  const argv = cmdline.split('\0');
-  if (argv[argv.length - 1] === '') argv.pop();
-  const ppid = Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[1]);
-  return { argv, ppid: Number.isInteger(ppid) ? ppid : 0 };
-}
-
-/**
- * One line of `ps -o ppid=,args=` → `{ argv, ppid }`, or null. The args
- * column is unquoted, so a spaced argument splits into several tokens; the
- * server test reads positions and names no prompt word. Exported for tests.
- */
-export function parsePsEntry(out) {
-  const match = /^\s*(\d+)\s+(.*\S)/.exec(out);
-  return match ? { argv: match[2].split(/\s+/), ppid: Number(match[1]) } : null;
-}
-
-/**
- * The argv the WSL launcher hands over: `/proc/<pid>/cmdline` with every NUL
- * turned into U+001F, so each argument ENDS with one. The final terminator is
- * dropped, as parseProcEntry drops /proc's; a value the launcher cut short
- * keeps its last, partial argument. Exported for tests.
- */
-export function parseHandedArgv(value) {
-  const argv = value.split('\x1f');
-  if (argv[argv.length - 1] === '') argv.pop();
-  return argv;
-}
-
-// Linux: straight from /proc, no spawn.
-function procEntryLinux(pid) {
-  return parseProcEntry(readFileSync(`/proc/${pid}/cmdline`, 'utf8'), readFileSync(`/proc/${pid}/stat`, 'utf8'));
-}
-
-// macOS and other POSIX: one `ps` per hop.
-function procEntryPs(pid, timeout) {
-  return parsePsEntry(execFileSync(existsSync('/bin/ps') ? '/bin/ps' : 'ps',
-    ['-ww', '-o', 'ppid=,args=', '-p', String(pid)],
-    { encoding: 'utf8', timeout, stdio: ['ignore', 'pipe', 'ignore'] }));
-}
-
-// Windows: one Windows PowerShell for the whole walk, stopping at the first
-// ancestor that is not a wrapper of this script, like readAncestorChain.
-// `[wmi]` rather than Get-CimInstance: loading CimCmdlets alone added ~500 ms.
-// One `L`-prefixed line per ancestor, line breaks inside a command line
-// flattened. UTF-8 output: in a legacy code page a trail byte can read back as
-// a backslash, and backslashes decide quoting in tokenizeCommandLine.
-function ancestorChainWindows(startPid, timeout) {
-  const powershell = join(process.env.SystemRoot || 'C:\\Windows',
-    'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-  const script = [
-    '[Console]::OutputEncoding=[Text.Encoding]::UTF8;',
-    `$p=${Number(startPid)};`,
-    `for ($i=0; $i -lt ${MAX_ORIGIN_HOPS} -and $p -gt 0; $i++) {`,
-    "try { $w=[wmi]('Win32_Process.Handle=' + [char]34 + $p + [char]34) } catch { break };",
-    "$c=[string]$w.CommandLine -replace '[\\r\\n]',' ';",
-    "'L' + $c;",
-    `if ($c -notlike '*${SELF_BASENAME}*') { break };`,
-    '$p=[int]$w.ParentProcessId };',
-    'exit 0',
-  ].join(' ');
-  const out = execFileSync(powershell, ['-NoProfile', '-NonInteractive', '-Command', script],
-    { encoding: 'utf8', timeout, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
-  return out.split(/\r?\n/)
-    .filter((line) => line.startsWith('L'))
-    .map((line) => tokenizeCommandLine(line.slice(1)));
-}
-
-/**
- * The argv of this process's ancestors, nearest first, up to the first one
- * that is not a wrapper of this script — or the one argv the WSL launcher
- * handed over. Never throws: a failed lookup ends the chain, and an empty
- * chain classifies as 'unknown'. PID 1 is never read — a parent that already
- * exited leaves this process re-parented to init, which is not who asked for
- * the notification.
- */
-function readAncestorChain(startPid = process.ppid) {
-  const handed = process.env[HANDED_ARGV_ENV];
-  if (typeof handed === 'string' && handed.length > 0) return [parseHandedArgv(handed)];
-  const deadline = Date.now() + ORIGIN_LOOKUP_BUDGET_MS;
-  const chain = [];
-  try {
-    if (process.platform === 'win32') return ancestorChainWindows(startPid, ORIGIN_LOOKUP_BUDGET_MS);
-    let pid = startPid;
-    for (let hop = 0; hop < MAX_ORIGIN_HOPS && pid > 1; hop++) {
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) break;
-      const entry = process.platform === 'linux' ? procEntryLinux(pid) : procEntryPs(pid, remaining);
-      if (!entry) break;
-      chain.push(entry.argv);
-      if (!entry.argv.some(isSelfToken)) break;
-      pid = entry.ppid;
-    }
-  } catch {
-    // An unreadable ancestor ends the walk; what was read still counts.
-  }
-  return chain;
-}
+// Origin and rollout classification are shared with the hooks bridge.
+export {
+  classifyNotifierOrigin, isSharedServerArgv, claimsPaneIdentity, tokenizeCommandLine,
+  parseProcEntry, parsePsEntry, parseHandedArgv,
+  uuidV7Millis, findRolloutFile, parseSessionMeta, classifyCodexThread,
+} from './wmux-codex-thread.mjs';
 
 // ----- Main ---------------------------------------------------------------
 
@@ -662,41 +405,58 @@ async function main() {
   }
   const turnId = nonEmptyStr(payload['turn-id']);
   const cwd = nonEmptyStr(payload.cwd) ?? process.cwd();
-  const transcriptPath = nonEmptyStr(payload.transcript_path);
+  const transcriptPathClaimed = nonEmptyStr(payload.transcript_path);
 
+  const origin = notifierOrigin();
+
+  // #1696/#1697: a sub-agent thread reports as agent.subagent_stop with no
+  // agentSessionId (see "Sub-agent threads" above) — never agent.stop under
+  // its own id, which would replace the pane's resume binding with a thread
+  // the user cannot type into.
+  let thread = { subagent: false, rootId: sessionId };
+  try {
+    thread = classifyCodexThread(sessionId, codexSessionsRoot(process.env));
+  } catch {
+    // Fail open: an unreadable history is today's agent.stop.
+  }
+  if (!await attributeThread(origin, thread)) return;
   const envPtyId = nonEmptyStr(process.env.WMUX_PTY_ID);
-  const wslAgentProcess = wslAgentProcessFromEnv(process.env);
   const envWorkspaceId = nonEmptyStr(process.env.WMUX_WORKSPACE_ID);
   const envSurfaceId = nonEmptyStr(process.env.WMUX_SURFACE_ID);
+  const wslAgentProcess = origin !== 'shared-server' ? wslAgentProcessFromEnv(process.env) : undefined;
 
-  // Before anything is sent OR spooled (the no-token branch below spools too):
-  // a shared server's inherited identity is not this turn's pane (#1523). An
-  // environment that claims no pane has nothing to get wrong and is sent as
-  // before, so its ancestors are not even read.
-  const origin = claimsPaneIdentity(process.env) ? classifyNotifierOrigin(readAncestorChain()) : 'unclaimed';
-  if (origin === 'shared-server') {
-    logEvent('refused-shared-server', { sessionId, ...(envPtyId ? { claimedPtyId: envPtyId } : {}) });
-    return;
-  }
+  // A sub-agent's own transcript_path (legacy payloads) names the sub-agent's
+  // rollout and must never ride along under any other thread's signal.
+  const transcriptPath = thread.subagent ? undefined : transcriptPathClaimed;
+  const signalKind = thread.subagent ? 'agent.subagent_stop' : 'agent.stop';
+  const threadLog = thread.subagent
+    ? { subagent: true, ...(thread.rootId ? { rootSessionId: thread.rootId } : {}) }
+    : {};
 
   // Endpoints to try, daemon first (see resolveTargets).
   const targets = resolveTargets();
   if (targets.length === 0) {
-    logEvent('no-auth-token', { origin, paths: [getDaemonAuthTokenPath(), getAuthTokenPath()] });
-    // Still spool so a later daemon boot reconciles the capture.
-    if (envPtyId) spoolResumeBinding({ ptyId: envPtyId, agent: 'codex', sessionId, cwd, transcriptPath, ts: Date.now() });
+    logEvent('no-auth-token', { origin, ...threadLog, paths: [getDaemonAuthTokenPath(), getAuthTokenPath()] });
+    // Still spool so a later daemon boot reconciles the capture. A sub-agent
+    // completion carries no id to spool (#1697 review, "should fix" #5): it
+    // must never replace an older, valid agent.stop spool for this pane.
+    if (envPtyId && !thread.subagent) {
+      spoolResumeBinding({ ptyId: envPtyId, agent: 'codex', sessionId, cwd, transcriptPath, ts: Date.now() });
+    }
     return;
   }
 
   // Canonical AgentSignal envelope. kind 'agent.stop' = a turn completed (the
   // strongest "task done" signal); it triggers the agent-agnostic resume-binding
-  // capture in hooks.rpc.ts. Only non-sensitive, allowlisted metadata rides in
+  // capture in hooks.rpc.ts. A sub-agent thread's turn is 'agent.subagent_stop'
+  // with no agentSessionId (see "Sub-agent threads" above), so it binds
+  // nothing. Only non-sensitive, allowlisted metadata rides in
   // signal.payload: official turn-id and the legacy transcript_path used by the
   // binding's D5 liveness probe. Native input/assistant content is never copied.
   const envelope = {
-    kind: 'agent.stop',
+    kind: signalKind,
     agent: 'codex',
-    agentSessionId: sessionId,
+    ...(thread.subagent ? {} : { agentSessionId: sessionId }),
     ...(envWorkspaceId ? { workspaceId: envWorkspaceId } : {}),
     ...(envSurfaceId ? { surfaceId: envSurfaceId } : {}),
     ...(envPtyId ? { ptyId: envPtyId } : {}),
@@ -723,18 +483,21 @@ async function main() {
   const innerOk = outerOk && rpcResult.result && rpcResult.result.ok === true;
 
   if (innerOk) {
-    logEvent('ok', { sessionId, target: target?.name, origin });
+    logEvent('ok', { sessionId, ...threadLog, target: target?.name, origin });
   } else {
     logEvent(outerOk ? 'rpc-rejected' : 'rpc-failed', {
       origin,
+      ...threadLog,
       target: target?.name,
       reason: rpcResult?.result?.reason,
       error: rpcResult?.error,
       detail: rpcResult?.detail,
     });
     // Anything but a durable success would lose the capture. Spool it (needs
-    // the exact per-pane key) so the daemon reconciles it on its next boot.
-    if (envPtyId) {
+    // the exact per-pane key) so the daemon reconciles it on its next boot —
+    // except a sub-agent completion, which carries nothing to spool and must
+    // never replace an older, valid agent.stop spool for this pane.
+    if (envPtyId && !thread.subagent) {
       spoolResumeBinding({ ptyId: envPtyId, agent: 'codex', sessionId, cwd, transcriptPath, ts: envelope.ts });
     }
   }

@@ -38,6 +38,12 @@ import type { ComputerUseSettingsPayload } from '../shared/computer/config';
 import type { QuickLaunchSettingsPayload } from '../shared/quickLaunch';
 import type { ResumeBinding } from '../shared/agentResume';
 import type { PaneUsageLimit, PaneUsageLimitPatch } from '../shared/usageLimit';
+import type {
+  WorkspaceSettleChangedPayload,
+  WorkspaceSettleCommand,
+  WorkspaceSettleCommandResult,
+  WorkspaceSettleSnapshot,
+} from '../shared/workspaceSettle';
 import type { DeadPaneRecovery } from '../shared/ptyRecovery';
 import type { AgentSlug } from '../shared/events';
 import type { BrowserHelpOutcome, BrowserHelpRequestInfo } from '../shared/browserHelp';
@@ -76,8 +82,14 @@ export interface McpTargetStatusPayload {
   verified: boolean;
   wmux: { registered: boolean; path: string | null };
 }
-interface McpStatusPayload {
+export interface McpStatusPayload {
   targets: McpTargetStatusPayload[];
+}
+export interface McpRegisterTargetResult {
+  id: string;
+  success: boolean;
+  error?: string;
+  status: McpStatusPayload;
 }
 
 const chat: ChatBridgeApi = {
@@ -481,8 +493,8 @@ const electronAPI = {
     // progress) flow through this one shape. Renderer routes by ptyId
     // (preferred) or workspaceId (for surface-less updates like
     // meta.setStatus on the active workspace).
-    onUpdate: (callback: (payload: { ptyId?: string; workspaceId?: string; gitBranch?: string; cwd?: string; listeningPorts?: number[]; agentStatus?: string; agentName?: string; status?: string; progress?: number; gitIsWorktree?: boolean; pr?: { number: number; state: 'open' | 'draft' | 'merged' | 'closed'; checks: 'pending' | 'passing' | 'failing' | null; url: string } | null; gitSync?: { dirty: number; ahead: number; behind: number; hasUpstream: boolean } | null; lastNotificationText?: { ts: number; title: string | null; body: string; source: 'osc9' | 'osc777' | 'osc99' }; activity?: string; pendingQuestion?: string; lastMessage?: string; paneId?: string; paneLabel?: string; paneRole?: string; agentSlug?: string | null; hookKind?: string; settled?: boolean }) => void) => {
-      const listener = (_event: Electron.IpcRendererEvent, payload: { ptyId?: string; workspaceId?: string; gitBranch?: string; cwd?: string; listeningPorts?: number[]; agentStatus?: string; agentName?: string; status?: string; progress?: number; gitIsWorktree?: boolean; pr?: { number: number; state: 'open' | 'draft' | 'merged' | 'closed'; checks: 'pending' | 'passing' | 'failing' | null; url: string } | null; gitSync?: { dirty: number; ahead: number; behind: number; hasUpstream: boolean } | null; lastNotificationText?: { ts: number; title: string | null; body: string; source: 'osc9' | 'osc777' | 'osc99' }; activity?: string; pendingQuestion?: string; lastMessage?: string; paneId?: string; paneLabel?: string; paneRole?: string; agentSlug?: string | null; hookKind?: string; settled?: boolean }) =>
+    onUpdate: (callback: (payload: { ptyId?: string; workspaceId?: string; gitBranch?: string; cwd?: string; listeningPorts?: number[]; agentStatus?: string; agentName?: string; status?: string; progress?: number; gitIsWorktree?: boolean; pr?: { number: number; state: 'open' | 'draft' | 'merged' | 'closed'; checks: 'pending' | 'passing' | 'failing' | null; url: string } | null; gitSync?: { dirty: number; ahead: number; behind: number; hasUpstream: boolean } | null; lastNotificationText?: { ts: number; title: string | null; body: string; source: 'osc9' | 'osc777' | 'osc99' }; activity?: string; pendingQuestion?: string; lastMessage?: string; lastActivity?: ''; paneId?: string; paneLabel?: string; paneRole?: string; agentSlug?: string | null; hookKind?: string; settled?: boolean }) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, payload: { ptyId?: string; workspaceId?: string; gitBranch?: string; cwd?: string; listeningPorts?: number[]; agentStatus?: string; agentName?: string; status?: string; progress?: number; gitIsWorktree?: boolean; pr?: { number: number; state: 'open' | 'draft' | 'merged' | 'closed'; checks: 'pending' | 'passing' | 'failing' | null; url: string } | null; gitSync?: { dirty: number; ahead: number; behind: number; hasUpstream: boolean } | null; lastNotificationText?: { ts: number; title: string | null; body: string; source: 'osc9' | 'osc777' | 'osc99' }; activity?: string; pendingQuestion?: string; lastMessage?: string; lastActivity?: ''; paneId?: string; paneLabel?: string; paneRole?: string; agentSlug?: string | null; hookKind?: string; settled?: boolean }) =>
         callback(payload);
       ipcRenderer.on(IPC.METADATA_UPDATE, listener);
       return () => { ipcRenderer.removeListener(IPC.METADATA_UPDATE, listener); };
@@ -553,6 +565,11 @@ const electronAPI = {
         ...(opts?.keepContext ? { keepContext: opts.keepContext } : {}),
         ...(opts?.taskId ? { taskId: opts.taskId } : {}),
         ...(opts?.pane ? { pane: opts.pane } : {}),
+        // The Git page's hand-off: the typing hold and its checks.
+        ...(opts?.waitQuiet ? { waitQuiet: true } : {}),
+        ...(opts?.waitQuiet && opts.expectAgent ? { expectAgent: opts.expectAgent } : {}),
+        ...(opts?.waitQuiet && opts.deadlineAt !== undefined ? { deadlineAt: opts.deadlineAt } : {}),
+        ...(opts?.waitQuiet && typeof opts.guardKey === 'string' ? { guardKey: opts.guardKey } : {}),
       }) as Promise<
         import('../shared/ptyMessageDelivery').GatedSubmitResult
       >,
@@ -743,7 +760,7 @@ const electronAPI = {
     send: (args: { workspaceId: string; text: string; fleetContext?: string; model?: string }) =>
       ipcRenderer.invoke(IPC.DECK_SEND, args) as Promise<{
         ok: boolean;
-        code?: 'busy' | 'disposed' | 'empty' | 'invalid_workspace';
+        code?: 'busy' | 'disposed' | 'empty' | 'invalid_workspace' | 'mode_off' | 'task_workspace' | 'moa_off' | 'not_hq' | 'hq_missing' | 'hq_unknown';
       }>,
     interrupt: (workspaceId: string) =>
       ipcRenderer.invoke(IPC.DECK_INTERRUPT, { workspaceId }) as Promise<{ ok: true }>,
@@ -766,7 +783,90 @@ const electronAPI = {
       ipcRenderer.invoke(IPC.DECK_STATUS, { workspaceId }) as Promise<{
         status: 'idle' | 'busy' | 'disposed';
         sessionId: string | null;
+        /** Present only while a designated HQ cannot run. */
+        hq?: 'hq-missing' | 'hq-unknown' | 'hq-store-corrupt';
       }>,
+    // The designated HQ workspace (main bot). Read-only from the renderer.
+    hq: {
+      get: () =>
+        ipcRenderer.invoke(IPC.DECK_HQ_GET) as Promise<{
+          workspaceId: string | null;
+          state: 'unset' | 'ok' | 'hq-missing' | 'hq-unknown' | 'hq-store-corrupt';
+        }>,
+    },
+    // The main bot's master switch (default on).
+    moa: {
+      get: () => ipcRenderer.invoke(IPC.DECK_MOA_GET) as Promise<{ enabled: boolean }>,
+      set: (enabled: boolean) =>
+        ipcRenderer.invoke(IPC.DECK_MOA_SET, { enabled }) as Promise<{ ok: boolean; enabled?: boolean; code?: string }>,
+      // Settings → Moa: one read for the switch, its settings, the HQ and the
+      // archived-decision notice; onChanged says it moved.
+      state: () =>
+        ipcRenderer.invoke(IPC.DECK_MOA_STATE) as Promise<import('../shared/moa').MoaState>,
+      setConfig: (patch: import('../shared/moa').MoaConfigPatch) =>
+        ipcRenderer.invoke(IPC.DECK_MOA_CONFIG_SET, patch) as Promise<{ ok: boolean; code?: string }>,
+      setup: (workspaceId: string, opts?: { rebind?: boolean }) =>
+        ipcRenderer.invoke(IPC.DECK_MOA_SETUP, { workspaceId, ...(opts?.rebind ? { rebind: true } : {}) }) as Promise<import('../shared/moa').MoaSetupResult>,
+      archiveList: () =>
+        ipcRenderer.invoke(IPC.DECK_MOA_ARCHIVE_LIST) as Promise<{ decisions: import('../shared/moa').MoaArchivedDecision[] }>,
+      archiveAck: () => ipcRenderer.invoke(IPC.DECK_MOA_ARCHIVE_ACK) as Promise<{ ok: boolean }>,
+      resetStore: () => ipcRenderer.invoke(IPC.DECK_MOA_STORE_RESET) as Promise<{ ok: boolean }>,
+      memoryList: () =>
+        ipcRenderer.invoke(IPC.DECK_MOA_MEMORY_LIST) as Promise<{ items: import('../shared/moa').MoaMemoryItem[] }>,
+      memoryDelete: (kind: import('../shared/moa').MoaMemoryItem['kind'], name: string) =>
+        ipcRenderer.invoke(IPC.DECK_MOA_MEMORY_DELETE, { kind, name }) as Promise<{ ok: boolean }>,
+      memoryCard: () =>
+        ipcRenderer.invoke(IPC.DECK_MOA_MEMORY_CARD) as Promise<{ card: import('../shared/moa').MoaMemoryCard | null }>,
+      memoryResolve: (args: { id: string; answer: 'save' | 'discard'; fullTextShown: boolean }) =>
+        ipcRenderer.invoke(IPC.DECK_MOA_MEMORY_RESOLVE, args) as Promise<{ ok: boolean; code?: string }>,
+      // Moa's own permission prompt (the HQ brain's dialog as an approval
+      // record), and pressing one of its choices from the Moa chat.
+      approval: () =>
+        ipcRenderer.invoke(IPC.DECK_MOA_APPROVAL) as Promise<{ approval: import('../shared/moa').MoaApproval | null }>,
+      approvalAnswer: (args: { approvalId: string; choiceKey: string; promptFingerprint: string }) =>
+        ipcRenderer.invoke(IPC.DECK_MOA_APPROVAL_ANSWER, args) as Promise<import('../shared/moa').MoaApprovalAnswerResult>,
+      // Every workspace's pending decision ("Waiting on you").
+      decisions: () =>
+        ipcRenderer.invoke(IPC.DECK_MOA_DECISIONS) as Promise<{ decisions: import('../shared/moa').MoaPendingDecision[] }>,
+      taskResult: (args: { workspaceId: string; taskId: string }) =>
+        ipcRenderer.invoke(IPC.DECK_MOA_TASK_RESULT, args) as Promise<{ result: import('../shared/moaResult').MoaTaskResult | null }>,
+      delegatedApprovals: () =>
+        ipcRenderer.invoke(IPC.DECK_MOA_DELEGATED_APPROVALS) as Promise<{ approvals: import('../shared/moa').MoaDelegatedApproval[] }>,
+      delegatedAnswer: (args: { approvalId: string; choiceKey: string; promptFingerprint: string }) =>
+        ipcRenderer.invoke(IPC.DECK_MOA_DELEGATED_ANSWER, args) as Promise<import('../shared/moa').MoaApprovalAnswerResult>,
+      // Moa's hand-offs: answer a hand-off card (a body only when the operator
+      // edited it), the recent auto hand-offs, and stopping one of them.
+      handoffResolve: (args: import('../shared/moaHandoff').MoaHandoffResolveRequest) =>
+        ipcRenderer.invoke(IPC.DECK_MOA_HANDOFF_RESOLVE, args) as Promise<import('../shared/moaHandoff').MoaHandoffResolveResult>,
+      handoffReceipts: () =>
+        ipcRenderer.invoke(IPC.DECK_MOA_HANDOFF_RECEIPTS) as Promise<{ receipts: import('../shared/moaHandoff').MoaAutoHandoffReceipt[] }>,
+      handoffStop: (args: { id: string }) =>
+        ipcRenderer.invoke(IPC.DECK_MOA_HANDOFF_STOP, args) as Promise<{ ok: boolean }>,
+      // The HQ brain's transcript as turn events (chat look over the terminal brain).
+      transcript: {
+        status: () =>
+          ipcRenderer.invoke(IPC.DECK_MOA_TRANSCRIPT_STATUS) as Promise<import('../shared/transcript/turnEvents').TranscriptStatus>,
+        snapshot: (opts?: { before?: number }) =>
+          ipcRenderer.invoke(IPC.DECK_MOA_TRANSCRIPT_SNAPSHOT, opts ?? {}) as Promise<import('../shared/transcript/turnEvents').TranscriptPage | null>,
+        // `client` names who listens ('panel', 'notice'): appends flow while
+        // any client is subscribed, so one cannot unsubscribe the other.
+        subscribe: (client?: string) =>
+          ipcRenderer.invoke(IPC.DECK_MOA_TRANSCRIPT_SUBSCRIBE, client) as Promise<import('../shared/transcript/turnEvents').TranscriptStatus>,
+        unsubscribe: (client?: string) => ipcRenderer.invoke(IPC.DECK_MOA_TRANSCRIPT_UNSUBSCRIBE, client) as Promise<void>,
+        codeBlock: (args: { srcOffset: number; n: number; eventId?: string }) =>
+          ipcRenderer.invoke(IPC.DECK_MOA_TRANSCRIPT_CODEBLOCK, args) as Promise<{ body: string } | null>,
+        onAppend: (callback: (data: import('../shared/transcript/turnEvents').TranscriptAppendData) => void) => {
+          const listener = (_e: Electron.IpcRendererEvent, data: import('../shared/transcript/turnEvents').TranscriptAppendData): void => callback(data);
+          ipcRenderer.on(IPC.DECK_MOA_TRANSCRIPT_APPEND, listener);
+          return () => { ipcRenderer.removeListener(IPC.DECK_MOA_TRANSCRIPT_APPEND, listener); };
+        },
+      },
+      onChanged: (callback: () => void) => {
+        const listener = (): void => callback();
+        ipcRenderer.on(IPC.DECK_MOA_CHANGED, listener);
+        return () => { ipcRenderer.removeListener(IPC.DECK_MOA_CHANGED, listener); };
+      },
+    },
     // P3d — persisted orchestrator schedules (fire as ordinary brain turns on
     // their own workspace's orchestrator).
     schedules: {
@@ -949,7 +1049,7 @@ const electronAPI = {
         ipcRenderer.invoke(IPC.DECK_DECISION_GET, { workspaceId }) as Promise<{
           decision: import('../main/deck/deckDecisionStore').WorkspaceDecision | null;
         }>,
-      resolve: (args: { workspaceId: string; id: string; resolution: string }) =>
+      resolve: (args: { workspaceId: string; id: string; resolution: string; dismiss?: boolean }) =>
         ipcRenderer.invoke(IPC.DECK_DECISION_RESOLVE, args) as Promise<{
           ok: boolean;
           code?: string;
@@ -1029,6 +1129,18 @@ const electronAPI = {
       ipcRenderer.on(IPC.DECK_FANOUT_CALLER, listener);
       return () => { ipcRenderer.removeListener(IPC.DECK_FANOUT_CALLER, listener); };
     },
+    // A PR event for a brain-less workspace: a pointer for the PR owner
+    // pane's one-line nudge (same queue as the fan-out caller nudge).
+    onPrOwner: (
+      callback: (ev: import('../main/deck/prOwnerNotify').PrOwnerEvent) => void,
+    ) => {
+      const listener = (
+        _e: Electron.IpcRendererEvent,
+        ev: import('../main/deck/prOwnerNotify').PrOwnerEvent,
+      ) => callback(ev);
+      ipcRenderer.on(IPC.DECK_PR_OWNER, listener);
+      return () => { ipcRenderer.removeListener(IPC.DECK_PR_OWNER, listener); };
+    },
     fanoutCallerSession: (ptyId: string) =>
       ipcRenderer.invoke(IPC.DECK_FANOUT_CALLER_SESSION, ptyId) as Promise<{ incarnationId: string } | null>,
     fanoutCallerSubmit: (payload: {
@@ -1036,6 +1148,8 @@ const electronAPI = {
       ownerWorkspaceId: string;
       incarnationId: string;
       text: string;
+      /** The PRs the line names, with the url the owner was resolved by. */
+      prs?: { number: number; url: string }[];
     }) =>
       ipcRenderer.invoke(IPC.DECK_FANOUT_CALLER_SUBMIT, payload) as Promise<
         import('../main/deck/fanoutCallerSubmit').FanoutCallerSubmitReply
@@ -1118,6 +1232,97 @@ const electronAPI = {
       ipcRenderer.invoke(IPC.GITHUB_PR_DETAIL, repoPath, number, updatedAt) as Promise<
         import('../main/ipc/handlers/github.handler').GithubPrDetailResult
       >,
+    // host/owner/repo of origin (lowercased), or null — groups clones of one repo.
+    repoKey: (repoPath: string) =>
+      ipcRenderer.invoke(IPC.GITHUB_REPO_KEY, repoPath) as Promise<{ key: string | null }>,
+    // Open issues (filtered) and one issue's detail; force skips the 30s TTL.
+    issueList: (repoPath: string, filter: import('../shared/issueSurface').IssueFilter, force?: boolean) =>
+      ipcRenderer.invoke(IPC.GITHUB_ISSUE_LIST, repoPath, filter, force ?? false) as Promise<
+        import('../shared/issueSurface').IssueListResult
+      >,
+    issueDetail: (repoPath: string, number: number, updatedAt: string) =>
+      ipcRenderer.invoke(IPC.GITHUB_ISSUE_DETAIL, repoPath, number, updatedAt) as Promise<
+        import('../shared/issueSurface').IssueDetailResult
+      >,
+    // PR review and CI: reads, and writes tied to the head the person saw
+    // (main re-reads it right before writing and refuses if it moved).
+    prChecks: (repoPath: string, prUrl: string, force?: boolean) =>
+      ipcRenderer.invoke(IPC.PR_REVIEW_CHECKS, repoPath, prUrl, force === true) as Promise<
+        import('../shared/prReview').PrReviewRead<import('../shared/prReview').PrChecksState>
+      >,
+    prFiles: (repoPath: string, prUrl: string, headRefOid: string) =>
+      ipcRenderer.invoke(IPC.PR_REVIEW_FILES, repoPath, prUrl, headRefOid) as Promise<
+        import('../shared/prReview').PrReviewRead<import('../shared/prReview').PrFilesState>
+      >,
+    prThreads: (repoPath: string, prUrl: string, headRefOid: string, force?: boolean) =>
+      ipcRenderer.invoke(IPC.PR_REVIEW_THREADS, repoPath, prUrl, headRefOid, force === true) as Promise<
+        import('../shared/prReview').PrReviewRead<import('../shared/prReview').PrThreadsState>
+      >,
+    prComment: (repoPath: string, prUrl: string, req: import('../shared/prReview').PrCommentRequest) =>
+      ipcRenderer.invoke(IPC.PR_REVIEW_COMMENT, repoPath, prUrl, req) as Promise<import('../shared/prReview').PrWriteResult>,
+    prReply: (repoPath: string, prUrl: string, commentId: number, body: string) =>
+      ipcRenderer.invoke(IPC.PR_REVIEW_REPLY, repoPath, prUrl, commentId, body) as Promise<import('../shared/prReview').PrWriteResult>,
+    prSubmitReview: (repoPath: string, prUrl: string, req: import('../shared/prReview').PrSubmitReviewRequest) =>
+      ipcRenderer.invoke(IPC.PR_REVIEW_SUBMIT, repoPath, prUrl, req) as Promise<import('../shared/prReview').PrWriteResult>,
+    prMerge: (repoPath: string, prUrl: string, req: import('../shared/prReview').PrMergeRequest) =>
+      ipcRenderer.invoke(IPC.PR_REVIEW_MERGE, repoPath, prUrl, req) as Promise<import('../shared/prReview').PrWriteResult>,
+    prRunLog: (repoPath: string, prUrl: string, runId: string) =>
+      ipcRenderer.invoke(IPC.PR_REVIEW_RUN_LOG, repoPath, prUrl, runId) as Promise<
+        import('../shared/prReview').PrReviewRead<import('../shared/prReview').PrRunLog>
+      >,
+    prRerunFailed: (repoPath: string, prUrl: string, runId: string) =>
+      ipcRenderer.invoke(IPC.PR_REVIEW_RERUN, repoPath, prUrl, runId) as Promise<import('../shared/prReview').PrWriteResult>,
+    // Ship button: the current branch's status and its writes (each re-checked in main).
+    shipStatus: (repoPath: string) =>
+      ipcRenderer.invoke(IPC.GIT_SHIP_STATUS, repoPath) as Promise<import('../main/git/shipActions').ShipStatusResult>,
+    // Each write names the branch + HEAD it was asked for; main refuses if either moved.
+    shipCommit: (repoPath: string, message: string, expect: import('../main/git/shipActions').ShipExpect) =>
+      ipcRenderer.invoke(IPC.GIT_SHIP_COMMIT, repoPath, message, expect) as Promise<import('../main/git/shipActions').ShipActionResult>,
+    shipPush: (repoPath: string, expect: import('../main/git/shipActions').ShipExpect) =>
+      ipcRenderer.invoke(IPC.GIT_SHIP_PUSH, repoPath, expect) as Promise<import('../main/git/shipActions').ShipActionResult>,
+    shipCreatePr: (repoPath: string, title: string, expect: import('../main/git/shipActions').ShipExpect) =>
+      ipcRenderer.invoke(IPC.GIT_SHIP_CREATE_PR, repoPath, title, expect) as Promise<import('../main/git/shipActions').ShipActionResult>,
+    // Hand an issue / PR to an agent pane (gated, typing-held delivery) or to a new worktree.
+    handoffSend: (req: import('../shared/gitHandoff').HandoffSendRequest) =>
+      ipcRenderer.invoke(IPC.GIT_HANDOFF_SEND, req) as Promise<import('../shared/gitHandoff').HandoffSendResult>,
+    handoffStartWorktree: (req: import('../shared/gitHandoff').HandoffStartRequest) =>
+      ipcRenderer.invoke(IPC.GIT_HANDOFF_START_WORKTREE, req) as Promise<import('../shared/gitHandoff').HandoffStartResult>,
+    // One-step connect: main runs gh auth login --web; events carry the device code and the outcome.
+    loginStart: () => ipcRenderer.invoke(IPC.GH_LOGIN_START) as Promise<import('../shared/ghDeviceLogin').GhLoginStartResult>,
+    loginCancel: () => ipcRenderer.invoke(IPC.GH_LOGIN_CANCEL) as Promise<void>,
+    onLoginEvent: (callback: (event: import('../shared/ghDeviceLogin').GhLoginEvent) => void) => {
+      const listener = (_e: Electron.IpcRendererEvent, event: import('../shared/ghDeviceLogin').GhLoginEvent) => callback(event);
+      ipcRenderer.on(IPC.GH_LOGIN_EVENT, listener);
+      return () => { ipcRenderer.removeListener(IPC.GH_LOGIN_EVENT, listener); };
+    },
+  },
+  // Work links (docs/work-links.md): read-only here, main is the only writer.
+  // onChanged hands over the changed link ids; re-read what you show.
+  workLinks: {
+    list: (filter?: import('../shared/workLink').WorkLinkFilter) =>
+      ipcRenderer.invoke(IPC.WORK_LINK_LIST, filter ?? {}) as Promise<import('../shared/workLink').WorkLink[]>,
+    get: (id: string) =>
+      ipcRenderer.invoke(IPC.WORK_LINK_GET, id) as Promise<import('../shared/workLink').WorkLink | null>,
+    onChanged: (callback: (ids: string[]) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, ids: string[]) => callback(ids);
+      ipcRenderer.on(IPC.WORK_LINK_CHANGED, listener);
+      return () => { ipcRenderer.removeListener(IPC.WORK_LINK_CHANGED, listener); };
+    },
+  },
+  // Moa's track record: the weekly retro card and its settings.
+  trackRecord: {
+    getRetro: (workspaceId: string) =>
+      ipcRenderer.invoke(IPC.TRACK_RECORD_RETRO_GET, { workspaceId }) as Promise<{ card: import('../shared/trackRecord').RetroCard | null }>,
+    dismissRetro: () => ipcRenderer.invoke(IPC.TRACK_RECORD_RETRO_DISMISS) as Promise<{ ok: boolean }>,
+    getSchedule: () => ipcRenderer.invoke(IPC.TRACK_RECORD_SCHEDULE_GET) as Promise<import('../shared/trackRecord').RetroSchedule>,
+    setSchedule: (patch: Partial<import('../shared/trackRecord').RetroSchedule>) =>
+      ipcRenderer.invoke(IPC.TRACK_RECORD_SCHEDULE_SET, patch) as Promise<import('../shared/trackRecord').RetroSchedule>,
+    clear: () => ipcRenderer.invoke(IPC.TRACK_RECORD_CLEAR) as Promise<{ ok: boolean }>,
+    onChanged: (callback: () => void) => {
+      const listener = () => callback();
+      ipcRenderer.on(IPC.TRACK_RECORD_CHANGED, listener);
+      return () => { ipcRenderer.removeListener(IPC.TRACK_RECORD_CHANGED, listener); };
+    },
   },
   // Deck Git 탭 — worktree list/add/remove(렌더러 전용, 파이프 미노출).
   worktree: {
@@ -1327,6 +1532,8 @@ const electronAPI = {
     check: () => ipcRenderer.invoke(IPC.MCP_CHECK) as Promise<McpStatusPayload>,
     reregister: () => ipcRenderer.invoke(IPC.MCP_REREGISTER) as Promise<McpStatusPayload>,
     unregister: () => ipcRenderer.invoke(IPC.MCP_UNREGISTER) as Promise<McpStatusPayload>,
+    registerTarget: (targetId: string) =>
+      ipcRenderer.invoke(IPC.MCP_REGISTER_TARGET, targetId) as Promise<McpRegisterTargetResult>,
   },
   tokenUsage: {
     readQuota: (request?: QuotaReadRequest) =>
@@ -1470,6 +1677,19 @@ const electronAPI = {
     },
     update: (ptyId: string, patch: PaneUsageLimitPatch) =>
       ipcRenderer.invoke(IPC.USAGE_LIMIT_UPDATE, { ptyId, patch }) as Promise<{ ok: boolean }>,
+  },
+  // Workspace settle / snooze (shared/workspaceSettle). Main owns the state;
+  // `get` hydrates on boot, `onChanged` streams the snapshot and the changes
+  // behind it, `command` sends the user's verbs (settle, snooze, undo, ...).
+  workspaceSettle: {
+    get: () => ipcRenderer.invoke(IPC.WORKSPACE_SETTLE_GET) as Promise<WorkspaceSettleSnapshot>,
+    command: (command: WorkspaceSettleCommand) =>
+      ipcRenderer.invoke(IPC.WORKSPACE_SETTLE_COMMAND, command) as Promise<WorkspaceSettleCommandResult>,
+    onChanged: (callback: (payload: WorkspaceSettleChangedPayload) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, payload: WorkspaceSettleChangedPayload) => callback(payload);
+      ipcRenderer.on(IPC.WORKSPACE_SETTLE_CHANGED, listener);
+      return () => { ipcRenderer.removeListener(IPC.WORKSPACE_SETTLE_CHANGED, listener); };
+    },
   },
   window: {
     hide: () => ipcRenderer.send(IPC.WINDOW_HIDE),

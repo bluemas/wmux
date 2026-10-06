@@ -35,6 +35,10 @@ import {
   buildDenyScript,
   buildBrainLaunchCommand,
   flattenPromptForPty,
+  tuiDialogExcerpt,
+  classifyReportedPrompt,
+  lastPasteModeToggle,
+  printedText,
   resolveBrainHomeDir,
   BRAIN_PTY_ALLOWED_TOOLS,
   createBrainPtyHost,
@@ -66,6 +70,8 @@ interface FakeHost extends BrainPtyHost {
   /** Make every write throw — the production host's "the pty is gone" signal
    *  (createBrainPtyHost turns a false writeToSession into this). */
   failWrites: boolean;
+  /** Print output on one session, as the TUI would. */
+  emit(id: string, data: string): void;
 }
 
 function makeHost(): FakeHost {
@@ -94,6 +100,9 @@ function makeHost(): FakeHost {
     },
     set failNextAttach(v: boolean) {
       failAttach = v;
+    },
+    emit(id, data) {
+      listeners.get(id)?.(data);
     },
     killSession(id, exitCode = 1) {
       exitListeners.get(id)?.(exitCode);
@@ -167,6 +176,7 @@ function makeAdapter(host: FakeHost, over: Record<string, unknown> = {}): Claude
     staleResumeWindowMs: 5,
     turnTimeoutMs: 500,
     submitDelayMs: 1,
+    pasteModeWaitMs: 1,
     readTranscript: () => ({ text: 'final answer', endsWithQuestion: false }),
     ...over,
   });
@@ -325,6 +335,33 @@ describe('buildBrainSettingsProfile', () => {
     expect(hooks.SessionStart[0].hooks[0].command).not.toContain('--gate');
   });
 
+  it('runs UserPromptSubmit in context mode (never gated)', () => {
+    const hooks = profile.hooks as Record<string, Array<{ hooks: Array<{ command: string }> }>>;
+    const command = hooks.UserPromptSubmit[0].hooks[0].command;
+    expect(command).toContain('UserPromptSubmit --context');
+    expect(command).not.toContain('--gate');
+    expect(hooks.Stop[0].hooks[0].command).not.toContain('--context');
+  });
+
+  it('wires PermissionRequest to the bridge as a signal only, so main sees the brain\'s own dialog (phone Moa pane)', () => {
+    const hooks = profile.hooks as Record<string, Array<{ hooks: Array<{ command: string }> }>>;
+    const command = hooks.PermissionRequest[0].hooks[0].command;
+    expect(command).toContain('wmux-bridge.mjs');
+    expect(command).toContain('PermissionRequest');
+    expect(command).not.toContain('--gate');
+    expect(command).not.toContain('--context');
+  });
+
+  it('reports a permission dialog (PermissionRequest) and its end (PostToolUse) without gating', () => {
+    const hooks = profile.hooks as Record<string, Array<{ matcher: string; hooks: Array<{ command: string }> }>>;
+    for (const event of ['PermissionRequest', 'PostToolUse']) {
+      const command = hooks[event][0].hooks[0].command;
+      expect(hooks[event][0].matcher).toBe('');
+      expect(command).toContain('wmux-bridge.mjs');
+      expect(command.endsWith(` ${event}`)).toBe(true);
+    }
+  });
+
   it('backstops each denied tool with a PreToolUse hook that names the tool', () => {
     const pre = profile.hooks as { PreToolUse: Array<{ matcher: string; hooks: Array<{ command: string }> }> };
     const matchers = pre.PreToolUse.map((g) => g.matcher);
@@ -356,6 +393,22 @@ describe('buildBrainSettingsProfile', () => {
   it('omits the signal hooks when no bridge could be located', () => {
     const noBridge = buildBrainSettingsProfile({ bridgePath: null, nodePath: '/usr/bin/node' });
     expect((noBridge.hooks as Record<string, unknown>).Stop).toBeUndefined();
+  });
+
+  it('Moa\'s read gate hooks Read, Grep and Glob, and only when given', () => {
+    type Entry = { matcher: string; hooks: Array<{ command: string }> };
+    const withGate = buildBrainSettingsProfile({
+      bridgePath: null,
+      nodePath: '/usr/bin/node',
+      readGate: { scriptPath: '/tmp/brain-profiles/read-gate-1.cjs' },
+    });
+    const pre = (withGate.hooks as { PreToolUse: Entry[] }).PreToolUse;
+    const gate = pre.find((e) => e.matcher === 'Read|Grep|Glob');
+    expect(gate?.hooks[0].command).toContain('read-gate-1.cjs');
+    // Reads are never added to the deny list: the gate allows or asks.
+    expect((withGate.permissions as { deny: string[] }).deny).not.toContain('Read');
+    const without = buildBrainSettingsProfile({ bridgePath: null, nodePath: '/usr/bin/node' });
+    expect((without.hooks as { PreToolUse: Entry[] }).PreToolUse.some((e) => e.matcher === 'Read|Grep|Glob')).toBe(false);
   });
 });
 
@@ -611,9 +664,29 @@ describe('the spawned command line', () => {
   });
 });
 
+// Claude Code 2.1.290's folder-trust dialog as the pty received it (the path
+// shortened). Ink places every word with a column move and colours it mid-line.
+const REAL_TRUST_DIALOG = "\u001b7\u001b[r\u001b8\u001b[?25h\u001b[?25l\u001b[?2004h\u001b[?2031h\u001b[?1004h\r\r\n\u001b[38;5;220m────────────────────────────────────────────────────────────────────────────────\u001b[39m\r\r\n\u001b[2G\u001b[38;5;220m\u001b[1mAccessing\u001b[12Gworkspace:\u001b[22m\u001b[39m\r\r\n\r\r\n\u001b[2G\u001b[1m/Users/me/projects/real\u001b[22m\r\r\n\u001b[2G\u001b[1mdlg/cwd\u001b[22m\r\r\n\r\r\n\u001b[2GQuick\u001b[8Gsafety\u001b[15Gcheck:\u001b[22GIs\u001b[25Gthis\u001b[30Ga\u001b[32Gproject\u001b[40Gyou\u001b[44Gcreated\u001b[52Gor\u001b[55Gone\u001b[59Gyou\u001b[63Gtrust?\u001b[70G(Like\u001b[76Gyour\r\r\n\u001b[2Gown\u001b[6Gcode,\u001b[12Ga\u001b[14Gwell-known\u001b[25Gopen\u001b[30Gsource\u001b[37Gproject,\u001b[46Gor\u001b[49Gwork\u001b[54Gfrom\u001b[59Gyour\u001b[64Gteam).\u001b[71GIf\u001b[74Gnot,\r\r\n\u001b[2Gtake\u001b[7Ga\u001b[9Gmoment\u001b[16Gto\u001b[19Greview\u001b[26Gwhat's\u001b[33Gin\u001b[36Gthis\u001b[41Gfolder\u001b[48Gfirst.\r\r\n\r\r\n\u001b[2GClaude\u001b[9GCode'll\u001b[17Gbe\u001b[20Gable\u001b[25Gto\u001b[28Gread,\u001b[34Gedit,\u001b[40Gand\u001b[44Gexecute\u001b[52Gfiles\u001b[58Ghere.\r\r\n\r\r\n\u001b[2G\u001b[38;5;246mSecurity\u001b[11Gguide\u001b[39m\r\r\n\r\r\n\u001b[2G\u001b[38;5;153m❯\u001b[4GNo,\u001b[8Gexit\u001b[39m\r\r\n\u001b[4GYes,\u001b[9GI\u001b[11Gtrust\u001b[17Gthis\u001b[22Gfolder\r\r\n\r\r\n\u001b[2G\u001b[38;5;246mEnter\u001b[8Gto\u001b[11Gconfirm\u001b[19G·\u001b[21GEsc\u001b[25Gto\u001b[28Gcancel\u001b[39m\r\r\n\u001b[1C\u001b[4A\u001b[>0q\u001b[?u\u001b[c";
+
+describe('tuiDialogExcerpt', () => {
+  it('reads Claude Code\'s own trust dialog as whole lines, options last', () => {
+    const excerpt = tuiDialogExcerpt(REAL_TRUST_DIALOG);
+    const lines = excerpt.split('\n');
+    expect(lines.slice(-3)).toEqual(['❯ No, exit', 'Yes, I trust this folder', 'Enter to confirm · Esc to cancel']);
+    expect(lines).toContain("Claude Code'll be able to read, edit, and execute files here.");
+    expect(excerpt.length).toBeLessThanOrEqual(300);
+    expect(excerpt).not.toContain('\u001b');
+    expect(excerpt).not.toMatch(/[\u2500-\u257f]/);
+  });
+
+  it('keeps a line whole when colour codes sit inside it', () => {
+    expect(tuiDialogExcerpt('\u001b[2G\u001b[38;5;153m❯\u001b[4G\u001b[1mYes\u001b[22m, proceed\u001b[39m\r\n')).toBe('❯ Yes, proceed');
+  });
+});
+
 describe('flattenPromptForPty', () => {
   it('collapses newlines and control characters — the TUI submits on Enter', () => {
-    expect(flattenPromptForPty('do this\nthen that[A')).toBe('do this then that [A');
+    expect(flattenPromptForPty('do this\nthen that\x1b[A')).toBe('do this then that [A');
   });
 });
 
@@ -702,6 +775,59 @@ describe('ClaudePtyBrainAdapter — turn mapping', () => {
     expect(host.writes).toEqual([]);
     // And the pty survives, so answering it there resumes the same session.
     expect(host.destroyed).toEqual([]);
+    adapter.dispose();
+  });
+
+  // The blocked send leaves the pty alive, so the NEXT send skips the spawn.
+  // It used to type the message and Enter into the dialog still open, which
+  // picked the dialog's default ("exit"): claude died with code 1 and every
+  // send alternated between the blocked error and a dead session.
+  it('never types into a dialog still open on a later send, and resumes once SessionStart lands', async () => {
+    const host = makeHost();
+    const adapter = makeAdapter(host);
+    host.nextBanner =
+      '\x1b[?25l\x1b[2J\x1b[H╭────────╮\r\n│ Do you trust the files in this folder? │\r\n' +
+      '│ \x1b[1m❯ 1. Yes, proceed\x1b[22m │\r\n│ 2. No, exit │\r\n╰────────╯\r\n';
+    const first = await collect(adapter.send('summarise the fleet'));
+    expect(first).toHaveLength(1);
+    expect(first[0]).toMatchObject({ type: 'error' });
+    const ptyId = host.created[0].id;
+
+    const second = await collect(adapter.send('summarise the fleet'));
+    expect(second).toHaveLength(1);
+    expect((second[0] as { message: string }).message).toMatch(/answer it in the terminal/i);
+    const excerpt = (second[0] as { tuiDialog?: { excerpt: string } }).tuiDialog?.excerpt ?? '';
+    expect(excerpt).toContain('Do you trust the files in this folder?');
+    expect(excerpt).toContain('2. No, exit');
+    expect(excerpt).not.toContain('\x1b');
+    expect(excerpt).not.toMatch(/[│╭]/);
+    // Nothing typed, the same pty kept, no respawn.
+    expect(host.writes).toEqual([]);
+    expect(host.created).toHaveLength(1);
+    expect(host.destroyed).toEqual([]);
+
+    // The user answered the dialog in the terminal: the TUI starts.
+    expect(deliverBrainPtyHookSignal(signal('agent.session_start', ptyId)).consumed).toBe(true);
+    const third = collect(adapter.send('summarise the fleet'));
+    await vi.waitFor(() => expect(host.writes.length).toBeGreaterThan(0));
+    expect(host.writes.every((w) => w.id === ptyId)).toBe(true);
+    expect(host.writes.map((w) => w.data).join('')).toContain('summarise the fleet');
+    deliverBrainPtyHookSignal(signal('agent.stop', ptyId, { agentSessionId: 'sess-ok' }));
+    const events = await third;
+    expect(events.some((e) => e.type === 'error')).toBe(false);
+    expect(events.at(-1)).toEqual({ type: 'turn-end', sessionId: 'sess-ok' });
+    expect(host.created).toHaveLength(1);
+    adapter.dispose();
+  });
+
+  it('still types into a pty that printed nothing (slow start, no SessionStart)', async () => {
+    const host = makeHost();
+    const adapter = makeAdapter(host);
+    const turn = collect(adapter.send('hi'));
+    await vi.waitFor(() => expect(host.writes.length).toBeGreaterThan(0));
+    deliverBrainPtyHookSignal(signal('agent.stop', host.created[0].id, { agentSessionId: 'sess-quiet' }));
+    const events = await turn;
+    expect(events.at(-1)).toEqual({ type: 'turn-end', sessionId: 'sess-quiet' });
     adapter.dispose();
   });
 
@@ -1091,6 +1217,133 @@ describe('a turn the human started in the TUI', () => {
   });
 });
 
+describe('the view pointer on a prompt the human typed', () => {
+  const LINE = '[wmux context] viewing workspace "A" (ws-a), pane p-1, branch main, cwd /a';
+
+  async function settledAdapter(over: Record<string, unknown>) {
+    const host = makeHost();
+    const adapter = makeAdapter(host, over);
+    const turn = collect(adapter.send('hi'));
+    await vi.waitFor(() => expect(host.writes.length).toBeGreaterThan(0));
+    const ptyId = host.created[0].id;
+    return { host, adapter, turn, ptyId };
+  }
+
+  it('returns the line for a human prompt, and nothing for its own send()', async () => {
+    const viewContext = vi.fn(() => LINE);
+    const { adapter, turn, ptyId } = await settledAdapter({ viewContext });
+    // Our own (automated) turn: no pointer, and the lookup is not even asked.
+    expect(deliverBrainPtyHookSignal(signal('agent.user_prompt_submit', ptyId))).toEqual({ consumed: true });
+    expect(viewContext).not.toHaveBeenCalled();
+    deliverBrainPtyHookSignal(signal('agent.stop', ptyId, { agentSessionId: 'sess-1' }));
+    await turn;
+
+    // The human types into the TUI: the pointer rides the hook response.
+    const human = deliverBrainPtyHookSignal(
+      signal('agent.user_prompt_submit', ptyId, { payload: { prompt: 'tell iOS about this' } }),
+    );
+    expect(human).toEqual({ consumed: true, additionalContext: LINE });
+    expect(viewContext).toHaveBeenCalledWith('ws-1');
+    adapter.dispose();
+  });
+
+  it('asks again on every prompt, so a switched view is reported', async () => {
+    let viewed = 'A';
+    const viewContext = vi.fn(() => `[wmux context] viewing workspace "${viewed}"`);
+    const { adapter, turn, ptyId } = await settledAdapter({ viewContext, foreignResubmitFoldMs: 0 });
+    deliverBrainPtyHookSignal(signal('agent.stop', ptyId, { agentSessionId: 'sess-1' }));
+    await turn;
+    const a = deliverBrainPtyHookSignal(signal('agent.user_prompt_submit', ptyId, { payload: { prompt: 'one' } }));
+    deliverBrainPtyHookSignal(signal('agent.stop', ptyId, { agentSessionId: 'sess-1' }));
+    viewed = 'B';
+    const b = deliverBrainPtyHookSignal(signal('agent.user_prompt_submit', ptyId, { payload: { prompt: 'two' } }));
+    expect(a.additionalContext).toContain('"A"');
+    expect(b.additionalContext).toContain('"B"');
+    adapter.dispose();
+  });
+
+  /** What send() typed: the first write that is not a bare Enter. */
+  function typedPrompt(host: FakeHost): string {
+    return host.writes.find((w) => w.data !== '\r')!.data;
+  }
+
+  it('gives the pointer to a prompt the human types while an automated turn is open', async () => {
+    const viewContext = vi.fn(() => LINE);
+    const { host, adapter, turn, ptyId } = await settledAdapter({ viewContext });
+    // Claude Code reports our own prompt back: no pointer.
+    const own = deliverBrainPtyHookSignal(
+      signal('agent.user_prompt_submit', ptyId, { payload: { prompt: `  ${typedPrompt(host)}\n` } }),
+    );
+    expect(own).toEqual({ consumed: true });
+    // The human types into the TUI before our turn ends.
+    const human = deliverBrainPtyHookSignal(
+      signal('agent.user_prompt_submit', ptyId, { payload: { prompt: 'merge this when it is green' } }),
+    );
+    expect(human).toEqual({ consumed: true, additionalContext: LINE });
+    deliverBrainPtyHookSignal(signal('agent.stop', ptyId, { agentSessionId: 'sess-1' }));
+    await turn;
+    adapter.dispose();
+  });
+
+  it('gives the pointer after the human ESC-interrupts an automated turn and types', async () => {
+    const viewContext = vi.fn(() => LINE);
+    const { host, adapter, ptyId } = await settledAdapter({ viewContext, turnTimeoutMs: 60_000 });
+    const ownText = typedPrompt(host);
+    expect(deliverBrainPtyHookSignal(signal('agent.user_prompt_submit', ptyId, { payload: { prompt: ownText } })))
+      .toEqual({ consumed: true });
+    // ESC fires no hook and no Stop: our turn is still open when the human
+    // submits. Even the same words, once ours were already seen, are theirs.
+    expect(deliverBrainPtyHookSignal(signal('agent.user_prompt_submit', ptyId, { payload: { prompt: 'do this instead' } })))
+      .toEqual({ consumed: true, additionalContext: LINE });
+    expect(deliverBrainPtyHookSignal(signal('agent.user_prompt_submit', ptyId, { payload: { prompt: ownText } })))
+      .toEqual({ consumed: true, additionalContext: LINE });
+    adapter.dispose();
+  });
+
+  it('recognises its own prompt when the TUI reports part of it as a split paste', async () => {
+    const viewContext = vi.fn(() => LINE);
+    const host = makeHost();
+    const adapter = makeAdapter(host, { viewContext });
+    const first = collect(adapter.send('Fleet event: worker pane finished; check the ledger and report blocked work.'));
+    await vi.waitFor(() => expect(host.writes.length).toBeGreaterThan(0));
+    const ptyId = host.created[0].id;
+    // The shape measured on Claude Code 2.1.289: a paste-marked head whose
+    // closing marker falls mid-word ("blo" / "cked").
+    const typed = typedPrompt(host);
+    const cut = typed.indexOf('blocked') + 3;
+    const reported = `\n\n<pasted_content id="bc9f">\n${typed.slice(0, cut)}\n</pasted_content id="bc9f">\n\n${typed.slice(cut)}`;
+    expect(deliverBrainPtyHookSignal(signal('agent.user_prompt_submit', ptyId, { payload: { prompt: reported } })))
+      .toEqual({ consumed: true });
+    deliverBrainPtyHookSignal(signal('agent.stop', ptyId, { agentSessionId: 'sess-1' }));
+    await first;
+    // A short automated prompt is never "inside" a human prompt: exact only.
+    const second = collect(adapter.send('hi'));
+    await vi.waitFor(() => expect(host.writes.filter((w) => w.data === 'hi').length).toBe(1));
+    expect(deliverBrainPtyHookSignal(signal('agent.user_prompt_submit', ptyId, { payload: { prompt: 'look at this' } })))
+      .toEqual({ consumed: true, additionalContext: LINE });
+    expect(deliverBrainPtyHookSignal(signal('agent.user_prompt_submit', ptyId, { payload: { prompt: 'hi' } })))
+      .toEqual({ consumed: true });
+    deliverBrainPtyHookSignal(signal('agent.stop', ptyId, { agentSessionId: 'sess-1' }));
+    await second;
+    adapter.dispose();
+  });
+
+  it('adds nothing when the lookup has no line or throws', async () => {
+    const { adapter, turn, ptyId } = await settledAdapter({
+      viewContext: vi.fn().mockReturnValueOnce(null).mockImplementationOnce(() => { throw new Error('boom'); }),
+      foreignResubmitFoldMs: 0,
+    });
+    deliverBrainPtyHookSignal(signal('agent.stop', ptyId, { agentSessionId: 'sess-1' }));
+    await turn;
+    expect(deliverBrainPtyHookSignal(signal('agent.user_prompt_submit', ptyId, { payload: { prompt: 'x' } })))
+      .toEqual({ consumed: true });
+    deliverBrainPtyHookSignal(signal('agent.stop', ptyId, { agentSessionId: 'sess-1' }));
+    expect(deliverBrainPtyHookSignal(signal('agent.user_prompt_submit', ptyId, { payload: { prompt: 'y' } })))
+      .toEqual({ consumed: true });
+    adapter.dispose();
+  });
+});
+
 describe('a foreign turn that could get stuck open', () => {
   it('lets the foreign Stop close the turn instead of feeding a superseded credit', async () => {
     const host = makeHost();
@@ -1411,8 +1664,424 @@ describe('a session id learned from a foreign Stop', () => {
   });
 });
 
+describe('transcript hints', () => {
+  it('reports every hook signal\'s session id and transcript path, own turn or foreign', async () => {
+    const host = makeHost();
+    const hints: unknown[] = [];
+    const adapter = makeAdapter(host, { onTranscriptHint: (h: unknown) => hints.push(h) });
+    const turn = collect(adapter.send('hi'));
+    await vi.waitFor(() => expect(host.writes.length).toBeGreaterThan(0));
+    const ptyId = host.created[0].id;
+    deliverBrainPtyHookSignal(signal('agent.stop', ptyId, { agentSessionId: 'sess-own', payload: { transcript_path: '/tmp/sess-own.jsonl' } }));
+    await turn;
+    deliverBrainPtyHookSignal(signal('agent.session_start', ptyId, { agentSessionId: 'sess-new' }));
+    expect(hints).toEqual([
+      { kind: 'agent.stop', agentSessionId: 'sess-own', transcriptPath: '/tmp/sess-own.jsonl' },
+      { kind: 'agent.session_start', agentSessionId: 'sess-new' },
+    ]);
+    adapter.dispose();
+  });
+
+  it('a throwing hint listener never breaks the turn', async () => {
+    const host = makeHost();
+    const adapter = makeAdapter(host, { onTranscriptHint: () => { throw new Error('boom'); } });
+    const turn = collect(adapter.send('hi'));
+    await vi.waitFor(() => expect(host.writes.length).toBeGreaterThan(0));
+    deliverBrainPtyHookSignal(signal('agent.stop', host.created[0].id, { agentSessionId: 's' }));
+    expect((await turn).some((e) => e.type === 'turn-end')).toBe(true);
+    adapter.dispose();
+  });
+});
+
 it('allows every commander surface tool in the PTY runtime and settings profile', () => {
   for (const tool of [...COMMANDER_TOOL_SURFACE, ...COMMANDER_ONLY_TOOLS]) {
     expect(BRAIN_PTY_ALLOWED_TOOLS).toContain(`mcp__wmux__${tool}`);
   }
+});
+
+// ── Moa: proposal gate and first-turn memory ─────────────────────────────────
+
+describe('the Moa proposal gate in the profile', () => {
+  type Pre = { PreToolUse: Array<{ matcher: string; hooks: Array<{ command: string }> }> };
+  const base = { bridgePath: null, nodePath: '/usr/bin/node', denyScriptPath: '/tmp/deny.js' };
+
+  it('is absent by default: Write and Edit stay hard-denied, no gate hook', () => {
+    const profile = buildBrainSettingsProfile(base);
+    const deny = (profile.permissions as { deny: string[] }).deny;
+    expect(deny).toContain('Write');
+    expect(deny).toContain('Edit');
+    expect((profile.hooks as Pre).PreToolUse.some((g) => g.hooks[0].command.includes('proposal-gate'))).toBe(false);
+  });
+
+  it('moves Write and Edit from the deny list to the gate script; everything else stays denied', () => {
+    const profile = buildBrainSettingsProfile({ ...base, proposalGateScriptPath: '/tmp/proposal-gate-1.cjs' });
+    const deny = (profile.permissions as { deny: string[] }).deny;
+    expect(deny).toEqual(['Agent', 'Task', 'Bash', 'MultiEdit', 'NotebookEdit', 'AskUserQuestion']);
+    const groups = (profile.hooks as Pre).PreToolUse;
+    const gate = groups.find((g) => g.matcher === 'Write|Edit')!;
+    expect(gate.hooks[0].command).toBe('"/usr/bin/node" "/tmp/proposal-gate-1.cjs"');
+    expect(groups.some((g) => g.matcher === 'Write' || g.matcher === 'Edit')).toBe(false);
+  });
+
+  it('writes the gate script and proposals folder at spawn only when asked', async () => {
+    const proposalsDir = path.join(tmpDir, 'memory', '_proposals');
+    const host = makeHost();
+    const adapter = makeAdapter(host, { proposalGate: { proposalsDir } });
+    const turn = collect(adapter.send('hi'));
+    await vi.waitFor(() => expect(host.created.length).toBe(1));
+    const dir = path.join(tmpDir, 'brain-profiles');
+    const gateFile = fs.readdirSync(dir).find((f) => f.startsWith('proposal-gate-'));
+    expect(gateFile).toBeDefined();
+    expect(fs.readFileSync(path.join(dir, gateFile!), 'utf8')).toContain(JSON.stringify(proposalsDir));
+    expect(fs.statSync(proposalsDir).isDirectory()).toBe(true);
+    const settings = fs.readdirSync(dir).find((f) => f.startsWith('settings-'))!;
+    expect(fs.readFileSync(path.join(dir, settings), 'utf8')).toContain('proposal-gate-');
+    adapter.dispose();
+    await turn;
+
+    const plainHost = makeHost();
+    const plain = makeAdapter(plainHost, { workspaceId: 'ws-2' });
+    const plainTurn = collect(plain.send('hi'));
+    await vi.waitFor(() => expect(plainHost.created.length).toBe(1));
+    // The first brain's dispose unlinked its gate; this one never wrote one.
+    expect(fs.readdirSync(dir).filter((f) => f.startsWith('proposal-gate-'))).toEqual([]);
+    plain.dispose();
+    await plainTurn;
+  });
+});
+
+describe('first-turn memory', () => {
+  it('rides the first prompt of a fresh conversation only, and a throw costs nothing', async () => {
+    const host = makeHost();
+    const adapter = makeAdapter(host, { loadMemory: () => '## Orchestrator memory (background context)\nprecedent-x' });
+    adapter.start({ systemPrompt: 'SYSTEM' });
+    const first = collect(adapter.send('first'));
+    await vi.waitFor(() => expect(host.writes.length).toBeGreaterThan(0));
+    expect(host.writes[0].data).toContain('SYSTEM');
+    expect(host.writes[0].data).toContain('precedent-x');
+    deliverBrainPtyHookSignal(signal('agent.stop', host.created[0].id, { agentSessionId: 's1' }));
+    await first;
+    const n = host.writes.length;
+    const second = collect(adapter.send('second'));
+    await vi.waitFor(() => expect(host.writes.length).toBeGreaterThan(n));
+    expect(host.writes[n].data).not.toContain('precedent-x');
+    deliverBrainPtyHookSignal(signal('agent.stop', host.created[0].id, { agentSessionId: 's1' }));
+    await second;
+    adapter.dispose();
+
+    const host2 = makeHost();
+    const throwing = makeAdapter(host2, { loadMemory: () => { throw new Error('torn'); } });
+    const t = collect(throwing.send('go'));
+    await vi.waitFor(() => expect(host2.writes.length).toBeGreaterThan(0));
+    expect(host2.writes[0].data).toContain('go');
+    deliverBrainPtyHookSignal(signal('agent.stop', host2.created[0].id, { agentSessionId: 's2' }));
+    expect((await t).some((e) => e.type === 'error')).toBe(false);
+    throwing.dispose();
+  });
+});
+
+describe('first-turn memory after the conversation changes', () => {
+  it('rides the next turn again once a foreign Stop reports a different session (e.g. /clear)', async () => {
+    const host = makeHost();
+    const adapter = makeAdapter(host, { loadMemory: () => 'MEMORY-BLOCK' });
+    const first = collect(adapter.send('first'));
+    await vi.waitFor(() => expect(host.writes.length).toBeGreaterThan(0));
+    const ptyId = host.created[0].id;
+    expect(host.writes[0].data).toContain('MEMORY-BLOCK');
+    deliverBrainPtyHookSignal(signal('agent.stop', ptyId, { agentSessionId: 's1' }));
+    await first;
+
+    // A foreign Stop on the SAME conversation changes nothing.
+    deliverBrainPtyHookSignal(signal('agent.stop', ptyId, { agentSessionId: 's1' }));
+    let n = host.writes.length;
+    const second = collect(adapter.send('second'));
+    await vi.waitFor(() => expect(host.writes.length).toBeGreaterThan(n));
+    expect(host.writes[n].data).not.toContain('MEMORY-BLOCK');
+    deliverBrainPtyHookSignal(signal('agent.stop', ptyId, { agentSessionId: 's1' }));
+    await second;
+
+    // The human cleared the TUI: a new conversation id arrives on a foreign Stop.
+    deliverBrainPtyHookSignal(signal('agent.stop', ptyId, { agentSessionId: 's2' }));
+    n = host.writes.length;
+    const third = collect(adapter.send('third'));
+    await vi.waitFor(() => expect(host.writes.length).toBeGreaterThan(n));
+    expect(host.writes[n].data).toContain('MEMORY-BLOCK');
+    deliverBrainPtyHookSignal(signal('agent.stop', ptyId, { agentSessionId: 's2' }));
+    await third;
+    adapter.dispose();
+  });
+});
+
+// ── #1787: a cold-start prompt that reaches the TUI incomplete ─────────────
+
+interface ColdTuiOptions {
+  /** Damage what the Nth bracketed paste puts in the box (1-based). */
+  damage?: (attempt: number, text: string) => string;
+  /** How long the UserPromptSubmit hook runs. The box keeps its text until it
+   *  returns, so an Enter in the meantime submits that text again. */
+  hookDelayMs?: number;
+  /** The bridge missed main's answer: a refusal does not take, the copy runs. */
+  bridgeTimeout?: boolean;
+  /** Claude Code prints a refusal's reason (default true). */
+  printRefusal?: boolean;
+  /** How long a turn that runs takes to fire its Stop. */
+  stopDelayMs?: number;
+  /** The Nth bracketed paste loses its end marker (measured on Windows ConPTY
+   *  with a busy TUI): the box holds the text, and every Enter after it is
+   *  taken as pasted text until an end marker arrives on its own. */
+  dropPasteEnd?: (attempt: number) => boolean;
+}
+
+/**
+ * A fake Claude Code input box over the fake pty, modelled on what Claude Code
+ * 2.1.289 did on a cold start: a bare write longer than the pty's 1024-byte
+ * input queue arrives as several reads, each taken as its own paste, and the
+ * first bare write loses every read but the last. A bracketed paste is held
+ * whole. On Enter it reports the box through UserPromptSubmit; a refused
+ * report clears the box and prints the reason, an accepted one runs the turn.
+ */
+function makeColdTui(opts: ColdTuiOptions = {}) {
+  const host = makeHost();
+  host.nextBanner = '\u001b[?2004h';
+  // The TUI's SessionStart lands once the session is up.
+  const attach = host.attach.bind(host);
+  host.attach = async (id) => {
+    await attach(id);
+    deliverBrainPtyHookSignal(signal('agent.session_start', id));
+  };
+  const accepted: string[] = [];
+  const verdicts: Array<ReturnType<typeof deliverBrainPtyHookSignal>> = [];
+  let box = '';
+  let coldBareWrite = true;
+  let pastes = 0;
+  let pasteOpen = false;
+  // Hook runs armed and not yet reported (a slow hook outlives the turn).
+  let hooksRunning = 0;
+  const write = host.write.bind(host);
+  host.write = (id, data) => {
+    write(id, data);
+    if (data === '\u001b[201~') {
+      pasteOpen = false;
+      return;
+    }
+    if (data === '\u001b') {
+      box = '';
+      return;
+    }
+    if (data === '\r' && pasteOpen) {
+      box += '\n';
+      return;
+    }
+    if (data === '\r') {
+      if (!box) return;
+      const prompt = box;
+      const report = (): void => {
+        if (opts.hookDelayMs) hooksRunning -= 1;
+        const verdict = deliverBrainPtyHookSignal(signal('agent.user_prompt_submit', id, { payload: { prompt } }));
+        verdicts.push(verdict);
+        if (box === prompt) box = '';
+        if (verdict.block && !opts.bridgeTimeout) {
+          // Wrapped and spaced with cursor moves, as Claude Code draws it.
+          const shown = verdict.block.replace(/ /g, '\u001b[1C').replace(/(.{40})/g, '$1\r\n  ');
+          if (opts.printRefusal !== false) {
+            host.emit(id, `\r\n\u001b[1m⏺ UserPromptSubmit operation blocked by hook:\u001b[22m\r\n  ${shown}`);
+          }
+          return;
+        }
+        accepted.push(prompt);
+        setTimeout(
+          () => deliverBrainPtyHookSignal(signal('agent.stop', id, { agentSessionId: 'sess-1' })),
+          opts.stopDelayMs ?? 0,
+        );
+      };
+      if (opts.hookDelayMs) {
+        hooksRunning += 1;
+        setTimeout(report, opts.hookDelayMs);
+      } else report();
+      return;
+    }
+    let text: string;
+    if (data.startsWith('\u001b[200~') && data.endsWith('\u001b[201~')) {
+      pastes += 1;
+      text = data.slice(6, -6);
+      if (opts.damage) text = opts.damage(pastes, text);
+      if (opts.dropPasteEnd?.(pastes)) pasteOpen = true;
+    } else {
+      const reads: string[] = [];
+      for (let i = 0; i < data.length; i += 1024) reads.push(data.slice(i, i + 1024));
+      text = coldBareWrite ? reads[reads.length - 1] : reads.join('');
+      coldBareWrite = false;
+    }
+    box += text;
+  };
+  const pasteWrites = (): number => host.writes.filter((w) => w.data.startsWith('\u001b[200~')).length;
+  return { host, accepted, verdicts, pasteWrites, hooksRunning: () => hooksRunning };
+}
+
+const LONG_PROMPT = Array.from({ length: 400 }, (_, i) => `word${i}`).join(' ');
+const tailOnly = (text: string): string => text.slice(-100);
+
+describe('a cold-start prompt that reaches the TUI incomplete (#1787)', () => {
+  it('lands the whole prompt on a cold TUI that splits a long bare write into pastes', async () => {
+    const { host, accepted } = makeColdTui();
+    const adapter = makeAdapter(host);
+    const events = await collect(adapter.send(LONG_PROMPT));
+    expect(accepted).toEqual([LONG_PROMPT]);
+    expect(events.at(-1)).toMatchObject({ type: 'turn-end' });
+    adapter.dispose();
+  });
+
+  it('refuses a damaged copy, skips its second Enter, and types the prompt again once refused', async () => {
+    const { host, accepted, verdicts, pasteWrites } = makeColdTui({
+      damage: (n, text) => (n === 1 ? tailOnly(text) : text),
+    });
+    const adapter = makeAdapter(host);
+    const events = await collect(adapter.send(LONG_PROMPT));
+    expect(verdicts[0].block).toMatch(/incomplete \(\d+ of \d+ characters\)/);
+    expect(verdicts.slice(1).every((v) => !v.block)).toBe(true);
+    expect(accepted).toEqual([LONG_PROMPT]);
+    expect(pasteWrites()).toBe(2);
+    // One Enter per attempt: each was reported before the second could go out.
+    expect(host.writes.filter((w) => w.data === '\r')).toHaveLength(2);
+    expect(events.at(-1)).toMatchObject({ type: 'turn-end' });
+    adapter.dispose();
+  });
+
+  it('refuses a damaged copy the second Enter resubmits while a slow hook holds the box', async () => {
+    const { host, accepted, verdicts, hooksRunning } = makeColdTui({
+      damage: (n, text) => (n === 1 ? tailOnly(text) : text),
+      hookDelayMs: 150,
+    });
+    const adapter = makeAdapter(host);
+    const events = await collect(adapter.send(LONG_PROMPT));
+    // The turn ends on the first Stop; every Enter still in its hook reports
+    // after that, and none of them may run anything either.
+    await vi.waitFor(() => expect(hooksRunning()).toBe(0));
+    // Both submissions of the damaged box were refused (and, depending on the
+    // hook's timing, the full prompt's own resubmission too): the full prompt
+    // ran exactly once and nothing else ran.
+    expect(verdicts.filter((v) => v.block).length).toBeGreaterThanOrEqual(2);
+    expect(accepted).toEqual([LONG_PROMPT]);
+    expect(events.at(-1)).toMatchObject({ type: 'turn-end' });
+    adapter.dispose();
+  });
+
+  it('fails the turn, never running half a prompt, when every attempt arrives damaged', async () => {
+    const { host, accepted, verdicts } = makeColdTui({ damage: (_n, text) => tailOnly(text) });
+    const adapter = makeAdapter(host, { turnTimeoutMs: 5_000 });
+    const events = await collect(adapter.send(LONG_PROMPT));
+    expect(accepted).toEqual([]);
+    expect(verdicts).toHaveLength(3);
+    expect(verdicts.every((v) => typeof v.block === 'string')).toBe(true);
+    expect(events).toEqual([{ type: 'error', message: expect.stringMatching(/only part of the prompt/) }]);
+    adapter.dispose();
+  });
+
+  it('never types again, nor reports the result, when a refusal did not take and the copy ran', async () => {
+    const { host, accepted, pasteWrites } = makeColdTui({
+      damage: (_n, text) => tailOnly(text),
+      bridgeTimeout: true,
+    });
+    const adapter = makeAdapter(host, { turnTimeoutMs: 5_000 });
+    const events = await collect(adapter.send(LONG_PROMPT));
+    expect(accepted).toHaveLength(1);
+    expect(pasteWrites()).toBe(1);
+    expect(events).toEqual([{ type: 'error', message: expect.stringMatching(/ran an incomplete copy/) }]);
+    adapter.dispose();
+  });
+
+  it('interrupts instead of typing again when a refusal is never seen taking effect', async () => {
+    const { host, pasteWrites } = makeColdTui({
+      damage: (_n, text) => tailOnly(text),
+      bridgeTimeout: true,
+      stopDelayMs: 10_000,
+    });
+    const adapter = makeAdapter(host, { turnTimeoutMs: 5_000, refusalConfirmMs: 30 });
+    const events = await collect(adapter.send(LONG_PROMPT));
+    expect(pasteWrites()).toBe(1);
+    expect(host.writes.some((w) => w.data === '\u001b')).toBe(true);
+    expect(events).toEqual([{ type: 'error', message: expect.stringMatching(/could not confirm/) }]);
+    adapter.dispose();
+  });
+
+  it('does not type a refused prompt again after interrupt()', async () => {
+    const { host, verdicts, pasteWrites } = makeColdTui({
+      damage: (_n, text) => tailOnly(text),
+      printRefusal: false,
+    });
+    const adapter = makeAdapter(host, { turnTimeoutMs: 5_000, refusalConfirmMs: 5_000 });
+    const turn = collect(adapter.send(LONG_PROMPT));
+    await vi.waitFor(() => expect(verdicts).toHaveLength(1));
+    adapter.interrupt();
+    expect(await turn).toEqual([{ type: 'error', message: expect.stringMatching(/interrupted/) }]);
+    expect(pasteWrites()).toBe(1);
+    adapter.dispose();
+  });
+
+  it('closes a paste the TUI left open, so its Enter submits the prompt instead of hanging the turn', async () => {
+    const { host, accepted } = makeColdTui({ dropPasteEnd: (n) => n === 1 });
+    const adapter = makeAdapter(host, { turnTimeoutMs: 5_000 });
+    const events = await collect(adapter.send(LONG_PROMPT));
+    expect(accepted.map((p) => p.replace(/\s+/g, ''))).toEqual([LONG_PROMPT.replace(/\s+/g, '')]);
+    expect(host.writes.filter((w) => w.data === '\u001b[201~')).toHaveLength(1);
+    expect(events.at(-1)).toMatchObject({ type: 'turn-end' });
+    adapter.dispose();
+  });
+
+  it('sends no extra end marker when the paste closed and the Enter was reported', async () => {
+    const { host, accepted } = makeColdTui();
+    const adapter = makeAdapter(host);
+    await collect(adapter.send(LONG_PROMPT));
+    expect(accepted).toEqual([LONG_PROMPT]);
+    expect(host.writes.some((w) => w.data === '\u001b[201~')).toBe(false);
+    adapter.dispose();
+  });
+
+  it('waits out the startup h -> l -> h toggle of bracketed paste before typing', async () => {
+    const { host } = makeColdTui();
+    let lastOn = 0;
+    const attach = host.attach.bind(host);
+    host.attach = async (id) => {
+      await attach(id);
+      // The banner turned the mode on; it goes off now, and on again later.
+      host.emit(id, '\u001b[?2004l');
+      setTimeout(() => {
+        lastOn = Date.now();
+        host.emit(id, '\u001b[?2004h');
+      }, 60);
+    };
+    let typedAt = 0;
+    const write = host.write.bind(host);
+    host.write = (id, data) => {
+      if (data.startsWith('\u001b[200~')) typedAt = Date.now();
+      write(id, data);
+    };
+    const adapter = makeAdapter(host, { pasteModeWaitMs: 5_000, pasteModeSettleMs: 50 });
+    await collect(adapter.send(LONG_PROMPT));
+    expect(lastOn).toBeGreaterThan(0);
+    expect(typedAt - lastOn).toBeGreaterThanOrEqual(45);
+    adapter.dispose();
+  });
+
+  it('classifies any piece of its own prompt as damaged, however short', () => {
+    const own = 'checkthefleetandsayok';
+    expect(classifyReportedPrompt(own, own)).toBe('own');
+    expect(classifyReportedPrompt('fleetandsayok', own)).toBe('damaged'); // tail
+    expect(classifyReportedPrompt('checkthe', own)).toBe('damaged'); // head only
+    expect(classifyReportedPrompt('checkthesayok', own)).toBe('damaged'); // middle lost
+    for (let n = 1; n <= 7; n++) expect(classifyReportedPrompt(own.slice(-n), own)).toBe('damaged');
+    expect(classifyReportedPrompt('mergethis', own)).toBe('other');
+    expect(classifyReportedPrompt(`draft${own}`, own)).toBe('other');
+    expect(classifyReportedPrompt('lookatthis', 'hi')).toBe('other');
+  });
+
+  it('reads the bracketed-paste mode the TUI output leaves on', () => {
+    expect(lastPasteModeToggle('\u001b[?2004h\u001b[?2004l\u001b[?2004h')).toBe(true);
+    expect(lastPasteModeToggle('x\u001b[?2004l')).toBe(false);
+    expect(lastPasteModeToggle('plain output')).toBeNull();
+  });
+
+  it('reads printed text through cursor moves, styling and line wraps', () => {
+    expect(printedText('\u001b[1m[wmux-\r\n  refused-3]\u001b[1Cwmux\u001b[22m')).toBe('[wmux-refused-3]wmux');
+  });
 });

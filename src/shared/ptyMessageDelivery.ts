@@ -205,12 +205,37 @@ export function resolveAgentSlug(agent?: string | null): AgentSlug | undefined {
  * fresh-context command and never saw it finish, so the text was not written.
  * `usage_limited`: the pane hit its provider's usage limit and is held until
  * the window resets (shared/usageLimit); nothing was written.
+ * `user_typing`: a `waitQuiet` delivery found a draft in the composer or keys
+ * still arriving within its wait; nothing was written.
  */
 export interface GatedSubmitRefusal {
   ok: false;
-  reason: 'approval_pending' | 'gate_unavailable' | 'write_failed' | 'fresh_context_timeout' | 'fresh_context_busy' | 'usage_limited';
+  reason:
+    | 'approval_pending'
+    | 'gate_unavailable'
+    | 'write_failed'
+    | 'fresh_context_timeout'
+    | 'fresh_context_busy'
+    | 'usage_limited'
+    /** A `waitQuiet` delivery: the person kept typing (or left a draft) in
+     *  the pane, so nothing was written (or, after the paste, no Enter). */
+    | 'user_typing'
+    /** A `waitQuiet` delivery: the agent it was aimed at left the pane or was
+     *  replaced (or the pane is back at a shell). */
+    | 'agent_changed'
+    /** A `waitQuiet` delivery: the pane's agent could not be read, so it could
+     *  not be verified (a local pty, no daemon, or a failed read). */
+    | 'agent_unverified'
+    /** A `waitQuiet` delivery ran past its deadline; the sender has given up. */
+    | 'deadline'
+    /** A `waitQuiet` delivery carrying main's `guardKey`: main's own check for
+     *  that delivery refused it (e.g. Moa's auto hand-off saw a mode change). */
+    | 'guard_refused';
   detail: string;
   pasted?: boolean;
+  /** With `pasted`: whether the pasted text was cleared again (best effort:
+   *  one Ctrl+U, which empties an agent's composer or a shell's line). */
+  cleared?: boolean;
 }
 /** A delivered submit. A new-task delivery also says what its fresh-context
  *  step did (shared/freshContext). */
@@ -234,4 +259,18 @@ export interface GatedSubmitOptions {
   /** With `newTask`: where the delivered pane sits, so main can check the
    *  daemon's open tasks for it (a pane it cannot place is never cleared). */
   pane?: { workspaceId: string; paneId: string; surfaceId: string };
+  /** Hold the paste until the pane has no draft and no key input for a quiet
+   *  window, within a bounded wait; refuse with `user_typing` otherwise (the
+   *  Git page's hand-off: the person may be typing in that pane). Also checks,
+   *  before the paste and before the Enter, that the same agent is there. */
+  waitQuiet?: boolean;
+  /** With `waitQuiet`: the agent the sender saw in the pane (display name). */
+  expectAgent?: string;
+  /** With `waitQuiet`: epoch ms after which nothing is written (main stamps
+   *  it from the send's own timeout). */
+  deadlineAt?: number;
+  /** With `waitQuiet`: a key main registered for this delivery (deliveryGuards
+   *  in main). Main runs that delivery's own check before the paste and before
+   *  the Enter; an unknown key refuses. Only adds checks, never removes one. */
+  guardKey?: string;
 }

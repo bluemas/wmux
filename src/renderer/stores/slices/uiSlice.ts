@@ -87,6 +87,7 @@ export function siteGuidesAutoEnablePatch(input: {
 }
 import type { FleetSortMode } from '../selectors/fleet';
 import { EMPTY_FILTER, type WorkspaceFilter } from '../../components/Sidebar/workspaceFilter';
+import { initialGitPageState, type GitDragContext, type GitHandoffOpen, type GitPageState } from '../../components/Git/gitPageState';
 import { multiviewColumnCount, type MultiviewArrangement } from '../../utils/multiviewGrid';
 import {
   normalizeRoleBinding,
@@ -150,7 +151,7 @@ export type FleetTab = 'fleet' | 'approvals' | 'remote';
  * panes and tools dock) is home; every other page covers it while the
  * terminals stay mounted underneath. Session-only, never persisted.
  */
-export type AppRoute = 'workspaces' | 'fleet' | 'schedules' | 'remote' | 'settings';
+export type AppRoute = 'workspaces' | 'fleet' | 'schedules' | 'remote' | 'git' | 'settings';
 
 export interface UISlice {
   // ─── Startup gate (Fix 0) ─────────────────────────────────────────────
@@ -199,6 +200,23 @@ export interface UISlice {
   sidebarFilter: WorkspaceFilter;
   setSidebarFilter: (filter: WorkspaceFilter) => void;
 
+  // The Git page's scope, tab, filter, selection and list scroll, kept here
+  // so they survive leaving the page. Session-only.
+  gitPage: GitPageState;
+  setGitPage: (patch: Partial<GitPageState>) => void;
+  // Whether a merge session runs, per repo (its main worktree, normalized):
+  // the Worktrees tab starts / lands / discards it, the branch bar's ship
+  // button waits on it. Session-only.
+  gitMerge: Record<string, boolean>;
+  setGitMerge: (repoKey: string, active: boolean) => void;
+  // An issue / PR drag from the Git page: its repo, set at dragstart and
+  // cleared at dragend (never exposed through DataTransfer).
+  gitDragContext: GitDragContext | null;
+  setGitDragContext: (ctx: GitDragContext | null) => void;
+  // The open hand-off confirm popover, or null.
+  gitHandoff: GitHandoffOpen | null;
+  setGitHandoff: (open: GitHandoffOpen | null) => void;
+
   // S-C1 Fleet View — full-screen cockpit overlay (Ctrl+Shift+A). Transient
   // UI state; never persisted (buildSessionData allowlist excludes it, like the
   // command palette / settings panel flags).
@@ -233,10 +251,20 @@ export interface UISlice {
   // collapsed to one summary row. Session-only: not in buildSessionData.
   fleetIdleExpanded: boolean;
   setFleetIdleExpanded: (expanded: boolean) => void;
+  // The same for the Finished section (turns that ended, not yet looked at).
+  fleetFinishedExpanded: boolean;
+  setFleetFinishedExpanded: (expanded: boolean) => void;
   // One-shot request from the sidebar's `N to review` link: Fleet consumes it
   // (focuses the first Ready to review row) and clears it. Session-only.
   fleetFocusReview: boolean;
   setFleetFocusReview: (focus: boolean) => void;
+  // One-shot request from an "Open conversation" link (Moa's task cards and
+  // Waiting on you, the deck ledger): a WorkTask id. Fleet consumes it — it
+  // selects that task and shows its conversation — and clears it. Session-only.
+  fleetFocusTask: string | null;
+  setFleetFocusTask: (taskId: string | null) => void;
+  /** Go to Fleet and show a fan-out task's conversation there. */
+  openTaskConversation: (taskId: string) => void;
   // Fleet's "changed since you last looked" baseline, written when the overlay
   // closes. Session-only: not in buildSessionData; null until the first close.
   fleetLastSeen: FleetSeenSnapshot | null;
@@ -245,6 +273,12 @@ export interface UISlice {
   settingsPanelVisible: boolean;
   toggleSettingsPanel: () => void;
   setSettingsPanelVisible: (visible: boolean) => void;
+  /** A tab Settings should land on the next time it shows (consumed by
+   *  SettingsPanel). Transient, not persisted. */
+  settingsInitialTab: string | null;
+  /** Open Settings on `tab` (an id `resolveSettingsTab` understands). */
+  openSettingsTab: (tab: string) => void;
+  clearSettingsInitialTab: () => void;
 
   notificationSoundEnabled: boolean;
   toggleNotificationSound: () => void;
@@ -1102,6 +1136,22 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
   setSidebarFilter: (filter) => set((state) => {
     state.sidebarFilter = filter;
   }),
+  gitPage: initialGitPageState(),
+  setGitPage: (patch) => set((state) => {
+    Object.assign(state.gitPage, patch);
+  }),
+  gitMerge: {},
+  setGitMerge: (repoKey, active) => set((state) => {
+    if (state.gitMerge[repoKey] !== active) state.gitMerge[repoKey] = active;
+  }),
+  gitDragContext: null,
+  setGitDragContext: (ctx) => set((state) => {
+    state.gitDragContext = ctx;
+  }),
+  gitHandoff: null,
+  setGitHandoff: (open) => set((state) => {
+    state.gitHandoff = open;
+  }),
 
   // ─── Rail route ──────────────────────────────────────────────────────────
   appRoute: 'workspaces',
@@ -1147,11 +1197,26 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
     state.fleetIdleExpanded = expanded;
   }),
 
+  fleetFinishedExpanded: false,
+
+  setFleetFinishedExpanded: (expanded) => set((state) => {
+    state.fleetFinishedExpanded = expanded;
+  }),
+
   fleetFocusReview: false,
 
   setFleetFocusReview: (focus) => set((state) => {
     state.fleetFocusReview = focus;
   }),
+
+  fleetFocusTask: null,
+  setFleetFocusTask: (taskId) => set((state) => {
+    state.fleetFocusTask = taskId;
+  }),
+  openTaskConversation: (taskId) => {
+    get().setFleetFocusTask(taskId);
+    get().setFleetViewVisible(true);
+  },
 
   fleetLastSeen: null,
 
@@ -1172,6 +1237,13 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
     if (visible) get().setAppRoute('settings');
     else set((state) => { leaveAppRoute(state, 'settings'); });
   },
+
+  settingsInitialTab: null,
+  openSettingsTab: (tab) => {
+    set((state) => { state.settingsInitialTab = tab; });
+    get().setSettingsPanelVisible(true);
+  },
+  clearSettingsInitialTab: () => set((state) => { state.settingsInitialTab = null; }),
 
   // ─── Notification sound ──────────────────────────────────────────────────
   notificationSoundEnabled: true,

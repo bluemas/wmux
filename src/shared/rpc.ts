@@ -96,6 +96,14 @@ export const WMUX_HOOK_BRIDGE_CLIENT_NAME = 'wmux-hook-bridge';
 export const WMUX_STATUSLINE_CLIENT_NAME = 'wmux-statusline';
 
 /**
+ * Stable `clientName` reported by Moa's read gate (the PreToolUse hook main
+ * generates for the HQ brain, src/main/deck/moaReadGate.ts) when it asks the
+ * MAIN pipe which repositories Moa may read without a prompt
+ * (`deck.moaReadRoots`). Its own one-method lane, like the statusline's.
+ */
+export const WMUX_READ_GATE_CLIENT_NAME = 'wmux-read-gate';
+
+/**
  * `clientName` values that must NEVER be promoted to first-party recognition
  * through `mcp.firstPartyClients` in `~/.wmux/config.json` (issue #636).
  * Compared case-insensitively. Enforced by `setConfiguredFirstPartyClients`
@@ -125,6 +133,7 @@ export const NON_IDENTIFYING_CLIENT_NAMES: ReadonlySet<string> = new Set<string>
   WMUX_CLI_CLIENT_NAME,
   WMUX_HOOK_BRIDGE_CLIENT_NAME,
   WMUX_STATUSLINE_CLIENT_NAME,
+  WMUX_READ_GATE_CLIENT_NAME,
 ]);
 
 /**
@@ -418,6 +427,7 @@ export type RpcMethod =
   | 'deck.completeWork'
   | 'deck.requestDecision'
   | 'deck.resolveDecision'
+  | 'deck.proposeHandoff'
   | 'deck.state.prune'
   | 'browser.tabs'
   | 'browser.open'
@@ -487,6 +497,9 @@ export type RpcMethod =
   | 'daemon.phone.register'
   | 'daemon.phone.complete'
   | 'daemon.workspaceFacts.set'
+  // Main → daemon: which daemon session is the Moa (HQ brain) pane, or null.
+  // The phone's access to that one brain pane stands only while it does.
+  | 'daemon.moa.set'
   | 'daemon.inbox.poll'
   | 'lanlink.status'
   | 'lanlink.configure'
@@ -533,6 +546,7 @@ export type RpcMethod =
   | 'company.provisionCeo'
   | 'hooks.signal'
   | 'usage.rateLimits'
+  | 'deck.moaReadRoots'
   | 'a2a.channel.list'
   | 'a2a.channel.get'
   | 'a2a.channel.getMessages'
@@ -660,6 +674,7 @@ export const ALL_RPC_METHODS = [
   'deck.completeWork',
   'deck.requestDecision',
   'deck.resolveDecision',
+  'deck.proposeHandoff',
   'deck.state.prune',
   'browser.tabs',
   'browser.open',
@@ -722,6 +737,7 @@ export const ALL_RPC_METHODS = [
   'daemon.phone.register',
   'daemon.phone.complete',
   'daemon.workspaceFacts.set',
+  'daemon.moa.set',
   'daemon.inbox.poll',
   'lanlink.status',
   'lanlink.configure',
@@ -768,6 +784,7 @@ export const ALL_RPC_METHODS = [
   'company.provisionCeo',
   'hooks.signal',
   'usage.rateLimits',
+  'deck.moaReadRoots',
   'a2a.channel.list',
   'a2a.channel.get',
   'a2a.channel.getMessages',
@@ -847,6 +864,14 @@ export interface DaemonEvent {
     // A pane's usage-limit hold changed (shared/usageLimit).
     //   usage.limit.changed → { limit: PaneUsageLimit | null }  (null = cleared)
     | 'usage.limit.changed'
+    // An approval record was created, resolved or expired. A RE-LIST NUDGE
+    // only — nothing from the record rides along (main reads
+    // daemon.approvals.list). Drives the HQ approval lane.
+    //   approvals.changed → { change: 'create' | 'resolve' | 'expire' | ... }
+    | 'approvals.changed'
+    // A key (not a mouse report) reached the pane by any input path; at most
+    // once per 30 s per pane. Workspace settle activity. No data.
+    | 'input.typed'
     | 'session.output'
     | 'phone.request'
     | 'agent.event'
@@ -861,6 +886,11 @@ export interface DaemonEvent {
     // watching, or null when it could not attribute one.
     //   agent.processExit → { slug: string | null }
     | 'agent.processExit'
+    // The last tool an agent with no per-tool hook ran, read from its own
+    // transcript (TranscriptActivityWatcher). Same meaning as a PostToolUse
+    // activity line; '' clears it.
+    //   agent.transcriptActivity → { activity: string }
+    | 'agent.transcriptActivity'
     | 'prompt.event'
     | 'notification.event'
     | 'cwd.changed'

@@ -131,8 +131,11 @@ export function checkProcessLiveness(pid: number): ProcessLiveness {
 }
 
 /**
- * Look up the process image name (executable basename) for a PID, so the
- * launcher can verify a PID actually belongs to wmux before sending SIGKILL.
+ * Look up the process image name (executable basename) for a PID, so
+ * ensureDaemon can screen a recorded PID before trusting it. The forced-kill
+ * helpers never compare it (another host may have spawned the daemon);
+ * strict mode only refuses when it cannot be read. Script identity from
+ * `getProcessArgv` is what clears a kill.
  *
  * Critical for the "alive but unresponsive" branch: after a crash, the OS
  * may reuse the daemon's PID for an unrelated user process (Chrome, an
@@ -183,7 +186,7 @@ function getProcessImageName(pid: number): string | null {
  * Read a process's full command line, so callers can verify it actually
  * carries the daemon-script path before treating it as a wmux daemon.
  *
- * This is the second safety net for the kill path: image basename alone
+ * This is the identity gate for every forced kill: image basename alone
  * ("electron.exe" in dev) collides with the main process itself and with
  * any other Electron-based app the user happens to be running. Adding
  * "did this process get spawned with the daemon script as argv[1]"
@@ -1399,35 +1402,63 @@ export async function ensureDaemon(deps: DaemonLauncherDeps): Promise<DaemonInfo
 
 /**
  * Force-kill the daemon recorded in `daemon.pid` — but ONLY if the live
- * process at that PID verifiably still belongs to wmux (image basename +
- * cmdline carry the daemon script). This is the explicit-full-shutdown
- * backstop for main's before-quit: when the user picks "Shut down wmux
- * completely" and the graceful `daemon.shutdown` RPC times out, this
- * guarantees a wedged daemon can't survive the teardown the user explicitly
- * asked for.
+ * process at that PID has a verified daemon entry script. This is the
+ * explicit-full-shutdown backstop for main's before-quit: when the user picks
+ * "Shut down wmux completely" and the graceful `daemon.shutdown` RPC times
+ * out, this attempts to stop a wedged daemon without signalling an
+ * unverified process.
  *
- * The PID-reuse guards mirror ensureDaemon()'s verify-before-kill logic so we
- * never SIGKILL an unrelated process that recycled the daemon's old PID. We
- * only abort the kill when a check returns a DEFINITIVE mismatch; an
- * indeterminate result (null image/cmdline, e.g. AV blocking tasklist) still
- * proceeds, because this path runs at most a few seconds after we were
- * actively talking to that PID, so reuse is near-impossible and leaving an
- * orphan is the worse outcome here.
+ * An unreadable or mismatched command line refuses the kill, even when an
+ * executable name matches. The image is not consulted, since another host
+ * can run the same daemon script. A refused kill can leave the daemon
+ * running for explicit recovery.
  *
  * Best-effort: never throws. Returns true only when a verified daemon was
- * signalled.
+ * signalled; `killDaemonByPidFileOutcome` says why it was not.
  */
 export function killDaemonByPidFile(scriptCandidates: string[] = []): boolean {
+  return killDaemonByPidFileOutcome(scriptCandidates) === 'killed';
+}
+
+/** `killDaemonByPidFile`, reporting why nothing was signalled. Never throws. */
+export function killDaemonByPidFileOutcome(scriptCandidates: string[] = []): DaemonKillOutcome {
+  let pid: number;
   try {
     const wmuxDir = getWmuxDir();
     const pidStr = fs.readFileSync(path.join(wmuxDir, 'daemon.pid'), 'utf8').trim();
-    const pid = parseInt(pidStr, 10);
-    // Before-quit mode: indeterminate verification still proceeds — this
-    // path runs seconds after we were actively talking to that PID, so
-    // reuse is near-impossible and an orphan is the worse outcome.
-    return killVerifiedDaemonPid(pid, { definitiveOnly: false, scriptCandidates });
+    pid = parseInt(pidStr, 10);
   } catch {
-    return false;
+    return 'dead'; // no pid file: no daemon recorded
+  }
+  // Relaxed mode: no image lookup, but never a kill without script identity.
+  return killVerifiedDaemonPidOutcome(pid, { definitiveOnly: false, scriptCandidates });
+}
+
+/**
+ * Why a verified kill did or did not signal its target. Callers that only
+ * need "was a daemon signalled" use the boolean wrappers; the full-shutdown
+ * backstop logs the outcome so a refusal is not mistaken for "already gone".
+ *
+ *  - `killed`: a verified daemon was sent SIGKILL.
+ *  - `dead`: nothing to kill: no pid file, an invalid PID, or a process that
+ *    is confirmed gone.
+ *  - `not-daemon`: the process's command line was read and it is not a wmux
+ *    daemon (for example a reused PID). It was left alone.
+ *  - `unverifiable`: the process may still be live, but its identity could
+ *    not be read (the command line, or strict mode's image lookup). It was
+ *    left running rather than guessed at.
+ *  - `failed`: identity was verified, but sending the signal threw.
+ */
+export type DaemonKillOutcome = 'killed' | 'dead' | 'not-daemon' | 'unverifiable' | 'failed';
+
+/** Log phrase for a backstop outcome; `unverifiable` names the daemon left running. */
+export function describeDaemonKillOutcome(outcome: DaemonKillOutcome): string {
+  switch (outcome) {
+    case 'killed': return 'killed the daemon';
+    case 'dead': return 'found no live daemon to kill';
+    case 'not-daemon': return 'refused: the recorded PID is not a wmux daemon';
+    case 'unverifiable': return 'refused: could not verify the daemon script identity (process inspection unavailable), so the daemon may still be running; retry shutdown once inspection works';
+    case 'failed': return 'verified the daemon but the kill signal failed';
   }
 }
 
@@ -1440,59 +1471,55 @@ export function killDaemonByPidFile(scriptCandidates: string[] = []): boolean {
  *    from daemon.pid. Between ack and backstop another app instance may have
  *    already spawned a replacement daemon and rewritten the pid file; a
  *    file-read here would SIGKILL the fresh daemon.
- *  - `definitiveOnly: true` refuses to kill when the image or cmdline lookup
- *    is indeterminate (null — AV blocking tasklist/ps/WMI). The replacement
- *    path deliberately waits up to ~5s after asking the daemon to die, which
- *    is long enough for PID reuse to stop being "near-impossible"; the
- *    before-quit relaxation does not transfer. A refused kill degrades to
- *    the respawn-budget machinery, never to a blind SIGKILL.
+ *  - `definitiveOnly: true` also refuses when the image lookup is
+ *    indeterminate (null — AV blocking tasklist/ps). This is a conservative
+ *    "refuse when indeterminate" gate, not the PID-reuse defense: in both
+ *    modes that defense is the script identity read from the command line.
+ *
+ * Both modes require script identity from the command line. A matching
+ * executable name is shared by unrelated Node/Electron processes, so an
+ * unreadable command line refuses the kill; a refused kill degrades to the
+ * caller's recovery path, never to a blind SIGKILL.
  *
  * Best-effort: never throws. Returns true only when a verified daemon was
- * signalled.
+ * signalled; `killVerifiedDaemonPidOutcome` says why it was not.
  */
 export function killVerifiedDaemonPid(
   pid: number,
   opts: { definitiveOnly: boolean; scriptCandidates?: string[] },
 ): boolean {
+  return killVerifiedDaemonPidOutcome(pid, opts) === 'killed';
+}
+
+/** `killVerifiedDaemonPid`, reporting why nothing was signalled. Never throws. */
+export function killVerifiedDaemonPidOutcome(
+  pid: number,
+  opts: { definitiveOnly: boolean; scriptCandidates?: string[] },
+): DaemonKillOutcome {
   try {
-    if (!Number.isFinite(pid) || pid <= 0 || pid === process.pid) return false;
+    if (!Number.isFinite(pid) || pid <= 0) return 'dead';
+    if (pid === process.pid) return 'not-daemon';
     // Only a confirmed-dead PID skips the kill (already gone). `unknown`
     // proceeds to verification — the image/cmdline guards below decide.
-    if (checkProcessLiveness(pid) === 'dead') return false;
+    if (checkProcessLiveness(pid) === 'dead') return 'dead';
 
-    // `expectedImage` is THIS caller's own image — a diagnostic pre-filter,
-    // not authoritative (see the comment on the equivalent check in
-    // `ensureDaemon` above). Since #1001 a daemon may have been spawned by a
-    // different host than the one asking to kill it here (Electron killing a
-    // CLI-spawned daemon, or vice versa), so a mismatch alone must not
-    // refuse the kill — only the cmdline check below is host-independent.
-    const expectedImage = path.basename(process.execPath);
-    const image = getProcessImageName(pid);
-    // A definite read that does NOT match is inconclusive on its own since
-    // #1001 (a different host may have spawned this daemon) — but it is
-    // still a real, negative signal. Recorded so a null cmdline right after
-    // it can be refused instead of silently combined into "proceed".
-    const imageDefinitivelyMismatched = image !== null && image.toLowerCase() !== expectedImage.toLowerCase();
-    if (image === null) {
-      if (opts.definitiveOnly) return false; // indeterminate — refuse
-    }
+    // Since #1001 another host may have spawned the daemon (Electron vs CLI),
+    // so the image is never compared with this caller's; script identity below
+    // is the host-independent gate. Only strict mode reads the image, and only
+    // to refuse an indeterminate lookup; skipping it in relaxed mode saves
+    // before-quit one tasklist/ps call (up to 3 s) whose result was unused.
+    if (opts.definitiveOnly && getProcessImageName(pid) === null) return 'unverifiable';
     const argv = getProcessArgv(pid);
-    if (argv === null) {
-      // `definitiveOnly` already refuses on any indeterminate cmdline. Below
-      // that threshold, a null cmdline COMBINED with an already-confirmed
-      // image mismatch is refused too: neither signal alone proves the PID
-      // isn't ours (cross-host support needs that), but having both point
-      // away from "ours" restores the pre-#1001 guarantee that an image
-      // mismatch blocks the kill — it just needs the second, cmdline signal
-      // to also fail to clear it, rather than mismatch alone.
-      if (opts.definitiveOnly || imageDefinitivelyMismatched) return false;
-    } else if (!argvIdentifiesDaemonScript(argv, opts.scriptCandidates ?? [])) {
-      return false; // definitive: same image but not our daemon script
-    }
-
-    process.kill(pid, 'SIGKILL');
-    return true;
+    // Missing or mismatched script identity refuses, regardless of image.
+    if (argv === null) return 'unverifiable';
+    if (!argvIdentifiesDaemonScript(argv, opts.scriptCandidates ?? [])) return 'not-daemon';
   } catch {
-    return false;
+    return 'unverifiable';
+  }
+  try {
+    process.kill(pid, 'SIGKILL');
+    return 'killed';
+  } catch {
+    return 'failed';
   }
 }

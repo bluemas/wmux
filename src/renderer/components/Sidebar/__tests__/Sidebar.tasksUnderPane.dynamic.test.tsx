@@ -227,7 +227,7 @@ describe('fan-out tasks under the pane — review fixes', () => {
     expect(group('pane:w1:p2')).toBeNull();
     const tasks = document.querySelector('[data-roster-chip-tasks]') as HTMLElement;
     expect(tasks.getAttribute('data-roster-chip-needs-you')).toBe('1');
-    expect(tasks.querySelector('.text-\\[var\\(--accent-yellow\\)\\]')?.textContent).toBe('1');
+    expect(tasks.querySelector('.text-\\[var\\(--attention-text\\)\\]')?.textContent).toBe('1');
     expect(chip().getAttribute('aria-label')).toContain('1 need you');
     // A second task starts needing you while folded: the roster opens again.
     act(() => useStore.setState({
@@ -311,9 +311,14 @@ describe('fan-out tasks under the pane — review fixes', () => {
     act(() => root.render(<Sidebar />));
     const owner = [...document.querySelectorAll('.sidebar-row')].find((r) => r.textContent?.startsWith('Workspace 1')) as HTMLElement;
     const taskRow = group('pane:w1:p2')!.querySelector('[data-task-group-list] .sidebar-row') as HTMLElement;
-    expect(owner.classList.contains('group')).toBe(true);
-    expect(taskRow.classList.contains('group')).toBe(false);
-    expect(taskRow.classList.contains('group/task')).toBe(true);
+    // The group sits on each row's own line, so the owner's never contains
+    // its nested task rows and a task's hover never reaches the owner's chrome.
+    const ownerLine = owner.firstElementChild as HTMLElement;
+    const taskLine = taskRow.firstElementChild as HTMLElement;
+    expect(ownerLine.classList.contains('group')).toBe(true);
+    expect(ownerLine.contains(taskRow)).toBe(false);
+    expect(taskLine.classList.contains('group')).toBe(false);
+    expect(taskLine.classList.contains('group/task')).toBe(true);
     // No element inside a task row listens to the owner's plain group hover.
     expect(taskRow.outerHTML).not.toMatch(/(^|\s|")group-hover:/);
     expect(taskRow.outerHTML).not.toMatch(/(^|\s|")group-focus-within:/);

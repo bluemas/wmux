@@ -15,6 +15,7 @@ import { IPC } from '../../../shared/constants';
 import { getWorkspaceMirror } from '../../workspace/WorkspaceMirror';
 import { reconcileWorkspaceClaims } from '../../workspace/workspaceClaimTrust';
 import { getWorkerTempDirSweeper } from '../../worktask/fanoutTempDir';
+import { getWorkspaceSettleService } from '../../workspace/settle/workspaceSettleHost';
 import type {
   WorkspaceListEntry,
   FleetSnapshot,
@@ -153,6 +154,23 @@ export function parseWorkspaceMirrorPayload(raw: unknown): WorkspaceMirrorPushPa
   }
   // Only a literal true counts: anything else keeps the startup Deck reconcile off.
   if (raw.sessionRestored === true) out.sessionRestored = true;
+  // Sidebar pins (settle exemption). Absent (old renderer) stays absent.
+  if (Array.isArray(raw.pinnedIds)) {
+    out.pinnedIds = raw.pinnedIds.filter((id): id is string => typeof id === 'string' && WORKSPACE_ID_RE.test(id));
+  }
+  // The viewed workspace/pane (HQ brain context line). A bad workspace id drops
+  // the field (unknown); a bad pane id keeps the workspace with no pane.
+  if (isRecord(raw.viewed) && typeof raw.viewed.workspaceId === 'string'
+    && WORKSPACE_ID_RE.test(raw.viewed.workspaceId)) {
+    const { paneId, cwd, branch } = raw.viewed;
+    out.viewed = {
+      workspaceId: raw.viewed.workspaceId,
+      paneId: typeof paneId === 'string' && PTY_ID_RE.test(paneId) ? paneId : null,
+      // Bounded here; the context line re-checks and sanitizes both.
+      ...(typeof cwd === 'string' && cwd.length > 0 && cwd.length <= 4096 ? { cwd } : {}),
+      ...(typeof branch === 'string' && branch.length > 0 && branch.length <= 512 ? { branch } : {}),
+    };
+  }
   return out;
 }
 
@@ -185,6 +203,12 @@ export function registerWorkspaceMirrorHandler(): () => void {
       getWorkerTempDirSweeper().reconcile(payload.entries.map((e) => e.id));
     } catch {
       /* temp-dir bookkeeping must never affect the mirror */
+    }
+    // Settle rules read agent status and pins from this same push.
+    try {
+      getWorkspaceSettleService()?.noteMirror(payload);
+    } catch (err) {
+      console.error('[workspaceSettle] mirror note failed:', err);
     }
   };
   ipcMain.removeAllListeners(IPC.WORKSPACE_MIRROR_PUSH);

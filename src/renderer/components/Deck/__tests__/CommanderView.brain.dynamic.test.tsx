@@ -9,8 +9,9 @@
 import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
 import { createElement, act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { CommanderViewContent, type CommanderViewContentProps } from '../CommanderView';
+import { CommanderViewContent, MOA_BLOCK_CODES, MOA_BLOCK_KEY, isMoaBlockCode, type CommanderViewContentProps } from '../CommanderView';
 import { applyBrainEvent, type DeckBrainMessage } from '../deckBrain';
+import { setDeckHeaderSlot } from '../deckHeaderSlot';
 import { t, setLocale } from '../../../i18n';
 
 // The embed attaches a real xterm to a real daemon session (window.electronAPI),
@@ -20,6 +21,15 @@ vi.mock('../BrainTerminalEmbed', () => ({
   __esModule: true,
   default: ({ ptyId }: { ptyId: string }) =>
     createElement('div', { 'data-commander-brain-terminal': true, 'data-pty-id': ptyId }),
+}));
+
+// The decision card and ledger hydrate from main; here only WHERE they are
+// drawn matters, so they are stubbed to markers.
+vi.mock('../DeckDecisionCard', () => ({
+  DeckDecisionCard: () => createElement('div', { 'data-test-decision-card': true }),
+}));
+vi.mock('../DeckLedgerPanel', () => ({
+  DeckLedgerPanel: () => createElement('div', { 'data-test-ledger': true }),
 }));
 
 let container: HTMLDivElement;
@@ -132,6 +142,48 @@ describe('CommanderViewContent — brain surface', () => {
     expect(input.placeholder).toBe('deck.composerModeOffShort');
   });
 
+  it('Moa off: the composer is disabled with the reason, and the notice opens Settings › Moa', () => {
+    const onOpenSettings = vi.fn();
+    mount({ moaBlock: { code: 'moa_off', onOpenSettings }, t });
+    const input = container.querySelector('[data-channel-composer-input]') as HTMLTextAreaElement;
+    expect(input.disabled).toBe(true);
+    expect(input.placeholder).toBe('Moa is off — turn it on in Settings → Moa');
+    const shell = container.querySelector('[data-commander-composer]') as HTMLElement;
+    expect(shell.getAttribute('data-moa-off')).toBe('true');
+    const notice = container.querySelector('[data-commander-moa-block="moa_off"]') as HTMLElement;
+    expect(notice.textContent).toContain('Moa is off.');
+    act(() => (notice.querySelector('[data-commander-moa-open-settings]') as HTMLButtonElement).click());
+    expect(onOpenSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it("not_hq: says this isn't Moa's workspace, offers to open it, and leaves the composer live", () => {
+    const onOpenHq = vi.fn();
+    mount({ moaBlock: { code: 'not_hq', onOpenSettings: vi.fn(), onOpenHq }, t });
+    const notice = container.querySelector('[data-commander-moa-block="not_hq"]') as HTMLElement;
+    expect(notice.textContent).toContain("This workspace isn't Moa's workspace.");
+    expect(notice.querySelector('[data-commander-moa-open-settings]')).toBeNull();
+    act(() => (notice.querySelector('[data-commander-moa-open-hq]') as HTMLButtonElement).click());
+    expect(onOpenHq).toHaveBeenCalledTimes(1);
+    expect((container.querySelector('[data-channel-composer-input]') as HTMLTextAreaElement).disabled).toBe(false);
+  });
+
+  it('hq_missing and hq_unknown each say their own reason; no notice without a block', () => {
+    mount({ moaBlock: { code: 'hq_missing', onOpenSettings: vi.fn() }, t });
+    expect(container.querySelector('[data-commander-moa-block="hq_missing"]')?.textContent).toContain("Moa's workspace is missing.");
+    mount({ moaBlock: { code: 'hq_unknown' }, t });
+    expect(container.querySelector('[data-commander-moa-block="hq_unknown"]')?.textContent).toContain("hasn't been seen yet");
+    mount({});
+    expect(container.querySelector('[data-commander-moa-block]')).toBeNull();
+  });
+
+  it('every Moa refusal code main sends has its own sentence', () => {
+    for (const code of MOA_BLOCK_CODES) {
+      expect(isMoaBlockCode(code)).toBe(true);
+      expect(t(MOA_BLOCK_KEY[code])).not.toBe(MOA_BLOCK_KEY[code]);
+    }
+    expect(isMoaBlockCode('busy')).toBe(false);
+  });
+
   it('leaves the composer live in any other mode', () => {
     mount({ modeOff: false });
     const input = container.querySelector('[data-channel-composer-input]') as HTMLTextAreaElement;
@@ -214,7 +266,7 @@ describe('CommanderViewContent — brain surface', () => {
     const actions = [
       { id: 'recover-fleet' as const, label: 'Recover agents', prompt: 'recover please' },
     ];
-    mount({ activeWorkspaceId: 'ws-1', quickActions: actions, onQuickAction });
+    mount({ chatWorkspaceId: 'ws-1', quickActions: actions, onQuickAction });
 
     const chips = container.querySelectorAll('[data-deck-quick-action]');
     expect(chips).toHaveLength(1);
@@ -226,7 +278,7 @@ describe('CommanderViewContent — brain surface', () => {
 
   it('disables the recovery chip while a brain turn streams', () => {
     mount({
-      activeWorkspaceId: 'ws-1',
+      chatWorkspaceId: 'ws-1',
       quickActions: [{ id: 'recover-fleet' as const, label: 'Recover agents', prompt: 'x' }],
       brainBusy: true,
       brainMessages: brainTurn(),
@@ -240,7 +292,7 @@ describe('CommanderViewContent — brain surface', () => {
     // shows whenever there is a workspace to control. Their containers self-hide
     // without a preload (jsdom), so the bar is present but the recovery
     // sub-group is absent.
-    mount({ activeWorkspaceId: 'ws-1', quickActions: [] });
+    mount({ chatWorkspaceId: 'ws-1', quickActions: [] });
     expect(container.querySelector('[data-deck-control-bar]')).not.toBeNull();
     expect(container.querySelector('[data-deck-quick-actions]')).toBeNull();
   });
@@ -248,7 +300,7 @@ describe('CommanderViewContent — brain surface', () => {
   it('no longer renders the fan-out chip in the control bar (moved to the agent toolbar)', () => {
     // fan-out returned control bar → agent toolbar (DESIGN.md Decisions Log
     // 2026-07-20); the control bar must not carry the chip anymore.
-    mount({ activeWorkspaceId: 'ws-1', quickActions: [], threads: [], brainMessages: [] });
+    mount({ chatWorkspaceId: 'ws-1', quickActions: [], threads: [], brainMessages: [] });
     expect(container.querySelector('[data-deck-fanout-chip]')).toBeNull();
   });
 
@@ -262,7 +314,7 @@ describe('CommanderViewContent — brain surface', () => {
     // Real translator: the rail header interpolates {count} into the locale
     // string, which a key-echoing stub would silently swallow.
     setLocale('en');
-    mount({ brainPtyId: 'pty-1', brainMessages: brainTurn(), activeWorkspaceId: 'ws-1', t });
+    mount({ brainPtyId: 'pty-1', brainMessages: brainTurn(), chatWorkspaceId: 'ws-1', t });
     // The TUI replaces the chat surface entirely.
     expect(container.querySelector('[data-commander-brain-terminal]')).not.toBeNull();
     expect(container.querySelector('[data-channel-composer-input]')).toBeNull();
@@ -288,7 +340,7 @@ describe('CommanderViewContent — brain surface', () => {
     const wake = vi.fn(async () => ({ ok: true }));
     (window as unknown as { electronAPI: unknown }).electronAPI = { deck: { wake } };
     try {
-      mount({ brainPtyId: 'pty-1', activeWorkspaceId: 'ws-1' });
+      mount({ brainPtyId: 'pty-1', chatWorkspaceId: 'ws-1' });
       const btn = container.querySelector('[data-commander-wake-now]') as HTMLButtonElement;
       expect(btn).not.toBeNull();
       expect(btn.disabled).toBe(false);
@@ -300,16 +352,16 @@ describe('CommanderViewContent — brain surface', () => {
   });
 
   it('disables the Wake button while a brain turn streams; hides it without a pty', () => {
-    mount({ brainPtyId: 'pty-1', activeWorkspaceId: 'ws-1', brainBusy: true });
+    mount({ brainPtyId: 'pty-1', chatWorkspaceId: 'ws-1', brainBusy: true });
     const btn = container.querySelector('[data-commander-wake-now]') as HTMLButtonElement;
     expect(btn.disabled).toBe(true);
     // The bubble layouts keep their composer instead — no Wake button.
-    mount({ brainMessages: brainTurn(), activeWorkspaceId: 'ws-1' });
+    mount({ brainMessages: brainTurn(), chatWorkspaceId: 'ws-1' });
     expect(container.querySelector('[data-commander-wake-now]')).toBeNull();
   });
 
   it('without a brain pty the SDK layout is untouched: composer, no terminal', () => {
-    mount({ brainMessages: brainTurn(), activeWorkspaceId: 'ws-1' });
+    mount({ brainMessages: brainTurn(), chatWorkspaceId: 'ws-1' });
     expect(container.querySelector('[data-commander-brain-terminal]')).toBeNull();
     expect(container.querySelector('[data-channel-composer-input]')).not.toBeNull();
     expect(container.querySelector('[data-commander-report-rail-toggle]')).toBeNull();
@@ -408,5 +460,130 @@ describe('CommanderViewContent — surfaced rate-limit notices (real locale)', (
     msgs = applyBrainEvent(msgs, { type: 'limit', status: 'allowed_warning', ...ep });
     mount({ brainMessages: msgs, t });
     expect(container.querySelectorAll('[data-commander-brain-limits] [data-limit-status]')).toHaveLength(2);
+  });
+});
+
+describe('CommanderViewContent — Moa slots', () => {
+  const chatNode = createElement('div', { 'data-test-moa-chat': true }, 'bubbles');
+  const topNode = createElement('div', { 'data-test-moa-top': true });
+  // The header slot DeckTabs registers in the real dock.
+  let slot: HTMLDivElement;
+  beforeEach(() => {
+    slot = document.createElement('div');
+    document.body.appendChild(slot);
+    act(() => setDeckHeaderSlot(slot));
+  });
+  afterEach(() => {
+    act(() => setDeckHeaderSlot(null));
+    slot.remove();
+  });
+  const openMenu = () => act(() => (slot.querySelector('[data-moa-header-more]') as HTMLButtonElement).click());
+  const menuItem = (key: string) => document.querySelector(`[data-pane-menu-action="${key}"]`) as HTMLButtonElement | null;
+
+  it('opens on the chat look: no terminal is mounted until asked for', () => {
+    const onViewChange = vi.fn();
+    mount({ brainPtyId: 'pty-hq', chatWorkspaceId: 'ws-hq', moa: { top: topNode, chat: chatNode, view: 'chat', onViewChange } });
+    // The chat draws the top inside its own scroll; the panel does not repeat it.
+    expect(container.querySelector('[data-test-moa-top]')).toBeNull();
+    expect(container.querySelector('[data-test-moa-chat]')).not.toBeNull();
+    expect(container.querySelector('[data-commander-brain-terminal]')).toBeNull();
+    openMenu();
+    expect(menuItem('view')?.textContent).toBe('moa.panel.viewAsTerminal');
+    act(() => menuItem('view')!.click());
+    expect(onViewChange).toHaveBeenCalledWith('terminal');
+  });
+
+  it('draws no control rows: Mode, Loop, Schedules, New session, Wake and the view switch are in the ⋯ menu', () => {
+    for (const brainPtyId of ['pty-hq', null]) {
+      mount({ brainPtyId, chatWorkspaceId: 'ws-hq', moa: { top: topNode, chat: chatNode, view: 'chat', onViewChange: vi.fn() } });
+      expect(container.querySelector('[data-agent-mode-chip], [data-deck-new-session], [data-commander-wake-now], [data-moa-terminal-toggle], .wmux-agent-tools-toggle')).toBeNull();
+      // Nothing to show, so the bar is hidden as empty.
+      const bar = container.querySelector('[data-deck-control-bar]');
+      expect(bar?.childElementCount ?? 0).toBe(0);
+      expect(slot.querySelector('[data-moa-header-more]')).not.toBeNull();
+    }
+  });
+
+  it('the terminal view mounts the brain pty exactly once, in place of the chat', () => {
+    const onViewChange = vi.fn();
+    mount({ brainPtyId: 'pty-hq', chatWorkspaceId: 'ws-hq', moa: { chat: chatNode, view: 'terminal', onViewChange } });
+    const embeds = container.querySelectorAll('[data-commander-brain-terminal]');
+    expect(embeds).toHaveLength(1);
+    expect(embeds[0].getAttribute('data-pty-id')).toBe('pty-hq');
+    expect(container.querySelector('[data-test-moa-chat]')).toBeNull();
+    openMenu();
+    expect(menuItem('view')?.textContent).toBe('moa.panel.viewAsChat');
+    act(() => menuItem('view')!.click());
+    expect(onViewChange).toHaveBeenCalledWith('chat');
+  });
+
+  it('before the brain is up, the composer speaks of Moa, not the orchestrator', () => {
+    mount({ brainPtyId: null, chatWorkspaceId: 'ws-hq', moa: { top: topNode, chat: chatNode, view: 'chat', onViewChange: vi.fn() } });
+    const input = container.querySelector('[data-channel-composer-input]') as HTMLTextAreaElement;
+    expect(input.placeholder).toBe('moa.panel.placeholder');
+    // A send here goes to Moa, not into a channel's shared record.
+    expect(container.querySelector('[data-channel-record-hint]')?.textContent).toBe('chat.inputHint');
+  });
+
+  it('without a transcript source the terminal is the only view, and there is no toggle', () => {
+    mount({ brainPtyId: 'pty-hq', chatWorkspaceId: 'ws-hq', moa: { chat: null, view: 'chat', onViewChange: vi.fn() } });
+    expect(container.querySelectorAll('[data-commander-brain-terminal]')).toHaveLength(1);
+    openMenu();
+    expect(menuItem('settings')).not.toBeNull();
+    expect(menuItem('view')).toBeNull();
+  });
+
+  it('Waiting on you and the task cards replace the HQ decision card and ledger', () => {
+    // Terminal view, and the bubble layout before the brain is up: the panel
+    // draws the top itself (the chat view carries it inside its scroll).
+    for (const brainPtyId of ['pty-hq', null]) {
+      mount({ brainPtyId, chatWorkspaceId: 'ws-hq', moa: { top: topNode, chat: chatNode, view: 'terminal', onViewChange: vi.fn() } });
+      expect(container.querySelector('[data-test-moa-top]')).not.toBeNull();
+      expect(container.querySelector('[data-test-decision-card]')).toBeNull();
+      expect(container.querySelector('[data-test-ledger]')).toBeNull();
+    }
+  });
+
+  it('over the terminal the top is capped with its own scroll; the bubble layout keeps it in the one scroll', () => {
+    mount({ brainPtyId: 'pty-hq', chatWorkspaceId: 'ws-hq', moa: { top: topNode, chat: chatNode, view: 'terminal', onViewChange: vi.fn() } });
+    const cap = container.querySelector('[data-moa-pty-top]') as HTMLElement;
+    expect(cap.querySelector('[data-test-moa-top]')).not.toBeNull();
+    expect(cap.className).toContain('max-h-[30%]');
+    expect(cap.className).toContain('overflow-y-auto');
+    expect(cap.nextElementSibling?.compareDocumentPosition(container.querySelector('[data-commander-brain-terminal]')!)).toBeTruthy();
+    mount({ brainPtyId: null, chatWorkspaceId: 'ws-hq', moa: { top: topNode, chat: chatNode, view: 'chat', onViewChange: vi.fn() } });
+    expect(container.querySelector('[data-moa-pty-top]')).toBeNull();
+    expect(container.querySelector('[data-commander-threads] [data-test-moa-top]')).not.toBeNull();
+  });
+
+  it("Moa's panel draws no Fleet roster; without Moa the roster stays, in either layout", () => {
+    const fleetSlot = createElement('div', { 'data-test-fleet-roster': true });
+    for (const brainPtyId of ['pty-hq', null]) {
+      mount({ brainPtyId, chatWorkspaceId: 'ws-hq', fleetSlot, moa: { top: topNode, chat: chatNode, view: 'chat', onViewChange: vi.fn() } });
+      expect(container.querySelector('[data-test-fleet-roster]')).toBeNull();
+      mount({ brainPtyId, chatWorkspaceId: 'ws-a', fleetSlot });
+      expect(container.querySelector('[data-test-fleet-roster]')).not.toBeNull();
+    }
+  });
+
+  it('without Moa (per-workspace chat) both stay, in either layout', () => {
+    for (const brainPtyId of ['pty-a', null]) {
+      mount({ brainPtyId, chatWorkspaceId: 'ws-a' });
+      expect(container.querySelector('[data-test-decision-card]')).not.toBeNull();
+      expect(container.querySelector('[data-test-ledger]')).not.toBeNull();
+    }
+  });
+
+  it('Wake fires for the chat workspace (the HQ), not the one on screen', () => {
+    const wake = vi.fn(async () => ({ ok: true }));
+    (window as unknown as { electronAPI: unknown }).electronAPI = { deck: { wake } };
+    try {
+      mount({ brainPtyId: 'pty-hq', chatWorkspaceId: 'ws-hq', moa: { chat: chatNode, view: 'chat', onViewChange: vi.fn() } });
+      openMenu();
+      act(() => menuItem('wake')!.click());
+      expect(wake).toHaveBeenCalledWith('ws-hq');
+    } finally {
+      delete (window as unknown as { electronAPI?: unknown }).electronAPI;
+    }
   });
 });

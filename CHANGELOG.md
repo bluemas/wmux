@@ -1,3 +1,780 @@
+## [4.0.0] — 2026-10-06
+
+wmux 4.0 is the ADE release. It also includes every change listed under 4.0.0-beta.1 below.
+
+### Added
+
+- **Fleet rows say what each agent is doing.** A row reads `Edited foo.ts` or
+  `Ran npm test` while the agent works, and `Last: Edited foo.ts` once it
+  stops. Before, a finished row said nothing about what the agent had done.
+  Agents that report no tools show their last reply. (#1799)
+
+- **A detail area under the Fleet list.** Selecting a row, or pressing Space,
+  shows the agent's recent terminal output and its task's conversation under
+  the list. Esc closes it. Rows themselves no longer show terminal text.
+  (#1799)
+
+- **Moa's delegated work as tickets in Fleet.** The Tickets chip lists each
+  hand-off and delegated task with its state (queued, working, needs your
+  decision, done or failed), who has it, the decisions it is waiting on, and
+  the worker's result with its verification. An agent working on a ticket is
+  named after it. A ticket only asks for you when Moa needs a decision and
+  once with its final report; queued and working tickets stay quiet.
+  (#1799)
+
+- **Resume an exited agent from the phone chat view.** When a pane's agent has
+  exited but the pane still holds its conversation, the phone can now continue
+  that same conversation, optionally with a first message, the same way the
+  desktop resume button does. Before, the phone could only say that the agent
+  had exited and to restart it in the terminal. This works in zsh, bash, sh and
+  in Windows PowerShell (there without a first message); cmd.exe, WSL, fish and
+  nu panes still need the terminal. (#1800)
+
+- **Fleet says what every agent is doing, not only plugin installs.** Claude
+  panes set up with `wmux setup-hooks` and Codex panes now show "Edited
+  foo.ts" or "Ran npm test" while they work and "Last: …" after the turn.
+  wmux reads the last tool from the agent's own transcript instead of a
+  per-tool hook, so this adds no cost to each tool call. Before, these rows
+  only showed the agent's last reply. (#1802)
+
+- **Delegated agents' permission prompts in Moa's Waiting on you.** When an agent Moa handed work to asks to run something, the prompt now shows in Waiting on you with the agent, the command and a jump to its pane. Before, only the titlebar count showed it. You answer in the pane; Moa does not answer it. (#1804)
+
+- **A result card when delegated work finishes.** Moa's chat shows a card where the task finished: what it was, the result, how many checks were verified, the changed files when known, and a jump to the agent. (#1804)
+
+- **Moa's own steps read as cards.** A hand-off it proposed, a question it asked (with its reason), work it finished and tasks it started show as small cards in the chat, never hidden with the tool activity. A question or hand-off still waiting on you says so. (#1804)
+
+- **Every hand-off card says why it waits for you:** outside danger mode, auto hand-off off, text from outside, this hour's limit reached, or an automatic delivery that did not go through. (#1804)
+
+- **Answer a delegated agent's permission prompt from Moa's panel.** Waiting on you offers Allow once and Don't allow for the agents Moa handed work to. Each answer is pressed once and only while the prompt on screen is still the same.
+
+- **Moa's delegated jobs reach the phone.** `GET /api/workspaces` now lists the jobs Moa handed to agents (`moaDelegations`): each job's agent, title and whether it is working, waiting on you, done or failed. Open jobs and jobs that ended in the last 24 hours are listed, at most 20. Only the title is sent, never the request, the result or the transcript. `/api/config` advertises `moaDelegations: true`. (#1810)
+
+- **Moa reads the repositories it handed work to without asking.** When Moa checks an agent's result, reading a file in that agent's repository, searching one file, or listing its files by name no longer stops on a permission prompt. This holds while the work is open, and up to an hour after it ends until Moa finishes the job. Searching a whole folder, secret files, `.git`, linked files and anything outside still ask, as do all edits and commands. Turn it off in Settings › Moa.
+
+- **Move through the sidebar with the keyboard.** Workspace rows now form one Tab stop. ↑ and ↓ move between rows, nested tasks included. Enter opens a row, → shows its agents and ← folds them. Shift+F10 opens the row menu. A row's own buttons come next in Tab order. Before this, Tab skipped the rows and walked through every hidden row button instead. (#1812)
+
+- **Change the sidebar order from its header.** A new order button next to the filter switches between Attention, Manual and Recent activity. Before, the order could only be changed in Settings. (#1812)
+
+### Changed
+
+- **Moa asks less and reports once.** Before Moa asks you anything, it now looks things up first (workspaces, panes, tasks, its memory) and decides by what matters in production. It still asks about taste, releases, irreversible actions outside wmux, security boundaries, or when what you want is unclear, and every question comes with its recommendation. It no longer sends progress updates: you hear from it once, when the job is done, with what changed and how it was checked. Canceling a hand-off now counts as your answer, so Moa no longer asks whether to drop the request. (#1798)
+
+- **Moa finishes a hand-off.** Before, a task Moa handed to another agent stayed open after the agent finished, so Moa could never close the request or report back. Once the agent's turn ends, Moa now checks the result, closes the task with the agent's last words recorded on it, and reports once. It still waits while the agent is working or waiting on you. (#1798)
+
+- **Fleet is an attention list again.** One row per agent, in the order the
+  sidebar uses: Needs you, Ready to review, Running, then a folded Idle row.
+  This replaces the four-column board. Filter chips for Needs you, Running,
+  Replied, Idle and Tickets lead the summary line, each with its count. Use
+  the arrow keys to move, Enter to jump, and `/` to search. (#1799)
+
+- **First launch asks one thing at a time.** A fresh install used to open the
+  welcome dialog, a "New: …" toast, a separate Automatic Updates question, the
+  spotlight tour and the keyboard cheat sheet almost at once, stacked on top of
+  each other. Now the welcome dialog carries the update choice as one switch,
+  announcements of new behaviour are shown only to people upgrading, the tour
+  starts the first time you open Fleet, and the cheat sheet appears once after
+  the tour instead of on every launch. Anything else that opens by itself waits
+  until the current dialog or Settings is closed.
+
+- **Moa's chat reads like a messenger.** Replies are short and conversational, a hand-off gets one line, and tool activity is hidden behind a small working dot next to Moa's name. Click the dot to show the activity. (#1804)
+
+- **Plain hand-offs.** A hand-off now carries your request, its scope and how to check it, and follows the agent's own checkout. Moa no longer adds a separate worktree, branch, result file or DONE line unless you ask, which also saves extra permission prompts. (#1804)
+
+- **The onboarding tour is text only.** Its last remaining recorded clip
+  showed an older sidebar layout; every step now keeps its text and its
+  spotlight on the real control.
+
+- **Fleet's Needs you holds decisions only.** Questions come first, then errors, stopped supervision and unconfirmed panes. Finished turns used to sit in Needs you beside the questions — twelve rows where four were decisions — and now fold into one `Finished N · newest 2m` row that expands like Idle. The rail badge and `fleet_triage` follow the same rule; `fleet_triage` gains a `finished` list. Moa's unread final reports get their own marked block instead of mixing with agent rows. (#1807)
+
+- **One Needs you count.** The filter chip, the section head and the rail badge now read the same rows, so they no longer show three different numbers; the rail's tooltip says Moa's tickets are counted only in Fleet. Screen readers hear the count when it changes. (#1807)
+
+- **Respond and check without leaving Fleet.** A row that needs input opens to the agent's question in full and the choices its prompt offers, with Reply, Open approval and Jump to pane above the output. An error row names the last error its terminal printed, and Check opens the detail on that line instead of jumping away. (#1807)
+
+- Moa's panel shows one final report per job: Moa's reply, how Moa checked it, the agent's own report folded, changed files and Open agent. Small talk stays a plain reply.
+
+- Moa's chat shows only each turn's final reply; its step-by-step narration and internal retries move into the activity view.
+
+- Your message appears in Moa's panel the moment you send it, and an empty panel says what to ask.
+
+- **A row that needs you shows the question.** The row's second line is now what the agent asked, in place of its branch. The "Needs you" label stays visible when you hover. (#1812)
+
+- **Errors stay near the top.** A failed agent turn says "Error" on its row and sorts above finished and idle rows, however old it is. Fleet still lists errors under Needs you. (#1812)
+
+- **The selected row is easy to spot.** A selected row that needs you now keeps a clear selection ring. Tasks nested under a workspace no longer draw a box inside its box. (#1812)
+
+- **Needs you is now a clear orange.** Each theme has its own shade of orange. It's used for the sidebar's ring, dashed outline and label, the rail badge, Fleet's Needs you chip and dot, and the titlebar count. It replaces the amber, which looked muddy brown on light themes. Warnings stay yellow and errors stay red. (#1812)
+
+- **One Needs you count everywhere.** The titlebar now counts agents that need you the same way Fleet and its sidebar badge do, errors included. The three numbers no longer disagree. (#1812)
+
+- **Status marks in the collapsed sidebar.** The collapsed sidebar now uses the same status marks as the full one. Screen readers hear each workspace's name and status. (#1812)
+
+- **Moa's "needs you" marks use the attention orange.** Waiting on you, the hand-off and memory cards, the titlebar dot and Moa's bubble now share the orange the sidebar and Fleet use, instead of the yellow.
+
+### Fixed
+
+- **Codex behind the shared background server gets its own pane identity for A2A.** A `codex` running on the shared app-server used to fail `a2a_whoami` and `send_message` with "Workspace identity unknown", or could act as the pane that started the server. The wmux MCP server now reads the conversation id Codex sends with every tool call and resolves it to the pane that owns that conversation, live, on every call. If no open pane owns it, the error says why instead of guessing. On Windows, where no pane records an owner yet, a single Codex pane keeps working as before. Claude Code, `codex --no-daemon` and other MCP clients are unchanged. (#1778, #1780)
+
+- **Moa finds agents in other workspaces.** Moa's own workspace holds no agents, so when it listed its panes it saw nothing. It could then decide a live agent had ended and ask whether to restart it. Listing Moa's workspace now also lists the agent panes in every other workspace (names and statuses only), and Moa is told to look there before it asks. (#1798)
+
+- **Close a decision Moa no longer needs.** A decision card from Moa or a workspace brain now has a **Not needed** action. The card closes, and the brain is told plainly that the operator dismissed it and that it must act on none of the options. Before, a card that had become moot stayed open, and clicking any option counted as an answer. (#1798)
+
+- **Decisions stay in view.** Pending decisions and hand-off cards now sit right above Moa's composer instead of at the top of the conversation, so you no longer scroll up to reach them. (#1798)
+
+- **One bubble per message in Moa's chat.** A message you sent no longer shows twice for a moment when Moa records it quickly. (#1798)
+
+- **A delegated job's result no longer disappears from its ticket after 30
+  minutes.** The worker's final report and its verification count are kept
+  with the ticket for as long as the ticket is listed. (#1802)
+
+- **Hovering a sidebar row no longer hides its text.** The row's folder, copy
+  and close buttons used to float over the row while the text under them faded
+  out, taking the branch and diff with the name. Hovering an owner workspace
+  also faded every fan-out task nested under it. The buttons now take their own
+  place: on a row with a branch they replace the diff counts while hovered, so
+  the name keeps its full width, and hovering a nested task no longer shows its
+  owner's buttons. The workspace list also no longer scrolls sideways, which
+  could cut the status marks off at the left edge.
+
+- **Fleet showed no output for agents in other workspaces.** The detail read only terminals drawn on screen, so most rows said "No terminal output available."; it now reads the session's text from the daemon. (#1807)
+
+- **Fleet wording, contrast and keyboard use.** One word for a finished turn (Finished), running rows in the present tense ("Running npm test"), one name per agent, readable key hints and search placeholder, a focus ring distinct from the selection, Shift+F10 for a row's menu, and no "Requester unknown". (#1807)
+
+- Better contrast for the composer placeholder and the yellow labels in Moa's panel; cards no longer scroll on their own.
+
+- A message Moa refuses after you sent it stays in the chat marked not sent, with the reason and Retry, and its words go back in the composer.
+
+- **Moa is no longer woken while a worker waits on a permission prompt.** A delegated agent sitting on a prompt, or Claude Code's mid-turn "shift+tab to cycle" tip, used to read as a finished turn. Moa then reported early or raised a second, unrequested hand-off card that stayed in Waiting on you.
+
+- **Moa's hand-off cards clear themselves.** A second hand-off for an agent that is still working is refused. Unanswered cards close when the agent's task completes or Moa finishes the job, so a finished job ends at "Waiting on you 0".
+
+- **Permission prompts from Claude Code 2.1.289 can be answered again from the phone and the desktop.** Its new dialog layout was not recognised, so every prompt read "answer in terminal".
+
+- **Moa's chat shows its replies, not its working.** Moa's narration between tool calls and its internal tool errors stay in the activity view. Moa delegates to other workspaces by hand-off first, replies in the language you wrote in, and treats a thank-you as conversation, not as a job to report on.
+
+- **A permission prompt names the tool it is really about.** When Moa ran two tools at once, its Grep prompt could read as a prompt for the other tool.
+
+- **The yellow labels in Waiting on you are readable in light themes.**
+
+- **Moa's "Remember this?" card speaks plainly.** A remembered answer reads as one sentence in your language instead of the raw memory file with its id and settings.
+
+- **Sidebar polish.**
+  - "Needs you" uses one colour everywhere, the titlebar count included.
+  - Small sidebar text is now at least 11px.
+  - At the narrowest sidebar width, branch names no longer disappear behind diff counts.
+  - Rows with one idle agent no longer show "› 1".
+  - Remote rows say "disconnected" when their host is unreachable.
+  - Tasks started from the app no longer appear under "From closed pane".
+  - Codex rows no longer say "Codex" twice.
+  - The filter menu no longer cuts off its last option in an 800px window.
+
+  (#1812)
+
+- **Codex thread identity follow-ups.** A Codex installed under a path with spaces is recognised as the shared background server again instead of falling back to the pane that started it. `pane_list`, `surface_list`, `pane_split` and `surface_new` from a Codex conversation that no open pane owns now fail with the identity error instead of acting on the focused workspace. On Windows, a non-default `CODEX_HOME` is found from the server's own path. (#1778, #1780, #1813)
+
+- **The orange "needs you" outline is easier to see in the light themes.** On Paper, Mono Light, Hinomaru and Taegeuk the dashed outline around a row that needs you was too faint against the row's background, especially on hover; its orange is slightly deeper now.
+
+## [4.0.0-beta.1] — 2026-10-05
+
+### Added
+
+- **Moa knows which workspace you're looking at.** When you type to Moa while
+  viewing another workspace, it now also gets one line naming that workspace,
+  its active pane, branch and working directory. So "tell iOS about this" or
+  "merge this when it's green" points at the right thing. Before this, Moa had
+  no idea where you were and had to ask. The line never includes terminal
+  output. It's only added for messages you type yourself, only while Moa is on,
+  and not while you're viewing Moa's own workspace.
+
+- **Moa can press small approvals for you.** Settings → Moa has a new
+  "Press small approvals" switch, off by default. When it is on, a worker in a
+  workspace set to Danger that stops to ask permission to run a command or edit
+  a file is answered for you, and Moa is told afterwards. Anything that looks
+  destructive, every workspace not set to Danger, and every question still
+  wait for you. The HQ can deny another workspace's worker but never approve
+  one on its own judgement.
+
+- **Phone: talk to Moa.** While Moa is on, `/api/config` names Moa's own pane as `moaSessionId`, and a paired phone can read its conversation, send it messages, stop a turn and type into it, with the same transcript and input permissions as any pane. Before, every orchestrator pane was off limits to the phone. Only Moa's pane opens, and only for those routes. Switching Moa off, changing its workspace or losing it closes access at once, even for a request already in flight. Each phone send to Moa is recorded in the device audit log. (#1769)
+
+- **Hand an issue or PR to an agent by dragging it.** Drag a row from the Git
+  page onto an agent pane or a workspace in the sidebar (hold it over
+  Workspaces in the rail to get there). A small popover asks where it goes and
+  takes an optional note. The agent gets a short reference with the link and
+  the `gh` command to read the item, never the item's own text, and it waits
+  until nobody is typing in that pane. Work already running on the item is
+  flagged, with Send anyway. The detail header's **Send to agent…** does the
+  same from the keyboard, and **Start in a new worktree** opens the issue on
+  its own `issue-<n>-…` branch with your default agent.
+
+- **Connect GitHub from the Git page.** Signed out, the page shows one connect
+  card. Connect shows GitHub's one-time code in the app with Copy code & open
+  GitHub, and the page loads by itself once you finish in the browser. Before,
+  you had to sign in from a terminal tab and come back. gh still keeps the
+  credential; wmux stores no token.
+
+- **The right panel is Moa.** One conversation with Moa, whatever workspace is on screen: chat bubbles over Moa's terminal (with **View as terminal** when you need the real thing), the decisions waiting on you across every task at the top with one-click answers, and a card for each piece of work Moa handed out, expanding to its decisions, agent state and PR. With Moa off, the panel says so and links to Settings. (#1771)
+
+- **Moa has a face.** Moa's character sits in the panel header and the titlebar, idle, working, needing you or done. It stays still under the system's reduced-motion setting or Settings → Moa → Reduce motion. (#1771)
+
+- **Moa taps you on the shoulder.** With the panel closed, a short bubble under the titlebar icon says when a decision is waiting or delegated work has finished, then shrinks to a dot: yellow for a decision, grey for a reply you haven't seen. Turn it off with Settings → Moa → Bubble notifications. (#1771)
+
+- **Review and merge a pull request from the Git page.** The PR detail now
+  lists its changed files with their diffs, shows review threads under the
+  lines they are about, and lets you comment on a line, reply, approve,
+  request changes or comment. Squash and merge opens with the subject
+  "<title> (#n)" and an empty body, and is disabled with the reason while
+  checks fail or there are conflicts. Every action is tied to the commit you
+  were looking at: if new commits land meanwhile, wmux refuses and says so.
+
+- **CI on the PR, with the failure in front of you.** Each check is listed
+  with its status; a failed GitHub Actions run shows the end of its log as
+  plain text, with Open on GitHub and a Rerun failed jobs button that only
+  ever runs when you click it.
+
+- **Who acts next** shows in the PR header when wmux has linked work to it.
+
+- **Moa proposes new issues and PRs.** Turn it on in Settings › Moa › Issues and PRs (off by default; it needs Moa on with an HQ). For each GitHub repo open in a workspace, Moa checks for new issues and for new PRs from other people (every 10 minutes by default, using the Git page's cached reads) and asks with one card per item: hand it to that repo's workspace, not now, or ignore the repo. It only proposes and never sends without your answer. The one exception: an item labeled `wmux:auto` by you (the account gh is signed in as) or by a trusted author goes straight to a workspace set to Danger. An item is never proposed twice, and turning Moa or the setting off takes its open cards down. Cards appear once the Git page's hand-off path is available in the build. (#1775)
+
+- **Moa remembers precedents and skills you approve.** When you answer one of Moa's questions, or Moa drafts a skill, a "Remember this?" card appears in Moa's deck with Save and Discard. The card shows the full text that Save will keep, and a long text must be opened before Save is available. A saved answer becomes a precedent in Moa's memory, and a saved skill becomes a Claude Code skill in Moa's brain folder. Moa reads both at the start of a new conversation as background, not as instructions. Moa cannot write its memory itself: it can only leave proposals in one folder, and nothing is kept until you click Save. Settings → Moa lists what is kept, each with Remove, and has a switch to stop the proposals. With Moa off, nothing is proposed. (#1776)
+
+- **Moa keeps a track record and writes a weekly retro.** While Moa is on, wmux counts, per workspace and agent, how much work was handed out, how long it took to finish, nudges, decisions, approvals (pressed by rule or by you) and stalls. The counts come from wmux's own task data only, never task text, and are kept for 12 weeks. Moa reads them when it picks where to delegate, but cannot change them. Once a week (Monday 09:00 by default) Moa's briefing shows a short retro: how often you were asked compared with the week before, work that sat waiting for hours, questions that keep coming back, and the slowest work. It has Open details and Dismiss. Settings › Moa has the retro switch, its day and time, and Clear stats. With Moa off, nothing is counted or shown. (#1777)
+
+- `fanout_start` `agents[]` entries take an optional `effort` (e.g. `{agent: "claude", model: "claude-opus-5-5", effort: "medium"}` or `{agent: "codex", effort: "low"}`), so a worker no longer silently inherits the operator's global CLI effort. An agent without an effort flag ignores it and the reply carries a warning. (#1781)
+
+- **The phone can start an agent without a first message, or continue the previous conversation.** `POST …/chat/launch` now accepts an omitted or empty `prompt`, which types only the agent launcher. It also accepts `resume: true`, which runs `claude --continue` or `codex resume --last` in the pane's directory, with an optional first message after resuming. If there is no earlier conversation for that agent in that directory, the launch is refused with `resume-unavailable` before anything is typed. If another pane is still running that conversation, it is refused with `resume-in-use`. Bypass and YOLO still need the server ceiling and an explicit confirmation. `/api/config` advertises `chatLaunchBare` and `chatLaunchResume`, so the app shows these options only on daemons that support them. Before this change, a launch always needed a first message and always started a new conversation. (#1783)
+
+- **Moa's own permission prompt shows up where you are.** When Moa stops on its own permission prompt, the Moa chat now names what it wants to use, and a paired phone gets the same card in its approvals inbox. A card tied to the exact dialog on screen can be answered from the Moa chat, with the same checks as any other prompt card (still the prompt on screen, one answer only, not in the first moment it appears); otherwise it offers Answer in terminal. The phone shows the card but does not answer it yet. Moa's own automatic approvals never press it. (#1785)
+
+- **A fan-out task's conversation in Fleet.** Select a fan-out task on the Fleet board and its mission channel shows at the foot: worker reports, orchestrator instructions, ledger transitions and questions, read-only, oldest first and live. Moa's task cards and its Waiting on you rows have an "Open conversation" link to the same view, and so does the deck ledger's channel jump. Since the right panel became Moa only, the mission channel had no desktop view. (#1789)
+
+- **Set a pane's role from Fleet.** Each agent row's menu has Role… (or press
+  R), and the role shows on the card. (#1795)
+
+- **Moa asks before it hands work to another workspace.** When you ask Moa to
+  give a job to an agent in another workspace, a card now appears in that
+  workspace and in Moa's "Waiting on you": Hand off, Edit or Cancel. Only your
+  click sends it, and it arrives in the agent's pane as your own instruction,
+  with one line naming the task. Before, Moa typed a message headed "From:
+  Moa" into the pane, and a careful agent rightly refused it because it was
+  not your instruction; Moa never saw the refusal and the task stayed queued.
+
+- **Moa hears back from the agent.** When the agent stops on a question (or
+  declines), the task moves to "needs input" and Moa is told, with the agent's
+  last words marked as unverified. Moa's task card shows that question and
+  links to the pane. Closing the pane or quitting the agent cancels the task.
+
+- **Danger mode can skip the card.** When both the target workspace and Moa's
+  HQ are in danger mode, Moa may hand off without asking: you get a receipt in
+  Moa's panel with Stop and Open pane. Work built from GitHub or other outside
+  text always asks, and so does anything past six hand-offs per workspace per
+  hour. Turn it off in Settings › Moa › "Let Moa hand off to danger-mode
+  workspaces without asking".
+
+- **The phone shows a pending hand-off.** The paired phone sees that a
+  hand-off card is waiting in a workspace (read only; answer it on the desktop).
+
+### Changed
+
+- **No automated approve lands on a critical prompt or under a lowered owner.**
+  A brain or the HQ lane can no longer approve a prompt flagged as destructive;
+  it stays in your approval inbox. Lowering a workspace from Danger now lowers
+  the workers it already started, at once.
+
+- **The Git page opens on Issues**, then remembers your last tab, and the
+  branch bar is folded to one thin line until you open it.
+
+- **One panel button.** While Moa is on, the titlebar Moa icon opens and closes the right panel in place of the panel toggle. (#1771)
+
+- **The right panel is Moa only.** Its Channels tab is gone. Channels themselves stay: agents still use them, and the phone still lists them. (#1771)
+
+- **The Git page leads with the repo.** The header is the repo's `owner/repo`
+  with its open issue and pull request counts, and the page opens on Issues
+  and Pull requests. Branches, the ship button and worktrees move to a
+  secondary Worktrees tab.
+
+- **Pick the repo from the Git page header.** The repo name opens a list of
+  every repo in your open workspaces, plus All repos and Follow active
+  workspace. Type to filter. A picked repo stays, across restarts too, until
+  you pick another, so switching workspaces no longer moves the page.
+
+- **Moa stays in view on the Git page.** The page sits beside the tools
+  panel instead of covering it, and an issue or pull request dragged onto
+  the panel goes to Moa.
+
+- **The titlebar names the page you are on.** On Git, Fleet, Schedules and
+  Remote it shows the page's name instead of the workspace's name and
+  branch, and hides New workspace. Search & commands stays.
+
+- **Prerelease tags ship as GitHub prereleases.** A tag like `v4.0.0-beta.1`
+  now publishes a GitHub prerelease that is never marked latest, and is not
+  pushed to Chocolatey or WinGet. Existing installs are never offered it:
+  update.electronjs.org skips prereleases and the updater reads its manifests
+  from the latest release. Before, every `v*` tag went out as a full release to
+  every channel. (#1790)
+
+- **The titlebar stops repeating the sidebar.** New workspace is no longer in
+  the titlebar: use the sidebar's `+`, or the rail's when the sidebar is
+  collapsed. While the sidebar is open the titlebar also drops the
+  workspace's name and branch, which the highlighted row already shows;
+  collapse the sidebar and they come back. (#1795)
+
+- **A sidebar toggle in the titlebar.** Right after `wmux` sits a toggle that
+  pairs with Moa's panel toggle at the other end; Ctrl+Shift+B still works.
+  Both toggles are plain icons, with no fill unless you hover them. (#1795)
+
+- **A quieter titlebar.** The Search & commands box and the Settings gear
+  are gone; the middle of the titlebar is free space to drag the window.
+  ⌘K (Ctrl+K on Windows and Linux) still opens the command palette. (#1795)
+
+- **Settings moved to a More menu.** The `⋯` button at the foot of the rail
+  replaces the collapse arrow and holds Command palette (⌘K), Settings (⌘,),
+  Turn on Moa… (while Moa is off), Keyboard shortcuts, Check for updates and
+  the version. (#1795)
+
+- **No mystery "M" on the rail.** The rail no longer has an entry for Moa's
+  workspace; Moa's panel is its home, and its ⋯ menu shows Moa's terminal.
+  (#1795)
+
+- **No right panel while Moa is off.** With Moa off, the right panel held
+  only an off notice and a task list Fleet already shows, so it is gone and
+  the terminals take the full width. Turn Moa on from Settings › Moa or the
+  More menu; the panel opens the first time. The sidebar's Tasks line opens
+  Fleet while Moa is off. (#1795)
+
+- **The sidebar slides open and closed.** Terminals are refitted once when
+  the slide ends instead of on every frame, so nothing reflows mid-motion.
+  It snaps instantly if your system asks for reduced motion. (#1795)
+
+- **Moa stays beside every page.** Fleet, Schedules and Remote now leave
+  Moa's panel in view, as Git did, and Moa's button opens it in place
+  instead of leaving the page. (#1795)
+
+- **Moa is no longer a Fleet worker.** Moa's own workspace is left off the
+  Fleet board, its counts and the titlebar's running and need-you counts.
+  Its decisions still reach Waiting on you. (#1795)
+
+- **A calmer Moa panel.** The always-on Fleet list and control rows are gone;
+  Model, Mode, New session, Wake, the terminal view, Loop, Schedules and Moa
+  settings live in one `⋯` menu on Moa's header, with the mode shown as a
+  small label. The panel scrolls as one column (Waiting on you, delegated
+  work, then the chat), decision cards are never cut off, the briefing no
+  longer repeats a waiting decision, and the composer is a single field.
+  (#1795)
+
+- **Chat folds runs of tool calls into one line.** A turn that reads, edits and runs commands now shows "Read 4 files", "Edited 2 files +5 −1" and "Ran 3 commands". Click a line to see the calls behind it. Before, each call was its own row and a long turn buried the reply. Approvals, questions, failed calls and errors are never folded, so anything that needs you stays in view. Tool rows are quieter until you hover or open them. Edits show green and red line counts, and a diff block links to the file. Command output appears under a dim `$ command` line and fades where it scrolls, and a decided approval shows a check or a cross. New rows fade in gently, but not under reduced motion. (#1797)
+
+### Fixed
+
+- **Codex panes bind to their real conversation.** A fresh Codex pane, a fan-out worker especially, could be bound to Codex's internal title-generation thread, which writes no conversation record, and then stay without a turn view for good once the real turn was interrupted. A pane now binds only to a thread whose record exists, and a fresh pane finds its record from its working directory within seconds of launch; a directory shared by several Codex panes is left alone. The title thread's completion also no longer marks a long-running turn as done. (#1764)
+
+- **The forced-shutdown backstop requires a verified daemon script identity.** An unavailable command-line probe no longer permits terminating a process solely because its executable name matches. If identity cannot be verified and graceful shutdown also fails, the daemon may remain running; retry shutdown once process inspection is available. On Windows an update install uses the same shutdown, so in that rare case the install is refused and the update can be retried. The log now says when the backstop refused an unverifiable daemon instead of reporting that no daemon was found. Verified daemons started by a different host remain eligible for termination. (#1774)
+
+- The repo name on the Git page is no longer cut short while there is room
+  for it; hover it for the full name.
+
+- Handing an issue or pull request to an agent no longer says "Sent" when
+  wmux could only paste it (a busy Codex can take the paste and miss the
+  Enter): it says it was pasted and asks you to check the agent started.
+
+- **Moa's first message after a cold start reaches it whole.** When Moa's terminal brain had just started, a long first prompt could arrive with most of its beginning missing, and Moa then ran that turn without its instructions and context. The prompt is now typed as one paste. Moa checks what the terminal actually received; a damaged copy is discarded unrun and typed again. If it keeps arriving damaged, the turn stops with a message instead of running on part of the prompt. (#1788)
+
+- **Mouse and focus reports no longer get typed into the shell after an agent dies.** When a TUI agent such as Claude Code was killed or crashed, the mouse tracking and focus reporting it had turned on stayed on. Back at the shell prompt, every pointer move and focus change then landed in the prompt as junk like `[555;24;14M` or `[O[I`. wmux now watches for the shell's prompt to come back and switches those modes off in the terminal. On the desktop wmux first checks that the program is really gone, so one still running in the background or stopped with Ctrl+Z keeps its mouse. Bracketed paste is left alone, and the fix applies to desktop panes, remote mirror panes and the phone page. (#1794)
+
+- **Panes started from inside Claude Code are no longer "nested" sessions.**
+  If wmux itself was launched from a Claude Code session, new panes, and panes
+  restored after a restart, inherited Claude Code's session markers, so a
+  `claude` started there did not save its conversation and could not be
+  resumed. Your own settings such as `CLAUDE_CONFIG_DIR` are kept.
+
+## [3.67.0] — 2026-10-04
+
+### Added
+
+- **Inline images in the browser terminal.** The classic browser terminal that `wmux web` serves (`/classic`) now draws sixel and iTerm2 (OSC 1337) images too, with limits sized for a phone. The browser app at `/` keeps them off for now. Browsers that cannot run the image decoder keep showing plain text. Turn it off with `wmux web --no-inline-images`; like the other options, the choice is kept across re-runs, daemon restarts and `--stop`, and a connected phone picks the change up on its next reconnect, from the first screen it paints. The browser terminal no longer forwards its own answers to device queries in the pane output to the pane. (#1641)
+
+- **Answer Claude's multi-select, multi-question and "Other" questions from
+  the phone.** A Claude Code `AskUserQuestion` that was not one single-select
+  question used to be answerable only at the terminal. The phone could see
+  it, but approving was refused. A phone that speaks the decision-v2 wire can
+  now answer the whole prompt: tick several options, type an "Other" answer,
+  or answer every question of a multi-question prompt. wmux types the answer
+  into Claude's own picker one key at a time and checks the screen after each
+  key. On the review screen it checks that every answer reads as given before
+  it submits. It reports success only once Claude's transcript shows those
+  exact answers. When it cannot confirm that, the phone is told the answer is
+  uncertain instead of being told it worked. If someone types at the
+  terminal meanwhile, nothing more is sent. The shipped iOS app and the
+  single-choice answer work as before. (#1658)
+
+- **Create a worktree from the phone.** A paired phone with the input grant
+  can start a new branch in its own worktree for any pane's repository:
+  `POST /api/sessions/<id>/git/worktree` with a short name creates branch
+  `phone/<name>` at the pane's current commit, in a directory under wmux's
+  own worktrees folder, and the phone polls a receipt until it is created.
+  It can then open a pane there with the existing `POST /api/sessions`. The
+  phone never names a path or a ref, repository hooks do not run, and
+  repositories with submodules or content filters in use are refused.
+  Before, starting parallel work on a new branch needed the desktop.
+  `/api/config` advertises it as `gitWorktrees`. (#1666)
+
+- **Phone worktrees in the desktop cleanup list.** The worktree cleanup view
+  lists worktrees created from the phone under their own "Phone worktree"
+  label instead of as orphaned directories, with a Remove action: it waits
+  until no pane runs inside, asks before discarding uncommitted changes or
+  removing a locked worktree, and offers to delete the `phone/…` branch
+  afterwards. (#1666)
+
+- **Fan-out can run tasks on the Antigravity CLI (agy).** agy refuses a positional prompt, so wmux launches it as `agy -i "<prompt>"`. agy stops on its "Do you trust…" screen in every new task folder; turn on **Settings › Fan-out workers › Trust agy fan-out task folders automatically** (off by default) to have wmux list exactly that task's folder in agy's own `trustedWorkspaces` before launch. With it off, wmux writes nothing to agy's settings and shows a note that the task waits on the trust screen. Verified on Windows with agy 1.2.14: a Claude pane called `fanout_start` with `agents:[{agent:'agy'}]`, agy ran the prompt in its own worktree, wrote the file and committed.
+
+- **agy in Roles & fan-out.** The agent list for a role binding includes agy; its effort is the model id suffix (`gemini-3.8-flash-low|medium|high`).
+
+- **Builder and Tester presets.** Each row has an "Apply preset (skips permission prompts)" button that writes a ready-made binding for that role (Builder: high effort, Tester: medium, both with skip permissions) after asking you to confirm the bypass. It keeps the agent, model and extra args you set, filling in a model only when none is chosen. Because the settings live on the role rather than the provider, Builder and Tester can both use agy and still differ.
+
+- **`--role=<Role>` MCP surface.** A role-bound agent sees only the wmux tools its role uses (Planner 6, Reviewer 5, Builder/Tester none), and `wmux role resolve --json` prints the per-CLI tokens to launch it that way. `RoleBinding.tools` selects `full`, `core` or `role`, and a role-bound pane that wmux launches gets that tool level.
+
+- **Deck state hygiene.** Orphan Deck state and orphan atomic-write temp files are reconciled at startup, but only after the saved session was actually restored (a failed or empty load deletes nothing); workspace removal archives the workspace's active request and then tears down all of its Deck state; `wmux deck state --orphans` and `--prune --yes` inspect and clean it; the prune runs inside the running app, so it never races the app's own writes to the Deck files. The request archive keeps the latest 200 entries, and an unreadable archive is moved aside instead of overwritten.
+
+- **Agent-friendly scripts.** `npm run test:agent`, `test:changed` and `typecheck:quiet` print short output.
+
+- **Desktop computer use on Windows (helper).** wmux now ships a native Windows helper for computer use: agents can read an app's accessibility tree, take window screenshots and click, type and press keys in the window you approved. It refuses password fields, elevated windows, the lock screen and the UAC prompt, and types without touching the clipboard. Packaged builds keep it off until the helper is release-signed.
+
+- **Claude and Codex in a WSL pane get the wmux tools.** An agent started in a
+  WSL pane already reported its turns to wmux, but it had no wmux MCP server,
+  so A2A messages and tasks, channels and the browser tools were missing. The
+  pane's `claude` and `codex` launchers now mount the wmux server for that
+  launch only. The server runs on the Windows side, as the hook bridge already
+  does, so it reaches the same browser and the same panes as a Windows agent.
+  It starts once per agent session, never once per tool call. Your own
+  `~/.claude` and `~/.codex` settings are not edited, and a `wmux` server you
+  configured yourself for Codex is left alone.
+
+- **Browser and REPL file paths work in the agent's own spelling under WSL.**
+  Upload paths under `/mnt/c/...` are accepted, a path inside the distro is
+  refused with the uploads folder named as the agent sees it, and download,
+  PDF, trace and REPL paths are reported as `/mnt/c/...`. Windows and macOS
+  agents see the same paths as before.
+
+- **Each fan-out worker gets its own temp folder.** Every fan-out task now runs with `TMPDIR`, `TMP` and `TEMP` set to a private, owner-only folder of its own, and its prompt says where that folder is. Before, every worker shared the system temp folder, so one worker could read or overwrite another's scratch files. The folder is removed about a minute after the task's workspace is closed. (#1709)
+
+- **A warning when an agent starts in a checkout a fan-out task owns.** If an agent shows up in a pane from another workspace whose working directory is inside a fan-out task's worktree, wmux now warns you that two agents are sharing one working tree. "Continue here" dismisses the warning, and clicking it opens the task's workspace. Before, the two agents shared the checkout with no warning. (#1709)
+
+- **Global quick launch.** Press Cmd+Shift+Space (Ctrl+Shift+Space on Windows
+  and Linux) from any app to open a small composer. Type a prompt, pick a
+  workspace, an agent or role, and the current checkout or a new worktree.
+  Enter starts the agent in a background workspace without bringing wmux
+  forward, and Esc closes the composer. The shortcut can be changed or
+  turned off in Settings › Keyboard › Quick launch, which also shows when the
+  shortcut could not be registered.
+
+- **Fan-out tasks can declare what they write and what they wait for.**
+  `fanout_start` takes `files` (one list of repo-relative globs per task;
+  overlapping scopes between tasks that may run at the same time are refused
+  before anything spawns, and each worker is told its scope) and `depends_on`
+  (per-task indices that must finish first; cycles and out-of-range indices
+  are refused). A dependent task's worktree is created only once every
+  dependency reaches `review_requested` or `completed`, from a freshly fetched
+  origin commit, and its prompt names the dependency branches to merge if they
+  are not on origin yet. Waiting tasks are dropped when a dependency is
+  cancelled, after 12 hours, or when the owner repeats the call with
+  `cancel_pending`. Before, every task of a fan-out started at once with
+  nothing keeping two workers off the same files.
+
+- **Agent panes pause at a usage limit and can pick up after the reset.**
+  When Claude Code or Codex stops on its provider's usage limit, wmux now
+  holds everything that would type into that pane — scheduled prompts,
+  automation pastes, channel wakes and a2a / fan-out messages — until the
+  limit resets, instead of queuing prompts into a turn that cannot run. The
+  pane header and its Fleet row show when the limit resets and a countdown.
+  Turning on "Resume at reset" for a pane, or "Continue after a usage limit
+  resets" in Settings (off by default), sends one short continue message once
+  the window resets. Before, a limited pane just showed an error and every
+  automatic delivery landed in it anyway.
+
+- **Provider quota readings for Claude, Codex and Antigravity (agy).** A quota service returns usage windows (percent used, reset time), plan label and credits per provider, read only when asked and never on a background timer. Claude reuses wmux's existing usage API; Codex queries its app-server rate limits and falls back to the limits Codex records in its own session files when no app-server answers; agy is read from a small statusLine sensor (`quota-sink.js`) that chains an existing statusLine instead of replacing it and stores only quota, plan, model and context metrics. Average tokens per message are computed from local Claude and Codex transcripts.
+
+- **Read-only inventory of what each CLI loads.** MCP servers (and their tools), skills, plugins, hooks and built-in tools for Claude, Codex and agy, plus the individual wmux core tools per provider.
+
+- **Safe configuration writers.** Per-CLI writers can switch those items off and on. Every write is atomic, takes a timestamped `*.bak-wmux-<timestamp>` backup first, edits JSON and TOML while preserving comments and ordering, re-parses before committing and rolls back on failure. Editing is enabled from the oldest tested CLI release through later releases of the same major version (tested: agy 1.2.14–1.2.15, Codex 0.156–0.159); a release newer than the last tested one shows a warning, and older or next-major versions stay read-only. A hook is matched by its content, not its name, and the writer refuses when two identical hooks match. Only on/off settings can be switched; numbers and lists are shown read-only. An agy statusLine the user turned off is never chained, and chaining keeps every field of the original entry.
+
+- **Drift detection and saved surface profiles.** wmux hashes the config files it wrote and reports out-of-band edits; a profile snapshots the on/off state across CLIs so it can be previewed and re-applied.
+
+These are main-process services and IPC handlers; the settings UI that uses them follows in the next PR.
+
+- **Groundwork for a structured chat view.** The shared contract for chat v2
+  is now in place: the event model, a deterministic transcript fold, the
+  desktop and daemon method tables, and how approvals, restore and the phone
+  will work with it. Nothing changes in the app yet; the new methods answer
+  "not implemented" until the agent driver and the new view land.
+
+- **Settings → Token usage tab.** Shows a quota card per provider (Claude, Codex, Antigravity) with usage windows, reset time, change since the last check, average tokens per message (Claude and Codex), plan label and credits. Readings refresh only when you open the tab, click refresh or change which providers are shown, never on a background timer.
+
+- **Token profiles.** Full, Coding, Balanced and Minimal write a model, an effort level and a wmux tool level into the role bindings in one step, with a preview of what changes. Agents, extra args and permissions are never touched, and every binding stays editable in Roles & fan-out.
+
+- **Custom surface panel.** Inspect and toggle MCP servers (and individual tools), skills, plugins, hooks and built-in tools across Claude, Codex and agy, plus the individual wmux core tools, with a search box, an "only changed" view, read-only explanations for fixed items, a change preview before saving (Apply writes exactly what the last successful preview showed), and a backup before every write. Changes apply from the next CLI session.
+
+- **Drift notice and saved surface profiles.** When a config file changed outside wmux since the last apply, a notice offers to re-apply your choices; surface profiles snapshot and restore the on/off state across CLIs.
+
+- **MCP status and per-target Register.** Shows the registration status of wmux's MCP server across installed agent CLIs, with one-click Register and Re-register per target, including the opt-in Antigravity CLI. A Register touches only its own target; the agy quota sensor is installed only from its quota card's Install button.
+
+- **CLI detection.** Detects installed Claude, Codex and Antigravity CLIs, checks the version against the tested range and shows a read-only state when a CLI is missing or untested.
+
+- **Read and approve chat v2 conversations from the phone.** A conversation
+  the daemon runs itself (chat v2) now shows up in the phone's Chat view: its
+  replies, tool calls and results, subagent work, task lists, plans and
+  pending questions, with its tool permissions answerable from the phone's
+  approval list. A phone that declared Stop support can interrupt the running
+  turn and follow what the stop did. Sending from the phone stays off for
+  these conversations, and starting a second agent in the same pane from the
+  phone is refused.
+
+- **Continue a chat v2 conversation in the terminal.** The daemon can stop the
+  chat agent, confirm its process has exited, mark the chat as handed off, and
+  resume the same conversation in the pane's shell with the same folder, model
+  and permission mode. After that the phone reads the pane as an ordinary
+  terminal conversation.
+
+- **Chat v2 view (experimental, not yet active).** The desktop side of chat v2
+  is in place: a conversation transcript with tool rows, subagent cards,
+  in-chat approval and question cards, find, a per-turn "worked for" footer, a
+  composer with model and permission chips, New chat on a free pane, and
+  Continue in Terminal. It turns on once the daemon runs chat-v2
+  conversations; until then Chat view behaves exactly as before.
+
+- **Chat v2 can now run Claude Code from the daemon.** The daemon starts
+  Claude Code in its structured mode for a pane and streams its replies,
+  tool calls and subagent work. It keeps the conversation across app and
+  daemon restarts. Tool permissions and questions show up as approval cards
+  that the desktop or a paired phone can answer. Only the first answer
+  counts, and when no answer is possible the request is denied at once.
+  A chat refuses to start while another agent or command is running in the
+  pane. The view that shows it comes in a later release.
+
+- **Scheduled prompts and the resume chip now work for Claude Code in a WSL
+  pane.** wmux could not see processes inside WSL, so it never knew whether
+  a WSL pane's agent was still running: scheduling refused WSL panes, and
+  the resume chip had to guess. Claude Code's hook now tells wmux which
+  Linux process it is, and wmux checks that process inside the distro. A
+  check never starts a distro that has been shut down. Codex in a WSL pane
+  is not covered yet.
+
+- **Claude Code in a WSL pane gets the same hooks as on Windows, including
+  phone approval.** A WSL pane now reports when Claude is waiting on a
+  permission dialog or a question, and `wmux web --allow-input` can approve
+  or deny a WSL agent's commands from the phone. While nobody can answer
+  approvals, the check costs a WSL pane one file check per tool call
+  instead of starting a Windows process.
+
+- **A new look, with seven new themes.** Tint is the new default; Zinc, Graphite, Paper, Amber Line, Mono and Mono Light are in Settings › Appearance. The first five bring their own UI font (Geist, IBM Plex Sans or Figtree, bundled), chip shape, selection style and active-tab marker. A theme you already picked stays selected and keeps its colours, but the window frame, fonts, dialogs and icon sizes change in every theme. (#1733)
+
+- **The window is a frame holding one rounded sheet.** The sidebar, panes and tools dock sit together on the sheet; on macOS with a dark theme only the frame is translucent, so terminals never change with the wallpaper. Each element draws at most one line, and neighbours share it. (#1733)
+
+- **Rail pages for Fleet, Schedules and Remote.** The icon rail now switches the whole sheet between Workspaces, Fleet, Schedules and Remote instead of opening overlays. Your terminals stay mounted underneath: scrollback, input and the cursor are exactly where you left them when you come back. (#1733)
+
+- **Fleet is a four-column board.** Needs you, Running, Ready to review and a folding Idle column, with cards that show status, elapsed time, branch, diff, one detail line and chips. A pane waiting out a usage limit shows a muted clock and when it resets. Arrow keys move across cards and 1–4 jump to a column. (#1733)
+
+- **Schedules has a list and a one-box composer.** Write the prompt, then pick when, which folder and which agent from chips under it, or start from one of six templates. The detail view shows the run history. (#1733)
+
+- **Remote is a dashboard of what is connected.** Paired devices, hosts and LAN peers on the left; this computer's web server, how it is reachable and the Share & pair and Connect actions on the right. (#1733)
+
+- **Search and Settings move to the titlebar.** A "Search & commands" pill in the middle opens the command palette; the tools-panel toggle and the Settings gear sit at the right end (left of the window controls on Windows). (#1733)
+
+- **Filter the workspace list.** The sidebar's filter button opens search plus checks for status (including Waiting for a usage limit), agent kind, agent, PR, changes and fan-out tasks, with removable chips and an `N of M` count. (#1733)
+
+- **A pane that starts a fan-out hears back from its workers.** When the workspace has no orchestrator (agent mode Off, the default), a worker that finished used to be only recorded for an orchestrator that never started, so the agent that ran `fanout_start` was never told. Now that pane gets one line, such as `[wmux] fan-out task 6k7g7szw updated — channel_mission_list`, when a worker ends a turn (`updated`), ends a turn on an error (`stopped on an error`), or marks its task `ready for review` or `failed`. Several tasks finishing together share one line, and the line carries no worker output. Only the pane that started the fan-out is told, only while it still runs the same agent session, and never while someone is typing there: the line waits until the composer is empty and no key has been pressed for 10 seconds. A worker that keeps working is mentioned at most once every 5 minutes for plain turn ends. This changes what Off means for this one case; there is no separate setting to turn it off. (#1737)
+
+- **Scheduled prompts and the resume chip now work for Codex in a WSL pane
+  too.** After Codex finishes its first turn in a WSL pane, wmux knows which
+  Linux process it is, so a scheduled prompt can be delivered to it and the
+  pane shows when Codex exits.
+
+- **Claude and Codex launches can pick between your own accounts by quota.**
+  Settings → Accounts has a "Switch accounts by quota" switch for Claude and
+  for Codex (off by default). If you have registered more than one of your
+  own subscriptions and turn it on, a new Claude or Codex pane in a workspace
+  whose bound account is out of quota starts on the registered account with
+  the most quota left; the workspace binding itself does not change and
+  running panes are not touched. When every account is out, the pane says
+  when the first one frees up instead of starting an agent that would only
+  hit the limit. Claude quota comes from its usage endpoint (no model
+  request, refreshed before a launch only when older than 10 minutes);
+  Codex quota from the limits Codex records in each account's session files,
+  with no network. Codex rows now show the quota left. A Claude turn that
+  ends in a pane started on another account this way refreshes that
+  account's usage, not only the workspace's bound account's.
+
+- **Connect GitHub.** When the GitHub CLI is missing or signed out, the Git
+  page offers to sign in: it runs `gh auth login --web` in a new terminal tab
+  so you finish in the browser. gh keeps the credential; wmux stores no token.
+
+- **The phone can show files an agent sent you with `SendUserFile`.** When a
+  Claude Code pane hands you an image or a video with `SendUserFile`, the phone
+  turn view can now load it even though it lives outside the pane's folder (a
+  session scratch folder, a temp directory). Before, those files came back as
+  "not found" and the phone showed only a filename. A file is served only while
+  the pane's own transcript lists it in a successful `SendUserFile` call from
+  the last 24 hours, only as an image or video by its contents, and only with
+  the transcript grant on. Each one is recorded in the device audit log by
+  name and size. `/api/config` reports `turnSentFiles: true` so the app knows.
+
+- **Issues on the Git page.** The Pull requests header is now a Pull requests | Issues switch, and wmux remembers which one you chose. Issues lists the repo's open issues: all, assigned to you, created by you, or with a label. Each row shows its number, title, labels and age. Click a row to read the issue and its comments right there, or open it on GitHub. Like the pull request list, it updates only while you can see it. When GitHub's rate limit is hit, the list says when it will try again and stops asking until then. Issues are GitHub-only for now. Before, the Git page showed only pull requests. (#1750)
+
+- **One HQ workspace can run the deck brain.** With an HQ designated, only that workspace starts brain turns; other workspaces keep their panes, channels and fan-out routing, and their workers' events are parked for the HQ instead of being dropped. The HQ cannot be closed from the CLI or MCP, and if its workspace disappears the brain stops instead of moving elsewhere. Nothing changes until an HQ is designated. (#1753)
+
+- **A master off switch for the main bot.** When it is off, no brain starts, the heartbeat and the scheduler stop, and wake events are dropped; turning it back on restores everything. On by default. (#1753)
+
+- **The agent that owns a PR hears about it.** When CI fails, someone other than the PR author comments, or the PR hits a merge conflict, wmux writes one line into the agent pane whose checkout is that PR — for example `[wmux] PR #123: CI failed — gh pr checks 123`. Before, these events only reached a workspace's orchestrator, so in a workspace without one (the default) they were dropped. The line carries only the PR number and what happened, never a log line or a comment body. It waits while you type, and nothing is written when no single agent pane owns the PR. A one-time notice points to the switch: Settings › Notifications › Wake the agent on PR events, per workspace, where you can also opt in to a line when checks pass. This is separate from the HQ main bot and its off switch.
+
+- **Finished workspaces leave the sidebar on their own.** A workspace with no
+  agent turn and no input for 3 days (configurable in Settings), or whose PR
+  was merged or closed, now settles into a collapsed **Settled** group at the
+  foot of the sidebar. In Fleet it moves behind a **Settled** chip. Running,
+  waiting-on-you, pinned and HQ workspaces never settle. Any new agent turn,
+  input, reopened PR or new commit brings a workspace straight back. Before,
+  every finished workspace stayed in the list until you closed or archived it
+  by hand. Settling only changes visibility: nothing is closed, archived or
+  stopped. Main decides it, so it keeps working while the window is closed.
+  (#1758)
+
+- **Snooze a workspace.** The workspace menu can snooze a workspace for an
+  hour, until tonight, until tomorrow morning or until next week. It waits in
+  a collapsed **Snoozed** group and returns when the time is up or when it
+  needs you: an approval prompt, or a failing CI check. Every settle, snooze
+  and unsnooze shows a 5-second Undo toast. The phone workspace list gains
+  `settled` and `snoozedUntil` fields. (#1758)
+
+- **Delegated work is now tracked as one record.** Each task handed to a workspace gets a work link. The link ties the task to the workspace and pane doing it, plus its issue, worktree, PR and the decisions it raised, and it keeps a single state (queued, running, needs you, blocked, in review, done, abandoned) up to date as the task moves. This is groundwork for the Git page and Moa's task cards; nothing is shown yet. (#1759)
+
+- **`deck_ask_decision` takes an optional `task_id`.** A decision can now name the A2A task it is about, and it is attached to that task's work link. Without it, decisions work exactly as before. (#1759)
+
+- **One button to ship the current branch.** The Git page's branch bar has a button that names the next step: Commit (with a message box), Push, Create PR (with an editable title) or Open PR. A menu next to it offers the other steps that can run now. When a step can't run, the button is disabled and says why, for example while a merge session is running or when the branch has no upstream. (#1760)
+
+- **Settings → Moa.** The Orchestrator settings became a Moa section: the on/off switch first, then the engine, model and effort, the state of Moa's workspace with a one-click fix, a mode for each workspace, an hourly turn limit, bubble notifications and reduce motion. Turning Moa on the first time shows one card explaining what it does and doesn't do, then creates its workspace for you. (#1763)
+
+- **Moa's workspace is looked after for you.** It stays out of the workspace list and opens from a Moa item on the rail; it can't be closed or archived by accident, and if it goes missing wmux offers to recreate it. Decisions moved aside when Moa was set up are listed once, with a link to view them. (#1763)
+
+- **Phone: Moa's workspace is marked.** The workspace and session lists mark Moa's rows with `role: "hq"`, and `/api/config` says when Moa is on, so a phone can show Moa separately. Approvals from Moa's workspace still reach the phone as before. (#1763)
+
+### Changed
+
+- The Settings navigation gains a "Token usage" tab in the Agents group, next to Browser and Computer use. Strings are in en, ko, zh and pl.
+
+- wmux does not touch running agent panes: every configuration change takes effect from the next CLI session. Codex edits are not hot-reloaded by its app server, and agy may overwrite settings saved while it is running. wmux core tools do not include `browser_*` or `company_*` tools, and agy does not report per-message token telemetry.
+
+- **Git has its own page.** The tools panel's Git tab moved to a Git icon
+  on the rail, below Remote. The page shows your current branch on top
+  (ahead/behind, uncommitted changes with Diff, the PR and its CI state),
+  then pull requests with their comments and one row per worktree that
+  names the workspaces on it. Switch between this repo and all your repos.
+  Open, Diff, Merge and Remove work as before. Clicking the branch in the
+  titlebar opens the page too, and the rail icon shows a red dot when a pull
+  request's checks fail or it conflicts with its base. The tools panel keeps
+  the Orchestrator (and Channels if you turned them on), and its titlebar dot
+  no longer counts dirty worktrees.
+
+- **Git page: a list beside the detail, worktrees on their own tab, and one ship button.** Pull requests and Issues now show a list on the left and the selected item on the right, each scrolling on its own, with the title, number, repo and state pinned above the detail. Before, a PR or issue opened inline inside a narrow column. Each list says when it was last updated, and if a refresh fails it keeps the last list with a Retry. A pull request says what it needs next in words, such as "CI failing", "Review requested" or "Approved, mergeable". Links in GitHub text open in your browser, and task lists show their checkboxes. Worktrees moved to their own tab, grouped as in use, no workspace, and cleanup candidates to check before removing. The current branch is now a one-line bar with Diff and Go to terminal. The page remembers your tab, scope, filter, selection and scroll when you leave and come back. (#1760)
+
+- **Moa starts off on a new install.** An install that already uses the deck brain keeps working as before until Moa is set up in Settings. (#1763)
+
+### Fixed
+
+- **Fewer of an app's frames land in scrollback when you shrink a pane.** A full-screen app that draws in the main buffer, like Codex, now learns the smaller size before the pane shrinks, rather than one round trip after. On Windows, dragging a divider while Codex is drawing leaks about half as many old-size frames into scrollback. Some frames already on their way from the app can still land there (#1436). (#1439)
+
+- **Shift, Ctrl and Alt+F3 reach a remote pane from the desktop mirror.** The mirror told its terminal's answers to device queries apart from typing by their shape, and a modified F3 has the same bytes as a cursor position report, so it was dropped. The mirror and the browser terminal now forward only what the user typed. (#1641)
+
+- **Keep the titlebar in place when focus reaches the icon rail in a short window.** The app frame now clips its overflow like the sheet inside it, so a rail taller than the window can no longer give the frame a scroll range that a focus or caret reveal moves. The scroll-pin backstop stays, and source guards now lock both clips. (#1691)
+
+- The runtime test lane no longer writes into the live `~/.wmux`: vitest runs against an isolated data directory and a test that bypasses the isolation refuses the live one.
+
+- **Resuming a Codex pane opens your conversation, not one of its sub-agents.** A Codex sub-agent runs inside the pane's Codex process, so its turn-complete reached wmux exactly like the main thread's. Each one replaced the pane's saved conversation, and "Resume Codex" then opened the sub-agent read-only ("Viewing sub-agent — direct input is disabled"). Every sub-agent finishing also raised a "Task finished" notification that the Subagent mute did not silence, and counted as the pane's turn ending. wmux now tells a sub-agent thread from the main one by its Codex session record and reports it as a subagent finishing, under the main conversation's id: resume keeps the conversation you work in, the Subagent mute applies, and the pane keeps running until its own turn ends. (#1696, #1697)
+
+- **The wmux MCP server exits when its agent goes away.** A server holding a
+  browser connection or a REPL could outlive the agent that started it. It now
+  shuts down as soon as the agent closes its input.
+
+- **Terminals no longer lose their text after a GPU reset.** When the GPU
+  process crashed or reset and WebGL came back within a few seconds, panes
+  could stay blank or show only a few characters until a pane was reopened.
+  wmux now rebuilds the shared glyph atlas as soon as a terminal's WebGL
+  context is restored, so every pane redraws its full text by itself.
+
+- **The phone shows "connected" right away when it reopens.** Reopening the app with nothing new to catch up on made the daemon hold back the event stream's response until its first keep-alive, up to 25 seconds, so the phone said it was not connected and kept sending locked. Both streams now answer as soon as they open. (#1707)
+
+- A Customize button opens the custom surface panel and scrolls it into view.
+
+- **Log rotation releases its own lock correctly on Windows.** Path-based and descriptor-based file stats can report different device ids for the same file, leaving a completed rotation's lock behind and delaying later rotations. Ownership comparisons now use descriptor stats on both sides and preserve full-width file ids, so a different holder's identity is not rounded into the old holder's. (#1718)
+
+- **A temporary session lookup failure no longer permanently invalidates a paused prompt schedule.** Resume keeps the schedule paused with its original binding and delivery claim intact, explains that verification is unavailable, and lets you retry. Each retry checks the session identity again; a confirmed replacement still requires recreating the schedule. Local fallback mode refuses Resume while keeping existing schedules manageable. (#1719)
+
+- **Browser REPL worker failures retain their reason even when the thrown value is not an Error.** Strings, numbers and null no longer become a misleading `runtime crashed: undefined` message or throw inside the error handler, while error-like objects keep their string `message`. Values that cannot be printed use a safe fallback. Both active-run and idle failures report the reason when the next call starts a fresh runtime. (#1720)
+
+- **`claude` in a WSL pane no longer hangs for 10 seconds and then claims it
+  is not installed.** When claude's folder is added to PATH only by
+  `~/.bashrc`, as with nvm or `~/.local/bin`, the pane's `claude` launcher
+  asks an interactive shell for its PATH. That shell got stuck on the pane's
+  terminal until a 10 second limit killed it, and the launcher then reported
+  claude as missing. The lookup now runs detached from the terminal and
+  answers at once.
+
+- **A WSL pane no longer gets stuck after a restart because of a garbled
+  working directory.** In a narrow pane the shell prompt can wrap in the
+  middle of the path, and wmux could save that wrapped text as the pane's
+  directory. On the next start the pane then failed with "WSL working
+  directory must be an absolute Linux/Windows path" and could only be
+  closed. wmux no longer saves such a path, and a pane that already has one
+  starts in your home directory instead.
+
+- **Chat v2 starts where you are.** A new chat used the directory the pane
+  was opened in, so changing directory in the terminal first had no effect.
+  It now uses the shell's verified working directory (falling back to the
+  directory the pane started in), says where it will run before you start,
+  and shows the directory next to the composer.
+
+- **Chat v2 effort matches what it shows.** Effort settings inherited from the
+  environment wmux was launched from (`CLAUDE_CODE_EFFORT_LEVEL`,
+  `CLAUDE_EFFORT`) no longer override the effort the chat shows.
+
+- **"Show full text" shows all of it.** Long replies were cut at 128 KiB when
+  expanded; the full text now loads, says so when only part arrived (with
+  Retry), and offers "Show the rest" past 2 MiB.
+
+- **The desktop terminal applies its image size limit to sixel images too.** A sixel image larger than the per-pane pixel limit is now skipped before it is drawn, as the browser terminal already does since #1644; output after it prints normally. Before, the limit was not checked against the finished image. (#1735)
+
+- **Panes recovered after a daemon restart show output in the browser and on the phone.** A recovered pane held its output until the desktop app resized it, so on a headless daemon, or for a pane the desktop never showed, the browser terminal and the phone stayed blank and typed commands produced no visible output. Opening the pane's stream or typing into it now starts the output, beginning with the shell's prompt. `/api/sessions` rows carry a `deferred` flag while a pane is still waiting. (#1736)
+
+- **The daemon starts when a saved pane's resume details are incomplete.** A saved resume entry missing its folder stopped the daemon at startup, so no pane came back until the saved state was edited by hand. That entry is now skipped with a warning in the daemon log: the pane is recovered without its resume offer, and every other pane recovers as usual. (#1738)
+
+- **Closing a task removes its worktree completely.** Panes still running
+  inside the worktree are stopped first, once the close has passed the
+  unpushed and dirty checks, so they no longer leave part of the folder
+  behind on Windows. (#1741)
+
+- **Merge session labels showed raw keys.** Merge, Land, Discard and the
+  merge phases read `git.merge` and the like instead of words.
+
+- **PR status and PR creation find `gh` when wmux is opened from the Dock or
+  Finder on macOS.** Before, a Homebrew-installed `gh` was found only when wmux
+  was launched from a terminal, so the sidebar PR badge stayed empty and
+  creating a PR for a task reported that `gh` was missing. If `gh` is missing,
+  PR status now checks again after five minutes instead of giving up for the
+  rest of the session.
+
+- **Fan-out workers can record their result.** Builder and Tester panes launched with the role tool level now get the wmux tools their instructions name: the task ledger and their mission channel, plus reading the checked pane for Tester. Before, a Codex worker had wmux turned off and could not call `ledger_update`. (#1745)
+
+- **Fan-out workers can check for follow-up work.** Builder and Tester panes now get `a2a_task_query`, which their instructions tell them to use. (#1746)
+
+- **Shift+Enter inserts a newline in Codex on Windows again.** Shift+Enter, Ctrl+Enter and Ctrl+J used to send Codex a key it does not treat as a newline, so only Alt+Enter worked. Once wmux detects Codex in a native Windows pane, all three now send Alt+Enter, until the shell prompt returns. Codex inside WSL, Claude Code panes and plain shells are unchanged. (#1751)
+
+- **The notification drawer can be closed with the mouse on Windows.** Its close button used to sit under the native minimize / maximize / close buttons at the window's top right, so clicking it minimized or closed the window instead. The drawer now opens below the titlebar on every platform, and clicking elsewhere in the app (a terminal, the sidebar, a browser pane) closes it. Esc still works. (#1752)
+
+- Stabilized CI fixture copies by disabling background Git maintenance, isolated live operating-system checks in the runtime test lane, and gave disk-heavy regression tests explicit time budgets. (#1761)
+
+- **Codex shared-server turns reach their owning pane.** Thread ownership recorded at TUI start or attachment selects the pane and wmux instance, while unknown shared threads are dropped instead of inheriting another pane's identity. Shell-wrapped hooks, pane closure, and restarted panes preserve that attribution. (#1762)
+
+- **Codex sub-agent hooks preserve the main conversation.** Sub-agent and unconfirmed SessionStart events no longer replace the pane's resume binding or resume spool. Only a Stop with confirmed top-level rollout metadata binds a hook session. (#1762)
+
+### Security
+
+- **Heads-up for agy users: agy reads files your ignore files would hide.** agy does not keep a file from the agent because an ignore file lists it: a canary file listed in `.gitignore`, `.geminiignore` or `.agyignore` (agy 1.2.14) or in the documented `.antigravityignore` (agy 1.2.15) was still read on request, in the default mode, with `--sandbox` and with `--mode plan`. agy also reads any file by absolute path, so a fan-out task can still reach the main checkout's `.env`; with skip permissions on it reads anything your account can. wmux cannot prevent this, so Settings › Roles & fan-out and the Fan-out dialog now show this warning wherever agy is picked.
+
 ## [3.66.0] — 2026-10-02
 
 ### Added

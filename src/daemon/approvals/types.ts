@@ -129,8 +129,21 @@ export interface ApprovalRequest {
    *
    * Absent means "no match", never "safe". Only 'critical' exists today; the
    * softer `review` tier is deliberately not carried — see hasCriticalRisk.
+   *
+   * The one place it does gate: an AUTOMATED approve (a brain or the HQ lane)
+   * is refused as `critical-risk` (decideApprovalPress). That withholds
+   * nothing from a human — the record stays pending in front of them — it
+   * only stops a machine from saying yes on their behalf.
    */
   risk?: 'critical';
+  /**
+   * How the hook that created this record was tied to its pane. `exact`: the
+   * hook named this pane's id (a wmux-launched agent). `inexact`: the pane was
+   * guessed from the workspace or the cwd — e.g. a Claude started outside wmux
+   * that cd'd into a task worktree. Only an `exact` record can be approved by
+   * an automated caller; absent reads as not exact. Daemon-internal.
+   */
+  attribution?: 'exact' | 'inexact';
   /** Epoch ms. */
   createdAt: number;
   /**
@@ -658,6 +671,8 @@ export interface ApprovalHookSink {
      * form (see claudeQuestionsForm), answered by the stepwise driver.
      */
     form?: DecisionForm;
+    /** See ApprovalRequest.attribution. */
+    attribution?: 'exact' | 'inexact';
   }): void;
   /**
    * Expire a pane's informational `awaiting_input` cards for these agent
@@ -679,6 +694,10 @@ export interface ApprovalHookSink {
     workspaceId?: string;
     toolName: string;
     toolInputSummary?: string;
+    /** Judged on the call's FULL input before the summary was cut. */
+    risk?: 'critical';
+    /** See ApprovalRequest.attribution. */
+    attribution?: 'exact' | 'inexact';
   }): string;
   /**
    * Record the agent's own terminal dialog as a `kind:'terminal_prompt'`
@@ -737,6 +756,15 @@ export interface ApprovalResolveParams {
    * (`decideApprovalPress`), which a human is deliberately not subject to.
    */
   resolver?: 'human' | 'automated';
+  /**
+   * The HQ approval lane's declaration (main, deck/hqApprovalLane.ts). Like
+   * `resolver: 'automated'` it can only ADD a check: an automated approve that
+   * declares the lane is refused as `hq-lane-closed` unless main's published
+   * lane policy is open AND still the `laneGeneration` the caller checked —
+   * re-read right before the record is released, inside the mutation chain.
+   */
+  lane?: 'hq';
+  laneGeneration?: number;
   /**
    * Re-check the caller's authority from INSIDE the mutation link. A resolve
    * can queue behind other resolves and re-reads the screen before it writes,

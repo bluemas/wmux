@@ -256,10 +256,37 @@ describe('DaemonSessionManager', () => {
     expect(lastMockPty?.spawnEnv?.WMUX_AUTH_TOKEN).toBeUndefined();
   });
 
+  it('drops agent-nesting markers and WMUX_SOCKET_PATH from a supplied env (fresh and recovered panes)', () => {
+    manager.createSession({
+      id: 'nesting-env',
+      cmd: 'cmd.exe',
+      cwd: '.',
+      env: {
+        CLAUDE_CODE_CHILD_SESSION: '1',
+        CLAUDECODE: '1',
+        CLAUDE_CODE_SESSION_X: 'abc',
+        claude_code_entrypoint: 'cli', // case-insensitive
+        WMUX_SOCKET_PATH: '/tmp/parent.sock',
+        WMUX_WORKSPACE_ID: 'real-ws',
+        CLAUDE_CONFIG_DIR: '/Users/me/.claude-work',
+        ANTHROPIC_BASE_URL: 'https://example.invalid',
+        CLAUDE_CODE_SANDBOXED: '1', // set on purpose for fan-out/automation panes
+      },
+    });
+    const env = lastMockPty?.spawnEnv ?? {};
+    for (const key of ['CLAUDE_CODE_CHILD_SESSION', 'CLAUDECODE', 'CLAUDE_CODE_SESSION_X', 'claude_code_entrypoint', 'WMUX_SOCKET_PATH']) {
+      expect(env[key]).toBeUndefined();
+    }
+    expect(env.WMUX_WORKSPACE_ID).toBe('real-ws');
+    expect(env.CLAUDE_CONFIG_DIR).toBe('/Users/me/.claude-work');
+    expect(env.ANTHROPIC_BASE_URL).toBe('https://example.invalid');
+    expect(env.CLAUDE_CODE_SANDBOXED).toBe('1');
+  });
+
   // Instance-isolation suffix (WMUX_DATA_SUFFIX) must always reflect THIS
   // daemon's own instance, never a value carried in a replayed/persisted env
   // blob — otherwise a recovered pane could be pointed at a DIFFERENT instance's
-  // control pipe. stripReservedAuth keeps non-auth WMUX_* from a supplied env, so
+  // control pipe. stripReservedSuppliedEnv keeps WMUX_DATA_SUFFIX in a supplied env, so
   // the daemon forces its own inherited suffix over the blob (and scrubs it when
   // the daemon itself has none).
   it("forces the daemon's own WMUX_DATA_SUFFIX over a replayed env blob", () => {
@@ -304,7 +331,7 @@ describe('DaemonSessionManager', () => {
         id: 'suffix-case',
         cmd: 'cmd.exe',
         cwd: '.',
-        env: { wmux_data_suffix: '-stale', FOO: 'bar' }, // lowercase variant survives stripReservedAuth
+        env: { wmux_data_suffix: '-stale', FOO: 'bar' }, // lowercase variant survives stripReservedSuppliedEnv
       });
       const spawned = lastMockPty?.spawnEnv ?? {};
       const anyVariant = Object.keys(spawned).some((k) => k.toUpperCase() === 'WMUX_DATA_SUFFIX');

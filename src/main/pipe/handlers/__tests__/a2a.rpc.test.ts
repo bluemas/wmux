@@ -23,6 +23,12 @@ vi.mock('../../../../shared/constants', async (importOriginal) => ({
   getPidMapDir: () => '/tmp/wmux-test-pidmap',
 }));
 
+const hqRef = vi.hoisted(() => ({ current: null as string | null }));
+vi.mock('../../../deck/deckHqStore', () => ({ getHqWorkspaceId: () => hqRef.current }));
+vi.mock('../../../deck/taskLedgerHost', () => ({
+  getTaskLedger: () => ({ list: (f: { ownerWorkspaceId?: string }) => (f.ownerWorkspaceId === 'ws-hq' ? [{ taskWorkspaceId: 'ws-task-1' }] : []) }),
+}));
+
 const fakeWindow = {} as BrowserWindow;
 
 function makeWorker(): ClaudeWorker & { execute: ReturnType<typeof vi.fn>; cancel: ReturnType<typeof vi.fn> } {
@@ -476,5 +482,63 @@ describe('a2a delivery methods — operator origin is stamped, never trusted fro
     await capture(method)(params, { origin: 'local', operator: true } as unknown as RpcContext);
     const forwarded = sendToRendererMock.mock.calls[0]?.[2] as Record<string, unknown>;
     expect(forwarded.operatorOrigin).toBe(true);
+  });
+});
+
+describe('a2a.task.send — main-only delivery fields', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const fields = { deliveryGuardKey: 'moa-auto-1', presetTaskId: 'task-00000000-0000-4000-8000-000000000000' };
+  const sentParams = (): Record<string, unknown> =>
+    sendToRendererMock.mock.calls.find((c) => c[1] === 'a2a.task.send')![2] as Record<string, unknown>;
+
+  it('forwards the guard key and preset task id on the operator lane with a gated delivery', async () => {
+    sendToRendererMock.mockResolvedValue({ ok: true, taskId: fields.presetTaskId });
+    const send = captureTaskSend(makeWorker());
+    await send({ workspaceId: 'ws-human', to: 'ws-to', message: 'hi', gatedDelivery: true, ...fields }, { origin: 'local', operator: true } as RpcContext);
+    expect(sentParams()).toMatchObject(fields);
+  });
+
+  it('strips both off the operator lane, and the guard key without a gated delivery', async () => {
+    sendToRendererMock.mockResolvedValue({ ok: true, taskId: 't' });
+    const send = captureTaskSend(makeWorker());
+    await send({ workspaceId: 'ws-a', to: 'ws-to', message: 'hi', gatedDelivery: true, ...fields }, { origin: 'local' } as RpcContext);
+    expect(sentParams()).not.toHaveProperty('deliveryGuardKey');
+    expect(sentParams()).not.toHaveProperty('presetTaskId');
+
+    vi.clearAllMocks();
+    sendToRendererMock.mockResolvedValue({ ok: true, taskId: 't' });
+    await send({ workspaceId: 'ws-human', to: 'ws-to', message: 'hi', ...fields }, { origin: 'local', operator: true } as RpcContext);
+    expect(sentParams()).not.toHaveProperty('deliveryGuardKey');
+  });
+});
+
+
+describe('a2a.task.send — Moa sends work to another workspace only by hand-off', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    hqRef.current = 'ws-hq';
+  });
+  const sentParams = (): Record<string, unknown> =>
+    sendToRendererMock.mock.calls.find((c) => c[1] === 'a2a.task.send')![2] as Record<string, unknown>;
+
+  it('a new task from the HQ brain carries its allowed targets (its own workspace and fan-out tasks)', async () => {
+    sendToRendererMock.mockResolvedValue({ ok: true, taskId: 't' });
+    const send = captureTaskSend(makeWorker());
+    await send({ to: 'wseal', message: 'audit' }, { origin: 'local', commanderWorkspace: 'ws-hq' } as RpcContext);
+    expect(sentParams().hqHandoffOnly).toEqual({ allowedTargets: ['ws-hq', 'ws-task-1'] });
+  });
+
+  it('nobody else gets it, and the wire cannot set or clear it', async () => {
+    sendToRendererMock.mockResolvedValue({ ok: true, taskId: 't' });
+    const send = captureTaskSend(makeWorker());
+    await send({ workspaceId: 'ws-a', to: 'wseal', message: 'x', hqHandoffOnly: { allowedTargets: ['wseal'] } }, { origin: 'local' } as RpcContext);
+    expect(sentParams()).not.toHaveProperty('hqHandoffOnly');
+    vi.clearAllMocks();
+    sendToRendererMock.mockResolvedValue({ ok: true, taskId: 't' });
+    await send({ to: 'wseal', message: 'x' }, { origin: 'local', commanderWorkspace: 'ws-other' } as RpcContext);
+    expect(sentParams()).not.toHaveProperty('hqHandoffOnly');
   });
 });

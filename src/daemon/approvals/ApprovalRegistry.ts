@@ -74,6 +74,7 @@ import {
   type ParsedTerminalPrompt,
 } from './terminalPromptParse';
 import { commandOfToolInput, type PendingToolUse } from '../transcript/pendingToolUse';
+import { screenShowsActiveDialog, screenShowsPermissionDialog } from '../transcript/chatScreenGate';
 import { terminalPromptTextRisk } from '../push/approvalRisk';
 import {
   decideApprovalPress,
@@ -422,7 +423,11 @@ export interface ApprovalRegistryDeps {
    * classify this workspace, which refuses as `workspace-unknown`. Every branch
    * refuses; what differs is what an operator is told to go and fix.
    */
-  pressScope?: (workspaceId: string) => Pick<ApprovalPressFacts, 'isTaskWorkspace' | 'autonomyMode'> | null;
+  pressScope?: (
+    workspaceId: string,
+  ) => Pick<ApprovalPressFacts, 'isTaskWorkspace' | 'autonomyMode' | 'approvalPress' | 'ownerMode'> | null;
+  /** Main's published HQ lane policy (workspaceFacts.ts), or null. */
+  hqLane?: () => { open: boolean; generation: number } | null;
   log?: (level: 'info' | 'warn' | 'error', message: string) => void;
   /** Injected for test determinism. */
   now?: () => number;
@@ -699,6 +704,7 @@ export class ApprovalRegistry implements ApprovalRegistryApi, ApprovalHookSink {
     requestId?: string;
     /** Claude's AskUserQuestion as a `questions` form (see claudeQuestionsForm). */
     form?: DecisionForm;
+    attribution?: 'exact' | 'inexact';
   }): Promise<void> {
     // Snapshot BEFORE queuing. `mutate` runs the body after the chain drains,
     // which can be seconds later (a resolve ahead of it is holding the chain
@@ -716,6 +722,7 @@ export class ApprovalRegistry implements ApprovalRegistryApi, ApprovalHookSink {
       questionShape: input.questionShape,
       requestId: input.requestId,
       form: input.form && input.form.kind === 'questions' ? boundDecisionForm(input.form) : null,
+      attribution: input.attribution,
     };
     return this.mutate(() => {
       // A Codex pane whose approval is already up as a native decision: the
@@ -758,6 +765,7 @@ export class ApprovalRegistry implements ApprovalRegistryApi, ApprovalHookSink {
         ...(snapshot.choices && snapshot.choices.length > 0 ? { choices: snapshot.choices.map((c) => ({ ...c })) } : {}),
         ...(snapshot.questionShape ? { questionShape: snapshot.questionShape } : {}),
         ...(snapshot.requestId ? { hookRequestId: snapshot.requestId } : {}),
+        ...(snapshot.attribution ? { attribution: snapshot.attribution } : {}),
         ...(form
           ? {
               channel: 'fenced-keys' as const,
@@ -794,6 +802,9 @@ export class ApprovalRegistry implements ApprovalRegistryApi, ApprovalHookSink {
     workspaceId?: string;
     toolName: string;
     toolInputSummary?: string;
+    /** The ingest's verdict on the call's FULL input (the summary is cut). */
+    risk?: 'critical';
+    attribution?: 'exact' | 'inexact';
   }): string {
     const id = this.newId();
     const snapshot = {
@@ -804,6 +815,9 @@ export class ApprovalRegistry implements ApprovalRegistryApi, ApprovalHookSink {
       toolName: input.toolName,
       toolInputSummary: input.toolInputSummary,
     };
+    // The same pattern list every other record kind uses; the summary is
+    // scanned too so a caller that passed no verdict still gets one.
+    const critical = input.risk === 'critical' || hasCriticalRisk(input.toolInputSummary);
     this.mutate(() => {
       // One-pending-per-session holds for SCREEN-backed prompts: a pane shows
       // one question at a time, so a newer one replaced the older. Gates are
@@ -835,6 +849,8 @@ export class ApprovalRegistry implements ApprovalRegistryApi, ApprovalHookSink {
         kind: 'awaiting_permission',
         toolName: snapshot.toolName,
         ...(snapshot.toolInputSummary ? { toolInputSummary: snapshot.toolInputSummary } : {}),
+        ...(critical ? { risk: 'critical' as const } : {}),
+        ...(input.attribution ? { attribution: input.attribution } : {}),
         createdAt: this.now(),
         // No `deadlineAt` here on purpose. The record is created BEFORE the
         // broker arms its timer, and that timer runs for min(the bridge's own
@@ -1372,6 +1388,15 @@ export class ApprovalRegistry implements ApprovalRegistryApi, ApprovalHookSink {
     } catch (err) {
       this.deps.log?.('warn', `[approvals] transcript read failed for ${sessionId}: ${String(err)}`);
     }
+    // Parallel calls: the newest pending call need not be the one the dialog
+    // asks about. When the hook names another tool, the record takes the
+    // hook's name (it labelled a Grep dialog with the MCP call made beside it)
+    // but is never answerable: the hook's own evidence cannot be tied to a
+    // call by id while another unanswered call stands, and a re-proof would
+    // fail on that call and loop. The supersede path builds through here too.
+    if (pending && note.toolName && pending.name !== note.toolName) {
+      return { name: note.toolName, input: note.toolInput ?? {}, unbindable: true };
+    }
     if (pending) {
       return {
         id: pending.id,
@@ -1406,13 +1431,41 @@ export class ApprovalRegistry implements ApprovalRegistryApi, ApprovalHookSink {
 
   /** One screen read, parsed. Outside the mutation chain: a render can take seconds. */
   private async readActiveDialog(sessionId: string): Promise<DialogRead | null> {
-    let screen: { rows: readonly string[]; mark: PromptScreenMark; cols?: number } | null = null;
+    const screen = await this.readPromptScreenSafely(sessionId);
+    return screen ? this.parseActiveDialog(screen) : null;
+  }
+
+  /**
+   * True only when a fresh read of the pane shows readable rows and no dialog
+   * on them. An unreadable or blank screen is not evidence: false.
+   * For a caller that learned a dialog closed from something other than the
+   * screen (the Moa pane's main-side flag) and must not expire on that alone.
+   *
+   * Presence, not answerability: a dialog the parser does not read as active
+   * (a WebFetch dialog has no `Esc to cancel` footer) is still up while its
+   * cursor row owns the bottom of the screen, so the looser screen checks the
+   * awaiting-state verifier uses count too. One read is one sample; the caller
+   * wants a few in a row before it believes the dialog is gone.
+   */
+  async dialogGoneFromScreen(sessionId: string): Promise<boolean> {
+    const screen = await this.readPromptScreenSafely(sessionId);
+    if (!screen || !screen.rows.some((row) => row.trim().length > 0)) return false;
+    if (this.parseActiveDialog(screen) !== null) return false;
+    return !screenShowsActiveDialog(screen.rows) && !screenShowsPermissionDialog(screen.rows);
+  }
+
+  private async readPromptScreenSafely(
+    sessionId: string,
+  ): Promise<{ rows: readonly string[]; mark: PromptScreenMark; cols?: number } | null> {
     try {
-      screen = (await this.deps.readPromptScreen?.(sessionId)) ?? null;
+      return (await this.deps.readPromptScreen?.(sessionId)) ?? null;
     } catch (err) {
       this.deps.log?.('warn', `[approvals] prompt screen read failed for ${sessionId}: ${String(err)}`);
+      return null;
     }
-    if (!screen) return null;
+  }
+
+  private parseActiveDialog(screen: { rows: readonly string[]; mark: PromptScreenMark; cols?: number }): DialogRead | null {
     const opts = screen.cols ? { cols: screen.cols } : {};
     const parsed = parseTerminalPrompt(screen.rows, opts);
     const geometry = { ...(screen.cols ? { cols: screen.cols } : {}), height: screen.rows.length };
@@ -3670,6 +3723,16 @@ export class ApprovalRegistry implements ApprovalRegistryApi, ApprovalHookSink {
       // record's own existence is the origin evidence.
       origin: 'hook',
       stillOnScreen,
+      ...(record.risk === 'critical' ? { risk: 'critical' as const } : {}),
+      ...(record.attribution ? { attribution: record.attribution } : {}),
+      ...(params.lane === 'hq'
+        ? (() => {
+            // Read HERE, at release: a lane closed while this resolve waited
+            // in the chain is closed for it.
+            const policy = this.deps.hqLane?.() ?? null;
+            return { lane: 'hq' as const, laneOpen: policy?.open === true && policy.generation === params.laneGeneration };
+          })()
+        : {}),
     });
     if (!pressDecision.press && pressDecision.reason !== 'prompt-gone') {
       // NOT an expiry: the request is live and a human at the desktop can

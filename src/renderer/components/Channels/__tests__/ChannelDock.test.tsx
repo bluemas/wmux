@@ -21,28 +21,20 @@ const sidebar = read('components/Sidebar/Sidebar.tsx');
 const uiSlice = read('stores/slices/uiSlice.ts');
 
 describe('channel dock — wiring regression guard', () => {
-  it('ChannelDock renders the list + the conversation', () => {
-    expect(dock).toMatch(/<ChannelsPanel\s*\/>/);
-    expect(dock).toMatch(/<ChannelView\s*\/>/);
+  it('ChannelDock is Moa only: the tab bar shows no Channels tab and the channels view is unreachable', () => {
+    // Owner decision 2026-10-04: the right panel is Moa only. Channel data, the
+    // MCP channel tools and the phone's /api/channels stay; the desktop tab goes.
     expect(dock).toContain('data-channel-dock');
-  });
-
-  it('ChannelDock is a Command Deck: tab bar + Commander tab (default) over the channels tab', () => {
-    // Phase 1 P1a — the dock gained a [Commander] [Channels] tab bar; Commander
-    // is the default and the classic list/conversation moved under the channels
-    // tab (conditional render, code otherwise unchanged). The channels view is
-    // ALSO gated on channelsTabVisible (human channel UI frozen — the tab is a
-    // Settings opt-in), so a stale persisted activeDeckTab can never render it.
     expect(dock).toMatch(/<DeckTabs\b/);
-    expect(dock).toMatch(/<CommanderView\s*\/>/);
-    expect(dock).toContain('activeDeckTab');
-    expect(dock).toMatch(/activeDeckTab === 'channels' && channelsTabVisible/);
-    // The VIEW stays gated on channelsTabVisible, but the glyph no longer is:
-    // hiding it left an open deck with no way to reach channels at all once
-    // the sidebar's Channels row was deleted, since the flag ships false.
-    // Pressing the glyph is the opt-in, exactly as that row was (2026-08-14).
-    expect(dock).not.toMatch(/showChannels=/);
-    expect(dock).toMatch(/if \(tab === 'channels' && !channelsTabVisible\) setChannelsTabVisible\(true\)/);
+    expect(dock).toMatch(/showChannels=\{false\}/);
+    expect(dock).toMatch(/active="commander"/);
+    // The conversation is pinned by prop: Moa's HQ when Moa runs, else the
+    // active workspace (resolveMoaPanelMode), never read inside the view.
+    expect(dock).toMatch(/<CommanderView chatWorkspaceId=\{mode\.chatWorkspaceId\} viewedWorkspaceId=\{activeWorkspaceId\}/);
+    // No path from the dock to the channel list or a conversation.
+    expect(dock).not.toMatch(/<ChannelsPanel\b/);
+    expect(dock).not.toMatch(/<ChannelView\b/);
+    expect(dock).not.toContain('activeDeckTab');
   });
 
   it('ChannelView is dock content, NOT a fixed covering overlay', () => {
@@ -53,13 +45,18 @@ describe('channel dock — wiring regression guard', () => {
     expect(channelView).toMatch(/data-channel-view-wrapper/);
   });
 
-  it('AppLayout mounts ChannelDock gated on channelDockVisible (not the old overlay)', () => {
+  it('AppLayout mounts ChannelDock gated on the open flag AND Moa being on (not the old overlay)', () => {
     expect(appLayout).toMatch(/import ChannelDock from '\.\.\/Channels\/ChannelDock'/);
     // Collapsed means absent again (owner decision 2026-08-18): the 36px glyph
     // rail that used to stand in for the dock is gone, and the way back is the
-    // titlebar's DeckToggle. Nothing may render on this edge while collapsed —
-    // that is the whole point, the terminals take the width.
-    expect(appLayout).toContain('channelDockVisible && (');
+    // titlebar's Moa button. Nothing may render on this edge while collapsed,
+    // or at all while Moa is off — the terminals take the width.
+    expect(appLayout).toContain('const dockOpen = useStore(selectDockOpen);');
+    expect(appLayout).toContain("dockOpen && dockMode === 'inline' && (");
+    // Too narrow for the panes' floor: the dock leaves the row and floats over
+    // the panes on the far edge (dockLayout.ts), so the sheet never overflows.
+    expect(appLayout).toContain("dockOpen && dockMode === 'overlay' && (");
+    expect(appLayout).toMatch(/data-dock-overlay[\s\S]{0,200}absolute inset-y-0/);
     expect(appLayout).not.toMatch(/<DeckMiniRail\s*\/>/);
     expect(appLayout).toMatch(/<ChannelDock\s*\/>/);
     // The old always-mounted overlay <ChannelView /> must be gone from AppLayout.
@@ -79,3 +76,35 @@ describe('channel dock — wiring regression guard', () => {
     expect(uiSlice).not.toMatch(/toggleChannelDock/);
   });
 });
+
+describe('channel dock beside the rail pages (Moa stays in reach)', () => {
+  it('the dock is its own region, outside the inert Workspaces page, and every rail page but Settings leaves it live', () => {
+    const region = appLayout.slice(appLayout.indexOf('data-dock-region') - 200, appLayout.indexOf('data-dock-region'));
+    expect(region).toMatch(/inert=\{!dockShownOn\(appRoute\) && !inspectModeActive\}/);
+    // The one shared rule: the Workspaces page, and every rail page but
+    // Settings beside the dock.
+    const besideDock = read('components/Layout/pagesBesideDock.ts');
+    expect(besideDock).toMatch(/PAGES_BESIDE_DOCK[^=]*= new Set<AppRoute>\(\['git', 'fleet', 'schedules', 'remote'\]\)/);
+    expect(besideDock).toMatch(/route === 'workspaces' \|\| PAGES_BESIDE_DOCK\.has\(route\)/);
+    // The dock is mounted inside that region, not inside a data-workspaces-page wrapper.
+    const dockAt = appLayout.indexOf('<ChannelDock />');
+    const regionAt = appLayout.indexOf('data-dock-region');
+    const lastPageWrapperBefore = appLayout.lastIndexOf('data-workspaces-page', dockAt);
+    expect(regionAt).toBeLessThan(dockAt);
+    expect(lastPageWrapperBefore).toBeLessThan(regionAt);
+    // The narrow-window overlay dock lives in the same region, so it too stays
+    // live beside a rail page and is what the page measures.
+    const overlayAt = appLayout.indexOf('data-dock-overlay');
+    const regionEnd = appLayout.indexOf('data-workspaces-page', regionAt);
+    expect(overlayAt).toBeGreaterThan(regionAt);
+    expect(overlayAt).toBeLessThan(regionEnd);
+  });
+
+  it('a Git page drag dropped on the dock opens the hand-off on Moa\'s HQ', () => {
+    expect(dock).toMatch(/isOurHandoffDrag\(dt\) && !!moaHqId\(/);
+    expect(dock).toMatch(/takeHandoffDrop\(e\.dataTransfer\)/);
+    expect(dock).toMatch(/setGitHandoff\(\{ item: taken\.item, workspaceId: hq, repo: taken\.repo/);
+    expect(dock).toMatch(/onDrop=\{onDrop\}/);
+  });
+});
+

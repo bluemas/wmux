@@ -65,6 +65,15 @@ export async function gatedSubmitToPty(
   if (typeof submit !== 'function') {
     return { ok: false, reason: 'gate_unavailable', detail: 'delivery: approval gate unavailable' };
   }
+  // The hand-off's wait and its checks travel together.
+  const quiet: GatedSubmitOptions = options.waitQuiet
+    ? {
+        waitQuiet: true,
+        ...(options.expectAgent ? { expectAgent: options.expectAgent } : {}),
+        ...(options.deadlineAt !== undefined ? { deadlineAt: options.deadlineAt } : {}),
+        ...(options.guardKey ? { guardKey: options.guardKey } : {}),
+      }
+    : {};
   try {
     // `newTask` only when set, so every other delivery calls exactly as before.
     const result = options.newTask
@@ -73,8 +82,11 @@ export async function gatedSubmitToPty(
           ...(options.keepContext ? { keepContext: options.keepContext } : {}),
           ...(options.taskId ? { taskId: options.taskId } : {}),
           ...(options.pane ? { pane: options.pane } : {}),
+          ...quiet,
         })
-      : await submit(ptyId, text, options.agent ?? null);
+      : options.waitQuiet
+        ? await submit(ptyId, text, options.agent ?? null, quiet)
+        : await submit(ptyId, text, options.agent ?? null);
     return result && typeof result === 'object' && 'ok' in result
       ? result
       : { ok: false, reason: 'gate_unavailable', detail: 'delivery: approval gate returned no answer' };

@@ -11,7 +11,8 @@
 //
 // Builder / Tester get only what a fan-out worker is told to do in
 // WORKER_DELIVERY_PREAMBLE (FanOutService.ts): record its ledger row, read and
-// acknowledge its mission channel, and post completion there. A Tester also
+// acknowledge its mission channel, post completion there, and check for
+// follow-up work with a2a_task_query. A Tester also
 // reads the output of the pane it checks. Nothing that types into other panes.
 
 import type { OrchRole, WmuxTools } from './orchestratorRole';
@@ -38,6 +39,7 @@ export const ROLE_TOOL_SURFACES: Readonly<Record<OrchRole, readonly string[]>> =
     'channel_unread',
     'channel_ack',
     'channel_post',
+    'a2a_task_query',
   ],
   Tester: [
     'ledger_update',
@@ -45,6 +47,7 @@ export const ROLE_TOOL_SURFACES: Readonly<Record<OrchRole, readonly string[]>> =
     'channel_unread',
     'channel_ack',
     'channel_post',
+    'a2a_task_query',
     'terminal_read',
     'pane_list',
   ],

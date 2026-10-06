@@ -963,7 +963,7 @@ export function selectSurfaceLastMessage(
 // detail it shows. Pure over the fleet rows plus a small context so a non-UI
 // consumer (an MCP tool) can reuse the exact same triage.
 
-export type FleetSection = 'needsYou' | 'running' | 'idle';
+export type FleetSection = 'needsYou' | 'finished' | 'running' | 'idle';
 
 /** Fallback detail keys — the renderer translates them. */
 export type FleetDetailKey =
@@ -991,6 +991,8 @@ export interface FleetRow {
 
 export interface FleetGroups {
   needsYou: FleetRow[];
+  /** Turns that ended and have not been looked at — a look, not a decision. */
+  finished: FleetRow[];
   running: FleetRow[];
   idle: FleetRow[];
 }
@@ -1020,20 +1022,22 @@ export function fleetIdleForMs(ptyId: string, ctx: FleetGroupContext): number | 
 
 /**
  * #1481 glance board — the one attention classification both surfaces use.
- * Fleet folds it into three sections (sectionOfAttentionClass); the sidebar
- * sorts workspaces by it. Order of urgency: needs you → finished (a turn that
- * ended and has not been looked at: `complete` is retained until the pane is
- * focused) → running → unconfirmed (running, but silent past the hook window)
- * → idle.
+ * Fleet folds it into its sections (sectionOfAttentionClass); the sidebar
+ * sorts workspaces by it. Order of urgency: needs you → error (a failed turn,
+ * its own tier so an old error never sinks below a fresh finish) → finished
+ * (a turn that ended and has not been looked at: `complete` is retained until
+ * the pane is focused) → running → unconfirmed (running, but silent past the
+ * hook window) → idle.
  */
-export type FleetAttentionClass = 'needsYou' | 'finished' | 'running' | 'unconfirmed' | 'idle';
+export type FleetAttentionClass = 'needsYou' | 'error' | 'finished' | 'running' | 'unconfirmed' | 'idle';
 
 export const ATTENTION_CLASS_RANK: Record<FleetAttentionClass, number> = {
   needsYou: 0,
-  finished: 1,
-  running: 2,
-  unconfirmed: 3,
-  idle: 4,
+  error: 1,
+  finished: 2,
+  running: 3,
+  unconfirmed: 4,
+  idle: 5,
 };
 
 export function fleetAttentionClass(
@@ -1044,8 +1048,9 @@ export function fleetAttentionClass(
   if (pane.unverifiable) return 'unconfirmed';
   switch (pane.agentStatus) {
     case 'awaiting_input':
-    case 'error':
       return 'needsYou';
+    case 'error':
+      return 'error';
     case 'waiting':
       return question ? 'needsYou' : 'idle';
     case 'complete':
@@ -1057,10 +1062,14 @@ export function fleetAttentionClass(
   }
 }
 
-/** Fleet's section for a class. Unconfirmed and finished are "needs you" there. */
+/** Fleet's section for a class. Needs you holds what waits on a person
+ *  (input, errors, stopped supervision, unconfirmed); a finished turn is a
+ *  look, not a decision, so it has its own section. Errors are their own
+ *  class for the sidebar's order and word, and still a Needs you row here. */
 export function sectionOfAttentionClass(cls: FleetAttentionClass): FleetSection {
   if (cls === 'running') return 'running';
   if (cls === 'idle') return 'idle';
+  if (cls === 'finished') return 'finished';
   return 'needsYou';
 }
 
@@ -1223,31 +1232,31 @@ export function fleetRow(pane: FleetPane, ctx: FleetGroupContext = {}): FleetRow
   }
 }
 
-/** Severity inside Needs you: a stopped supervisor, then a request for
- *  input, then an error, then an unconfirmed turn, then a finished one. */
+/** Order inside Needs you: decisions first (a request for input), then an
+ *  error, then a stopped supervisor, then an unconfirmed turn. */
 function needsYouRank(row: FleetRow): number {
-  if (row.pane.supervision?.status === 'stopped') return 0;
+  if (row.pane.supervision?.status === 'stopped') return 2;
   if (row.pane.unverifiable) return 3;
   switch (row.pane.agentStatus) {
     case 'awaiting_input':
     case 'waiting':
-      return 1;
+      return 0;
     case 'error':
-      return 2;
+      return 1;
     default:
       return 4;
   }
 }
 
 /**
- * Group fleet rows into the three attention-board sections. Within a section
+ * Group fleet rows into the four attention-board sections. Within a section
  * ('attention' mode): Needs you ranks by severity (needsYouRank), the other
  * sections by STATUS_RANK; then the most recent activity first, rows with no
  * timestamps last, then input order. 'workspace' mode keeps the input
  * (sidebar) order inside each section.
  */
 export function groupFleetPanes(panes: FleetPane[], ctx: FleetGroupContext = {}): FleetGroups {
-  const groups: FleetGroups = { needsYou: [], running: [], idle: [] };
+  const groups: FleetGroups = { needsYou: [], finished: [], running: [], idle: [] };
   const order = new Map<FleetRow, number>();
   panes.forEach((pane, index) => {
     const row = fleetRow(pane, ctx);
@@ -1268,6 +1277,7 @@ export function groupFleetPanes(panes: FleetPane[], ctx: FleetGroupContext = {})
       return (order.get(a) ?? 0) - (order.get(b) ?? 0);
     };
     groups.needsYou.sort(compare);
+    groups.finished.sort(compare);
     groups.running.sort(compare);
     groups.idle.sort(compare);
   }
@@ -1289,7 +1299,7 @@ export function fleetTitle(pane: FleetPane, mission?: WorkTask): string {
  *  FleetView subscribes to them shallowly (so the 2 s decay clock does not
  *  re-derive the board) and passes them in; a caller holding the live store
  *  omits them and they are derived from the same state here. */
-export type FleetBoardState = FleetSelectorState & Pick<StoreState, 'surfaceOutputAt'> & {
+export type FleetBoardState = FleetSelectorState & Pick<StoreState, 'surfaceOutputAt'> & Partial<Pick<StoreState, 'moa' | 'moaHqSeed'>> & {
   /** Produced by `selectUnverifiablePaneMinutes`; derived when absent. */
   unverifiablePaneMinutes?: Record<string, number>;
 };
@@ -1325,14 +1335,26 @@ export function selectFleetBoard(
   return { panes, groups };
 }
 
+/** The workspace Fleet leaves off as Moa's: the known HQ, whether or not Moa
+ *  is on. Main may report no HQ id while Moa is off, so the remembered one
+ *  (the seed) still counts: Moa's own terminal is never a worker. */
+export function fleetHqId(state: Pick<FleetBoardState, 'moa' | 'moaHqSeed'>): string | null {
+  return state.moa?.hq.workspaceId ?? state.moaHqSeed ?? null;
+}
+
 /** The board's rows before grouping — shared by the board and its counts so
- *  both read the same panes with the same liveness inputs. */
+ *  both read the same panes with the same liveness inputs. Moa's HQ workspace
+ *  is left out: Moa is the main bot, not a worker on the board, and what it
+ *  waits on reaches the operator through its own panel ("Waiting on you" and
+ *  its permission card). `selectFleetPanes` itself keeps the HQ, since the
+ *  workspace mirror (pane_list) and per-workspace roll-ups read it. */
 function fleetBoardPanes(
   state: FleetBoardState,
   hookRunningByPtyId: Record<string, boolean>,
   unverifiable: Record<string, number>,
 ): FleetPane[] {
   const surfaceAgent = state.surfaceAgent ?? {};
+  const hq = fleetHqId(state);
   // Use the same turn/liveness inputs as the sidebar and Deck roster. Missing
   // these optional inputs silently classified active hook-driven turns as idle.
   return selectFleetPanes({
@@ -1350,7 +1372,7 @@ function fleetBoardPanes(
     agentAliveByPtyId: state.agentAliveByPtyId,
     hookRunningByPtyId,
     remoteWorkspaces: state.remoteWorkspaces,
-  }).map((pane) => ({
+  }).filter((pane) => pane.workspaceId !== hq).map((pane) => ({
     ...pane,
     agentName: surfaceAgent[pane.ptyId]?.name || pane.agentName,
     unverifiable: !!unverifiable[pane.ptyId],
@@ -1375,8 +1397,8 @@ let sectionCountsMemo: { inputs: unknown[]; hook: Record<string, boolean>; unver
  * How many rows the Fleet board has in Needs you and Running — the sidebar's
  * Fleet shortcut shows these. Same panes as the board (fleetBoardPanes) and the
  * same per-row section rule as `fleetRow`, but counted only: no detail text,
- * no grouping, no sort. Needs you includes finished and unconfirmed rows, as
- * on the board.
+ * no grouping, no sort. Finished turns are their own section, so they do not
+ * count as needs you; unconfirmed rows do, as on the board.
  *
  * The sidebar is always mounted and the store changes on every output chunk,
  * so the pass is memoized on the inputs that can move a section — not on the
@@ -1390,7 +1412,7 @@ export function selectFleetSectionCounts(state: FleetBoardState): FleetSectionCo
     state.workspaces, state.surfaceAgentStatus, state.surfaceActivity, state.paneLabel,
     state.supervisionByPtyId, state.surfaceAgent, state.surfacePendingQuestion, state.surfaceActivityAt,
     state.surfaceTurnOpenAt, state.commandRunningByPtyId, state.agentAliveByPtyId, state.remoteWorkspaces,
-    state.usageLimitWaiting,
+    state.usageLimitWaiting, fleetHqId(state),
   ];
   const memo = sectionCountsMemo;
   if (memo && inputs.every((value, i) => Object.is(value, memo.inputs[i]))

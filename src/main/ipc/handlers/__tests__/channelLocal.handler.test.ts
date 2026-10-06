@@ -34,6 +34,16 @@ vi.mock('../../../deck/deckWorkspaceTeardown', () => ({
   surfaceStrandedWork: vi.fn(),
 }));
 
+const recordTaskStateMock = vi.fn(async () => undefined);
+vi.mock('../../../workLink/a2aProducer', () => ({
+  recordTaskState: (...args: unknown[]) => recordTaskStateMock(...(args as [])),
+}));
+
+let mockHq: string | null = null;
+vi.mock('../../../deck/deckHqStore', () => ({
+  getHqWorkspaceId: () => mockHq,
+}));
+
 vi.mock('electron', () => {
   const handlers = new Map<string, (...args: unknown[]) => unknown>();
   const ipcMain = {
@@ -205,6 +215,16 @@ describe('channelLocal.handler — CHANNEL_MUTATE_LOCAL', () => {
   });
 
   describe('whole-workspace purgeMembership teardown trigger', () => {
+    it('records each A2A task the daemon force-failed on its work link, like any other transition', async () => {
+      installHandler();
+      const failed = { id: 'task-9', status: { state: 'failed', evidence: { summary: 'Receiver workspace was removed.', items: [] } } };
+      rpc.mockResolvedValueOnce({ ok: true, result: { removed: 1, failedA2aTasks: [failed] } });
+      recordTaskStateMock.mockClear();
+      const handler = getHandler(IPC.CHANNEL_MUTATE_LOCAL);
+      await handler(fakeEvent, 'a2a.channel.purgeMembership', { verifiedWorkspaceId: 'ws-ceo', workspaceId: 'ws-remove-me' });
+      expect(recordTaskStateMock).toHaveBeenCalledWith('task-9', 'failed', undefined, failed);
+    });
+
     it('triggers teardown exactly once on whole-workspace purge (both memberId and principalId absent)', async () => {
       installHandler();
       const handler = getHandler(IPC.CHANNEL_MUTATE_LOCAL);
@@ -244,6 +264,32 @@ describe('channelLocal.handler — CHANNEL_MUTATE_LOCAL', () => {
       expect(rpc).toHaveBeenCalledTimes(1);
       expect(teardownMock).not.toHaveBeenCalled();
       expect(res).toMatchObject({ ok: true });
+    });
+
+    it('refuses a whole-workspace purge of the HQ before the daemon is called', async () => {
+      mockHq = 'ws-hq';
+      try {
+        installHandler();
+        const handler = getHandler(IPC.CHANNEL_MUTATE_LOCAL);
+        const res = await handler(fakeEvent, 'a2a.channel.purgeMembership', {
+          verifiedWorkspaceId: 'ws-ceo',
+          workspaceId: 'ws-hq',
+        });
+        expect(res).toMatchObject({ ok: false });
+        expect(JSON.stringify(res)).toMatch(/ws-hq: it is the HQ workspace/);
+        expect(rpc).not.toHaveBeenCalled();
+        expect(teardownMock).not.toHaveBeenCalled();
+        // A per-member purge in the HQ and a whole purge of another workspace pass.
+        await handler(fakeEvent, 'a2a.channel.purgeMembership', {
+          verifiedWorkspaceId: 'ws-ceo', workspaceId: 'ws-hq', memberId: 'mem-1',
+        });
+        await handler(fakeEvent, 'a2a.channel.purgeMembership', {
+          verifiedWorkspaceId: 'ws-ceo', workspaceId: 'ws-other',
+        });
+        expect(rpc).toHaveBeenCalledTimes(2);
+      } finally {
+        mockHq = null;
+      }
     });
 
     it('returns daemon result even when teardown throws (teardown failure does not change RPC result)', async () => {

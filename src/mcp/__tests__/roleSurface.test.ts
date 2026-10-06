@@ -57,9 +57,9 @@ describe('--role surface', () => {
     expect(await listNames({ roleSurface: 'Reviewer' })).toHaveLength(5);
   });
 
-  it('a fan-out worker gets its ledger and mission-channel tools: Builder 5, Tester 7', async () => {
-    expect(await listNames({ roleSurface: 'Builder' })).toHaveLength(5);
-    expect(await listNames({ roleSurface: 'Tester' })).toHaveLength(7);
+  it('a fan-out worker gets the tools its preamble names: Builder 6, Tester 8', async () => {
+    expect(await listNames({ roleSurface: 'Builder' })).toHaveLength(6);
+    expect(await listNames({ roleSurface: 'Tester' })).toHaveLength(8);
     expect(await listNames({ roleSurface: 'Builder' })).toContain('ledger_update');
   });
 

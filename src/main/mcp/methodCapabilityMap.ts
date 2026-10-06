@@ -307,6 +307,9 @@ export const METHOD_CAPABILITY: Record<RpcMethod, RequiredCapability> = {
   // Brain self-resolve of a stale decision (WP3). Same commander-token auth +
   // server-side auto/staleness/substance gate, so no capability gate either.
   'deck.resolveDecision': { capability: null },
+  // Moa hand-off proposal. Own commander-token auth (HQ brain only) in
+  // deck.rpc.ts, and it only raises an operator card, so no capability gate.
+  'deck.proposeHandoff': { capability: null },
   // Orphan Deck state prune (`wmux deck state --prune --yes`). Runs inside the
   // app so its writes share the stores' in-process locks and caches; it
   // deletes state, so it carries the same internal gate as workspace.close.
@@ -425,6 +428,9 @@ export const METHOD_CAPABILITY: Record<RpcMethod, RequiredCapability> = {
   // Main → daemon only. A plugin that could write this table would choose
   // which panes an automated approval may be pressed into.
   'daemon.workspaceFacts.set': { capability: 'wmux.internal' },
+  // Main → daemon only. A client that could write this would choose which
+  // brain pane a paired phone may read and type into.
+  'daemon.moa.set':          { capability: 'wmux.internal' },
   // LanLink PR-2 — cursor-pull of the durable remote inbox. main↔daemon only
   // (DaemonClient → daemon control pipe); never an external MCP surface.
   'daemon.inbox.poll':       { capability: 'wmux.internal' },
@@ -596,6 +602,9 @@ export const METHOD_CAPABILITY: Record<RpcMethod, RequiredCapability> = {
   // Live Claude Code rate limits from the bundled statusline script — the same
   // internal caller class as hooks.signal.
   'usage.rateLimits': { capability: 'wmux.internal' },
+  // Moa's read gate asks which repositories it may read without a prompt.
+  // Read-only, answered from main's memory; the same internal caller class.
+  'deck.moaReadRoots': { capability: 'wmux.internal' },
 };
 
 /**

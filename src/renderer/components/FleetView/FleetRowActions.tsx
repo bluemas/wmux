@@ -1,7 +1,8 @@
 // Row verbs for the Fleet attention board: one ⋮ trigger per row that opens
 // the shared PaneActionsMenu (same popover, same placePopover placement as the
 // pane header's overflow menu), plus the inline editors the verbs open under a
-// row — a single-line message composer, a label input, and a close confirm.
+// row — a single-line message composer, a label input, a role picker, and a
+// close confirm.
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   fleetTargetPtyId,
@@ -12,7 +13,8 @@ import {
 import { useStore } from '../../stores';
 import { useT } from '../../hooks/useT';
 import PaneActionsMenu, { type PaneActionItem } from '../Pane/PaneActionsMenu';
-import { IconChevron, IconClock, IconEye, IconEyeOff, IconPencil, IconTerminal, IconX } from '../icons';
+import { IconChevron, IconClock, IconEye, IconEyeOff, IconPencil, IconTerminal, IconUsers, IconX } from '../icons';
+import { paneRoleOptions } from './paneRoleOptions';
 import { updateUsageLimit } from '../../hooks/useUsageLimitBridge';
 import { submitBracketedPasteToPty } from '../../utils/ptyMessageDelivery';
 import { disposePanePtys } from '../../utils/paneTeardown';
@@ -20,7 +22,7 @@ import { findParent, findPane } from '../../../shared/paneUtils';
 import { findStashedEntry } from '../../../shared/paneStash';
 import type { TranslationKey } from '../../i18n/locales/en';
 
-export type FleetEditorKind = 'message' | 'label' | 'close';
+export type FleetEditorKind = 'message' | 'label' | 'role' | 'close';
 
 export interface FleetRowVerbs {
   /** Remote rows can only be jumped to; every other verb is hidden. */
@@ -112,13 +114,11 @@ interface FleetRowMenuProps {
   /** Told the menu's close function while it is open (null once closed), so
    *  FleetView's Escape handler can close the menu instead of the overlay. */
   onMenuOpenChange?: (close: (() => void) | null) => void;
-  /** Roving slot owner — only its trigger is in the Tab order. */
-  focused: boolean;
   onJump: (pane: FleetPane) => void;
   onEdit: (pane: FleetPane, kind: FleetEditorKind) => void;
 }
 
-export function FleetRowMenu({ pane, verbs, focused, onJump, onEdit, onMenuOpenChange }: FleetRowMenuProps) {
+export function FleetRowMenu({ pane, verbs, onJump, onEdit, onMenuOpenChange }: FleetRowMenuProps) {
   const t = useT();
   const [anchor, setAnchor] = useState<{ top: number; left: number; right: number; bottom: number } | null>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -159,6 +159,7 @@ export function FleetRowMenu({ pane, verbs, focused, onJump, onEdit, onMenuOpenC
         onSelect: () => toggleFleetStash(pane),
       },
       { key: 'label', label: t('fleet.verb.label'), shortcut: 'L', icon: <IconPencil size={12} />, onSelect: () => onEdit(pane, 'label') },
+      { key: 'role', label: t('fleet.verb.role'), shortcut: 'R', icon: <IconUsers size={12} />, onSelect: () => onEdit(pane, 'role') },
     );
     if (canArmLimit && usageLimit) {
       const armed = usageLimit.autoResume === true;
@@ -191,7 +192,10 @@ export function FleetRowMenu({ pane, verbs, focused, onJump, onEdit, onMenuOpenC
         ref={triggerRef}
         type="button"
         className="wmux-fleet-row-trigger"
-        tabIndex={focused ? 0 : -1}
+        // Pointer twin of the row's keys (Shift+F10 / the Menu key open it
+        // from the row): kept out of the listbox's tree and tab order.
+        tabIndex={-1}
+        aria-hidden="true"
         title={t('pane.moreActions')}
         aria-label={t('pane.moreActions')}
         aria-haspopup="menu"
@@ -223,6 +227,8 @@ export function FleetRowEditor({ pane, kind, onDone }: FleetRowEditorProps) {
   const target = fleetTargetPtyId(pane);
   const agentName = useStore((s) => s.surfaceAgent[target]?.name);
   const [value, setValue] = useState(kind === 'label' ? pane.paneLabel ?? '' : '');
+
+  if (kind === 'role') return <FleetRoleEditor pane={pane} onDone={onDone} />;
 
   if (kind === 'close') {
     return (
@@ -277,6 +283,38 @@ export function FleetRowEditor({ pane, kind, onDone }: FleetRowEditorProps) {
           if (e.key === 'Enter' && !e.nativeEvent.isComposing) { e.preventDefault(); submit(); }
         }}
       />
+    </div>
+  );
+}
+
+/** Write a pane's operator-assigned role ('' clears it) through MetadataStore,
+ *  the same path the Deck roster uses, so it persists and reaches the brain. */
+export function setFleetPaneRole(pane: Pick<FleetPane, 'paneId' | 'workspaceId'>, role: string, failed: string): void {
+  Promise.resolve(window.electronAPI?.metadata?.setRole?.(pane.paneId, pane.workspaceId, role)).catch((err: unknown) => {
+    console.error('[fleet] setRole failed', err);
+    useStore.getState().pushToast({ level: 'error', message: failed });
+  });
+}
+
+/** The Role editor: None plus the role vocabulary as one row of toggle
+ *  buttons, the current one pressed. Picking one writes it and closes. */
+function FleetRoleEditor({ pane, onDone }: { pane: FleetPane; onDone: () => void }) {
+  const t = useT();
+  const role = useStore((s) => s.paneRole[pane.paneId] ?? '');
+  const pick = (next: string) => {
+    if (next !== role) setFleetPaneRole(pane, next, t('fleet.role.failed'));
+    onDone();
+  };
+  return (
+    <div className="wmux-fleet-editor" role="group" aria-label={t('fleet.verb.role')} title={t('deck.fleetPreferredRole')} data-fleet-editor="role">
+      <button type="button" autoFocus={role === ''} aria-pressed={role === ''} data-fleet-role="" onClick={() => pick('')}>
+        {t('fleet.role.none')}
+      </button>
+      {paneRoleOptions(role).map((r) => (
+        <button key={r} type="button" autoFocus={r === role} aria-pressed={r === role} data-fleet-role={r} onClick={() => pick(r)}>
+          {r}
+        </button>
+      ))}
     </div>
   );
 }

@@ -1,9 +1,10 @@
-// Fleet task rows show reported activity; raw output lives in the opt-in preview.
+// Fleet rows say what the agent is doing in words; raw output lives in the
+// detail area, never in a row.
 import { describe, expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { createElement } from 'react';
-import FleetCard, { FleetCardMissionLine, FleetCardEvidenceBadge } from '../FleetCard';
-import type { FleetPane } from '../../../stores/selectors/fleet';
+import FleetCard, { agentDisplayName, FleetCardMissionLine, FleetCardEvidenceBadge } from '../FleetCard';
+import { fleetRow, type FleetPane } from '../../../stores/selectors/fleet';
 import { fleetTitle } from '../fleetPresentation';
 import type { WorkTask } from '../../../../shared/workTask';
 import type { EvidenceItem, Task } from '../../../../shared/types';
@@ -26,9 +27,9 @@ function card(overrides: Partial<FleetPane> = {}): FleetPane {
   };
 }
 
-function render(props: { card: FleetPane; tail?: string[] }): string {
+function render(props: { card: FleetPane; ticketTitle?: string }): string {
   return renderToStaticMarkup(
-    createElement(FleetCard, { card: props.card, focused: false, onJump: noop, tail: props.tail }),
+    createElement(FleetCard, { card: props.card, focused: false, onJump: noop, ticketTitle: props.ticketTitle }),
   );
 }
 
@@ -36,14 +37,23 @@ describe('FleetCard — task-first rows', () => {
   it('shows a reported tool activity', () => {
     const html = render({ card: card({ activity: '✎ fleet.ts' }) });
     expect(html).toContain('data-fleet-activity');
-    expect(html).toContain('✎ fleet.ts');
+    expect(html).toContain('data-fleet-now="now"');
+    expect(html).toContain('Editing fleet.ts');
+    expect(html).not.toContain('✎');
   });
 
-  it('keeps raw prompts and separators out of the overview', () => {
-    const html = render({ card: card({ agentStatus: 'idle' }), tail: ['────────', '❯ Ask Codex to do anything.'] });
-    expect(html).not.toContain('────────');
-    expect(html).not.toContain('Ask Codex');
-    expect(html).toContain('No recent activity reported');
+  it('names the row after the ticket the pane is working on', () => {
+    const html = render({ card: card(), ticketTitle: 'Fix the login redirect' });
+    expect(html).toContain('Fix the login redirect');
+  });
+
+  it('draws a usage-limit hold as a muted Waiting clock, not an error', () => {
+    const c = card({ agentStatus: 'error', usageLimitWaiting: true });
+    const html = renderToStaticMarkup(createElement(FleetCard, { card: c, row: fleetRow(c), focused: false, onJump: noop }));
+    expect(html).toContain('Waiting');
+    expect(html).toContain('data-shape="clock"');
+    expect(html).toContain('var(--text-muted)');
+    expect(html).not.toContain('var(--accent-red)');
   });
 
   it('treats whitespace-only activity as missing information', () => {
@@ -63,7 +73,7 @@ describe('FleetCard — task-first rows', () => {
     const html = render({ card: card({ agentStatus: 'waiting' }) });
     expect(html).toContain('Idle');
     expect(html).not.toContain('Waiting');
-    expect(html).not.toContain('var(--accent-yellow)');
+    expect(html).not.toContain('var(--attention)');
     expect(html).toContain('var(--text-sub)');
   });
 
@@ -78,9 +88,9 @@ describe('FleetCard — task-first rows', () => {
 
   it('labels response completion without claiming task success', () => {
     const html = render({ card: card({ agentStatus: 'complete' }) });
-    expect(html).toContain('Turn complete');
-    expect(html).toContain('Response finished');
-    expect(html).toContain('Review');
+    expect(html).toContain('>Finished<');
+    expect(html).toContain('Turn finished');
+    expect(html).toContain('See result');
   });
 
   it('shows stale running evidence as unconfirmed', () => {
@@ -107,12 +117,43 @@ describe('FleetCard — task-first rows', () => {
   });
 });
 
+describe('FleetCard — one name, a short label', () => {
+  it('names a known agent by its display name, whatever the title says', () => {
+    expect(agentDisplayName('claude')).toBe('Claude Code');
+    expect(agentDisplayName('✳ Claude Code')).toBe('Claude Code');
+    expect(agentDisplayName('codex')).toBe('Codex CLI');
+    expect(agentDisplayName('my build')).toBe('my build');
+  });
+
+  it('keeps the accessible name short: name, status, place, the question clipped', () => {
+    const question = 'q'.repeat(200);
+    const html = renderToStaticMarkup(createElement(FleetCard, {
+      card: card({ agentStatus: 'awaiting_input' }), focused: false, onJump: noop,
+      row: { pane: card({ agentStatus: 'awaiting_input' }), section: 'needsYou', detail: question, detailSource: 'question', detailKey: 'fleet.needsYourInput' },
+    }));
+    const label = /aria-label="([^"]*)"/.exec(html)?.[1] ?? '';
+    expect(label.startsWith('alpha, Needs input, alpha, ')).toBe(true);
+    expect(label.length).toBeLessThan(140);
+    expect(label).not.toContain('Respond');
+  });
+
+  it('shows an error row\'s last error line in the now-doing slot, in mono', () => {
+    const html = renderToStaticMarkup(createElement(FleetCard, {
+      card: card({ agentStatus: 'error' }), focused: false, onJump: noop, errorLine: 'Error: build failed',
+    }));
+    expect(html).toContain('data-fleet-now="error"');
+    expect(html).toContain('is-activity');
+    expect(html).toContain('Error: build failed');
+    expect(html).toContain('Check');
+  });
+});
+
 describe('FleetCard — #1343 remote rows', () => {
   it('marks a remote agent with the origin glyph and names the host in the label', () => {
     const html = render({ card: card({ ptyId: 'remote:h1:s1', surfaceType: 'remote-terminal', remote: { hostId: 'h1', hostLabel: 'build-box' } }) });
     expect(html).toContain('data-fleet-remote');
     expect(html).toContain('title="@build-box"');
-    expect(html).toMatch(/aria-label="[^"]*, alpha, build-box,/);
+    expect(html).toMatch(/aria-label="[^"]*, alpha, build-box"/);
   });
 
   it('renders no origin glyph for a local agent', () => {

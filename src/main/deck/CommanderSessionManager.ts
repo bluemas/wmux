@@ -37,17 +37,24 @@ export interface CommanderSendResult {
    *  workspaceId to route to an orchestrator), or `mode_off` (handler-level —
    *  the workspace's agent mode is `off`, so the brain must not run at all),
    *  or `task_workspace` (handler-level — a fan-out task workspace never runs
-   *  a brain of its own; the owner's brain drives it).
+   *  a brain of its own; the owner's brain drives it), or `not_hq` /
+   *  `hq_missing` / `hq_unknown` (handler-level — an HQ is designated and this
+   *  is not it, or the HQ's workspace is gone / not yet observed;
+   *  deckHqStore.ts), or `moa_off` (handler-level
+   *  — the main bot's master switch is off).
    *  Additionally `errored` rides an ok:true result when the turn RAN but the
    *  adapter threw mid-stream — callers that must distinguish "completed" from
    *  "died mid-turn" (the re-examine consume) check it; everyone else keys off
    *  `ok` alone. */
-  code?: 'busy' | 'disposed' | 'empty' | 'invalid_workspace' | 'mode_off' | 'task_workspace' | 'errored';
+  code?: 'busy' | 'disposed' | 'empty' | 'invalid_workspace' | 'moa_off' | 'mode_off' | 'task_workspace' | 'not_hq' | 'hq_missing' | 'hq_unknown' | 'errored';
 }
 
 export interface CommanderStatusSnapshot {
   status: CommanderStatus;
   sessionId: string | null;
+  /** Present only while a designated HQ cannot run: its workspace is gone or
+   *  not yet observed, or deck-hq.json is unreadable (deckHqStore.ts). */
+  hq?: 'hq-missing' | 'hq-unknown' | 'hq-store-corrupt';
 }
 
 export interface CommanderSessionManagerDeps {
@@ -107,6 +114,24 @@ export class CommanderSessionManager {
     return (this.adapter as { busy?: boolean }).busy === true;
   }
 
+  private _turnOrigin: 'human' | 'automation' | null = null;
+
+  /** Who started the latest turn this brain ACCEPTED: 'human' (the operator at
+   *  the composer, or typing into the embedded TUI) or 'automation' (any wake,
+   *  the dock's Wake button included). Set at the moment a turn is accepted,
+   *  never on a request that was refused or is still waiting for a slot, so a
+   *  queued wake and an operator prompt cannot overwrite each other's mark.
+   *  Moa's no-click hand-off reads it (moaHandoff.ts). */
+  get turnOrigin(): 'human' | 'automation' | null {
+    return this._turnOrigin;
+  }
+
+  /** The human typed a turn into the embedded TUI (it did not go through send). */
+  notifyForeignTurnStart(): void {
+    if (this._status === 'disposed') return;
+    this._turnOrigin = 'human';
+  }
+
   getStatus(): CommanderStatusSnapshot {
     const status: CommanderStatus =
       this._status === 'idle' && this.adapterBusy ? 'busy' : this._status;
@@ -142,6 +167,7 @@ export class CommanderSessionManager {
     }
 
     this._status = 'busy';
+    this._turnOrigin = opts.origin === 'automation' ? 'automation' : 'human';
     // Round-5 review P1: production adapters (ClaudeSdkAdapter, AcpBrainAdapter)
     // report failures by YIELDING a BrainEvent{type:'error'} — or by ending the
     // stream without a turn-end — rather than throwing, so an exception-only

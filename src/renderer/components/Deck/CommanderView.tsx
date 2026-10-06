@@ -34,7 +34,7 @@ import {
   type DeckLimitNotice,
 } from './deckBrain';
 import DeckFleet from './DeckFleet';
-import { selectMissionChannelIds } from '../../stores/selectors/missions';
+import { findMission, selectMissionChannelIds } from '../../stores/selectors/missions';
 import { getWorkspaceLeafPanes } from '../../../shared/paneUtils';
 import { generateId } from '../../../shared/types';
 import type { ChannelMention, ChannelMessage } from '../../../shared/channels';
@@ -79,11 +79,14 @@ import { DeckLoopPanel } from './DeckLoopPanel';
 import { DeckLedgerPanel } from './DeckLedgerPanel';
 import { DeckApprovalCountdown } from './DeckApprovalCountdown';
 import { DeckDecisionCard } from './DeckDecisionCard';
+import { MoaMemoryCard } from '../Moa/MoaMemoryCard';
 import BrainTerminalEmbed from './BrainTerminalEmbed';
 import { DeckBriefingCard } from './DeckBriefingCard';
 import { AgentModeChipContainer } from './AgentModeChip';
+import { MoaHeaderMenu } from './MoaHeaderMenu';
 import { onAgentModeChanged } from './deckModeBus';
 import type { AgentMode } from '../../../main/deck/deckAutonomyStore';
+import Button from '../ui/Button';
 
 const EMPTY_MESSAGES: ChannelMessage[] = [];
 
@@ -95,6 +98,42 @@ const USER_BUBBLE = 'max-w-[85%] rounded-lg px-3 py-2 bg-[color-mix(in_srgb,var(
 const TIME = 'text-[11px] tabular-nums text-[color-mix(in_srgb,var(--text-main)_35%,transparent)]';
 
 // ─── Pure view ───────────────────────────────────────────────────────────────
+
+/** Why Moa will not run a turn in this workspace — main's refusal codes. */
+export type MoaBlockCode = 'moa_off' | 'not_hq' | 'hq_missing' | 'hq_unknown';
+
+export const MOA_BLOCK_CODES: readonly MoaBlockCode[] = ['moa_off', 'not_hq', 'hq_missing', 'hq_unknown'];
+
+export const isMoaBlockCode = (code: unknown): code is MoaBlockCode =>
+  typeof code === 'string' && (MOA_BLOCK_CODES as readonly string[]).includes(code);
+
+/** The sentence for each refusal (also the failed turn's error text). */
+export const MOA_BLOCK_KEY: Record<MoaBlockCode, string> = {
+  moa_off: 'deck.moaOff',
+  not_hq: 'deck.moaNotHq',
+  hq_missing: 'deck.moaHqMissing',
+  hq_unknown: 'deck.moaHqUnknown',
+};
+
+export interface MoaBlock {
+  code: MoaBlockCode;
+  /** Settings › Moa (switch, HQ recovery). */
+  onOpenSettings?: () => void;
+  /** Moa's own workspace, when one exists. */
+  onOpenHq?: () => void;
+}
+
+/** What Moa mode adds to the pty layout. */
+export interface CommanderMoaSlots {
+  /** Waiting on you, delegated work and the briefing. Drawn above the
+   *  terminal; the chat view already carries it inside its own scroll. */
+  top?: React.ReactNode;
+  /** The brain's transcript as chat bubbles, shown in place of the terminal
+   *  while `view` is 'chat'. Null when there is no transcript source. */
+  chat?: React.ReactNode;
+  view: 'chat' | 'terminal';
+  onViewChange: (view: 'chat' | 'terminal') => void;
+}
 
 export interface CommanderViewContentProps {
   threads: CommanderThread[];
@@ -138,13 +177,24 @@ export interface CommanderViewContentProps {
   quickActions?: DeckQuickAction[];
   /** Fire a quick action (sends its canned prompt to the brain). */
   onQuickAction?: (action: DeckQuickAction) => void;
-  /** M1.5: the workspace this deck view is bound to — new schedules are
-   *  created against its orchestrator. */
-  activeWorkspaceId?: string;
+  /** The workspace whose brain this view talks to: Moa's HQ when Moa runs,
+   *  else the active workspace (M1.5). Schedules, mode, wake and the decision
+   *  card are all bound to it. */
+  chatWorkspaceId?: string;
+  /** The workspace the human is viewing. Equal to chatWorkspaceId until the
+   *  dock is pinned to the HQ. Main reads the same fact from the workspace
+   *  mirror for the HQ brain's context line, so nothing here sends it. */
+  viewedWorkspaceId?: string;
+  /** Moa mode: the panel's own top section (Waiting on you, task cards) and
+   *  the chat look over the HQ brain's terminal. Waiting on you and the task
+   *  cards replace the HQ's decision card and ledger panel, so those two are
+   *  not drawn. Absent = today's layouts. */
+  moa?: CommanderMoaSlots;
   /** 활성 pane의 라이브 cwd — 루프 설정 모달의 스킬 카탈로그 스캔 기준. */
   activePaneCwd?: string;
   /** P2① mission control — the Fleet roster slot, pinned above the thread.
-   *  Injected as a node so this surface stays presentational/store-free. */
+   *  Injected as a node so this surface stays presentational/store-free.
+   *  Not drawn in Moa mode (`moa` set). */
   fleetSlot?: React.ReactNode;
   /** D1 briefing — unread channel count for the active workspace (renderer-only
    *  overlay on the briefing card; main can't see it). */
@@ -155,12 +205,20 @@ export interface CommanderViewContentProps {
    *  does not run, so the composer is disabled and says why. Main refuses the
    *  send with `mode_off` regardless; this is the explanation, not the gate. */
   modeOff?: boolean;
+  /** Moa will not run here: `moa_off` (known up front, disables the composer)
+   *  or the code main gave the last refused send. Renders a notice with the
+   *  reason and the action that fixes it. */
+  moaBlock?: MoaBlock | null;
   /** D1 briefing — fingerprint of the active workspace's status-relevant fleet
    *  state; the card refetches when it moves (the autonomy-'off' path, where no
    *  brain stream ever fires). */
   fleetSignature?: string;
   t?: (key: string) => string;
 }
+
+/** How long a send waits for main's verdict before it counts as accepted.
+ *  Every refusal is decided before the turn starts, well inside this. */
+const SEND_VERDICT_GRACE_MS = 1500;
 
 /** Side-effect-free presentational surface — all data via props (mirrors the
  *  ChannelViewContent split so the render is testable without the store). */
@@ -180,16 +238,39 @@ export function CommanderViewContent({
   onDismissRecovery,
   quickActions = [],
   onQuickAction,
-  activeWorkspaceId,
+  chatWorkspaceId,
+  moa,
   activePaneCwd,
   fleetSlot,
   channelsUnread = 0,
   onJumpToChannels,
   fleetSignature,
   modeOff = false,
+  moaBlock = null,
   t: tProp,
 }: CommanderViewContentProps): React.ReactElement {
   const t = tProp ?? ((key: string) => key);
+  const moaOff = moaBlock?.code === 'moa_off';
+  // The notice for a Moa refusal: the reason, and the one action that fixes it
+  // (open Moa's workspace for not_hq, Settings › Moa otherwise).
+  const moaNotice = moaBlock ? (
+    <div
+      className="ui-notice mx-3 mb-1.5 flex flex-col items-start gap-2 px-3 py-2.5 shrink-0"
+      role="status"
+      data-commander-moa-block={moaBlock.code}
+    >
+      <p className="m-0 text-[13px] leading-5">{t(MOA_BLOCK_KEY[moaBlock.code])}</p>
+      {moaBlock.code === 'not_hq' && moaBlock.onOpenHq ? (
+        <Button variant="secondary" size="sm" onClick={moaBlock.onOpenHq} data-commander-moa-open-hq>
+          {t('deck.moaOpenHq')}
+        </Button>
+      ) : moaBlock.code !== 'not_hq' && moaBlock.onOpenSettings ? (
+        <Button variant="secondary" size="sm" onClick={moaBlock.onOpenSettings} data-commander-moa-open-settings>
+          {t('deck.moaOpenSettings')}
+        </Button>
+      ) : null}
+    </div>
+  ) : null;
   const modeOffReason =
     t('deck.composerModeOff') ||
     'The orchestrator is off for this workspace. Set Mode to Assist or Danger to talk to it.';
@@ -206,6 +287,22 @@ export function CommanderViewContent({
   // — the state must survive the layout swap.
   const [railCollapsed, setRailCollapsed] = useState(true);
   const [automationExpanded, setAutomationExpanded] = useState(false);
+  // Moa's ⋯ menu opens Loop and Schedules: each bump is one click on the chip.
+  const [loopRequest, setLoopRequest] = useState(0);
+  const [schedulesRequest, setSchedulesRequest] = useState(0);
+  const moaHeaderMenu = moa ? (
+    <MoaHeaderMenu
+      t={t}
+      workspaceId={chatWorkspaceId}
+      brainBusy={brainBusy}
+      brainPtyId={brainPtyId}
+      chatAvailable={!!brainPtyId && moa.chat != null}
+      view={moa.view}
+      onViewChange={moa.onViewChange}
+      onOpenLoop={() => setLoopRequest((n) => n + 1)}
+      onOpenSchedules={() => setSchedulesRequest((n) => n + 1)}
+    />
+  ) : null;
   // The `#` jump for the ledger rows. The sidebar used to own this link; the
   // deck's rows own it now, so the sidebar could shrink to one navigation line
   // (DESIGN.md Layout Contract). The ledger summary is built in main from the
@@ -215,9 +312,10 @@ export function CommanderViewContent({
   // object identity for the same ids would re-render the whole deck every 15 s.
   const channelByTaskId = useStore(useShallow((s) => selectMissionChannelIds(s.missionsByWorkspace)));
   const openMissionChannel = useCallback((channelId: string) => {
-    // Reuse the existing channel route — setActiveChannel opens the dock and
-    // selects the channel. No new routing.
-    useStore.getState().setActiveChannel(channelId);
+    // The mission channel reads in Fleet, as the task's conversation.
+    const st = useStore.getState();
+    const task = findMission(st.missionsByWorkspace, (item) => item.missionChannelId === channelId);
+    if (task) st.openTaskConversation(task.id);
   }, []);
   const jumpToTaskWorkspace = useCallback((taskWorkspaceId: string) => {
     useStore.getState().setActiveWorkspace(taskWorkspaceId);
@@ -226,9 +324,9 @@ export function CommanderViewContent({
   // here before the 15 s mission poll knows its channel. Re-pull once so the
   // `#` lands with the row instead of up to fifteen seconds later.
   const onLedgerPush = useCallback(() => {
-    if (!activeWorkspaceId) return;
-    void useStore.getState().refreshMissions(activeWorkspaceId);
-  }, [activeWorkspaceId]);
+    if (!chatWorkspaceId) return;
+    void useStore.getState().refreshMissions(chatWorkspaceId);
+  }, [chatWorkspaceId]);
   const finishedExpanded = useStore((s) => s.deckLedgerFinishedExpanded);
   const setFinishedExpanded = useStore((s) => s.setDeckLedgerFinishedExpanded);
   // Delegated work makes the rail worth opening: the ledger panel says a task
@@ -270,39 +368,51 @@ export function CommanderViewContent({
     stickToBottom.current = true;
     const el = threadsRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [activeWorkspaceId]);
+  }, [chatWorkspaceId]);
 
   // The orchestrator control bar — the persistent automation controls. Shared
   // by both layouts: below the thread in the bubble layout, merged into the pty
   // layout's single top row. `data-deck-control-bar` stays on it either way.
   const renderControlBar = (className: string, extra?: React.ReactNode): React.ReactElement | null =>
-    activeWorkspaceId || quickActions.length > 0 ? (
+    chatWorkspaceId || quickActions.length > 0 ? (
       <div
         data-deck-control-bar
-        className={className}
+        // Moa: no always-on controls (they live in the header's ⋯ menu), so
+        // the row only shows while an opened loop/schedules panel, the approval
+        // countdown or a quick action has something in it.
+        className={moa ? `${className} empty:hidden` : className}
       >
+        {moa ? (
+          <>
+            <DeckLoopPanel t={t} workspaceId={chatWorkspaceId} cwd={activePaneCwd} hideTrigger openRequest={loopRequest} />
+            <DeckSchedulesPanel t={t} workspaceId={chatWorkspaceId} workspaceName={workspaceName} hideTrigger openRequest={schedulesRequest} />
+          </>
+        ) : (
+          <>
         {/* Mode = the single autonomy knob, always showing the current mode.
             모델 선택은 Agent 탭 인라인 드롭다운으로 이동(DESIGN.md Decisions
             Log 2026-07-20)했고, fan-out은 에이전트 툴바로 복귀했다. */}
-        <AgentModeChipContainer t={t} workspaceId={activeWorkspaceId} />
+        <AgentModeChipContainer t={t} workspaceId={chatWorkspaceId} />
         {!brainPtyId && <button type="button" className="wmux-agent-tools-toggle"
           aria-expanded={automationExpanded} onClick={() => setAutomationExpanded((value) => !value)}>
           {t('deck.automationTools')} <span aria-hidden="true">{automationExpanded ? '▴' : '▾'}</span>
         </button>}
         <div className="wmux-agent-automation" hidden={!brainPtyId && !automationExpanded}>
-          <DeckLoopPanel t={t} workspaceId={activeWorkspaceId} cwd={activePaneCwd} />
-          <DeckSchedulesPanel t={t} workspaceId={activeWorkspaceId} workspaceName={workspaceName} />
+          <DeckLoopPanel t={t} workspaceId={chatWorkspaceId} cwd={activePaneCwd} />
+          <DeckSchedulesPanel t={t} workspaceId={chatWorkspaceId} workspaceName={workspaceName} />
         </div>
         {/* Brain lifecycle — the last ALWAYS-ON control, so in the pty layout
             it lands next to Wake and the two "what is the brain doing" buttons
             sit together. Deliberately not disabled while a turn streams: a
             stuck turn is the main reason to want a fresh orchestrator. */}
-        {activeWorkspaceId && (
-          <NewSessionChipContainer t={t} workspaceId={activeWorkspaceId} busy={brainBusy} />
+        {chatWorkspaceId && (
+          <NewSessionChipContainer t={t} workspaceId={chatWorkspaceId} busy={brainBusy} />
+        )}
+          </>
         )}
         {/* How long a displayed approval has before it auto-rejects. Renders
             nothing until a pending record carries a deadline. */}
-        <DeckApprovalCountdown t={t} workspaceId={activeWorkspaceId} />
+        <DeckApprovalCountdown t={t} workspaceId={chatWorkspaceId} />
         {extra}
 
         {/* Reboot-recovery re-entry (post-reboot only) — the canned one-click
@@ -311,7 +421,8 @@ export function CommanderViewContent({
             the trailing edge stranded it alone on its own line with a gap).
             Neutral at rest, accent on hover (the DESIGN.md AI-action
             grammar), disabled while a turn streams. */}
-        {quickActions.some((action) => action.id !== 'recover-fleet' || recoveryPanes.length === 0 || !!brainPtyId) && (
+        {/* Not in Moa's panel: each recovered pane offers its own resume pill. */}
+        {!moa && quickActions.some((action) => action.id !== 'recover-fleet' || recoveryPanes.length === 0 || !!brainPtyId) && (
           <div data-deck-quick-actions className="flex flex-wrap gap-1.5">
             {quickActions.filter((action) => action.id !== 'recover-fleet' || recoveryPanes.length === 0 || !!brainPtyId).map((action) => (
               <button
@@ -341,41 +452,59 @@ export function CommanderViewContent({
   // in the branch below, where it is their ONLY input path). No Stop button
   // either: ESC in the TUI is the interrupt.
   if (brainPtyId) {
+    // Moa mode with a transcript source opens on the chat view; without one
+    // (no Moa, an older main) the terminal is the only view, as before.
+    const moaChatAvailable = !!moa && moa.chat != null;
+    const showTerminal = !moaChatAvailable || moa!.view === 'terminal';
     return (
       <div
         data-commander-view
         className="flex flex-col flex-1 min-h-0 bg-[var(--bg-mantle)]"
         {...tokenAttrs('bgMantle', 'bg')}
       >
+        {/* Moa's chat view carries its top inside the chat's own scroll. Over
+            the terminal it is capped with its own scroll, so pending decisions
+            can never squeeze the TUI to nothing. */}
+        {showTerminal && moa?.top && (
+          <div data-moa-pty-top className="shrink-0 max-h-[30%] overflow-y-auto">{moa.top}</div>
+        )}
         {/* Delegated tasks, pinned above everything: the ledger is the one
             state the brain, the workers and the Stop gate share. */}
-        <DeckLedgerPanel
-          t={t}
-          workspaceId={activeWorkspaceId}
-          onOpenCountChange={onLedgerOpenCount}
-          channelByTaskId={channelByTaskId}
-          onOpenChannel={openMissionChannel}
-          onJumpToTaskWorkspace={jumpToTaskWorkspace}
-          finishedExpanded={finishedExpanded}
-          onToggleFinished={setFinishedExpanded}
-          onLedgerPush={onLedgerPush}
-        />
-        {/* One control row: the Fleet roster and the automation controls. */}
-        {fleetSlot}
+        {!moa && (
+          <DeckLedgerPanel
+            t={t}
+            workspaceId={chatWorkspaceId}
+            onOpenCountChange={onLedgerOpenCount}
+            channelByTaskId={channelByTaskId}
+            onOpenChannel={openMissionChannel}
+            onJumpToTaskWorkspace={jumpToTaskWorkspace}
+            finishedExpanded={finishedExpanded}
+            onToggleFinished={setFinishedExpanded}
+            onLedgerPush={onLedgerPush}
+          />
+        )}
+        {/* One control row: the Fleet roster and the automation controls. Moa's
+            panel draws no roster: the Fleet page lists every pane and Settings
+            binds roles. */}
+        {!moa && fleetSlot}
+        {moaHeaderMenu}
         {renderControlBar(
           'flex flex-wrap items-center gap-1 px-3 py-1.5 border-b border-[var(--stroke)] shrink-0',
+          // Moa: Wake and the view switch are in the header's ⋯ menu.
+          moa ? undefined :
           // Wake button — pty-layout only. With no composer, this is the
           // human's one-click "take a turn now"; the bubble layout's composer
           // already covers it. Disabled mid-turn: the busy reject would be the
           // only outcome. Same visual grammar as a quick action (neutral at
           // rest, accent on hover).
-          activeWorkspaceId ? (
+          <>
+          {chatWorkspaceId ? (
             <button
               type="button"
               data-commander-wake-now
               disabled={brainBusy}
               onClick={() => {
-                void window.electronAPI?.deck?.wake?.(activeWorkspaceId).catch(() => {
+                void window.electronAPI?.deck?.wake?.(chatWorkspaceId).catch(() => {
                   /* best-effort — a rejected wake just means the brain is busy */
                 });
               }}
@@ -384,23 +513,40 @@ export function CommanderViewContent({
             >
               {t('deck.wakeNow') || 'Wake'}
             </button>
-          ) : null,
+          ) : null}
+          </>,
         )}
 
         {/* The TUI — the hero of this layout, taking every pixel the fixed rows
             leave. It has no collapse toggle anymore: collapsing the dock's only
             input surface has no meaning, and the rail below it is what the
             operator opens instead. */}
-        <div className="flex flex-col flex-1 min-h-0 px-3 py-2">
-          <BrainTerminalEmbed ptyId={brainPtyId} />
-        </div>
+        {moaNotice && <div className="pt-2">{moaNotice}</div>}
+        {/* Moa's "Remember this?" card waits on the operator, so it sits at the
+            top of the panel, above the TUI, never inside the collapsed rail.
+            It is Moa's own: it shows whichever workspace the deck is on. When
+            Moa owns the panel it is the first row of Waiting on you instead. */}
+        {!moa && <MoaMemoryCard t={t} className="px-3 pt-2 shrink-0 max-h-[55%] min-h-0 flex flex-col overflow-y-auto" />}
+        {/* The brain pty is embedded here and nowhere else; in Moa's chat view
+            it is not mounted at all until the operator asks for the terminal. */}
+        {showTerminal ? (
+          <div className="flex flex-col flex-1 min-h-0 px-3 py-2">
+            <BrainTerminalEmbed ptyId={brainPtyId} />
+          </div>
+        ) : (
+          <div className="flex flex-col flex-1 min-h-0" data-moa-chat-region>
+            {moa!.chat}
+          </div>
+        )}
 
         {/* Report rail — the durable footer. The TUI scrolls its own
             conversation away, so closed turns (and the decision gate, and the
             briefing) stay reachable here. Collapsed by default; the header
             carries the count, a busy dot, and an error affordance so a
             collapsed rail never hides something that needs the operator. */}
-        <div
+        {/* Moa's chat view IS the conversation (and says when Moa is working),
+            so the rail would only repeat it. */}
+        {showTerminal && <div
           className="border-t border-[var(--stroke)] shrink-0"
         >
           <button
@@ -415,7 +561,7 @@ export function CommanderViewContent({
               className={railHasError ? 'text-[var(--accent-red)]' : undefined}
               {...(railHasError ? tokenAttrs('danger', 'text') : {})}
             >
-              {(t('deck.reportRail') || 'Reports {count}').replace(
+              {(t('deck.reportRail') || 'Moa\'s updates {count}').replace(
                 '{count}',
                 String(railMessages.length),
               )}
@@ -425,6 +571,7 @@ export function CommanderViewContent({
                 {` · ${t('deck.reportRailDecision') || '1 decision'}`}
               </span>
             )}
+
             {/* Slim busy indicator: automation-driven turns (heartbeat, loop,
                 schedule) must stay visible now that the busy bar is gone. */}
             {brainBusy && (
@@ -433,7 +580,7 @@ export function CommanderViewContent({
                   aria-hidden="true"
                   className="inline-block w-2 h-2 rounded-full border border-[var(--accent)] border-t-transparent animate-spin"
                 />
-                <span>{t('deck.commanderThinking') || 'Orchestrator is working…'}</span>
+                <span>{t('deck.commanderThinking') || 'Moa is working…'}</span>
               </span>
             )}
           </button>
@@ -445,20 +592,24 @@ export function CommanderViewContent({
                 : 'max-h-[30vh] overflow-y-auto px-4 pb-3 space-y-3'
             }
           >
-            <DeckBriefingCard
-              workspaceId={activeWorkspaceId}
-              t={t}
-              onJumpToPane={onJumpToPane}
-              resolvePtyPane={resolvePtyPane}
-              channelsUnread={channelsUnread}
-              onJumpToChannels={onJumpToChannels}
-              fleetSignature={fleetSignature}
-            />
-            <DeckDecisionCard
-              workspaceId={activeWorkspaceId}
-              onPendingChange={setDecisionPending}
-              t={t}
-            />
+            {!moa && (
+              <DeckBriefingCard
+                workspaceId={chatWorkspaceId}
+                t={t}
+                onJumpToPane={onJumpToPane}
+                resolvePtyPane={resolvePtyPane}
+                channelsUnread={channelsUnread}
+                onJumpToChannels={onJumpToChannels}
+                fleetSignature={fleetSignature}
+              />
+            )}
+            {!moa && (
+              <DeckDecisionCard
+                workspaceId={chatWorkspaceId}
+                onPendingChange={setDecisionPending}
+                t={t}
+              />
+            )}
             {railMessages.map((m, i) => (
               <Fragment key={m.id}>
                 {isVendorBoundary(railMessages[i - 1], m) && m.vendor && (
@@ -468,7 +619,7 @@ export function CommanderViewContent({
               </Fragment>
             ))}
           </div>
-        </div>
+        </div>}
       </div>
     );
   }
@@ -484,19 +635,22 @@ export function CommanderViewContent({
       {...tokenAttrs('bgMantle', 'bg')}
     >
       {/* Delegated tasks, pinned above the roster (see the pty layout above). */}
-      <DeckLedgerPanel
-        t={t}
-        workspaceId={activeWorkspaceId}
-        onOpenCountChange={onLedgerOpenCount}
-        channelByTaskId={channelByTaskId}
-        onOpenChannel={openMissionChannel}
-        onJumpToTaskWorkspace={jumpToTaskWorkspace}
-        finishedExpanded={finishedExpanded}
-        onToggleFinished={setFinishedExpanded}
-        onLedgerPush={onLedgerPush}
-      />
-      {/* P2① — Fleet roster pinned above the thread (does not scroll with it). */}
-      {fleetSlot}
+      {!moa && (
+        <DeckLedgerPanel
+          t={t}
+          workspaceId={chatWorkspaceId}
+          onOpenCountChange={onLedgerOpenCount}
+          channelByTaskId={channelByTaskId}
+          onOpenChannel={openMissionChannel}
+          onJumpToTaskWorkspace={jumpToTaskWorkspace}
+          finishedExpanded={finishedExpanded}
+          onToggleFinished={setFinishedExpanded}
+          onLedgerPush={onLedgerPush}
+        />
+      )}
+      {/* P2① — Fleet roster pinned above the thread (does not scroll with it).
+          Not in Moa's panel (see the pty layout above). */}
+      {!moa && fleetSlot}
       {/* Message list — the brain conversation (Phase 2) plus the Phase 1
           @-mention fan-out threads. Chat convention: sticks to the bottom
           (newest message) as content streams in, unless the user scrolled up
@@ -507,6 +661,10 @@ export function CommanderViewContent({
         className="flex-1 min-h-0 overflow-y-auto px-4 py-3 space-y-3"
         data-commander-threads
       >
+        {/* Moa: Waiting on you, delegated work and the briefing scroll with the
+            conversation, one column (the negative margin undoes this list's
+            padding: the sections bring their own). */}
+        {moa?.top && <div className="-mx-4 -mt-3" data-moa-top>{moa.top}</div>}
         {/* No empty-state paragraph. It said "Ask the orchestrator to run your
             agents, or @mention agent panes to command them directly" — three
             centred lines saying what the composer's own placeholder ("Tell the
@@ -516,7 +674,8 @@ export function CommanderViewContent({
         {/* Reboot-recovery greeting card (P3b) — shown while recoverable panes
             exist and the card wasn't dismissed. One click sends the canned
             recovery prompt to the brain. */}
-        {recoveryPanes.length > 0 && (
+        {/* Not in Moa's panel: each recovered pane offers its own resume pill. */}
+        {!moa && recoveryPanes.length > 0 && (
           <div
             data-commander-recovery
             className="rounded-lg px-4 py-3 space-y-2 bg-[var(--selection-subtle)]"
@@ -562,21 +721,25 @@ export function CommanderViewContent({
             thread ABOVE the decision card; neutral chrome (amber stays reserved
             for the decision card + running dots). Self-contained + renders null
             when the config is disabled or there is nothing to brief. */}
-        <DeckBriefingCard
-          workspaceId={activeWorkspaceId}
-          t={t}
-          onJumpToPane={onJumpToPane}
-          resolvePtyPane={resolvePtyPane}
-          channelsUnread={channelsUnread}
-          onJumpToChannels={onJumpToChannels}
-          fleetSignature={fleetSignature}
-        />
+        {/* Moa's top already carries its briefing. */}
+        {!moa && (
+          <DeckBriefingCard
+            workspaceId={chatWorkspaceId}
+            t={t}
+            onJumpToPane={onJumpToPane}
+            resolvePtyPane={resolvePtyPane}
+            channelsUnread={channelsUnread}
+            onJumpToChannels={onJumpToChannels}
+            fleetSignature={fleetSignature}
+          />
+        )}
 
         {/* Decision gate — a brain-raised decision blocking the loop until the
             operator answers. Self-contained (hydrates from the durable store, so
             it survives a reboot); renders null unless a decision is pending for
             this workspace. */}
-        <DeckDecisionCard workspaceId={activeWorkspaceId} t={t} />
+        {!moa && <DeckDecisionCard workspaceId={chatWorkspaceId} t={t} />}
+        {!moa && <MoaMemoryCard t={t} />}
 
         {/* Brain conversation — the normalized bubbles + tool chips. The
             `claude-pty` vendor never reaches here (it returns the TUI layout
@@ -617,7 +780,7 @@ export function CommanderViewContent({
             className="text-[12px] text-[color-mix(in_srgb,var(--text-main)_50%,transparent)] flex-1"
             {...tokenAttrs('textMain', 'text')}
           >
-            {t('deck.commanderThinking') || 'Orchestrator is working…'}
+            {t('deck.commanderThinking') || 'Moa is working…'}
           </span>
           <button
             type="button"
@@ -640,6 +803,7 @@ export function CommanderViewContent({
           it never crowds the always-on controls. Each control's container
           self-hides when its preload API is absent, so pure jsdom parent tests
           are unaffected. */}
+      {moaHeaderMenu}
       {renderControlBar(
         'flex flex-wrap items-center gap-1 px-3 py-1.5 shrink-0',
       )}
@@ -651,22 +815,32 @@ export function CommanderViewContent({
             at all — main refuses those sends with `mode_off`, so leaving the box
             live would only produce a silent rejection. The title says which of
             the two it is, and how to undo the `off` case. */}
+      {moaNotice}
       <div
         className="px-1.5 pb-1.5 shrink-0"
-        title={modeOff ? modeOffReason : undefined}
+        title={moaOff ? t('deck.moaOff') : modeOff ? modeOffReason : undefined}
         data-commander-composer
         data-mode-off={modeOff ? 'true' : undefined}
+        data-moa-off={moaOff ? 'true' : undefined}
       >
         <ComposerContent
           channelId={COMMANDER_CHANNEL_NAME}
           onSubmit={onSubmit}
           mentionCandidates={mentionCandidates}
-          disabled={brainBusy || modeOff}
+          disabled={brainBusy || modeOff || moaOff}
           placeholder={
-            modeOff
+            // Moa off comes first: main refuses with moa_off before it reads
+            // the workspace's mode.
+            moaOff
+              ? t('deck.moaOffShort')
+              : modeOff
               ? modeOffPlaceholder
+              // Moa's panel before its brain is up: the same words as its chat.
+              : moa
+              ? t('moa.panel.placeholder')
               : t('deck.commanderPlaceholder') || 'Tell the orchestrator, or @mention panes…'
           }
+          hint={moa ? t('chat.inputHint') : undefined}
           t={t}
         />
       </div>
@@ -1135,7 +1309,34 @@ function useActiveAgentMode(workspaceId: string): AgentMode | null {
   return mode;
 }
 
-export function CommanderView(): React.ReactElement {
+export interface CommanderViewProps {
+  /** The workspace whose brain this view talks to (Moa's HQ, or the active
+   *  workspace when there is no HQ). Every conversation read and write uses
+   *  it: thread, brain pty, decision card, briefing, controls, send, wake,
+   *  interrupt. */
+  chatWorkspaceId: string;
+  /** The workspace the operator is looking at, for context only: the fleet
+   *  summary a send carries, the active pane's cwd, the recovery card. */
+  viewedWorkspaceId: string;
+  /** Moa mode: build the panel's top section and the transcript chat. The
+   *  chat gets this view's send and interrupt so a typed message takes the
+   *  same path as every other brain send. */
+  moa?: {
+    top?: React.ReactNode;
+    renderChat?: (args: {
+      brainPtyId: string;
+      busy: boolean;
+      onSend: (text: string) => Promise<{ ok: boolean }>;
+      onInterrupt: () => void;
+      onTerminal: () => void;
+      /** Waiting on you, delegated work and the briefing: drawn at the top of
+       *  the chat's own scroll, so the panel scrolls as one column. */
+      top?: React.ReactNode;
+    }) => React.ReactNode;
+  };
+}
+
+export function CommanderView({ chatWorkspaceId: chatWorkspaceIdProp, viewedWorkspaceId, moa: moaSlots }: CommanderViewProps): React.ReactElement {
   const t = useT();
   const channels = useStore((s) => s.channels);
   // D1 briefing: the unread-channels overlay + a jump to the Channels tab. The
@@ -1155,15 +1356,16 @@ export function CommanderView(): React.ReactElement {
   const setActivePane = useStore((s) => s.setActivePane);
   const pushToast = useStore((s) => s.pushToast);
   const company = useStore((s) => s.company);
-  // Commander brain (Phase 2, per-workspace M1.5): the deck shows the ACTIVE
-  // workspace's orchestrator thread — switching workspace tabs switches the
-  // conversation. Background workspaces' turns keep streaming into their own
-  // threads via useDeckStream's envelope routing.
-  const activeWorkspaceId = useStore((s) => s.activeWorkspaceId) || '';
+  // Commander brain (Phase 2, per-workspace M1.5): the deck shows ONE
+  // workspace's orchestrator thread — Moa's HQ, or (no HQ) the active
+  // workspace, so switching workspace tabs switches the conversation. Other
+  // workspaces' turns keep streaming into their own threads via
+  // useDeckStream's envelope routing.
+  const chatWorkspaceId = chatWorkspaceIdProp || '';
   // 활성 pane의 라이브 cwd(OSC 7 추적 surface.cwd) — 루프 모달의 스킬 카탈로그
   // 스캔 기준. 트리 워크는 셀렉터 안에서 원시 문자열로 수렴시켜 리렌더 최소화.
   const activePaneCwd = useStore((s) => {
-    const ws = s.workspaces.find((w) => w.id === s.activeWorkspaceId);
+    const ws = s.workspaces.find((w) => w.id === viewedWorkspaceId);
     if (!ws) return '';
     const findLeaf = (pane: import('../../../shared/types').Pane): import('../../../shared/types').PaneLeaf | null => {
       if (pane.type === 'leaf') return pane.id === ws.activePaneId ? pane : null;
@@ -1178,7 +1380,7 @@ export function CommanderView(): React.ReactElement {
     return surface?.cwd || ws.profile?.startupCwd || '';
   });
   const brainThread =
-    useStore((s) => (activeWorkspaceId ? s.brainThreads[activeWorkspaceId] : undefined)) ??
+    useStore((s) => (chatWorkspaceId ? s.brainThreads[chatWorkspaceId] : undefined)) ??
     EMPTY_DECK_BRAIN_THREAD;
   const startDeckBrainTurn = useStore((s) => s.startDeckBrainTurn);
   const failDeckBrainTurn = useStore((s) => s.failDeckBrainTurn);
@@ -1193,21 +1395,21 @@ export function CommanderView(): React.ReactElement {
   // adapter spawns its TUI. Any other vendor never sets it, so the bubble
   // rendering path is unchanged for them.
   const brainPtyIds = useStore((s) => s.brainPtyIds);
-  const brainPtyId = activeWorkspaceId ? brainPtyIds[activeWorkspaceId] ?? null : null;
+  const brainPtyId = chatWorkspaceId ? brainPtyIds[chatWorkspaceId] ?? null : null;
 
-  // M1.5: recovery is per-workspace — this deck's card lists only the ACTIVE
-  // workspace's recoverable panes (its orchestrator cannot target the others;
-  // each workspace recovers from its own tab).
+  // M1.5: recovery is per-workspace — this deck's card lists only the VIEWED
+  // workspace's recoverable panes (each workspace recovers from its own tab;
+  // under Moa the HQ brain is asked to recover the one on screen).
   const recoveryPanes = useMemo(
     () =>
       buildRecoveryPanes({
         resumeHintByPtyId,
         resumeBindingByPtyId,
         ptyReadyByPtyId,
-        workspaces: workspaces.filter((w) => w.id === activeWorkspaceId),
+        workspaces: workspaces.filter((w) => w.id === viewedWorkspaceId),
         paneLabel,
       }),
-    [resumeHintByPtyId, resumeBindingByPtyId, ptyReadyByPtyId, workspaces, activeWorkspaceId, paneLabel],
+    [resumeHintByPtyId, resumeBindingByPtyId, ptyReadyByPtyId, workspaces, viewedWorkspaceId, paneLabel],
   );
 
   const commanderChannel = useMemo(() => findCommanderChannel(channels), [channels]);
@@ -1239,7 +1441,7 @@ export function CommanderView(): React.ReactElement {
   // complete) is a retained ATTENTION status and lives in `surfaceAgentStatus`;
   // the workspace-level status covers the active pane's running/idle.
   const fleetSignature = useStore((s) => {
-    const ws = s.workspaces.find((w) => w.id === s.activeWorkspaceId);
+    const ws = s.workspaces.find((w) => w.id === chatWorkspaceId);
     if (!ws) return '';
     const parts: string[] = [`~${ws.metadata?.agentStatus ?? ''}`];
     // Workspace-wide (#977) — paired with deckBrain.countAgentPanes. If only
@@ -1415,14 +1617,34 @@ export function CommanderView(): React.ReactElement {
   // its input on this promise — awaiting it left the typed text sitting in
   // the composer for the entire orchestrator turn. A late reject (busy race /
   // disposed) is surfaced by failing the open turn's bubble instead.
+  // Moa: the switch (known up front) and the last refusal main gave a send
+  // in this workspace (not_hq / hq_missing / hq_unknown, or moa_off from a
+  // race with the switch).
+  const moa = useStore((s) => s.moa);
+  const [moaRefusal, setMoaRefusal] = useState<{ workspaceId: string; code: MoaBlockCode } | null>(null);
+  const moaBlock = useMemo((): MoaBlock | null => {
+    let code: MoaBlockCode | null = null;
+    if (moa && !moa.config.enabled) code = 'moa_off';
+    else if (moaRefusal && moaRefusal.workspaceId === chatWorkspaceId && moaRefusal.code !== 'moa_off') {
+      code = moaRefusal.code;
+    }
+    if (!code) return null;
+    const hqId = moa?.hq.state === 'ok' ? moa.hq.workspaceId : null;
+    return {
+      code,
+      onOpenSettings: () => useStore.getState().openSettingsTab('moa'),
+      ...(hqId && hqId !== chatWorkspaceId ? { onOpenHq: () => useStore.getState().openMoaHq() } : {}),
+    };
+  }, [moa, moaRefusal, chatWorkspaceId]);
+
   const handleBrainSend = useCallback(
     async (text: string): Promise<{ ok: boolean; errorCode?: string; errorMessage?: string }> => {
       const api = window.electronAPI?.deck;
-      if (!api || !activeWorkspaceId) {
+      if (!api || !chatWorkspaceId) {
         pushToast({ level: 'error', message: t('deck.commanderUnavailable') || 'The orchestrator is unavailable' });
         return { ok: false, errorCode: 'UNAVAILABLE' };
       }
-      const workspaceId = activeWorkspaceId;
+      const workspaceId = chatWorkspaceId;
       // The operator's `/clear` (alias `/reset`) — a command, not a message:
       // reset the brain's context instead of sending a turn. The transcript
       // stays (audit trail); the next turn starts a fresh SDK conversation.
@@ -1455,7 +1677,9 @@ export function CommanderView(): React.ReactElement {
       const recoveryLines = buildRecoveryContextLines(recoveryPanes);
       const wsSummary = buildWorkspaceContextSummary({
         workspaces,
-        activeWorkspaceId: workspaceId,
+        // The summary describes what the operator is looking at; under Moa
+        // that is not the HQ the message goes to.
+        activeWorkspaceId: viewedWorkspaceId || workspaceId,
         surfaceAgent,
         paneLabel,
         paneRole,
@@ -1465,34 +1689,52 @@ export function CommanderView(): React.ReactElement {
       const fleetContext = recoveryLines ? `${recoveryLines}\n\n${wsSummary}` : wsSummary;
       // The orchestrator model override rides along on every send; main swaps
       // this workspace's brain between turns when it changes (Settings →
-      // Claude tab). Fire-and-observe: the verdict closes the bubble on
-      // rejection, the stream fills it on acceptance.
-      void api
+      // Claude tab). deck:send resolves when the whole turn ends, but every
+      // refusal (Moa gates, mode off, busy) comes back at once: the composer
+      // waits SEND_VERDICT_GRACE_MS for one and keeps its draft on refusal;
+      // silence means accepted. A late refusal still closes the turn below.
+      const verdict = (res: { ok: boolean; code?: string }): { ok: boolean; errorCode?: string; errorMessage?: string } => {
+        // Main's Moa gates refuse with their own codes (deck.handler
+        // refuseWhenModeOff); the preload type predates them.
+        const code: string | undefined = res.code;
+        if (res.ok) {
+          setMoaRefusal((prev) => (prev?.workspaceId === workspaceId ? null : prev));
+          return { ok: true };
+        }
+        let reason: string;
+        if (isMoaBlockCode(code)) {
+          // Say which gate refused and keep the notice (with its fix) up.
+          setMoaRefusal({ workspaceId, code });
+          reason = t(MOA_BLOCK_KEY[code]);
+        } else {
+          // Rejected before any stream event (busy race / disposed): close the
+          // open turn with an error so the placeholder doesn't spin forever.
+          reason = code === 'busy'
+            ? t('deck.commanderBusy') || 'A command is already running.'
+            : t('deck.commanderFailed') || 'The command could not run.';
+        }
+        failDeckBrainTurn(workspaceId, reason);
+        return { ok: false, errorCode: code ?? 'FAILED', errorMessage: reason };
+      };
+      const sent = api
         .send({
           workspaceId,
           text,
           fleetContext,
           ...(useStore.getState().deckBrainModel ? { model: useStore.getState().deckBrainModel } : {}),
         })
-        .then((res) => {
-          if (!res.ok) {
-            // Rejected before any stream event (busy race / disposed): close
-            // the open turn with an error so the placeholder doesn't spin
-            // forever.
-            failDeckBrainTurn(
-              workspaceId,
-              res.code === 'busy'
-                ? t('deck.commanderBusy') || 'A command is already running.'
-                : t('deck.commanderFailed') || 'The command could not run.',
-            );
-          }
-        })
-        .catch((err) => {
-          failDeckBrainTurn(workspaceId, err instanceof Error ? err.message : String(err));
+        .then(verdict, (err: unknown) => {
+          const message = err instanceof Error ? err.message : String(err);
+          failDeckBrainTurn(workspaceId, message);
+          return { ok: false, errorCode: 'FAILED', errorMessage: message };
         });
-      return { ok: true };
+      const early = await Promise.race([
+        sent,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), SEND_VERDICT_GRACE_MS)),
+      ]);
+      return early ?? { ok: true };
     },
-    [activeWorkspaceId, workspaces, surfaceAgent, paneLabel, paneRole, channels, recoveryPanes, startDeckBrainTurn, failDeckBrainTurn, pushToast, t],
+    [chatWorkspaceId, viewedWorkspaceId, workspaces, surfaceAgent, paneLabel, paneRole, channels, recoveryPanes, startDeckBrainTurn, failDeckBrainTurn, pushToast, t],
   );
 
   // diff→오케스트레이터 질문 릴레이(deckSlice.pendingBrainPrompt) — DiffPanel이
@@ -1549,20 +1791,51 @@ export function CommanderView(): React.ReactElement {
   );
 
   // Mode `off` = the orchestrator does not run, so the composer is disabled.
-  const agentMode = useActiveAgentMode(activeWorkspaceId);
+  const agentMode = useActiveAgentMode(chatWorkspaceId);
 
   const onInterrupt = useCallback(() => {
-    if (!activeWorkspaceId) return;
-    window.electronAPI?.deck?.interrupt(activeWorkspaceId).catch(() => {
+    if (!chatWorkspaceId) return;
+    window.electronAPI?.deck?.interrupt(chatWorkspaceId).catch(() => {
       /* best-effort — the turn may already be over */
     });
-  }, [activeWorkspaceId]);
+  }, [chatWorkspaceId]);
+
+  // Moa's chat look over the HQ brain's terminal. The view choice is local and
+  // transient; a fresh panel opens on the chat.
+  const [brainView, setBrainView] = useState<'chat' | 'terminal'>('chat');
+  const showTerminal = useCallback(() => setBrainView('terminal'), []);
+  const brainBusy = brainThread.status === 'busy';
+  const moaContent = useMemo((): CommanderMoaSlots | undefined => {
+    if (!moaSlots) return undefined;
+    // Moa's column, in order: Waiting on you, delegated work, then the
+    // briefing, minus the decision lines Waiting on you already states.
+    const top = (
+      <>
+        {moaSlots.top}
+        <DeckBriefingCard
+          workspaceId={chatWorkspaceId}
+          t={t}
+          onJumpToPane={onJumpToPane}
+          resolvePtyPane={resolvePtyPane}
+          channelsUnread={channelsUnread}
+          onJumpToChannels={onJumpToChannels}
+          fleetSignature={fleetSignature}
+          omitDecision
+        />
+      </>
+    );
+    const chat = brainPtyId && moaSlots.renderChat
+      ? moaSlots.renderChat({ brainPtyId, busy: brainBusy, onSend: handleBrainSend, onInterrupt, onTerminal: showTerminal, top })
+      : null;
+    return { top, chat, view: brainView, onViewChange: setBrainView };
+  }, [moaSlots, brainPtyId, brainBusy, handleBrainSend, onInterrupt, showTerminal, brainView,
+    chatWorkspaceId, t, onJumpToPane, resolvePtyPane, channelsUnread, onJumpToChannels, fleetSignature]);
 
   return (
     <CommanderViewContent
       threads={threads}
       brainMessages={brainThread.messages}
-      brainBusy={brainThread.status === 'busy'}
+      brainBusy={brainBusy}
       onInterrupt={onInterrupt}
       mentionCandidates={mentionCandidates}
       onSubmit={handleSubmit}
@@ -1575,13 +1848,16 @@ export function CommanderView(): React.ReactElement {
       onDismissRecovery={dismissRecoveryCard}
       quickActions={quickActions}
       onQuickAction={handleQuickAction}
-      activeWorkspaceId={activeWorkspaceId}
+      chatWorkspaceId={chatWorkspaceId}
+      viewedWorkspaceId={viewedWorkspaceId}
+      moa={moaContent}
       activePaneCwd={activePaneCwd}
       fleetSlot={<DeckFleet onJumpToPane={onJumpToPane} />}
       channelsUnread={channelsUnread}
       onJumpToChannels={onJumpToChannels}
       fleetSignature={fleetSignature}
       modeOff={agentMode === 'off'}
+      moaBlock={moaBlock}
       t={t}
     />
   );

@@ -38,3 +38,19 @@ describe('role surfaces', () => {
     expect(roleArgValue(['--core', '--role=Tester'])).toBe('Tester');
   });
 });
+
+describe('fan-out worker surfaces', () => {
+  it('give Builder and Tester every wmux tool the worker preamble names', async () => {
+    const { WORKER_DELIVERY_PREAMBLE } = await import('../../main/worktask/FanOutService');
+    const { FANOUT_WORKER_DISALLOWED_TOOLS } = await import('../workerLaunch');
+    // `send_message` is named only to say how tasks arrive; workers may not call it.
+    const forbidden = new Set(FANOUT_WORKER_DISALLOWED_TOOLS.map((t) => t.replace('mcp__wmux__', '')));
+    const named = [...WORKER_DELIVERY_PREAMBLE.matchAll(/`([a-z0-9_]+)`/g)]
+      .map((m) => m[1])
+      .filter((n) => CORE_TOOL_SURFACE.includes(n) && !forbidden.has(n));
+    expect(named.length).toBeGreaterThan(0);
+    for (const role of ['Builder', 'Tester'] as const) {
+      expect(named.filter((n) => !ROLE_TOOL_SURFACES[role].includes(n))).toEqual([]);
+    }
+  });
+});
