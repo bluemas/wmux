@@ -4,7 +4,7 @@
 // needs you → finished → running → unconfirmed → idle, newest first within a
 // class). A workspace created in the last few minutes stays at the bottom (newest
 // last) so the row you just made lands at the end of the list instead of jumping
-// to the top (owner decision 2026-10-04). It orders only the rows below the
+// to the top (owner decision 2026-10-07). It orders only the rows below the
 // pinned group (2026-09-26): pinned rows stay first, in the user's order, and
 // never re-sort — see splitPinnedGroup.
 //

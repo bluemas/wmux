@@ -479,7 +479,7 @@ leaves the page.
   Tab. Focus is the app's ring: 2px `--accent`, inside the row, never the
   browser default.
 - **Order control:** a sort button in the header, left of the filter, names
-  the current order (`Order: Attention`) and opens a three-item menu —
+  the current order (`Order: Manual`) and opens a three-item menu —
   Attention, Manual, Recent activity — the same setting as Settings ›
   Appearance › Sidebar.
 - **Moa's workspace** is app-owned and never in the list, its count, the
@@ -801,6 +801,7 @@ primitives plus `Settings/SettingsLayout.tsx` (`SettingsSection`,
 | 2026-10-05 | Fleet returns to the attention list (one row per agent; Needs you, Ready to review, Running, folded Idle) in today's look, replacing the four-column board. Rows gain a now-doing sentence that outlives the turn (`Last: Edited foo.ts`), terminal output and the task Conversation move to a detail area under the list (selection, Space, Esc), and Moa's delegated work shows as tickets behind a Tickets chip that interrupt only for a pending decision and once with the final report | Columns split one glance into four reads, pushed finished panes away from the sidebar's own Needs you rule, and every card spent lines on chips; the raw glyph line (`✎ foo.ts`) read as code and vanished at turn end, so a finished row said nothing about what it did. A list answers "what needs me, in order" in one scan, the detail area keeps output and conversations one key away without putting terminal text in rows, and delegated work had no place to be followed once Moa handed it off |
 | 2026-10-05 | Fleet's Needs you holds decisions only (questions first, then errors, stopped supervision, unconfirmed); finished turns leave it for a folded `Finished N · newest age` row, in Fleet, the rail badge and `fleet_triage` (which gains a `finished` list) alike — this supersedes the 2026-09-27 note that finished rows count as needs you. Moa's final reports sit in their own marked block. The chip, head and badge read one set of arrays; a live region says the count. A Needs you row's detail leads with the question in full and the prompt's choices (or Open approval / Reply / Jump), an error row names its last error line and Check opens the detail on it. One word (Finished), present tense while running, `--text-subtle` for small hint text, a focus ring distinct from selection, the row's side buttons out of the listbox tree (Shift+F10 opens the menu), and the rail badge in needs-you yellow | A design critique found 12 rows in Needs you of which 4 were decisions, three counts that disagreed (11/12/13), a question cut off at narrow widths with `No terminal output available.` beneath it, error rows that only said `Check the terminal`, five words for one finished state, 2.5–3.4:1 hint text, and an indigo badge for an amber state. A finished turn is something to glance at, not something blocking, so it folds like Idle; one set of arrays makes the counts unable to drift |
 | 2026-10-05 | Sidebar row hover actions return to the row's flow: they end the git line in place of the diff counts and PR badge, end the name line on a branchless top-level row, or take a line of their own on a branchless nested task; focus reveals them like hover (amends "row actions floating over a faded right edge", 2026-10-03). No fade on the text column; a nested task row's hover never reveals its owner's actions; the workspace list clips horizontal overflow and the sidebar column clips (not scrolls) while it animates | The overlay covered the roster chip, the fade took the branch and diff with the name, and as a descendant rule it faded every nested task row while the owner card was hovered, so a hovered sidebar read as "fleet: ba", "wtas…". A hidden-overflow column is still a scroll container: a focus inside the half-open sidebar scrolled it 148px sideways |
+| 2026-10-07 | Owner: the sidebar's default order is Manual (supersedes the 2026-09-25 Attention default); in Attention a new workspace lands last instead of holding the top; the Ctrl+N number is always shown, left of the name, in `--text-muted`, in every order | Rows that move on their own when an agent starts working cost the user the order they built. Ctrl+N already follows the stored order in every mode, so showing its number everywhere tells the truth about the key even when a sorted list makes the numbers read out of sequence. The number is a key label, not a state, so it stays neutral |
 
 ### Desktop conversation view
 
@@ -919,7 +920,7 @@ no empty reply row or reserved gap under the latest prompt.
   truncates first. A closed requester keeps the same coordinate-first order.
   Inside a task workspace the titlebar's workspace name is followed by a muted
   `↰ <owner>` link (steel on hover) that jumps to the owner.
-- **Order:** Attention (default), Manual, or Recent activity — the header's
+- **Order:** Manual (default), Attention, or Recent activity — the header's
   order button or Settings › Appearance › Sidebar. Attention: needs you →
   error (a failed turn: its own tier, so an old error never sinks below a
   fresh finish; Fleet still lists it under Needs you and counts it there) →
@@ -928,16 +929,16 @@ no empty reply row or reserved gap under the latest prompt.
   recent event first. Plain `waiting` with no question is idle here, as in
   Fleet, and draws no "Needs you" wash or label. A fan-out owner scores as its
   most urgent nested task, so a task that needs you lifts its group. A
-  workspace created in the last three minutes holds the top of the unpinned
-  rows. Rows never move under the pointer or keyboard focus: a re-sort
+  workspace created in the last three minutes holds the last slot of the
+  unpinned rows, so a new row lands at the end of the list. Rows never move under the pointer or keyboard focus: a re-sort
   applies after the list has been quiet for 3 s (at most 10 s after the first
   pending change), or at once when the pointer or focus leaves; adds and
   removals land immediately. The non-manual orders are display-only:
-  drag-to-reorder pauses, and the `^N` shortcut hints are hidden because
-  Ctrl+N follows the stored order — except in the pinned group, below.
-  Sessions that never chose an order move to
-  Attention once, with a notice offering to keep the manual order; an explicit
-  choice is kept.
+  drag-to-reorder pauses. Every row (not a nested task, Moa's HQ or a
+  Snoozed/Settled row) shows the number its Ctrl+N jumps to, left of its name,
+  in `--text-muted` and in every order; Ctrl+N follows the stored order, so in
+  a sorted order the numbers can read out of sequence. Sessions that never
+  chose an order use Manual; an explicit choice is kept.
 - **Pinned to top:** row menu › Pin to top / Unpin, in every order (not on a
   nested task row). Nesting wins: a nested task cannot be pinned, and a pinned
   workspace that becomes one leaves the group. Pinned workspaces lead the list and the rail in every
@@ -945,8 +946,8 @@ no empty reply row or reserved gap under the latest prompt.
   below follow the chosen order. A pinned row carries a muted pin glyph
   (`--text-muted`, never amber) and no group header or divider — the glyph
   and the position are the signal. The group is the head of the stored order,
-  so `^N`, the rail numbers and the phone's `order` all read pinned-first, and
-  pinned rows show their `^N` hint in every order. Pin, unpin and reorders
+  so the Ctrl+N numbers, the rail numbers and the phone's `order` all read
+  pinned-first. Pin, unpin and reorders
   inside the group apply at once (they are the user's own act, not a
   re-sort). Drag reorders inside the group in every order; in Manual a drop
   takes the target row's pin state, so dropping beside a pinned row pins and

@@ -401,14 +401,6 @@ const REST_HIDDEN =
 const REST_HIDDEN_GAP_ROW = '-ml-2 group-hover:ml-0 group-focus-within:ml-0';
 const REST_HIDDEN_GAP_NAME_LINE = '-ml-1 group-hover:ml-0 group-focus-within:ml-0';
 
-// Shortcut number colour: a blue that contrasts with the sidebar's own tone —
-// light on a dark sidebar, deep on a light one — and never white, whatever the
-// theme's accent is (Zinc's accent is near-white). L flips on the sidebar's
-// lightness; chroma and hue stay fixed.
-const SHORTCUT_NUMBER_STYLE = {
-  color: 'oklch(from var(--bg-mantle) calc(0.4 + 0.38 * (1 - round(l))) 0.13 250)',
-} as const;
-
 /**
  * 2026-09-27 — a task row renders INSIDE its owner's row (under the pane that
  * requested it). Tailwind's `group-hover` matches any `.group` ancestor, so
@@ -1304,8 +1296,7 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutInde
                   // (selection, copy, accessible name).
                   <span
                     aria-hidden
-                    className="flex-none text-[11px] font-semibold tabular-nums before:content-[attr(data-shortcut-number)]"
-                    style={SHORTCUT_NUMBER_STYLE}
+                    className="flex-none text-[11px] font-semibold tabular-nums text-[var(--text-muted)] before:content-[attr(data-shortcut-number)]"
                     data-shortcut-number={shortcutIndex + 1}
                   />
                 )}
