@@ -287,7 +287,9 @@ describe('DECK_BRIEFING_GET', () => {
     seedMirror('ws-1', [
       { ptyId: 'p-run', agentStatus: 'running' },
       { ptyId: 'p-b', agentStatus: 'awaiting_input' },
-      { ptyId: 'p-a', agentStatus: 'waiting' },
+      { ptyId: 'p-a', agentStatus: 'awaiting_input' },
+      // 2026-10-07 — a turn that ended with no question is idle, not blocked.
+      { ptyId: 'p-w', agentStatus: 'waiting' },
     ]);
     const r = (await invoke(IPC.DECK_BRIEFING_GET, { workspaceId: 'ws-1' })) as unknown as {
       briefing: WorkspaceBriefing;

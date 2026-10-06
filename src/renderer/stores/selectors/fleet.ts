@@ -801,13 +801,11 @@ export function selectLatestCompletionEvidenceTask(
   return best;
 }
 
-// Statuses that count toward the "N need you" header chip: awaiting_input is the
-// precise blocked-mid-turn state; waiting means the turn ended and a fresh
-// instruction is wanted. Both are "the agent is idle on you".
+// Panes that need you, by the shared class (fleetAttentionClass): a dialog is
+// open or the turn ended on a question (both read awaiting_input here), or
+// supervision stopped. A turn that ended with no question is not one.
 export function countNeedsAttention(panes: FleetPane[]): number {
-  return panes.filter(
-    (p) => p.agentStatus === 'awaiting_input' || p.agentStatus === 'waiting',
-  ).length;
+  return panes.filter((p) => fleetAttentionClass(p) === 'needsYou').length;
 }
 
 // ─── Per-workspace status roll-up — the sidebar dot's source ─────────────────

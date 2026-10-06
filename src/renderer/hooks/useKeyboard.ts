@@ -88,10 +88,10 @@ const STOP_PROPAGATION_ACTIONS: ReadonlySet<ShortcutActionId> = new Set<Shortcut
 ]);
 
 // Terminal font-size zoom bounds. Kept in lockstep with the Appearance tab's
-// font-size slider (SettingsPanel TabAppearance: min 12 / max 24) and the
+// font-size slider (SettingsPanel TabAppearance: min 8 / max 24) and the
 // store default (uiSlice terminalFontSize: 14) so keyboard zoom and the slider
 // never disagree on the reachable range. One-px steps mirror the slider grain.
-const FONT_SIZE_MIN = 12;
+const FONT_SIZE_MIN = 8;
 const FONT_SIZE_MAX = 24;
 const FONT_SIZE_DEFAULT = 14;
 const FONT_SIZE_STEP = 1;

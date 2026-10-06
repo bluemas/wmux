@@ -91,7 +91,30 @@ export function parseMacFontProfile(stdout: string): string[] {
   return Array.from(new Set(names)).sort((a, b) => a.localeCompare(b));
 }
 
+// NSFontManager answers in ~0.2s (system_profiler takes 8s+), and its family
+// names are the same CSS-resolvable ones. JXA via osascript needs no native
+// module. Falls back to system_profiler when osascript is unavailable or fails.
+const OSASCRIPT_TIMEOUT_MS = 5000;
+const OSASCRIPT_FONT_SCRIPT =
+  'ObjC.import("AppKit"); $.NSFontManager.sharedFontManager.availableFontFamilies.js.map(x => x.js).join("\\n")';
+
+async function listMacFontsFast(): Promise<string[]> {
+  const { stdout } = await execFileAsync(
+    '/usr/bin/osascript',
+    ['-l', 'JavaScript', '-e', OSASCRIPT_FONT_SCRIPT],
+    { timeout: OSASCRIPT_TIMEOUT_MS, encoding: 'utf8' as const },
+  );
+  const names = parseFontList(stdout);
+  if (names.length === 0) throw new Error('empty NSFontManager family list');
+  return names;
+}
+
 async function listMacFonts(): Promise<string[]> {
+  try {
+    return await listMacFontsFast();
+  } catch {
+    // fall through to the slower system_profiler path
+  }
   // system_profiler는 항상 /usr/sbin에 있다 — PATH 의존 없이 절대 경로 사용.
   const { stdout } = await execFileAsync(
     '/usr/sbin/system_profiler',

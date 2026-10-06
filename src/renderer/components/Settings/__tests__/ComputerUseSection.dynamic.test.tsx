@@ -49,6 +49,22 @@ describe('formatStopKey', () => {
 });
 
 describe('Settings › Computer use', () => {
+  it('lets an unsigned Windows helper turn on, with one note about Defender or SmartScreen', async () => {
+    const unsigned: ComputerUseSettingsPayload = { ...ready, helperUnsigned: true };
+    const el = await render({ get: async () => unsigned, set: async () => ({ ...unsigned, enabled: true }) });
+    const sw = el.querySelector('[role="switch"]') as HTMLButtonElement;
+    expect(sw.disabled || sw.getAttribute('aria-disabled') === 'true').toBe(false);
+    expect(el.textContent).toContain('Windows Defender or SmartScreen may warn');
+    expect(el.textContent).not.toContain('Not in this build yet');
+    await act(async () => { sw.click(); });
+    expect(sw.getAttribute('aria-checked')).toBe('true');
+  });
+
+  it('shows no unsigned note for a signed or non-Windows helper', async () => {
+    const el = await render({ get: async () => ready, set: async () => ready });
+    expect(el.textContent).not.toContain('code-signed');
+  });
+
   it('shows the stored state, the helper status and the stop key', async () => {
     const el = await render({ get: async () => base, set: async () => base });
     const sw = el.querySelector('[role="switch"]') as HTMLButtonElement;

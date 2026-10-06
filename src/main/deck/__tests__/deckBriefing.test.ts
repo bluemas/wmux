@@ -89,7 +89,9 @@ describe('buildWorkspaceBriefing — priority ordering', () => {
     expect(b).not.toHaveProperty('panes');
   });
 
-  it('waiting is treated as blocked (same priority as awaiting_input)', () => {
+  // 2026-10-07 — the sidebar and Fleet rule: a turn that ended with no
+  // question (`waiting`) is idle, not blocked.
+  it('a plain turn-end waiting is idle, not blocked', () => {
     const b = buildWorkspaceBriefing({
       ...baseInputs,
       snapshot: snap([
@@ -97,8 +99,9 @@ describe('buildWorkspaceBriefing — priority ordering', () => {
         { ptyId: 'p-wait', agentStatus: 'waiting' },
       ]),
     });
-    expect(b.topPane?.ptyId).toBe('p-wait');
-    expect(b.topPane?.reason).toBe('blocked');
+    expect(b.topPane?.ptyId).toBe('p-run');
+    expect(b.blockedPtyIds).toEqual([]);
+    expect(b.counts).toMatchObject({ blocked: 0, running: 1, idle: 1 });
   });
 
   it('equal-priority panes break ties by ptyId so the named pane never flickers', () => {
@@ -432,10 +435,10 @@ describe('rising edge through build → briefingSignal → isNewlyActionable', (
     expect(isNewlyActionable(after, again)).toBe(false);
   });
 
-  it('a `waiting` pane counts as blocked for the edge, same as awaiting_input', () => {
+  it('a turn-end `waiting` is not a blocked edge; awaiting_input is', () => {
     const before = observe([{ ptyId: 'p', agentStatus: 'running' }]);
-    const after = observe([{ ptyId: 'p', agentStatus: 'waiting' }]);
-    expect(isNewlyActionable(before, after)).toBe(true);
+    expect(isNewlyActionable(before, observe([{ ptyId: 'p', agentStatus: 'waiting' }]))).toBe(false);
+    expect(isNewlyActionable(before, observe([{ ptyId: 'p', agentStatus: 'awaiting_input' }]))).toBe(true);
   });
 });
 

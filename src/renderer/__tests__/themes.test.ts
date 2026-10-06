@@ -15,7 +15,7 @@ import { luminance, getContrastRatio } from '../tailwindPalette';
 describe('themes — 10-token system', () => {
   const builtinIds: BuiltinThemeId[] = [
     'catppuccin-mocha', 'monochrome', 'stars-and-stripes', 'red-dynasty',
-    'nightowl', 'void', 'hinomaru', 'taegeuk',
+    'nightowl', 'gruvbox-dark-hard', 'void', 'hinomaru', 'taegeuk',
   ];
 
   describe('UI_THEME_TOKENS — 10 manual tokens per built-in', () => {
@@ -129,6 +129,7 @@ describe('themes — 10-token system', () => {
         'red-dynasty': '#6AA0CC',
         hinomaru: '#1C4D6A',
         nightowl: '#7FA6C9',
+        'gruvbox-dark-hard': '#83A598',
       };
       for (const id of builtinIds) {
         const tokens = UI_THEME_TOKENS[id];

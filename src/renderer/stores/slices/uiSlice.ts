@@ -87,6 +87,14 @@ export function siteGuidesAutoEnablePatch(input: {
 }
 import type { FleetSortMode } from '../selectors/fleet';
 import { EMPTY_FILTER, type WorkspaceFilter } from '../../components/Sidebar/workspaceFilter';
+import {
+  DEFAULT_ATTENTION_BLINK,
+  DEFAULT_ATTENTION_BLINK_FINISHED,
+  DEFAULT_ATTENTION_REMIND_MS,
+  type AttentionBlinkFinished,
+  type AttentionBlinkMode,
+  type AttentionRemindMs,
+} from '../../components/Sidebar/attentionBlink';
 import { initialGitPageState, type GitDragContext, type GitHandoffOpen, type GitPageState } from '../../components/Git/gitPageState';
 import { multiviewColumnCount, type MultiviewArrangement } from '../../utils/multiviewGrid';
 import {
@@ -608,6 +616,16 @@ export interface UISlice {
   sidebarShowPaneCoordinates: boolean;
   setSidebarShowPaneCoordinates: (enabled: boolean) => void;
 
+  /** Attention blink (2026-10-07): how a row waiting on a question or approval
+   *  pulses, the "once + remind" interval, and whether a finished turn pulses
+   *  once beside its done dot. Per user, persisted in the session. */
+  attentionBlink: AttentionBlinkMode;
+  attentionBlinkRemindMs: AttentionRemindMs;
+  attentionBlinkFinished: AttentionBlinkFinished;
+  setAttentionBlink: (mode: AttentionBlinkMode) => void;
+  setAttentionBlinkRemindMs: (ms: AttentionRemindMs) => void;
+  setAttentionBlinkFinished: (mode: AttentionBlinkFinished) => void;
+
   // ─── Toast / ring notification UI ────────────────────────────────────────
   toastEnabled: boolean;
   setToastEnabled: (enabled: boolean) => void;
@@ -722,6 +740,11 @@ export interface UISlice {
   // default; each pane can override it from its limit chip.
   usageLimitAutoResume: boolean;
   setUsageLimitAutoResume: (enabled: boolean) => void;
+  // #1826: when on, a pane recovered at app start that was running Claude Code
+  // gets its resume line typed and submitted instead of only showing the
+  // Resume pill. Off by default.
+  claudeResumeOnStart: boolean;
+  setClaudeResumeOnStart: (enabled: boolean) => void;
   anthropicUsage: {
     status:
       | 'idle'
@@ -1709,6 +1732,13 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
     state.sidebarShowPaneCoordinates = enabled;
   }),
 
+  attentionBlink: DEFAULT_ATTENTION_BLINK,
+  attentionBlinkRemindMs: DEFAULT_ATTENTION_REMIND_MS,
+  attentionBlinkFinished: DEFAULT_ATTENTION_BLINK_FINISHED,
+  setAttentionBlink: (mode) => set((state) => { state.attentionBlink = mode; }),
+  setAttentionBlinkRemindMs: (ms) => set((state) => { state.attentionBlinkRemindMs = ms; }),
+  setAttentionBlinkFinished: (mode) => set((state) => { state.attentionBlinkFinished = mode; }),
+
   // ─── Toast / ring notification UI ────────────────────────────────────────
   toastEnabled: true,
 
@@ -1802,6 +1832,10 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
   usageLimitAutoResume: false,
   setUsageLimitAutoResume: (enabled) => set((state) => {
     state.usageLimitAutoResume = enabled;
+  }),
+  claudeResumeOnStart: false,
+  setClaudeResumeOnStart: (enabled) => set((state) => {
+    state.claudeResumeOnStart = enabled;
   }),
   anthropicUsageEnabled: false,
   setAnthropicUsageEnabled: (enabled) => {
