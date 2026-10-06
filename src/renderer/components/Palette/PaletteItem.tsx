@@ -1,5 +1,6 @@
 import React, { memo } from 'react';
 import { useT } from '../../hooks/useT';
+import type { ShortcutActionId } from '../../../shared/keymap';
 
 export type PaletteCategory = 'workspace' | 'surface' | 'command' | 'recent';
 
@@ -9,15 +10,25 @@ export interface PaletteItemData {
   category: PaletteCategory;
   icon: React.ReactNode;
   action: () => void;
+  /** The keymap action this row runs, when it can be given a shortcut. */
+  shortcut?: ShortcutActionId;
 }
 
 interface PaletteItemProps {
   item: PaletteItemData;
   isActive: boolean;
   onClick: () => void;
+  /** The row's current key, ready to display; null when none is bound. */
+  combo?: string | null;
+  /**
+   * Start recording a new key for `item.shortcut`. Takes the action rather
+   * than closing over it, so the palette passes one stable callback and the
+   * memo below still holds.
+   */
+  onSetShortcut?: (action: ShortcutActionId) => void;
 }
 
-function PaletteItem({ item, isActive, onClick }: PaletteItemProps) {
+function PaletteItem({ item, isActive, onClick, combo, onSetShortcut }: PaletteItemProps) {
   const t = useT();
 
   const categoryLabel: Record<PaletteCategory, string> = {
@@ -46,6 +57,24 @@ function PaletteItem({ item, isActive, onClick }: PaletteItemProps) {
         {item.icon}
       </span>
       <span className="flex-1 truncate text-[13px] leading-5">{item.label}</span>
+      {/* The key chip doubles as the pointer route to rebinding (the keyboard
+          route is Ctrl+Enter). An unbound row offers it on the active row
+          only, so the list does not fill up with empty placeholders. A span,
+          not a button: the row itself is the button. */}
+      {onSetShortcut && item.shortcut && (combo || isActive) && (
+        <span
+          role="button"
+          tabIndex={-1}
+          className="ui-kbd shrink-0 cursor-pointer hover:text-[var(--text-main)]"
+          style={combo ? undefined : { color: 'var(--text-muted)' }}
+          title={t('palette.setShortcut')}
+          aria-label={`${t('palette.setShortcut')}: ${item.label}`}
+          data-testid="palette-shortcut-chip"
+          onClick={(e) => { e.stopPropagation(); if (item.shortcut) onSetShortcut(item.shortcut); }}
+        >
+          {combo || t('palette.addShortcut')}
+        </span>
+      )}
       <span className="shrink-0 text-[11px] leading-4 text-[var(--text-sub)]">
         {categoryLabel[item.category]}
       </span>

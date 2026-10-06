@@ -42,16 +42,16 @@ import {
 } from '../../../shared/workerLaunch';
 import {
   ADVERTISED_SHORTCUTS,
+  UNBOUND_SHORTCUTS,
   builtinCombosFor,
   comboFromEvent,
   concreteCombo,
   defaultRowsFor,
   displayCombo,
-  effectiveBindings,
-  rebindProblem,
   type ShortcutActionId,
 } from '../../../shared/keymap';
 import { shortcutPressGuard } from '../../utils/shortcutBindings';
+import { describeShortcut, rebindProblemText } from '../../utils/shortcutRebind';
 import { CLAUDE_EFFORT_LEVELS } from '../../../shared/claudeModels';
 import {
   agyEffortOf,
@@ -443,10 +443,12 @@ function SettingPathInput({
 
 function KbdRow({
   keys, description, disabled, onToggleDisabled, toggleTitle,
-  onChangeKey, changeKeyTitle, onReset, resetLabel, note,
+  onChangeKey, changeKeyTitle, onReset, resetLabel, note, unset,
 }: {
   keys: string;
   description: string;
+  /** No key bound (yet): `keys` is a placeholder, shown muted. */
+  unset?: boolean;
   /** #1152 — undefined hides the toggle (rows that cannot be disabled). */
   disabled?: boolean;
   onToggleDisabled?: () => void;
@@ -485,6 +487,7 @@ function KbdRow({
             type="button"
             className={`settings-kbd settings-kbd-hint ${FOCUS_RING}`}
             data-disabled={disabled || undefined}
+            data-unset={unset || undefined}
             onClick={onChangeKey}
             title={changeKeyTitle}
             aria-label={`${description} (${keys}) — ${changeKeyTitle ?? ''}`}
@@ -4383,7 +4386,6 @@ export function TabShortcuts() {
   const platform: NodeJS.Platform = window.electronAPI?.platform === 'darwin'
     ? 'darwin'
     : window.electronAPI?.platform === 'linux' ? 'linux' : 'win32';
-  const bindings = effectiveBindings(platform, shortcutOverrides);
 
   // The combos custom keybindings can lose to: every built-in in force, in
   // the concrete form (on macOS a ⌘ built-in cannot collide with a custom
@@ -4396,22 +4398,9 @@ export function TabShortcuts() {
 
   const bindingEntries = Object.entries(prefixConfig.bindings);
 
-  const describe = (action: ShortcutActionId): string => {
-    const row = ADVERTISED_SHORTCUTS.find((e) => e.action === action);
-    return row ? t(row.descriptionKey as Parameters<typeof t>[0], row.descriptionVars) : action;
-  };
-  // Why `combo` cannot run `action`, as a sentence — or null when it can.
-  const problemText = (action: ShortcutActionId, combo: string): string | null => {
-    const problem = rebindProblem(action, combo, bindings, platform, prefixConfig.key);
-    if (!problem) return null;
-    const shown = displayCombo(combo, platform);
-    switch (problem.kind) {
-      case 'needsModifier': return t('settings.sc.needsModifier');
-      case 'clipboard': return t('settings.sc.reservedKey', { combo: shown });
-      case 'prefix': return t('settings.sc.prefixConflict', { combo: shown });
-      case 'taken': return t('settings.sc.conflict', { name: describe(problem.by) });
-    }
-  };
+  // Shared with the command palette, which can rebind too (shortcutRebind).
+  const describe = describeShortcut;
+  const problemText = rebindProblemText;
   const moveShortcut = (action: ShortcutActionId, combo: string) => {
     const text = problemText(action, combo);
     setShortcutNote(text ? { action, text } : null);
@@ -4443,6 +4432,13 @@ export function TabShortcuts() {
     return matchesShortcut(describe(entry.action), displayCombo(combo, platform));
   });
   const prefixRowVisible = matchesShortcut(t('settings.prefixMode'), prefixKeyDisplay);
+  // Palette commands that ship with no key: listed so a key given to one (here
+  // or from the palette) can be seen, changed and taken off again.
+  const unsetLabel = t('settings.sc.unset');
+  const visibleUnbound = UNBOUND_SHORTCUTS.filter((entry) => {
+    const override = shortcutOverrides[entry.action];
+    return matchesShortcut(describe(entry.action), typeof override === 'string' ? displayCombo(override, platform) : '');
+  });
 
   return (
     <div className="settings-page">
@@ -4474,7 +4470,7 @@ export function TabShortcuts() {
           aria-label={t('settings.sc.searchPlaceholder')}
           data-testid="shortcut-search"
         />
-        {shortcutNeedle && !prefixRowVisible && visibleShortcuts.length === 0 && (
+        {shortcutNeedle && !prefixRowVisible && visibleShortcuts.length === 0 && visibleUnbound.length === 0 && (
           <p className="settings-nav-count" aria-live="polite">
             {t('settings.sc.noMatches', { query: shortcutQuery.trim() })}
           </p>
@@ -4502,6 +4498,23 @@ export function TabShortcuts() {
               onChangeKey={() => setRebinding(entry.action)}
               changeKeyTitle={t('settings.sc.changeKey')}
               onReset={entry.action in shortcutOverrides ? () => restoreShortcut(entry.action) : undefined}
+              resetLabel={t('settings.sc.reset')}
+              note={shortcutNote?.action === entry.action ? shortcutNote.text : undefined}
+            />
+          );
+        })}
+        {visibleUnbound.map((entry) => {
+          const override = shortcutOverrides[entry.action];
+          const bound = typeof override === 'string';
+          return (
+            <KbdRow
+              key={entry.action}
+              keys={bound ? displayCombo(override, platform) : unsetLabel}
+              description={describe(entry.action)}
+              unset={!bound}
+              onChangeKey={() => setRebinding(entry.action)}
+              changeKeyTitle={t('settings.sc.changeKey')}
+              onReset={bound ? () => restoreShortcut(entry.action) : undefined}
               resetLabel={t('settings.sc.reset')}
               note={shortcutNote?.action === entry.action ? shortcutNote.text : undefined}
             />
