@@ -290,7 +290,11 @@ export function planAutoResume(args: {
   const plan = planRecoveryPillType({
     launcher: 'claude',
     sessionId: exact ? binding?.sessionId : undefined,
-    permFlag: exact ? permissionFlagFor(binding?.permissionMode) : '',
+    // A saved bypassPermissions mode restores as the default mode here: only
+    // the pill's explicit toggle may type --dangerously-skip-permissions.
+    permFlag: exact && binding?.permissionMode !== 'bypassPermissions'
+      ? permissionFlagFor(binding?.permissionMode)
+      : '',
     forceSkip: false,
     // Both flags land on one line: the staged click flow does not apply here.
     resumeStage: 0,

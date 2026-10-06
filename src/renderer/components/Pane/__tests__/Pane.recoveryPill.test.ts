@@ -282,6 +282,17 @@ describe('planAutoResume — Claude panes resume themselves on app start', () =>
       .not.toContain('--dangerously-skip-permissions');
   });
 
+  it('never adds --dangerously-skip-permissions for a saved bypassPermissions mode', () => {
+    const line = planAutoResume({
+      enabled: true,
+      agent: 'claude',
+      binding: { ...binding, permissionMode: 'bypassPermissions' },
+      paneCwds: ['C:/git/wmux'],
+      roleBinding: undefined,
+    });
+    expect(line).toBe(`claude --resume ${SID}`);
+  });
+
   it('leaves other agents and non-agent panes alone', () => {
     expect(planAutoResume({ enabled: true, agent: 'codex', binding: undefined, paneCwds: [], roleBinding: undefined })).toBeNull();
     expect(planAutoResume({ enabled: true, agent: undefined, binding: undefined, paneCwds: [], roleBinding: undefined })).toBeNull();
