@@ -64,7 +64,6 @@ import {
   noteTerminalInput,
   discardTerminalOutput,
   isTerminalDirty,
-  isTerminalRetained,
   markTerminalDirty,
   markTerminalClean,
   getQueuedCharCount,
@@ -441,17 +440,17 @@ function hiddenRetentionActive(): boolean {
 /** Reveal-time flush cap (GPU repaint-burst fix, 2026-07-21). A retained
  *  backlog handed to xterm in one shot on reveal is a single giant parse that
  *  dirties the whole viewport and rasters it across many consecutive frames —
- *  the measured workspace-switch burst. Above this size we discard the backlog
- *  and re-synchronize a bounded screen snapshot from the daemon instead, which
- *  is cheaper than parsing to reconstruct a screen the daemon can serialize in
- *  a few KB (one clean repaint vs. a multi-frame raster storm).
+ *  the measured workspace-switch burst. Above this size the backlog goes to
+ *  the budgeted priority drain instead, which catches up over frames.
+ *
+ *  It used to be discarded for a daemon resync instead; that re-parsed the
+ *  whole ring at the current width and garbled history written at another
+ *  width. MAX_QUEUE_CHARS (2 MB, scheduler) is still the HARD (memory) cap
+ *  that force-discards and resyncs.
  *
  *  Threshold: xterm parses ~5–35 MB/s (xterm.js flow-control docs), so 256 KB
  *  is ~7–50 ms of parse — the point where a reveal starts spanning multiple
- *  frames and the raster becomes perceptible. This is the SOFT (perf) cap;
- *  MAX_QUEUE_CHARS (2 MB, scheduler) is the HARD (memory) cap that force-
- *  discards. Both use the identical discard→dirty→resync mechanism and safety;
- *  they differ only in trigger (perceptible parse vs. unbounded memory). */
+ *  frames and the raster becomes perceptible. */
 const REVEAL_FLUSH_MAX_CHARS = 256 * 1024;
 
 /** One-shot diagnostic latch: logged at the first data event that arrives for
@@ -3179,51 +3178,17 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
           // to keep the main log usable; anything that had retained backlog
           // logs the catch-up size.
           const queued = getQueuedCharCount(terminalRef.current);
-          // Reveal-backlog-cap: a large RETAINED backlog handed to xterm in one
-          // shot is the workspace-switch raster burst. Above the cap, discard it
-          // and re-synchronize a bounded snapshot from the daemon — identical
-          // mechanism and safety to the retention overflow→dirty path, just at a
-          // lower (perf, not memory) threshold.
-          //
-          // Two-part gate (review-team 2026-07-21):
-          //  - isTerminalRetained (per-pane): a retained entry is only ever
-          //    produced by the retainWhenHidden write path, so its bytes came
-          //    from the daemon and are in the RingBuffer. A non-retained backlog
-          //    (background drain / a local pane) is NEVER capped — discarding it
-          //    could lose the pane's only copy (GLM+Codex round-1 P1).
-          //  - isDaemonModeActive (current reachability): `retained` is
-          //    historical — the daemon could have disconnected AFTER the bytes
-          //    were retained. Without this the reveal would discard the only
-          //    copy while resync fails with local-mode/session-gone (Codex
-          //    round-2 P1). Requiring the daemon to be live NOW means resync can
-          //    actually replace what we discard; on resync failure the pane
-          //    stays dirty and retries, and the daemon still holds the bytes.
-          // Caveat: a renderer-only exit marker (terminal.exitedBracket) in the
-          // backlog is dropped — the same tradeoff as the overflow path, now
-          // more frequent at the 256KB cap; the daemon resync replays the PTY's
-          // real final screen, which conveys the exit, just not the localized
-          // bracket.
-          // Not for an alt-screen pane (a full-screen agent TUI): the daemon
-          // cannot snapshot the alternate buffer, so the resync ships the raw
-          // ring (measured 1–7 MB) and the pane sits blank between reset() and
-          // the end of that parse. The budgeted catch-up below parses only
-          // the backlog and keeps the old frame up meanwhile.
-          const altScreen = terminalRef.current.buffer.active.type === 'alternate';
-          if (
-            queued > REVEAL_FLUSH_MAX_CHARS &&
-            !altScreen &&
-            isTerminalRetained(terminalRef.current) &&
-            isDaemonModeActive()
-          ) {
-            console.log(`[wmux:reveal] ptyId=${ptyIdRef.current} mechanism=reveal-backlog-cap queuedChars=${queued}`);
-            markTerminalDirty(terminalRef.current);
-            void startResync('reveal-backlog-cap');
-          } else if (queued > REVEAL_FLUSH_MAX_CHARS) {
-            // Large but NON-retained (or daemon down, or alt-screen): we can't
-            // usefully discard it, but flushing it inline would burst. Hand
-            // it to the budgeted priority drain so it catches up over frames
-            // instead of one giant parse — data-loss-safe, order preserved.
-            console.log(`[wmux:reveal] ptyId=${ptyIdRef.current} mechanism=reveal-budgeted-catchup queuedChars=${queued}${altScreen ? ' altScreen=1' : ''}`);
+          // A large backlog is never discarded for a daemon resync here. The
+          // resync re-parses the whole ring (up to 8 MB) at the CURRENT width,
+          // and history written at another width (a window or font resize)
+          // re-wraps wrong — Claude Code's cursor-up redraws then stack into
+          // garbled frames. Parsing only the backlog is what the live pane
+          // would have done anyway. Above the cap it goes to the budgeted
+          // priority drain so it catches up over frames instead of one giant
+          // parse, with the old frame up meanwhile; only an overflowed (dirty)
+          // backlog still needs the resync above.
+          if (queued > REVEAL_FLUSH_MAX_CHARS) {
+            console.log(`[wmux:reveal] ptyId=${ptyIdRef.current} mechanism=reveal-budgeted-catchup queuedChars=${queued}`);
             promoteTerminalToPriorityDrain(terminalRef.current);
           } else {
             if (queued > 0) {

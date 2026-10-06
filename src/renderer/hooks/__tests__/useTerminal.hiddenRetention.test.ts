@@ -62,30 +62,18 @@ describe('Phase 3 PR-A — useTerminal hidden-pane retention wiring (source-leve
     expect(src).toMatch(/if\s*\(recoveredBytes\s*>\s*0\)\s*markTerminalDirty\(terminal\);/);
   });
 
-  it('reveal branches on dirtiness: resync for dirty, cap-then-resync or flush for clean', () => {
+  it('reveal branches on dirtiness: resync for dirty, budgeted catch-up or flush for clean', () => {
     const idx = src.indexOf('if (isTerminalDirty(terminalRef.current))');
     expect(idx).toBeGreaterThan(0);
-    // Window widened for the P0-5 retained-catchup mechanism log AND the
-    // reveal-backlog-cap branch (2026-07-21) between the dirty check and the flush.
-    const body = src.slice(idx, idx + 4000);
+    const body = src.slice(idx, idx + 2400);
     expect(body).toMatch(/startResync\('dirty-reveal'\)/);
     expect(body).toMatch(/flushTerminalOutput\(terminalRef\.current\)/);
-    // Reveal-backlog-cap two-part gate (review-team 2026-07-21): per-pane
-    // isTerminalRetained (byte provenance — daemon-sourced, in the RingBuffer)
-    // AND isDaemonModeActive (current reachability — resync can actually
-    // replace what we discard). Neither alone is sufficient; both guard against
-    // data loss on a non-retained/local pane or a since-disconnected daemon.
+    // A large clean backlog catches up over frames; it is never discarded for
+    // a resync, which re-parsed the whole ring at the current width and
+    // garbled history written at another width.
     expect(body).toMatch(/queued > REVEAL_FLUSH_MAX_CHARS/);
-    expect(body).toMatch(/isTerminalRetained\(terminalRef\.current\)/);
-    expect(body).toMatch(/isDaemonModeActive\(\)/);
-    expect(body).toMatch(/startResync\('reveal-backlog-cap'\)/);
-    // An alt-screen pane never takes the cap: the daemon cannot snapshot the
-    // alternate buffer, so the resync would replay the whole raw ring.
-    expect(body).toMatch(/buffer\.active\.type === 'alternate'/);
-    expect(body).toMatch(/!altScreen &&/);
-    // Large NON-retained backlog can't be discarded (no daemon authority) but
-    // must not burst — hand it to the budgeted priority drain instead.
     expect(body).toMatch(/promoteTerminalToPriorityDrain\(terminalRef\.current\)/);
+    expect(src).not.toMatch(/startResync\('reveal-backlog-cap'\)/);
   });
 
   it('resync degrades without ever clearing the ptyId (dead pane keeps its last screen)', () => {
