@@ -30,6 +30,7 @@
 import { Terminal } from '@xterm/headless';
 import { SerializeAddon } from '@xterm/addon-serialize';
 import { applyUnicodeWidthModel } from '../shared/terminalUnicode';
+import type { ReplayGeometry } from './RingBuffer';
 import {
   PartialSequenceTracker,
   MarginTracker,
@@ -44,6 +45,13 @@ export interface SnapshotRequest {
   scrollback?: number;
   /** Raw history captured at T0 (ring buffer readAll). */
   initial: Buffer;
+  /**
+   * The sizes `initial` was written at (RingBuffer.readAllWithGeometry). Each
+   * stretch is parsed at its own size and the terminal is then resized to
+   * `cols`×`rows`, which reflows the way the live terminal did. Omitted: the
+   * whole history is parsed at `cols`×`rows`.
+   */
+  geometry?: ReplayGeometry;
   /**
    * Live-tee drain: returns (and removes) chunks that arrived since the last
    * call. Called repeatedly until it comes back empty. Omit for read-only
@@ -195,8 +203,8 @@ async function generateTextInner(req: SnapshotRequest): Promise<TextSnapshotOutc
   const scrollback = clamp(req.scrollback ?? DEFAULT_SCROLLBACK, 0, MAX_SCROLLBACK);
 
   const terminal = new Terminal({
-    cols: req.cols,
-    rows: req.rows,
+    cols: req.geometry?.start.cols ?? req.cols,
+    rows: req.geometry?.start.rows ?? req.rows,
     scrollback,
     allowProposedApi: true,
     logLevel: 'off',
@@ -236,7 +244,7 @@ async function generateTextInner(req: SnapshotRequest): Promise<TextSnapshotOutc
       return true;
     };
 
-    if (!(await feed(req.initial))) {
+    if (!(await feedAtRecordedSizes(terminal, req, feed))) {
       return { ok: false, reason: 'budget' };
     }
     if (req.drainQueue) {
@@ -304,8 +312,8 @@ async function generateInner(req: SnapshotRequest): Promise<SnapshotOutcome> {
   const scrollback = clamp(req.scrollback ?? DEFAULT_SCROLLBACK, 0, MAX_SCROLLBACK);
 
   const terminal = new Terminal({
-    cols: req.cols,
-    rows: req.rows,
+    cols: req.geometry?.start.cols ?? req.cols,
+    rows: req.geometry?.start.rows ?? req.rows,
     scrollback,
     allowProposedApi: true,
     logLevel: 'off',
@@ -367,7 +375,7 @@ async function generateInner(req: SnapshotRequest): Promise<SnapshotOutcome> {
       return true;
     };
 
-    if (!(await feed(req.initial))) {
+    if (!(await feedAtRecordedSizes(terminal, req, feed))) {
       return { ok: false, reason: 'budget' };
     }
     if (req.drainQueue) {
@@ -462,6 +470,33 @@ function buildModesTail(terminal: Terminal, sgrMouse: SgrMouseEncodingTracker): 
   // (xterm has an internal timeout, so a crashed app cannot wedge painting).
   if (modes.synchronizedOutputMode) tail += '\x1b[?2026h';
   return tail;
+}
+
+/**
+ * Feed `req.initial`, resizing the terminal at each recorded size change so
+ * every stretch parses at the width it was written at, then settle at the
+ * requested size. Returns false when `feed` ran out of budget.
+ */
+async function feedAtRecordedSizes(
+  terminal: Terminal,
+  req: SnapshotRequest,
+  feed: (raw: Buffer) => Promise<boolean>,
+): Promise<boolean> {
+  const resizeTo = (cols: number, rows: number): void => {
+    const c = Math.max(1, Math.floor(cols));
+    const r = Math.max(1, Math.floor(rows));
+    if (terminal.cols !== c || terminal.rows !== r) terminal.resize(c, r);
+  };
+  let from = 0;
+  for (const change of req.geometry?.changes ?? []) {
+    const at = clamp(change.offset, from, req.initial.length);
+    if (at > from && !(await feed(req.initial.subarray(from, at)))) return false;
+    from = at;
+    resizeTo(change.cols, change.rows);
+  }
+  if (from < req.initial.length && !(await feed(req.initial.subarray(from)))) return false;
+  resizeTo(req.cols, req.rows);
+  return true;
 }
 
 function clamp(v: number, lo: number, hi: number): number {

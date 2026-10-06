@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { getSessionSocketPath } from '../shared/constants';
-import type { RingBuffer } from './RingBuffer';
+import type { RingBuffer, ReplayGeometry } from './RingBuffer';
 import { generateSnapshot, MAX_SCROLLBACK } from './HeadlessSnapshot';
 import {
   createSessionPipeMarkers,
@@ -193,7 +193,7 @@ export class SessionPipe {
    * and the fresh full read ships raw — fail-open, never a gap.
    */
   private async flushRingBuffer(socket: net.Socket): Promise<void> {
-    const buffered = this.ringBuffer.readAll();
+    const { data: buffered, geometry } = this.ringBuffer.readAllWithGeometry();
     // Instrumentation for #35 (scrollback-empty-after-restart). Pairs
     // with `[recovery] session X bytes=N` on daemon startup and
     // `Suspended session X (buffer: N bytes)` on shutdown. If those
@@ -218,6 +218,7 @@ export class SessionPipe {
         cols: dims.cols,
         rows: dims.rows,
         initial: buffered,
+        geometry,
         // This layer has no renderer config, and the renderer's xterm scrollback
         // is user-configurable (default 10k) above the snapshot DEFAULT (5k). A
         // successful snapshot would otherwise truncate history the raw replay
@@ -231,7 +232,9 @@ export class SessionPipe {
       // cell-by-cell SGR reconstruction can come out BIGGER than the raw
       // stream. No win then — ship raw. The big-ring case this path exists
       // for (megabytes of overwritten history) compresses drastically.
-      if (outcome.ok && outcome.payload.length >= buffered.length) {
+      // Not when the size changed inside the ring: raw replays the history
+      // at the current width, which garbles what was written at another.
+      if (outcome.ok && outcome.payload.length >= buffered.length && !geometry?.changes.length) {
         // No gain — ship raw. But re-read the ring first: bytes written DURING
         // the await were gated off the socket (flushed=false) and are absent
         // from the pre-parse `buffered`. Shipping `buffered` here would drop
@@ -376,6 +379,7 @@ export class SessionPipe {
       rows: number;
       scrollback?: number;
       initial: Buffer;
+      geometry?: ReplayGeometry;
       drainQueue: () => Buffer[];
     }) => Promise<
       | { ok: true; payload: Buffer; bytesIn: number; durationMs: number }
@@ -424,6 +428,7 @@ export class SessionPipe {
       rows: number;
       scrollback?: number;
       initial: Buffer;
+      geometry?: ReplayGeometry;
       drainQueue: () => Buffer[];
     }) => Promise<
       | { ok: true; payload: Buffer; bytesIn: number; durationMs: number }
@@ -445,7 +450,7 @@ export class SessionPipe {
       // the ring, arm the tee. Nothing can arrive between these statements.
       socket.write(this.markers.resyncBegin);
       this.flushed = false;
-      const initial = this.ringBuffer.readAll();
+      const { data: initial, geometry } = this.ringBuffer.readAllWithGeometry();
       opts.bridge.on('data', tee);
 
       let outcome: Awaited<ReturnType<typeof opts.generate>>;
@@ -455,6 +460,7 @@ export class SessionPipe {
           rows: opts.rows,
           scrollback: opts.scrollback,
           initial,
+          geometry,
           drainQueue: () => teeQueue.splice(0),
         });
       } catch (err) {

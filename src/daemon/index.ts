@@ -2699,10 +2699,12 @@ function registerRpcHandlers(
     }
     const MAX_RPC_PAYLOAD_BYTES = 512 * 1024; // base64 ×1.37 + JSON stays < 1 MB
     const scrollback = Math.min(typeof p.scrollback === 'number' ? p.scrollback : 2000, 10_000);
+    const { data: initial, geometry } = managed.ringBuffer.readAllWithGeometry();
     const base = {
       cols: managed.meta.cols,
       rows: managed.meta.rows,
-      initial: managed.ringBuffer.readAll(),
+      initial,
+      geometry,
     };
     let outcome = await generateSnapshot({ ...base, scrollback });
     if (outcome.ok && outcome.payload.length > MAX_RPC_PAYLOAD_BYTES) {
