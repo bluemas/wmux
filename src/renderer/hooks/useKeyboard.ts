@@ -19,6 +19,13 @@ import { mentionKeyClaim } from '../utils/agentMention';
 import { OPEN_MENTION_PICKER_EVENT } from '../utils/agentMentionInsert';
 import { isChatV2Covering } from '../components/ChatV2/coverage';
 import { showWorkspaces } from '../utils/showWorkspaces';
+import {
+  openMultiTask,
+  openWorktaskCleanup,
+  showGitDiff,
+  stashActivePane,
+  toggleAgentToolbarPin,
+} from '../utils/commandActions';
 
 // Lightweight bookmark toast — reuses the same DOM element pattern as showCopyToast
 let bookmarkToastTimer: ReturnType<typeof setTimeout> | null = null;
@@ -78,6 +85,8 @@ export const WORKSPACES_ONLY_ACTIONS: ReadonlySet<ShortcutActionId> = new Set<Sh
   'focusUp', 'focusDown', 'focusLeft', 'focusRight',
   'focusUpAlt', 'focusDownAlt', 'focusLeftAlt', 'focusRightAlt',
   'clearMultiview', 'openBrowser', 'addBookmark', 'zoomIn', 'zoomOut', 'zoomReset',
+  'stashPane', 'movePaneLeft', 'movePaneRight', 'movePaneUp', 'movePaneDown',
+  'multiTask', 'showGitDiff',
 ]);
 
 const STOP_PROPAGATION_ACTIONS: ReadonlySet<ShortcutActionId> = new Set<ShortcutActionId>([
@@ -547,6 +556,18 @@ export function useKeyboard() {
         }
       },
       mentionAgent: () => { document.dispatchEvent(new CustomEvent(OPEN_MENTION_PICKER_EVENT)); },
+      // No default key (UNBOUND_SHORTCUTS) — these run only once the user
+      // binds one, from the command palette or Settings → Shortcuts. Each
+      // runs exactly what its palette row runs.
+      stashPane: stashActivePane,
+      movePaneLeft: () => { store.getState().moveActivePaneDirection('left'); },
+      movePaneRight: () => { store.getState().moveActivePaneDirection('right'); },
+      movePaneUp: () => { store.getState().moveActivePaneDirection('up'); },
+      movePaneDown: () => { store.getState().moveActivePaneDirection('down'); },
+      multiTask: openMultiTask,
+      toggleToolbarPin: toggleAgentToolbarPin,
+      openWorktaskCleanup,
+      showGitDiff,
     };
 
     /** Clear the prefix timeout if running */

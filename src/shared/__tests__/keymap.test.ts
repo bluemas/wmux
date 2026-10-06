@@ -4,6 +4,7 @@ import {
   builtinCombosFor,
   collidesWithKeymap,
   ADVERTISED_SHORTCUTS,
+  UNBOUND_SHORTCUTS,
   SHORTCUT_ACTION_IDS,
   comboFromEvent,
   concreteCombo,
@@ -122,8 +123,11 @@ describe('ADVERTISED_SHORTCUTS', () => {
   it('has exactly one row per action (the rest are aliases)', () => {
     const actions = ADVERTISED_SHORTCUTS.map((e) => e.action);
     expect(new Set(actions).size).toBe(actions.length);
-    // Every action the table binds can be listed, changed and switched off.
-    expect([...new Set(actions)].sort()).toEqual([...SHORTCUT_ACTION_IDS].sort());
+    // Every action is either bound by the table (listed, changed, switched
+    // off) or ships unbound (UNBOUND_SHORTCUTS) — and never both.
+    const unbound = UNBOUND_SHORTCUTS.map((e) => e.action);
+    expect(unbound.filter((a) => actions.includes(a))).toEqual([]);
+    expect([...actions, ...unbound].sort()).toEqual([...SHORTCUT_ACTION_IDS].sort());
   });
 
   it('puts an action\'s primary row before its aliases', () => {
@@ -426,5 +430,32 @@ describe('ShortcutPressGuard (IME double keydown)', () => {
     const g = new ShortcutPressGuard();
     g.noteActed(ev('ㅅ', 'KeyT'));
     expect(g.isDuplicate(ev('t', 'KeyT'))).toBe(true);
+  });
+});
+
+// ─── Unbound actions (command-palette shortcuts) ─────────────────────────────
+
+describe('UNBOUND_SHORTCUTS', () => {
+  it('bind nothing until the user gives them a key', () => {
+    const unbound = new Set(UNBOUND_SHORTCUTS.map((e) => e.action));
+    for (const platform of ['win32', 'darwin', 'linux'] as const) {
+      expect(defaultBindings(platform).filter((b) => unbound.has(b.action))).toEqual([]);
+    }
+    // And so reserve no menu accelerator either.
+    expect(WMUX_KEYMAP.filter((e) => unbound.has(e.action as never))).toEqual([]);
+  });
+
+  it('take an override like any built-in, and survive the session loader', () => {
+    const overrides = sanitizeShortcutOverrides({ movePaneRight: 'Ctrl+Alt+P', stashPane: null });
+    expect(overrides).toEqual({ movePaneRight: 'Ctrl+Alt+P', stashPane: null });
+    const bindings = effectiveBindings('win32', overrides);
+    expect(resolveShortcut(ev({ key: 'p', code: 'KeyP', altKey: true }), bindings)).toBe('movePaneRight');
+  });
+
+  it('are checked for conflicts like any built-in', () => {
+    const bindings = effectiveBindings('win32', {});
+    expect(rebindProblem('movePaneRight', 'Ctrl+D', bindings, 'win32', 'KeyB'))
+      .toEqual({ kind: 'taken', by: 'splitHorizontal' });
+    expect(rebindProblem('movePaneRight', 'Ctrl+Alt+P', bindings, 'win32', 'KeyB')).toBeNull();
   });
 });
