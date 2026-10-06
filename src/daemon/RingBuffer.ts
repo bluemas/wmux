@@ -190,17 +190,21 @@ export class RingBuffer {
   }
 
   /**
-   * readAll() plus the sizes its bytes were written at. `geometry` is
-   * undefined when no size was ever recorded.
+   * readAll() plus the sizes its bytes were written at, and the lifetime
+   * byte count at the read (`writtenAt`) so a later read can locate exactly
+   * the bytes that arrived since. `geometry` is undefined when no size was
+   * ever recorded.
    */
-  readAllWithGeometry(): { data: Buffer; geometry: ReplayGeometry | undefined } {
+  readAllWithGeometry(): { data: Buffer; geometry: ReplayGeometry | undefined; writtenAt: number } {
     const data = this.readAll();
+    const writtenAt = this.totalWritten;
     this.pruneGeometry();
-    if (this.geometry.length === 0) return { data, geometry: undefined };
+    if (this.geometry.length === 0) return { data, geometry: undefined, writtenAt };
     const windowStart = this.totalWritten - data.length;
     const [first, ...rest] = this.geometry;
     return {
       data,
+      writtenAt,
       geometry: {
         start: { cols: first.cols, rows: first.rows },
         changes: rest.map((m) => ({ offset: m.at - windowStart, cols: m.cols, rows: m.rows })),

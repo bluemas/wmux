@@ -14,12 +14,18 @@
  * System invariant ("slower, never wrong"): every condition the snapshot
  * cannot reproduce faithfully returns `{ ok: false }` so the caller degrades
  * to the raw-replay ladder:
- *  - alternate screen buffer active (vim & friends — DECSC, saved titles and
- *    other unserialized state make fidelity unprovable),
  *  - DECSTBM scroll margins in effect (not serialized by the addon),
  *  - the stream ends inside an escape sequence too large to re-ship,
  *  - the parse exceeded its time budget,
  *  - anything thrown by xterm itself.
+ *
+ * The alternate screen IS snapshotted (SerializeAddon writes the normal
+ * buffer, then `?1049h` and the alternate one). It used to degrade to raw, but
+ * for a full-screen agent TUI raw meant re-parsing up to 8 MB on reveal — the
+ * pane sat blank meanwhile — and at the current width, garbling history
+ * written at another. Cursor visibility is restored from the stream
+ * (CursorVisibilityTracker). Not restored: the DECSC saved cursor and window
+ * titles; a TUI redraws its frame on its next output anyway.
  *
  * IMPORTANT (query safety): no `onData` handler is ever wired on the headless
  * terminal. It must never answer DA1/DSR/OSC color queries — the renderer's
@@ -35,6 +41,7 @@ import {
   PartialSequenceTracker,
   MarginTracker,
   SgrMouseEncodingTracker,
+  CursorVisibilityTracker,
   incompleteUtf8SuffixLength,
 } from './util/ansiStreamScan';
 
@@ -65,7 +72,6 @@ export interface SnapshotRequest {
 }
 
 export type SnapshotFallbackReason =
-  | 'alt-screen'
   | 'margins'
   | 'partial-tail-overflow'
   | 'budget'
@@ -331,6 +337,7 @@ async function generateInner(req: SnapshotRequest): Promise<SnapshotOutcome> {
     const partialTail = new PartialSequenceTracker();
     const margins = new MarginTracker();
     const sgrMouse = new SgrMouseEncodingTracker();
+    const cursor = new CursorVisibilityTracker();
     // Bytes at a chunk tail that form an incomplete UTF-8 char — carried into
     // the next chunk; whatever remains at finalize is appended raw after the
     // snapshot so the renderer's byte stream stays contiguous.
@@ -367,6 +374,7 @@ async function generateInner(req: SnapshotRequest): Promise<SnapshotOutcome> {
         partialTail.feed(text);
         margins.feed(text);
         sgrMouse.feed(text);
+        cursor.feed(text);
         // Await the parse callback: backpressure AND an event-loop yield per
         // slice (xterm completes writes asynchronously).
         await new Promise<void>((resolve) => terminal.write(text, resolve));
@@ -394,9 +402,6 @@ async function generateInner(req: SnapshotRequest): Promise<SnapshotOutcome> {
       }
     }
 
-    if (terminal.buffer.active.type === 'alternate') {
-      return { ok: false, reason: 'alt-screen' };
-    }
     if (margins.active) {
       return { ok: false, reason: 'margins' };
     }
@@ -406,7 +411,7 @@ async function generateInner(req: SnapshotRequest): Promise<SnapshotOutcome> {
     }
 
     const core = serializer.serialize();
-    const modesTail = buildModesTail(terminal, sgrMouse);
+    const modesTail = buildModesTail(terminal, sgrMouse) + (cursor.hidden ? '\x1b[?25l' : '');
     const payload = Buffer.concat([
       Buffer.from(core + modesTail + tail, 'utf8'),
       utf8Carry,
@@ -430,9 +435,8 @@ async function generateInner(req: SnapshotRequest): Promise<SnapshotOutcome> {
  * headless terminal's public modes, plus the SGR mouse-encoding pair the
  * public API does not expose (tracked from the raw stream).
  *
- * Not covered (accepted): DECSC saved cursor, cursor visibility (DECTCEM) —
- * apps that use them are overwhelmingly alt-screen TUIs, which already fell
- * back to raw replay above.
+ * Not covered (accepted): the DECSC saved cursor. Cursor visibility (DECTCEM)
+ * is appended by the caller from CursorVisibilityTracker.
  */
 function buildModesTail(terminal: Terminal, sgrMouse: SgrMouseEncodingTracker): string {
   const modes = terminal.modes;
