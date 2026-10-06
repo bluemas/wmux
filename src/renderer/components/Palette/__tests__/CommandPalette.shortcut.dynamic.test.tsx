@@ -123,6 +123,16 @@ describe('CommandPalette shortcut recording', () => {
     expect(useStore.getState().shortcutOverrides.splitHorizontal).toBeNull();
   });
 
+  it('holds focus on the prompt while recording, so an IME has nowhere to type', () => {
+    // The search input unmounts when recording starts. Without this, focus fell
+    // back to the terminal and Hangul composed there reached the shell.
+    selectRow(t('palette.cmd.movePane.right'));
+    startRecording();
+    expect(document.activeElement).toBe(recordingPrompt());
+    press({ key: 'a', code: 'KeyA' }); // refused: needs a modifier
+    expect(document.activeElement).toBe(recordingPrompt());
+  });
+
   it('Esc cancels the recording, not the palette', () => {
     selectRow(t('palette.cmd.movePane.right'));
     startRecording();

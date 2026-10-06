@@ -451,7 +451,15 @@ export function comboFromEvent(e: ShortcutKeyEventLike): string | null {
   // Record the physical key when the logical one is a non-ASCII glyph (IME):
   // the glyph changes with the input mode, the code does not.
   const physical = comboKeyFromCode(e.code);
-  const key = /^[\x20-\x7e]$/.test(first) || first.length > 1 || physical === null ? first : physical;
+  // With Shift held a symbol key reports its shifted glyph (Windows sends '}'
+  // for Shift+], #1422), while the defaults and the conflict check spell it by
+  // the key itself: recorded as 'Ctrl+Shift+}', Ctrl+Shift+] slipped past the
+  // "already used by next tab" check and then shadowed it. Record the physical
+  // key instead; an existing 'Ctrl+Shift+}' override still resolves.
+  const shiftedSymbol = e.shiftKey && first.length === 1 && !/^[A-Z0-9]$/.test(first);
+  const key = physical !== null && (shiftedSymbol || !/^[\x20-\x7e]$/.test(first)) && first.length === 1
+    ? physical
+    : first;
   return modifierPrefix(e) + key;
 }
 

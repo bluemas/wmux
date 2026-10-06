@@ -801,21 +801,11 @@ export function selectLatestCompletionEvidenceTask(
   return best;
 }
 
-// Statuses that count toward the "N need you" header chip: awaiting_input is the
-// precise blocked-mid-turn state. waiting (the turn ended at an idle prompt)
-// counts only while the agent left a question pending — the same rule
-// fleetAttentionClass applies, so the chip never counts a pane the Fleet board
-// files under Idle.
-export function countNeedsAttention(
-  panes: FleetPane[],
-  surfacePendingQuestion: Record<string, string> = {},
-): number {
-  return panes.filter((p) => {
-    if (p.agentStatus === 'awaiting_input') return true;
-    if (p.agentStatus !== 'waiting') return false;
-    const target = fleetTargetPtyId(p);
-    return !!(target && surfacePendingQuestion[target]?.trim());
-  }).length;
+// Panes that need you, by the shared class (fleetAttentionClass): a dialog is
+// open or the turn ended on a question (both read awaiting_input here), or
+// supervision stopped. A turn that ended with no question is not one.
+export function countNeedsAttention(panes: FleetPane[]): number {
+  return panes.filter((p) => fleetAttentionClass(p) === 'needsYou').length;
 }
 
 // ─── Per-workspace status roll-up — the sidebar dot's source ─────────────────

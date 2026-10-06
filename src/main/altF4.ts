@@ -31,6 +31,28 @@ function load(): GetAsyncKeyState | null {
   return getAsyncKeyState;
 }
 
+/** The subset of Electron's `Input` that the Alt+F4 check reads. */
+export interface AltF4Input {
+  type: string;
+  key: string;
+  alt: boolean;
+  control: boolean;
+  meta: boolean;
+  isAutoRepeat: boolean;
+}
+
+/**
+ * Whether a `before-input-event` input is a fresh Alt+F4 press.
+ *
+ * When a terminal has focus, xterm handles Alt+F4 as a key for the shell and
+ * cancels it, so Windows never turns it into a close request. The main window
+ * has to act on the key itself before the renderer sees it.
+ */
+export function isAltF4KeyDown(input: AltF4Input): boolean {
+  return input.type === 'keyDown' && input.key === 'F4' && input.alt
+    && !input.control && !input.meta && !input.isAutoRepeat;
+}
+
 export function isAltF4Held(): boolean {
   const fn = load();
   if (!fn) return false;

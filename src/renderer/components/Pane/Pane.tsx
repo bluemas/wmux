@@ -33,6 +33,7 @@ import { useElementWidth } from '../../hooks/useElementWidth';
 import { ErrorBoundary } from '../ErrorBoundary';
 import { agentSupportsPermissionFlag, normalizeResumeCwd, permissionFlagFor, resumeGrammarFor } from '../../../shared/agentResume';
 import { applyRoleBinding, type RoleBinding } from '../../../shared/orchestratorRole';
+import { CHATV2_PROVIDER_SESSION_ID } from '../../../shared/chatv2/ipc';
 import { ResumeInfoChipGate } from './ResumeInfoChip';
 import { tokenAttrs } from '../../themes';
 import PaneDecorations from '../../plugins/PaneDecorations';
@@ -264,8 +265,24 @@ export function planRecoveryPillType(args: {
   return { text: ` ${grammar.withId(sessionId)}`, clearHint: true, advanceStage: false, rewritten: false };
 }
 
-/** Ptys whose Claude session was already resumed automatically this run. */
+/**
+ * Ptys the automatic resume must no longer touch this run: already resumed
+ * automatically, or the user started the Resume pill (whose staged first click
+ * leaves the hint up while it waits for the second).
+ */
 const autoResumedPtys = new Set<string>();
+
+/** Record that the Resume pill typed into `ptyId`; automatic resume then stays out. */
+export function markResumePillUsed(ptyId: string): void {
+  autoResumedPtys.add(ptyId);
+}
+
+/** Take the one automatic resume `ptyId` gets; false if it ran or the pill was used. */
+export function claimAutoResume(ptyId: string): boolean {
+  if (autoResumedPtys.has(ptyId)) return false;
+  autoResumedPtys.add(ptyId);
+  return true;
+}
 
 /**
  * The line to run when a recovered Claude pane is resumed on app start, or null
@@ -276,19 +293,30 @@ const autoResumedPtys = new Set<string>();
  * the pill toggle's explicit choice, not something to grant on every start.
  */
 export function planAutoResume(args: {
+  /** The user's opt-in setting (`claudeResumeOnStart`); off means the pill only. */
+  enabled: boolean;
   agent: string | undefined;
   binding: { agent?: string; cwd: string; sessionId?: string; permissionMode?: Parameters<typeof permissionFlagFor>[0] } | undefined;
   paneCwds: ReadonlyArray<string | undefined>;
   roleBinding: RoleBinding | undefined;
 }): string | null {
-  if (args.agent !== 'claude') return null;
+  if (!args.enabled || args.agent !== 'claude') return null;
   const { binding } = args;
-  const exact = !!binding && binding.agent === 'claude' &&
+  // Validate the session id before typing it: only a well-formed Claude session
+  // id is ever put on the line; anything else falls back to `--continue`.
+  const sessionId = binding?.sessionId && CHATV2_PROVIDER_SESSION_ID.test(binding.sessionId)
+    ? binding.sessionId
+    : undefined;
+  const exact = !!binding && !!sessionId && binding.agent === 'claude' &&
     args.paneCwds.some((c) => !!c && normalizeResumeCwd(binding.cwd) === normalizeResumeCwd(c));
   const plan = planRecoveryPillType({
     launcher: 'claude',
-    sessionId: exact ? binding?.sessionId : undefined,
-    permFlag: exact ? permissionFlagFor(binding?.permissionMode) : '',
+    sessionId: exact ? sessionId : undefined,
+    // A saved bypassPermissions mode restores as the default mode here: only
+    // the pill's explicit toggle may type --dangerously-skip-permissions.
+    permFlag: exact && binding?.permissionMode !== 'bypassPermissions'
+      ? permissionFlagFor(binding?.permissionMode)
+      : '',
     forceSkip: false,
     // Both flags land on one line: the staged click flow does not apply here.
     resumeStage: 0,
@@ -299,8 +327,8 @@ export function planAutoResume(args: {
   // first; build the whole line instead.
   if (plan.advanceStage) {
     const grammar = resumeGrammarFor('claude');
-    if (!grammar || !binding?.sessionId) return null;
-    return `${plan.text} ${grammar.withId(binding.sessionId)}`;
+    if (!grammar || !sessionId) return null;
+    return `${plan.text} ${grammar.withId(sessionId)}`;
   }
   return plan.text;
 }
@@ -629,7 +657,10 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
   // on the same conversation. Asked only for panes that offer a resume.
   const chatV2Binding = usePaneChatV2Binding(activeSurfacePtyId || undefined, !!resumeBinding || !!resumeHint);
   const chatV2OwnsPane = !!chatV2Binding && chatV2Binding.status !== 'handed-off';
-  // Resume Claude Code panes automatically on app start: a pane recovered this
+  // Resume Claude Code panes automatically on app start, when the user opted
+  // in (`claudeResumeOnStart`, off by default; off keeps the pill). The setting
+  // is read when the pane becomes ready, not subscribed to: turning it on must
+  // not type into panes already showing the pill. A pane recovered this
   // boot that was running Claude gets its resume line typed and submitted once
   // its shell is interactive, instead of waiting for the pill's click + Enter.
   const autoResumeCwds = [
@@ -641,6 +672,7 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
     if (!ptyId || !resumePtyReady || supervision || chatV2OwnsPane) return;
     if (autoResumedPtys.has(ptyId)) return;
     const line = planAutoResume({
+      enabled: useStore.getState().claudeResumeOnStart,
       agent: resumeHint,
       binding: resumeBinding,
       paneCwds: autoResumeCwds,
@@ -649,9 +681,9 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
     if (!line) return;
     // A beat after the first output, so the prompt is up and reading input.
     const timer = setTimeout(() => {
-      if (autoResumedPtys.has(ptyId)) return;
+      if (!useStore.getState().claudeResumeOnStart) return; // turned off meanwhile
       if (useStore.getState().resumeHintByPtyId[ptyId] !== 'claude') return; // typed into / dismissed meanwhile
-      autoResumedPtys.add(ptyId);
+      if (!claimAutoResume(ptyId)) return; // resumed already, or the pill was clicked meanwhile
       window.electronAPI.pty.write(ptyId, `${line}\r`);
       useStore.getState().clearResumeHint(ptyId);
     }, 400);
@@ -952,6 +984,9 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
             roleBinding: paneRoleBinding,
           });
           if (!plan) return; // not resumable — pill shouldn't have shown (defensive)
+          // The staged first click keeps the hint up; keep automatic resume
+          // from appending a second line to what the pill typed.
+          markResumePillUsed(ptyId);
           if (plan.rewritten) {
             // Audit trail — a role silently changed what this pill types. Logged
             // at the ACTION so it fires once per real rewrite, not every render.

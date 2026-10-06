@@ -19,6 +19,7 @@ import { mentionKeyClaim } from '../utils/agentMention';
 import { OPEN_MENTION_PICKER_EVENT } from '../utils/agentMentionInsert';
 import { isChatV2Covering } from '../components/ChatV2/coverage';
 import { showWorkspaces } from '../utils/showWorkspaces';
+import { listedWorkspaces, moaHqId, refuseWorkspaceClose } from '../components/Moa/moaHqGuard';
 import {
   openMultiTask,
   openWorktaskCleanup,
@@ -26,7 +27,6 @@ import {
   stashActivePane,
   toggleAgentToolbarPin,
 } from '../utils/commandActions';
-import { listedWorkspaces, moaHqId, refuseWorkspaceClose } from '../components/Moa/moaHqGuard';
 
 // Lightweight bookmark toast — reuses the same DOM element pattern as showCopyToast
 let bookmarkToastTimer: ReturnType<typeof setTimeout> | null = null;
@@ -773,7 +773,11 @@ export function useKeyboard() {
       // Allow shortcuts to fire inside editable fields when any modifier (Ctrl,
       // ⌘, or Alt) is pressed — covers both literal-Ctrl bindings (tmux prefix)
       // and cmdOrCtrl bindings (palette, settings, …).
-      if (isEditable && !literalCtrl && !cmdOrCtrl && !alt && !isFunctionKey) return;
+      // A Win / Super chord has no Ctrl or Alt, so the check above would drop
+      // it wherever the user types — the terminal included — and a Win+J the
+      // user recorded would never run. Let it through when it is a shortcut.
+      const metaShortcut = e.metaKey && !isMac && resolveShortcut(e, currentShortcutBindings()) !== null;
+      if (isEditable && !literalCtrl && !cmdOrCtrl && !alt && !isFunctionKey && !metaShortcut) return;
 
       // Ctrl+<prefixKey>: Enter prefix mode (configurable, default Ctrl+B)
       // Use e.code for Korean IME compatibility (see commit 60e39b0)

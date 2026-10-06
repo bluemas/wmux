@@ -162,6 +162,7 @@ export default function CommandPalette() {
   const [activeIdx, setActiveIdx] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
+  const recordingRef = useRef<HTMLSpanElement>(null);
   const { invoke: ipcInvoke } = useIpc();
 
   // Giving a command a shortcut without leaving the palette: Ctrl+Enter on
@@ -735,6 +736,11 @@ export default function CommandPalette() {
     // useKeyboard stands down while this is set, so a chord that is already
     // a shortcut reaches the recorder instead of running.
     setKeyCaptureActive(true);
+    // The search input just unmounted, and focus fell back to the terminal.
+    // With a Hangul IME on, keys pressed while recording would compose there
+    // and the text would reach the shell. A focused non-editable prompt has
+    // no composition, so focus that.
+    recordingRef.current?.focus();
     const finish = () => {
       setRecording(null);
       setRecordNote(null);
@@ -855,7 +861,9 @@ export default function CommandPalette() {
           </span>
           {recording ? (
             <span
-              className="flex-1 truncate text-[14px] leading-5 text-[var(--text-main)]"
+              ref={recordingRef}
+              tabIndex={-1}
+              className="flex-1 truncate text-[14px] leading-5 text-[var(--text-main)] outline-none"
               role="status"
               data-testid="palette-recording"
             >

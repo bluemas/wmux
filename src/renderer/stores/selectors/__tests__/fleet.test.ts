@@ -377,12 +377,13 @@ describe('sortFleetPanes', () => {
 // ─── countNeedsAttention ─────────────────────────────────────────────────────
 
 describe('countNeedsAttention', () => {
-  it('counts awaiting_input and waiting, ignores everything else', () => {
+  it('counts awaiting_input, ignores everything else', () => {
     const panes = selectFleetPanes(fixture());
     expect(countNeedsAttention(panes)).toBe(1); // only p1 (awaiting_input)
   });
 
-  it('counts awaiting_input, and waiting only when a question is pending', () => {
+  // 2026-10-07 — the shared class: a turn-end `waiting` is not needs you.
+  it('counts an open dialog, not a turn-end waiting', () => {
     const base: FleetPane = { workspaceId: 'w', workspaceName: 'w', paneId: 'x', surfaceId: 'x', ptyId: 'x', agentStatus: 'idle', title: 'x', surfaceType: 'terminal', isActivePane: false, unverifiable: false };
     const panes: FleetPane[] = [
       { ...base, paneId: '1', ptyId: 'pty-1', agentStatus: 'awaiting_input' },
@@ -391,10 +392,7 @@ describe('countNeedsAttention', () => {
       { ...base, paneId: '4', ptyId: 'pty-4', agentStatus: 'complete' },
       { ...base, paneId: '5', ptyId: 'pty-5', agentStatus: 'waiting' },
     ];
-    // A turn that ended at an idle prompt is idle on the Fleet board, so it
-    // must not light the chip either.
     expect(countNeedsAttention(panes)).toBe(1);
-    expect(countNeedsAttention(panes, { 'pty-5': 'Proceed?' })).toBe(2);
   });
 });
 

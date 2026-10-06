@@ -942,6 +942,12 @@ export interface SessionData {
   /** #1326 — whether the agent roster's muted trailer shows the auto `w<ws>-<pane>`
    *  coordinate for unlabeled panes. Default true. */
   sidebarShowPaneCoordinates?: boolean;
+  /** Attention blink (2026-10-07): 'off' | 'once' | 'remind' | 'continuous',
+   *  the remind interval in ms, and 'dot' | 'pulse' for finished turns.
+   *  Whitelisted on load (attentionBlink.ts). */
+  attentionBlink?: string;
+  attentionBlinkRemindMs?: number;
+  attentionBlinkFinished?: string;
   /** #1481 — workspace list order ('manual' | 'attention' | 'recent'). Absent in
    *  older sessions; `sidebarAttentionFirst` then decides. Whitelisted on load. */
   sidebarSortMode?: string;
@@ -963,6 +969,8 @@ export interface SessionData {
   anthropicUsageEnabled?: boolean;
   /** Arm a pane held at a usage limit to continue after the reset, unless the pane decided otherwise. */
   usageLimitAutoResume?: boolean;
+  /** #1826 — type the resume line into Claude Code panes recovered at app start. Opt-in. */
+  claudeResumeOnStart?: boolean;
   /** Categories whose surface actions are suppressed (#516). */
   mutedNotificationCategories?: NotificationCategory[];
   customKeybindings?: CustomKeybinding[];
