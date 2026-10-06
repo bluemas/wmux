@@ -444,9 +444,16 @@ function writePtyDataImmediately(
  * would clamp the PTY side to MIN_SAFE_COLS anyway, splitting the two sides
  * of the pipe. Callers skip; a later resize tick (layout settled, pane
  * revealed, font swapped) re-proposes.
+ *
+ * A container that is not laid out (display:none workspace) is not
+ * measurable even when FitAddon returns numbers: its computed width/height
+ * read back as the declared "100%", which FitAddon parses as 100px and turns
+ * into a ~11x5 proposal that clears the floor. Sending that on a daemon
+ * reattach shrank every background pane's PTY at app start.
  */
 function proposedSafeDimensions(
   addon: FitAddon | null | undefined,
+  container: HTMLElement | null | undefined,
 ): { cols: number; rows: number } | null {
   if (!addon) return null;
   try {
@@ -455,6 +462,7 @@ function proposedSafeDimensions(
     // A fixed grid is the owner's size, not a transient measurement: the
     // floor protects against mid-layout fits, which this never is.
     if (addon instanceof FixedGeometryFitAddon) return dims;
+    if (!container || container.offsetWidth === 0 || container.offsetHeight === 0) return null;
     if (!isSafeGeometry(dims.cols, dims.rows)) return null;
     return dims;
   } catch {
@@ -1113,7 +1121,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // the reflow re-wraps the whole scrollback at that width — damage a later
     // correct fit does not undo. The ResizeObserver re-fires when the layout
     // settles, so skipping is self-healing.
-    if (!proposedSafeDimensions(fitAddonRef.current)) return;
+    if (!proposedSafeDimensions(fitAddonRef.current, container)) return;
     try {
       fitAddonRef.current.fit();
       // This path fits and resizes too, so it settles any deferred debt (#747) —
@@ -1693,7 +1701,8 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // #1255: sub-floor proposals (mid-split/restoring container) are treated
     // exactly like a hidden container — no fit, and an adoption holds its
     // parked viewport until a real fit runs.
-    if (container.offsetWidth > 0 && container.offsetHeight > 0 && proposedSafeDimensions(fitAddon)) {
+    const initialFitRan = container.offsetWidth > 0 && container.offsetHeight > 0 && !!proposedSafeDimensions(fitAddon, container);
+    if (initialFitRan) {
       fitAddon.fit();
       // #1002: the fit runs AFTER the adopted element is back in the DOM and
       // can change how many rows the viewport holds, which moves what "the
@@ -1785,7 +1794,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         // records no fit debt: layout settling re-fires the ResizeObserver,
         // which is the retry. (Checked before claimFit so the debt mechanism
         // stays reserved for selection-deferred fits.)
-        const proposed = proposedSafeDimensions(fitAddon);
+        const proposed = proposedSafeDimensions(fitAddon, container);
         if (!proposed) return;
 
         // Selection-preservation guard: xterm's SelectionService clears the
@@ -2594,7 +2603,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // lastSentCols cache already "matches" — a transient sub-floor fit
       // could have left the daemon pinned at its MIN_SAFE_COLS clamp while
       // the cache believed otherwise. sendResize carries no dedup.
-      const dims = proposedSafeDimensions(fitAddon);
+      const dims = proposedSafeDimensions(fitAddon, container);
       if (dims) sendResize(ptyId, dims.cols, dims.rows);
       st.resolvers.splice(0).forEach((r) => r());
       return true;
@@ -2910,9 +2919,11 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       });
     }
 
-    // Resize PTY on initial fit — only when we actually have valid dimensions.
+    // Resize PTY on initial fit — only when that fit ran. Unfitted, xterm still
+    // holds its 80x24 default, which would shrink a background pane's PTY to
+    // a size nothing displays; the first fit after reveal sends the real one.
     const { cols, rows } = terminal;
-    if (cols > 0 && rows > 0) {
+    if (initialFitRan && cols > 0 && rows > 0) {
       lastSentCols = cols;
       lastSentRows = rows;
       sendResize(ptyId, cols, rows);
@@ -3210,7 +3221,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
           // daemon session was recreated at its default/clamped size; the
           // renderer's dedup cache may already "match" that stale value, so
           // the resize goes out unconditionally via sendResize (no dedup).
-          const dims = proposedSafeDimensions(fitAddonRef.current);
+          const dims = proposedSafeDimensions(fitAddonRef.current, containerRef.current);
           if (dims) sendResize(id, dims.cols, dims.rows);
         })
         .finally(() => { inFlight = false; reconnectInFlightRef.current = false; });
@@ -3292,7 +3303,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     }
     // #1255: floor gate — a font change re-measures the container; skip
     // sub-floor proposals instead of reflowing the buffer at a broken width.
-    if (!proposedSafeDimensions(fitAddonRef.current)) {
+    if (!proposedSafeDimensions(fitAddonRef.current, container)) {
       console.debug('[Terminal] font/theme fit skipped — sub-floor dimensions');
       return;
     }
