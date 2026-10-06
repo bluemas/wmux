@@ -688,6 +688,9 @@ export const IPC = {
   // Replaces the renderer-only performance.memory.usedJSHeapSize, which only
   // measured the renderer V8 JS heap (~10MB) and grossly under-reported usage.
   APP_MEMORY: 'app:memory',
+  // CPU use of wmux + all its child processes, percent of the whole machine
+  // (renderer -> main, invoke). null until a baseline sample exists.
+  APP_CPU: 'app:cpu',
   // Windows "start on login" toggle. GET queries the per-user Run registry key
   // (source of truth) and returns { enabled }. SET adds/removes it and returns
   // the post-op state. No-op returning { enabled: false } off-Windows.

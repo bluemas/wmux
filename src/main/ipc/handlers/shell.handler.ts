@@ -8,6 +8,9 @@ import { enumerateWslDistros } from '../../pty/defaultWslDistro';
 import { IPC } from '../../../shared/constants';
 import { wrapHandler } from '../wrapHandler';
 import { isAutostartEnabled, setAutostartEnabled } from '../../autostart';
+import { sampleAppCpuPercent } from '../../perf/appCpu';
+import { readDaemonPid } from '../../updater/installTeardown';
+import { getWmuxDir } from '../../../daemon/config';
 
 // Hard cap on the path string the renderer can send. Long enough for
 // Windows long-path (\\?\ prefix + ~32k) callers but small enough that a
@@ -123,6 +126,12 @@ export function registerShellHandlers(): () => void {
     return totalKB * 1024; // bytes
   }));
 
+  // CPU use of wmux and everything it started (Electron tree + the daemon's PTY
+  // and agent processes), polled next to the memory chip.
+  ipcMain.removeHandler(IPC.APP_CPU);
+  ipcMain.handle(IPC.APP_CPU, wrapHandler(IPC.APP_CPU, (_event: Electron.IpcMainInvokeEvent) =>
+    sampleAppCpuPercent(readDaemonPid(getWmuxDir()))));
+
   // Windows "start on login" toggle (issue #460). The per-user Run registry
   // key is the source of truth; GET reads it, SET writes it and echoes back
   // the resulting state so an optimistic renderer can reconcile. Both are
@@ -188,6 +197,7 @@ export function registerShellHandlers(): () => void {
     ipcMain.removeHandler(IPC.SHELL_OPEN_EXTERNAL);
     ipcMain.removeHandler(IPC.SHELL_OPEN_PATH);
     ipcMain.removeHandler(IPC.APP_MEMORY);
+    ipcMain.removeHandler(IPC.APP_CPU);
     ipcMain.removeHandler(IPC.AUTOSTART_GET);
     ipcMain.removeHandler(IPC.AUTOSTART_SET);
     ipcMain.removeHandler(IPC.SHELL_DETECT_APPS);

@@ -387,6 +387,8 @@ const electronAPI = {
      * V8 JS heap (~10MB) and under-reported real usage by ~10x.
      */
     getMemoryUsage: () => ipcRenderer.invoke(IPC.APP_MEMORY) as Promise<number>,
+    /** CPU % of the whole machine used by wmux and all its child processes. */
+    getCpuUsage: () => ipcRenderer.invoke(IPC.APP_CPU) as Promise<number | null>,
     /**
      * System woke from sleep (main's powerMonitor 'resume'). Used to rebuild
      * renderer GPU state that sleep can silently invalidate (shared glyph
