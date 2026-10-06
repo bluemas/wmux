@@ -139,7 +139,7 @@ import { ClaudeWorker } from './a2a/ClaudeWorker';
 import { AutoUpdater } from './updater/AutoUpdater';
 import { warnOnInstallIntegrityGap } from './updater/installIntegrity';
 import { readDaemonPid } from './updater/installTeardown';
-import { isAltF4Held } from './altF4';
+import { isAltF4Held, isAltF4KeyDown } from './altF4';
 import { McpRegistrar } from './mcp/McpRegistrar';
 import { BrokerSupervisor, isMcpBrokerEnabled } from './mcp/BrokerSupervisor';
 import { WebviewCdpManager } from './browser-session/WebviewCdpManager';
@@ -2473,11 +2473,18 @@ function adoptMainWindow(win: BrowserWindow): void {
 
   // Intercept window close — hide to tray instead of destroying, except for
   // Alt+F4, which asks to quit. The OS delivers Alt+F4 and the title-bar X as the
-  // same close request (and Chromium never reports the key), so the key state is
-  // read from the OS when the request arrives; the input event is a second hint.
+  // same close request (and the key may never reach the page), so the key state
+  // is read from the OS when the request arrives; the input event is a second hint.
   let altF4At = 0;
-  win.webContents.on('before-input-event', (_event, input) => {
-    if (input.type === 'keyDown' && input.alt && input.key === 'F4') altF4At = Date.now();
+  win.webContents.on('before-input-event', (event, input) => {
+    if (!isAltF4KeyDown(input)) return;
+    altF4At = Date.now();
+    // A focused terminal cancels Alt+F4 (xterm sends it to the shell), so no
+    // close request ever follows. On Windows, take the key here and ask.
+    if (process.platform === 'win32' && !isQuitting) {
+      event.preventDefault();
+      void confirmQuit(win);
+    }
   });
   win.on('close', (e) => {
     if (isQuitting) return;
