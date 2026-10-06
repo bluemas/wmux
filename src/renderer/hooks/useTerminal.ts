@@ -36,7 +36,7 @@ import {
 import { terminalFontFamilyCss } from '../utils/terminalFont';
 import { createPathLinkProvider } from '../terminal/pathLinkProvider';
 import { resolveNewlineKeyByte, wantsAltEnterNewline, foldAtPromptCarry, noteCodexEndedByPrompt } from '../terminal/newlineKeys';
-import { resolveMacWordDeleteByte } from '../terminal/macWordDeleteKey';
+import { resolveMacLineDeleteByte } from '../terminal/macLineDeleteKey';
 import { isWslShell } from '../../shared/imagePaste';
 import { encodeEscape, isBareEscape } from '../terminal/escapeKeys';
 import { resolveCtrlLetterByte } from '../terminal/ctrlLetterKeys';
@@ -2175,13 +2175,13 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         }
       }
 
-      // ⌘Backspace deletes the previous word (xterm encodes no ⌘ chord).
+      // ⌘Backspace deletes to the start of the line (xterm encodes no ⌘ chord).
       // Below the shortcut checks so a user binding on it still wins.
-      const wordDeleteByte = resolveMacWordDeleteByte(e, isMac);
-      if (wordDeleteByte !== null) {
+      const lineDeleteByte = resolveMacLineDeleteByte(e, isMac);
+      if (lineDeleteByte !== null) {
         e.preventDefault();
-        window.electronAPI.pty.write(ptyId, wordDeleteByte);
-        noteUserKeystroke(wordDeleteByte);
+        window.electronAPI.pty.write(ptyId, lineDeleteByte);
+        noteUserKeystroke(lineDeleteByte);
         return false;
       }
 
