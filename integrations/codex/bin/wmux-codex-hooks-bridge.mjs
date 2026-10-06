@@ -65,7 +65,7 @@
 //     feature flag, the flag's presence, and a clean config parse are all
 //     useless as capability probes; only the version is load-bearing.
 //
-// SELF-CONTAINED: JS-only, Node built-ins only — no imports from src/ or
+// JS-only with a sibling wmux-codex-thread.mjs; no imports from src/ or
 // integrations/shared/. Mirrors integrations/codex/bin/wmux-codex-notify.mjs
 // and integrations/kiro/bin/wmux-kiro-bridge.mjs; the duplication across
 // bridges is by design (a bridge runs in the agent's runtime, where wmux's
@@ -85,6 +85,10 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createConnection } from 'node:net';
 import { randomUUID } from 'node:crypto';
+
+import {
+  inspectCodexThread, codexSessionsRoot, notifierOrigin, attributeThread, recordThreadOwner, invalidatePaneOwner,
+} from './wmux-codex-thread.mjs';
 
 const HOOK_TIMEOUT_MS = 2000; // hard cap so we never stall a Codex turn
 // Stamped on every codex-hooks.log line; bump on behavior changes.
@@ -455,14 +459,14 @@ function nonEmptyStr(v) {
  * and `tool_input` are user and model content; this bridge is metadata-only,
  * and the allowlist here is where that is enforced.
  */
-export function buildCodexHookEnvelope(payload, { env = process.env, now = Date.now() } = {}) {
+export function buildCodexHookEnvelope(payload, { env = process.env, now = Date.now(), thread: classifiedThread } = {}) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
   const event = nonEmptyStr(payload.hook_event_name);
   // hasOwn, not a bare index: `constructor` / `toString` / `__proto__` resolve
   // through the prototype chain to truthy values, sail past a `!kind` guard,
   // and produce an envelope whose `kind` is a function or `{}`. Same trap the
   // Kiro bridge documents.
-  const kind = event && Object.hasOwn(EVENT_TO_KIND, event)
+  let kind = event && Object.hasOwn(EVENT_TO_KIND, event)
     ? EVENT_TO_KIND[event]
     : undefined;
   if (!kind) return null;
@@ -472,7 +476,14 @@ export function buildCodexHookEnvelope(payload, { env = process.env, now = Date.
 
   const sessionId = nonEmptyStr(payload.session_id);
   const turnId = nonEmptyStr(payload.turn_id);
-  const transcriptPath = nonEmptyStr(payload.transcript_path);
+  const thread = classifiedThread ?? (sessionId ? inspectCodexThread(sessionId, codexSessionsRoot(env)) : { subagent: false, confirmed: false });
+  if (thread.subagent) {
+    // Nested prompts/approvals must not change the lead's turn state either.
+    if (event !== 'Stop' && event !== 'SessionStart') return null;
+    kind = 'agent.subagent_stop';
+  }
+  const canBind = event === 'Stop' && thread.confirmed && !thread.subagent;
+  const transcriptPath = canBind ? nonEmptyStr(payload.transcript_path) : undefined;
   // `source` is "startup" | "resume" on SessionStart. Metadata, not content.
   // NO CONSUMER YET — nothing in src/ reads signal.payload.source; it is
   // carried because it is the only field that distinguishes a resumed session
@@ -485,7 +496,7 @@ export function buildCodexHookEnvelope(payload, { env = process.env, now = Date.
   return {
     kind,
     agent: 'codex',
-    ...(sessionId ? { agentSessionId: sessionId } : {}),
+    ...(sessionId && canBind ? { agentSessionId: sessionId } : {}),
     ptyId,
     ...(workspaceId ? { workspaceId } : {}),
     ...(surfaceId ? { surfaceId } : {}),
@@ -515,7 +526,19 @@ async function main() {
     return;
   }
 
-  const envelope = buildCodexHookEnvelope(payload);
+  const event = nonEmptyStr(payload?.hook_event_name);
+  if (!event || !Object.hasOwn(EVENT_TO_KIND, event)) return;
+  const sessionIdClaimed = nonEmptyStr(payload?.session_id);
+  const thread = sessionIdClaimed
+    ? inspectCodexThread(sessionIdClaimed, codexSessionsRoot(process.env))
+    : { subagent: false, confirmed: false };
+  const origin = notifierOrigin();
+  if (origin === 'process' && event === 'SessionStart' && !thread.subagent) {
+    invalidatePaneOwner();
+    if (thread.confirmed) recordThreadOwner(sessionIdClaimed, process.env);
+  }
+  if (!await attributeThread(origin, thread)) return;
+  const envelope = buildCodexHookEnvelope(payload, { thread });
   if (!envelope) {
     // Two reasons, and the log distinguishes them without echoing content: an
     // event wmux does not act on, or a pane we cannot identify.

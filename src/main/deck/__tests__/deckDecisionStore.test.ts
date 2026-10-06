@@ -4,7 +4,10 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
   raiseDecision,
+  raiseDecisionIfFree,
+  isIssueProposalDecision,
   replaceStaleDecision,
+  hasBrainBlockingDecision,
   resolveDecision,
   clearDecision,
   clearResolvedDecision,
@@ -14,6 +17,7 @@ import {
   renderStaleDecisionBlock,
   isDecisionStale,
   getDeckDecisionPath,
+  onDecisionsChanged,
   DECISION_LIMITS,
   type WorkspaceDecision,
 } from '../deckDecisionStore';
@@ -27,6 +31,40 @@ afterEach(() => {
 });
 
 describe('deckDecisionStore', () => {
+  it('raiseDecisionIfFree raises only into an empty slot and never clobbers', async () => {
+    const first = await raiseDecisionIfFree('ws-1', { question: 'Hand it off?', options: ['Yes', 'No'] }, dir);
+    expect(first).toMatchObject({ question: 'Hand it off?', status: 'pending' });
+    expect(await raiseDecisionIfFree('ws-1', { question: 'Second?' }, dir)).toBeNull();
+    expect(loadWorkspaceDecision('ws-1', dir)!.id).toBe(first!.id);
+    // A resolved answer not consumed yet holds the slot too.
+    await resolveDecision('ws-1', first!.id, 'Yes', dir);
+    expect(await raiseDecisionIfFree('ws-1', { question: 'Third?' }, dir)).toBeNull();
+    expect(loadWorkspaceDecision('ws-1', dir)!.resolution).toBe('Yes');
+    await clearResolvedDecision('ws-1', first!.id, dir);
+    expect(await raiseDecisionIfFree('ws-1', { question: 'Now?' }, dir)).toMatchObject({ question: 'Now?' });
+  });
+
+  it('keeps an issue-proposal card\'s origin and key through a resolve and a reload', async () => {
+    const d = await raiseDecisionIfFree('ws-1', { question: 'Hand it off?', origin: 'issue-proposal', ref: 'issue:github.com/a/b#1' }, dir);
+    expect(isIssueProposalDecision(d)).toBe(true);
+    await resolveDecision('ws-1', d!.id, 'Not now', dir);
+    expect(loadWorkspaceDecision('ws-1', dir)).toMatchObject({ origin: 'issue-proposal', ref: 'issue:github.com/a/b#1', status: 'resolved' });
+    expect(isIssueProposalDecision(await raiseDecision('ws-2', { question: 'Brain?' }, dir))).toBe(false);
+  });
+
+  it('tells change listeners after every write, and a throwing listener breaks nothing', async () => {
+    let calls = 0;
+    const offBad = onDecisionsChanged(() => { throw new Error('boom'); });
+    const off = onDecisionsChanged(() => { calls++; });
+    const d = await raiseDecision('ws-1', { question: 'A or B?' }, dir);
+    await resolveDecision('ws-1', d!.id, 'A', dir);
+    await clearDecision('ws-1', dir);
+    off();
+    offBad();
+    await raiseDecision('ws-1', { question: 'again?' }, dir);
+    expect(calls).toBe(3);
+  });
+
   it('raises a pending decision and loads it back', async () => {
     const d = await raiseDecision('ws-1', { question: 'A or B?', options: ['A', 'B'], context: 'ctx' }, dir);
     expect(d).toMatchObject({ question: 'A or B?', options: ['A', 'B'], status: 'pending' });
@@ -101,10 +139,25 @@ describe('deckDecisionStore', () => {
     const pending = renderDecisionBlock(d);
     expect(pending).toContain('BLOCKED');
     expect(pending).toContain('yes | no');
+    // A moot card is withdrawn by asking the operator to close it.
+    expect(pending).toContain('ask them to close the card with Not needed');
     const r = (await resolveDecision('ws-1', d.id, 'yes', dir))!;
     const resolved = renderDecisionBlock(r);
     expect(resolved).toContain('RESOLVED');
     expect(resolved).toContain('yes');
+  });
+
+  it('a dismissed decision survives a reload and renders as no answer, never as an option', async () => {
+    const d = (await raiseDecision('ws-1', { question: 'Continue the old session?', options: ['yes', 'no'] }, dir))!;
+    await resolveDecision('ws-1', d.id, '', dir, 'human', { dismissed: true });
+    const loaded = loadWorkspaceDecision('ws-1', dir)!;
+    expect(loaded).toMatchObject({ status: 'resolved', dismissed: true, resolvedBy: 'human' });
+    const block = renderDecisionBlock(loaded);
+    expect(block).toContain('DISMISSED');
+    expect(block).not.toContain('the human decided');
+    // A brain resolve can never carry the flag.
+    const e = (await raiseDecision('ws-2', { question: 'Q?' }, dir))!;
+    expect(await resolveDecision('ws-2', e.id, 'x', dir, 'brain', { dismissed: true })).not.toHaveProperty('dismissed');
   });
 
   it('resolveDecision returns null on a stale resolve (no double-transition kick)', async () => {
@@ -148,6 +201,7 @@ describe('deckDecisionStore', () => {
         '  options: yes | no',
         '  context: why',
         'Do not act until the human resolves this. If they just messaged you, they may be answering — otherwise wait.',
+        'If their message or a lookup already answers it, say so in one line and ask them to close the card with Not needed.',
       ].join('\n'),
     );
   });
@@ -329,5 +383,36 @@ describe('renderDecisionBlock provenance (round 3)', () => {
     const block = renderDecisionBlock(loadWorkspaceDecision('ws-1', dir)!);
     expect(block).toContain('the human decided: human answer');
     expect(block).not.toContain('(self)');
+  });
+});
+
+describe('main-owned cards in the store', () => {
+  it('replaceStaleDecision never swaps out a stale moa-handoff card, and the origin survives a reload', async () => {
+    writeFileSync(
+      getDeckDecisionPath(dir),
+      JSON.stringify({
+        'ws-1': {
+          id: 'dec-h', question: 'Moa proposes…', options: ['Hand off', 'Edit', 'Cancel'], context: '',
+          status: 'pending', raisedAt: 1, origin: 'moa-handoff', ref: 'h1',
+        },
+      }),
+    );
+    expect(await replaceStaleDecision('ws-1', 'dec-h', 60_000, { question: 'Mine now?' }, dir)).toBeNull();
+    expect(loadWorkspaceDecision('ws-1', dir)).toMatchObject({ id: 'dec-h', origin: 'moa-handoff' });
+  });
+});
+
+describe('hasBrainBlockingDecision', () => {
+  it('a pending main-owned card blocks no wake but still counts as pending', () => {
+    writeFileSync(
+      getDeckDecisionPath(dir),
+      JSON.stringify({
+        'ws-1': { id: 'h', question: 'Moa proposes…', options: [], context: '', status: 'pending', raisedAt: 1, origin: 'moa-handoff' },
+        'ws-2': { id: 'q', question: 'Brain asks?', options: [], context: '', status: 'pending', raisedAt: 1 },
+      }),
+    );
+    expect(hasBrainBlockingDecision('ws-1', dir)).toBe(false);
+    expect(hasPendingDecision('ws-1', dir)).toBe(true);
+    expect(hasBrainBlockingDecision('ws-2', dir)).toBe(true);
   });
 });

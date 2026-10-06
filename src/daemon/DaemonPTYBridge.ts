@@ -40,6 +40,9 @@ import { titleShowsRunningTurn } from './transcript/chatScreenGate';
  *  - 'awaitingActivity' → { sessionId, cause: 'input' | 'output', ... } —
  *                 stdin or output while the pane is blocked on a human
  *  - 'fenceInput' → { sessionId } — a key, click, release or wheel reached stdin
+ *  - 'typedInput' → { sessionId } — a key (not a mouse report) reached stdin;
+ *                 at most once per TYPED_INPUT_THROTTLE_MS. Workspace settle
+ *                 reads it as "someone is using this pane".
  *  - 'resize'   → (no payload) — an applied geometry change; consumers read the
  *                 new size from the session's own meta.
  */
@@ -338,6 +341,7 @@ export class DaemonPTYBridge extends EventEmitter {
         // Sizes nothing, carries nothing: a remote terminal-prompt answer that
         // a key or click has overtaken is refreshed off this.
         if (this.sessionId) this.emit('fenceInput', { sessionId: this.sessionId });
+        this.noteTyped(active);
       }
       this.emptyShellPrompt = false;
       this.completedShellCommand = false;
@@ -546,6 +550,20 @@ export class DaemonPTYBridge extends EventEmitter {
     return this.draftPending;
   }
 
+  /** Every mouse report: SGR (press, release, wheel, motion) and X10. */
+  private static readonly ANY_MOUSE = /\x1b\[<\d+;\d+;\d+[Mm]|\x1b\[M[\s\S]{3}/g;
+  static readonly TYPED_INPUT_THROTTLE_MS = 30_000;
+  private typedInputAt = -Infinity;
+
+  /** `active` is already free of passive input; a key is anything but a mouse report. */
+  private noteTyped(active: string): void {
+    if (!this.sessionId || active.replace(DaemonPTYBridge.ANY_MOUSE, '').length === 0) return;
+    const now = Date.now();
+    if (now - this.typedInputAt < DaemonPTYBridge.TYPED_INPUT_THROTTLE_MS) return;
+    this.typedInputAt = now;
+    this.emit('typedInput', { sessionId: this.sessionId });
+  }
+
   private static stripPassiveInput(data: string): string {
     return data
       .replace(DaemonPTYBridge.FOCUS_REPORT, '')
@@ -668,6 +686,11 @@ export class DaemonPTYBridge extends EventEmitter {
    *  pointer-motion reports do not break the quiet (#1680). */
   isKeyInputQuiet(): boolean {
     return Date.now() - this.lastKeyInputAt >= DaemonPTYBridge.INPUT_ECHO_QUIET_MS;
+  }
+
+  /** Milliseconds since the last key input (focus and pointer reports excluded). */
+  keyInputIdleMs(): number {
+    return Date.now() - this.lastKeyInputAt;
   }
 
   /** `isKeyInputQuiet` over a caller-chosen window: no key input for `ms`. */

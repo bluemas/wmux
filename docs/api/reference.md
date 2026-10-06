@@ -7,7 +7,7 @@
 
 # wmux API Reference (generated)
 
-> **Generated from wmux v3.66.0 sources.** This file is produced by
+> **Generated from wmux v4.0.0 sources.** This file is produced by
 > `scripts/gen-api-reference.mjs` directly from the code — it lists every
 > RPC method, event type, required capability, and the key event-bus
 > constants exactly as the running daemon sees them. For the hand-curated
@@ -26,7 +26,7 @@ returns `EPERM`. Wire framing: newline-delimited JSON, one object per line.
 
 ## RPC methods
 
-Total: **195** methods (`ALL_RPC_METHODS` in
+Total: **198** methods (`ALL_RPC_METHODS` in
 `src/shared/rpc.ts`). Capability and risk class are read from
 `src/main/mcp/methodCapabilityMap.ts`:
 
@@ -286,6 +286,7 @@ Total: **195** methods (`ALL_RPC_METHODS` in
 | `daemon.phone.register` | `wmux.internal` |  |
 | `daemon.phone.complete` | `wmux.internal` |  |
 | `daemon.workspaceFacts.set` | `wmux.internal` |  |
+| `daemon.moa.set` | `wmux.internal` |  |
 | `daemon.inbox.poll` | `wmux.internal` |  |
 
 ### `hooks`
@@ -306,8 +307,10 @@ Total: **195** methods (`ALL_RPC_METHODS` in
 | `deck.completeWork` | `null` |  |
 | `deck.requestDecision` | `null` |  |
 | `deck.resolveDecision` | `null` |  |
+| `deck.proposeHandoff` | `null` |  |
 | `deck.state.prune` | `wmux.internal` |  |
 | `usage.rateLimits` | `wmux.internal` |  |
+| `deck.moaReadRoots` | `wmux.internal` |  |
 | `task.mission.start` | `a2a.channel.send` | `a2a` |
 | `task.mission.close` | `a2a.channel.send` | `a2a` |
 | `task.mission.list` | `a2a.channel.read` | `a2a` |

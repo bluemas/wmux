@@ -8,8 +8,9 @@ export type SettingsTabId =
   | 'notifications'
   | 'claude-integration'
   | 'accounts'
-  | 'orchestrator'
+  | 'moa'
   | 'roles'
+  | 'tokens'
   | 'browser'
   | 'computer-use'
   | 'remote'
@@ -44,7 +45,7 @@ export const SETTINGS_NAV_GROUPS: {
   {
     id: 'agents',
     labelKey: 'settings.navGroupAgents',
-    tabs: ['claude-integration', 'accounts', 'orchestrator', 'roles', 'browser', 'computer-use'],
+    tabs: ['claude-integration', 'accounts', 'moa', 'roles', 'tokens', 'browser', 'computer-use'],
   },
   {
     id: 'connections',
@@ -61,10 +62,12 @@ export const SETTINGS_NAV_GROUPS: {
  * Tab ids that no longer exist, mapped to the tab that now holds their
  * settings. `agents` was split into Orchestrator and Roles & fan-out; the
  * orchestrator half kept the tab's first section, so an old deep link lands
- * there. Every tab id that survived kept its spelling, so it needs no alias.
+ * there. Orchestrator then became Moa (the HQ main bot), which kept all of its
+ * rows. Every other tab id kept its spelling, so it needs no alias.
  */
 export const LEGACY_SETTINGS_TAB_ALIASES: Readonly<Record<string, SettingsTabId>> = {
-  agents: 'orchestrator',
+  agents: 'moa',
+  orchestrator: 'moa',
 };
 
 const TAB_IDS: ReadonlySet<string> = new Set(SETTINGS_NAV_GROUPS.flatMap((g) => g.tabs));
@@ -111,6 +114,7 @@ export const SETTINGS_CATALOG: SettingsCatalogEntry[] = [
   { id: 'sidebarpos', tab: 'appearance', labelKey: 'settings.sidebarPosition', descKey: 'settings.sidebarPositionDesc', synonyms: 'sidebar left right dock' },
   { id: 'sidebarattention', tab: 'appearance', labelKey: 'settings.sidebarSort', descKey: 'settings.sidebarSortDesc', synonyms: 'needs you waiting attention sort order recent activity manual pin top 대기 정렬 순서 최근' },
   { id: 'sidebarpanecoordinates', tab: 'appearance', labelKey: 'settings.sidebarShowPaneCoordinates', descKey: 'settings.sidebarShowPaneCoordinatesDesc', synonyms: 'roster coordinate w1-2 pane name label unnamed clutter agent' },
+  { id: 'workspacesettleidle', tab: 'appearance', labelKey: 'settings.workspaceSettleIdleDays', descKey: 'settings.workspaceSettleIdleDaysDesc', synonyms: 'settle settled idle days finished snooze hide quiet sidebar 마무리 미뤄두기 유휴' },
   { id: 'multiview', tab: 'appearance', labelKey: 'settings.multiviewArrangement', descKey: 'settings.multiviewArrangementDesc', synonyms: 'grid split stack columns rows' },
   { id: 'uiscale', tab: 'appearance', labelKey: 'settings.uiScale', descKey: 'settings.uiScaleDesc', synonyms: 'zoom dpi accessibility scale 배율' },
   { id: 'toolbar', tab: 'appearance', labelKey: 'settings.agentToolbarShow', descKey: 'settings.agentToolbarShowDesc', synonyms: 'toolbar compose new chat' },
@@ -120,6 +124,7 @@ export const SETTINGS_CATALOG: SettingsCatalogEntry[] = [
   { id: 'osnotify', tab: 'notifications', labelKey: 'settings.ring', descKey: 'settings.ringDesc', synonyms: 'system toast windows macos banner' },
   { id: 'catmute', tab: 'notifications', labelKey: 'settings.notificationCategories', descKey: 'settings.notificationCategoriesDesc', synonyms: 'mute category subagent approval' },
   { id: 'wsmute', tab: 'notifications', labelKey: 'settings.perWorkspaceNotifications', descKey: 'settings.perWorkspaceNotificationsDesc', synonyms: 'mute workspace quiet' },
+  { id: 'wsprwake', tab: 'notifications', labelKey: 'settings.prWake', descKey: 'settings.prWakeDesc', synonyms: 'pull request ci checks review comment conflict nudge agent' },
 
   { id: 'quicklaunch', tab: 'shortcuts', labelKey: 'settings.quickLaunch', descKey: 'settings.quickLaunchDesc', synonyms: 'quick launch global shortcut hotkey composer spotlight launcher prompt 빠른 실행 전역 단축키' },
   { id: 'quicklaunchkey', tab: 'shortcuts', labelKey: 'settings.quickLaunchShortcut', descKey: 'settings.quickLaunchShortcutDesc', synonyms: 'quick launch global hotkey cmd shift space 빠른 실행 단축키' },
@@ -134,13 +139,29 @@ export const SETTINGS_CATALOG: SettingsCatalogEntry[] = [
 
   { id: 'claudeacct', tab: 'accounts', labelKey: 'accounts.title', synonyms: 'claude account login subscription max usage quota 계정' },
 
-  { id: 'brain', tab: 'orchestrator', labelKey: 'settings.orchestratorBrain', descKey: 'settings.orchestratorBrainDesc', synonyms: 'orchestrator brain hermes claude acp' },
-  { id: 'model', tab: 'orchestrator', labelKey: 'settings.orchestratorModel', descKey: 'settings.orchestratorModelDesc', synonyms: 'model opus sonnet haiku' },
-  { id: 'effort', tab: 'orchestrator', labelKey: 'settings.orchestratorEffort', descKey: 'settings.orchestratorEffortDesc', synonyms: 'effort thinking reasoning budget low medium high max' },
-  { id: 'autowake', tab: 'orchestrator', labelKey: 'settings.autoWake', descKey: 'settings.autoWakeDesc', synonyms: 'autowake wake event push tokens' },
-  { id: 'fullpower', tab: 'orchestrator', labelKey: 'settings.orchestratorFullPower', synonyms: 'full power sdk settings sources tools' },
-  { id: 'ledgergate', tab: 'orchestrator', labelKey: 'settings.ledgerGate', descKey: 'settings.ledgerGateDesc', synonyms: 'ledger gate stop task orchestrator delegated experimental' },
-  { id: 'briefing', tab: 'orchestrator', labelKey: 'settings.briefing', descKey: 'settings.briefingDesc', synonyms: 'briefing welcome home summary' },
+  { id: 'moaswitch', tab: 'moa', labelKey: 'moa.settings.switch', descKey: 'moa.settings.switchDesc', synonyms: 'moa main bot hq orchestrator brain on off enable disable 모아 메인봇 오케스트레이터' },
+  { id: 'brain', tab: 'moa', labelKey: 'moa.settings.engine', descKey: 'moa.settings.engineDesc', synonyms: 'orchestrator brain engine runtime hermes claude acp sdk terminal' },
+  { id: 'model', tab: 'moa', labelKey: 'settings.orchestratorModel', descKey: 'settings.orchestratorModelDesc', synonyms: 'model opus sonnet haiku' },
+  { id: 'effort', tab: 'moa', labelKey: 'settings.orchestratorEffort', descKey: 'settings.orchestratorEffortDesc', synonyms: 'effort thinking reasoning budget low medium high max' },
+  { id: 'moahq', tab: 'moa', labelKey: 'moa.settings.hq', synonyms: 'hq headquarters workspace recreate reset setup' },
+  { id: 'moamodes', tab: 'moa', labelKey: 'moa.settings.modes', descKey: 'moa.settings.modesDesc', synonyms: 'mode off assist danger autonomy workspace 모드' },
+  { id: 'moaturncap', tab: 'moa', labelKey: 'moa.settings.turnCap', descKey: 'moa.settings.turnCapDesc', synonyms: 'turn cap limit rate hour budget usage' },
+  { id: 'moamemoryproposals', tab: 'moa', labelKey: 'moa.settings.memoryProposals', descKey: 'moa.settings.memoryProposalsDesc', synonyms: 'remember precedent skill proposal memory save 기억 판례 스킬' },
+  { id: 'moaapprovalpress', tab: 'moa', labelKey: 'moa.settings.approvalPress', descKey: 'moa.settings.approvalPressDesc', synonyms: 'approval approve press permission prompt auto yes danger worker 승인' },
+  { id: 'moaretro', tab: 'moa', labelKey: 'moa.settings.retro', descKey: 'moa.settings.retroDesc', synonyms: 'retro retrospective weekly review summary interruptions stalls 회고' },
+  { id: 'moastats', tab: 'moa', labelKey: 'moa.settings.stats', descKey: 'moa.settings.statsDesc', synonyms: 'track record stats statistics clear reset delegation 실적' },
+  { id: 'moaissueproposals', tab: 'moa', labelKey: 'moa.settings.issueProposals', descKey: 'moa.settings.issueProposalsDesc', synonyms: 'issue pr pull request propose new hand off github contributor 이슈 제안' },
+  { id: 'moaautohandoff', tab: 'moa', labelKey: 'moa.settings.autoHandoff', descKey: 'moa.settings.autoHandoffDesc', synonyms: 'hand off handoff auto danger delegate without asking card 위임 자동 핸드오프' },
+  { id: 'moareadwithoutasking', tab: 'moa', labelKey: 'moa.settings.readWithoutAsking', descKey: 'moa.settings.readWithoutAskingDesc', synonyms: 'read grep glob files permission prompt ask repo delegated verify 읽기 권한' },
+  { id: 'moaissuepoll', tab: 'moa', labelKey: 'moa.settings.issuePoll', descKey: 'moa.settings.issuePollDesc', synonyms: 'poll interval minutes scan check github issue' },
+  { id: 'moatrustedauthors', tab: 'moa', labelKey: 'moa.settings.trustedAuthors', descKey: 'moa.settings.trustedAuthorsDesc', synonyms: 'trusted author login github auto label wmux:auto' },
+  { id: 'moaignoredrepos', tab: 'moa', labelKey: 'moa.settings.ignoredRepos', descKey: 'moa.settings.ignoredReposDesc', synonyms: 'ignore mute repo repository proposals' },
+  { id: 'moabubbles', tab: 'moa', labelKey: 'moa.settings.bubbles', descKey: 'moa.settings.bubblesDesc', synonyms: 'bubble notification popup titlebar dot moa 말풍선 알림' },
+  { id: 'moareducemotion', tab: 'moa', labelKey: 'moa.settings.reduceMotion', descKey: 'moa.settings.reduceMotionDesc', synonyms: 'reduce motion animation mascot still accessibility 애니메이션 동작 줄이기' },
+  { id: 'fullpower', tab: 'moa', labelKey: 'settings.orchestratorFullPower', synonyms: 'full power sdk settings sources tools' },
+  { id: 'autowake', tab: 'moa', labelKey: 'settings.autoWake', descKey: 'settings.autoWakeDesc', synonyms: 'autowake wake event push tokens' },
+  { id: 'ledgergate', tab: 'moa', labelKey: 'settings.ledgerGate', descKey: 'settings.ledgerGateDesc', synonyms: 'ledger gate stop task orchestrator delegated experimental' },
+  { id: 'briefing', tab: 'moa', labelKey: 'settings.briefing', descKey: 'settings.briefingDesc', synonyms: 'briefing welcome home summary' },
 
   { id: 'roles', tab: 'roles', labelKey: 'settings.roleBindings', descKey: 'settings.roleBindingsDesc', synonyms: 'role reviewer tester planner model bind' },
   { id: 'a2a', tab: 'roles', labelKey: 'settings.a2aAutoApproveExecute', descKey: 'settings.a2aAutoApproveExecuteDesc', synonyms: 'a2a execute approve' },
@@ -149,6 +170,8 @@ export const SETTINGS_CATALOG: SettingsCatalogEntry[] = [
   { id: 'fanoutworkers', tab: 'roles', labelKey: 'settings.fanoutWorkerPermissionMode', descKey: 'settings.fanoutWorkerPermissionModeDesc', synonyms: 'fanout fan-out worker permission auto bypass sandbox' },
   { id: 'fanoutpresets', tab: 'roles', labelKey: 'settings.fanoutPresets', descKey: 'settings.fanoutPresetsDesc', synonyms: 'fanout fan-out preset image video agents codex grok output folder worktree' },
   { id: 'fanoutallowtools', tab: 'roles', labelKey: 'settings.fanoutAllowWorkerTools', descKey: 'settings.fanoutAllowWorkerToolsDesc', synonyms: 'fanout worker allow tools permissions settings.json' },
+
+  { id: 'tokenprofile', tab: 'tokens', labelKey: 'settings.tokenProfile', descKey: 'settings.tokenProfileDesc', synonyms: 'token usage cost cheap minimal balanced effort model profile' },
 
   { id: 'browserbackend', tab: 'browser', labelKey: 'settings.browserBackend', descKey: 'settings.browserBackendDesc', synonyms: 'browser chrome chromium external builtin' },
   { id: 'browserlight', tab: 'browser', labelKey: 'settings.browserLightweight', descKey: 'settings.browserLightweightDesc', synonyms: 'browser throttle cpu lightweight' },

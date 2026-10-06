@@ -4,6 +4,8 @@ import { BROWSER_BACKENDS, isBrowserBackend } from '../../../shared/browserBacke
 import { isWslShellPath } from '../../../shared/wslDistro';
 import type { ImagePasteMode } from '../../../shared/imagePaste';
 import { useShallow } from 'zustand/react/shallow';
+import { isMoaHqWorkspace } from '../../stores/slices/moaSlice';
+import { workspaceCloseRefusal } from '../Moa/moaHqGuard';
 import { useStore } from '../../stores';
 import { selectWorkspaceMuteRows } from '../../stores/selectors/workspaceProjections';
 import { LOCALE_OPTIONS, type Locale } from '../../i18n';
@@ -50,7 +52,7 @@ import {
 } from '../../../shared/keymap';
 import { shortcutPressGuard } from '../../utils/shortcutBindings';
 import { describeShortcut, rebindProblemText } from '../../utils/shortcutRebind';
-import { CLAUDE_EFFORT_LEVELS, CLAUDE_MODEL_OPTIONS } from '../../../shared/claudeModels';
+import { CLAUDE_EFFORT_LEVELS } from '../../../shared/claudeModels';
 import {
   agyEffortOf,
   agyFamilyOf,
@@ -65,9 +67,9 @@ import { MULTIVIEW_ARRANGEMENTS } from '../../utils/multiviewGrid';
 import type { NicInfo, LanLinkNic, LanLinkStatus, LanLinkPeerSummary } from '../../../shared/lanlink';
 import type { FirstRunCheckResult } from '../../../shared/firstRun';
 import { FIRST_RUN_REOPEN_EVENT } from '../../../shared/firstRun';
-import { notifyBriefingConfigChanged } from '../Deck/deckBriefingConfigBus';
 import { ClaudeIntegrationSection } from './ClaudeIntegrationSection';
 import { IntegrationSetupSectionContainer, MCP_STATUS_CHANGED_EVENT } from './IntegrationSetupSection';
+import { McpStatusSection } from './McpStatusSection';
 import { AccountsSection } from './AccountsSection';
 import { FanoutPresetsSection } from './FanoutPresetsSection';
 import { terminalFontFamilyCss } from '../../utils/terminalFont';
@@ -88,8 +90,12 @@ import Select from '../ui/Select';
 import Input from '../ui/Input';
 import SegmentedControl from '../ui/SegmentedControl';
 import Badge from '../ui/Badge';
+import TokenUsageTab from './tabs/TokenUsageTab';
 import './settings.css';
 import { SettingsSection, SettingRow, SettingNote } from './SettingsLayout';
+import { MAX_WORKSPACE_IDLE_DAYS, MIN_WORKSPACE_IDLE_DAYS } from '../../../shared/workspaceSettle';
+import { sendWorkspaceSettleIdleDays } from '../../hooks/useWorkspaceSettleBridge';
+import { TabMoa } from './MoaTab';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -570,19 +576,18 @@ function ResetSection() {
   const { invoke: ipcInvoke } = useIpc();
 
   const handleReset = useCallback(async () => {
-    const workspaces = useStore.getState().workspaces;
-    // Dispose all PTYs across all workspaces
-    for (const ws of workspaces) {
-      disposeWorkspacePtys(ws);
-    }
-
-    // Remove all workspaces except the last one (store requires at least 1)
-    const ids = workspaces.map((w) => w.id);
-    // Add a fresh workspace first
+    // Moa's HQ workspace is app-owned and survives a reset (the store refuses
+    // to remove it), so its sessions are left alone too.
+    const workspaces = useStore.getState().workspaces.filter((w) => !isMoaHqWorkspace(useStore.getState(), w.id));
+    // Add a fresh workspace first, so every old one passes the shared close
+    // check (the operator always keeps one workspace of their own).
     addWorkspace('Workspace 1');
-    // Then remove all old ones
-    for (const id of ids) {
-      removeWorkspace(id);
+    // Then dispose and remove each old one, asking the close check before any
+    // dispose so a refused removal never leaves a dead, empty workspace.
+    for (const ws of workspaces) {
+      if (workspaceCloseRefusal(useStore.getState(), ws.id)) continue;
+      disposeWorkspacePtys(ws);
+      removeWorkspace(ws.id);
     }
 
     // Save the clean session — surface IPC errors via toast (daemon may be down).
@@ -978,252 +983,6 @@ function RoleBindingEditor() {
   );
 }
 
-function OrchestratorSection() {
-  const t = useT();
-  const deckBrainModel = useStore((s) => s.deckBrainModel);
-  const setDeckBrainModel = useStore((s) => s.setDeckBrainModel);
-  const deckBrainEffort = useStore((s) => s.deckBrainEffort);
-  const setDeckBrainEffort = useStore((s) => s.setDeckBrainEffort);
-  const deckBrainFullPower = useStore((s) => s.deckBrainFullPower);
-  const setDeckBrainFullPower = useStore((s) => s.setDeckBrainFullPower);
-  const deckBrainVendor = useStore((s) => s.deckBrainVendor);
-  const setDeckBrainVendor = useStore((s) => s.setDeckBrainVendor);
-  const channelsTabVisible = useStore((s) => s.channelsTabVisible);
-  const setChannelsTabVisible = useStore((s) => s.setChannelsTabVisible);
-  // Global auto-wake switch — persisted in MAIN (deck-autowake.json) because
-  // the event-push coalescer that spends the tokens lives there. Read on
-  // mount; optimistic toggle with echo reconciliation.
-  const [autoWake, setAutoWake] = useState(true);
-  useEffect(() => {
-    let cancelled = false;
-    window.electronAPI.deck?.autoWake
-      ?.get()
-      .then((r) => { if (!cancelled) setAutoWake(r.enabled); })
-      .catch(() => undefined); // keep the default-on rendering
-    return () => { cancelled = true; };
-  }, []);
-  const onAutoWakeChange = (enabled: boolean) => {
-    setAutoWake(enabled);
-    window.electronAPI.deck?.autoWake
-      ?.set(enabled)
-      .then((r) => setAutoWake(r.enabled))
-      .catch(() => setAutoWake(!enabled));
-  };
-  // `deck.ledgerGate` — persisted in MAIN (deck-ledger-gate.json), the same
-  // file the Stop gate reads, so the toggle and the gate can never disagree and
-  // the choice survives a restart. Default OFF; same optimistic-toggle-with-
-  // echo shape as auto-wake, except the default rendering is off, so a failed
-  // read leaves the switch showing the behaviour actually in force.
-  const [ledgerGate, setLedgerGate] = useState(false);
-  useEffect(() => {
-    let cancelled = false;
-    window.electronAPI.deck?.ledgerGate
-      ?.get()
-      .then((r) => { if (!cancelled) setLedgerGate(r.enabled); })
-      .catch(() => undefined); // keep the default-off rendering
-    return () => { cancelled = true; };
-  }, []);
-  const onLedgerGateChange = (enabled: boolean) => {
-    setLedgerGate(enabled);
-    window.electronAPI.deck?.ledgerGate
-      ?.set(enabled)
-      .then((r) => setLedgerGate(r.enabled))
-      .catch(() => setLedgerGate(!enabled));
-  };
-  // D1 briefing toggles — persisted in MAIN (deck-briefing.json). Read on mount;
-  // optimistic toggle with echo reconciliation (mirrors auto-wake).
-  const [briefingEnabled, setBriefingEnabled] = useState(true);
-  const [briefingAutoShow, setBriefingAutoShow] = useState(true);
-  useEffect(() => {
-    let cancelled = false;
-    window.electronAPI.deck?.briefing
-      ?.getConfig()
-      .then((c) => {
-        if (cancelled) return;
-        setBriefingEnabled(c.enabled);
-        setBriefingAutoShow(c.autoShow);
-      })
-      .catch(() => undefined); // keep the default-on rendering
-    return () => { cancelled = true; };
-  }, []);
-  // A mounted DeckBriefingCard reads its config from main, not from this
-  // component's state, so every confirmed change is broadcast — otherwise a card
-  // that is already on screen stays visible after the operator turns it off.
-  const onBriefingEnabledChange = (enabled: boolean) => {
-    setBriefingEnabled(enabled);
-    window.electronAPI.deck?.briefing
-      ?.setConfig({ enabled })
-      .then((c) => {
-        setBriefingEnabled(c.enabled);
-        setBriefingAutoShow(c.autoShow);
-        notifyBriefingConfigChanged();
-      })
-      .catch(() => setBriefingEnabled(!enabled));
-  };
-  const onBriefingAutoShowChange = (autoShow: boolean) => {
-    setBriefingAutoShow(autoShow);
-    window.electronAPI.deck?.briefing
-      ?.setConfig({ autoShow })
-      .then((c) => {
-        setBriefingEnabled(c.enabled);
-        setBriefingAutoShow(c.autoShow);
-        notifyBriefingConfigChanged();
-      })
-      .catch(() => setBriefingAutoShow(!autoShow));
-  };
-  const options = CLAUDE_MODEL_OPTIONS.map((o) => ({
-    value: o.value,
-    label: o.value === '' ? t('settings.orchestratorModelDefault') : o.label,
-  }));
-  // A hand-typed / newer id that is not in the list still shows as itself.
-  if (deckBrainModel && !options.some((o) => o.value === deckBrainModel)) {
-    options.push({ value: deckBrainModel, label: deckBrainModel });
-  }
-  const effortOptions = [
-    { value: '', label: t('settings.orchestratorEffortDefault') },
-    ...CLAUDE_EFFORT_LEVELS.map((l) => ({ value: l, label: l })),
-  ];
-  return (
-    <>
-      <SettingsSection data-testid="orchestrator-section">
-        <SettingRow id="brain"
-          label={t('settings.orchestratorBrain')}
-          description={t('settings.orchestratorBrainDesc')}
-        >
-          <SettingSelect
-            value={deckBrainVendor}
-            onChange={(v) =>
-              setDeckBrainVendor(v === 'claude' || v === 'hermes' ? v : 'claude-pty')
-            }
-            options={[
-              { value: 'claude', label: t('settings.orchestratorBrainClaude') },
-              { value: 'claude-pty', label: t('settings.orchestratorBrainClaudePty') },
-              { value: 'hermes', label: t('settings.orchestratorBrainHermes') },
-            ]}
-            label={t('settings.orchestratorBrain')}
-          />
-        </SettingRow>
-        {/* Picking the terminal runtime does not only swap the agent behind the
-            orchestrator: the panel itself becomes an embedded Claude Code TUI
-            instead of the chat surface. That is the change people actually
-            notice, and nothing said so before they picked it. */}
-        {deckBrainVendor === 'claude-pty' && (
-          <SettingNote data-testid="orchestrator-claude-pty-note">
-            {t('settings.orchestratorBrainClaudePtyNote')}
-          </SettingNote>
-        )}
-        <SettingRow id="model"
-          label={t('settings.orchestratorModel')}
-          description={t('settings.orchestratorModelDesc')}
-        >
-          <SettingSelect
-            value={deckBrainModel}
-            onChange={setDeckBrainModel}
-            options={options}
-            label={t('settings.orchestratorModel')}
-          />
-        </SettingRow>
-        {/* Effort reaches both Claude runtimes (SDK options.effort / TUI
-            --effort); an ACP brain ignores it, so the row hides there. */}
-        {deckBrainVendor !== 'hermes' && (
-          <SettingRow id="effort"
-            label={t('settings.orchestratorEffort')}
-            description={t('settings.orchestratorEffortDesc')}
-          >
-            <SettingSelect
-              value={deckBrainEffort}
-              onChange={setDeckBrainEffort}
-              options={effortOptions}
-              label={t('settings.orchestratorEffort')}
-            />
-          </SettingRow>
-        )}
-        {/* Full power tunes settingSources/canUseTool — both SDK-only knobs. The
-            terminal brain (an interactive TUI) and ACP brains ignore the flag
-            entirely (see createAdapter in deck.handler), so with the terminal
-            brain now the default the row would otherwise read as a toggle that
-            does nothing when clicked. Inert + a reason instead of hidden: the
-            setting still exists, it just belongs to the other vendor. */}
-        <SettingRow
-          id="fullpower"
-          label={t('settings.orchestratorFullPower')}
-          description={
-            deckBrainVendor === 'claude'
-              ? t('settings.orchestratorFullPowerDesc')
-              : t('settings.orchestratorFullPowerSdkOnly')
-          }
-        >
-          <Toggle
-            checked={deckBrainFullPower}
-            onChange={setDeckBrainFullPower}
-            label={t('settings.orchestratorFullPower')}
-            disabled={deckBrainVendor !== 'claude'}
-          />
-        </SettingRow>
-        <SettingRow id="autowake"
-          label={t('settings.autoWake')}
-          description={t('settings.autoWakeDesc')}
-        >
-          <Toggle
-            checked={autoWake}
-            onChange={onAutoWakeChange}
-            label={t('settings.autoWake')}
-          />
-        </SettingRow>
-        {/* Experimental on purpose: this replaces the shipped Stop gate's
-            snapshot inference with the task ledger, and the ledger has not run a
-            full dogfood yet (orchestrator track, 2026-09). */}
-        <SettingRow id="ledgergate"
-          label={t('settings.ledgerGate')}
-          description={t('settings.ledgerGateDesc')}
-        >
-          <div className="flex items-center gap-3">
-            <Badge title={t('settings.ledgerGateDesc')}>{t('settings.mcpExperimental')}</Badge>
-            <Toggle
-              checked={ledgerGate}
-              onChange={onLedgerGateChange}
-              label={t('settings.ledgerGate')}
-            />
-          </div>
-        </SettingRow>
-        <SettingRow
-          label={t('settings.channelsTabVisible')}
-          description={t('settings.channelsTabVisibleDesc')}
-        >
-          <Toggle
-            checked={channelsTabVisible}
-            onChange={setChannelsTabVisible}
-            label={t('settings.channelsTabVisible')}
-          />
-        </SettingRow>
-      </SettingsSection>
-      <SettingsSection title={t('settings.briefing')}>
-        <SettingRow
-          id="briefing"
-          label={t('settings.briefing')}
-          description={t('settings.briefingDesc')}
-        >
-          <Toggle
-            checked={briefingEnabled}
-            onChange={onBriefingEnabledChange}
-            label={t('settings.briefing')}
-          />
-        </SettingRow>
-        <SettingRow
-          label={t('settings.briefingAutoShow')}
-          description={t('settings.briefingAutoShowDesc')}
-        >
-          <Toggle
-            checked={briefingAutoShow}
-            onChange={onBriefingAutoShowChange}
-            label={t('settings.briefingAutoShow')}
-          />
-        </SettingRow>
-      </SettingsSection>
-    </>
-  );
-}
-
 // ─── MCP integration status ──────────────────────────────────────────────────
 
 /** Mirror of McpStatusPayload in main/ipc/handlers/mcp.handler.ts. */
@@ -1245,176 +1004,7 @@ interface McpStatusPayload {
   targets: McpTargetStatusPayload[];
 }
 
-interface ElectronMcpApi {
-  check: () => Promise<McpStatusPayload>;
-  reregister: () => Promise<McpStatusPayload>;
-  unregister: () => Promise<McpStatusPayload>;
-}
 
-/**
- * MCP servers panel in Settings → General. Surfaces whether each agent config
- * has the wmux MCP entry, plus Re-register / Unregister buttons.
- *
- * Mirrors the `wmux mcp check` CLI output so users have a one-stop way to
- * verify Claude Code can discover the wmux MCP bridge — DX D4 decision.
- */
-/** Tell the setup card (and any other MCP view) to re-read. This section's
- *  own listener re-reads too, which costs one extra check and nothing else. */
-function announceMcpChange(): void {
-  window.dispatchEvent(new CustomEvent(MCP_STATUS_CHANGED_EVENT));
-}
-
-function McpStatusSection() {
-  const t = useT();
-  const [status, setStatus] = useState<McpStatusPayload | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [confirmingUnregister, setConfirmingUnregister] = useState(false);
-  const [pending, setPending] = useState<'reregister' | 'unregister' | null>(null);
-  // NOT_FOUND is expected when running the dev shell with no main wired up;
-  // silence those toasts so the empty state renders cleanly.
-  const { invoke: ipcInvoke } = useIpc({ silent: ['NOT_FOUND', 'UNKNOWN'] });
-
-  // Lazily access the API so this component is safe to render in tests where
-  // the preload has not exposed mcp yet.
-  const mcpApi = (window.electronAPI as unknown as { mcp?: ElectronMcpApi }).mcp;
-
-  const refresh = useCallback(async () => {
-    if (!mcpApi) {
-      setLoading(false);
-      return;
-    }
-    const result = await ipcInvoke(() => mcpApi.check());
-    if (result.ok) setStatus(result.data);
-    setLoading(false);
-  }, [ipcInvoke, mcpApi]);
-
-  useEffect(() => {
-    void refresh();
-    // The setup card's Register writes the same configs: re-read after it.
-    const onChanged = () => void refresh();
-    window.addEventListener(MCP_STATUS_CHANGED_EVENT, onChanged);
-    return () => window.removeEventListener(MCP_STATUS_CHANGED_EVENT, onChanged);
-  }, [refresh]);
-
-  const handleReregister = useCallback(async () => {
-    if (!mcpApi) return;
-    setPending('reregister');
-    const result = await ipcInvoke(() => mcpApi.reregister());
-    if (result.ok) setStatus(result.data);
-    setPending(null);
-    announceMcpChange();
-  }, [ipcInvoke, mcpApi]);
-
-  const handleUnregister = useCallback(async () => {
-    if (!mcpApi) return;
-    setPending('unregister');
-    const result = await ipcInvoke(() => mcpApi.unregister());
-    if (result.ok) setStatus(result.data);
-    setPending(null);
-    announceMcpChange();
-    setConfirmingUnregister(false);
-  }, [ipcInvoke, mcpApi]);
-
-  // Section is hidden entirely when the preload doesn't expose the API —
-  // keeps older dev builds clean and avoids "phantom" buttons that error.
-  if (!mcpApi && !loading) return null;
-
-  // One row per client config. The status is a Badge (neutral/success), the
-  // client name is prose, and only the config path is mono (machine evidence).
-  // Non-existent configs read "not detected" — the agent isn't installed, and
-  // wmux never creates its config.
-  const renderTarget = (target: McpTargetStatusPayload) => (
-    <div key={target.id} className="settings-row" data-mcp-target={target.id}>
-      <div className="flex items-center justify-between gap-3">
-        <div className="min-w-0 flex flex-col gap-0.5">
-          <span className="flex items-center gap-2">
-            <span className="ui-field-label">{target.displayName}</span>
-            {!target.verified && (
-              <Badge title={t('settings.mcpExperimentalTitle')}>{t('settings.mcpExperimental')}</Badge>
-            )}
-          </span>
-          {target.configExists ? (
-            <span className="ui-field-description font-mono truncate" title={target.configPath}>
-              {target.configPath}
-              {target.configModified ? ` ${t('settings.mcpModified', { date: new Date(target.configModified).toLocaleString() })}` : ''}
-            </span>
-          ) : (
-            <span className="ui-field-description">
-              {t('settings.mcpNotDetected')}<span className="font-mono">{target.configPath}</span>
-            </span>
-          )}
-          {target.configExists && target.wmux.path && (
-            <span className="ui-field-description font-mono truncate" title={target.wmux.path}>
-              {target.wmux.path}
-            </span>
-          )}
-        </div>
-        {target.configExists && (
-          <Badge tone={target.wmux.registered ? 'success' : 'neutral'}>
-            {target.wmux.registered && <span aria-hidden="true" className="inline-flex"><IconCheck size={12} /></span>}
-            {target.wmux.registered ? t('settings.mcpRegistered') : t('settings.mcpNotRegistered')}
-          </Badge>
-        )}
-      </div>
-    </div>
-  );
-
-  const actions = status ? (
-    <div className="flex items-center gap-2 shrink-0">
-      <Button
-        variant="secondary"
-        onClick={() => void handleReregister()}
-        disabled={pending !== null}
-      >
-        {pending === 'reregister' ? '…' : t('settings.mcpReregister')}
-      </Button>
-      {confirmingUnregister ? (
-        <>
-          <Button
-            variant="ghost"
-            onClick={() => setConfirmingUnregister(false)}
-            disabled={pending !== null}
-          >
-            {t('common.cancel')}
-          </Button>
-          <UiButton
-            variant="danger"
-            size="md"
-            onClick={() => void handleUnregister()}
-            disabled={pending !== null}
-          >
-            {pending === 'unregister' ? '…' : t('settings.mcpConfirm')}
-          </UiButton>
-        </>
-      ) : (
-        <Button
-          variant="destructive"
-          onClick={() => setConfirmingUnregister(true)}
-          disabled={pending !== null}
-        >
-          {t('settings.mcpUnregister')}
-        </Button>
-      )}
-    </div>
-  ) : undefined;
-
-  return (
-    <SettingsSection id="mcp" title={t('settings.mcpServers')}>
-      {loading ? (
-        <SettingNote>{t('settings.mcpChecking')}</SettingNote>
-      ) : status ? (
-        <>
-          {status.targets.map((target) => renderTarget(target))}
-          <div className="settings-row">
-            <div className="flex justify-end">{actions}</div>
-          </div>
-        </>
-      ) : (
-        <SettingNote>{t('settings.mcpUnavailable')}</SettingNote>
-      )}
-    </SettingsSection>
-  );
-}
 
 // ─── LanLink control plane (PR-3) ───────────────────────────────────────────────
 //
@@ -1430,7 +1020,7 @@ export const LANLINK_NIC_NONE = '';
 
 /** Stable select-value key for a NIC identity (US separator can't appear in a name/MAC). */
 function nicKey(nic: LanLinkNic): string {
-  return `${nic.name}${nic.mac}`;
+  return `${nic.name}\x1f${nic.mac}`;
 }
 
 export interface NicOption {
@@ -2147,6 +1737,7 @@ function UpdateStatus() {
             variant="secondary"
             onClick={handleCheck}
             disabled={state === 'checking' || state === 'downloading'}
+            data-settings-check-update
           >
             {t('settings.checkUpdate')}
           </Button>
@@ -2673,15 +2264,6 @@ function FanoutWorkersSection() {
         </SettingNote>
       )}
     </SettingsSection>
-  );
-}
-
-// ─── Orchestrator tab — the deck brain: runtime, model, wake, gates ──────────
-function TabOrchestrator() {
-  return (
-    <div className="settings-page">
-      <OrchestratorSection />
-    </div>
   );
 }
 
@@ -3977,6 +3559,7 @@ function TabAppearance() {
   const setSidebarSortMode = useStore((s) => s.setSidebarSortMode);
   const sidebarShowPaneCoordinates = useStore((s) => s.sidebarShowPaneCoordinates);
   const setSidebarShowPaneCoordinates = useStore((s) => s.setSidebarShowPaneCoordinates);
+  const workspaceSettleIdleDays = useStore((s) => s.workspaceSettle.idleDays);
   const setSidebarPosition = useStore((s) => s.setSidebarPosition);
   const multiviewArrangement = useStore((s) => s.multiviewArrangement);
   const setMultiviewArrangement = useStore((s) => s.setMultiviewArrangement);
@@ -4131,6 +3714,24 @@ function TabAppearance() {
             label={t('settings.sidebarShowPaneCoordinates')}
           />
         </SettingRow>
+        {/* Main owns the value (it runs the idle rule while the window is
+            closed). The field shows it at once and main's reply confirms it. */}
+        <SettingRow
+          id="workspacesettleidle"
+          label={t('settings.workspaceSettleIdleDays')}
+          description={t('settings.workspaceSettleIdleDaysDesc')}
+        >
+          <SettingNumberInput
+            value={workspaceSettleIdleDays}
+            min={MIN_WORKSPACE_IDLE_DAYS}
+            max={MAX_WORKSPACE_IDLE_DAYS}
+            label={t('settings.workspaceSettleIdleDays')}
+            onChange={(days) => {
+              useStore.getState().setWorkspaceSettleIdleDays(days);
+              sendWorkspaceSettleIdleDays(days);
+            }}
+          />
+        </SettingRow>
       </SettingsSection>
 
       <SettingsSection title={t('settings.sectionPanes')}>
@@ -4233,6 +3834,10 @@ export interface NotificationsViewWorkspaceRow {
   id: string;
   name: string;
   muted: boolean;
+  /** "Wake the agent on PR events" — absent reads as on (the default). */
+  prWake?: boolean;
+  /** Its "checks passed" pointer — absent reads as off (the default). */
+  prWakeChecksPassed?: boolean;
 }
 
 export interface NotificationsViewProps {
@@ -4264,6 +3869,9 @@ export interface NotificationsViewProps {
   // T12 — per-workspace mute list
   workspaces: NotificationsViewWorkspaceRow[];
   onChangeWorkspaceMuted: (workspaceId: string, muted: boolean) => void;
+  /** Per-workspace "Wake the agent on PR events"; absent hides the section. */
+  onChangeWorkspacePrWake?: (workspaceId: string, enabled: boolean) => void;
+  onChangeWorkspacePrWakeChecksPassed?: (workspaceId: string, enabled: boolean) => void;
 
   // Translator — injected so the pure view can render with the live
   // `useT()` translator in production and a static stub in tests.
@@ -4288,7 +3896,7 @@ export function NotificationsView(props: NotificationsViewProps) {
     taskbarFlashEnabled, onChangeTaskbarFlashEnabled,
     notificationSoundChoice, onChangeNotificationSoundChoice,
     mutedNotificationCategories, onChangeCategoryMuted,
-    workspaces, onChangeWorkspaceMuted,
+    workspaces, onChangeWorkspaceMuted, onChangeWorkspacePrWake, onChangeWorkspacePrWakeChecksPassed,
     t,
   } = props;
 
@@ -4486,6 +4094,69 @@ export function NotificationsView(props: NotificationsViewProps) {
           </div>
         )}
       </SettingsSection>
+
+      {/* Per-workspace "Wake the agent on PR events" (renderer/hooks/fanoutCallerNudge.ts) */}
+      {onChangeWorkspacePrWake && workspaces.length > 0 && (
+        <SettingsSection
+          id="wsprwake"
+          title={t('settings.prWake')}
+          description={t('settings.prWakeDesc')}
+          data-testid="per-workspace-pr-wake-section"
+        >
+          <div className="flex flex-col" style={{ maxHeight: 240, overflowY: 'auto' }}>
+            {workspaces.map((ws, idx) => {
+              const labelId = `workspace-pr-wake-label-${ws.id}`;
+              const enabled = ws.prWake !== false;
+              return (
+                <div
+                  key={ws.id}
+                  className="settings-row"
+                  style={{
+                    flexDirection: 'row',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    borderTop: idx === 0 ? 'none' : '1px solid var(--surface-hairline)',
+                  }}
+                  data-testid={`per-workspace-pr-wake-row-${ws.id}`}
+                >
+                  <span className="ui-field-label truncate min-w-0 mr-3" id={labelId}>
+                    {ws.name}
+                  </span>
+                  <div className="flex items-center gap-4 shrink-0">
+                    <label className="flex items-center gap-2 cursor-pointer ui-field-description">
+                      {t('settings.prWakeFailures')}
+                      <input
+                        id={`workspace-pr-wake-${ws.id}`}
+                        type="checkbox"
+                        checked={enabled}
+                        aria-describedby={labelId}
+                        onChange={(e) => onChangeWorkspacePrWake(ws.id, e.target.checked)}
+                        data-testid={`per-workspace-pr-wake-checkbox-${ws.id}`}
+                        className="settings-native-check cursor-pointer"
+                      />
+                    </label>
+                    {onChangeWorkspacePrWakeChecksPassed && (
+                      <label className="flex items-center gap-2 cursor-pointer ui-field-description">
+                        {t('settings.prWakeChecksPassed')}
+                        <input
+                          id={`workspace-pr-wake-passed-${ws.id}`}
+                          type="checkbox"
+                          checked={enabled && ws.prWakeChecksPassed === true}
+                          disabled={!enabled}
+                          aria-describedby={labelId}
+                          onChange={(e) => onChangeWorkspacePrWakeChecksPassed(ws.id, e.target.checked)}
+                          data-testid={`per-workspace-pr-wake-passed-checkbox-${ws.id}`}
+                          className="settings-native-check cursor-pointer"
+                        />
+                      </label>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </SettingsSection>
+      )}
     </div>
   );
 }
@@ -4525,6 +4196,8 @@ function TabNotifications() {
       id: ws.id,
       name: ws.name,
       muted: ws.notificationsMuted,
+      prWake: ws.wakeOnPrEvents,
+      prWakeChecksPassed: ws.wakeOnPrChecksPassed,
     })),
     [muteRows],
   );
@@ -4552,6 +4225,8 @@ function TabNotifications() {
       onChangeCategoryMuted={setNotificationCategoryMuted}
       workspaces={workspaceRows}
       onChangeWorkspaceMuted={(id, muted) => updateWorkspaceMetadata(id, { notificationsMuted: muted })}
+      onChangeWorkspacePrWake={(id, enabled) => updateWorkspaceMetadata(id, { wakeOnPrEvents: enabled })}
+      onChangeWorkspacePrWakeChecksPassed={(id, enabled) => updateWorkspaceMetadata(id, { wakeOnPrChecksPassed: enabled })}
     />
   );
 }
@@ -5090,8 +4765,8 @@ export function TabShortcuts() {
 //   - "Open setup wizard"  → dispatches FIRST_RUN_REOPEN_EVENT window event
 //                            (T8a's AppLayout listens and re-mounts the wizard
 //                            in mode='reopen').
-//   - "Show keyboard cheat sheet" → flips `cheatSheetDismissed` to false in
-//                            uiSlice; T8a's effect remounts the cheat sheet.
+//   - "Show keyboard cheat sheet" → force-shows the cheat sheet (as the `?`
+//                            prefix action does) and closes Settings.
 //
 // Section name is "First-run setup" (D7-C4 — avoids collision with the
 // existing "Onboarding" spotlight tutorial).
@@ -5206,9 +4881,19 @@ export function FirstRunStatusView({ status, onOpenWizard, onShowCheatSheet }: F
   );
 }
 
+/**
+ * Settings › First-run setup › "Show keyboard cheat sheet": shown now, like the
+ * `?` prefix action, with Settings out of the way (the sheet sits under it).
+ * The first-boot queue only auto-shows it after the tour, which this button
+ * must not wait for.
+ */
+export function showCheatSheetFromSettings(): void {
+  useStore.getState().setCheatSheetForceShown(true);
+  useStore.getState().setSettingsPanelVisible(false);
+}
+
 function TabFirstRunSetup() {
   const [status, setStatus] = useState<FirstRunCheckResult | null>(null);
-  const setCheatSheetDismissed = useStore((s) => s.setCheatSheetDismissed);
 
   useEffect(() => {
     const api = firstRunBridgeOrNull();
@@ -5233,17 +4918,13 @@ function TabFirstRunSetup() {
     window.dispatchEvent(new CustomEvent(FIRST_RUN_REOPEN_EVENT));
   }, []);
 
-  const handleShowCheatSheet = useCallback(() => {
-    // Approach A (per task brief): flip uiSlice flag back to false. T8a's
-    // AppLayout effect on cheatSheetDismissed → false re-mounts the cheat sheet.
-    setCheatSheetDismissed(false);
-  }, [setCheatSheetDismissed]);
+
 
   return (
     <FirstRunStatusView
       status={status}
       onOpenWizard={handleOpenWizard}
-      onShowCheatSheet={handleShowCheatSheet}
+      onShowCheatSheet={showCheatSheetFromSettings}
     />
   );
 }
@@ -5432,8 +5113,17 @@ export default function SettingsPanel({ initialTab }: { initialTab?: string }) {
 
   // Every id that reaches the state goes through resolveSettingsTab, so a
   // retired or unknown id (an old deep link) opens a real tab, never nothing.
-  const [activeTab, setActiveTabState] = useState<TabId>(() => resolveSettingsTab(initialTab));
+  // A tab asked for from elsewhere (`openSettingsTab`) wins over the default.
+  const [activeTab, setActiveTabState] = useState<TabId>(
+    () => resolveSettingsTab(initialTab ?? useStore.getState().settingsInitialTab),
+  );
   const setActiveTab = useCallback((id: string) => setActiveTabState(resolveSettingsTab(id)), []);
+  const requestedTab = useStore((s) => s.settingsInitialTab);
+  useEffect(() => {
+    if (!requestedTab) return;
+    setActiveTab(requestedTab);
+    useStore.getState().clearSettingsInitialTab();
+  }, [requestedTab, setActiveTab]);
   const ownedDialogs = useRef(0);
   const registerOwnedDialog = useCallback((delta: number) => { ownedDialogs.current += delta; }, []);
   const [searchQuery, setSearchQuery] = useState('');
@@ -5481,8 +5171,9 @@ export default function SettingsPanel({ initialTab }: { initialTab?: string }) {
     notifications:        { label: t('settings.tabNotifications'), icon: <IconNotifications /> },
     'claude-integration': { label: t('settings.tabClaudeCode'),    icon: <IconClaude /> },
     accounts:             { label: t('settings.tabAccounts'),      icon: <IconUsers /> },
-    orchestrator:         { label: t('settings.tabOrchestrator'),  icon: <IconAgents /> },
+    moa:                  { label: t('settings.tabMoa'),           icon: <IconAgents /> },
     roles:                { label: t('settings.tabRoles'),         icon: <IconRobot /> },
+    tokens:               { label: t('settings.tabTokens'),        icon: <IconAgents /> },
     browser:              { label: t('settings.tabBrowser'),       icon: <IconBrowser /> },
     'computer-use':       { label: t('settings.tabComputerUse'),   icon: <IconComputer /> },
     remote:               { label: t('settings.tabRemote'),        icon: <IconRemoteDevices /> },
@@ -5667,8 +5358,9 @@ export default function SettingsPanel({ initialTab }: { initialTab?: string }) {
                     {activeTab === 'notifications'      && <TabNotifications />}
                     {activeTab === 'claude-integration' && <TabClaudeCode />}
                     {activeTab === 'accounts'           && <AccountsSection />}
-                    {activeTab === 'orchestrator'       && <TabOrchestrator />}
+                    {activeTab === 'moa'                && <TabMoa registerDialog={registerOwnedDialog} />}
                     {activeTab === 'roles'              && <TabRoles />}
+          {activeTab === 'tokens'             && <TokenUsageTab onOpenTab={setActiveTab} />}
                     {activeTab === 'browser'            && <TabBrowser />}
                     {activeTab === 'computer-use'       && <TabComputerUse />}
                     {activeTab === 'remote'             && <TabRemote />}

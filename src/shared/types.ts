@@ -386,6 +386,13 @@ export interface WorkspaceMetadata {
   // them, and the listener (T7) skips toast/sound/ring/flashFrame.
   // undefined === false === not muted.
   notificationsMuted?: boolean;
+  // "Wake the agent on PR events": when a PR event (CI failed, checks passed,
+  // a review comment, a merge conflict) arrives for this workspace and no
+  // brain hears it, write one pointer line into the agent pane that owns the
+  // PR (renderer/hooks/fanoutCallerNudge.ts). undefined === true === on.
+  wakeOnPrEvents?: boolean;
+  // "Checks passed" is its own, lower-priority switch: undefined === false.
+  wakeOnPrChecksPassed?: boolean;
   // ── X1 workspace-context sidebar (schema-freeze §2, additive) ──
   /** True when gitBranch comes from a linked worktree, not the main checkout. */
   gitIsWorktree?: boolean;
@@ -405,6 +412,12 @@ export interface PrStatus {
   state: 'open' | 'draft' | 'merged' | 'closed';
   checks: 'pending' | 'passing' | 'failing' | null;
   url: string;
+  /** Set (true) only when GitHub reports the PR as conflicting with its base;
+   *  absent otherwise (additive, read in the same `gh pr view` call). */
+  conflicting?: true;
+  /** The PR head commit (`headRefOid`), read in the same `gh pr view` call.
+   *  Keys the PR owner nudge dedup (one line per PR, kind and head). */
+  headSha?: string;
 }
 
 /** Sidebar git sync badge — dirty count + ahead/behind vs upstream
@@ -481,6 +494,13 @@ export interface MetadataUpdatePayload {
    * send ''.
    */
   lastMessage?: string;
+  /**
+   * The retained last activity line (the renderer's `surfaceLastActivity`)
+   * outlives a Stop, so a finished row can say what it did. Only a session
+   * start sends it, as '' — a fresh session (startup, `/clear`, a restarted
+   * agent) must not inherit the previous session's line.
+   */
+  lastActivity?: '';
   // External RPC channels (meta.setStatus / meta.setProgress) write through
   // the same payload. Renderer applies these to the active workspace when no
   // ptyId/workspaceId is provided.

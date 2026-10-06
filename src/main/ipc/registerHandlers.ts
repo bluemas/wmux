@@ -1,5 +1,6 @@
 import { registerQuickCommandHandlers } from './handlers/quickCommand.handler';
 import { registerUsageLimitHandlers } from '../usageLimit/usageLimit.handler';
+import { registerWorkspaceSettle } from '../workspace/settle/workspaceSettleHost';
 import { ipcMain, type BrowserWindow } from 'electron';
 import { PTYManager } from '../pty/PTYManager';
 import { PTYBridge } from '../pty/PTYBridge';
@@ -28,6 +29,11 @@ import { registerToolbarHandlers } from './handlers/toolbar.handler';
 import { registerDiffHandlers } from './handlers/diff.handler';
 import { registerWorktreeHandlers } from './handlers/worktree.handler';
 import { registerGithubHandlers } from './handlers/github.handler';
+import { registerPrReviewHandlers } from './handlers/prReview.handler';
+import { registerWorkLinkHandlers } from './handlers/workLink.handler';
+import { registerTrackRecordHandlers } from './handlers/trackRecord.handler';
+import { registerGitShipHandlers } from './handlers/gitShip.handler';
+import { registerGhLoginHandlers } from './handlers/ghLogin.handler';
 import { registerMcpHandlers } from './handlers/mcp.handler';
 import { registerTokenUsageQuotaHandlers } from './handlers/tokenUsageQuota.handler';
 import { registerTokenUsageSurfaceHandlers } from './handlers/tokenUsageSurface.handler';
@@ -162,6 +168,7 @@ export function registerAllHandlers(
 ): () => void {
   const cleanupPty = registerPTYHandlers(ptyManager, ptyBridge, daemonClient, getWindow);
   const cleanupUsageLimit = registerUsageLimitHandlers(daemonClient, getWindow);
+  const cleanupWorkspaceSettle = registerWorkspaceSettle(getWindow, { daemonClient, ptyManager });
   // session/scrollback handlers: installed elsewhere (module-load in
   // main/index.ts) and intentionally NOT in this swap cycle. See the
   // import-block note above for the race rationale.
@@ -185,6 +192,14 @@ export function registerAllHandlers(
   const cleanupWorktree = registerWorktreeHandlers();
   // Deck Git 탭 PR 섹션 — gh CLI 기반(미설치/미인증은 fail-closed 안내).
   const cleanupGithub = registerGithubHandlers();
+  // PR review and CI on the Git page's detail pane.
+  const cleanupPrReview = registerPrReviewHandlers();
+  // Work links — read-only for the renderer (docs/work-links.md).
+  const cleanupWorkLinks = registerWorkLinkHandlers(getWindow);
+  // Moa's track record — the retro card and its schedule (Settings → Moa).
+  const cleanupTrackRecord = registerTrackRecordHandlers(getWindow);
+  const cleanupGitShip = registerGitShipHandlers();
+  const cleanupGhLogin = registerGhLoginHandlers(getWindow);
   const cleanupMcp = options.mcpRegistrar
     ? registerMcpHandlers(options.mcpRegistrar, options.getMcpAuthToken ?? (() => null))
     : null;
@@ -494,6 +509,7 @@ export function registerAllHandlers(
   return () => {
     cleanupPty();
     cleanupUsageLimit();
+    cleanupWorkspaceSettle();
     // cleanupSession deliberately omitted — session/scrollback handlers
     // live outside this swap cycle (see import-block note above).
     cleanupShell();
@@ -505,6 +521,11 @@ export function registerAllHandlers(
     cleanupDiff();
     cleanupWorktree();
     cleanupGithub();
+    cleanupPrReview();
+    cleanupWorkLinks();
+    cleanupTrackRecord();
+    cleanupGitShip();
+    cleanupGhLogin();
     if (cleanupMcp) cleanupMcp();
     cleanupTokenUsageQuota();
     cleanupTokenUsageSurface();

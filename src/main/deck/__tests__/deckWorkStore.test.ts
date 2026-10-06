@@ -12,6 +12,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { isSmallTalk } from '../smallTalk';
 import {
   beginOrContinueDeckWork,
   recordDeckWorkA2aTask,
@@ -29,6 +30,7 @@ import {
   loadLiveDeckWork,
   loadLiveDeckWorks,
   unparkDeckWork,
+  operatorDecisionContext,
 } from '../deckWorkStore';
 
 let dir: string;
@@ -553,6 +555,15 @@ describe('renderActiveDeckWorkBlock', () => {
     expect(block).toMatch(/do NOT finish it/i);
   });
 
+  it('asks only for the closed list of forks, with a recommendation, and forbids progress reports', () => {
+    beginOrContinueDeckWork('ws-1', 'ship the roster', dir, 1_000);
+    const flat = renderActiveDeckWorkBlock(loadActiveDeckWork('ws-1', dir)!).replace(/\s+/g, ' ');
+    expect(flat).toContain('that one final report is all they hear, so no progress reports.');
+    expect(flat).toContain('Settle forks yourself (lookups first, then production impact).');
+    expect(flat).toContain('Use deck_ask_decision only for taste, a release, an irreversible outside action, a security-boundary change or ambiguous operator intent, with your recommended option first, and leave this work active.');
+    expect(flat).not.toContain('If blocked on a real human fork');
+  });
+
   it('lists tracked tasks as POINTERS and tells the brain to query canonical state', () => {
     beginOrContinueDeckWork('ws-1', 'objective', dir, 1_000);
     recordDeckWorkA2aTask(
@@ -612,3 +623,38 @@ describe('renderActiveDeckWorkBlock', () => {
     expect(block).not.toContain('Continue delegating');
   });
 });
+
+describe('deckWorkStore — small talk is not work', () => {
+  it('reads a thank-you or a greeting, alone, as small talk', () => {
+    for (const t of ['ㅋㅋㅋ', 'ㅎㅎ', 'lol', 'haha', '👍', '🙏🙏', 'ㅋㅋ 👍', '고마워', '고마워요!', '감사합니다 :)', '수고했어 ㅎㅎ', '정말 고마워요 🙏', '안녕하세요', 'ㄱㅅ', 'Thanks!', 'thank you so much', 'hi Moa', 'Good morning', 'nice work']) {
+      expect(isSmallTalk(t), t).toBe(true);
+    }
+  });
+
+  it('anything that asks for something is work', () => {
+    for (const t of ['math.js에 빼기 함수 추가해줘', '고마워, 이제 테스트도 돌려줘', 'thanks, now run the tests', 'ok', '네', '좋아', 'hi, what is running?', '', '   ']) {
+      expect(isSmallTalk(t), t).toBe(false);
+    }
+    expect(isSmallTalk('고마워 '.repeat(20))).toBe(false);
+  });
+});
+
+describe('operatorDecisionContext', () => {
+  it('reduces a PARKED brain block to the request it is about', () => {
+    const ctx = [
+      '[active-work PARKED] id: work-1',
+      'objective: ship the fleet rework',
+      'tracked A2A tasks (query canonical state before acting):',
+      '- task=task-1 to=ws-gone state=canceled',
+      'This request predates the current wmux session, so it is PARKED: it is recorded but NOT authorization to act.',
+      'Ask the human whether to resume or drop it (deck_ask_decision) and wait for the answer.',
+    ].join('\n');
+    expect(operatorDecisionContext(ctx)).toBe('Earlier request: "ship the fleet rework"');
+  });
+
+  it('does the same for a dropped-work block, and passes the brain\'s own prose through', () => {
+    expect(operatorDecisionContext('[dropped-work] id: work-2\nobjective: x')).toBe('Earlier request: "x"');
+    expect(operatorDecisionContext('Two options; I recommend A.')).toBe('Two options; I recommend A.');
+  });
+});
+

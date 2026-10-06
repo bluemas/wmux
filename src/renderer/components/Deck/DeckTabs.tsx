@@ -3,9 +3,10 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { tokenAttrs } from '../../themes';
-import { IconRobot, IconGitBranch, IconHash } from '../icons';
+import { IconRobot, IconHash } from '../icons';
 import { formatDeckCount } from './deckIconStyles';
 import type { DeckTab } from '../../stores/slices/deckSlice';
+import { setDeckHeaderSlot } from './deckHeaderSlot';
 
 export interface DeckTabsProps {
   active: DeckTab;
@@ -38,6 +39,14 @@ export interface DeckTabsProps {
   commanderModelValue?: string;
   /** 모델 선택 콜백. 있으면 활성 Agent 탭 재클릭 시 드롭다운이 열린다. */
   onCommanderModelSelect?: (value: string) => void;
+  /** Moa owns the panel: the Orchestrator tab is named for it instead
+   *  ("Moa" over "Main bot", the mascot for its icon). Omit → unchanged. */
+  commanderTitle?: string;
+  commanderSubtitle?: string;
+  commanderIcon?: React.ReactNode;
+  /** What the icon says without words (e.g. "needs you"), for the tab's
+   *  accessible name. */
+  commanderStatusLabel?: string;
   /** Translator — defaults to identity so tests can omit it. */
   t?: (key: string) => string;
 }
@@ -49,7 +58,6 @@ const TABS: {
   Icon: (props: { size?: number }) => React.ReactElement;
 }[] = [
   { id: 'commander', labelKey: 'deck.tabCommander', fallback: 'Orchestrator', Icon: IconRobot },
-  { id: 'git', labelKey: 'deck.tabGit', fallback: 'Git', Icon: IconGitBranch },
   { id: 'channels', labelKey: 'deck.tabChannels', fallback: 'Channels', Icon: IconHash },
 ];
 
@@ -64,6 +72,10 @@ export function DeckTabs({
   commanderModelOptions,
   commanderModelValue = '',
   onCommanderModelSelect,
+  commanderTitle,
+  commanderSubtitle,
+  commanderIcon,
+  commanderStatusLabel,
   t: tProp,
 }: DeckTabsProps): React.ReactElement {
   const t = tProp ?? ((key: string) => key);
@@ -74,7 +86,9 @@ export function DeckTabs({
   // 드롭다운은 탭 button의 형제로, relative 래퍼 안에 절대배치한다.
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const modelMenuRef = useRef<HTMLDivElement>(null);
-  const canModelMenu = !!onCommanderModelSelect && !!commanderModelOptions?.length;
+  // Moa owns the tab: the model is picked in its ⋯ menu (Model ›), so the tab
+  // is a plain label and opens no second model menu.
+  const canModelMenu = !commanderTitle && !!onCommanderModelSelect && !!commanderModelOptions?.length;
   useEffect(() => {
     if (!modelMenuOpen) return;
     const onDoc = (e: MouseEvent) => {
@@ -116,12 +130,15 @@ export function DeckTabs({
         const isCommander = tab.id === 'commander';
         // Agent 탭만 모델 인라인 드롭다운을 가진다(활성 상태에서 재클릭 시 토글).
         const tabHasModelMenu = isCommander && canModelMenu;
-        const baseLabel = t(tab.labelKey) || tab.fallback;
+        const baseLabel = (isCommander && commanderTitle) || t(tab.labelKey) || tab.fallback;
+        const named = isCommander && commanderTitle && commanderSubtitle ? `${baseLabel} · ${commanderSubtitle}` : baseLabel;
         // Keep the current model in the accessible name and tooltip.
-        const label = isCommander && commanderModelLabel ? `${baseLabel} (${commanderModelLabel})` : baseLabel;
+        const label = isCommander && commanderModelLabel ? `${named} (${commanderModelLabel})` : named;
         const unread = tab.id === 'channels' ? formatDeckCount(channelsUnread) : null;
         // Include unread activity in the accessible name as well as the badge.
-        const ariaLabel = unread ? `${label} (${unread} unread)` : label;
+        // The two suffixes add up: an unread count never drops the mascot state.
+        const status = isCommander && commanderStatusLabel ? ` — ${commanderStatusLabel}` : '';
+        const ariaLabel = `${label}${status}${unread ? ` (${unread} unread)` : ''}`;
         const button = (
           <button
             key={tab.id}
@@ -132,6 +149,7 @@ export function DeckTabs({
             title={label}
             data-deck-tab={tab.id}
             data-active={isActive ? 'true' : undefined}
+            data-deck-tab-named={isCommander && commanderTitle ? 'true' : undefined}
             {...(tabHasModelMenu ? { 'aria-haspopup': 'menu', 'aria-expanded': modelMenuOpen } : {})}
             onClick={() => {
               // 비활성 → 탭 선택(기존 동작). 활성 Agent 탭 재클릭 → 모델 메뉴 토글.
@@ -141,8 +159,11 @@ export function DeckTabs({
             className="wmux-deck-tab"
             {...(isActive ? tokenAttrs('textMain', 'text') : tokenAttrs('textMuted', 'text'))}
           >
-            <tab.Icon size={16} />
+            {isCommander && commanderIcon ? commanderIcon : <tab.Icon size={16} />}
             <span className="wmux-deck-tab-label">{baseLabel}</span>
+            {isCommander && commanderTitle && commanderSubtitle && (
+              <span className="text-[11px] text-[var(--text-sub)]" data-deck-tab-subtitle>{commanderSubtitle}</span>
+            )}
             {/* 활성 Agent 탭에만 붙는 힌트 — 재클릭하면 모델 메뉴가 열린다는 표시. */}
             {tabHasModelMenu && isActive && (
               <span aria-hidden="true" className="wmux-deck-tab-chevron">▾</span>
@@ -164,7 +185,7 @@ export function DeckTabs({
                 role="menu"
                 aria-label={t('deck.orchestratorModel') || 'Orchestrator model'}
                 data-commander-model-menu
-                className="absolute left-0 top-full mt-2 z-50 min-w-[160px] rounded-lg border p-1 shadow-lg bg-[var(--bg-surface)]"
+                className="absolute left-0 top-full mt-2 z-50 min-w-[160px] max-w-[calc(100vw-1rem)] rounded-lg border p-1 shadow-lg bg-[var(--bg-surface)]"
                 style={{ borderColor: 'var(--border-soft)' }}
                 {...tokenAttrs('bgSurface', 'bg')}
               >
@@ -207,6 +228,12 @@ export function DeckTabs({
         <div data-deck-header-tools className="wmux-deck-header-tools">
           {afterTabs}
         </div>
+      )}
+      {/* Moa owns the panel: its mode chip and options menu are portalled in
+          here by CommanderView, which holds the state they act on. Hidden
+          while empty (Moa off, or its workspace missing). */}
+      {commanderTitle && (
+        <div ref={setDeckHeaderSlot} data-moa-header-slot className="flex items-center ml-auto shrink-0 pr-1.5 gap-1 empty:hidden" />
       )}
       {rightSlot && (
         <div data-deck-header-controls className="flex items-center ml-auto shrink-0 pr-1.5 gap-0.5">

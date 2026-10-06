@@ -4,7 +4,9 @@ import { useShallow } from 'zustand/react/shallow';
 import { useStore } from '../../stores';
 import { selectWorkspaceIdName } from '../../stores/selectors/workspaceProjections';
 import { useGlanceBoardOrder } from './useGlanceBoardOrder';
-import { buildSidebarTree, ORPHAN_GROUP_KEY } from './sidebarTree';
+import { buildSidebarTree, ORPHAN_GROUP_KEY, type SidebarTreeNode } from './sidebarTree';
+import { partitionWorkspaceSettle, workspaceSettleGroupOf } from './workspaceSettleGroups';
+import WorkspaceSettleGroup from './WorkspaceSettleGroup';
 import SidebarTaskGroup, { ClosedPaneTaskGroup } from './SidebarTaskGroup';
 import SidebarResizeHandle from './SidebarResizeHandle';
 import { resolveTaskLink } from '../../utils/fanoutProvenance';
@@ -22,6 +24,8 @@ import { useT } from '../../hooks/useT';
 import { buildWorkspaceMarkdown } from '../../utils/sessionInfoMarkdown';
 import { tokenAttrs } from '../../themes';
 import { collapseDirection } from './sidebarGlyphs';
+import { nextRowIndex } from './sidebarRowKeys';
+import SidebarSortMenu from './SidebarSortMenu';
 import { IconPlus, IconChevronDir, IconGear } from '../icons';
 import { FOCUS_RING } from '../focusRing';
 import { HIT_TARGET_24 } from '../hitArea';
@@ -35,6 +39,7 @@ import {
 
 import PresetPicker from './PresetPicker';
 import { COMPANY_MODE_ENABLED } from '../../../shared/featureFlags';
+import { listedWorkspaces, moaHqId as selectMoaHqId, refuseWorkspaceClose } from '../Moa/moaHqGuard';
 
 /** Namespaces a remote row's id in the shared glance order. */
 const REMOTE_ROW_PREFIX = 'remote:';
@@ -70,6 +75,11 @@ export default function Sidebar({ chrome = 'full' }: { chrome?: 'full' | 'sheet'
   // WorkspaceItem이 자기 ws를 self-subscribe한다. 배경 ws의 metadata/surface
   // churn은 이 컴포넌트를 리렌더하지 않는다(이름/추가/삭제/재정렬 시에만).
   const workspaces = useStore(useShallow(selectWorkspaceIdName));
+  // Moa's HQ is app-owned and never part of the list (nor its count, filter,
+  // or Ctrl+N numbering). While it is the active workspace it shows as its
+  // own row above the list, so the operator sees where they are.
+  const moaHqId = useStore(selectMoaHqId);
+  const listed = useMemo(() => listedWorkspaces(workspaces, moaHqId), [workspaces, moaHqId]);
   const [wsSearch, setWsSearch] = useState('');
   const wsSearchRef = useRef<HTMLInputElement>(null);
   // The header's filter button (or Ctrl/Cmd+F) opens the filter popover: the
@@ -91,9 +101,9 @@ export default function Sidebar({ chrome = 'full' }: { chrome?: 'full' | 'sheet'
   const factKeys = useStore(useShallow((s) => (filterOn ? selectWorkspaceFactKeys(s) : NO_FACTS)));
   const filteredWorkspaces = useMemo(() => {
     const q = wsSearch.trim().toLowerCase();
-    return workspaces.filter((ws) => (!q || ws.name.toLowerCase().includes(q))
+    return listed.filter((ws) => (!q || ws.name.toLowerCase().includes(q))
       && (!filterOn || (factKeys[ws.id] !== undefined && matchesFilter(wsFilter, factsFromKey(factKeys[ws.id])))));
-  }, [workspaces, wsSearch, filterOn, wsFilter, factKeys]);
+  }, [listed, wsSearch, filterOn, wsFilter, factKeys]);
 
   // #1481 — fan-out nesting. Both maps change only when a fan-out lands, a
   // task closes or detaches, or the audit log is re-read — not on output.
@@ -130,6 +140,19 @@ export default function Sidebar({ chrome = 'full' }: { chrome?: 'full' | 'sheet'
     if (!link.ownerId || link.ownerId === id || !liveIds.has(link.ownerId)) return ORPHAN_GROUP_KEY;
     return link.ownerId;
   }, [workspaces, missionByPaneGroup, fanoutLineage, fanoutSpawnOwner]);
+  // Snoozed and settled rows leave the main list for the two groups at its
+  // foot BEFORE the glance-board order, so they take no slot there. Pinned
+  // wins; a nested task goes where its owner goes (workspaceSettleGroups).
+  const settleStates = useStore((s) => s.workspaceSettle.states);
+  const pinnedIds = useStore((s) => s.sidebarPinnedIds);
+  const settleSplit = useMemo(() => {
+    const now = Date.now();
+    return partitionWorkspaceSettle(filteredWorkspaces, {
+      groupOf: (id) => workspaceSettleGroupOf(settleStates[id], now),
+      pinned: new Set(pinnedIds),
+      nestedOwnerOf,
+    });
+  }, [filteredWorkspaces, settleStates, pinnedIds, nestedOwnerOf]);
   // #1329 — rows that only exist to poll a remote-terminal PANE's host are not
   // attachments and must not render here: the user never asked for a mirror,
   // and a row they cannot detach (nothing persists it) would be a ghost.
@@ -169,7 +192,7 @@ export default function Sidebar({ chrome = 'full' }: { chrome?: 'full' | 'sheet'
     onPointerLeave: onListPointerLeave,
     onFocusCapture: onListFocus,
     onBlurCapture: onListBlur,
-  } = useGlanceBoardOrder(filteredWorkspaces, nestedOwnerOf, remoteRows, remoteScores);
+  } = useGlanceBoardOrder(settleSplit.main, nestedOwnerOf, remoteRows, remoteScores);
   // Remote row ids are no workspace: linkOf finds none, so each one is a plain
   // top-level node in its sorted slot.
   const tree = useMemo(() => {
@@ -183,6 +206,16 @@ export default function Sidebar({ chrome = 'full' }: { chrome?: 'full' | 'sheet'
       new Set(workspaces.map((w) => w.id)),
     );
   }, [orderedWorkspaces, workspaces, missionByPaneGroup, fanoutLineage, fanoutSpawnOwner]);
+  // The groups keep the stored order and nest the same way, so a grouped
+  // owner keeps its task group.
+  const settleTrees = useMemo(() => {
+    const liveIds = new Set(workspaces.map((w) => w.id));
+    const linkOf = (id: string) => resolveTaskLink(missionByPaneGroup[id], fanoutLineage[id], fanoutSpawnOwner[id]);
+    return {
+      snoozed: buildSidebarTree(settleSplit.snoozed, linkOf, liveIds),
+      settled: buildSidebarTree(settleSplit.settled, linkOf, liveIds),
+    };
+  }, [settleSplit, workspaces, missionByPaneGroup, fanoutLineage, fanoutSpawnOwner]);
   const activeRemoteKey = useStore((s) => s.activeRemoteKey);
   const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
   // While a mirror is on screen the local selection is only remembered, not
@@ -230,7 +263,7 @@ export default function Sidebar({ chrome = 'full' }: { chrome?: 'full' | 'sheet'
   // sidebar root via onKeyDown and stops propagation so the global handler
   // does not also fire.
   // Remote rows share the list and the query, so they count toward showing it.
-  const listedCount = workspaces.length + remoteWorkspaces.length;
+  const listedCount = listed.length + remoteWorkspaces.length;
   const handleSidebarKeyDown = useCallback((e: React.KeyboardEvent) => {
     if (e.key === 'f' && (e.ctrlKey || e.metaKey) && listedCount >= 3) {
       e.preventDefault();
@@ -267,6 +300,9 @@ export default function Sidebar({ chrome = 'full' }: { chrome?: 'full' | 'sheet'
   }, [t, pushToast]);
 
   const handleClose = useCallback((wsId: string) => {
+    // Refused before any session is torn down: the store keeps the HQ and the
+    // operator's last workspace, and would refuse only after the dispose.
+    if (refuseWorkspaceClose(wsId)) return;
     // 삭제 전 해당 워크스페이스의 모든 PTY 정리
     const ws = useStore.getState().workspaces.find((w) => w.id === wsId);
     if (ws) disposeAllPtys(ws);
@@ -278,11 +314,11 @@ export default function Sidebar({ chrome = 'full' }: { chrome?: 'full' | 'sheet'
   // sidebar is the point), but the configuration snapshot survives and lists
   // in the Archived section for one-click restore.
   const handleArchive = useCallback((wsId: string) => {
-    const { workspaces: all } = useStore.getState();
-    const ws = all.find((w) => w.id === wsId);
-    // archiveWorkspace refuses the last workspace; disposing first would kill
-    // its sessions and then leave the workspace in place, emptied.
-    if (!ws || all.length <= 1) return;
+    // archiveWorkspace refuses the HQ and the last workspace; disposing first
+    // would kill its sessions and then leave the workspace in place, emptied.
+    if (refuseWorkspaceClose(wsId)) return;
+    const ws = useStore.getState().workspaces.find((w) => w.id === wsId);
+    if (!ws) return;
     disposeAllPtys(ws);
     archiveWorkspace(wsId);
   }, [archiveWorkspace]);
@@ -291,17 +327,73 @@ export default function Sidebar({ chrome = 'full' }: { chrome?: 'full' | 'sheet'
   // Filtering only changes what the list shows; the header counts what is left.
   const narrowed = filterOn || wsSearch.trim() !== '';
   const shownCount = filteredWorkspaces.length + remoteByRowId.size;
-  const activeHidden = !activeRemoteKey && !filteredWorkspaces.some((w) => w.id === activeWorkspaceId);
+  const hqActive = !!moaHqId && !activeRemoteKey && activeWorkspaceId === moaHqId
+    && workspaces.some((w) => w.id === moaHqId);
+  const activeHidden = !activeRemoteKey && !hqActive && !filteredWorkspaces.some((w) => w.id === activeWorkspaceId);
   const clearFilters = useCallback(() => {
     setWsSearch('');
     useStore.getState().setSidebarFilter(EMPTY_FILTER);
   }, []);
+  // Keyboard (roving tabindex, the rail's arrow-key pattern): the list is one
+  // Tab stop — the row the keyboard was last on while inside, else the
+  // selected row, else the first — and ↑ ↓ Home End move between rows in
+  // screen order, nested task and remote rows included. Each row handles its
+  // own Enter, → / ← and Shift+F10 (WorkspaceItem.tsx).
+  const [keyRowId, setKeyRowId] = useState<string | null>(null);
+  const activeRowId = activeRemoteKey ? `${REMOTE_ROW_PREFIX}${activeRemoteKey}` : activeWorkspaceId;
+  const firstRowId = tree.top[0]?.id ?? null;
+  const tabStopId = keyRowId
+    ?? (activeRowId && (filteredWorkspaces.some((w) => w.id === activeRowId) || remoteByRowId.has(activeRowId)) ? activeRowId : firstRowId);
+  const onTreeKeyDown = useCallback((e: React.KeyboardEvent<HTMLDivElement>) => {
+    const target = e.target as HTMLElement;
+    if (!target.hasAttribute('data-sidebar-row')) return;
+    if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+    const rows = [...e.currentTarget.querySelectorAll<HTMLElement>('[data-sidebar-row]')]
+      .filter((el) => el.getClientRects().length > 0);
+    const next = nextRowIndex(e.key, rows.indexOf(target), rows.length);
+    if (next === null) return;
+    e.preventDefault();
+    rows[next].focus();
+    rows[next].scrollIntoView?.({ block: 'nearest' });
+  }, []);
+  const onTreeFocus = useCallback((e: React.FocusEvent<HTMLDivElement>) => {
+    const id = (e.target as HTMLElement).getAttribute('data-sidebar-row');
+    if (id) setKeyRowId(id);
+  }, []);
+  const onTreeBlur = useCallback((e: React.FocusEvent<HTMLDivElement>) => {
+    // Leaving the list hands the stop back to the selected row.
+    if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setKeyRowId(null);
+  }, []);
+  // The stop must always sit on a row that is on screen. A row can leave
+  // without a blur — closed, filtered, snoozed, or folded away with its group
+  // while focus was elsewhere — and rows mount and unmount inside their own
+  // components without re-rendering this one, so the tree is watched: when no
+  // visible row holds the stop, it moves to the selected row, else the first.
+  const [treeEl, setTreeEl] = useState<HTMLDivElement | null>(null);
+  const activeRowIdRef = useRef(activeRowId);
+  activeRowIdRef.current = activeRowId;
+  useEffect(() => {
+    const el = treeEl;
+    if (!el) return;
+    const ensureStop = () => {
+      const rows = [...el.querySelectorAll<HTMLElement>('[data-sidebar-row]')].filter((r) => r.getClientRects().length > 0);
+      if (rows.length === 0 || rows.some((r) => r.tabIndex === 0)) return;
+      const next = rows.find((r) => r.getAttribute('data-sidebar-row') === activeRowIdRef.current) ?? rows[0];
+      setKeyRowId(next.getAttribute('data-sidebar-row'));
+    };
+    ensureStop();
+    const observer = new MutationObserver(ensureStop);
+    observer.observe(el, { childList: true, subtree: true, attributes: true, attributeFilter: ['tabindex'] });
+    return () => observer.disconnect();
+  }, [treeEl]);
+
   const renderTask = useCallback((id: string) => (
     <WorkspaceItem
       workspaceId={id}
       isActive={id === shownActiveId}
       isMultiview={multiviewIds.includes(id)}
       index={workspaces.findIndex((w) => w.id === id)}
+      shortcutIndex={listed.findIndex((w) => w.id === id)}
       onSelect={setActiveWorkspace}
       onCtrlSelect={handleCtrlSelect}
       onRename={renameWorkspace}
@@ -311,8 +403,68 @@ export default function Sidebar({ chrome = 'full' }: { chrome?: 'full' | 'sheet'
       onDuplicate={duplicateWorkspace}
       onReorder={reorderWorkspace}
       taskRow
+      tabStop={id === tabStopId}
     />
-  ), [shownActiveId, multiviewIds, workspaces, setActiveWorkspace, handleCtrlSelect, renameWorkspace, handleClose, handleArchive, handleCopySessionInfo, duplicateWorkspace, reorderWorkspace]);
+  ), [tabStopId, shownActiveId, multiviewIds, workspaces, listed, setActiveWorkspace, handleCtrlSelect, renameWorkspace, handleClose, handleArchive, handleCopySessionInfo, duplicateWorkspace, reorderWorkspace]);
+
+  // One top-level node: a remote mirror, a task row whose owner is filtered
+  // out, or a workspace row with its nested tasks. `inSettleGroup` rows sit
+  // out of stored order, so they draw no Ctrl+N hint.
+  const renderNode = (node: SidebarTreeNode, taskIds: ReadonlySet<string>, inSettleGroup = false) => {
+    const rw = remoteByRowId.get(node.id);
+    if (rw) {
+      return (
+        <RemoteWorkspaceItem
+          key={node.id}
+          rowId={node.id}
+          tabStop={node.id === tabStopId}
+          workspace={rw}
+          isActive={rw.key === activeRemoteKey}
+          onSelect={setActiveRemoteKey}
+          onDetach={detachRemoteWorkspace}
+        />
+      );
+    }
+    const ws = workspaceById.get(node.id);
+    if (!ws) return null;
+    // A task whose owner is only hidden by the search filter still
+    // renders as a task row (prefix stripped, provenance, no drag).
+    if (taskIds.has(node.id)) return <Fragment key={node.id}>{renderTask(node.id)}</Fragment>;
+    return (
+      <Fragment key={node.id}>
+        <WorkspaceItem
+          workspaceId={ws.id}
+          isActive={ws.id === shownActiveId}
+          isMultiview={multiviewIds.includes(ws.id)}
+          index={workspaces.indexOf(ws)}
+          shortcutIndex={listed.indexOf(ws)}
+          onSelect={setActiveWorkspace}
+          onCtrlSelect={handleCtrlSelect}
+          onRename={renameWorkspace}
+          onClose={handleClose}
+          onArchive={handleArchive}
+          onCopyInfo={handleCopySessionInfo}
+          onDuplicate={duplicateWorkspace}
+          onReorder={reorderWorkspace}
+          shortcutHintHidden={inSettleGroup}
+          tabStop={ws.id === tabStopId}
+          nestedTaskIds={node.taskIds.length > 0 ? node.taskIds : undefined}
+          renderTask={node.taskIds.length > 0 ? renderTask : undefined}
+          onCloseTask={node.taskIds.length > 0 ? handleClose : undefined}
+        />
+        {node.taskIds.length > 0 && (
+          <ClosedPaneTaskGroup
+            ownerId={node.id}
+            ownerName={ws.name}
+            taskIds={node.taskIds}
+            ownerActive={node.id === activeWorkspaceId}
+            renderTask={renderTask}
+            onCloseWorkspace={handleClose}
+          />
+        )}
+      </Fragment>
+    );
+  };
 
   return (
     <div
@@ -324,14 +476,37 @@ export default function Sidebar({ chrome = 'full' }: { chrome?: 'full' | 'sheet'
       {pickerOpen && <PresetPicker onClose={closePicker} anchorStyle={pickerAnchor} />}
       <SidebarResizeHandle />
       {!readOnly && chrome === 'full' && <SidebarNavigation />}
+      {hqActive && moaHqId && (
+        <div className="shrink-0 pt-1" data-moa-hq-row>
+          <WorkspaceItem
+            workspaceId={moaHqId}
+            isActive
+            isMultiview={multiviewIds.includes(moaHqId)}
+            index={workspaces.findIndex((w) => w.id === moaHqId)}
+            onSelect={setActiveWorkspace}
+            onCtrlSelect={handleCtrlSelect}
+            onRename={renameWorkspace}
+            onClose={handleClose}
+            onArchive={handleArchive}
+            onCopyInfo={handleCopySessionInfo}
+            onDuplicate={duplicateWorkspace}
+            onReorder={reorderWorkspace}
+            moaHq
+          />
+        </div>
+      )}
       <div className="wmux-sidebar-section">
         <span className="truncate">{t('sidebar.workspaces')}</span>
         <span className="wmux-sidebar-total" data-sidebar-total>
           {narrowed ? t('sidebar.filter.count', { shown: shownCount, total: listedCount }) : listedCount}
         </span>
+        {/* The order is a visible choice here, not only in Settings. */}
+        {listedCount >= 2 && <span className="ml-auto flex">
+          <SidebarSortMenu />
+        </span>}
         {listedCount >= 3 && <button
           type="button"
-          className={`ui-icon-btn relative ml-auto h-7 w-7 ${FOCUS_RING}`}
+          className={`ui-icon-btn relative h-7 w-7 ${FOCUS_RING}`}
           onClick={() => (wsSearchOpen ? closeWsSearch() : openWsSearch())}
           data-filter-active={narrowed ? 'true' : undefined}
           // A filter for this list — distinct from the rail's Search &
@@ -346,7 +521,7 @@ export default function Sidebar({ chrome = 'full' }: { chrome?: 'full' | 'sheet'
         {!readOnly && <button
           ref={pickerButtonRef}
           type="button"
-          className={`ui-icon-btn ${listedCount >= 3 ? '' : 'ml-auto '}h-7 w-7 ${FOCUS_RING}`}
+          className={`ui-icon-btn ${listedCount >= 2 ? '' : 'ml-auto '}h-7 w-7 ${FOCUS_RING}`}
           onClick={togglePicker}
           title={t('sidebar.newWorkspace')}
           aria-label={t('sidebar.newWorkspace')}
@@ -403,9 +578,12 @@ export default function Sidebar({ chrome = 'full' }: { chrome?: 'full' | 'sheet'
       /* The list container absorbs dragover for sidebar-internal reorder
           drags so the gaps between WorkspaceItem rows (and the empty area
           below the last row) don't paint a 🚫 cursor mid-drag. External
-          drags hover-through the container untouched. */
+          drags hover-through the container untouched.
+          `overflow-y-auto` alone computes overflow-x to auto: a row a few px
+          too wide made the whole list swipe sideways, cutting the status marks
+          at the left edge. The list never scrolls horizontally. */
       <div
-        className="flex-1 min-h-0 overflow-y-auto px-0 pb-2 space-y-0.5"
+        className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden px-0 pb-2 space-y-0.5"
         onPointerEnter={onListPointerEnter}
         onPointerLeave={onListPointerLeave}
         onFocusCapture={onListFocus}
@@ -435,56 +613,17 @@ export default function Sidebar({ chrome = 'full' }: { chrome?: 'full' | 'sheet'
             the rest in the owner's trailing "From closed pane" group.
             Detached tasks are ordinary rows; tasks whose owner is gone
             collect in the "From closed workspace" group below. */}
-        {tree.top.map((node) => {
-          const rw = remoteByRowId.get(node.id);
-          if (rw) {
-            return (
-              <RemoteWorkspaceItem
-                key={node.id}
-                workspace={rw}
-                isActive={rw.key === activeRemoteKey}
-                onSelect={setActiveRemoteKey}
-                onDetach={detachRemoteWorkspace}
-              />
-            );
-          }
-          const ws = workspaceById.get(node.id);
-          if (!ws) return null;
-          // A task whose owner is only hidden by the search filter still
-          // renders as a task row (prefix stripped, provenance, no drag).
-          if (tree.taskIds.has(node.id)) return <Fragment key={node.id}>{renderTask(node.id)}</Fragment>;
-          return (
-            <Fragment key={node.id}>
-              <WorkspaceItem
-                workspaceId={ws.id}
-                isActive={ws.id === shownActiveId}
-                isMultiview={multiviewIds.includes(ws.id)}
-                index={workspaces.indexOf(ws)}
-                onSelect={setActiveWorkspace}
-                onCtrlSelect={handleCtrlSelect}
-                onRename={renameWorkspace}
-                onClose={handleClose}
-                onArchive={handleArchive}
-                onCopyInfo={handleCopySessionInfo}
-                onDuplicate={duplicateWorkspace}
-                onReorder={reorderWorkspace}
-                nestedTaskIds={node.taskIds.length > 0 ? node.taskIds : undefined}
-                renderTask={node.taskIds.length > 0 ? renderTask : undefined}
-                onCloseTask={node.taskIds.length > 0 ? handleClose : undefined}
-              />
-              {node.taskIds.length > 0 && (
-                <ClosedPaneTaskGroup
-                  ownerId={node.id}
-                  ownerName={ws.name}
-                  taskIds={node.taskIds}
-                  ownerActive={node.id === activeWorkspaceId}
-                  renderTask={renderTask}
-                  onCloseWorkspace={handleClose}
-                />
-              )}
-            </Fragment>
-          );
-        })}
+        <div
+          ref={setTreeEl}
+          role="tree"
+          aria-label={t('sidebar.workspaces')}
+          className="space-y-0.5"
+          onKeyDown={onTreeKeyDown}
+          onFocus={onTreeFocus}
+          onBlur={onTreeBlur}
+          data-sidebar-tree
+        >
+        {tree.top.map((node) => renderNode(node, tree.taskIds))}
         {/* Until the first lineage + ledger refresh lands, a task whose owner
             is not yet known to be gone is not called orphaned: it waits as a
             plain task row instead of flashing into the group. */}
@@ -501,6 +640,20 @@ export default function Sidebar({ chrome = 'full' }: { chrome?: 'full' | 'sheet'
             onCloseWorkspace={handleClose}
           />
         )}
+
+        {/* Snoozed, then settled: rows main took out of the main list. Still
+            live — nothing is closed; any activity brings a row back. */}
+        {(['snoozed', 'settled'] as const).map((kind) => (
+          <WorkspaceSettleGroup
+            key={kind}
+            kind={kind}
+            count={settleTrees[kind].top.length}
+            containsActive={!!activeWorkspaceId && settleSplit[kind].some((w) => w.id === activeWorkspaceId)}
+          >
+            {settleTrees[kind].top.map((node) => renderNode(node, settleTrees[kind].taskIds, true))}
+          </WorkspaceSettleGroup>
+        ))}
+        </div>
 
         {/* #1011 — put-away workspaces: configuration snapshots, one click
             back to live. Collapsed by default; empty → invisible. */}

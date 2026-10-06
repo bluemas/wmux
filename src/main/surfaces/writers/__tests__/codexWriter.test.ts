@@ -13,6 +13,9 @@ import {
 import { createCodexWriter } from '../codexWriter';
 import { SurfacesStore } from '../../safeWrite';
 
+// Real files on disk, several applies per test: slow Windows runners need more than vitest's 5 s.
+vi.setConfig({ testTimeout: 30_000 });
+
 const REALISTIC_CODEX_CONFIG = `# Top-level configuration settings
 web_search = "live"
 default_tools_approval_mode = "ask"

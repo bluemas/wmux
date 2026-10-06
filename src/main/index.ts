@@ -57,6 +57,7 @@ import { registerSurfaceRpc } from './pipe/handlers/surface.rpc';
 import { registerPaneRpc } from './pipe/handlers/pane.rpc';
 import { registerInputRpc, makeRoleBindingResolver } from './pipe/handlers/input.rpc';
 import { gatedSubmitTaskContext } from './pipe/handlers/a2aOpenTasks';
+import { registerGitHandoffHandlers } from './ipc/handlers/gitHandoff.handler';
 import { registerApprovalsRpc } from './pipe/handlers/approvals.rpc';
 import { registerDeckRpc } from './pipe/handlers/deck.rpc';
 import { registerNotifyRpc } from './pipe/handlers/notify.rpc';
@@ -94,7 +95,7 @@ import { registerChannelLocalHandlers } from './ipc/handlers/channelLocal.handle
 import { registerRemoteHandlers } from './ipc/handlers/remote.handler';
 import { RemoteHostsStore } from './remote/RemoteHostsStore';
 import { RemoteAttachmentsStore } from './remote/RemoteAttachmentsStore';
-import { registerFanOutHandler } from './ipc/handlers/fanout.handler';
+import { registerFanOutHandler, startGuiFanOut } from './ipc/handlers/fanout.handler';
 import { initQuickLaunch } from './quickLaunch';
 import { focusedPrimaryWindow } from './window/auxiliaryWindows';
 import { createFanOutService } from './worktask/createFanOutService';
@@ -108,9 +109,18 @@ import { TaskAdoptService } from './worktask/TaskAdoptService';
 import { TaskGateRunner } from './worktask/TaskGateRunner';
 import { createHostedLedgerPort } from './worktask/ledgerPort';
 import { getProjectConfigStore } from './project/ProjectConfigStore';
-import { createWorkspaceFactsPublisher, invalidateAutonomyCache } from './workspace/workspaceFactsFeed';
+import { createWorkspaceFactsPublisher, invalidateAutonomyCache, registerWorkspaceFactsPublisher } from './workspace/workspaceFactsFeed';
+import { publishMoaPane, setMoaPanePush } from './deck/moaPaneFeed';
+import { reconcileOwnerDowngrades } from './worktask/taskAutonomy';
+import { createHqAutoPress, setHqAutoPress } from './deck/hqApprovalLane';
 import { getTaskLedger } from './deck/taskLedgerHost';
-import { onAutonomyWritten } from './deck/deckAutonomyStore';
+import { createTrackRecordFeed, setTrackRecordFeed, type TrackApprovalRecord } from './deck/trackRecordFeed';
+import { getTrackRecordStore } from './deck/trackRecordStore';
+import { loadDeckDecisions, onDecisionsChanged } from './deck/deckDecisionStore';
+import { getWorkLinkStore } from './workLink/workLinkStore';
+import { agentSlug } from '../shared/trackRecord';
+import { onAutonomyWritten, loadWorkspaceMode } from './deck/deckAutonomyStore';
+import { getHqWorkspaceId, hqPresence, isHqApprovalPressEnabled, isMoaEnabled, onHqStoreWritten } from './deck/deckHqStore';
 import { registerDeckHandler } from './ipc/handlers/deck.handler';
 import { registerWorkspaceMirrorHandler } from './ipc/handlers/workspaceMirror.handler';
 import { getWorkspaceMirror } from './workspace/WorkspaceMirror';
@@ -152,7 +162,7 @@ import { AutomationBridge } from './automation/AutomationBridge';
 import { AutomationClient } from './automation/AutomationClient';
 import { toastManager } from './notification/ToastManager';
 import { WorkspaceContextRouter } from './metadata/WorkspaceContextRouter';
-import { ensureDaemon, killDaemonByPidFile, killVerifiedDaemonPid, checkProcessLiveness, isDaemonPipeGone } from './daemon/launcher';
+import { ensureDaemon, killDaemonByPidFile, describeDaemonKillOutcome, killVerifiedDaemonPid, checkProcessLiveness, isDaemonPipeGone } from './daemon/launcher';
 import { DaemonRespawnController } from './daemon/DaemonRespawnController';
 import { loadConfig, getWmuxDir } from '../daemon/config';
 import { CHANNELS_EPOCH } from '../shared/channels';
@@ -186,7 +196,7 @@ import { metadataStore } from './metadata/MetadataStore';
 import { collectLegacyMetadata } from './metadata/legacyMigration';
 import { sessionManager, registerSessionHandlers } from './ipc/handlers/session.handler';
 import { eventBus } from './events/EventBus';
-import { broadcastMetadataUpdate } from './ipc/handlers/metadata.handler';
+import { broadcastMetadataUpdate, currentPrOfPty, resetPollCacheOnRendererLoad } from './ipc/handlers/metadata.handler';
 import { broadcastSettledIdle } from './notification/turnSettle';
 import { readOrchRole } from '../shared/orchestratorRole';
 import { initLogSink, isBrokenPipeError, logLine, stdioErrorsConsumed } from './util/logSink';
@@ -887,6 +897,21 @@ ipcMain.handle(IPC.GATED_SUBMIT, async (_e, ptyId: unknown, text: unknown, agent
         ...(typeof opts === 'object' && opts !== null && (opts as { keepContext?: unknown }).keepContext === 'open_a2a_task'
           ? { keepContext: 'open_a2a_task' as const }
           : {}),
+        ...(typeof opts === 'object' && opts !== null && (opts as { waitQuiet?: unknown }).waitQuiet === true
+          ? {
+              waitQuiet: true,
+              ...(typeof (opts as { expectAgent?: unknown }).expectAgent === 'string'
+                ? { expectAgent: ((opts as { expectAgent: string }).expectAgent).slice(0, 80) }
+                : {}),
+              ...(typeof (opts as { deadlineAt?: unknown }).deadlineAt === 'number' &&
+              Number.isFinite((opts as { deadlineAt: number }).deadlineAt)
+                ? { deadlineAt: (opts as { deadlineAt: number }).deadlineAt }
+                : {}),
+              ...(typeof (opts as { guardKey?: unknown }).guardKey === 'string'
+                ? { guardKey: ((opts as { guardKey: string }).guardKey).slice(0, 128) }
+                : {}),
+            }
+          : {}),
         ...gatedSubmitTaskContext(opts),
       })
     : { ok: false, reason: 'write_failed', detail: 'delivery: missing target pty or text' },
@@ -896,6 +921,7 @@ ipcMain.handle(IPC.GATED_SUBMIT, async (_e, ptyId: unknown, text: unknown, agent
 const fanoutCallerSubmit = createFanoutCallerSubmit({
   deliveryGate: (ptyId) => inputRpc.deliveryGate(ptyId),
   ownerOf: (ptyId) => resolvePtyOwnerWorkspace(() => mainWindow, ptyId),
+  prOf: (ptyId) => currentPrOfPty(ptyId),
   agentState: async (ptyId) => (daemonClient?.isConnected ? daemonClient.getAgentState(ptyId) : null),
   deliver: async (args) =>
     daemonClient ? daemonClient.deliverCallerNudge(args) : { result: 'unavailable', pasted: false },
@@ -1058,6 +1084,13 @@ getWorkerTempDirSweeper().setLiveTempDirs(async () => {
 });
 let quickLaunch: ReturnType<typeof initQuickLaunch> | null = null;
 registerFanOutHandler(fanOutService);
+// The Git page's hand-off (issue / PR → agent pane or new worktree): the
+// operator RPC lane for the A2A send (so the task joins its work link) and
+// the fan-out service for a new worktree.
+registerGitHandoffHandlers({
+  invoke: (method, params) => invokeRendererRpc(method, params),
+  startFanOut: (req) => startGuiFanOut(fanOutService, req),
+});
 registerFanOutRpc(rpcRouter, fanOutService, () => mainWindow);
 registerLedgerRpc(rpcRouter, () => mainWindow);
 // Scheduled runs for agents: draft-only propose + redacted reads, relayed to
@@ -1105,20 +1138,94 @@ registerWorktaskHandlers(() => daemonClient, (services: WorktaskServices) => {
 // cancelled) and an autonomy write. Until the first push lands the daemon
 // answers `scope-unavailable` and refuses, which is the safe direction.
 // See workspace/workspaceFactsFeed.ts.
+// The HQ approval lane (deck/hqApprovalLane.ts) presses by the facts this feed
+// publishes, so a lane pass runs right after each push lands — never before
+// the daemon holds the table it will judge by.
+// The HQ lane's policy as main sees it now; published beside the table.
+const hqLanePolicyNow = (): { open: boolean; hq: string | null } => {
+  const hq = getHqWorkspaceId();
+  return {
+    open: hq !== null && isMoaEnabled() && isHqApprovalPressEnabled() && hqPresence(hq) === 'present',
+    hq,
+  };
+};
+const hqAutoPress = createHqAutoPress({
+  facts: {
+    settled: () => workspaceFactsPublisher.settled(),
+    ackedSeq: () => workspaceFactsPublisher.ackedSeq(),
+    ackedLaneGeneration: () => workspaceFactsPublisher.ackedLaneGeneration(),
+  },
+  getHq: () => getHqWorkspaceId(),
+  isMoaEnabled: () => isMoaEnabled(),
+  presence: (hq) => hqPresence(hq),
+  isOptedIn: () => isHqApprovalPressEnabled(),
+  ledger: () => getTaskLedger(),
+  modeOf: (ws) => loadWorkspaceMode(ws),
+  nameOf: (ws) => getWorkspaceMirror().getEntries()?.find((e) => e.id === ws)?.name,
+  getDaemonClient: () => daemonClient,
+});
+setHqAutoPress(hqAutoPress);
 const workspaceFactsPublisher = createWorkspaceFactsPublisher({
-  push: async (facts, seq) => {
+  push: async (facts, seq, lane) => {
     if (!daemonClient) throw new Error('Daemon not connected');
-    return daemonClient.rpc('daemon.workspaceFacts.set', { facts, seq });
+    const result = (await daemonClient.rpc('daemon.workspaceFacts.set', { facts, seq, lane })) as
+      | { ok?: boolean; error?: string }
+      | undefined;
+    // Refused outright (not merely raced by a newer table): the daemon does
+    // not hold this, so the publisher must not count it as acknowledged.
+    if (result?.ok === false) throw new Error(result.error ?? 'workspace fact table refused');
+    void hqAutoPress.run();
+    return result;
+  },
+  lanePolicy: hqLanePolicyNow,
+});
+registerWorkspaceFactsPublisher(workspaceFactsPublisher);
+// Any change to the lane's own inputs reaches the daemon at once.
+onHqStoreWritten(() => workspaceFactsPublisher.publishIfLaneChanged());
+// Moa's track record (deck/trackRecordFeed.ts): counts from wmux's own task
+// data, running only while Moa is on — the switch starts and stops it.
+const trackRecordFeed = createTrackRecordFeed({
+  store: getTrackRecordStore(),
+  isMoaEnabled: () => isMoaEnabled(),
+  workLinks: getWorkLinkStore(),
+  decisions: { load: () => loadDeckDecisions(), onChanged: onDecisionsChanged },
+  ledger: getTaskLedger(),
+  listResolvedApprovals: async () => {
+    if (!daemonClient?.isConnected) return null;
+    const listed = (await daemonClient.rpc('daemon.approvals.list', {})) as
+      | { recentlyResolved?: TrackApprovalRecord[] }
+      | undefined;
+    return listed?.recentlyResolved ?? [];
+  },
+  agentOf: (ws) => agentSlug(getWorkspaceMirror().getEntries()?.find((e) => e.id === ws)?.metadata?.agentName),
+  ownerOfTaskWorkspace: (ws) =>
+    getTaskLedger().list({}).find((e) => e.taskWorkspaceId === ws)?.ownerWorkspaceId ?? null,
+  onRetroChanged: () => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(IPC.TRACK_RECORD_CHANGED);
   },
 });
+setTrackRecordFeed(trackRecordFeed);
+onHqStoreWritten(() => trackRecordFeed.sync());
+getWorkspaceMirror().onSnapshot(() => workspaceFactsPublisher.publishIfLaneChanged());
 getTaskLedger().onTransition(() => {
   workspaceFactsPublisher.schedule();
+});
+// The phone's Moa pane (main → daemon): which daemon session is the HQ brain's
+// TUI, or null. The deck handler re-publishes on every change; see
+// deck/moaPaneFeed.ts.
+setMoaPanePush(async (pane, seq) => {
+  if (!daemonClient) throw new Error('Daemon not connected');
+  return daemonClient.rpc('daemon.moa.set', { pane, seq });
 });
 onAutonomyWritten(() => {
   // The store this feed reads was just rewritten, so the cached copy is stale
   // before the debounce fires — invalidate first, then schedule.
   invalidateAutonomyCache();
-  workspaceFactsPublisher.schedule();
+  // Not debounced: a lowered mode must reach the daemon before the next
+  // automated approve is judged (and the publisher reads unsettled until it has).
+  void workspaceFactsPublisher.publishNow();
+  // An owner lowered after a fan-out lowers its open tasks too (taskAutonomy.ts).
+  void reconcileOwnerDowngrades(() => getTaskLedger().list({ openOnly: true }));
 });
 
 // Command Deck Phase 2 — the Commander brain. Renderer-only surface (same
@@ -1132,7 +1239,11 @@ onAutonomyWritten(() => {
 // data dir before the Deck stores are first read (once per registration).
 const disposeDeckHandler = registerDeckHandler(() => mainWindow, {
   getDaemonClient: () => daemonClient,
+  invokeOperatorRpc: (method, params) => invokeRendererRpc(method, params),
 });
+// The track record's first start waits for the deck handler: it decides Moa's
+// switch for a new install (ensureMoaDefault), which reads as on until then.
+trackRecordFeed.sync();
 // WorkspaceMirror — renderer push (fire-and-forget) keeps a main-process cache
 // of the workspace tree + per-pane agent status warm, so routing / hook
 // resolution is served locally instead of via the workspace.list renderer
@@ -1827,6 +1938,12 @@ app.on('ready', async () => {
       // process, so read it fresh.
       invalidateAutonomyCache();
       void workspaceFactsPublisher.publishNow();
+      // Same for the Moa pane: the daemon drops it with its publisher, so a
+      // fresh connection holds none until main says so again.
+      void publishMoaPane({ force: true });
+      // A new approval, or one settled elsewhere: the lane re-lists.
+      client.on('approvals:changed', () => { void hqAutoPress.run(); });
+      client.on('approvals:changed', () => { void trackRecordFeed.onApprovalsChanged(); });
       // Handler swap to daemon-routed mode. The microsecond window where
       // pty/* handlers are torn down and re-registered is the same
       // surface the original code used; the swap is logged for the
@@ -2300,23 +2417,6 @@ app.on('window-all-closed', () => {
   // Actual quit is triggered from the tray "Quit" menu item.
 });
 
-// quitAndInstall() closes every window and only installs once the window list
-// empties. With isQuitting still false the hide-to-tray close intercept above
-// cancels that close, so the window list never empties, the install never runs,
-// and ShipIt waits forever on a process that will not exit. Flipping the flag
-// here is what lets the windows close through.
-//
-// This used to hang off `app.on('before-quit-for-update')`. That listener never
-// fired: the event belongs to Electron's `autoUpdater`, not to `app`, and the
-// `as unknown as NodeJS.EventEmitter` cast that was added to "work around the
-// missing type" silenced the very error that said so. The updater now calls
-// this directly, so there is no event name left to get wrong.
-//
-// The full before-quit teardown is skipped on this path, so anything it
-// guarantees has to be done here: the broker is stopped explicitly, and the
-// session state is flushed the same way the darwin before-quit pass flushes it
-// (the renderer-side save already ran in AutoUpdater.performInstall, but that
-// does not cover the main process's pending debounced write).
 // Alt+F4: ask before quitting. A normal Quit only detaches from the daemon, so
 // live sessions keep running and reattach on the next launch.
 let quitConfirmOpen = false;
@@ -2340,12 +2440,30 @@ async function confirmQuit(win: BrowserWindow): Promise<void> {
   }
 }
 
+// quitAndInstall() closes every window and only installs once the window list
+// empties. With isQuitting still false the hide-to-tray close intercept above
+// cancels that close, so the window list never empties, the install never runs,
+// and ShipIt waits forever on a process that will not exit. Flipping the flag
+// here is what lets the windows close through.
+//
+// This used to hang off `app.on('before-quit-for-update')`. That listener never
+// fired: the event belongs to Electron's `autoUpdater`, not to `app`, and the
+// `as unknown as NodeJS.EventEmitter` cast that was added to "work around the
+// missing type" silenced the very error that said so. The updater now calls
+// this directly, so there is no event name left to get wrong.
+//
+// The full before-quit teardown is skipped on this path, so anything it
+// guarantees has to be done here: the broker is stopped explicitly, and the
+// session state is flushed the same way the darwin before-quit pass flushes it
+// (the renderer-side save already ran in AutoUpdater.performInstall, but that
+// does not cover the main process's pending debounced write).
 // Wiring every main window needs, wherever it was created. Boot, the Dock
 // 'activate' path and the aborted-install recovery all built windows their own
 // way, and only boot attached the hide-to-tray close intercept — a window from
 // either of the other two destroyed itself on close instead of hiding.
 function adoptMainWindow(win: BrowserWindow): void {
   attachWindowRecovery(win);
+  resetPollCacheOnRendererLoad(win);
 
   win.on('closed', () => {
     // Guarded: a recovery window may be adopted while the old reference is
@@ -2649,8 +2767,8 @@ app.on('before-quit', async (e) => {
   // Only an explicit "Shut down wmux (close all sessions)" from the tray flips
   // fullShutdownRequested → the teardown branch: ask the daemon to shut down
   // gracefully (it dumps RingBuffers + saves state), and if that RPC doesn't
-  // land in time, pid-kill it so a wedged daemon can't survive a teardown the
-  // user explicitly asked for.
+  // land in time, attempt a verified pid-kill. Unavailable script identity
+  // refuses that backstop and can leave the daemon running for recovery.
   //
   // `clientAtQuit` captures the reference BEFORE any await: the daemon may
   // close its socket mid-teardown, firing the module-level 'disconnected'
@@ -2678,16 +2796,17 @@ app.on('before-quit', async (e) => {
             `[Main] daemon.shutdown did not complete (elapsed=${elapsed}ms): ${race.error} — pid-kill backstop`,
           );
           logLine('warn', 'main', `full-shutdown: daemon.shutdown timed out (${race.error}); invoking pid-kill backstop`);
-          const killed = killDaemonByPidFile();
-          logLine('warn', 'main', `full-shutdown: pid-kill backstop ${killed ? 'killed the daemon' : 'found no verified daemon to kill'}`);
+          const outcome = killDaemonByPidFile();
+          logLine('warn', 'main', `full-shutdown: pid-kill backstop ${describeDaemonKillOutcome(outcome)}`);
         }
       } else {
         console.log('[Main] Quit — detaching from daemon; live sessions stay alive (tmux-style persistence)');
         logLine('info', 'main', 'quit: detaching from daemon, sessions remain live (persistence)');
       }
       // Detach our half of the control pipe in BOTH branches. In full-shutdown
-      // the daemon is already gone (RPC ack) or killed (backstop), so this just
-      // cleans up our socket; in the detach branch it is the whole operation.
+      // the daemon is already gone (RPC ack), killed (backstop), or, when its
+      // script identity could not be verified, left running; either way this
+      // just cleans up our socket. In the detach branch it is the whole operation.
       // Best-effort — if the 'disconnected' handler already tore the socket
       // down, disconnect() may throw; swallow it so the quit sequence proceeds.
       try {
@@ -2706,25 +2825,24 @@ app.on('before-quit', async (e) => {
       // client to it — the daemon dropped/respawn-exhausted into local mode while
       // daemon.pid still points at a live daemon. Without this the user's
       // close-all request silently leaves that daemon and its PTYs running. The
-      // pid-kill is verify-before-kill (image + cmdline), so a recycled PID is
-      // never signalled. A normal Quit (fullShutdownRequested=false) still leaves
+      // pid-kill requires script identity; an unavailable probe refuses rather
+      // than guessing from the persisted PID. A normal Quit still leaves
       // any such daemon alone — that is the persistence promise.
       if (fullShutdownRequested) {
-        const killed = killDaemonByPidFile();
-        logLine('warn', 'main', `full-shutdown (no live client): pid-kill backstop ${killed ? 'killed the daemon' : 'found no verified daemon to kill'}`);
+        const outcome = killDaemonByPidFile();
+        logLine('warn', 'main', `full-shutdown (no live client): pid-kill backstop ${describeDaemonKillOutcome(outcome)}`);
       }
     }
   } catch (err) {
     console.error('[Main] before-quit daemon teardown threw — continuing to quit:', err);
     logLine('error', 'main', `before-quit daemon teardown threw: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
-    // Close-all must still complete even if the graceful path above threw: a
-    // verified pid-kill is the last-resort backstop so an explicit shutdown
-    // can't leave the daemon + PTYs running. verify-before-kill (image +
-    // cmdline), and a normal Quit skips this entirely.
+    // Try the verified pid-kill even if the graceful path threw. Missing
+    // script identity refuses the backstop and can leave the daemon + PTYs
+    // running; a normal Quit skips this entirely.
     if (fullShutdownRequested) {
       safeStep('full-shutdown pid-kill (post-throw backstop)', () => {
-        const killed = killDaemonByPidFile();
-        logLine('warn', 'main', `full-shutdown: post-throw pid-kill backstop ${killed ? 'killed the daemon' : 'found no verified daemon to kill'}`);
+        const outcome = killDaemonByPidFile();
+        logLine('warn', 'main', `full-shutdown: post-throw pid-kill backstop ${describeDaemonKillOutcome(outcome)}`);
       });
     }
   }

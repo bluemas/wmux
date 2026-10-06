@@ -179,3 +179,93 @@ describe('buildEventPrompt with a task tag', () => {
     expect(prompt).toContain('worker-task=t1 ws=w1 pane=p(claude)');
   });
 });
+
+describe('buildEventPrompt for a Moa hand-off task', () => {
+  it('carries the worker question as unverified text and says the task is the operator\'s', () => {
+    const prompt = buildEventPrompt(
+      [{
+        ptyId: 'a2a:task-h', kind: 'a2a.input_required', source: 'a2a', agent: null, seq: 1, ts: 0,
+        a2a: { taskId: 'task-h', from: 'ws-human', to: 'ws-seal', state: 'input-required', handoff: { question: 'Which stack is it?' } },
+      }],
+      DEFAULT_AUTONOMY,
+      { remaining: 1, total: 1 },
+    );
+    expect(prompt).toContain('HAND-OFF NEEDS INPUT');
+    expect(prompt).toContain('Which stack is it?');
+    expect(prompt).toContain('unverified');
+    expect(prompt).toContain('cannot query, answer or cancel');
+    expect(prompt).not.toContain('reply with send_message');
+  });
+
+  it('a worker turn end tells the HQ how to close the task, quoting the words as unverified', () => {
+    const prompt = buildEventPrompt(
+      [{
+        ptyId: 'a2a:task-h', kind: 'agent.stop', source: 'hook', agent: 'claude', seq: 1, ts: 0,
+        lastMessage: { text: 'Wrote hello.txt.', endsWithQuestion: false },
+        a2a: { taskId: 'task-h', from: 'ws-hq', to: 'ws-seal', state: 'working', handoff: {} },
+      }],
+      DEFAULT_AUTONOMY,
+      { remaining: 1, total: 1 },
+    );
+    expect(prompt).toContain('HAND-OFF TURN ENDED');
+    expect(prompt).toContain('Wrote hello.txt.');
+    expect(prompt).toContain('a2a_task_update({ task_id: "task-h", status: "completed" })');
+    expect(prompt).toContain('deck_complete_work');
+  });
+
+  it('a turn end seen by status alone (no closing words) still tells the HQ to check and close it itself', () => {
+    const prompt = buildEventPrompt(
+      [{
+        ptyId: 'a2a:task-h', kind: 'agent.stop', source: 'detector', agent: null, seq: 1, ts: 0,
+        a2a: { taskId: 'task-h', from: 'ws-hq', to: 'ws-seal', state: 'working', handoff: {} },
+      }],
+      DEFAULT_AUTONOMY,
+      { remaining: 1, total: 1 },
+    );
+    expect(prompt).toContain('leaving no closing words for you');
+    expect(prompt).toContain('Never ask the operator to check it for you.');
+    expect(prompt).toContain('a2a_task_update({ task_id: "task-h", status: "completed" })');
+  });
+
+  it('a reported completion tells the HQ to read the file itself, never the other workspace\'s pane', () => {
+    const prompt = buildEventPrompt(
+      [{
+        ptyId: 'a2a:task-h', kind: 'a2a.completed', source: 'a2a', agent: null, seq: 1, ts: 0,
+        a2a: { taskId: 'task-h', from: 'ws-hq', to: 'ws-seal', state: 'completed', handoff: {} },
+      }],
+      DEFAULT_AUTONOMY,
+      { remaining: 1, total: 1 },
+    );
+    expect(prompt).toContain('HAND-OFF DONE');
+    expect(prompt).toContain('read the file the request names with Read or Grep');
+    expect(prompt).not.toContain('terminal_read');
+  });
+
+  it('an operator cancel is their answer: no re-proposal, no question, no replacement', () => {
+    const prompt = buildEventPrompt(
+      [{
+        ptyId: 'a2a:handoff-h1', kind: 'a2a.canceled', source: 'a2a', agent: null, seq: 1, ts: 0,
+        a2a: { taskId: 'handoff-h1', from: 'ws-hq', to: 'ws-wmux', state: 'canceled', handoff: {} },
+      }],
+      DEFAULT_AUTONOMY,
+      { remaining: 1, total: 1 },
+    );
+    expect(prompt).toContain('HAND-OFF CANCELED');
+    expect(prompt).toContain('do not re-propose it, ask about it or dispatch a replacement');
+    expect(prompt).not.toContain('determine why');
+  });
+
+  it('a cancel wmux made itself (pane gone) is reported neutrally, not as the operator\'s answer', () => {
+    const prompt = buildEventPrompt(
+      [{
+        ptyId: 'a2a:task-h', kind: 'a2a.canceled', source: 'a2a', agent: null, seq: 1, ts: 0,
+        a2a: { taskId: 'task-h', from: 'ws-hq', to: 'ws-seal', state: 'canceled', handoff: { internalCancel: 'pane-gone' } },
+      }],
+      DEFAULT_AUTONOMY,
+      { remaining: 1, total: 1 },
+    );
+    expect(prompt).toContain('HAND-OFF ENDED BY WMUX');
+    expect(prompt).toContain('its pane closed or its agent left');
+    expect(prompt).not.toContain('That is their answer');
+  });
+});

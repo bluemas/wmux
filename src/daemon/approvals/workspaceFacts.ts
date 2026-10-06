@@ -31,7 +31,7 @@ import type { ApprovalPressFacts } from './approvalKeystrokes';
  *  is what authorizes; the mode rides along for the refusal reason. */
 export type WorkspaceFacts = Pick<
   ApprovalPressFacts,
-  'isTaskWorkspace' | 'autonomyMode' | 'approvalPress'
+  'isTaskWorkspace' | 'autonomyMode' | 'approvalPress' | 'ownerMode'
 >;
 
 /** One row as it arrives on the wire. */
@@ -40,6 +40,9 @@ export interface WorkspaceFactRowInput {
   isTaskWorkspace: boolean;
   autonomyMode: string;
   approvalPress: boolean;
+  /** The live mode of the task's single open owner. Absent when the row is
+   *  not a task workspace or its task has no single open owner. */
+  ownerMode?: string;
 }
 
 /** Upper bound on a pushed table. Main sends one row per live workspace, so a
@@ -61,8 +64,17 @@ export interface WorkspaceFactsAccepted {
   seq: number;
 }
 
+/** Main's HQ approval-lane policy, published beside the table. `open` folds
+ *  Moa on, an HQ designated and present, and the operator's opt-in;
+ *  `generation` changes whenever any of them does. */
+export interface HqLanePolicy {
+  open: boolean;
+  generation: number;
+}
+
 export class WorkspaceFactStore {
   private facts: Map<string, WorkspaceFacts> | null = null;
+  private lanePolicy: HqLanePolicy | null = null;
   /** The `seq` of the table currently held. -1 = nothing published yet. */
   private seq = -1;
 
@@ -76,10 +88,20 @@ export class WorkspaceFactStore {
    * authorizes a press. A monotonic counter from the publisher makes the
    * late-arriving older table a no-op rather than a silent regression.
    */
-  replace(rows: readonly WorkspaceFactRowInput[], seq: number): WorkspaceFactsAccepted | WorkspaceFactsStale {
+  replace(
+    rows: readonly WorkspaceFactRowInput[],
+    seq: number,
+    lane?: unknown,
+  ): WorkspaceFactsAccepted | WorkspaceFactsStale {
     if (!Number.isFinite(seq) || seq <= this.seq) {
       return { ok: false, reason: 'stale', seq: this.seq };
     }
+    // A table without a well-formed lane policy closes the lane.
+    const l = lane as { open?: unknown; generation?: unknown } | undefined;
+    this.lanePolicy =
+      l && typeof l.open === 'boolean' && typeof l.generation === 'number' && Number.isFinite(l.generation)
+        ? { open: l.open, generation: l.generation }
+        : null;
     const next = new Map<string, WorkspaceFacts>();
     for (const row of rows) {
       if (next.size >= WORKSPACE_FACTS_MAX_ROWS) break;
@@ -90,6 +112,9 @@ export class WorkspaceFactStore {
         isTaskWorkspace: row.isTaskWorkspace,
         autonomyMode: row.autonomyMode,
         approvalPress: row.approvalPress,
+        // A malformed owner mode drops the FIELD, not the row: the row's other
+        // facts are still good, and a missing owner mode refuses on its own.
+        ...(typeof row.ownerMode === 'string' ? { ownerMode: row.ownerMode } : {}),
       });
     }
     this.facts = next;
@@ -109,6 +134,11 @@ export class WorkspaceFactStore {
     return this.facts.get(workspaceId) ?? {};
   }
 
+  /** The HQ lane policy from the last table, or null (closed). */
+  hqLane(): HqLanePolicy | null {
+    return this.lanePolicy;
+  }
+
   /** True once main has pushed at least one table (empty counts). */
   get published(): boolean {
     return this.facts !== null;
@@ -124,6 +154,7 @@ export class WorkspaceFactStore {
    */
   clear(): void {
     this.facts = null;
+    this.lanePolicy = null;
     this.seq = -1;
   }
 }

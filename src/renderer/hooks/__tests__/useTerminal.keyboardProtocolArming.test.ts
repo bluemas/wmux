@@ -50,6 +50,37 @@ describe('useTerminal keyboard-protocol arming (#1363)', () => {
     expect(after).toBe(INITIAL_REMOTE_KEYBOARD_STATE);
   });
 
+  it('#1694: native Windows Codex gets its newline from the detected agent', () => {
+    // The fold above stays untrusting; the newline keys read host, WSL,
+    // agent and prompt state per keystroke instead of the win32Input flag.
+    expect(SRC).toMatch(
+      /altEnterNewline: wantsAltEnterNewline\(\{\s*hostPlatform: hostPlatform\(\),\s*isWsl: wslByPtyId\.get\(ptyId\),\s*agentSlug: useStore\.getState\(\)\.surfaceAgent\[ptyId\]\?\.slug,\s*atPrompt: atPromptRef\.current,\s*codexEndedAt: codexEndedAtRef\.current,\s*\}\)/,
+    );
+    // WSL comes from the pty's real shell, the predicate the clipboard uses.
+    expect(SRC).toMatch(/wslByPtyId\.set\(s\.id, isWslShell\(s\.shell\)\)/);
+  });
+
+  it('#1694: every live output chunk feeds the prompt state and the end-of-Codex latch', () => {
+    // Folded with the previous chunk's tail, so a marker split across two data
+    // events still counts (#1751 review).
+    expect(SRC).toMatch(/const folded = foldAtPromptCarry\(wasAtPrompt, promptTailRef\.current, data\);\s*atPromptRef\.current = folded\.atPrompt;\s*promptTailRef\.current = folded\.tail;/);
+    expect(SRC).toMatch(
+      /codexEndedAtRef\.current = noteCodexEndedByPrompt\(\s*codexEndedAtRef\.current,\s*wasAtPrompt,\s*atPromptRef\.current,\s*useStore\.getState\(\)\.surfaceAgent\[ptyId\]\?\.slug,/,
+    );
+  });
+
+  it('#1694: a failed shell lookup is retried, not left unknown for good', () => {
+    expect(SRC).toMatch(
+      /\.catch\(\(\) => \{\s*const delay = PTY_SHELLS_RETRY_MS\[attempt\];\s*if \(delay !== undefined\) window\.setTimeout\(\(\) => learnPtyShells\(ptyId, attempt \+ 1\), delay\);/,
+    );
+  });
+
+  it('#1694: the latch clears once the stale Codex slug is dropped', () => {
+    expect(SRC).toMatch(
+      /if \(codexEndedAtRef\.current !== null && state\.surfaceAgent\[ptyId\]\?\.slug !== 'codex'\) \{\s*codexEndedAtRef\.current = null;/,
+    );
+  });
+
   it('a prompt start clears state without waiting for the liveness poll', () => {
     const armed = foldRemoteKeyboardState(INITIAL_REMOTE_KEYBOARD_STATE, '\x1b[>1u');
     expect(armed.kitty).toBe(true);

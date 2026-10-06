@@ -55,6 +55,7 @@ import type { DaemonClient } from '../../DaemonClient';
 import type { ResumeBinding, PermissionMode } from '../../../shared/agentResume';
 import { readLastAssistantMessage } from '../../claude/lastAssistantMessage';
 import { deliverBrainPtyHookSignal } from '../../deck/brainPtyHookBus';
+import { noteBrainHookSignal } from '../../deck/moaPaneFeed';
 import { getWorkspaceMirror, type WorkspaceMirror } from '../../workspace/WorkspaceMirror';
 import { normalizeHookCue, type CompletionAlarm } from '../../../shared/hooks/CompletionAlarm';
 import type { AgentLastMessage } from '../../../shared/events';
@@ -178,7 +179,7 @@ export function buildTurnBoundaryMetadata(
   kind: AgentSignal['kind'],
   stopMessage: AgentLastMessage | null,
   leftoverWork = 0,
-): { activity: string; pendingQuestion: string; lastMessage: string; agentStatus?: 'complete' | 'error' } | null {
+): { activity: string; pendingQuestion: string; lastMessage: string; lastActivity?: ''; agentStatus?: 'complete' | 'error' } | null {
   if (kind !== 'agent.stop' && kind !== 'agent.session_start' && kind !== 'agent.stop_failure') {
     return null;
   }
@@ -188,6 +189,9 @@ export function buildTurnBoundaryMetadata(
     // not the grapheme cut: the whole question is the point of the row.
     pendingQuestion: stopMessage?.endsWithQuestion ? flattenAgentText(stopMessage.text) : '',
     lastMessage: assistantPreview(stopMessage?.text ?? '') ?? '',
+    // A fresh session also drops the retained last-activity line, which a
+    // Stop keeps so the finished row can say what the turn did.
+    ...(kind === 'agent.session_start' ? { lastActivity: '' as const } : {}),
     // #1096 — a lead stop with background agents still running is not a turn
     // end, so it must not stamp the hook-authoritative completion status: the
     // pane sat on Completed for the whole `Waiting for N background agent(s)`
@@ -540,11 +544,16 @@ export function registerHooksRpc(
     //     A claimed signal may come back with a BLOCK — the Stop gate refusing
     //     to let the orchestrator end its turn. It rides this response because
     //     a second, independent hook would race the one that ends the turn.
+    //     A claimed prompt-submit may come back with a context line instead
+    //     (the HQ brain's view pointer), carried the same way.
     const brainVerdict = deliverBrainPtyHookSignal(signal);
     if (brainVerdict.consumed) {
-      return brainVerdict.block
-        ? { ok: true, block: { reason: brainVerdict.block } }
-        : { ok: true };
+      // The daemon never sees a brain's hooks, so the Moa pane's transcript
+      // reaches it only through the Moa pane feed (phone turn view).
+      noteBrainHookSignal(signal);
+      if (brainVerdict.block) return { ok: true, block: { reason: brainVerdict.block } };
+      if (brainVerdict.additionalContext) return { ok: true, additionalContext: brainVerdict.additionalContext };
+      return { ok: true };
     }
     // An unclaimed prompt-submit used to be dropped RIGHT HERE, on the premise
     // that the brain lane was its only emitter, so an unclaimed one meant a

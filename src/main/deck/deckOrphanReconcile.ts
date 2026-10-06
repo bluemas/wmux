@@ -21,8 +21,10 @@ import { getDeckLoopStatePath } from './deckLoopStateStore';
 import { getDeckAutonomyPath } from './deckAutonomyStore';
 import { getCommanderSessionPath } from './commanderSessionStore';
 import { getDeckDecisionPath } from './deckDecisionStore';
+import { MOA_MEMORY_DECISION_KEY } from '../../shared/moa';
 import { getDeckSchedulesPath } from './deckScheduleStore';
 import { teardownWorkspaceDeckState } from './deckWorkspaceTeardown';
+import { getHqWorkspaceId, isHqStoreCorrupt } from './deckHqStore';
 import { getWorkspaceMirror } from '../workspace/WorkspaceMirror';
 import { DEFAULT_MAX_SNAPSHOT_AGE_MS } from './stopGate';
 
@@ -128,7 +130,8 @@ export function collectDeckWorkspaceFiles(dir?: string): Map<string, string[]> {
     const raw = atomicReadJSONSync<unknown>(getDeckDecisionPath(dir));
     if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
       for (const k of Object.keys(raw as Record<string, unknown>)) {
-        if (WORKSPACE_ID_RE.test(k)) addId(k, 'deck-decisions.json');
+        // Moa's "Remember this?" card key is not a workspace (moaMemory.ts).
+        if (WORKSPACE_ID_RE.test(k) && k !== MOA_MEMORY_DECISION_KEY) addId(k, 'deck-decisions.json');
       }
     }
   } catch {
@@ -228,12 +231,27 @@ export async function reconcileOrphanDeckState(
       return { orphans, archived: [], tornDown: [], skippedIds: [] };
     }
 
+    // FAIL CLOSED: an unreadable deck-hq.json hides which workspace is the HQ.
+    if (isHqStoreCorrupt(dir)) {
+      const skipped = 'skipped: deck-hq.json is unreadable';
+      log(skipped);
+      return { orphans, archived: [], tornDown: [], skippedIds: orphans, skipped };
+    }
+
     const archived: string[] = [];
     const tornDown: string[] = [];
     const skippedIds: string[] = [];
     const activeWorks = loadActiveDeckWorks(dir);
+    const hq = getHqWorkspaceId(dir);
 
     for (const id of orphans) {
+      // The HQ's Deck state is never swept, even when its workspace is gone
+      // (that is the 'hq-missing' state, which fails closed).
+      if (id === hq) {
+        skippedIds.push(id);
+        log(`skipping orphan ${id}: it is the HQ workspace`);
+        continue;
+      }
       const work = activeWorks[id];
 
       if (work) {
@@ -287,6 +305,13 @@ export async function reconcileOrphanDeckState(
   }
 }
 
+/** Whether a work link's owner still counts as live for the closed-workspace
+ *  settle: listed now, or the HQ. A missing HQ is not closed — it comes back
+ *  under the same id — so its links are kept, like its Deck state above. */
+export function workLinkOwnerLive(live: ReadonlySet<string>, hq: string | null): (workspaceId: string) => boolean {
+  return (workspaceId) => live.has(workspaceId) || workspaceId === hq;
+}
+
 let startupDeckReconcileDone = false;
 
 export function isStartupDeckReconcileDone(): boolean {
@@ -305,6 +330,9 @@ export async function tryStartupDeckReconcile(opts?: {
   dir?: string;
   log?: (line: string) => void;
   maxSnapshotAgeMs?: number;
+  /** Settle work outside the deck stores whose workspace is gone (the work
+   *  links). Runs under the same restored-session rule as the sweep. */
+  settleClosedWork?: (liveIds: ReadonlySet<string>) => Promise<unknown>;
 }): Promise<boolean> {
   if (startupDeckReconcileDone) return true;
   const mirror = getWorkspaceMirror();
@@ -332,6 +360,7 @@ export async function tryStartupDeckReconcile(opts?: {
     const liveIds = entries.map((e) => e.id);
     try {
       await reconcileOrphanDeckState(liveIds, opts);
+      await opts?.settleClosedWork?.(new Set(liveIds));
       return true;
     } catch (err) {
       opts?.log?.(`startup reconcile error: ${String(err)}`);

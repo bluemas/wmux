@@ -16,6 +16,7 @@
 import type {
   WorkspaceListEntry,
   FleetSnapshot,
+  ViewedPointer,
   WorkspaceMirrorPushPayload,
 } from '../../shared/workspaceMirror';
 
@@ -34,9 +35,11 @@ export class WorkspaceMirror {
   // null ⇒ the last push carried no roleBindings field (old renderer) — callers
   // must treat the bindings as UNKNOWN and round-trip, never as "unbound".
   private roleBindings: Record<string, unknown> | null = null;
+  private viewed: ViewedPointer | null = null;
   private setAt = 0;
   private populated = false;
   private sessionRestored = false;
+  private readonly snapshotListeners = new Set<() => void>();
   private readonly now: () => number;
 
   constructor(now: () => number = Date.now) {
@@ -52,12 +55,20 @@ export class WorkspaceMirror {
     this.fleets = new Map(payload.fleets.map((f) => [f.workspaceId, f]));
     this.roleBindings = payload.roleBindings ?? null;
     this.sessionRestored = payload.sessionRestored === true;
+    this.viewed = payload.viewed ? { ...payload.viewed } : null;
     // Stamp with our own clock, not the renderer's `payload.ts`: `peek().ageMs`
     // must be measured against the same clock the caller reads `now()` on, so a
     // clock skew between renderer and main can never make a snapshot look
     // negatively aged or arbitrarily stale.
     this.setAt = this.now();
     this.populated = true;
+    for (const listener of this.snapshotListeners) {
+      try {
+        listener();
+      } catch (err) {
+        console.warn(`[WorkspaceMirror] snapshot listener threw: ${String(err)}`);
+      }
+    }
   }
 
   // Read accessors return a SHALLOW COPY of the stored array so a mutating caller
@@ -66,6 +77,14 @@ export class WorkspaceMirror {
   // renderer-validated value objects and are treated as read-only downstream — a
   // per-read deep-freeze would tax this hot routing path (a hook fires far more
   // often than the tree changes) for no additional list-corruption protection.
+
+  /** Run `listener` after every snapshot push. Returns the unsubscribe. */
+  onSnapshot(listener: () => void): () => void {
+    this.snapshotListeners.add(listener);
+    return () => {
+      this.snapshotListeners.delete(listener);
+    };
+  }
 
   /** The mirrored workspace entries, or null if nothing has ever been pushed. */
   getEntries(): WorkspaceListEntry[] | null {
@@ -104,6 +123,12 @@ export class WorkspaceMirror {
    */
   isSessionRestored(): boolean {
     return this.sessionRestored;
+  }
+
+  /** The workspace + pane the human is viewing, or null when unknown (nothing
+   *  pushed yet, or an old renderer that omits the field). */
+  getViewed(): ViewedPointer | null {
+    return this.viewed === null ? null : { ...this.viewed };
   }
 
   /** The per-workspace agent-status snapshot, or null when unknown. */

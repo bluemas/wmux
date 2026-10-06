@@ -1,11 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import { buildPhoneSidebarSnapshot } from '../phoneSidebarSnapshot';
+import { buildPhoneSidebarSnapshot, phoneHandoffTitle } from '../phoneSidebarSnapshot';
 import { resolveTaskLink } from '../../utils/fanoutProvenance';
 import { parsePhoneSidebarSnapshot, PHONE_SIDEBAR_LIMITS } from '../../../shared/phoneFleetSidebar';
 import type { StoreState } from '../../stores';
 import type { Workspace, Pane, PaneLeaf, Surface, AgentStatus } from '../../../shared/types';
 import type { WorkTask } from '../../../shared/workTask';
 import type { FanoutOrigin } from '../../../shared/fanoutOrigin';
+import type { MoaPendingDecision, MoaState } from '../../../shared/moa';
+import type { WorkLink } from '../../../shared/workLink';
 
 const NOW = 5_000_000;
 
@@ -406,5 +408,193 @@ describe('buildPhoneSidebarSnapshot — layout tree', () => {
     expect(layout).toBeUndefined();
     expect(snap.panes).toHaveLength(leaves.length);
     expect(reasons).toContain('workspace.layout.bounds');
+  });
+});
+
+describe('buildPhoneSidebarSnapshot — the Moa HQ', () => {
+  const moa = (hqWorkspaceId: string | null, enabled: boolean, hqState: MoaState['hq']['state'] = 'ok'): MoaState => ({
+    config: { enabled, onboarded: true, level: 2, maxTurnsPerHour: 30, bubbles: true, reduceMotion: false, defaultReason: null },
+    hq: { workspaceId: hqWorkspaceId, state: hqState },
+    archive: { unacked: 0, total: 0 },
+  });
+  const withMoa = (m: MoaState | null) => {
+    const a = workspace('a', [leaf('pa', [surface('sa', 'pty-a')])]);
+    const hq = workspace('hq', [leaf('ph', [surface('sh', 'pty-h')])]);
+    return { ...state({ workspaces: [a, hq] }), moa: m } as StoreState;
+  };
+
+  it('names the HQ once, at the snapshot level, and changes nothing else', () => {
+    const plain = buildPhoneSidebarSnapshot(withMoa(null));
+    const snap = buildPhoneSidebarSnapshot(withMoa(moa('hq', true)));
+    expect(snap.hqWorkspaceId).toBe('hq');
+    expect(snap.moa).toBe(true);
+    // toEqual reads an undefined key as absent: every other field is unchanged.
+    expect({ ...snap, hqWorkspaceId: undefined, moa: undefined }).toEqual(plain);
+    expect('hqWorkspaceId' in plain || 'moa' in plain).toBe(false);
+    expect(parsePhoneSidebarSnapshot(JSON.parse(JSON.stringify(snap)))).toEqual(snap);
+  });
+
+  it('keeps naming the HQ while Moa is off, as the desktop keeps it out of its list, but says moa only when on and present', () => {
+    const off = buildPhoneSidebarSnapshot(withMoa(moa('hq', false)));
+    expect(off.hqWorkspaceId).toBe('hq');
+    expect(off).not.toHaveProperty('moa');
+    const missing = buildPhoneSidebarSnapshot(withMoa(moa('hq', true, 'hq-missing')));
+    expect(missing.hqWorkspaceId).toBe('hq');
+    expect(missing).not.toHaveProperty('moa');
+    // Main says ok but the renderer holds no such workspace yet.
+    const notLive = buildPhoneSidebarSnapshot(withMoa(moa('gone', true)));
+    expect(notLive).not.toHaveProperty('moa');
+    const unset = buildPhoneSidebarSnapshot(withMoa(moa(null, true, 'unset')));
+    expect(unset).not.toHaveProperty('hqWorkspaceId');
+    expect(unset).not.toHaveProperty('moa');
+  });
+
+  it('names the remembered HQ before main\'s first answer (no flash on the phone), without claiming moa', () => {
+    const boot = buildPhoneSidebarSnapshot({ ...withMoa(null), moaHqSeed: 'hq' } as StoreState);
+    expect(boot.hqWorkspaceId).toBe('hq');
+    expect(boot).not.toHaveProperty('moa');
+    // Main's answer wins once it arrives.
+    const answered = buildPhoneSidebarSnapshot({ ...withMoa(moa(null, true, 'unset')), moaHqSeed: 'hq' } as StoreState);
+    expect(answered).not.toHaveProperty('hqWorkspaceId');
+  });
+});
+
+describe('buildPhoneSidebarSnapshot — pending Moa hand-off notice', () => {
+  const ws = [workspace('a', [leaf('pa', [surface('sa', 'pty-a')])]), workspace('b', [leaf('pb', [surface('sb', 'pty-b')])])];
+  const card = (workspaceId: string, extra: Partial<MoaPendingDecision> = {}, options = ['Hand off', 'Edit', 'Cancel']): MoaPendingDecision => ({
+    workspaceId,
+    decision: { id: `d-${workspaceId}`, question: 'Hand this off?', options, context: '', raisedAt: 1_700_000_000_000 },
+    handoff: {
+      body: '\n  Fix the login redirect\nthen run the tests\n' + 'x'.repeat(16_000),
+      title: 'Fallback title', agentName: 'Claude Code', targetPaneId: 'pa', targetPtyId: 'pty-a', foldsNewlines: false, willQueue: false,
+    },
+    ...extra,
+  });
+
+  it('puts the notice on the target workspace row only while a hand-off card is pending, never the body', () => {
+    const snap = buildPhoneSidebarSnapshot(state({ workspaces: ws }), undefined, [card('a')]);
+    expect(snap.workspaces[0].moaHandoff).toEqual({ agentName: 'Claude Code', title: 'Fix the login redirect', raisedAt: 1_700_000_000_000 });
+    expect(snap.workspaces[1]).not.toHaveProperty('moaHandoff');
+    expect(JSON.stringify(snap)).not.toContain('then run the tests');
+    expect(parsePhoneSidebarSnapshot(snap)).toEqual(snap);
+  });
+
+  it('omits it without decisions, for a plain decision, and for the could-not-deliver notice', () => {
+    const plain: MoaPendingDecision = { ...card('a'), handoff: undefined };
+    for (const decisions of [undefined, [], [plain], [card('a', {}, ['OK'])]]) {
+      const snap = buildPhoneSidebarSnapshot(state({ workspaces: ws }), undefined, decisions);
+      expect(snap.workspaces.some((row) => 'moaHandoff' in row)).toBe(false);
+    }
+  });
+
+  it('sanitises the title: first non-blank line, control and bidi characters stripped, cut to 80', () => {
+    expect(phoneHandoffTitle('\r\n\t \n\u202eDo\u0007it\u2028second', 'f')).toBe('Do it');
+    expect(phoneHandoffTitle('y'.repeat(500), 'f')).toBe('y'.repeat(PHONE_SIDEBAR_LIMITS.moaHandoffTitle));
+    expect(phoneHandoffTitle('   \n\n', 'Fallback\ttitle')).toBe('Fallback title');
+    expect(phoneHandoffTitle(undefined, undefined)).toBeUndefined();
+  });
+});
+
+describe('buildPhoneSidebarSnapshot — Moa delegations', () => {
+  const T = 1_700_000_000_000;
+  const DAY = 24 * 60 * 60 * 1000;
+  const ws = [
+    workspace('a', [leaf('pa', [surface('sa', 'pty-a')])]),
+    workspace('b', [leaf('pb', [surface('sb', 'pty-b')])]),
+  ];
+  const link = (id: string, extra: Partial<WorkLink> = {}): WorkLink => ({
+    id: `wl-${id}`,
+    origin: 'moa',
+    title: `Job ${id}`,
+    a2aTaskId: `task-${id}`,
+    a2aState: 'working',
+    owner: { workspaceId: 'a', paneId: 'pa' },
+    agent: 'codex',
+    state: 'running',
+    decisionIds: [],
+    createdAt: T,
+    updatedAt: T,
+    ...extra,
+  });
+  const decision = (id: string, workspaceId = 'a'): MoaPendingDecision => ({
+    workspaceId,
+    decision: { id, question: 'Which branch?', options: ['main', 'dev'], context: '', raisedAt: T },
+  });
+  const build = (links: WorkLink[], opts: { decisions?: MoaPendingDecision[]; status?: Record<string, AgentStatus>; now?: number } = {}) =>
+    buildPhoneSidebarSnapshot(state({ workspaces: ws, status: opts.status }), undefined, opts.decisions ?? [], { links, now: opts.now ?? T + 1000 });
+
+  it("lists Moa-origin jobs with an A2A task only, named by the pane's agent, never the request or result", () => {
+    const snap = build([
+      link('1', { result: { summary: 'secret report', at: T } as WorkLink['result'] }),
+      link('manual', { origin: 'manual' }),
+      link('undelivered', { a2aTaskId: undefined }),
+      link('auto', { origin: 'moa-auto', owner: { workspaceId: 'b' }, agent: undefined, updatedAt: T - 5 }),
+    ], { status: { 'pty-a': 'running' } });
+    expect(snap.moaDelegations).toEqual([
+      { taskId: 'task-1', workspaceId: 'a', agentName: 'Claude Code', title: 'Job 1', state: 'working', since: T },
+      { taskId: 'task-auto', workspaceId: 'b', agentName: 'Agent', title: 'Job auto', state: 'working', since: T - 5 },
+    ]);
+    expect(JSON.stringify(snap)).not.toContain('secret report');
+    expect(parsePhoneSidebarSnapshot(snap)).toEqual(snap);
+  });
+
+  it('falls back to the link agent slug when the pane has no agent, and bounds the title', () => {
+    const snap = build([link('1', { title: '\u202eFix\nit ' + 'y'.repeat(200) })]);
+    expect(snap.moaDelegations?.[0].agentName).toBe('Codex CLI');
+    expect(snap.moaDelegations?.[0].title).toBe(('Fix it ' + 'y'.repeat(200)).slice(0, PHONE_SIDEBAR_LIMITS.moaDelegationTitle));
+  });
+
+  it('is blocked while a linked Moa decision is pending, and working again once it is answered', () => {
+    const pending = build([link('1', { decisionIds: ['d1'] })], { decisions: [decision('d1')] });
+    expect(pending.moaDelegations?.[0].state).toBe('blocked');
+    const answered = build([link('1', { decisionIds: ['d1'] })], { decisions: [] });
+    expect(answered.moaDelegations?.[0].state).toBe('working');
+  });
+
+  it("is blocked while the delegated pane waits on a prompt, and not for another workspace's prompt", () => {
+    expect(build([link('1')], { status: { 'pty-a': 'awaiting_input' } }).moaDelegations?.[0].state).toBe('blocked');
+    expect(build([link('1')], { status: { 'pty-b': 'awaiting_input' } }).moaDelegations?.[0].state).toBe('working');
+    // No pane named: the workspace's only agent pane stands in.
+    expect(build([link('1', { owner: { workspaceId: 'a' } })], { status: { 'pty-a': 'awaiting_input' } }).moaDelegations?.[0].state).toBe('blocked');
+  });
+
+  it('leaves the job unattributed when its pane holds two agent tabs', () => {
+    const twoTabs = [workspace('a', [leaf('pa', [surface('sa', 'pty-a'), surface('sa2', 'pty-a2')])])];
+    const snap = buildPhoneSidebarSnapshot(
+      state({ workspaces: twoTabs, status: { 'pty-a': 'running', 'pty-a2': 'awaiting_input' } }),
+      undefined, [], { links: [link('1')], now: T + 1000 },
+    );
+    // The other tab's prompt does not block it, and the name falls back to the handed-to agent.
+    expect(snap.moaDelegations?.[0]).toMatchObject({ state: 'working', agentName: 'Codex CLI' });
+    // Same with no pane named: two agent tabs in the workspace are ambiguous too.
+    const unnamed = buildPhoneSidebarSnapshot(
+      state({ workspaces: twoTabs, status: { 'pty-a': 'running', 'pty-a2': 'awaiting_input' } }),
+      undefined, [], { links: [link('1', { owner: { workspaceId: 'a' } })], now: T + 1000 },
+    );
+    expect(unnamed.moaDelegations?.[0].state).toBe('working');
+  });
+
+  it('keeps finished jobs for 24 h only, and keeps open ones however old', () => {
+    const now = T + DAY + 10;
+    const snap = build([
+      link('old-done', { a2aState: 'completed', state: 'done', updatedAt: T }),
+      link('fresh-failed', { a2aState: 'failed', state: 'blocked', reason: 'task-failed', updatedAt: T + 20 }),
+      link('old-open', { updatedAt: T - DAY }),
+    ], { now });
+    expect(snap.moaDelegations?.map((d) => [d.taskId, d.state])).toEqual([['task-fresh-failed', 'failed'], ['task-old-open', 'working']]);
+  });
+
+  it('orders newest first and caps the list', () => {
+    const links = Array.from({ length: 30 }, (_, i) => link(String(i), { updatedAt: T + i }));
+    const list = build(links, { now: T + 100 }).moaDelegations ?? [];
+    expect(list).toHaveLength(PHONE_SIDEBAR_LIMITS.moaDelegations);
+    expect(list[0].taskId).toBe('task-29');
+    expect(list.every((d, i) => i === 0 || list[i - 1].since >= d.since)).toBe(true);
+  });
+
+  it('is empty with no jobs, and absent when the links or the decisions could not be read', () => {
+    expect(build([]).moaDelegations).toEqual([]);
+    expect(buildPhoneSidebarSnapshot(state({ workspaces: ws }), undefined, [])).not.toHaveProperty('moaDelegations');
+    expect(buildPhoneSidebarSnapshot(state({ workspaces: ws }), undefined, undefined, { links: [link('1')], now: T })).not.toHaveProperty('moaDelegations');
   });
 });

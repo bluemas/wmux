@@ -35,8 +35,13 @@ import {
   replaceStaleDecision,
   resolveDecision,
   isDecisionStale,
+  isMainOwnedDecision,
   type WorkspaceDecision,
 } from '../../deck/deckDecisionStore';
+import { getMoaHandoffService } from '../../deck/moaHandoff';
+import { currentMoaReadRoots, refreshMoaReadRoots } from '../../deck/moaReadGate';
+import { plainLanguageRefusal } from '../../deck/plainLanguage';
+import { getHqWorkspaceId } from '../../deck/deckHqStore';
 import { loadWorkspaceMode } from '../../deck/deckAutonomyStore';
 import { loadDeckHeartbeat } from '../../deck/deckHeartbeatStore';
 import { hasReExamineLease } from '../../deck/reExamineLease';
@@ -50,6 +55,7 @@ import { getWmuxDir } from '../../../daemon/config';
 import { DEFAULT_MAX_SNAPSHOT_AGE_MS, isOutstandingWorkerPane } from '../../deck/stopGate';
 import { getTaskLedger } from '../../deck/taskLedgerHost';
 import type { TaskLedger } from '../../../daemon/ledger/TaskLedger';
+import { attachDecisionToTask, carryDecision } from '../../workLink/decisionLink';
 
 /** Minimum characters a self-resolve resolution must carry. The re-examine
  *  prompt demands the brain CITE the binding rule/basis that settles the
@@ -183,6 +189,11 @@ export function registerDeckRpc(router: RpcRouter, getWindow: GetWindow, deps: D
     if (verification.length < MIN_WORK_VERIFICATION_CHARS) {
       return { ok: false, error: 'verification_required' };
     }
+    // Moa's report is the operator's to read: refuse internals.
+    if (ws === getHqWorkspaceId()) {
+      const refusal = plainLanguageRefusal([summary, verification]);
+      if (refusal) return refusal;
+    }
 
     // Brain PTYs are excluded from the mirror upstream, so only worker panes can
     // block. A stale/missing renderer snapshot cannot prove work outstanding and
@@ -207,7 +218,20 @@ export function registerDeckRpc(router: RpcRouter, getWindow: GetWindow, deps: D
       }
     }
 
-    const trackedIds = Object.keys(work.a2aTasks);
+    // A Moa hand-off is the OPERATOR's task (moaHandoff.ts): it is not in this
+    // brain's own task list, and an end the operator or the worker chose
+    // (canceled, failed) settles it as much as a completion does. Its state
+    // comes from main's hand-off store.
+    const handoffs = getMoaHandoffService();
+    const handoffOpen: string[] = [];
+    const trackedIds = Object.keys(work.a2aTasks).filter((taskId) => {
+      const st = handoffs?.handoffTaskStatus(taskId) ?? null;
+      if (st === 'open') handoffOpen.push(taskId);
+      return st === null;
+    });
+    if (handoffOpen.length > 0) {
+      return { ok: false, error: 'a2a_tasks_outstanding', tasks: handoffOpen.map((taskId) => ({ taskId, state: 'handoff_open' })) };
+    }
     if (trackedIds.length > 0) {
       const query = await router.dispatch({
         id: `deck-complete-${work.id}`,
@@ -242,6 +266,11 @@ export function registerDeckRpc(router: RpcRouter, getWindow: GetWindow, deps: D
     // request with an older completion verdict.
     const completed = completeActiveDeckWork(ws, work);
     if (!completed) return { ok: false, error: 'active_work_changed' };
+    // The job is done: hand-off cards Moa raised for it and the operator never
+    // answered are moot, and would keep "Waiting on you" above zero.
+    if (handoffs && ws === getHqWorkspaceId()) await handoffs.closeMootCards(ws).catch(() => 0);
+    // The job is settled: the repos it read stop being readable without asking.
+    if (ws === getHqWorkspaceId()) await refreshMoaReadRoots();
     return { ok: true, workId: work.id, summary, verification };
   });
 
@@ -266,8 +295,21 @@ export function registerDeckRpc(router: RpcRouter, getWindow: GetWindow, deps: D
       ? (params['options'] as unknown[]).filter((s): s is string => typeof s === 'string')
       : [];
     const context = typeof params['context'] === 'string' ? (params['context'] as string) : '';
+    // Moa's card is the operator's to read: refuse internals.
+    if (ws === getHqWorkspaceId()) {
+      const refusal = plainLanguageRefusal([question, context, ...options]);
+      if (refusal) return refusal;
+    }
+    // Optional A2A task the decision is about: shown on that task's work link.
+    // Best-effort — a missing or foreign task never fails the raise.
+    const taskId = typeof params['taskId'] === 'string' && params['taskId'] ? params['taskId'] : undefined;
     const existing = loadWorkspaceDecision(ws);
     let decision: WorkspaceDecision | null;
+    // A main-owned card (an issue proposal, a Moa hand-off) is never replaced
+    // by a brain's question, stale or not: only a human answers it.
+    if (existing && isMainOwnedDecision(existing)) {
+      return { ok: false, error: 'decision_pending', id: existing.id };
+    }
     if (existing && existing.status === 'pending') {
       // STALE REPLACE (WP3): the re-examine turn explicitly offers "re-raise a
       // sharper question, which replaces this one". That contract only exists
@@ -290,7 +332,12 @@ export function registerDeckRpc(router: RpcRouter, getWindow: GetWindow, deps: D
         // CAS lost — the decision was resolved/cleared/replaced concurrently.
         return { ok: false, error: 'decision_pending', id: existing.id };
       }
-      return { ok: true, id: decision.id };
+      // The replacement has a new id; without a task_id it stays on the old one's links.
+      if (!taskId) {
+        await carryDecision(existing.id, decision.id);
+        return { ok: true, id: decision.id };
+      }
+      return { ok: true, id: decision.id, ...(await attachDecisionToTask(ws, taskId, decision.id)) };
     }
     decision = await raiseDecision(ws, { question, options, context });
     // Fail CLOSED: if nothing was persisted (write failure, or the question
@@ -300,7 +347,35 @@ export function registerDeckRpc(router: RpcRouter, getWindow: GetWindow, deps: D
     if (!decision) {
       return { ok: false, error: 'raise_failed' };
     }
-    return { ok: true, id: decision.id };
+    if (!taskId) return { ok: true, id: decision.id };
+    return { ok: true, id: decision.id, ...(await attachDecisionToTask(ws, taskId, decision.id)) };
+  });
+
+  // `deck.proposeHandoff` (moa_propose_handoff): the HQ brain proposes work
+  // for an agent in ANOTHER workspace. Main stores the body and raises a card
+  // for the operator, or, in danger mode on both sides, delivers it itself
+  // (moaHandoff.ts). HQ only: the token's workspace must be the HQ. Nothing
+  // here takes a mode, an origin or a decision id from the brain.
+  // `deck.moaReadRoots`: Moa's read gate (a PreToolUse hook script in the HQ
+  // brain) asks which repositories it may read without a prompt. Read-only:
+  // the roots main holds in memory, unexpired and re-vetted (moaReadGate.ts).
+  // Reached through its own client lane (readGateLane.ts).
+  router.register('deck.moaReadRoots', async () => ({ roots: currentMoaReadRoots() }));
+
+  router.register('deck.proposeHandoff', async (params) => {
+    const ws = commanderTokenWorkspace(params['token']);
+    if (!ws) {
+      throw new Error('deck.proposeHandoff: not a live commander session');
+    }
+    const svc = getMoaHandoffService();
+    if (!svc) return { ok: false, error: 'moa_off' };
+    return svc.propose(ws, {
+      ptyId: params['ptyId'],
+      paneId: params['paneId'],
+      body: params['body'],
+      title: params['title'],
+      externalSource: params['externalSource'],
+    });
   });
 
   // `deck.resolveDecision` is how the commander brain resolves its OWN stale
@@ -332,6 +407,11 @@ export function registerDeckRpc(router: RpcRouter, getWindow: GetWindow, deps: D
 
     // Load the current decision once — the id must match the ACTIVE pending one.
     const current = loadWorkspaceDecision(ws);
+    // A main-owned card (an issue proposal, a Moa hand-off) is answered only by
+    // a human through main; no brain resolves one, whatever slot it sits in.
+    if (current && current.id === id && isMainOwnedDecision(current)) {
+      return { ok: false, error: 'main_owned' };
+    }
     if (!current || current.status !== 'pending' || current.id !== id) {
       return { ok: false, error: 'not_pending' };
     }

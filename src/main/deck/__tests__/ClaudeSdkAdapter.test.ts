@@ -351,9 +351,6 @@ describe('ClaudeSdkAdapter', () => {
     expect(prompt).toContain('[policy]');
     expect(prompt).toContain('binding policy rules');
     expect(prompt).toContain('recalled memory');
-    // The old positive trigger no longer stands alone unqualified: "a genuine
-    // choice between approaches" is now bound to "WHERE NO standing rule ...".
-    expect(prompt).toMatch(/genuine choice between approaches WHERE NO standing rule or convention/);
     expect(prompt).toContain('a standing rule already answers is NOT a genuine choice');
     // Mechanics preserved.
     expect(prompt).toContain('END YOUR TURN');
@@ -361,6 +358,60 @@ describe('ClaudeSdkAdapter', () => {
     expect(prompt).toContain('routine progress updates');
     // Learnings loop: persist an operator correction so it is not re-raised.
     expect(prompt).toContain('If the operator corrects an escalation you raised');
+  });
+
+  it('Moa reaches other workspaces by hand-off first, never by terminal_send', () => {
+    const moa = buildCommanderSystemPrompt(undefined, { moa: true }).replace(/\s+/g, ' ');
+    expect(moa).toContain('Reach such an agent ONLY with moa_propose_handoff({ptyId, title, body})');
+    expect(moa).toContain("terminal_send, terminal_send_key, terminal_read and send_message are refused for another workspace's pane, so never try them there.");
+    expect(moa).toContain('Hand the work THERE (moa_propose_handoff takes a pane running an agent, never a bare shell)');
+    expect(moa).toContain('You CAN read files (Read, Grep, Glob) to check a result.');
+    expect(moa).not.toContain('an idle shell, or an agent');
+    expect(moa).not.toContain('To act, use pane_split (spawn), terminal_send (instruct)');
+    expect(moa).not.toContain('Send the work THERE with terminal_send');
+    // A brain that is not Moa keeps the in-workspace guidance.
+    const plain = buildCommanderSystemPrompt().replace(/\s+/g, ' ');
+    expect(plain).toContain('To act, use pane_split (spawn), terminal_send (instruct)');
+    expect(plain).not.toContain('moa_propose_handoff({ptyId');
+  });
+
+  it('Moa answers in the operator\'s language, and small talk is not work', () => {
+    const moa = buildCommanderSystemPrompt(undefined, { moa: true }).replace(/\s+/g, ' ');
+    expect(moa).toContain("REPLY IN THE OPERATOR'S LANGUAGE: every reply, card and final report is written in the language of the operator's latest message (Korean in, Korean out)");
+    expect(moa).toContain("Only a hand-off body follows the target project's language rules.");
+    expect(moa).toContain('A thank-you or a greeting is not a request: answer in one short line, call no tools, and do not call deck_complete_work.');
+  });
+
+  it('replies read like chat: 1-3 sentences, lists only when due, one line per hand-off', () => {
+    const flat = buildCommanderSystemPrompt().replace(/\s+/g, ' ');
+    expect(flat).toContain('REPLY STYLE: write like a chat message, 1-3 conversational sentences.');
+    expect(flat).toContain('Use a list only when the operator asked for one or there are 3+ parallel items; no bold headings.');
+    expect(flat).toContain('When you hand work off, say one line ("Handed to <agent> in <workspace>."; for a card the operator still has to approve, "Asked to hand this to <agent> in <workspace>.") and nothing more until the result.');
+    expect(flat).toContain('Never narrate your steps between tool calls.');
+  });
+
+  it('a hand-off body is the request, its scope and how to verify, with no checkout ceremony', () => {
+    const flat = buildCommanderSystemPrompt().replace(/\s+/g, ' ');
+    expect(flat).toContain("DELEGATION CONTRACT — a dispatch or hand-off body is the operator's request in plain words, its SCOPE (what the worker must NOT do) and HOW TO VERIFY it.");
+    expect(flat).toContain("Follow the target agent's own checkout and conventions: no worktree, branch, result file or DONE marker unless the operator asks for one, or another agent works the same checkout at the same time.");
+    expect(flat).not.toContain('ARTIFACT PATH');
+    expect(flat).not.toContain('COMPLETION MARKER');
+  });
+
+  it('pins the chief-of-staff escalation policy: lookups first, a closed list of asks, one final report', () => {
+    const prompt = buildCommanderSystemPrompt().replace(/'\s*\n\s*'/g, ' ');
+    const flat = prompt.replace(/\s+/g, ' ');
+    expect(flat).toContain('First exhaust the cheap lookups (workspace_list, pane_list, a2a_task_query, the ledger, memory): a question a lookup answers is never asked.');
+    expect(flat).toContain('decide by production impact');
+    expect(flat).toContain('ONLY for: taste, a release, an irreversible action outside wmux, a security-boundary change, or a real fork where the operator\'s intent is ambiguous.');
+    expect(flat).toContain('Every question carries your recommended option, listed first.');
+    expect(flat).toContain('Its context says why you are asking: what blocks you and what each answer changes.');
+    expect(flat).toContain('ONCE per job with the FINAL result (what changed, how it was verified)');
+    expect(flat).toContain('No progress chatter');
+    expect(flat).not.toContain('short PROGRESS update');
+    expect(flat).toContain("SPEAK THE OPERATOR'S LANGUAGE in every card and reply: no tool names, ids or field names.");
+    expect(flat).toContain('If you find the answer to your own pending decision (a lookup, or their message), say so in one line and ask them to close the card with Not needed');
+    expect(flat).not.toContain('a risky or irreversible action, or a genuine choice between approaches');
   });
 
   it('GLM profile injects the compatible base-url / auth-token', async () => {

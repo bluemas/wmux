@@ -282,6 +282,8 @@ describe('task.fanout.start — happy path (so the rejections below mean somethi
       status: 'accepted',
       taskCount: 2,
       repoPath: CALLER_REPO_ROOT,
+      ownerWorkspaceId: CALLER_WS,
+      // Deprecated alias, kept for older callers.
       workspaceId: CALLER_WS,
     });
     await h.flush();
@@ -536,12 +538,19 @@ describe('the caller is answered without waiting for the fan-out', () => {
 
     const result: FanOutResult = {
       ok: true,
-      tasks: [{ index: 0, title: 'first task', ok: true, taskId: 'wtask-1' }],
+      tasks: [
+        { index: 0, title: 'first task', ok: true, taskId: 'wtask-1', workspaceId: 'ws-task-1' },
+        { index: 1, title: 'second task', ok: true, taskId: 'wtask-2', workspaceId: 'ws-task-2' },
+      ],
     };
     h.finishRun(result);
     await h.flush();
 
-    expect(await h.call(goodParams())).toMatchObject({ ok: true, status: 'completed', result });
+    const done = await h.call(goodParams()) as { result?: FanOutResult };
+    expect(done).toMatchObject({ ok: true, status: 'completed', result });
+    // Each task names its OWN workspace — never the owner's.
+    expect(done.result?.tasks.map((t) => t.workspaceId)).toEqual(['ws-task-1', 'ws-task-2']);
+    expect(done.result?.tasks.map((t) => t.workspaceId)).not.toContain(CALLER_WS);
     // Three calls, ONE run: polling must never re-fan-out.
     expect(h.start).toHaveBeenCalledTimes(1);
   });
@@ -1647,6 +1656,42 @@ describe('task.fanout.start — preset and agents', () => {
     expect(h.request().agentCmd).toBe(FANOUT_WIRE_AGENT_CMD);
     expect(h.request().worktree).toBeUndefined();
     expect(h.preview()).toMatch(/\[agent: codex -c projects\.<task folder>\.trust_level=trusted --model gpt-5\.5\]/);
+  });
+
+  it('carries a per-task effort to the service and names it in the preview', async () => {
+    const h = setup();
+    const res = await h.call(goodParams({ agents: [{ agent: 'claude', effort: 'medium' }, { agent: 'codex', effort: 'low' }] }));
+    expect(res).toMatchObject({ ok: true, status: 'accepted' });
+    expect((res as { warnings?: unknown }).warnings).toBeUndefined();
+    await h.flush();
+    expect(h.request().agents).toEqual([{ agent: 'claude', effort: 'medium' }, { agent: 'codex', effort: 'low' }]);
+    expect(h.preview()).toMatch(/\[agent: codex -c projects\.<task folder>\.trust_level=trusted effort low\]/);
+  });
+
+  it('ignores effort on an agent without an effort flag, with a warning instead of a refusal', async () => {
+    const h = setup();
+    const res = await h.call(goodParams({ agents: [{ agent: 'agy', effort: 'low' }, { agent: 'grok', effort: 'high' }] }));
+    expect(res).toMatchObject({ ok: true, status: 'accepted' });
+    const warnings = (res as { warnings: string[] }).warnings;
+    expect(warnings[0]).toMatch(/^agents\[0\]: agy takes its effort in the model id/);
+    expect(warnings[1]).toMatch(/^agents\[1\]: grok has no verified effort flag/);
+    await h.flush();
+    expect(h.request().agents).toEqual([{ agent: 'agy' }, { agent: 'grok' }]);
+  });
+
+  it('refuses a non-string effort as INVALID_ARGUMENT, not a thrown error', async () => {
+    const h = setup();
+    const err = errorOf(await h.call(goodParams({ agents: [{ agent: 'claude', effort: { toString: 1 } }, { agent: 'claude' }] })));
+    expect(err.code).toBe('INVALID_ARGUMENT');
+    expect(err.message).toMatch(/agents\[0\]: effort "<object>" is not one lowercase word/);
+  });
+
+  it('refuses an effort that is not one lowercase word', async () => {
+    const h = setup();
+    const err = errorOf(await h.call(goodParams({ agents: [{ agent: 'claude', effort: 'High; rm' }, { agent: 'claude' }] })));
+    expect(err.code).toBe('INVALID_ARGUMENT');
+    expect(err.message).toMatch(/agents\[0\]: effort "High; rm" is not one lowercase word/);
+    expect(h.start).not.toHaveBeenCalled();
   });
 
   it('matches the preset name case-insensitively and uses its rows in order', async () => {

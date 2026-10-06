@@ -50,6 +50,7 @@ import { tokenAttrs } from '../../themes';
 import { FOCUS_RING } from '../focusRing';
 import { IconChevron } from '../icons';
 import { onBriefingConfigChanged } from './deckBriefingConfigBus';
+import { MoaRetroCard } from '../Moa/MoaRetroCard';
 import {
   briefingHasContent,
   briefingSignal,
@@ -219,7 +220,23 @@ export function briefingDeltaLine(changed: BriefingChange, t: T): string {
   );
 }
 
-export function DeckBriefingCard({
+/** The briefing, with Moa's weekly retro on top when main has one for this
+ *  workspace (MoaRetroCard renders nothing otherwise). */
+/** The briefing with its decision facts removed (Moa's Waiting on you owns them). */
+export function withoutDecision(b: WorkspaceBriefing): WorkspaceBriefing {
+  return { ...b, pendingDecision: null, changed: b.changed ? { ...b.changed, newDecision: false } : b.changed };
+}
+
+export function DeckBriefingCard(props: Parameters<typeof DeckBriefingBody>[0]): React.ReactElement {
+  return (
+    <>
+      <MoaRetroCard workspaceId={props.workspaceId} t={props.t ?? (() => '')} />
+      <DeckBriefingBody {...props} />
+    </>
+  );
+}
+
+function DeckBriefingBody({
   api,
   onStream,
   workspaceId,
@@ -229,7 +246,12 @@ export function DeckBriefingCard({
   channelsUnread = 0,
   onJumpToChannels,
   fleetSignature,
+  omitDecision = false,
 }: {
+  /** Moa's panel lists every pending decision in Waiting on you, right above:
+   *  the briefing says nothing about decisions there, and renders nothing when
+   *  that was all it had to say. */
+  omitDecision?: boolean;
   api?: DeckBriefingApi;
   onStream?: DeckBriefingStream;
   workspaceId?: string;
@@ -259,12 +281,12 @@ export function DeckBriefingCard({
     (window.electronAPI as unknown as { deck?: { onStream?: DeckBriefingStream } } | undefined)
       ?.deck?.onStream;
 
-  const [briefing, setBriefing] = useState<WorkspaceBriefing | null>(null);
+  const [rawBriefing, setBriefing] = useState<WorkspaceBriefing | null>(null);
   const [expanded, setExpanded] = useState(false);
   // The delta STAYS once shown. Acknowledging it clears the delta in main, so
   // without this the "2 finished, 1 now blocked" line the operator is reading
   // would vanish on the very next stream tick.
-  const [shownChange, setShownChange] = useState<BriefingChange | null>(null);
+  const [rawShownChange, setShownChange] = useState<BriefingChange | null>(null);
   // Monotonic request id: ignore a slow get() whose response lands after the
   // workspace changed (or after a newer get), so a stale response can't overwrite
   // the active workspace's card (workspace-switch race — DeckDecisionCard pattern).
@@ -466,12 +488,14 @@ export function DeckBriefingCard({
   // brought back to the front — acknowledges then rather than never.
   const seen = resolvedApi?.seen;
   useEffect(() => {
-    if (!expanded || !briefing || !workspaceId || !seen) return;
+    if (!expanded || !rawBriefing || !workspaceId || !seen) return;
     if (!onScreen || !docVisible) return;
-    void seen(workspaceId, briefing.builtAt).catch(() => undefined);
-  }, [expanded, briefing, workspaceId, seen, onScreen, docVisible]);
+    void seen(workspaceId, rawBriefing.builtAt).catch(() => undefined);
+  }, [expanded, rawBriefing, workspaceId, seen, onScreen, docVisible]);
 
-  if (!resolvedApi || !briefing) return null;
+  if (!resolvedApi || !rawBriefing) return null;
+  const briefing = omitDecision ? withoutDecision(rawBriefing) : rawBriefing;
+  const shownChange = omitDecision && rawShownChange ? { ...rawShownChange, newDecision: false } : rawShownChange;
   // Nothing to say ⇒ no card at all (DESIGN.md: no dead gauges). The sticky delta
   // counts as content so an acknowledged "2 finished" doesn't yank the card away
   // mid-read on an otherwise-empty workspace.

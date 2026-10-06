@@ -211,8 +211,11 @@ export interface ChatDeliveredMessage {
 export interface ChatLaunchRequest {
   id: string;
   agent: TerminalLaunchAgent;
-  prompt: string;
+  /** The first message; absent launches the agent alone. */
+  prompt?: string;
   mode?: TerminalLaunchMode;
+  /** Continue the newest conversation in the pane's cwd (Claude `--continue`, Codex `resume --last`). */
+  resume?: boolean;
   /** Phone: refuse a pane that already has a readable conversation (desktop eligibility rule). */
   refuseConversation?: boolean;
   /** Called (`first-write`) immediately before the launcher is typed. `false` types nothing. */
@@ -222,7 +225,8 @@ export interface ChatLaunchRequest {
 export type ChatLaunchTag =
   | 'launch-pending' | 'conversation-exists' | 'launch-not-ready' | 'launch-unsupported'
   | 'agent-not-installed' | 'agent-runtime-unavailable' | 'launch-unconfirmed'
-  | 'authorization-expired' | 'invalid-chat-request';
+  | 'authorization-expired' | 'invalid-chat-request'
+  | 'resume-unavailable' | 'resume-in-use' | 'resume-prompt-unsupported';
 
 export type ChatLaunchOutcome =
   | { ok: true; effect: 'submitted' }
@@ -306,6 +310,8 @@ export interface ChatBridge {
   /** Owner-bound receipt read; never dispatches. `unknown` when absent, for another owner or another pane. */
   receipt(owner: ChatOwner, id: string, clientMessageId: string): ChatSendReceiptView;
   launch(request: ChatLaunchRequest): Promise<ChatLaunchOutcome>;
+  /** Whether `resume:true` would continue the pane's own binding now (`/turns` `chat.resumable`). */
+  resumable?(id: string): Promise<boolean>;
   /** Phone skills rule: Claude `spawnCwd`; Codex live relay selection cwd, else `spawnCwd`. */
   skills(id: string, agent: TerminalLaunchAgent): Promise<ChatSkillCatalog>;
   /** Bridge-owned OpenCode watch: nudges phone watchers on TUI changes until `unwatch`. */

@@ -147,6 +147,7 @@ function makeFakeChat() {
       if (req.authorized && !(await req.authorized())) return { ok: false, error: 'authorization-expired', effect: 'none' };
       return { ok: true, effect: 'submitted' };
     },
+    resumable: false,
     skills: { state: 'ready', skills: [{ name: 'review', description: 'Review the diff', invocation: '$review', source: 'user' }] } as ChatSkillCatalog,
   };
   const bridge = {
@@ -159,6 +160,7 @@ function makeFakeChat() {
     receipt: vi.fn((owner: ChatOwner, id: string, cmid: string): ChatSendReceiptView =>
       box.receipts.get(`${owner}|${id}|${cmid}`) ?? { clientMessageId: cmid, state: 'unknown' }),
     launch: vi.fn((req: ChatLaunchRequest) => box.launch(req)),
+    resumable: vi.fn(async (_id: string) => box.resumable),
     skills: vi.fn(async () => box.skills),
     watch: vi.fn(),
     unwatch: vi.fn(),
@@ -360,11 +362,24 @@ describe('native chat routes (contract v0.3.1)', () => {
       expect(body).not.toHaveProperty('reset');
       expect(body.chat).toEqual({
         binding: 'terminal', agent: 'claude', agentSessionId: 'sess-a', historyEpoch: epoch,
-        historyTruncated: false, agentStatus: 'idle', agentAlive: true,
+        historyTruncated: false, agentStatus: 'idle', agentAlive: true, resumable: false,
         capabilities: { history: true, send: true, permissions: false, cancel: false, fileUndo: false, streaming: false, launch: false, skills: true },
       });
+      // A live agent is never resumable, so the lookup does not run.
+      expect(chat.resumable).not.toHaveBeenCalled();
       expect(decodeCursor(body.cursor)).toEqual({ v: 2, src: 'file', a: 'sess-a', e: epoch, head: 5, tail: 50, fileSize: 50 });
       expect(projectorMock.snapshot).toHaveBeenCalledWith('s1');
+    });
+
+    it('reads resumable from the bridge once the agent is not alive', async () => {
+      const info = await start();
+      const resolution = chatBox.resolution as Extract<ChatResolution, { source: 'file' }>;
+      chatBox.resolution = { ...resolution, status: { ...resolution.status, agentAlive: false } };
+      chatBox.resumable = true;
+      expect((await turns(bearer(info.token as string))).body.chat).toMatchObject({ agentAlive: false, resumable: true });
+      expect(chat.resumable).toHaveBeenCalledWith('s1');
+      chatBox.resumable = false;
+      expect((await turns(bearer(info.token as string))).body.chat.resumable).toBe(false);
     });
 
     it('never advertises Stop or image attachments, which the phone has no route for; queue passes through', async () => {
@@ -1050,6 +1065,76 @@ describe('native chat routes (contract v0.3.1)', () => {
       expect(chat.traceDangerousLaunch).not.toHaveBeenCalled();
     });
 
+    it('a bare launch: an omitted or empty prompt reaches the bridge as no prompt', async () => {
+      await start();
+      const h = device('dev-1');
+      for (const over of [{ prompt: undefined }, { prompt: '' }]) {
+        const body = launchBody({ agent: 'claude', ...over });
+        const res = await postJson(url(), h, body);
+        expect(res.status).toBe(202);
+        expect(await res.json()).toEqual({ ok: true, replayed: false, clientLaunchId: body.clientLaunchId, effect: 'submitted' });
+      }
+      for (const [req] of chat.launch.mock.calls) {
+        expect(req).toMatchObject({ id: 's1', agent: 'claude', mode: 'default', resume: false, refuseConversation: true });
+        expect(req).not.toHaveProperty('prompt');
+      }
+    });
+
+    it('resume for claude and codex, with and without a prompt', async () => {
+      await start();
+      const h = device('dev-1');
+      for (const agent of ['claude', 'codex']) {
+        expect((await postJson(url(), h, launchBody({ agent, prompt: undefined, resume: true }))).status).toBe(202);
+        expect((await postJson(url(), h, launchBody({ agent, prompt: 'next step', resume: true }))).status).toBe(202);
+      }
+      const calls = chat.launch.mock.calls.map(([req]) => ({ agent: req.agent, prompt: req.prompt, resume: req.resume }));
+      expect(calls).toEqual([
+        { agent: 'claude', prompt: undefined, resume: true }, { agent: 'claude', prompt: 'next step', resume: true },
+        { agent: 'codex', prompt: undefined, resume: true }, { agent: 'codex', prompt: 'next step', resume: true },
+      ]);
+    });
+
+    it('resume-unavailable is 409 effect none, and the receipt reads refused', async () => {
+      await start();
+      chatBox.launch = async () => ({ ok: false, error: 'resume-unavailable', effect: 'none' });
+      const body = launchBody({ agent: 'claude', prompt: undefined, resume: true });
+      const res = await postJson(url(), device('dev-1'), body);
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({ error: 'resume-unavailable', effect: 'none', clientLaunchId: body.clientLaunchId });
+      const receipt = await fetch(`${base()}/api/sessions/s1/chat/launch/${body.clientLaunchId}`, { headers: device('dev-1') });
+      expect((await receipt.json()).state).toBe('refused');
+    });
+
+    it('a dangerous resume or bare launch still needs the ceiling and the exact confirm', async () => {
+      await start();
+      const h = device('dev-1');
+      let res = await postJson(url(), h, launchBody({ agent: 'claude', mode: 'bypass', confirm: 'claude:bypass', prompt: undefined, resume: true }));
+      expect(res.status).toBe(403);
+      await server.stop();
+      await start({ allowDangerousLaunch: true });
+      for (const over of [{ resume: true }, { resume: true, confirm: 'codex:yolo' }, {}]) {
+        res = await postJson(url(), h, launchBody({ agent: 'claude', mode: 'bypass', prompt: undefined, ...over }));
+        expect(res.status, JSON.stringify(over)).toBe(428);
+        expect(await res.json()).toMatchObject({ error: 'dangerous-mode-unconfirmed', effect: 'none' });
+      }
+      expect(chat.launch).not.toHaveBeenCalled();
+      res = await postJson(url(), h, launchBody({ agent: 'claude', mode: 'bypass', confirm: 'claude:bypass', prompt: undefined, resume: true }));
+      expect(res.status).toBe(202);
+      expect(chat.launch.mock.calls[0][0]).toMatchObject({ agent: 'claude', mode: 'bypass', resume: true });
+      expect(chat.traceDangerousLaunch).toHaveBeenLastCalledWith(expect.objectContaining({ mode: 'bypass', outcome: 'submitted' }));
+    });
+
+    it('resume is part of the launch fingerprint', async () => {
+      await start();
+      const h = device('dev-1');
+      const body = launchBody({ agent: 'claude', prompt: undefined });
+      expect((await postJson(url(), h, body)).status).toBe(202);
+      const conflict = await postJson(url(), h, { ...body, resume: true });
+      expect(conflict.status).toBe(409);
+      expect(await conflict.json()).toMatchObject({ error: 'launch-id-conflict', effect: 'none' });
+      expect((await postJson(url(), h, { ...body, prompt: '' })).status).toBe(200);
+    });
+
     it('schema: unknown keys, bad agent/mode combos, and prompt rules are 400', async () => {
       await start();
       const h = device('dev-1');
@@ -1063,6 +1148,9 @@ describe('native chat routes (contract v0.3.1)', () => {
         { prompt: 'line\rreturn' },
         { prompt: 'esc\u001b[31m' },
         { prompt: 'del\u007f' },
+        { prompt: 42 },
+        { resume: 'yes' },
+        { resume: 1 },
         { clientLaunchId: 'not-an-id' },
       ]) {
         const res = await postJson(url(), h, launchBody(over));
@@ -1147,6 +1235,9 @@ describe('native chat routes (contract v0.3.1)', () => {
         [{ ok: false, error: 'launch-unconfirmed', effect: 'uncertain' }, 502, { error: 'launch-unconfirmed', effect: 'uncertain' }],
         [{ ok: false, error: 'authorization-expired', effect: 'none' }, 401, { error: 'authorization-expired', effect: 'none' }],
         [{ ok: false, error: 'invalid-chat-request', effect: 'none' }, 400, { error: 'invalid-chat-request', effect: 'none' }],
+        [{ ok: false, error: 'resume-unavailable', effect: 'none' }, 409, { error: 'resume-unavailable', effect: 'none' }],
+        [{ ok: false, error: 'resume-in-use', effect: 'none' }, 409, { error: 'resume-in-use', effect: 'none' }],
+        [{ ok: false, error: 'resume-prompt-unsupported', effect: 'none' }, 409, { error: 'resume-prompt-unsupported', effect: 'none' }],
       ];
       for (const [outcome, status, expected] of rows) {
         chatBox.launch = async () => outcome;
@@ -1263,7 +1354,7 @@ describe('native chat routes (contract v0.3.1)', () => {
       chatWired = false;
       const info = await start();
       const body = await config(bearer(info.token as string));
-      for (const key of ['chatBinding', 'chatSend', 'chatLaunch', 'chatLaunchModes', 'chatSkills', 'chatVersion']) {
+      for (const key of ['chatBinding', 'chatSend', 'chatLaunch', 'chatLaunchModes', 'chatSkills', 'chatLaunchBare', 'chatLaunchResume', 'chatVersion']) {
         expect(body).not.toHaveProperty(key);
       }
     });
@@ -1273,6 +1364,7 @@ describe('native chat routes (contract v0.3.1)', () => {
       expect(await config(bearer(info.token as string))).toMatchObject({
         chatBinding: true, chatSend: true, chatLaunch: true, chatSkills: true, chatVersion: 1,
         chatLaunchModes: { claude: ['default'], codex: ['default'] },
+        chatLaunchBare: true, chatLaunchResume: true, chatResumeBound: true,
       });
       expect((await config(bearer(info.token as string))).chatCancel).toBe(true);
       const ro = await config(device('ro', false));

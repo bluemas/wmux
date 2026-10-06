@@ -1,7 +1,7 @@
 import { ipcMain, BrowserWindow } from 'electron';
 import fs from 'node:fs';
 import { IPC } from '../../../shared/constants';
-import type { AgentStatus, MetadataUpdatePayload } from '../../../shared/types';
+import type { AgentStatus, MetadataUpdatePayload, PrStatus } from '../../../shared/types';
 import { isWindowDisplayed } from '../../window/windowDisplayed';
 import { MetadataCollector } from '../../metadata/MetadataCollector';
 import { prStatusCache } from '../../metadata/PrStatusCache';
@@ -16,6 +16,7 @@ import { sendToRenderer } from '../../pipe/handlers/_bridge';
 import { PrCiRouter } from '../../metadata/PrCiRouter';
 import { PrReviewRouter } from '../../metadata/PrReviewRouter';
 import { ghPrService } from '../../github/GhPrService';
+import { publishPrOwnerEvent } from '../../deck/prOwnerNotify';
 
 // AO-style CI feedback (owner decision 2026-07-18). Module singletons set at
 // registration (they need getWindow for workspace resolution). The poll feeds
@@ -25,6 +26,34 @@ import { ghPrService } from '../../github/GhPrService';
 // that don't wire them.
 let prCiRouter: PrCiRouter | null = null;
 let prReviewRouter: PrReviewRouter | null = null;
+// The PR each pane's checkout showed on the last poll tick. The PR owner
+// nudge re-checks it right before a write (main/deck/fanoutCallerSubmit.ts):
+// a pane that has since moved to another branch is not told about the old PR.
+// A cwd or branch change drops the proof at once and bumps the pane's
+// generation, so a poll lookup that started before the change cannot put the
+// old PR back when it lands.
+const prByPty = new Map<string, { number: number; url: string }>();
+const prGeneration = new Map<string, number>();
+
+function invalidatePrProof(ptyId: string): void {
+  prByPty.delete(ptyId);
+  prGeneration.set(ptyId, (prGeneration.get(ptyId) ?? 0) + 1);
+}
+
+/** The PR the pane's checkout showed on the last poll tick, or null. */
+export function currentPrOfPty(ptyId: string): { number: number; url: string } | null {
+  return prByPty.get(ptyId) ?? null;
+}
+
+/**
+ * Feed one pane's PR observation to the CI router from outside the poll. The
+ * workspace settle host does this while the window is hidden (the poll is
+ * stopped then), so a CI failure still reaches the deck and wakes a snoozed
+ * workspace. The router is edge-triggered per pane, so it never double-emits.
+ */
+export function notePrCiObservation(ptyId: string, pr: PrStatus | null): void {
+  void prCiRouter?.note(ptyId, pr);
+}
 
 // Minimal shape findWorkspaceIdForPty reads from the renderer's workspace.list.
 interface WorkspaceListEntry {
@@ -224,6 +253,17 @@ export function resetMetadataPollCache(): void {
 }
 
 /**
+ * Reset the poll cache whenever `win` (re)loads its renderer. A reloaded
+ * renderer starts with empty per-pane state, and the poll only re-sends
+ * changed payloads: without this, only the active pane's metadata came back
+ * (the renderer pulls that one itself), and the PR owner nudge could not
+ * address any other pane's PR until its payload happened to change.
+ */
+export function resetPollCacheOnRendererLoad(win: Pick<BrowserWindow, 'webContents'>): void {
+  win.webContents.on('did-finish-load', resetMetadataPollCache);
+}
+
+/**
  * One tick of the metadata poll. Exported for unit tests; production calls it
  * from the 5 s interval in registerMetadataHandlers.
  */
@@ -242,6 +282,7 @@ export async function runMetadataPollTick(
       portsMap.delete(ptyId);
       prCiRouter?.forget(ptyId);
       prReviewRouter?.forget(ptyId);
+      prByPty.delete(ptyId);
       continue;
     }
 
@@ -255,8 +296,16 @@ export async function runMetadataPollTick(
       } catch { /* not available on macOS without /proc */ }
     }
 
+    const generation = prGeneration.get(ptyId) ?? 0;
     const payload = await buildMetadataPayload(ptyId);
     if (!payload) continue;
+    if ((prGeneration.get(ptyId) ?? 0) === generation) {
+      if (payload.pr && typeof payload.pr.number === 'number' && payload.pr.url) {
+        prByPty.set(ptyId, { number: payload.pr.number, url: payload.pr.url });
+      } else {
+        prByPty.delete(ptyId);
+      }
+    }
     // AO-style CI + review feedback: fire-and-forget — both routers are
     // edge/watermark-triggered and never throw, so they must not gate the
     // metadata broadcast below.
@@ -299,16 +348,32 @@ export function registerMetadataHandlers(
       return null;
     }
   };
-  prCiRouter = new PrCiRouter(resolvePtyWorkspace, (e) => {
-    eventBus.emit({
-      type: 'pr.ci',
-      workspaceId: e.workspaceId,
-      ptyId: e.ptyId,
-      prNumber: e.prNumber,
-      url: e.url,
-      checks: 'failing',
+  // Every PR sink also tells the pane that owns the PR when its workspace has
+  // no brain (main/deck/prOwnerNotify.ts) — the bus events stay as they were.
+  const toOwner = (
+    kind: Parameters<typeof publishPrOwnerEvent>[0]['kind'],
+    e: { workspaceId: string; prNumber: number; url: string; headSha?: string; episode?: string },
+  ): void =>
+    publishPrOwnerEvent({
+      workspaceId: e.workspaceId, prNumber: e.prNumber, url: e.url, kind,
+      ...(e.headSha ? { headSha: e.headSha } : {}),
+      ...(e.episode ? { episode: e.episode } : {}),
     });
-  });
+  prCiRouter = new PrCiRouter(
+    resolvePtyWorkspace,
+    (e) => {
+      eventBus.emit({
+        type: 'pr.ci',
+        workspaceId: e.workspaceId,
+        ptyId: e.ptyId,
+        prNumber: e.prNumber,
+        url: e.url,
+        checks: 'failing',
+      });
+      toOwner('pr.ci_failed', e);
+    },
+    (e) => toOwner('pr.checks_passed', e),
+  );
   // Slice 2: new review comments on a pane's PR → `pr.review`. Rides the
   // GhPrService caches (30 s list TTL + updatedAt-keyed detail), throttled
   // per pane inside the router.
@@ -326,6 +391,9 @@ export function registerMetadataHandlers(
         author: e.author,
         snippet: e.snippet,
       });
+      // Only someone else's words wake the pane: not the PR author's own
+      // comments, not bots.
+      if (e.fromOthers > 0) toOwner('pr.review_comment', e);
     },
     Date.now,
     // Slice 3: merge-conflict edge, riding the same throttled read.
@@ -337,6 +405,7 @@ export function registerMetadataHandlers(
         prNumber: e.prNumber,
         url: e.url,
       });
+      toOwner('pr.merge_conflict', e);
     },
   );
 
@@ -445,6 +514,7 @@ export function registerMetadataHandlers(
 }
 
 export function updateCwd(ptyId: string, cwd: string): void {
+  if (cwdMap.get(ptyId) !== cwd) invalidatePrProof(ptyId);
   cwdMap.set(ptyId, cwd);
   for (const listener of cwdListeners) {
     try { listener(ptyId, cwd); } catch { /* listener errors must not break PTY flow */ }
@@ -454,13 +524,16 @@ export function updateCwd(ptyId: string, cwd: string): void {
 export function removeCwd(ptyId: string): void {
   cwdMap.delete(ptyId);
   prCiRouter?.forget(ptyId);
+  invalidatePrProof(ptyId);
 }
 
 export function updateBranch(ptyId: string, branch: string): void {
+  if (branchMap.get(ptyId) !== branch) invalidatePrProof(ptyId);
   branchMap.set(ptyId, branch);
 }
 
 export function removeBranch(ptyId: string): void {
+  if (branchMap.has(ptyId)) invalidatePrProof(ptyId);
   branchMap.delete(ptyId);
 }
 

@@ -22,6 +22,7 @@ import { normalizeWorktreePath } from '../../shared/workTask';
 import { isBrainPtyId } from '../../shared/constants';
 import type { AppRoute } from '../stores/slices/uiSlice';
 import { showWorkspaces as revealWorkspaces } from '../utils/showWorkspaces';
+import { notePanePr } from './fanoutCallerNudge';
 
 /**
  * J3 §4 — cwd가 태스크 worktree 경계 안인지(best-effort, OSC 협조 기반). 정규화
@@ -599,6 +600,7 @@ export function useNotificationListener() {
     });
     const gitBranchCoalescer = new FrameCoalescer<string, string>((ptyId, branch) => {
       const state = useStore.getState();
+      state.setSurfaceGitBranch(ptyId, branch);
       for (const ws of state.workspaces) {
         if (findSurfaceByPtyId(ws.rootPane, ptyId)) {
           state.updateWorkspaceMetadata(ws.id, { gitBranch: branch });
@@ -691,7 +693,7 @@ export function useNotificationListener() {
       // workspace metadata — pull it OUT here, alongside ptyId, so it can never
       // flow into `...rest` and get written into updateWorkspaceMetadata by
       // applyToWorkspace's spread.
-      const { ptyId, workspaceId: payloadWsId, activity, pendingQuestion, lastMessage, paneId, paneLabel, paneRole, agentSlug, hookKind, settled, ...rest } = payload;
+      const { ptyId, workspaceId: payloadWsId, activity, pendingQuestion, lastMessage, lastActivity, paneId, paneLabel, paneRole, agentSlug, hookKind, settled, ...rest } = payload;
 
       // The orchestrator's own brain pty (the `claude-pty` vendor's embedded
       // Claude Code TUI) is not a fleet agent. The daemon has no idea it is
@@ -702,6 +704,10 @@ export function useNotificationListener() {
       // Nothing downstream of here is meaningful for a brain, so drop the
       // payload whole.
       if (isBrainPtyId(ptyId)) return;
+
+      // The PR owner nudge needs every pane's PR, not only the active one's
+      // (the workspace record below keeps the active surface's alone).
+      if (ptyId && 'pr' in rest) notePanePr(ptyId, rest.pr);
 
       // P2 (checklist D): a paneId-only payload is the pane-label relay from
       // MetadataStore. Route it to the per-pane label + role mirrors and return
@@ -780,6 +786,11 @@ export function useNotificationListener() {
             state.settleSurfaceTurn(ptyId);
           }
         }
+        // The surface's own branch (Moa's view pointer): the workspace record
+        // above only follows the active pane, and only at the time it arrives.
+        if (typeof rest.gitBranch === 'string') {
+          state.setSurfaceGitBranch(ptyId, rest.gitBranch);
+        }
         // Part A: stamp per-surface agent IDENTITY (name + status) keyed by
         // ptyId so a2a_discover / surface_list / pane_list can label each pane
         // individually. setSurfaceAgent keeps an already-known name when only a
@@ -809,6 +820,8 @@ export function useNotificationListener() {
         // agent resumed after any older complete/waiting state. Reconcile both
         // mirrors here, where event order is known; a selector cannot compare
         // the timestamp with an attention state that carries no timestamp.
+        // A session start drops the retained last-activity line (a Stop keeps it).
+        if (lastActivity === '') state.clearSurfaceLastActivity(ptyId);
         if (typeof activity === 'string') {
           state.setSurfaceActivity(ptyId, activity);
           // Only activity-ONLY payloads need lifecycle reconciliation. When

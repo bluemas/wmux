@@ -6,6 +6,7 @@
  * child proves it. The browser handlers are fakes in the collector's shape.
  */
 import * as os from 'os';
+import { AsyncLocalStorage } from 'async_hooks';
 import { afterEach, describe, expect, it } from 'vitest';
 import { z } from 'zod';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
@@ -205,14 +206,21 @@ describe('repl_run browser bridge (real child)', () => {
   });
 
   it('makes a replacement session wait for browser calls its killed predecessor left running', async () => {
-    let landedAt = 0;
+    // Ordering is observed in this process only. Comparing the child's
+    // Date.now() with this one's crosses two process clocks, which on Windows
+    // disagree by a millisecond often enough to fail a causally ordered pair.
+    const order: string[] = [];
     const tools = new Map<string, CollectedTool>();
     tools.set('browser_navigate', {
       name: 'browser_navigate',
       shape: { url: z.string() },
-      handler: async () => {
+      handler: async (args) => {
+        if (args.url === 'https://probe.test') {
+          order.push('probe');
+          return { content: [{ type: 'text', text: 'probed' }] };
+        }
         await new Promise((resolve) => setTimeout(resolve, 3_000));
-        landedAt = Date.now();
+        order.push('landed');
         return { content: [{ type: 'text', text: 'navigated' }] };
       },
     });
@@ -228,14 +236,14 @@ describe('repl_run browser bridge (real child)', () => {
         binding,
       );
       expect(killed.fatal).toBeTruthy();
-      expect(landedAt).toBe(0);
+      expect(order).toEqual([]);
 
       const second = registry.acquire('slow', os.tmpdir());
       expect(second.created).toBe(true);
-      const outcome = await second.session.run('Date.now()', 10_000, binding);
+      const outcome = await second.session.run('await browser.navigate({ url: "https://probe.test" }); 1', 10_000, binding);
       expect(outcome.ok).toBe(true);
-      expect(landedAt).toBeGreaterThan(0);
-      expect(Number(outcome.result?.text)).toBeGreaterThanOrEqual(landedAt);
+      // The replacement's first statement only ran once the predecessor's call landed.
+      expect(order).toEqual(['landed', 'probe']);
     } finally {
       registry.disposeAll();
     }
@@ -299,5 +307,37 @@ describe('repl_run browser bridge (real child)', () => {
     const outcome = await session.run('let browser = "mine"; browser', 10_000, binding);
     expect(outcome.ok).toBe(true);
     expect(outcome.result?.text).toBe("'mine'");
+  });
+});
+
+describe('repl_run browser bridge — the calling dispatch\'s context (#1778)', () => {
+  it('runs a reused session\'s browser call in the context of the call that sent it, not the one that spawned it', async () => {
+    // Stands in for any per-call AsyncLocalStorage, e.g. the Codex thread scope:
+    // the child's messages arrive in the SPAWNING call's context.
+    const perCall = new AsyncLocalStorage<string>();
+    const seen: Array<string | undefined> = [];
+    const tools = new Map<string, CollectedTool>([[
+      'browser_navigate',
+      {
+        name: 'browser_navigate',
+        shape: { url: z.string() },
+        handler: async () => {
+          seen.push(perCall.getStore());
+          return { content: [{ type: 'text', text: 'navigated' }] };
+        },
+      },
+    ]]);
+    const session = makeSession();
+    const runAs = (thread: string) =>
+      perCall.run(thread, () =>
+        session.run(
+          'await browser.navigate({ url: "https://example.com" }); 1',
+          10_000,
+          resolveReplBrowser({ tools, profile: 'full' }, undefined),
+        ),
+      );
+    expect((await runAs('thread-1')).ok).toBe(true);
+    expect((await runAs('thread-2')).ok).toBe(true);
+    expect(seen).toEqual(['thread-1', 'thread-2']);
   });
 });

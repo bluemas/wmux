@@ -252,3 +252,108 @@ describe('the top rule, the No label, and binding to a call', () => {
     expect(dialogMatchesToolCall(parsed, { name: 'Write', command: 'rm -rf build/cache', description: 'Remove the build cache' })).toBe(false);
   });
 });
+
+describe('Claude Code 2.1.289: the command boxed between dashed rules', () => {
+  // Measured (fixtures/terminal-prompts/claude-bash-boxed-01.json): title and
+  // description above a dashed box, gutter rows inside, the reason under it,
+  // all at the prose indent.
+  const BOXED = [
+    '──────────────────────────────────────────────────',
+    ' Bash command',
+    ' Verify subtract function works',
+    '╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌',
+    ' │ node -e "import(\'./math.js\').then(m => { const',
+    ' │ result = m.subtract(5, 3);',
+    ' │ console.log(\'Test passed:\', result === 2); })"',
+    '╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌',
+    ' This command requires approval',
+    '',
+    ' Do you want to proceed?',
+    ' ❯ 1. Yes',
+    '   2. Yes, and don’t ask again for: node *',
+    '   3. No',
+    '',
+    ' Esc to cancel · Tab to amend',
+  ];
+  const command = 'node -e "import(\'./math.js\').then(m => { const result = m.subtract(5, 3); console.log(\'Test passed:\', result === 2); })"';
+
+  it('reads the solid rule as the top: title, description, command and reason each in place', () => {
+    const p = parseTerminalPrompt(BOXED, { cols: 50 })!;
+    expect(p).toMatchObject({
+      title: 'Bash command',
+      descriptionRows: ['Verify subtract function works'],
+      reason: 'This command requires approval',
+      topRuleFound: true,
+      active: true,
+    });
+    expect(p.commandFull).toBe(command);
+    expect(terminalPromptAnswerability(p)).toEqual({ answerable: true, choices: [{ key: '1', label: 'Yes' }, { key: '3', label: 'No' }] });
+  });
+
+  it('binds to its call, and not to another command or description', () => {
+    const p = parseTerminalPrompt(BOXED, { cols: 50 })!;
+    expect(dialogMatchesToolCall(p, { name: 'Bash', command, description: 'Verify subtract function works' })).toBe(true);
+    expect(dialogMatchesToolCall(p, { name: 'Bash', command: `${command} && rm -rf x` })).toBe(false);
+    expect(dialogMatchesToolCall(p, { name: 'Bash', command, description: 'Something else' })).toBe(false);
+    expect(dialogMatchesToolCall(p, { name: 'Read', command })).toBe(false);
+  });
+
+  it('with the top scrolled off, the box still gives the command, bound only as a top-cut dialog', () => {
+    const cut = BOXED.slice(3); // solid rule, title and description scrolled away
+    const p = parseTerminalPrompt(cut, { cols: 50 })!;
+    expect(p).toMatchObject({ topRuleFound: false, reason: 'This command requires approval', active: true, descriptionRows: [] });
+    expect(p.title).toBeUndefined();
+    expect(p.commandFull).toBe(command);
+    expect(dialogMatchesToolCall(p, { name: 'Bash', command })).toBe(false);
+    expect(dialogMatchesToolCall(p, { name: 'Bash', command }, { topCut: true })).toBe(true);
+    expect(dialogMatchesToolCall(p, { name: 'Bash', command: `${command} && rm -rf /` }, { topCut: true })).toBe(false);
+  });
+
+  it('a command short enough to need no gutter is still the command, under a "<Tool> command" title', () => {
+    const short = [
+      '──────────────────────────────────────────────────',
+      ' Bash command',
+      ' Run shell command',
+      '╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌',
+      ' node math.test.js',
+      '╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌',
+      ' This command requires approval',
+      '',
+      ' Do you want to proceed?',
+      ' ❯ 1. Yes',
+      '   2. No',
+      '',
+      ' Esc to cancel · Tab to amend',
+    ];
+    const p = parseTerminalPrompt(short, { cols: 50 })!;
+    expect(p).toMatchObject({ title: 'Bash command', commandFull: 'node math.test.js', reason: 'This command requires approval' });
+    // A call with no description of its own: Claude's label is not compared.
+    expect(dialogMatchesToolCall(p, { name: 'Bash', command: 'node math.test.js' })).toBe(true);
+    expect(dialogMatchesToolCall(p, { name: 'Bash', command: 'node other.js' })).toBe(false);
+  });
+
+  it('a dashed box under any other title (an Edit dialog\'s diff) is not this layout', () => {
+    const edit = [
+      '──────────────────────────────────────────────────',
+      ' Edit file',
+      ' notes.txt',
+      '╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌',
+      ' 2 -beta',
+      ' 2 +BETA',
+      '╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌',
+      ' Do you want to make this edit to notes.txt?',
+      ' ❯ 1. Yes',
+      '   2. No',
+      '',
+      ' Esc to cancel · Tab to amend',
+    ];
+    expect(parseTerminalPrompt(edit, { cols: 50 })?.title).not.toBe('Edit file');
+  });
+
+  it('a dashed box with a non-gutter row inside is not this layout', () => {
+    const odd = [...BOXED];
+    odd[5] = ' result = m.subtract(5, 3);';
+    const p = parseTerminalPrompt(odd, { cols: 50 })!;
+    expect(p.title).not.toBe('Bash command');
+  });
+});

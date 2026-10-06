@@ -512,6 +512,211 @@ describe('launch', () => {
     expect(started[0]).toMatchObject({ KEEP_ME: 'yes' });
   });
 
+  it('launches bare with no prompt, and resumes in the pane cwd for both agents', async () => {
+    const f = fixture();
+    const checked: Array<[string, string]> = [];
+    f.deps.latestResumeSession = async (agent, cwd) => { checked.push([agent, cwd]); return 'sess-1'; };
+    const bridge = () => createChatBridge(f.deps);
+    const fresh = () => { f.shell.empty = true; };
+    expect(await bridge().launch({ id: 'pane', agent: 'claude' })).toEqual({ ok: true, effect: 'submitted' });
+    fresh();
+    expect(await bridge().launch({ id: 'pane', agent: 'codex' })).toMatchObject({ ok: true });
+    fresh();
+    expect(await bridge().launch({ id: 'pane', agent: 'claude', resume: true, mode: 'bypass' })).toMatchObject({ ok: true });
+    fresh();
+    expect(await bridge().launch({ id: 'pane', agent: 'codex', resume: true })).toMatchObject({ ok: true });
+    fresh();
+    expect(await bridge().launch({ id: 'pane', agent: 'claude', resume: true, prompt: "it's next" })).toMatchObject({ ok: true });
+    fresh();
+    expect(await bridge().launch({ id: 'pane', agent: 'codex', resume: true, prompt: 'go', mode: 'yolo' })).toMatchObject({ ok: true });
+    expect(f.typed).toEqual([
+      'claude\r',
+      'codex --remote unix:///tmp/relay.sock --cd "$PWD"\r',
+      "cd -- '/live' && claude --continue --dangerously-skip-permissions\r",
+      "codex resume --remote unix:///tmp/relay.sock --cd '/live' --last\r",
+      "cd -- '/live' && claude --continue -- 'it'\\''s next'\r",
+      "codex resume --remote unix:///tmp/relay.sock --cd '/live' --last --dangerously-bypass-approvals-and-sandbox -- 'go'\r",
+    ]);
+    expect(checked).toEqual([['claude', '/live'], ['codex', '/live'], ['claude', '/live'], ['codex', '/live']]);
+    // A blank prompt is still malformed: only an absent one is a bare launch.
+    fresh();
+    expect(await bridge().launch({ id: 'pane', agent: 'claude', prompt: '  ' })).toMatchObject({ error: 'invalid-chat-request', effect: 'none' });
+  });
+
+  it('refuses a resume with nothing to continue before any relay is touched or anything typed', async () => {
+    const f = fixture();
+    f.deps.latestResumeSession = async () => undefined;
+    const prepare = vi.fn(f.deps.relays.prepare);
+    const retire = vi.fn(f.deps.relays.retire);
+    f.deps.relays.prepare = prepare; f.deps.relays.retire = retire;
+    const bridge = createChatBridge(f.deps);
+    for (const agent of ['claude', 'codex'] as const) {
+      expect(await bridge.launch({ id: 'pane', agent, resume: true })).toEqual({ ok: false, error: 'resume-unavailable', effect: 'none' });
+      expect(await bridge.launch({ id: 'pane', agent, resume: true, prompt: 'go' })).toMatchObject({ error: 'resume-unavailable', effect: 'none' });
+    }
+    expect(prepare).not.toHaveBeenCalled();
+    expect(retire).not.toHaveBeenCalled();
+    expect(f.typed).toEqual([]);
+  });
+
+  it('refuses a resume whose latest session another live pane is running, and one in an unquotable cwd', async () => {
+    const f = fixture();
+    const other: ChatPane = { ...f.state.pane!, meta: { ...f.state.pane!.meta, id: 'other' } };
+    const agents: Record<string, ChatAgentState> = { other: { ...f.state.agent, agentName: 'Claude Code', agentVerified: true } };
+    f.deps.pane = (id) => id === 'other' ? other : f.state.pane;
+    f.deps.agentState = (id) => agents[id] ?? { ...f.state.agent };
+    f.deps.latestResumeSession = async () => 'sess-1';
+    f.deps.panesBoundTo = (_agent, sessionId) => sessionId === 'sess-1' ? ['pane', 'other'] : [];
+    const bridge = () => createChatBridge(f.deps);
+    expect(await bridge().launch({ id: 'pane', agent: 'claude', resume: true })).toEqual({ ok: false, error: 'resume-in-use', effect: 'none' });
+    // Codex in the other pane does not hold a Claude session.
+    expect(await bridge().launch({ id: 'pane', agent: 'codex', resume: true })).toMatchObject({ ok: true });
+    f.shell.empty = true;
+    // The agent there has exited: the binding alone does not hold the session.
+    agents.other = { ...f.state.agent, agentName: null };
+    expect(await bridge().launch({ id: 'pane', agent: 'claude', resume: true })).toMatchObject({ ok: true });
+    f.shell.empty = true;
+    f.state.pane!.meta.cwd = "/it's";
+    expect(await bridge().launch({ id: 'pane', agent: 'claude', resume: true })).toMatchObject({ error: 'resume-unavailable', effect: 'none' });
+    expect(f.typed).toHaveLength(2);
+  });
+
+  describe('resume of a bound pane whose agent exited', () => {
+    const SID = '0f1e2d3c-4b5a-4987-8a6b-5c4d3e2f1a0b';
+    const bound = (f: ReturnType<typeof fixture>, extra: Record<string, unknown> = {}) => {
+      f.state.projector = FILE;
+      f.state.pane!.meta.resumeBinding = { agent: 'claude', sessionId: SID, cwd: '/proj', transcriptPath: '/t.jsonl',
+        permissionMode: 'bypassPermissions', ts: 1, ...extra };
+      f.state.pane!.meta.cmd = '/bin/zsh';
+      f.deps.boundSessionLives = async () => true;
+      f.deps.latestResumeSession = async () => { throw new Error('the newest-conversation lookup must not run'); };
+    };
+    const phone = (agent: 'claude' | 'codex', extra: Record<string, unknown> = {}) =>
+      ({ id: 'pane', agent, resume: true, refuseConversation: true, ...extra });
+
+    it('types the exact session in the binding folder, with the request mode and prompt only', async () => {
+      const f = fixture();
+      bound(f);
+      expect(await createChatBridge(f.deps).launch(phone('claude', { prompt: "it's next" }))).toEqual({ ok: true, effect: 'submitted' });
+      f.shell.empty = true;
+      expect(await createChatBridge(f.deps).launch(phone('claude', { mode: 'bypass' }))).toMatchObject({ ok: true });
+      f.shell.empty = true;
+      bound(f, { agent: 'codex' });
+      expect(await createChatBridge(f.deps).launch(phone('codex', { prompt: 'go' }))).toMatchObject({ ok: true });
+      expect(f.typed).toEqual([
+        // The binding's stored bypass mode is never restored.
+        `cd -- '/proj' && claude --resume ${SID} -- 'it'\\''s next'\r`,
+        `cd -- '/proj' && claude --resume ${SID} --dangerously-skip-permissions\r`,
+        `codex resume --remote unix:///tmp/relay.sock --cd '/proj' ${SID} -- 'go'\r`,
+      ]);
+    });
+
+    it('refuses each case it cannot continue, typing nothing', async () => {
+      const f = fixture();
+      const attempt = async (setup: () => void, req = phone('claude')) => {
+        bound(f); f.shell.empty = true; setup();
+        return createChatBridge(f.deps).launch(req);
+      };
+      expect(await attempt(() => undefined, { id: 'pane', agent: 'claude', refuseConversation: true } as never))
+        .toEqual({ ok: false, error: 'conversation-exists', effect: 'none' });
+      expect(await attempt(() => { f.state.agent = { ...f.state.agent, agentName: 'Claude Code' }; }))
+        .toEqual({ ok: false, error: 'launch-not-ready', reason: 'agent-running', effect: 'none' });
+      f.state.agent = { ...f.state.agent, agentName: null };
+      expect(await attempt(() => { f.deps.boundSessionLives = async () => false; })).toMatchObject({ error: 'resume-unavailable' });
+      expect(await attempt(() => { f.state.pane!.meta.resumeBinding!.sessionId = 'abc; rm x'; })).toMatchObject({ error: 'resume-unavailable' });
+      expect(await attempt(() => { f.state.pane!.meta.resumeBinding!.cwd = "/it's"; })).toMatchObject({ error: 'resume-unavailable' });
+      expect(await attempt(() => undefined, phone('codex'))).toMatchObject({ error: 'resume-unavailable' });
+      expect(await attempt(() => { f.state.pendingApproval = 'ap'; })).toMatchObject({ error: 'launch-not-ready', reason: 'approval-pending' });
+      f.state.pendingApproval = undefined;
+      const other: ChatPane = { ...f.state.pane!, meta: { ...f.state.pane!.meta, id: 'other' } };
+      expect(await attempt(() => {
+        f.deps.pane = (id) => id === 'other' ? other : f.state.pane;
+        f.deps.agentState = (id) => id === 'other' ? { ...f.state.agent, agentName: 'Claude Code' } : { ...f.state.agent };
+        f.deps.panesBoundTo = () => ['pane', 'other'];
+      })).toMatchObject({ error: 'resume-in-use' });
+      expect(f.typed).toEqual([]);
+    });
+
+    it('types PowerShell on Windows with the pane account, takes no prompt there, and refuses cmd.exe and WSL', async () => {
+      const f = fixture();
+      bound(f, { cwd: 'C:\\Users\\me\\proj' });
+      f.deps.platform = 'win32';
+      const anyShell: unknown[] = [];
+      f.deps.idleShell = async (_pid, _env, any) => { anyShell.push(any); return { ok: true }; };
+      f.state.pane!.meta.cmd = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
+      // Native arguments are not re-quoted there, so a first message is refused before anything is typed.
+      expect(await createChatBridge(f.deps).launch(phone('claude', { prompt: 'a "b c" d' })))
+        .toEqual({ ok: false, error: 'resume-prompt-unsupported', effect: 'none' });
+      expect(anyShell).toEqual([]);
+      f.state.pane!.meta.paneAccount = { vendor: 'claude' };
+      f.state.pane!.meta.env = { CLAUDE_CONFIG_DIR: "C:\\acc\\o'k" };
+      expect(await createChatBridge(f.deps).launch(phone('claude'))).toMatchObject({ ok: true });
+      expect(f.typed).toEqual([`if (Set-Location -LiteralPath 'C:\\Users\\me\\proj' -PassThru -ErrorAction SilentlyContinue) `
+        + `{ $env:CLAUDE_CONFIG_DIR = 'C:\\acc\\o''k'; claude --resume ${SID} }\r`]);
+      expect(anyShell).toEqual([true, true]);
+      f.shell.empty = true;
+      f.state.pane!.meta.cmd = 'C:\\Windows\\System32\\cmd.exe';
+      expect(await createChatBridge(f.deps).launch(phone('claude')))
+        .toEqual({ ok: false, error: 'launch-unsupported', reason: 'unsupported-shell', effect: 'none' });
+      f.state.pane!.meta.cmd = 'wsl.exe'; f.state.pane!.meta.wslTarget = { distro: 'Ubuntu' };
+      expect(await createChatBridge(f.deps).launch(phone('claude'))).toMatchObject({ error: 'launch-unsupported', reason: 'unsupported-shell' });
+      expect(f.typed).toHaveLength(1);
+    });
+
+    it('re-checks the record uncached at launch, while /turns reads the cache', async () => {
+      const f = fixture();
+      bound(f);
+      const fresh: boolean[] = [];
+      f.deps.boundSessionLives = async (_b, _env, isFresh) => { fresh.push(isFresh); return !isFresh; };
+      const bridge = createChatBridge(f.deps);
+      expect(await bridge.resumable!('pane')).toBe(true);
+      // The cache still says yes, but the record is gone now: nothing is typed.
+      expect(await bridge.launch(phone('claude'))).toEqual({ ok: false, error: 'resume-unavailable', effect: 'none' });
+      expect(fresh).toEqual([false, true]);
+      expect(f.typed).toEqual([]);
+    });
+
+    it('reads resumable false wherever the launch would refuse', async () => {
+      const f = fixture();
+      bound(f);
+      const read = () => createChatBridge(f.deps).resumable!('pane');
+      expect(await read()).toBe(true);
+      f.state.agent = { ...f.state.agent, agentName: 'Claude Code' };
+      expect(await read()).toBe(false);
+      f.state.agent = { ...f.state.agent, agentName: null };
+      f.managed.has.mockReturnValueOnce(true);
+      expect(await read()).toBe(false);
+      for (const cmd of ['/opt/homebrew/bin/fish', '/usr/local/bin/nu']) {
+        f.state.pane!.meta.cmd = cmd;
+        expect(await read(), cmd).toBe(false);
+        expect(await createChatBridge(f.deps).launch(phone('claude')), cmd).toMatchObject({ error: 'launch-unsupported', reason: 'unsupported-shell' });
+      }
+      f.state.pane!.meta.cmd = '/bin/zsh';
+      const other: ChatPane = { ...f.state.pane!, meta: { ...f.state.pane!.meta, id: 'other' } };
+      f.deps.pane = (id) => id === 'other' ? other : f.state.pane;
+      f.deps.agentState = (id) => id === 'other' ? { ...f.state.agent, agentName: 'Claude Code' } : { ...f.state.agent };
+      f.deps.panesBoundTo = () => ['pane', 'other'];
+      expect(await read()).toBe(false);
+      f.deps.panesBoundTo = () => [];
+      f.deps.boundSessionLives = async () => false;
+      expect(await read()).toBe(false);
+      f.deps.boundSessionLives = async () => true;
+      f.state.pane!.meta.resumeBinding = undefined;
+      expect(await read()).toBe(false);
+      expect(f.typed).toEqual([]);
+    });
+  });
+
+  it('refuses resume + prompt for an agent whose resume line takes no prompt', async () => {
+    const f = fixture();
+    f.deps.latestResumeSession = async () => 'sess-1';
+    f.deps.resumeTakesPrompt = (agent) => agent !== 'codex';
+    const bridge = createChatBridge(f.deps);
+    expect(await bridge.launch({ id: 'pane', agent: 'codex', resume: true, prompt: 'go' })).toEqual({ ok: false, error: 'resume-prompt-unsupported', effect: 'none' });
+    expect(f.typed).toEqual([]);
+    expect(await bridge.launch({ id: 'pane', agent: 'codex', resume: true })).toMatchObject({ ok: true });
+  });
+
   it('types nothing when the grant is gone, and is uncertain when typing throws', async () => {
     const f = fixture();
     expect(await f.bridge.launch({ id: 'pane', agent: 'claude', prompt: 'go', authorized: async () => false }))
@@ -807,11 +1012,13 @@ describe('cancel', () => {
   it('a send right after an ESC waits out the quiet window before pasting', async () => {
     const f = running();
     const delays: number[] = [];
-    const bridge = createChatBridge({ ...f.deps, delay: async (ms) => { delays.push(ms); } });
-    f.shell.escAt = Date.now();
+    // Pin the bridge clock: wall time spent in send() before the quiet-window
+    // check (slow CI runners) would otherwise shrink the measured wait.
+    const t = Date.now();
+    const bridge = createChatBridge({ ...f.deps, now: () => t, delay: async (ms) => { delays.push(ms); } });
+    f.shell.escAt = t - 50;
     await bridge.send(phoneSend('next'));
-    expect(delays[0]).toBeGreaterThan(200);
-    expect(delays[0]).toBeLessThanOrEqual(300);
+    expect(delays[0]).toBe(250);
   });
 
   it('desktop keeps its enum: unavailable without a registry or on a native binding', async () => {

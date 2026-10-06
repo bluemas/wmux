@@ -76,14 +76,16 @@ describe('#747 — a deferred fit must be recorded and settled', () => {
     expect(src).toMatch(/pendingFitRaf/);
     expect(
       src,
-      'the queued fit frame is not cancelled next to the debounce timer in cleanup',
+      'the queued fit frame is not cancelled next to the resize scheduler in cleanup',
     ).toMatch(
-      /clearTimeout\(resizeDebounceTimer\);\s*if \(pendingFitRaf !== null\) cancelAnimationFrame\(pendingFitRaf\);/,
+      /resizeScheduler\.dispose\(\);\s*if \(pendingFitRaf !== null\) cancelAnimationFrame\(pendingFitRaf\);/,
     );
   });
 
   it('the ResizeObserver delegates to runFit instead of duplicating it', () => {
-    const start = src.indexOf('new ResizeObserver(');
+    // The observer feeds a fit scheduler (layoutTransitionGate), whose
+    // fitNextFrame callback is the one path into runFit.
+    const start = src.indexOf('createFitScheduler(');
     expect(start).toBeGreaterThan(-1);
     const block = src.slice(start, src.indexOf('resizeObserver.observe(', start));
     expect(block).toMatch(/runFit/);
@@ -132,7 +134,11 @@ describe('#1255 — every fit() apply site is floor-gated, every recovery re-ass
     const runFit = src.slice(runFitStart, src.indexOf('const autoCopy = createAutoSelectionCopy', runFitStart));
     // BEFORE claimFit: a floor skip records no selection debt — the settled
     // layout re-fires the ResizeObserver, which is the retry.
-    const gate = runFit.indexOf('proposedSafeDimensions(fitAddon)) return');
+    // #1436 turned the gate into a captured proposal (the shrink path sends
+    // those dims to the PTY before xterm applies them), so anchor on the
+    // capture + its early return rather than the old one-liner.
+    const gate = runFit.indexOf('const proposed = proposedSafeDimensions(fitAddon);');
+    expect(runFit.slice(gate)).toMatch(/const proposed = proposedSafeDimensions\(fitAddon\);\s+if \(!proposed\) return;/);
     const claim = runFit.indexOf('claimFit(');
     expect(gate).toBeGreaterThan(-1);
     expect(claim).toBeGreaterThan(gate);

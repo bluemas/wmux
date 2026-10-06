@@ -23,7 +23,7 @@
 // production wiring lives in metadata.handler next to PrCiRouter's.
 
 import type { PrStatus } from '../../shared/types';
-import type { PrListResult, PrDetailResult } from '../github/PrProvider';
+import type { PrListResult, PrDetailResult, PrComment } from '../github/PrProvider';
 import type { WorkspaceResolver } from './PrCiRouter';
 
 /** How often one pane may hit the (cached) provider. The metadata poll ticks
@@ -49,6 +49,14 @@ export interface PrReviewEmit {
   /** Author + sanitized snippet of the LATEST comment in the batch. */
   author: string;
   snippet: string;
+  /** How many of those are from someone other than the PR author, bots
+   *  excluded (the PR owner nudge fires only when this is above zero). */
+  fromOthers: number;
+  /** The PR head commit when gh reported it. */
+  headSha?: string;
+  /** The batch: newest comment time and the comment count. A second batch
+   *  on the same head is a new event for the PR owner nudge's dedup. */
+  episode?: string;
 }
 
 /** Merge-conflict edge (slice 3) — fired once when a pane's PR becomes
@@ -58,6 +66,22 @@ export interface PrConflictEmit {
   ptyId: string;
   prNumber: number;
   url: string;
+  headSha?: string;
+  /** Which conflict episode (process-local, increasing). */
+  episode?: string;
+}
+
+/**
+ * Comments from someone else talking to the PR: a person (the host typed the
+ * author as a User) who is not the PR author. Bots, and authors whose type
+ * could not be read, never count — an unknown author does not wake anyone.
+ */
+export function countFromOthers(fresh: readonly PrComment[], prAuthor: string): number {
+  const author = prAuthor.toLowerCase();
+  return fresh.filter((c) => {
+    const login = c.author.toLowerCase();
+    return c.authorType === 'User' && !login.endsWith('[bot]') && (author === '' || login !== author);
+  }).length;
 }
 
 /** Display-safe snippet: control chars and newlines stripped, hard cap. The
@@ -84,6 +108,7 @@ interface PaneState {
 
 export class PrReviewRouter {
   private panes = new Map<string, PaneState>();
+  private conflictEpisodes = 0;
 
   constructor(
     private readonly provider: ReviewProvider,
@@ -131,7 +156,10 @@ export class PrReviewRouter {
         } else if (!st.conflictFired) {
           const ws = await this.resolveWorkspaceId(ptyId);
           if (ws) {
-            this.emitConflict({ workspaceId: ws, ptyId, prNumber: pr.number, url: pr.url });
+            this.emitConflict({
+              workspaceId: ws, ptyId, prNumber: pr.number, url: pr.url,
+              ...(pr.headSha ? { headSha: pr.headSha } : {}), episode: String(++this.conflictEpisodes),
+            });
             st.conflictFired = true;
           }
         }
@@ -161,6 +189,9 @@ export class PrReviewRouter {
         count: fresh.length,
         author: latest.author,
         snippet: sanitizeSnippet(latest.body),
+        fromOthers: countFromOthers(fresh, summary.author),
+        ...(pr.headSha ? { headSha: pr.headSha } : {}),
+        episode: `${maxCreated}#${comments.length}`,
       });
       // Advance ONLY after a successful emit (CodeRabbit, PR #496) — a resolve
       // failure or emit throw above leaves the watermark put, so the same

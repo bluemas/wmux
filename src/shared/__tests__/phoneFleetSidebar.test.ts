@@ -165,6 +165,32 @@ describe('parsePhoneSidebarSnapshot', () => {
     expect(Object.fromEntries(phoneTaskNesting(rows, listed).placement)).toEqual({ closed: { nestedUnder: 'closedPane' } });
   });
 
+  it('keeps the HQ id and moa flag, and drops either alone when malformed', () => {
+    expect(parsePhoneSidebarSnapshot({ ...valid, hqWorkspaceId: 'ws-hq', moa: true })).toMatchObject({ hqWorkspaceId: 'ws-hq', moa: true });
+    const bad: unknown[] = ['', ' ws ', 'x'.repeat(PHONE_SIDEBAR_LIMITS.id + 1), '__proto__', 'ws\u202e', 42, null];
+    for (const hqWorkspaceId of bad) {
+      const reasons: string[] = [];
+      const parsed = parsePhoneSidebarSnapshot({ ...valid, hqWorkspaceId, moa: true }, (r) => reasons.push(r));
+      expect(parsed).not.toHaveProperty('hqWorkspaceId');
+      expect(parsed?.moa).toBe(true);
+      expect(parsed?.workspaces).toHaveLength(2);
+      expect(reasons).toEqual(['hqWorkspaceId']);
+    }
+    for (const moa of [false, 'true', 1, null, {}]) {
+      const reasons: string[] = [];
+      const parsed = parsePhoneSidebarSnapshot({ ...valid, hqWorkspaceId: 'ws-hq', moa }, (r) => reasons.push(r));
+      expect(parsed).not.toHaveProperty('moa');
+      expect(parsed?.hqWorkspaceId).toBe('ws-hq');
+      expect(reasons).toEqual(['moa']);
+    }
+    // Absent is not a drop.
+    const reasons: string[] = [];
+    const parsed = parsePhoneSidebarSnapshot(valid, (r) => reasons.push(r));
+    expect(parsed).not.toHaveProperty('hqWorkspaceId');
+    expect(parsed).not.toHaveProperty('moa');
+    expect(reasons).toEqual([]);
+  });
+
   it('caps the row counts', () => {
     const many = Array.from({ length: PHONE_SIDEBAR_LIMITS.panes + 10 }, (_, i) => ({ ptyId: `p${i}`, workspaceId: 'w' }));
     expect(parsePhoneSidebarSnapshot({ activeWorkspaceId: null, workspaces: [], panes: many })?.panes).toHaveLength(PHONE_SIDEBAR_LIMITS.panes);
@@ -367,5 +393,65 @@ describe('workspace layout tree', () => {
     expect(row?.layout?.activePaneId).toBeUndefined();
     expect(row?.layout?.root.kind).toBe('split');
     expect(dropped).toBe('workspace.layout.activePaneId×1');
+  });
+});
+
+describe('pending Moa hand-off notice', () => {
+  const row = (moaHandoff: unknown) => ({ activeWorkspaceId: null, panes: [], workspaces: [{ id: 'ws-1', order: 0, pinned: false, moaHandoff }] });
+
+  it('keeps a valid notice and only its three fields', () => {
+    const notice = { agentName: 'Codex', title: 'Ship the fix', raisedAt: 1_700_000_000_000 };
+    expect(parsePhoneSidebarSnapshot(row({ ...notice, body: 'secret body' }))!.workspaces[0].moaHandoff).toEqual(notice);
+  });
+
+  it('drops a malformed notice on its own and keeps the row', () => {
+    for (const bad of [
+      { agentName: 'Codex', title: 'a\nb', raisedAt: 1 },
+      { agentName: 'Codex', title: 'x'.repeat(PHONE_SIDEBAR_LIMITS.moaHandoffTitle + 1), raisedAt: 1 },
+      { agentName: '', title: 'ok', raisedAt: 1 },
+      { agentName: 'Codex', title: 'ok', raisedAt: 0 },
+      'nope',
+    ]) {
+      const reasons: string[] = [];
+      const parsed = parsePhoneSidebarSnapshot(row(bad), (r) => reasons.push(r))!;
+      expect(parsed.workspaces[0]).toEqual({ id: 'ws-1', order: 0, pinned: false });
+      expect(reasons).toEqual(['workspace.moaHandoff']);
+    }
+  });
+});
+
+describe("Moa's delegated jobs", () => {
+  const snap = (moaDelegations: unknown) => ({ activeWorkspaceId: null, panes: [], workspaces: [], moaDelegations });
+  const job = (taskId: string, since: number, extra: Record<string, unknown> = {}) => ({
+    taskId, workspaceId: 'ws-1', agentName: 'Codex CLI', title: 'Ship it', state: 'working', since, ...extra,
+  });
+
+  it('keeps only the six fields, newest first, and an empty list as empty', () => {
+    const parsed = parsePhoneSidebarSnapshot(snap([job('t1', 1), { ...job('t2', 2, { state: 'blocked' }), result: 'secret', request: 'secret' }]))!;
+    expect(parsed.moaDelegations).toEqual([job('t2', 2, { state: 'blocked' }), job('t1', 1)]);
+    expect(JSON.stringify(parsed)).not.toContain('secret');
+    expect(parsePhoneSidebarSnapshot(snap([]))!.moaDelegations).toEqual([]);
+    expect(parsePhoneSidebarSnapshot(snap(undefined))).not.toHaveProperty('moaDelegations');
+  });
+
+  it('drops a malformed job on its own, a duplicate, and anything past the cap', () => {
+    const reasons: string[] = [];
+    const bad = [
+      job('a', 1, { state: 'queued' }),
+      job('b', 1, { title: 'a\nb' }),
+      job('c', 1, { title: 'x'.repeat(PHONE_SIDEBAR_LIMITS.moaDelegationTitle + 1) }),
+      job('d', 0),
+      job('e', 1, { agentName: '' }),
+      { ...job('f', 1), workspaceId: undefined },
+      'nope',
+    ];
+    const many = Array.from({ length: PHONE_SIDEBAR_LIMITS.moaDelegations + 2 }, (_, i) => job(`ok-${i}`, i + 1));
+    const parsed = parsePhoneSidebarSnapshot(snap([...bad, job('ok-0', 9), ...many]), (r) => reasons.push(r))!;
+    expect(parsed.moaDelegations).toHaveLength(PHONE_SIDEBAR_LIMITS.moaDelegations);
+    expect(reasons.filter((r) => r === 'moaDelegations.row')).toHaveLength(bad.length);
+    expect(reasons).toContain('moaDelegations.duplicate');
+    expect(reasons).toContain('moaDelegations.overLimit');
+    expect(parsePhoneSidebarSnapshot(snap('nope'), (r) => reasons.push(r))).not.toHaveProperty('moaDelegations');
+    expect(reasons.at(-1)).toBe('moaDelegations');
   });
 });

@@ -7,6 +7,7 @@ import { ChatCancelReceiptStore } from './chat/ChatCancelReceiptStore';
 import { ChatQueueStore } from './chat/ChatQueue';
 import { createChatBridge, type NativeChatBridge } from './chat/nativeChatBridge';
 import {captureCodexRelayResume, codexRelayResumeCommand} from './web/codexRelayResume';
+import { persistCodexThreadOwner, invalidateCodexThreadOwner, trackCodexPaneOwnerCleanup } from './web/codexThreadOwner';
 import { codexCdOperand, recoverCodexPane, withCodexRemote } from './web/recoverCodexPane';
 import { CodexRelayUnavailableError } from './web/codexTuiRelay';
 import { paneCodexSettings } from './web/paneCodexSettings';
@@ -90,7 +91,7 @@ import { DEFAULT_COMPANY_ID, CHANNELS_EPOCH } from '../shared/channels';
 // (로그·machineId는 채널 부트 게이트 산출물 공유 — 별도 개방 금지.)
 import { A2aTaskService, type CreateTaskInput } from './a2a/A2aTaskService';
 import { WorkTaskService } from './worktask/WorkTaskService';
-import { isTaskState, type AgentStatus, type Message } from '../shared/types';
+import { isTaskState, type AgentStatus, type Message, type Task } from '../shared/types';
 import { ProcessMonitor } from './ProcessMonitor';
 import { AgentProcessTracker } from './AgentProcessTracker';
 import { checkWslAgentRunning, reportedAgentForPane, WslPidWatcher } from './wslAgentProcess';
@@ -133,8 +134,10 @@ import { deriveAgentLiveness } from './hooks/agentLiveness';
 import { agentSlugToDisplay, isAgentSignal, type AgentSignal } from '../shared/hooks/signal-types';
 import { checkNativeTranscriptPath } from './transcript/providers';
 import { TranscriptProjector } from './transcript/TranscriptProjector';
+import { TranscriptActivityWatcher } from './transcript/TranscriptActivityWatcher';
 import { TranscriptDiscovery, DISCOVERABLE_AGENT } from './transcript/TranscriptDiscovery';
-import { admitCodexCapture } from './transcript/codexCapture';
+import { admitCodexCapture, gateCodexStop } from './transcript/codexCapture';
+import { CodexCwdBinder, describeCodexPane, readProcessStartMs, type CodexPaneFacts } from './transcript/codexRolloutByCwd';
 import { PushSender } from './push/PushSender';
 import { RelayTransport } from './push/RelayTransport';
 import { LiveActivityPusher, type LiveActivityCounts } from './push/LiveActivityPusher';
@@ -155,6 +158,8 @@ import {
 } from './push/presence';
 import { ApprovalRegistry } from './approvals/ApprovalRegistry';
 import { WorkspaceFactStore, type WorkspaceFactRowInput } from './approvals/workspaceFacts';
+import { MoaPaneRpc, resolveMoaPane } from './web/moaPane';
+import { MoaPromptSync } from './web/moaPrompt';
 import { parseApprovalResolveRequest } from './approvals/resolveRequest';
 import { GateBroker } from './approvals/GateBroker';
 import { coerceGate } from './approvals/gateConfig';
@@ -249,6 +254,9 @@ let automationEngine: AutomationEngine | null = null;
 // handle at fire time and a null is simply "not configured yet".
 let webhookSink: WebhookSink | null = null;
 let transcriptProjector: TranscriptProjector | null = null;
+// Fleet's now-doing line for panes with no per-tool hook (setup-hooks installs,
+// Codex): tails the agent's own transcript. Guarded like the projector.
+let transcriptActivity: TranscriptActivityWatcher | null = null;
 // Phone native chat bridge (contract v0.3.1). Built in registerRpcHandlers next
 // to the services it wraps; the web server reads it lazily per request.
 let chatBridge: ChatBridge | null = null;
@@ -271,6 +279,10 @@ const chatSubscribers = new Map<string, Set<string>>();
 const chatPushTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const chatPushSeq = new Map<string, number>();
 let transcriptDiscovery: TranscriptDiscovery | null = null;
+// Binds a fresh Codex pane to its rollout by cwd on the launch edge (codexRolloutByCwd.ts).
+let codexCwdBinder: CodexCwdBinder | null = null;
+// Start time of each pane's current Codex process, read on its launch edge.
+const codexProcessStart = new Map<string, number>();
 // #1163 — registerRpcHandlers' canonical agent-state reader (readDaemonAgentState),
 // read by BOTH WebTerminalServer construction sites for /api/workspaces. Module-
 // scoped because the boot-restore site has no agent tracker in scope; a request
@@ -317,6 +329,7 @@ const codexPaneRelays = new CodexPaneRelays(undefined,()=>log('warn','[phone] Co
   {
     ensureRuntime: async (id,codeHome)=>{ await codexSharedRuntime.ensureStarted(id,{...process.env,...(codeHome ? {CODEX_HOME:codeHome} : {})}); },
     serverProven: (codeHome)=>codexSharedRuntime.state(codeHome)?.kind === 'clean',
+    retiring: (owner,codeHome)=>invalidateCodexThreadOwner(owner.meta,codeHome),
     refused: (id,reason)=>{
       log('warn',`[codex-relay] refused a Codex request in ${id}: ${reason}`);
       // One notice per pane per minute: a TUI can retry a refused request in a loop.
@@ -438,6 +451,16 @@ const workspaceFacts = new WorkspaceFactStore();
 /** The pipe client whose push the current table came from, so the table can be
  *  dropped when that client disconnects rather than outliving its publisher. */
 let workspaceFactsPublisher: string | null = null;
+
+// The Moa (HQ brain) pane main pushes down (see web/moaPane.ts). Module-scoped
+// like the fact table: the RPC handler writes it, the web server and the
+// transcript projector read it, and the client-close sweep drops it. Built in
+// registerRpcHandlers, which holds the session manager it checks against.
+let moaPaneRpc: MoaPaneRpc<ManagedSession> | null = null;
+const currentMoaPane = () => moaPaneRpc?.current() ?? null;
+// #1772 — the Moa pane's own permission dialog as a `terminal_prompt` record
+// (see web/moaPrompt.ts). Built with moaPaneRpc, whose pushes drive it.
+let moaPrompt: MoaPromptSync | null = null;
 
 // #783 — the gate broker holds bridge RPC responses open until a phone answers.
 // Module-scoped for the same reason as the registry: the RPC handler creates
@@ -641,6 +664,7 @@ function createApprovalRegistry(sessionManager: DaemonSessionManager): ApprovalR
     // pushed a table at all, which is what makes a missing integration report
     // as `scope-unavailable` instead of looking like a policy refusal.
     pressScope: (workspaceId) => workspaceFacts.get(workspaceId),
+    hqLane: () => workspaceFacts.hqLane(),
     log: (level, message) => log(level, message),
   });
 }
@@ -786,6 +810,12 @@ async function restoreWebServer(sessionManager: DaemonSessionManager): Promise<v
         uploadsDir: path.join(wmuxDir, 'uploads', 'phone'),
         // Each file served because an agent sent it with SendUserFile.
         auditSentFile: (entry) => getDeviceStore().recordSentFile(entry),
+        // The Moa (HQ brain) pane main last vouched for, read per request so a
+        // withdrawal closes the next check. See web/moaPane.ts.
+        moaPane: currentMoaPane,
+        auditMoaSend: (entry) => getDeviceStore().recordMoaSend(entry),
+        // #1772 — a refused answer to the Moa prompt looks at the screen once.
+        moaPromptRefused: (sessionId) => moaPrompt?.noteRefusedPress(sessionId),
         // #782 — the phone turn view. Lazy: the projector is built after the
         // first resume binding, so a getter resolves the live instance per
         // request rather than capturing a null at construction.
@@ -1315,8 +1345,16 @@ function ingestResumeSpool(
     // D5: a purged origin transcript makes `--resume` a silent "No conversation
     // found." — drop the record (the pill can still degrade to --continue).
     if (!bindingTranscriptLives(binding)) { drop(); continue; }
+    // A Codex record binds only with its rollout, like a live notify: a spooled
+    // title-thread id would otherwise bind path-less at boot.
+    let admitted = binding;
+    if (binding.agent === 'codex') {
+      const decision = admitCodexCapture(ptyId, prev, binding, managed.meta.env, null);
+      if (!decision.apply) { drop(); continue; }
+      admitted = decision.binding;
+    }
 
-    managed.meta.resumeBinding = mergeResumeBinding(prev, binding);
+    managed.meta.resumeBinding = mergeResumeBinding(prev, admitted);
     // Rung 1 parity: a spooled capture also proves the pane ran claude, so it
     // arms the pill gate even if no live banner was ever detected. (binding.agent
     // is already a KNOWN_AGENT_SLUG — validated in spoolRecordToBinding.)
@@ -3108,6 +3146,10 @@ function registerRpcHandlers(
       uploadsDir: path.join(wmuxDir, 'uploads', 'phone'),
       // See the restore path.
       auditSentFile: (entry) => getDeviceStore().recordSentFile(entry),
+      // See the restore path.
+      moaPane: currentMoaPane,
+      auditMoaSend: (entry) => getDeviceStore().recordMoaSend(entry),
+      moaPromptRefused: (sessionId) => moaPrompt?.noteRefusedPress(sessionId),
       // See the restore path: lazy projector for the phone turn view (#782).
       projector: () => transcriptProjector,
       chat: () => chatBridge,
@@ -3520,23 +3562,31 @@ function registerRpcHandlers(
   // Guarded like hookIngest: a second registerRpcHandlers call must not mint a
   // second projector, or the first one's fs.watch handles and poll timers would
   // be orphaned with no owner to tear them down.
+  // The persisted binding is the ONLY source of the transcript path — no
+  // cwd→slug derivation (agentResume.ts rejects that mapping as
+  // version-drift-prone, which is why the path is persisted at all). Shared by
+  // the projector and the activity watcher, so both read the same file.
+  const resolveTranscriptBinding = (id: string): ResumeBinding | undefined => {
+    const pane = sessionManager.getSession(id);
+    const live = codexPaneRelays.liveSelection(id, pane);
+    if (live.live) {
+      const selection = live.selection;
+      return selection ? { agent: 'codex', sessionId: selection.threadId, cwd: selection.cwd,
+        transcriptPath: selection.transcriptPath, ts: Date.now() } : undefined;
+    }
+    // The Moa pane's transcript is known only to main (a brain's hooks go
+    // there), so it arrives with the pushed fact and is read from memory —
+    // never persisted, see web/moaPane.ts. Only while the fact still
+    // resolves to this live brain pane.
+    const fact = currentMoaPane();
+    const binding = pane?.meta.resumeBinding
+      ?? (fact?.sessionId === id && resolveMoaPane(fact, (sid) => sessionManager.getSession(sid)) ? fact.binding : undefined);
+    const current = agentDisplayToSlug(readDaemonAgentState(id).agentName ?? '');
+    return current && binding?.agent !== current ? undefined : binding;
+  };
   if (!transcriptProjector) {
     transcriptProjector = new TranscriptProjector({
-      // The persisted binding is the ONLY source of the transcript path — no
-      // cwd→slug derivation (agentResume.ts rejects that mapping as
-      // version-drift-prone, which is why the path is persisted at all).
-      getResumeBinding: (id) => {
-        const pane = sessionManager.getSession(id);
-        const live = codexPaneRelays.liveSelection(id, pane);
-        if (live.live) {
-          const selection = live.selection;
-          return selection ? { agent: 'codex', sessionId: selection.threadId, cwd: selection.cwd,
-            transcriptPath: selection.transcriptPath, ts: Date.now() } : undefined;
-        }
-        const binding = pane?.meta.resumeBinding;
-        const current = agentDisplayToSlug(readDaemonAgentState(id).agentName ?? '');
-        return current && binding?.agent !== current ? undefined : binding;
-      },
+      getResumeBinding: resolveTranscriptBinding,
       // #782 — splits an absent binding into `stale-session` (agent running, no
       // binding yet) vs `no-hook` (no agent detected → hooks not installed).
       getDetectedAgent: (id) => sessionManager.getSession(id)?.meta.lastDetectedAgent,
@@ -3572,6 +3622,23 @@ function registerRpcHandlers(
     pipeServer.onClientClose((clientId) => projectorForClose.dropClient(clientId));
   }
   const projector = transcriptProjector;
+  if (!transcriptActivity) {
+    transcriptActivity = new TranscriptActivityWatcher({
+      listSessionIds: () => sessionManager.listLiveSessions().map((s) => s.id),
+      // Moa's brain reports its tools through its own hooks, to main.
+      getBinding: (id) => (currentMoaPane()?.sessionId === id ? undefined : resolveTranscriptBinding(id)),
+      // Process truth when the tracker attributed one; a Codex pane driven
+      // through the shared app-server counts while its relay is live.
+      isAgentAlive: (id) => (codexPaneRelays.liveSelection(id, sessionManager.getSession(id)).live
+        ? true
+        : agentProcessTracker.statusFor(id)),
+      emit: (sessionId, activity) => {
+        const event: DaemonEvent = { type: 'agent.transcriptActivity', sessionId, data: { activity } };
+        pipeServer.broadcast(event);
+      },
+    });
+    transcriptActivity.start();
+  }
 
   // Chat View — F9 early availability. Guarded like the projector: a second
   // registerRpcHandlers call must not mint a second searcher, or the first
@@ -3596,6 +3663,37 @@ function registerRpcHandlers(
         // on its own; this is only for a Chat surface that is ALREADY open and
         // would otherwise wait for the next hook nudge to notice the path.
         transcriptProjector?.rebind(sessionId);
+      },
+      log: (level, message) => log(level, message),
+    });
+  }
+  if (!codexCwdBinder) {
+    // Launch marker: the Codex process's start time, else the OSC 133
+    // command-start that launched it. Neither (tmux, no shell integration) is unknown.
+    const paneFacts = (s: { id: string; cwd: string; resumeBinding?: ResumeBinding; lastDetectedAgent?: string }): CodexPaneFacts => {
+      const tracked = agentProcessTracker.identityFor(s.id);
+      const launchAt = codexProcessStart.get(s.id)
+        ?? sessionManager.getSession(s.id)?.promptLog.recent(256).filter((e) => e.type === 'command_start').pop()?.ts;
+      return {
+        id: s.id,
+        cwd: s.cwd,
+        ...(s.resumeBinding ? { binding: s.resumeBinding } : {}),
+        ...(launchAt !== undefined ? { launchAt } : {}),
+        codexLive: tracked ? tracked.alive && tracked.slug === 'codex' : s.lastDetectedAgent === 'codex',
+      };
+    };
+    codexCwdBinder = new CodexCwdBinder({
+      pane: (id) => {
+        const managed = sessionManager.getSession(id);
+        if (!managed || (managed.meta.state !== 'attached' && managed.meta.state !== 'detached')) return undefined;
+        const others = sessionManager.listLiveSessions().filter((s) => s.id !== id).map(paneFacts);
+        return describeCodexPane(paneFacts({ ...managed.meta, id }), others, managed.meta.env);
+      },
+      bind: (id, match) => {
+        log('info', `[codex] bound ${id} to rollout ${match.threadId} by cwd`);
+        // Same writer as a hook-supplied path: vetted, merged, saveImmediate'd.
+        applyResumeBinding(id, { agent: 'codex', sessionId: match.threadId, cwd: match.cwd, transcriptPath: match.transcriptPath, ts: Date.now() });
+        transcriptProjector?.rebind(id);
       },
       log: (level, message) => log(level, message),
     });
@@ -3822,6 +3920,9 @@ function registerRpcHandlers(
   // drift between the two transports.
   const bridge: NativeChatBridge = createChatBridge({
     pane: (id) => sessionManager.getSession(id),
+    panesBoundTo: (agent, sessionId) => sessionManager.listManagedSessions()
+      .filter((s) => s.meta.resumeBinding?.agent === agent && s.meta.resumeBinding.sessionId === sessionId)
+      .map((s) => s.meta.id),
     agentState: (id) => readDaemonAgentState(id),
     chatAgentState: (id) => readChatAgentState(id),
     projector,
@@ -3872,7 +3973,7 @@ function registerRpcHandlers(
     queue: chatQueue,
     onQueueEvent: (event) => webTerminalServer?.emitChatQueue(event),
     onCancelEvent: (event) => webTerminalServer?.emitChatCancel(event),
-    idleShell: (pid, env) => agentProcessTracker.idleShellState(pid, env),
+    idleShell: (pid, env, anyShell) => agentProcessTracker.idleShellState(pid, env, anyShell),
     installedAgents: (env) => installedAgentLaunchOptions(env),
     relays: {
       retire: (id) => codexPaneRelays.retire(id),
@@ -3915,7 +4016,7 @@ function registerRpcHandlers(
   pipeServer.onRpc('daemon.chat.launchTerminal', async (params, ctx) => {
     const id = typeof params.id === 'string' ? params.id : '';
     if (!firstPartyOnly(ctx.clientId, 'launchTerminal') || !id || !['claude', 'codex'].includes(String(params.agent))) return { ok: false, error: 'Unavailable' };
-    const outcome = await bridge.launch({ id, agent: params.agent as 'claude' | 'codex', prompt: params.prompt as string, mode: params.mode as ChatLaunchRequest['mode'] });
+    const outcome = await bridge.launch({ id, agent: params.agent as 'claude' | 'codex', prompt: typeof params.prompt === 'string' ? params.prompt : '', mode: params.mode as ChatLaunchRequest['mode'] });
     if (outcome.ok) return { ok: true };
     // The desktop wire stays prose; the tags are the phone's.
     const error = outcome.error === 'launch-pending' ? 'Launch already pending'
@@ -4066,6 +4167,8 @@ function registerRpcHandlers(
       // no Chat surface open.
       onTranscriptNudge: (sessionId, kind, agentSessionId) => {
         projector.nudge(sessionId, kind, agentSessionId);
+        // A hook-fed session's own activity line wins over the transcript.
+        transcriptActivity?.noteHookSignal(sessionId, kind);
         // #782 — phone turn-view nudge. Non-recording: bypasses attentionLog so
         // a busy pane cannot evict a pending approval and blank the badge on
         // replay (CRITICAL 3). Delivered only to devices watching this pane; a
@@ -4209,6 +4312,21 @@ function registerRpcHandlers(
       }
       return { ok: true, ...(permissionDecision ? { permissionDecision } : {}) };
     }
+    // A Codex stop for a thread with no rollout (the title thread) is not the
+    // pane's turn end. Answer the bridge now (its 2s budget spools on timeout)
+    // and decide once the rollout had its grace.
+    if (isAgentSignal(params) && params.agent === 'codex' && params.kind === 'agent.stop') {
+      const signal: AgentSignal = params;
+      const pane = signal.ptyId ? sessionManager.getSession(signal.ptyId) : undefined;
+      const now = gateCodexStop(signal, {
+        ...(pane?.meta.resumeBinding ? { bound: pane.meta.resumeBinding } : {}),
+        ...(pane?.meta.env ? { env: pane.meta.env } : {}),
+        wsl: !!pane?.meta.wslTarget,
+        admit: (late) => { ingest.handle(late); },
+        drop: () => log('info', `[codex] ignored stop for ${signal.ptyId ?? '?'}: thread ${signal.agentSessionId} has no rollout`),
+      });
+      return now ? ingest.handle(now) : { ok: true };
+    }
     return ingest.handle(params);
   });
   // A2 — signal-health readout for the Settings "Plugin signal health" card.
@@ -4258,7 +4376,7 @@ function registerRpcHandlers(
     if (!firstPartyOnly(ctx.clientId, 'daemon.workspaceFacts.set')) {
       return { ok: false, error: 'daemon.workspaceFacts.set is first-party only' };
     }
-    const payload = params as { facts?: unknown; seq?: unknown };
+    const payload = params as { facts?: unknown; seq?: unknown; lane?: unknown };
     if (!Array.isArray(payload?.facts)) {
       return { ok: false, error: 'daemon.workspaceFacts.set requires a facts array' };
     }
@@ -4279,6 +4397,7 @@ function registerRpcHandlers(
     const result = workspaceFacts.replace(
       payload.facts as WorkspaceFactRowInput[],
       payload.seq,
+      payload.lane,
     );
     if (!result.ok) {
       // A push that lost a race. Not an error the caller must handle — the
@@ -4289,6 +4408,68 @@ function registerRpcHandlers(
     // main is no longer maintaining must not keep authorizing presses.
     workspaceFactsPublisher = ctx.clientId;
     return { ok: true, applied: true, accepted: result.accepted, seq: result.seq };
+  });
+
+  // ── Main → daemon Moa pane (phone access to the HQ brain) ────────────────
+  // Which daemon session is the Moa (HQ brain) pane, while Moa is on and its
+  // HQ is present; null otherwise. Main pushes it on every change, and the web
+  // server opens that one brain pane's turns, chat and input routes to a
+  // paired device for exactly as long as it stands. See web/moaPane.ts.
+  if (!moaPaneRpc) {
+    const prompt = new MoaPromptSync({
+      registry: () => approvalRegistry,
+      current: currentMoaPane,
+      resolves: (fact) => !!resolveMoaPane(fact, (sid) => sessionManager.getSession(sid)),
+      log: (level, message) => log(level, message),
+    });
+    moaPrompt = prompt;
+    approvalRegistry?.onEvent((event) => prompt.onApprovalEvent(event));
+    moaPaneRpc = new MoaPaneRpc<ManagedSession>({
+      isFirstParty: (clientId) => firstPartyOnly(clientId, 'daemon.moa.set'),
+      getSession: (id) => sessionManager.getSession(id),
+      onChanged: (prev, next, pane) => {
+        // First, and for every push (withdrawals included): the Moa prompt
+        // record follows the dialog, and its expiries are queued right here.
+        prompt.onChanged(next, pane);
+        if (!next || !pane) return;
+        // The brain's hooks go to main, so none of the hook paths that attach
+        // the process watch ever runs for this pane, and a chat send needs the
+        // live claude process proven (`agentVerified`). Main vouching for the
+        // pane is that evidence's trigger here. Idempotent while a watch is live.
+        agentProcessTracker.arm(next.sessionId, pane.meta.pid);
+        // A new answer (Stop) or a dialog opening/closing is news for a phone
+        // reading this pane: the brain's hooks never reach the daemon's own
+        // transcript nudge path, so the push is that path.
+        const sameBinding = prev?.sessionId === next.sessionId && JSON.stringify(prev.binding) === JSON.stringify(next.binding);
+        const sameDialog = prev?.sessionId === next.sessionId && JSON.stringify(prev.dialog) === JSON.stringify(next.dialog);
+        if (!sameBinding) transcriptProjector?.rebind(next.sessionId);
+        if (!sameBinding || !sameDialog) webTerminalServer?.emitTranscriptNudge(next.sessionId);
+      },
+      log: (level, message) => log(level, message),
+    });
+  }
+  const moaRpc = moaPaneRpc;
+  pipeServer.onRpc('daemon.moa.set', async (params, ctx) => moaRpc.handle(params, ctx.clientId));
+  // #1772 — the desktop's Moa chat reads and answers the Moa pane's own
+  // permission prompt. First-party only, and like daemon.approvals.* these are
+  // token-only string methods: NOT in the RpcMethod union or
+  // methodCapabilityMap, and main calls them only from its renderer IPC — no
+  // pipe route, MCP tool or CLI verb reaches them.
+  const moaPromptRpc = moaPrompt;
+  pipeServer.onRpc('daemon.moa.prompt', async (_params, ctx) => {
+    if (!firstPartyOnly(ctx.clientId, 'daemon.moa.prompt')) return { ok: false, error: 'daemon.moa.prompt is first-party only' };
+    return { ok: true, prompt: moaPromptRpc?.view() ?? null };
+  });
+  pipeServer.onRpc('daemon.moa.answerPrompt', async (params, ctx) => {
+    if (!firstPartyOnly(ctx.clientId, 'daemon.moa.answerPrompt')) return { ok: false, reason: 'first-party-only' };
+    return moaPromptRpc ? moaPromptRpc.answer(params) : { ok: false, reason: 'not-pending' };
+  });
+  // The prompt of an agent Moa delegated work to, answered from Moa's panel.
+  // First-party only like the two above: main scopes it to Moa's delegated
+  // panes, and no agent, CLI verb or phone route reaches it.
+  pipeServer.onRpc('daemon.moa.answerDelegatedPrompt', async (params, ctx) => {
+    if (!firstPartyOnly(ctx.clientId, 'daemon.moa.answerDelegatedPrompt')) return { ok: false, reason: 'first-party-only' };
+    return moaPromptRpc ? moaPromptRpc.answerDelegated(params) : { ok: false, reason: 'not-pending' };
   });
 
   const readDaemonAgentState = (id: string): {
@@ -4398,6 +4579,10 @@ function registerRpcHandlers(
       keyInputRevision: bridge.getKeyInputRevision(),
       keyInputQuiet: bridge.isKeyInputQuiet(),
       hookReports: bridge.hasHookReports(),
+      // Additive, for a delivery that waits for the person to stop typing:
+      // whether the composer holds a draft, and how long keys have been quiet.
+      hasDraft: bridge.hasDraft(),
+      keyInputIdleMs: bridge.keyInputIdleMs(),
     };
   });
   // #1594 — what main's terminal_send needs to paste into a session: the agent
@@ -4586,6 +4771,8 @@ function registerRpcHandlers(
   });
   sessionManager.on('session:inputSubmitted', (payload: { sessionId: string }) => usageLimits?.noteSubmitted(payload.sessionId));
   sessionManager.on('session:interrupted', (payload: { id: string }) => usageLimits?.drop(payload.id));
+  trackCodexPaneOwnerCleanup(sessionManager,path.join(os.homedir(),'.codex'),
+    (error)=>log('warn','[codex] pane ownership cleanup failed:',error));
   sessionManager.on('session:died', (payload: { id: string }) => usageLimits?.drop(payload.id));
   sessionManager.on('session:destroyed', (payload: { id: string }) => usageLimits?.drop(payload.id));
 
@@ -5267,23 +5454,28 @@ function registerRpcHandlers(
     // (로그)에서 force-fail한다 — 렌더러 캐시에서만 죽이면 재시작 시 restoreFromLog가
     // 부활시켜 정본이 실제와 어긋난다. per-member purge(paneSlice)는 teardown이
     // 아니므로 제외. 로그 커밋을 await해 응답 전 내구화(데몬 미가용 아님 — 동일 프로세스).
+    // Tasks this purge failed, returned to main so their work links record the
+    // failure and its reason like any other transition.
+    const failedA2aTasks: Task[] = [];
     if (a2aTaskService && memberId === undefined && principalId === undefined) {
       try {
         const n = await a2aTaskService.failTasksForWorkspaceRemoved(
           workspaceId,
           'Receiver workspace was removed before this task completed.',
+          (task) => { failedA2aTasks.push(task); },
         );
         if (n > 0) log('info', `A2A: force-failed ${n} task(s) for removed workspace ${workspaceId}`);
       } catch (err) {
         log('warn', `A2A: failTasksForWorkspaceRemoved(${workspaceId}) failed:`, err);
       }
     }
-    return channelService.purgeMembership({
+    const purged = await channelService.purgeMembership({
       workspaceId,
       verifiedWorkspaceId,
       ...(memberId !== undefined ? { memberId } : {}),
       ...(principalId !== undefined ? { principalId } : {}),
     });
+    return failedA2aTasks.length > 0 && purged && typeof purged === 'object' ? { ...purged, failedA2aTasks } : purged;
   });
 
   // a2a.channel.operatorJoin — 오퍼레이터(사람)가 에이전트들이 만든 비공개 채널에
@@ -5788,9 +5980,12 @@ function wireEvents(
     chatSessions?.drop(payload.id);
     chatSubscribers.delete(payload.id);
     transcriptProjector?.dropPty(payload.id);
+    transcriptActivity?.dropSession(payload.id);
     terminalChat?.dropPty(payload.id);
     // …and nothing left to discover a transcript FOR.
     transcriptDiscovery?.cancel(payload.id);
+    codexCwdBinder?.reset(payload.id);
+    codexProcessStart.delete(payload.id);
     try {
       const event: DaemonEvent = {
         type: 'session.died',
@@ -6143,6 +6338,8 @@ function wireEvents(
     // the AgentDetector display name ('Claude Code') → canonical slug ('claude').
     const slug = agentDisplayToSlug(payload.event.agent);
     const managed = sessionManager.getSession(payload.sessionId);
+    // A banner names Codex before (or without) the process probe: try the cwd bind.
+    if (slug === 'codex') codexCwdBinder?.arm(payload.sessionId);
     if (slug) {
       // The agent is live again → this pane is no longer a "resume me" shell.
       recoveredAgentShellIds.delete(payload.sessionId);
@@ -6262,6 +6459,12 @@ function wireEvents(
     approvalRegistry?.noteFenceInput(payload.sessionId);
   });
 
+  // Someone typed into a pane, by any path (desktop, phone/web, MCP, A2A).
+  // Main's workspace settle reads it as activity; throttled in the bridge.
+  sessionManager.on('session:typedInput', (payload: { sessionId: string }) => {
+    pipeServer.broadcast({ type: 'input.typed', sessionId: payload.sessionId, data: null });
+  });
+
   sessionManager.on('session:answered', (payload: { sessionId: string; reason?: 'input' | 'screen-cleared' }) => {
     awaitingVerifier.forget(payload.sessionId);
     // The dialog is closed, so its terminal_prompt record is done too (a record
@@ -6368,9 +6571,12 @@ function wireEvents(
     chatSessions?.drop(payload.id);
     chatSubscribers.delete(payload.id);
     transcriptProjector?.dropPty(payload.id);
+    transcriptActivity?.dropSession(payload.id);
     terminalChat?.dropPty(payload.id);
     // …and nothing left to discover a transcript FOR.
     transcriptDiscovery?.cancel(payload.id);
+    codexCwdBinder?.reset(payload.id);
+    codexProcessStart.delete(payload.id);
     const event: DaemonEvent = {
       type: 'session.destroyed',
       sessionId: payload.id,
@@ -6603,9 +6809,11 @@ async function shutdown(
   for (const timer of chatPushTimers.values()) clearTimeout(timer);
   chatPushTimers.clear(); chatSubscribers.clear();
   transcriptProjector?.dispose();
+  transcriptActivity?.dispose();
   terminalChat?.dispose();
   // Same for the discovery searches — unref'd watch handles and poll timers.
   transcriptDiscovery?.dispose();
+  codexCwdBinder?.dispose();
 
   // Cancel pending shutdown-kill reclassifications — the suspend loop below is
   // now the single owner of every non-dead session's persisted state.
@@ -7042,6 +7250,12 @@ async function main(): Promise<void> {
   // because which pushes were delivered is not persisted.
   approvalPushRouter.adopt(approvalRegistry.list().pending);
   const pipeServer = new DaemonPipeServer(config.daemon.pipeName);
+  // A re-list nudge for main's HQ approval lane (deck/hqApprovalLane.ts).
+  // Subscribed here, not above: that listener runs before `pipeServer` exists.
+  // No record field rides along — every subscribed client gets broadcasts.
+  approvalRegistry.onEvent((event) => {
+    pipeServer.broadcast({ type: 'approvals.changed', sessionId: '', data: { change: event.type } });
+  });
   // Desktop presence, reported by the Electron main process on every
   // focus/blur transition. Registered here rather than in `registerRpcHandlers`
   // so the wiring stays additive — the tracker is a boot-scope value and
@@ -7081,6 +7295,9 @@ async function main(): Promise<void> {
       workspaceFacts.clear();
       workspaceFactsPublisher = null;
     }
+    // Same for the Moa pane: nobody is vouching for it any more, so the phone
+    // loses it until a main process publishes again.
+    moaPaneRpc?.onClientClose(clientId);
   });
   // Channels (a2a-channels U3). Channels live in their own file
   // (`channels.json`, see ChannelStateWriter doc) so a channel-loss event
@@ -7578,6 +7795,18 @@ async function main(): Promise<void> {
     if (!state.alive) automationEngine?.onAgentProcessExit(sessionId);
     // The agent that hit the limit is gone; a relaunch is a new agent.
     if (!state.alive) usageLimits?.drop(sessionId);
+    // A Codex launch edge opens a fresh cwd-bind window; a death edge closes it.
+    codexCwdBinder?.reset(sessionId);
+    codexProcessStart.delete(sessionId);
+    if (state.alive && state.slug === 'codex') {
+      codexCwdBinder?.arm(sessionId);
+      const pid = agentProcessTracker.pidFor(sessionId);
+      if (pid !== undefined) {
+        void readProcessStartMs(pid).then((startedAt) => {
+          if (startedAt !== undefined && agentProcessTracker.pidFor(sessionId) === pid) codexProcessStart.set(sessionId, startedAt);
+        });
+      }
+    }
     // A pane whose status the HOOK owns has exactly two settle paths: the Stop
     // hook, and this edge. An agent killed mid-turn (double Ctrl+C, /exit, a
     // crash) sends no Stop, and byte silence no longer clears a hook-governed
@@ -7723,7 +7952,10 @@ async function main(): Promise<void> {
   persistCodexRelayState = (id,owner) => {
     if (shuttingDown || sessionManager.getSession(id) !== owner || !['attached','detached'].includes(owner.meta.state)) return;
     const before = JSON.stringify(owner.meta.codexRelayResume);
-    captureCodexRelayResume(owner.meta,codexPaneRelays.liveSelection(id,owner));
+    const observed = codexPaneRelays.liveSelection(id,owner);
+    const codeHome = codexPaneRelays.accountHome(id,owner);
+    if (codeHome) persistCodexThreadOwner(owner.meta, observed, codeHome);
+    captureCodexRelayResume(owner.meta, observed);
     if (before !== JSON.stringify(owner.meta.codexRelayResume) && !stateWriter.saveImmediate(buildState(sessionManager))) {
       throw new Error('Codex recovery selection could not be persisted');
     }

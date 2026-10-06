@@ -22,8 +22,10 @@ import { pasteClipboardImage } from '../utils/imagePaste';
 import { openTerminalUrl } from '../utils/browserPaneActions';
 import { runCopyWithFeedback } from '../utils/copyWithFeedback';
 import { claimFit } from '../utils/fitGuard';
+import { createFitScheduler } from '../utils/layoutTransitionGate';
 import { installAltClickTrackingGuard } from '../utils/altClickUnderMouseTracking';
 import { createMouseOwnedHint } from '../utils/mouseOwnedHint';
+import { resizeOrderFor, runOrderedFit, type CancelOrderedFit } from '../utils/resizeOrder';
 import { createAutoSelectionCopy } from '../utils/autoSelectionCopy';
 import { createOsc52Handler } from '../utils/osc52Clipboard';
 import {
@@ -33,8 +35,9 @@ import {
 } from '../terminal/replayMute';
 import { terminalFontFamilyCss } from '../utils/terminalFont';
 import { createPathLinkProvider } from '../terminal/pathLinkProvider';
-import { resolveNewlineKeyByte } from '../terminal/newlineKeys';
+import { resolveNewlineKeyByte, wantsAltEnterNewline, foldAtPromptCarry, noteCodexEndedByPrompt } from '../terminal/newlineKeys';
 import { resolveMacWordDeleteByte } from '../terminal/macWordDeleteKey';
+import { isWslShell } from '../../shared/imagePaste';
 import { encodeEscape, isBareEscape } from '../terminal/escapeKeys';
 import { resolveCtrlLetterByte } from '../terminal/ctrlLetterKeys';
 import { isComposeChord, composeOwnerHost, TERMINAL_PTY_ATTR, COMPOSE_OWNER_ATTR } from '../terminal/composeChord';
@@ -54,6 +57,8 @@ import { useWindowDisplayed } from './useWindowDisplayed';
 import { createDeadInputWatchdog } from '../terminal/deadInputWatchdog';
 import { awaitParseBarrier } from '../terminal/parseBarrier';
 import { STALE_REPLAY_INPUT_MODE_RESETS, STALE_REPLAY_ALIVE_SHELL_RESETS, STALE_REPLAY_DISPLAY_RESETS, staleReplayResetLevel } from '../../shared/terminal/staleReplayModeReset';
+import { installShellPromptModeReset, shellPromptModeResetFor } from '../../shared/terminal/shellPromptModeReset';
+import { paneForegroundProbe } from '../terminal/paneForegroundProbe';
 import { attachAltScreenWheel, PAGE_SCROLL_AGENTS } from '../terminal/altScreenWheel';
 import { RestingCursorGuard } from '../terminal/restingCursor';
 import { restoreSeam } from '../../shared/restoreSeam';
@@ -96,6 +101,30 @@ export function onTerminalRegistered(listener: (ptyId: string) => void): () => v
   terminalRegistrationListeners.add(listener);
   return () => terminalRegistrationListeners.delete(listener);
 }
+// #1694: ptyId → whether the pane's shell enters WSL, from the pty list's
+// `shell` (the same predicate the clipboard route uses, #1196). Learned once
+// per pane on a Windows host; a pane missing here counts as WSL, which keeps
+// the old newline bytes. Requests queue behind each other, and one that finds
+// its pane already learned (a restore mounts many at once) asks nothing.
+const wslByPtyId = new Map<string, boolean>();
+let ptyShellsQueue: Promise<void> = Promise.resolve();
+/** A failed lookup is retried, so one transient error doesn't leave a pane unknown. */
+const PTY_SHELLS_RETRY_MS = [1_000, 3_000, 10_000];
+function learnPtyShells(ptyId: string, attempt = 0): void {
+  if (wslByPtyId.has(ptyId)) return;
+  ptyShellsQueue = ptyShellsQueue
+    .then(async () => {
+      if (wslByPtyId.has(ptyId)) return;
+      for (const s of await window.electronAPI.pty.list()) {
+        wslByPtyId.set(s.id, isWslShell(s.shell));
+      }
+    })
+    .catch(() => {
+      const delay = PTY_SHELLS_RETRY_MS[attempt];
+      if (delay !== undefined) window.setTimeout(() => learnPtyShells(ptyId, attempt + 1), delay);
+    });
+}
+
 function registerTerminal(ptyId: string, terminal: Terminal): void {
   terminalRegistry.set(ptyId, terminal);
   for (const listener of [...terminalRegistrationListeners]) listener(ptyId);
@@ -827,11 +856,14 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
   //     once after the window clears (~1.1 s) so the size self-heals.
   //   • "not found" — the session was swapped/disposed mid-resize; the main
   //     pty:resize handler already retries-then-logs this, so we swallow it.
-  const sendResize = useCallback((targetPtyId: string, cols: number, rows: number) => {
+  // Returns the in-flight resize so a caller that must not touch xterm before
+  // the daemon has applied the geometry (#1436's shrink path) can wait on it.
+  // Every other caller ignores it, exactly as before.
+  const sendResize = useCallback((targetPtyId: string, cols: number, rows: number): Promise<void> => {
     // The grid belongs to someone else (see `fixedGeometry`): never resize the
     // PTY. Gated here, not at the callers, so no fit path can get around it.
-    if (fixedGeometryRef.current) return;
-    window.electronAPI.pty.resize(targetPtyId, cols, rows).catch((err: unknown) => {
+    if (fixedGeometryRef.current) return Promise.resolve();
+    return window.electronAPI.pty.resize(targetPtyId, cols, rows).catch((err: unknown) => {
       const msg = err instanceof Error ? err.message : String(err);
       if (!msg.includes('rate limited')) return; // not-found / other: handled upstream
       window.setTimeout(() => {
@@ -939,6 +971,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         const fromBottom = Math.max(0, term.buffer.active.baseY - term.buffer.active.viewportY);
         discardTerminalOutput(term);
         term.reset();
+        shellPromptModeResetFor(term)?.reset();
         // Historical bytes — clipboard bridge muted (#998).
         writeReplayed(term, bytes, replayMuteRef.current);
         term.write(STALE_REPLAY_INPUT_MODE_RESETS);
@@ -1215,6 +1248,22 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // new React mount. Share the mute with the terminal instance so an
     // in-flight replay cannot become live-authorized during that handoff.
     replayMuteRef.current = getTerminalReplayMute(terminal);
+
+    // #1792: a TUI agent killed mid-run leaves mouse / focus reporting armed,
+    // and the shell that takes the prompt back gets every report as typed
+    // junk. The guard watches this pane's own OSC 133 prompt marks and clears
+    // those modes terminal-side once the shell owns the pane again. Once per
+    // terminal, not per mount: an adopted terminal keeps the state it folded.
+    // #1794: on the desktop the reset also waits for process truth, so a TUI
+    // still alive behind the prompt (background launch, Ctrl+Z) keeps its
+    // mouse. Each mount binds its own probe (an adopting mount replaces it).
+    // The browser build (wmux web, the only one exposing `hostPlatform`) has
+    // no process-truth channel (`pty.resources` is denied there), so it keeps
+    // the prompt-mark-only behaviour, like the phone page and the mirror.
+    const hasProcessTruth = typeof (window.electronAPI as { hostPlatform?: unknown }).hostPlatform !== 'function';
+    const promptModeGuard = installShellPromptModeReset(terminal, hasProcessTruth
+      ? { isForegroundGone: paneForegroundProbe(ptyId, window.electronAPI.pty) }
+      : undefined);
 
     const fitAddon = fixedGeometryRef.current
       ? new FixedGeometryFitAddon(() => fixedGeometryRef.current)
@@ -1702,7 +1751,6 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // Track last sent dimensions to avoid redundant resizes
     let lastSentCols = 0;
     let lastSentRows = 0;
-    let resizeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
     // The container-resize fit, extracted so the selection-release retry below
     // runs the SAME path — including scroll preservation and sendResize —
@@ -1716,6 +1764,10 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // a queued fit at teardown nor stop several selection events in the same
     // debt window from each scheduling their own.
     let pendingFitRaf: number | null = null;
+    // #1436: a shrink hands the PTY its new geometry BEFORE xterm shrinks, so
+    // the handle for that deferred local fit lives here — teardown and a newer
+    // resize both have to be able to drop it.
+    let cancelOrderedFit: CancelOrderedFit | null = null;
     const runFit = () => {
       try {
         const term = terminalRef.current;
@@ -1733,7 +1785,8 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         // records no fit debt: layout settling re-fires the ResizeObserver,
         // which is the retry. (Checked before claimFit so the debt mechanism
         // stays reserved for selection-deferred fits.)
-        if (!proposedSafeDimensions(fitAddon)) return;
+        const proposed = proposedSafeDimensions(fitAddon);
+        if (!proposed) return;
 
         // Selection-preservation guard: xterm's SelectionService clears the
         // active selection on any rowsChanged event from fit(). While the user
@@ -1746,34 +1799,75 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         }
         pendingFitRef.current = false;
 
-        const prevYBase = term.buffer.active.baseY;
-        const prevYDisp = term.buffer.active.viewportY;
-        const wasScrolledUp = prevYDisp < prevYBase;
-        const distFromBottom = prevYBase - prevYDisp;
+        // Everything that must happen locally, in one place, so the shrink path
+        // can run the SAME body one IPC round trip later instead of a thinner
+        // copy that drifts (the lesson of #747).
+        const applyLocalFit = () => {
+          const live = terminalRef.current;
+          // Re-check on the deferred path: the wait is short, but a ptyId change
+          // or an unmount inside it must not fit the NEW terminal against the
+          // OLD container/addon.
+          if (!live || live !== terminal) return;
+          if (container.offsetWidth === 0 || container.offsetHeight === 0) return;
 
-        fitAddon.fit();
+          const prevYBase = live.buffer.active.baseY;
+          const prevYDisp = live.buffer.active.viewportY;
+          const wasScrolledUp = prevYDisp < prevYBase;
+          const distFromBottom = prevYBase - prevYDisp;
 
-        if (wasScrolledUp) {
-          const newYBase = term.buffer.active.baseY;
-          const targetYDisp = Math.max(0, newYBase - distFromBottom);
-          term.scrollToLine(targetYDisp);
-        }
+          fitAddon.fit();
 
-        // #1002: first real fit after adopting into a hidden container. The
-        // park's own reading wins over the one taken above, which was measured
-        // against a viewport that had no size to be scrolled in.
-        if (pendingAdoptViewport) {
-          restoreParkedViewport(pendingAdoptViewport);
-          pendingAdoptViewport = null;
-        }
+          if (wasScrolledUp) {
+            const newYBase = live.buffer.active.baseY;
+            const targetYDisp = Math.max(0, newYBase - distFromBottom);
+            live.scrollToLine(targetYDisp);
+          }
 
-        const { cols, rows } = term;
+          // #1002: first real fit after adopting into a hidden container. The
+          // park's own reading wins over the one taken above, which was measured
+          // against a viewport that had no size to be scrolled in.
+          if (pendingAdoptViewport) {
+            restoreParkedViewport(pendingAdoptViewport);
+            pendingAdoptViewport = null;
+          }
+
+          const { cols, rows } = live;
+          const id = ptyIdRef.current;
+          // The shrink path already sent `proposed` and recorded it, so this
+          // stays quiet unless fit() actually landed somewhere else — in which
+          // case the correction is exactly what we want to send.
+          if (id && cols > 0 && rows > 0 && (cols !== lastSentCols || rows !== lastSentRows)) {
+            lastSentCols = cols;
+            lastSentRows = rows;
+            sendResize(id, cols, rows);
+          }
+        };
+
         const currentPtyId = ptyIdRef.current;
-        if (currentPtyId && cols > 0 && rows > 0 && (cols !== lastSentCols || rows !== lastSentRows)) {
-          lastSentCols = cols;
-          lastSentRows = rows;
-          sendResize(currentPtyId, cols, rows);
-        }
+        const order = currentPtyId
+          ? resizeOrderFor(term.rows, proposed.rows)
+          : 'local-first';
+
+        // A newer resize supersedes a deferred one: drop the old handle rather
+        // than let two fits race to apply different geometries.
+        cancelOrderedFit?.();
+        cancelOrderedFit = runOrderedFit({
+          order,
+          sendGeometry: () => {
+            // Only reached on the shrink path, where currentPtyId is non-null.
+            lastSentCols = proposed.cols;
+            lastSentRows = proposed.rows;
+            return sendResize(currentPtyId as string, proposed.cols, proposed.rows);
+          },
+          applyLocalFit: () => {
+            cancelOrderedFit = null;
+            try {
+              applyLocalFit();
+            } catch {
+              // ignore fit errors during unmount, as on the synchronous path
+            }
+          },
+        });
       } catch {
         // ignore fit errors during unmount
       }
@@ -1847,15 +1941,46 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     const hostPlatform = () =>
       (window.electronAPI as { hostPlatform?: () => string | null }).hostPlatform?.() ?? window.electronAPI.platform;
     const foldOpts = () => ({ trustWin32Input: hostPlatform() !== 'win32' });
+    // #1694: the Codex newline mapping lives only while the command runs. The
+    // detected slug can outlive Codex, so the pane's own OSC 133;A ends the
+    // mapping at once and 133;C starts it again. The liveness edges above need
+    // no hook here: the same hydrate that flips them clears the slug.
+    const atPromptRef = { current: false };
+    // ...and a command started before that stale slug is dropped must not
+    // re-arm it: the prompt edge that ended Codex latches the mapping off until
+    // the slug goes (subscription below) or the grace window passes.
+    const codexEndedAtRef: { current: number | null } = { current: null };
+    // The unscanned end of the last chunk, so a marker split across two data
+    // events is still seen.
+    const promptTailRef = { current: '' };
+    if (hostPlatform() === 'win32') learnPtyShells(ptyId);
     const noteKeyboard = (data: string | Uint8Array) => {
       keyboardRef.current = foldRemoteKeyboardState(keyboardRef.current, data, foldOpts());
       parkedKeyboardByTerminal.set(terminal, keyboardRef.current);
+      if (hostPlatform() === 'win32') {
+        const wasAtPrompt = atPromptRef.current;
+        const folded = foldAtPromptCarry(wasAtPrompt, promptTailRef.current, data);
+        atPromptRef.current = folded.atPrompt;
+        promptTailRef.current = folded.tail;
+        codexEndedAtRef.current = noteCodexEndedByPrompt(
+          codexEndedAtRef.current,
+          wasAtPrompt,
+          atPromptRef.current,
+          useStore.getState().surfaceAgent[ptyId]?.slug,
+          Date.now(),
+        );
+      }
     };
     // #1228 review (C1): the fold is liveness-scoped. When process-truth or
     // OSC 133 says the pane's foreground command is gone, any negotiation it
     // armed (?9001h / kitty push) is stale — the next app in the pane starts
     // from a clean slate, not the dead app's encoding. Same edges #1210 uses.
     const unsubscribeKeyboardLiveness = useStore.subscribe((state, prev) => {
+      // #1694: the stale Codex slug is gone, so the end-of-Codex latch has
+      // done its job; a fresh detection arms the mapping straight away.
+      if (codexEndedAtRef.current !== null && state.surfaceAgent[ptyId]?.slug !== 'codex') {
+        codexEndedAtRef.current = null;
+      }
       const gone = (now: boolean | undefined, was: boolean | undefined) =>
         now === false && was !== false;
       if (
@@ -1913,6 +2038,16 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         // Claude Code inside wmux never pushes kitty, so the historical CSI-u
         // default was Escape + garbage and the prompt submitted (#1152).
         shiftEnterFallback: 'lf',
+        // #1694: native Windows Codex takes Alt+Enter as its newline. Keyed
+        // on the detected agent, not on `?9001h` — ConPTY emits that for
+        // every pane, so the fold ignores it on a Windows host (#1363).
+        altEnterNewline: wantsAltEnterNewline({
+          hostPlatform: hostPlatform(),
+          isWsl: wslByPtyId.get(ptyId),
+          agentSlug: useStore.getState().surfaceAgent[ptyId]?.slug,
+          atPrompt: atPromptRef.current,
+          codexEndedAt: codexEndedAtRef.current,
+        }),
       });
       if (newlineByte !== null) {
         e.preventDefault();
@@ -2304,6 +2439,10 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // own bracketed-paste markers if it pre-wrapped the payload.
     let inputBuffer = '';
     const onDataDisposable = terminal.onData((data) => {
+      // #1794: a reset is owed for leaked mouse / focus modes but has not
+      // applied yet (process truth pending, or queued behind output): the
+      // reports are the dead TUI's, not the shell's. Before anything else.
+      if (promptModeGuard.dropsReport(data)) return;
       // X6 ②: the user is driving this shell themselves — retract any pending
       // resume offer so the pill can't fire into a session they've moved on in.
       //
@@ -2431,6 +2570,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       const fromBottom = Math.max(0, terminal.buffer.active.baseY - terminal.buffer.active.viewportY);
       discardTerminalOutput(terminal); // stale retained backlog + dirty flag
       terminal.reset();
+      shellPromptModeResetFor(terminal)?.reset();
       // The scanner labels every held chunk at its source. Historical bytes
       // are muted for their exact parse lifetime; live output is not muted.
       for (const chunk of st.buffer) {
@@ -2617,7 +2757,10 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         lastFlushRecoveredBytes = recoveredBytes;
         if (pendingFlushReset) {
           pendingFlushReset = false;
-          if (recoveredBytes > 0) terminal.reset();
+          if (recoveredBytes > 0) {
+            terminal.reset();
+            shellPromptModeResetFor(terminal)?.reset();
+          }
         }
         resetStaleReplayModes(recoveredBytes);
       });
@@ -2684,7 +2827,10 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
               // bytes to xterm before reset() so the byte order xterm sees is
               // identical to the old direct-write path.
               flushTerminalOutput(terminal);
-              if (lastFlushRecoveredBytes > 0) terminal.reset();
+              if (lastFlushRecoveredBytes > 0) {
+                terminal.reset();
+                shellPromptModeResetFor(terminal)?.reset();
+              }
             } else {
               pendingFlushReset = true;
             }
@@ -2843,17 +2989,20 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // IMPORTANT: skip when the container has zero dimensions (display:none workspace).
     // Fitting a hidden terminal produces 0 cols/rows, which corrupts the PTY buffer
     // and manifests as "infinite content duplication" when switching back to it.
-    const resizeObserver = new ResizeObserver(() => {
-      if (resizeDebounceTimer) clearTimeout(resizeDebounceTimer);
-      resizeDebounceTimer = setTimeout(() => {
-        resizeDebounceTimer = null;
+    // The scheduler debounces ticks and, while an animated layout change (the
+    // sidebar toggle) holds fits, defers them to one fit on release — never a
+    // PTY resize per animation frame.
+    const resizeScheduler = createFitScheduler({
+      debounceMs: 100,
+      fitNextFrame: () => {
         if (pendingFitRaf !== null) cancelAnimationFrame(pendingFitRaf);
         pendingFitRaf = requestAnimationFrame(() => {
           pendingFitRaf = null;
           runFit();
         });
-      }, 100);
+      },
     });
+    const resizeObserver = new ResizeObserver(() => resizeScheduler.onResize());
     resizeObserver.observe(container);
 
     return () => {
@@ -2899,7 +3048,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // inferring it from what the screen did.
       console.log(`[wmux:pane-adopt] ptyId=${ptyId} teardown=${canPark ? 'parked' : `disposed reason=${parkRefusal}`}`);
 
-      if (resizeDebounceTimer) clearTimeout(resizeDebounceTimer);
+      resizeScheduler.dispose();
       if (pendingFitRaf !== null) cancelAnimationFrame(pendingFitRaf);
       if (isMac) { container.removeEventListener('paste', blockNativePaste, true); }
       detachAltClickGuard();
@@ -2932,6 +3081,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       container.removeEventListener('mousedown', onHintMouseDown);
       document.removeEventListener('mousemove', onHintMouseMove);
       document.removeEventListener('mouseup', onHintMouseUp);
+      cancelOrderedFit?.();
       resizeObserver.disconnect();
       // #929: cancel any pending resting-cursor show before dispose — a late
       // inject into a disposed xterm is the #582 class of bug.

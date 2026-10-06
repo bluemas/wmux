@@ -107,9 +107,13 @@ interface FakeDecision {
 }
 const decisions = new Map<string, FakeDecision>();
 vi.mock('../../../deck/deckDecisionStore', () => ({
+  onDecisionsChanged: vi.fn(() => () => undefined),
+  isIssueProposalDecision: vi.fn(() => false),
+  isMainOwnedDecision: vi.fn(() => false),
   loadWorkspaceDecision: vi.fn((ws: string) => decisions.get(ws) ?? null),
   loadDeckDecisions: vi.fn(() => Object.fromEntries(decisions.entries())),
   hasPendingDecision: vi.fn((ws: string) => decisions.get(ws)?.status === 'pending'),
+  hasBrainBlockingDecision: vi.fn((ws: string) => decisions.get(ws)?.status === 'pending'),
   resolveDecision: vi.fn(async () => null),
   clearResolvedDecision: vi.fn(async () => undefined),
   clearDecision: vi.fn(async () => undefined),
@@ -117,6 +121,7 @@ vi.mock('../../../deck/deckDecisionStore', () => ({
 }));
 
 import { registerDeckHandler } from '../deck.handler';
+import { setMoaEnabled } from '../../../deck/deckHqStore';
 import { IPC } from '../../../../shared/constants';
 import { getWorkspaceMirror, __resetWorkspaceMirrorForTest } from '../../../workspace/WorkspaceMirror';
 import type { WorkspaceMirrorPushPayload } from '../../../workspace/WorkspaceMirror';
@@ -161,6 +166,12 @@ function seedMirror(
   };
   getWorkspaceMirror().setSnapshot(payload);
 }
+
+// These suites exercise the deck brain itself: start with Moa's master
+// switch on (a fresh data dir would otherwise read as a new install, off).
+beforeEach(async () => {
+  await setMoaEnabled(true);
+});
 
 beforeEach(() => {
   captured.clear();

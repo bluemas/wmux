@@ -39,7 +39,10 @@ import { wrapHandler } from '../wrapHandler';
 import type { DaemonClient } from '../../DaemonClient';
 import type { RpcMethod } from '../../../shared/rpc';
 import { teardownWorkspaceDeckState } from '../../deck/deckWorkspaceTeardown';
+import { getHqWorkspaceId } from '../../deck/deckHqStore';
 import { renderStrandedDeckWorkBlock } from '../../deck/deckWorkStore';
+import { recordTaskState } from '../../workLink/a2aProducer';
+import { getWorkLinkStore } from '../../workLink/workLinkStore';
 
 /** Positive allow-list — only channel/principal-mutating methods may ride the
  *  renderer trust path. Reads and every other RPC are rejected so this surface
@@ -153,6 +156,19 @@ export function registerChannelLocalHandlers(getDaemonClient: () => DaemonClient
       // forged anchor on this path.
       delete p.senderPtyId;
 
+      // The HQ workspace is app-owned: a whole-workspace purge would drop its
+      // channel memberships and fail its in-flight A2A tasks before the Deck
+      // teardown below (which refuses the HQ) ever ran. Refuse it up front.
+      const isWholeWorkspacePurge =
+        method === 'a2a.channel.purgeMembership' &&
+        typeof p.workspaceId === 'string' &&
+        p.workspaceId.trim().length > 0 &&
+        p.memberId === undefined &&
+        p.principalId === undefined;
+      if (isWholeWorkspacePurge && (p.workspaceId as string).trim() === getHqWorkspaceId()) {
+        return reject(`channels:mutate-local refuses to purge ${String(p.workspaceId)}: it is the HQ workspace`);
+      }
+
       const dc = getDaemonClient();
       if (!dc) throw new Error('Daemon not connected');
       const result = await dc.rpc(method as RpcMethod, p);
@@ -160,15 +176,26 @@ export function registerChannelLocalHandlers(getDaemonClient: () => DaemonClient
       // Whole-workspace removal teardown: when purgeMembership is called for an entire
       // workspace (both memberId and principalId are absent), tear down its Deck stores.
       // Must run AFTER the daemon call has been made, and must never fail the RPC.
-      if (
-        method === 'a2a.channel.purgeMembership' &&
-        typeof p.workspaceId === 'string' &&
-        p.workspaceId.trim().length > 0 &&
-        p.memberId === undefined &&
-        p.principalId === undefined
-      ) {
+      if (isWholeWorkspacePurge) {
+        // The daemon failed the removed workspace's open A2A tasks itself (no
+        // a2a.task.update reached main), so record each on its work link here,
+        // through the same writer every other transition uses.
+        const body = result && typeof result === 'object' && 'result' in result
+          ? (result as { result?: unknown }).result
+          : result;
+        const failed = body && typeof body === 'object' ? (body as { failedA2aTasks?: unknown }).failedA2aTasks : undefined;
+        if (Array.isArray(failed)) {
+          for (const task of failed) {
+            if (task && typeof task === 'object') void recordTaskState((task as { id?: unknown }).id, 'failed', undefined, task);
+          }
+        }
+        // Links owned by the removed workspace can never finish: settle them
+        // so no "running" card points at a workspace that no longer exists.
+        const removedWs = (p.workspaceId as string).trim();
+        // The HQ keeps its links (its Deck state outlives a removal too).
+        void getWorkLinkStore().abandonOrphaned((id) => id !== removedWs || id === getHqWorkspaceId());
         try {
-          const wsId = p.workspaceId.trim();
+          const wsId = removedWs;
           await teardownWorkspaceDeckState(wsId, {
             // Log only: raising a Deck decision here would re-create state for the workspace
             // being removed (the decision step of the teardown runs right after this callback).

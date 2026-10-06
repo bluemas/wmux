@@ -255,6 +255,12 @@ export const IPC = {
   //   DECK_FANOUT_CALLER_SUBMIT (invoke) renderer → main: write the fixed
   //                   nudge line through the delivery gate and the daemon.
   DECK_FANOUT_CALLER_SUBMIT: 'deck:fanout-caller:submit',
+  //   DECK_PR_OWNER (send) main → renderer: a PR event (CI failed, checks
+  //                   passed, review comment, merge conflict) for a workspace
+  //                   with no brain. The renderer finds the one agent pane whose
+  //                   checkout is that PR and writes through
+  //                   DECK_FANOUT_CALLER_SUBMIT (main/deck/prOwnerNotify.ts).
+  DECK_PR_OWNER: 'deck:pr-owner',
   //   DECK_SCHEDULES_* (invoke) renderer → main: CRUD over the persisted
   //                    orchestrator schedules (P3d). Same renderer-only trust
   //                    boundary as DECK_SEND.
@@ -308,6 +314,90 @@ export const IPC = {
   //   + schedules. Same renderer-only trust boundary.
   DECK_MODE_GET: 'deck:mode:get',
   DECK_MODE_SET: 'deck:mode:set',
+  //   DECK_HQ_GET — the designated HQ workspace (deckHqStore.ts, main is the
+  //   source of truth): { workspaceId, state: 'unset' | 'ok' | 'hq-missing' |
+  //   'hq-unknown' | 'hq-store-corrupt' }. Read-only; no renderer setter yet.
+  DECK_HQ_GET: 'deck:hq:get',
+  //   DECK_MOA_* — the main bot's master switch (deckHqStore.ts `moaEnabled`,
+  //   default on). Off stops the whole deck runtime (brains, timers, bus and
+  //   mirror subscriptions); nothing is deleted. { enabled: boolean } both
+  //   ways; SET answers { ok: false, code: 'store_corrupt' } while the store
+  //   is unreadable.
+  DECK_MOA_GET: 'deck:moa:get',
+  DECK_MOA_SET: 'deck:moa:set',
+  //   DECK_MOA_STATE — Settings → Moa's one read: { config, hq: { workspaceId,
+  //   state }, archive: { unacked, total } }. DECK_MOA_CHANGED (send, main →
+  //   renderer, no payload) says it moved. DECK_MOA_CONFIG_SET takes a partial
+  //   { onboarded, level, maxTurnsPerHour, bubbles, reduceMotion }.
+  //   DECK_MOA_SETUP { workspaceId } makes a just-created workspace the HQ at
+  //   level 1 and turns Moa on (first run, and "Recreate Moa workspace").
+  //   With `rebind: true` and the current HQ's own id it only turns Moa on:
+  //   the lost HQ came back under its id, so its settings are kept.
+  //   DECK_MOA_ARCHIVE_LIST / _ACK: the decisions the HQ migration archived and
+  //   their one-time notice. DECK_MOA_STORE_RESET moves an unreadable
+  //   deck-hq.json aside and starts over (Moa off, no HQ).
+  DECK_MOA_STATE: 'deck:moa:state',
+  DECK_MOA_CHANGED: 'deck:moa:changed',
+  DECK_MOA_CONFIG_SET: 'deck:moa:config:set',
+  DECK_MOA_SETUP: 'deck:moa:setup',
+  DECK_MOA_ARCHIVE_LIST: 'deck:moa:archive:list',
+  DECK_MOA_ARCHIVE_ACK: 'deck:moa:archive:ack',
+  DECK_MOA_STORE_RESET: 'deck:moa:store:reset',
+  //   DECK_MOA_MEMORY_LIST / _DELETE: what Moa remembers (saved precedents,
+  //   notes and skills, all approved by the operator) and deleting one by
+  //   { kind, name }. DECK_MOA_CHANGED also says this list moved.
+  DECK_MOA_MEMORY_LIST: 'deck:moa:memory:list',
+  DECK_MOA_MEMORY_DELETE: 'deck:moa:memory:delete',
+  //   DECK_MOA_MEMORY_CARD: the pending "Remember this?" card with the full
+  //   text Save would write, or null. DECK_MOA_MEMORY_RESOLVE { id, answer:
+  //   'save' | 'discard', fullTextShown } answers it. DECK_MOA_CHANGED says the
+  //   card moved (raised, answered, next).
+  DECK_MOA_MEMORY_CARD: 'deck:moa:memory:card',
+  DECK_MOA_MEMORY_RESOLVE: 'deck:moa:memory:resolve',
+  //   DECK_MOA_DECISIONS — every workspace's pending decision, for the right
+  //   panel's "Waiting on you" ({ decisions: MoaPendingDecision[] }); a change
+  //   rides DECK_MOA_CHANGED.
+  //   DECK_MOA_TRANSCRIPT_* — the HQ brain's Claude transcript, projected in
+  //   main by the same TranscriptProjector the phone turn view uses (the brain
+  //   pane is never a daemon transcript session). STATUS / SNAPSHOT
+  //   ({ before? }) / SUBSCRIBE / UNSUBSCRIBE (invoke); APPEND (send, main →
+  //   renderer, TranscriptAppendData).
+  DECK_MOA_DECISIONS: 'deck:moa:decisions',
+  // Permission prompts of agents Moa delegated work to ({ approvals:
+  // MoaDelegatedApproval[] }), for the panel's "Waiting on you".
+  DECK_MOA_DELEGATED_APPROVALS: 'deck:moa:delegated-approvals',
+  // Answer one of those prompts in place ({ approvalId, choiceKey,
+  // promptFingerprint } → MoaApprovalAnswerResult). Main presses only a prompt
+  // it lists above, through the daemon's first-party desktop answer.
+  DECK_MOA_DELEGATED_ANSWER: 'deck:moa:delegated-answer',
+  // A delegated task's result from its A2A completion evidence ({ workspaceId,
+  // taskId } → { result: MoaTaskResult | null }), for Moa's result card.
+  DECK_MOA_TASK_RESULT: 'deck:moa:task-result',
+  //   DECK_MOA_HANDOFF_RESOLVE (invoke MoaHandoffResolveRequest): answer a
+  //   hand-off card by id (main reads the body from its own store; an edited
+  //   body is the operator's own input). DECK_MOA_HANDOFF_RECEIPTS (invoke):
+  //   recent auto hand-offs. DECK_MOA_HANDOFF_STOP (invoke { id }): interrupt
+  //   the worker and cancel an auto hand-off's task.
+  DECK_MOA_HANDOFF_RESOLVE: 'deck:moa:handoff:resolve',
+  DECK_MOA_HANDOFF_RECEIPTS: 'deck:moa:handoff:receipts',
+  DECK_MOA_HANDOFF_STOP: 'deck:moa:handoff:stop',
+  DECK_MOA_TRANSCRIPT_STATUS: 'deck:moa:transcript:status',
+  DECK_MOA_TRANSCRIPT_SNAPSHOT: 'deck:moa:transcript:snapshot',
+  DECK_MOA_TRANSCRIPT_SUBSCRIBE: 'deck:moa:transcript:subscribe',
+  DECK_MOA_TRANSCRIPT_UNSUBSCRIBE: 'deck:moa:transcript:unsubscribe',
+  DECK_MOA_TRANSCRIPT_APPEND: 'deck:moa:transcript:append',
+  //   CODEBLOCK (invoke { srcOffset, n, eventId? }): one code-block body from
+  //   the HQ brain's transcript (the daemon cannot resolve the brain pty).
+  DECK_MOA_TRANSCRIPT_CODEBLOCK: 'deck:moa:transcript:codeblock',
+  //   DECK_MOA_APPROVAL — Moa's own permission prompt (#1772): the daemon's
+  //   pending `terminal_prompt` record for the HQ brain pane, or null
+  //   ({ approval: MoaApproval | null }). DECK_MOA_APPROVAL_ANSWER
+  //   { approvalId, choiceKey, promptFingerprint } presses one of its choices
+  //   (MoaApprovalAnswerResult). Renderer-only: the daemon RPCs behind them
+  //   (daemon.moa.prompt / daemon.moa.answerPrompt) have no pipe route, MCP
+  //   tool or CLI verb.
+  DECK_MOA_APPROVAL: 'deck:moa:approval',
+  DECK_MOA_APPROVAL_ANSWER: 'deck:moa:approval:answer',
   //   HOOKS_BRIDGE_* — the Claude Code hook bridge (wmux setup-hooks, in-app).
   //   STATUS reports whether the wmux hook entries are installed in
   //   ~/.claude/settings.json; INSTALL performs the same idempotent install as
@@ -509,6 +599,44 @@ export const IPC = {
   // Git 탭 PR 섹션 — gh CLI 기반 PR 목록·코멘트(성긴 pull, 30s TTL)
   GITHUB_PR_LIST: 'github:prList',
   GITHUB_PR_DETAIL: 'github:prDetail',
+  GITHUB_REPO_KEY: 'github:repoKey',
+  // Git page Issues view (gh CLI, 30s TTL, rate-limit breaker)
+  GITHUB_ISSUE_LIST: 'github:issueList',
+  GITHUB_ISSUE_DETAIL: 'github:issueDetail',
+  // PR review and CI on the Git page's detail pane (src/main/github/GhPrReviewService.ts).
+  PR_REVIEW_CHECKS: 'prReview:checks',
+  PR_REVIEW_FILES: 'prReview:files',
+  PR_REVIEW_THREADS: 'prReview:threads',
+  PR_REVIEW_COMMENT: 'prReview:comment',
+  PR_REVIEW_REPLY: 'prReview:reply',
+  PR_REVIEW_SUBMIT: 'prReview:submit',
+  PR_REVIEW_MERGE: 'prReview:merge',
+  PR_REVIEW_RUN_LOG: 'prReview:runLog',
+  PR_REVIEW_RERUN: 'prReview:rerun',
+  // Work links (src/shared/workLink.ts): renderer reads only; main is the sole writer.
+  WORK_LINK_LIST: 'workLink:list',
+  WORK_LINK_GET: 'workLink:get',
+  WORK_LINK_CHANGED: 'workLink:changed',
+  // Moa's track record (src/shared/trackRecord.ts): the weekly retro card and
+  // its schedule. The counts themselves are main's and Moa's, not the renderer's.
+  TRACK_RECORD_RETRO_GET: 'trackRecord:retro:get',
+  TRACK_RECORD_RETRO_DISMISS: 'trackRecord:retro:dismiss',
+  TRACK_RECORD_SCHEDULE_GET: 'trackRecord:schedule:get',
+  TRACK_RECORD_SCHEDULE_SET: 'trackRecord:schedule:set',
+  TRACK_RECORD_CLEAR: 'trackRecord:clear',
+  TRACK_RECORD_CHANGED: 'trackRecord:changed',
+  // Git page ship button: the branch's status, commit / push / create PR
+  GIT_SHIP_STATUS: 'gitShip:status',
+  GIT_SHIP_COMMIT: 'gitShip:commit',
+  GIT_SHIP_PUSH: 'gitShip:push',
+  GIT_SHIP_CREATE_PR: 'gitShip:createPr',
+  // Git page hand-off: an issue / PR to an agent pane, or to a new worktree
+  GIT_HANDOFF_SEND: 'gitHandoff:send',
+  GIT_HANDOFF_START_WORKTREE: 'gitHandoff:startWorktree',
+  // One-step GitHub connect: gh auth login --web run by main, its device code shown in the page
+  GH_LOGIN_START: 'ghLogin:start',
+  GH_LOGIN_CANCEL: 'ghLogin:cancel',
+  GH_LOGIN_EVENT: 'ghLogin:event',
   DIALOG_PICK_FILE: 'dialog:pick-file',
   DIALOG_PICK_FOLDER: 'dialog:pick-folder',
   // File system
@@ -547,6 +675,12 @@ export const IPC = {
   USAGE_LIMIT_CHANGED: 'usageLimit:changed',
   USAGE_LIMIT_LIST: 'usageLimit:list',
   USAGE_LIMIT_UPDATE: 'usageLimit:update',
+  // Workspace settle / snooze (shared/workspaceSettle). Main owns and decides
+  // the state; renderer → main snapshot read on boot and the user's verbs,
+  // main → renderer push of the snapshot plus the changes behind it (toasts).
+  WORKSPACE_SETTLE_GET: 'workspaceSettle:get',
+  WORKSPACE_SETTLE_COMMAND: 'workspaceSettle:command',
+  WORKSPACE_SETTLE_CHANGED: 'workspaceSettle:changed',
   // EventBus publish — renderer→main one-way for pane lifecycle events
   EVENTS_PUBLISH: 'events:publish',
   // Total app memory (renderer → main, invoke). Returns the summed
@@ -615,6 +749,7 @@ export const IPC = {
   MCP_CHECK: 'mcp:check',
   MCP_REREGISTER: 'mcp:reregister',
   MCP_UNREGISTER: 'mcp:unregister',
+  MCP_REGISTER_TARGET: 'mcp:register-target',
   // Settings -> Token usage: quota (manual refresh only) and the CLI "surface" inventory / toggles.
   TOKEN_QUOTA_READ: 'tokenUsage:quota:read',
   TOKEN_QUOTA_SENSOR_STATUS: 'tokenUsage:quota:sensor-status',

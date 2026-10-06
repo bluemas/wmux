@@ -67,6 +67,12 @@ export interface SurfaceSlice {
    * the tab tooltip rely on. No-op for an empty ptyId or an unknown pty.
    */
   updateSurfaceCwd: (ptyId: string, cwd: string) => void;
+  /** The git branch each terminal last reported, keyed by ptyId. The
+   *  workspace's `metadata.gitBranch` is overwritten by whichever surface
+   *  reported last, so the Moa view pointer reads this one instead. Not
+   *  persisted; rebuilt as panes report. */
+  surfaceGitBranch: Record<string, string>;
+  setSurfaceGitBranch: (ptyId: string, branch: string) => void;
   /**
    * Persist the browser surface's current URL. Driven by BrowserPanel's
    * did-navigate events (user clicks, toolbar, MCP/CDP navigations alike), so
@@ -131,6 +137,12 @@ function persistBindingNow(get: () => StoreState): void {
 }
 
 export const createSurfaceSlice: StateCreator<StoreState, [['zustand/immer', never]], [], SurfaceSlice> = (set, get) => ({
+  surfaceGitBranch: {},
+  setSurfaceGitBranch: (ptyId, branch) => set((state: StoreState) => {
+    if (!ptyId || state.surfaceGitBranch[ptyId] === branch) return;
+    if (branch) state.surfaceGitBranch[ptyId] = branch;
+    else delete state.surfaceGitBranch[ptyId];
+  }),
   addSurface: (paneId, ptyId, shell, cwd, workspaceId) => {
     set((state: StoreState) => {
       const targetWsId = workspaceId || state.activeWorkspaceId;
@@ -305,6 +317,7 @@ export const createSurfaceSlice: StateCreator<StoreState, [['zustand/immer', nev
     }
     if (closedPtyId && state.surfaceAgent) delete state.surfaceAgent[closedPtyId];
     if (closedPtyId && state.surfaceActivity) delete state.surfaceActivity[closedPtyId];
+    if (closedPtyId && state.surfaceLastActivity) delete state.surfaceLastActivity[closedPtyId];
     // Drop the pending question too: a leaked entry would let a REUSED ptyId
     // inherit a dead pane's question and read as blocked from birth.
     if (closedPtyId && state.surfacePendingQuestion) delete state.surfacePendingQuestion[closedPtyId];

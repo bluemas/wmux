@@ -44,6 +44,8 @@ describe('buildFleetTriage', () => {
     expect(result.generatedAt).toBe(NOW);
     // Input requests first (most recent first), then the remote error.
     expect(result.needsYou.map((row) => row.paneId)).toEqual(['p2', 'p1', 'pr']);
+    // A finished turn is its own section, not a decision in Needs you.
+    expect(result.finished.map((row) => [row.paneId, row.reason])).toEqual([['p6', 'complete']]);
     expect(result.running.map((row) => row.paneId)).toEqual(['p3']);
   });
 
@@ -155,8 +157,10 @@ describe('buildFleetTriage', () => {
       surfaceAgentStatus: { ...base.surfaceAgentStatus, ...status },
     });
     const result = buildFleetTriage(useStore.getState(), { includeIdle: true }, NOW);
-    const returned = result.needsYou.length + result.running.length + (result.idle.rows?.length ?? 0);
+    const returned = result.needsYou.length + result.finished.length + result.running.length + (result.idle.rows?.length ?? 0);
     expect(returned).toBe(FLEET_TRIAGE_MAX_ROWS);
+    expect(result.finished).toEqual([]);
+    expect(result.omitted?.finished).toBe(1);
     expect(result.running).toEqual([]);
     expect(result.omitted?.needsYou).toBeGreaterThan(0);
     expect(result.omitted?.running).toBe(1);
@@ -177,6 +181,33 @@ describe('buildFleetTriage', () => {
     const block = source.match(/if \(method === 'fleet\.triage'\) \{[\s\S]*?\r?\n {2}\}\r?\n/)?.[0] ?? '';
     expect(block.indexOf('fleetTriageScopeError(')).toBeGreaterThan(-1);
     expect(block.indexOf('fleetTriageScopeError(')).toBeLessThan(block.indexOf('return buildFleetTriage('));
+  });
+
+  it('over the byte budget drops running rows before finished ones (least urgent first)', () => {
+    const base = useStore.getState();
+    const make = (prefix: string, n: number) => Array.from({ length: n }, (_, i) => ({
+      id: `ws-${prefix}-${i}`, name: `${prefix} 작업공간 ${i}`, activePaneId: `p${prefix}-${i}`,
+      rootPane: { id: `p${prefix}-${i}`, type: 'leaf' as const, activeSurfaceId: `s${prefix}-${i}`,
+        surfaces: [{ id: `s${prefix}-${i}`, ptyId: `pty-${prefix}-${i}`, title: 't', shell: 'zsh', cwd: '/', surfaceType: 'terminal' as const }] },
+    }));
+    const done = make('f', 30);
+    const busy = make('r', 30);
+    const long = '마이그레이션 결과를 정리했습니다. 테스트가 모두 통과했고 리뷰를 기다립니다. '.repeat(8);
+    useStore.setState({
+      workspaces: [...base.workspaces, ...done, ...busy] as typeof base.workspaces,
+      surfaceAgentStatus: { ...base.surfaceAgentStatus, ...Object.fromEntries(done.map((_, i) => [`pty-f-${i}`, 'complete' as const])) },
+      surfaceLastMessage: { ...Object.fromEntries(done.map((_, i) => [`pty-f-${i}`, long])) },
+      surfaceAgent: { ...base.surfaceAgent, ...Object.fromEntries(busy.map((_, i) => [`pty-r-${i}`, { name: 'Claude Code', status: 'running' as const }])) },
+      surfaceTurnOpenAt: { ...base.surfaceTurnOpenAt, ...Object.fromEntries(busy.map((_, i) => [`pty-r-${i}`, NOW - 1000])) },
+      surfaceActivity: { ...Object.fromEntries(busy.map((_, i) => [`pty-r-${i}`, `$ ${long}`])) },
+    });
+    const result = buildFleetTriage(useStore.getState(), { includeIdle: true }, NOW);
+    expect(Buffer.byteLength(JSON.stringify(result, null, 2))).toBeLessThanOrEqual(FLEET_TRIAGE_MAX_BYTES);
+    // The budget bites (well over 56 KB before trimming)...
+    expect((result.omitted?.idle ?? 0) + (result.omitted?.running ?? 0)).toBeGreaterThan(0);
+    // ...and running pays before finished: finished rows are cut only once running is empty.
+    if ((result.omitted?.finished ?? 0) > 0) expect(result.running).toEqual([]);
+    expect(result.finished.length).toBeGreaterThan(result.running.length);
   });
 
   it('keeps a Hangul-heavy fleet under the byte budget as whole JSON', () => {

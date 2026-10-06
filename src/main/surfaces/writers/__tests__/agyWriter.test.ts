@@ -12,6 +12,9 @@ import { createAgyWriter } from '../agyWriter';
 import * as safeWrite from '../../safeWrite';
 import { ConfigChangedError, SurfacesStore } from '../../safeWrite';
 
+// Real files on disk, several applies per test: slow Windows runners need more than vitest's 5 s.
+vi.setConfig({ testTimeout: 30_000 });
+
 function tempDir(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }

@@ -43,7 +43,7 @@ function render(ui: React.ReactElement) {
 
 /** Open the context menu on the row and return the Detach button. */
 function openMenu(container: HTMLElement): HTMLButtonElement {
-  const row = container.querySelector('[role="button"]') as HTMLElement;
+  const row = container.querySelector('[role="treeitem"]') as HTMLElement;
   act(() => {
     row.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }));
   });
@@ -63,6 +63,19 @@ afterEach(() => {
 });
 
 describe('RemoteWorkspaceItem', () => {
+  it.each([
+    ['Shift+F10', { key: 'F10', shiftKey: true }],
+    ['the Menu key', { key: 'ContextMenu' }],
+  ])('opens its menu from the keyboard with %s, like a local row', (_label, init) => {
+    const { container, unmount } = render(
+      <RemoteWorkspaceItem workspace={WS} isActive={false} onSelect={vi.fn()} onDetach={vi.fn()} />,
+    );
+    const row = container.querySelector('[role="treeitem"]') as HTMLElement;
+    act(() => { row.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, ...init })); });
+    expect(Array.from(container.querySelectorAll('button')).some((b) => /Detach/.test(b.textContent ?? ''))).toBe(true);
+    unmount();
+  });
+
   it('opens its menu on right-click', () => {
     const { container, unmount } = render(
       <RemoteWorkspaceItem workspace={WS} isActive={false} onSelect={vi.fn()} onDetach={vi.fn()} />,
@@ -135,7 +148,7 @@ describe('RemoteWorkspaceItem', () => {
     const { container } = render(
       <RemoteWorkspaceItem workspace={{ ...WS, hostLabel: '', authRejected: true, stale: true }} isActive={false} onSelect={vi.fn()} onDetach={vi.fn()} />,
     );
-    const row = container.querySelector('[role="button"]') as HTMLElement;
+    const row = container.querySelector('[role="treeitem"]') as HTMLElement;
     expect(row.getAttribute('aria-label')).toContain('the remote host no longer accepts this computer');
     expect(container.textContent).toContain('Pair again needed');
   });
@@ -144,7 +157,7 @@ describe('RemoteWorkspaceItem', () => {
     const { container } = render(
       <RemoteWorkspaceItem workspace={{ ...WS, insecureTransport: true, stale: true }} isActive={false} onSelect={vi.fn()} onDetach={vi.fn()} />,
     );
-    const row = container.querySelector('[role="button"]') as HTMLElement;
+    const row = container.querySelector('[role="treeitem"]') as HTMLElement;
     expect(row.getAttribute('aria-label')).toContain('needs HTTPS — re-pair over HTTPS');
     expect(container.textContent).toContain('needs HTTPS');
     expect(container.textContent).not.toContain('Pair again needed');

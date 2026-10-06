@@ -273,6 +273,20 @@ function escapeDigit(d: string): string {
 //      Everything upstream is a fact about when the hook fired, which is not
 //      a fact about the screen a press is about to land on.
 //
+// Two more, added with the HQ approval lane (C2 v2, 2026-10-04), for every
+// automated approve whichever process relays it:
+//   5. the task's single open OWNER is in `danger` right now. The task
+//      workspace's own mode is a copy taken at fan-out; the owner's live mode
+//      is the operator's current word, so a downgrade after the fan-out stops
+//      presses at once instead of when the copy catches up;
+//   6. the record is not flagged `risk: 'critical'`. The flag is a regex hint
+//      (shared/criticalPatterns), so it misses and over-fires — but it only
+//      ever withholds an AUTOMATED approve. The human still answers it.
+//      Checked FIRST, before any workspace fact;
+//   7. the record's hook named this pane exactly (`attribution: 'exact'`);
+//   8. a caller that declared the HQ lane finds main's lane policy still open
+//      at the generation it checked.
+//
 // UNKNOWN IS A REFUSAL. Each fact is optional in the input because the daemon
 // cannot see all of them yet (task-workspace membership and autonomy mode live
 // in the main process), and a fact we cannot establish must never be assumed
@@ -317,6 +331,19 @@ export interface ApprovalPressFacts {
   origin?: ApprovalPromptOrigin;
   /** A re-read taken now still shows an answerable prompt. */
   stillOnScreen?: boolean;
+  /**
+   * The LIVE mode of the task's one open owner workspace. Undefined when the
+   * task has no single open owner (none, or several) — never "fine".
+   */
+  ownerMode?: string;
+  /** The record's own risk flag (see ApprovalRequest.risk). */
+  risk?: 'critical';
+  /** How the record was tied to its pane (see ApprovalRequest.attribution). */
+  attribution?: 'exact' | 'inexact';
+  /** The caller declared the HQ lane; `laneOpen` is main's published policy,
+   *  re-read at release and matched against the caller's generation. */
+  lane?: 'hq';
+  laneOpen?: boolean;
 }
 
 /** Who is answering the prompt. */
@@ -333,7 +360,13 @@ export type ApprovalPressRefusal =
   | 'press-capability-off'
   | 'origin-unknown'
   | 'detector-only'
-  | 'prompt-gone';
+  | 'prompt-gone'
+  | 'owner-mode-unknown'
+  | 'owner-autonomy-off'
+  | 'owner-not-danger'
+  | 'critical-risk'
+  | 'attribution-inexact'
+  | 'hq-lane-closed';
 
 export type ApprovalPressDecision =
   | { press: true }
@@ -363,6 +396,14 @@ export function decideApprovalPress(facts: ApprovalPressFacts): ApprovalPressDec
   // Denying is the safe direction — it cancels the tool call and gives the turn
   // back. A refused deny would keep a pane blocked in the name of safety.
   if (facts.decision === 'deny') return { press: true };
+  // Critical first: whatever else is true of this pane, a machine never says
+  // yes to it, and the refusal must say so rather than name a policy the
+  // caller would escalate as a decision (the approval is already the human's).
+  if (facts.risk === 'critical') return { press: false, reason: 'critical-risk' };
+  // A record tied to its pane by a guess (workspace or cwd) may belong to an
+  // agent wmux did not launch.
+  if (facts.attribution !== 'exact') return { press: false, reason: 'attribution-inexact' };
+  if (facts.lane === 'hq' && facts.laneOpen !== true) return { press: false, reason: 'hq-lane-closed' };
   if (facts.scopeAvailable === false) return { press: false, reason: 'scope-unavailable' };
   if (facts.isTaskWorkspace === undefined) return { press: false, reason: 'workspace-unknown' };
   if (!facts.isTaskWorkspace) return { press: false, reason: 'not-a-task-workspace' };
@@ -379,6 +420,11 @@ export function decideApprovalPress(facts: ApprovalPressFacts): ApprovalPressDec
   if (!facts.approvalPress) return { press: false, reason: 'press-capability-off' };
   if (facts.origin === undefined) return { press: false, reason: 'origin-unknown' };
   if (facts.origin !== 'hook') return { press: false, reason: 'detector-only' };
+  // The owner's live word beats the task workspace's copy of it. Only `danger`
+  // means "nothing prompts", so only `danger` lets an automated approve through.
+  if (facts.ownerMode === undefined) return { press: false, reason: 'owner-mode-unknown' };
+  if (facts.ownerMode === 'off') return { press: false, reason: 'owner-autonomy-off' };
+  if (facts.ownerMode !== 'danger') return { press: false, reason: 'owner-not-danger' };
   if (facts.stillOnScreen !== true) return { press: false, reason: 'prompt-gone' };
   return { press: true };
 }

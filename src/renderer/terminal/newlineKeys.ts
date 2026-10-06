@@ -24,6 +24,8 @@
  *     is Escape + `[13;2u` to Claude Code inside wmux (TERM_PROGRAM=wmux is
  *     not on Claude's kitty whitelist), which is why Shift+Enter submitted
  *     after #1228 (#1152 follow-up). LF is the same byte Ctrl+J already sends.
+ *   - Native Windows Codex → Alt+Enter (`ESC CR`) for all three keys (see
+ *     `altEnterNewline`, #1694).
  *   - Ctrl+Enter → LF (`\n`): same intent as Ctrl+J. With no extended keyboard
  *     protocol enabled, xterm sends a bare CR for Ctrl+Enter — byte-identical
  *     to plain Enter — so an in-pane TUI submits instead of inserting a
@@ -88,6 +90,19 @@ export interface NewlineKeyOptions {
    * Defaults to `'lf'` (local pane). Remote/web pass `'xterm'`.
    */
   shiftEnterFallback?: ShiftEnterFallback;
+  /**
+   * The pane runs native Windows Codex (#1694). Shift+Enter, Ctrl+Enter and
+   * Ctrl+J all send Alt+Enter (`ESC CR`) instead of LF.
+   *
+   * The protocol flag cannot say this on Windows: every ConPTY session emits
+   * `?9001h` itself, so the fold ignores it there (#1363) and `win32Input`
+   * never arms. ConPTY turns a bare LF into Ctrl+Enter, which Codex does not
+   * take as a newline. Alt+Enter is the one chord measured to insert a
+   * newline in Codex on Windows (the #1694 report); a win32 Shift+Enter record
+   * may lose SHIFT inside ConPTY and submit (#1363). Set only through
+   * `wantsAltEnterNewline`.
+   */
+  altEnterNewline?: boolean;
 }
 
 /** Kitty CSI-u Shift+Enter. Only meaningful after the pane pushed kitty. */
@@ -112,6 +127,9 @@ export const SHIFT_ENTER_LF = '\n';
 export const SHIFT_ENTER_WIN32 =
   '\x1b[13;28;10;1;16;1_\x1b[13;28;0;0;16;1_';
 
+/** Alt+Enter as xterm encodes it. Native Windows Codex reads it as newline. */
+export const ALT_ENTER = '\x1b\r';
+
 /** xterm modifyOtherKeys mode 2: CSI 27 ; 2 ; 13 ~ */
 export const SHIFT_ENTER_MODIFY_OTHER_KEYS = '\x1b[27;2;13~';
 
@@ -133,6 +151,109 @@ export function encodeShiftEnter(
   if (fallback === 'csi-u') return SHIFT_ENTER_CSI_U;
   if (fallback === 'lf') return SHIFT_ENTER_LF;
   return null;
+}
+
+/** What `wantsAltEnterNewline` reads, per keystroke. */
+export interface AltEnterNewlineScope {
+  /** The pane's host OS (the daemon's in the browser build), null if unknown. */
+  hostPlatform: string | null | undefined;
+  /** The pane's shell enters WSL; undefined until the shell is known. */
+  isWsl: boolean | undefined;
+  /** The pane's detected agent. */
+  agentSlug: string | undefined;
+  /** The shell reported a prompt (OSC 133;A) since the last command start. */
+  atPrompt: boolean;
+  /**
+   * When a prompt last ended a running Codex (see `noteCodexEndedByPrompt`),
+   * or null. Cleared as soon as the slug stops being `codex`.
+   */
+  codexEndedAt?: number | null;
+  /** Clock for `codexEndedAt`; defaults to `Date.now()`. */
+  now?: number;
+}
+
+/**
+ * How long a prompt that ended Codex keeps the mapping off, even across a new
+ * command start. The slug is only dropped by a liveness snapshot, and the
+ * slowest of those is the 15 s `pty.list` poll; past that, a slug that is
+ * still `codex` belongs to a Codex that really is running again.
+ */
+export const CODEX_END_GRACE_MS = 16_000;
+
+/**
+ * Whether a pane gets `altEnterNewline` (#1694): Codex running natively on a
+ * Windows host, while its command is still running.
+ *
+ * - WSL: a Linux Codex behind wsl.exe reads VT bytes, not console key events,
+ *   so the old LF / negotiated encoding stays. A shell not yet known counts
+ *   as WSL — LF is the safe side.
+ * - `atPrompt`: the detected slug outlives Codex by up to one liveness poll,
+ *   so the prompt marker ends the mapping at once.
+ * - `codexEndedAt`: a command started inside that stale window (OSC 133;C)
+ *   must not re-arm it either, or that command gets Alt+Enter for Codex's
+ *   sake. The mapping stays off until the slug is dropped (the latch clears)
+ *   or `CODEX_END_GRACE_MS` has passed with the slug still `codex`.
+ */
+export function wantsAltEnterNewline(scope: AltEnterNewlineScope): boolean {
+  const endedRecently = scope.codexEndedAt != null
+    && (scope.now ?? Date.now()) - scope.codexEndedAt < CODEX_END_GRACE_MS;
+  return scope.hostPlatform === 'win32'
+    && scope.isWsl === false
+    && scope.agentSlug === 'codex'
+    && !scope.atPrompt
+    && !endedRecently;
+}
+
+/**
+ * Track when a prompt ended a running Codex. A prompt edge (not at a prompt →
+ * at a prompt) while the slug is `codex` stamps `now`; anything else keeps
+ * `prev`. The caller clears the stamp when the slug stops being `codex`.
+ */
+export function noteCodexEndedByPrompt(
+  prev: number | null,
+  wasAtPrompt: boolean,
+  atPrompt: boolean,
+  agentSlug: string | undefined,
+  now: number,
+): number | null {
+  return !wasAtPrompt && atPrompt && agentSlug === 'codex' ? now : prev;
+}
+
+const PROMPT_START_MARK = '\x1b]133;A';
+const COMMAND_START_MARK = '\x1b]133;C';
+// Every marker is ASCII, so a latin1 view of a byte chunk is exact for them.
+const latin1 = new TextDecoder('latin1');
+
+/**
+ * Fold one chunk of the pane's output into "is the shell at its prompt".
+ * The later of OSC 133;A (prompt) and 133;C (command started) wins; a chunk
+ * with neither keeps `prev`. Without shell integration the state never
+ * leaves `false`, and only the liveness edges end the mapping.
+ */
+export function foldAtPrompt(prev: boolean, bytes: string | Uint8Array): boolean {
+  const chunk = typeof bytes === 'string' ? bytes : latin1.decode(bytes);
+  const prompt = chunk.lastIndexOf(PROMPT_START_MARK);
+  const command = chunk.lastIndexOf(COMMAND_START_MARK);
+  if (prompt === -1 && command === -1) return prev;
+  return prompt > command;
+}
+
+/** Both markers are this long, so a shorter tail can never hold a whole one. */
+const MARK_TAIL = PROMPT_START_MARK.length - 1;
+
+/**
+ * `foldAtPrompt` across chunk boundaries. PTY output can split a marker
+ * between two data events, and neither half matches on its own. The caller
+ * keeps `tail` per pane: the last `MARK_TAIL` characters already scanned,
+ * which is too short to repeat a marker, so nothing is counted twice.
+ */
+export function foldAtPromptCarry(
+  prev: boolean,
+  tail: string,
+  bytes: string | Uint8Array,
+): { atPrompt: boolean; tail: string } {
+  const scan = tail + (typeof bytes === 'string' ? bytes : latin1.decode(bytes));
+  return { atPrompt: foldAtPrompt(prev, scan), tail: scan.slice(-MARK_TAIL) };
 }
 
 /** Enter / NumpadEnter, including an IME that mangled `key` to 'Process'. */
@@ -157,6 +278,7 @@ export function resolveNewlineKeyByte(
     !e.altKey &&
     !e.isComposing
   ) {
+    if (opts?.altEnterNewline) return ALT_ENTER;
     return encodeShiftEnter(opts?.protocol, opts?.shiftEnterFallback ?? 'lf');
   }
 
@@ -176,7 +298,7 @@ export function resolveNewlineKeyByte(
     !e.metaKey &&
     !e.isComposing
   ) {
-    return '\n';
+    return opts?.altEnterNewline ? ALT_ENTER : '\n';
   }
 
   // Ctrl+J → LF. Match the physical key so it survives a CJK IME where
@@ -202,7 +324,7 @@ export function resolveNewlineKeyByte(
     !e.altKey &&
     !e.metaKey
   ) {
-    return '\n';
+    return opts?.altEnterNewline ? ALT_ENTER : '\n';
   }
 
   return null;

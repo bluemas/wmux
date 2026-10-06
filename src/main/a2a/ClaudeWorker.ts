@@ -3,6 +3,7 @@ import type { BrowserWindow } from 'electron';
 import { getAccountStore } from '../account/accountStore';
 import { sendToRenderer } from '../pipe/handlers/_bridge';
 import type { CompletionEvidence } from '../../shared/types';
+import { recordTaskState, stateOfTask } from '../workLink/a2aProducer';
 
 type GetWindow = () => BrowserWindow | null;
 
@@ -436,8 +437,12 @@ export class ClaudeWorker {
         console.warn(`[ClaudeWorker] daemon transition unavailable for ${taskId}:`, err);
       }
     }
+    // Work link (best-effort): this path skips the a2a.rpc handlers, so it
+    // records the state itself, and only a committed one: the daemon's, or
+    // the requested one once the renderer's fallback accepted it.
+    if (committedTask) void recordTaskState(taskId, stateOfTask(committedTask), undefined, committedTask);
     try {
-      await sendToRenderer(this.getWindow, 'a2a.task.update', {
+      const res = await sendToRenderer(this.getWindow, 'a2a.task.update', {
         taskId,
         workspaceId,
         status,
@@ -447,6 +452,9 @@ export class ClaudeWorker {
           ? { daemonCommitted: true, committedTask }
           : {}),
       });
+      if (!committedTask && res && typeof res === 'object' && (res as { ok?: unknown }).ok === true) {
+        void recordTaskState(taskId, status, undefined, { status: { state: status, message, evidence } });
+      }
     } catch (err) {
       console.error(`[ClaudeWorker] Failed to update task ${taskId}:`, err);
     }

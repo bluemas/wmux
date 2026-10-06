@@ -593,6 +593,10 @@ export class DaemonClient extends EventEmitter {
     /** #1680 — the pane's CURRENT agent has delivered a hook (reset when that
      *  agent ends). Absent on an older daemon. */
     hookReports?: boolean;
+    /** The composer holds a typed but unsubmitted draft. Absent on an older daemon. */
+    hasDraft?: boolean;
+    /** Milliseconds since the last key input. Absent on an older daemon. */
+    keyInputIdleMs?: number;
   } | null> {
     try {
       const result = await (opts.timeoutMs !== undefined
@@ -607,6 +611,8 @@ export class DaemonClient extends EventEmitter {
         keyInputRevision?: unknown;
         keyInputQuiet?: unknown;
         hookReports?: unknown;
+        hasDraft?: unknown;
+        keyInputIdleMs?: unknown;
       };
       const validStatuses: AgentStatus[] = [
         'running',
@@ -642,6 +648,10 @@ export class DaemonClient extends EventEmitter {
           : {}),
         ...(typeof result.keyInputQuiet === 'boolean' ? { keyInputQuiet: result.keyInputQuiet } : {}),
         ...(typeof result.hookReports === 'boolean' ? { hookReports: result.hookReports } : {}),
+        ...(typeof result.hasDraft === 'boolean' ? { hasDraft: result.hasDraft } : {}),
+        ...(typeof result.keyInputIdleMs === 'number' && Number.isFinite(result.keyInputIdleMs) && result.keyInputIdleMs >= 0
+          ? { keyInputIdleMs: result.keyInputIdleMs }
+          : {}),
       };
     } catch {
       return null;
@@ -902,6 +912,13 @@ export class DaemonClient extends EventEmitter {
           this.emit('usageLimit:changed', { sessionId: event.sessionId, limit: data?.limit ?? null });
           break;
         }
+        case 'input.typed':
+          this.emit('session:input', { sessionId: event.sessionId });
+          break;
+        case 'approvals.changed':
+          // A re-list nudge (no record data) for the HQ approval lane.
+          this.emit('approvals:changed');
+          break;
         case 'activity.idle': {
           // #1463 — a daemon that knows the silence came before any turn says so.
           const preTurn = (event.data as { preTurn?: unknown } | null)?.preTurn === true;
@@ -931,6 +948,14 @@ export class DaemonClient extends EventEmitter {
             sessionId: event.sessionId,
             slug: data?.slug ?? null,
           });
+          break;
+        }
+        case 'agent.transcriptActivity': {
+          // The last tool of an agent with no per-tool hook, from its transcript.
+          const data = event.data as { activity?: unknown } | null;
+          if (typeof data?.activity === 'string') {
+            this.emit('session:transcriptActivity', { sessionId: event.sessionId, activity: data.activity });
+          }
           break;
         }
         case 'prompt.event':

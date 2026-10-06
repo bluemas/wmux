@@ -146,4 +146,66 @@ describe('A2A delivery approval gate', () => {
     expect(result.delivery).toMatchObject({ notified: true });
     expect(writesToTarget().join('')).toContain(BODY);
   });
+
+  describe('a Git page hand-off (operator, gated, reference delivery)', () => {
+    const REF = '[wmux] Issue o/r#12: "Crash" — https://github.com/o/r/issues/12\nRead it with: gh issue view 12 --repo o/r';
+    const handoff = (extra: Record<string, unknown> = {}) => send({
+      message: REF, operatorOrigin: true, gatedDelivery: true, referenceDelivery: true, ...extra,
+    });
+
+    it('a live agent gets the fixed reference itself, through the gate, held for typing, checked against that agent and main\'s deadline', async () => {
+      gateRefusal = null;
+      useStore.getState().hydrateAgentAlive({ [PTY]: true });
+      const result = await handoff({ deliveryDeadlineAt: 123_456 });
+      expect(result.delivery).toMatchObject({ notified: true });
+      expect(gate).toHaveBeenCalledWith(PTY, expect.any(String), 'Claude Code', expect.objectContaining({
+        newTask: true, waitQuiet: true, expectAgent: 'Claude Code', deadlineAt: 123_456,
+      }));
+      const pasted = gate.mock.calls[0][1] as string;
+      expect(pasted).toContain('[wmux] Issue o/r#12');
+      expect(pasted).toContain('gh issue view 12 --repo o/r');
+      expect(pasted).not.toContain('a2a_task_query');
+    });
+
+    it('without operator origin the flag is ignored: a live agent gets the nudge', async () => {
+      gateRefusal = null;
+      useStore.getState().hydrateAgentAlive({ [PTY]: true });
+      await handoff({ operatorOrigin: undefined });
+      expect(gate.mock.calls[0][1]).toContain('a2a_task_query');
+    });
+
+    it.each(['idle', 'complete'] as const)('an agent %s at its prompt is live: the reference goes through the gate', async (status) => {
+      gateRefusal = null;
+      // A fresh agent at its first prompt reads idle; one whose turn ended, complete.
+      useStore.getState().setSurfaceAgent(PTY, 'Claude Code', status, 'claude');
+      const result = await handoff();
+      expect(result.delivery).toMatchObject({ notified: true });
+      expect(gate.mock.calls[0][1]).toContain('[wmux] Issue o/r#12');
+    });
+
+    it('a pane whose agent is known gone counts as none: nothing written, no loud paste', async () => {
+      gateRefusal = null;
+      useStore.getState().hydrateAgentAlive({ [PTY]: false });
+      const result = await handoff();
+      expect(gate).not.toHaveBeenCalled();
+      expect(writesToTarget()).toEqual([]);
+      expect(result.delivery).toMatchObject({ notified: false, reason: 'no_agent_pane' });
+    });
+
+    it('main refusing because the agent changed is reported as not delivered, with its hint', async () => {
+      useStore.getState().hydrateAgentAlive({ [PTY]: true });
+      gateRefusal = { ok: false, reason: 'agent_changed', detail: 'delivery: the agent the hand-off was aimed at is no longer in the pane' };
+      const result = await handoff();
+      expect(result.delivery).toMatchObject({ notified: false, reason: 'agent_changed' });
+      expect(String(result.delivery?.hint)).toMatch(/left the target pane or was replaced/);
+    });
+
+    it('a pane with no agent gets nothing written', async () => {
+      gateRefusal = null;
+      useStore.getState().clearSurfaceAgent(PTY);
+      const result = await handoff();
+      expect(writesToTarget()).toEqual([]);
+      expect(result.delivery).toMatchObject({ notified: false, reason: 'no_agent_pane' });
+    });
+  });
 });

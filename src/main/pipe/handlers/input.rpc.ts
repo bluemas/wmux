@@ -1,5 +1,15 @@
 import type { BrowserWindow } from 'electron';
+import { getDeliveryCheck } from '../deliveryGuards';
+import { refuseHandoffMarker } from '../handoffMarkerTripwire';
 import { usageLimitHoldDetail } from '../../usageLimit/paneUsageLimits';
+import {
+  DELIVERY_RESERVE_MS,
+  QUIET_INPUT_WAIT_MS,
+  agentIdentityHolds,
+  quietWaitBudget,
+  typedPastOwnInput,
+  waitForQuietAgent,
+} from './quietInput';
 import type { RpcRouter } from '../RpcRouter';
 import { isHostedCaller, type RpcContext } from '../../../shared/rpc';
 import type { PTYManager } from '../../pty/PTYManager';
@@ -795,6 +805,40 @@ export async function deliveryGateCheck(
 }
 
 /**
+ * Extra checks for a delivery that must not land in the wrong place (the Git
+ * page's hand-off): run right before the paste and right before the Enter,
+ * inside the pane lock. A refusal before the Enter clears what was pasted.
+ */
+export interface DeliveryGuard {
+  /** Passing also records the key count the paste will bring the pane to. */
+  beforePaste: () => Promise<GatedSubmitRefusal | null>;
+  beforeEnter: () => Promise<GatedSubmitRefusal | null>;
+}
+
+/**
+ * Add the check main registered for this delivery (deliveryGuards.ts) after
+ * the hand-off guard's own, at both points. A key with no check refuses.
+ */
+export function withRegisteredCheck(guard: DeliveryGuard, key: string | undefined): DeliveryGuard {
+  if (!key) return guard;
+  const run = async (at: 'beforePaste' | 'beforeEnter'): Promise<GatedSubmitRefusal | null> => {
+    const check = getDeliveryCheck(key);
+    if (!check) return { ok: false, reason: 'guard_refused', detail: 'delivery: the check this delivery asked for is gone' };
+    let why: string | null;
+    try {
+      why = await check[at]();
+    } catch (err) {
+      why = err instanceof Error ? err.message : String(err);
+    }
+    return why ? { ok: false, reason: 'guard_refused', detail: `delivery: ${why}` } : null;
+  };
+  return {
+    beforePaste: async () => (await guard.beforePaste()) ?? run('beforePaste'),
+    beforeEnter: async () => (await guard.beforeEnter()) ?? run('beforeEnter'),
+  };
+}
+
+/**
  * Paste `text` into `ptyId` and submit it, gated as one operation in main. The
  * gate runs before the paste AND again right before the Enter, because the
  * Enter follows the paste after an agent-specific delay and a dialog drawn in
@@ -816,6 +860,7 @@ export async function gatedPasteSubmit(
    * paste: the step takes seconds, and a dialog can open meanwhile.
    */
   freshContext?: () => Promise<FreshContextReply>,
+  guard?: DeliveryGuard,
 ): Promise<GatedSubmitResult> {
   const before = await deliveryGateCheck(gate, ptyId);
   if (before) return before;
@@ -838,6 +883,8 @@ export async function gatedPasteSubmit(
         : afterStep;
     }
   }
+  const atPaste = guard ? await guard.beforePaste() : null;
+  if (atPaste) return atPaste;
   try {
     write(ptyId, formatBracketedPastePayload(text));
   } catch (err) {
@@ -846,6 +893,19 @@ export async function gatedPasteSubmit(
   await sleep(submitProfileForAgent(agent).submitDelayMs);
   const atEnter = await deliveryGateCheck(gate, ptyId);
   if (atEnter) return { ...atEnter, pasted: true };
+  const guardAtEnter = guard ? await guard.beforeEnter() : null;
+  if (guardAtEnter) {
+    // Not submitted; take the text back out (Ctrl+U empties an agent's
+    // composer or a shell's line — best effort, reported as such).
+    let cleared = false;
+    try {
+      write(ptyId, '\x15');
+      cleared = true;
+    } catch {
+      /* the pane went away */
+    }
+    return { ...guardAtEnter, pasted: true, cleared };
+  }
   try {
     write(ptyId, isMultilinePtyPayload(text) ? '\r\r' : '\r');
   } catch (err) {
@@ -894,6 +954,8 @@ export interface InputRpcDeps {
   readScreenText?: (ptyId: string) => Promise<string | null>;
   /** Injected in tests; the gated submit's wait between paste and Enter. */
   sleep?: (ms: number) => Promise<void>;
+  /** Injected in tests; the hand-off guard's clock. */
+  now?: () => number;
   /** The latest SessionStart hook main received for a pane: the evidence a
    *  fresh-context step waits for (#1680). */
   readSessionStart?: (ptyId: string) => SessionStartReceipt | undefined;
@@ -1072,6 +1134,12 @@ export function registerInputRpc(
       throw new Error('input.send: text exceeds 100KB limit');
     }
 
+    // Tripwire: the hand-off provenance line is written only by main's operator
+    // lane (moaHandoff.ts). A label, not an authentication boundary. Checked on
+    // the text as given and again on what is actually written (below).
+    const marked = refuseHandoffMarker('input.send', text, ctx);
+    if (marked) throw new Error(marked.error);
+
     const callerWs = typeof params['workspaceId'] === 'string' ? params['workspaceId'] : undefined;
 
     // #1680 — the caller says this text starts a NEW task, so a pane whose role
@@ -1200,6 +1268,9 @@ export function registerInputRpc(
     // ran a shell command and then an empty line.
     const submitRequested = params['submit'] === true;
     const bodyText = submitRequested ? stripTrailingEnter(safeText) : safeText;
+    // Again on exactly what is written (after sanitizing and any rewrite).
+    const markedAfter = refuseHandoffMarker('input.send', bodyText, ctx);
+    if (markedAfter) throw new Error(markedAfter.error);
     // Resolve the receipt workspace BEFORE the first write so its round-trip
     // never lands inside the text→Enter gap the delay below protects (nor
     // between a fresh-context command and the text). On the owner lane the pane
@@ -1560,10 +1631,76 @@ export function registerInputRpc(
     if (!dc?.isConnected) throw new Error(`delivery: PTY not found — id="${ptyId}"`);
     dc.writeToSession(ptyId, data);
   };
+  /**
+   * The hand-off's wait and guard. A pane whose agent main cannot read (a
+   * local pty, no daemon) is refused: its agent cannot be verified. The wait
+   * is bounded by what the deadline leaves after the rest of the delivery.
+   */
+  const prepareHandoffGuard = async (
+    ptyId: string,
+    opts: GatedSubmitOptions,
+  ): Promise<{ ok: true; guard: DeliveryGuard; noteOwnWrite: () => void } | { ok: false; refusal: GatedSubmitRefusal }> => {
+    const refusal = (reason: GatedSubmitRefusal['reason'], detail: string) => ({ ok: false as const, refusal: { ok: false as const, reason, detail } });
+    const dc = ptyManager.get(ptyId) ? null : getDaemonClient?.();
+    if (!dc?.isConnected) return refusal('agent_unverified', "delivery: the target pane's agent cannot be verified (no daemon state)");
+    const now = deps.now ?? Date.now;
+    const deadlineAt = typeof opts.deadlineAt === 'number' ? opts.deadlineAt : now() + QUIET_INPUT_WAIT_MS + DELIVERY_RESERVE_MS;
+    const read = () => dc.getAgentState(ptyId, { timeoutMs: 1_000 });
+    const waited = await waitForQuietAgent(read, {
+      ...(opts.expectAgent ? { expectAgent: opts.expectAgent } : {}),
+      waitMs: quietWaitBudget(deadlineAt, now()),
+      ...(deps.sleep ? { sleep: deps.sleep } : {}),
+      now,
+    });
+    if (!waited.ok) return refusal(waited.reason, waited.detail);
+    const { baseline } = waited;
+    const pastDeadline = (): GatedSubmitRefusal | null =>
+      now() > deadlineAt ? { ok: false, reason: 'deadline', detail: 'delivery: the hand-off ran past its deadline' } : null;
+    /** The key count our own writes account for: the count at the quiet read,
+     *  plus one per write of ours since (a fresh-context command, the paste). */
+    let expectedRevision = waited.keyInputRevision;
+    const check = async (atEnter: boolean): Promise<GatedSubmitRefusal | null> => {
+      const late = pastDeadline();
+      if (late) return late;
+      const s = await read().catch(() => null);
+      if (!s) return { ok: false, reason: 'agent_unverified', detail: "delivery: the target pane's agent could not be read" };
+      if (!agentIdentityHolds(baseline, s)) {
+        return { ok: false, reason: 'agent_changed', detail: 'delivery: the agent the hand-off was aimed at is no longer in the pane' };
+      }
+      // Before the paste a draft is the person's; before the Enter it is ours.
+      const typing = (!atEnter && s.hasDraft === true) || typedPastOwnInput(s, expectedRevision);
+      if (typing) return { ok: false, reason: 'user_typing', detail: 'delivery: someone typed in the target pane' };
+      // The paste follows at once and is one write: one key on the counter.
+      if (!atEnter && expectedRevision !== undefined) expectedRevision += 1;
+      return null;
+    };
+    return {
+      ok: true,
+      guard: {
+        beforePaste: () => check(false),
+        beforeEnter: () => check(true),
+      },
+      noteOwnWrite: () => {
+        if (expectedRevision !== undefined) expectedRevision += 1;
+      },
+    };
+  };
+
   return {
     deliveryGate: (ptyId) => deliveryGateCheck(approvalGate, ptyId),
-    gatedSubmit: (ptyId, text, agent, opts) => {
-      if (!opts?.newTask) return gatedPasteSubmit(approvalGate, writeToPty, ptyId, text, agent, deps.sleep);
+    gatedSubmit: async (ptyId, text, agent, opts) => {
+      // The Git page's hand-off: hold the paste while the person is typing in
+      // that pane, and check right before the paste and the Enter that the
+      // agent they chose is still the one there.
+      let guard: DeliveryGuard | undefined;
+      let noteOwnWrite = (): void => undefined;
+      if (opts?.waitQuiet) {
+        const prepared = await prepareHandoffGuard(ptyId, opts);
+        if (!prepared.ok) return prepared.refusal;
+        guard = withRegisteredCheck(prepared.guard, opts.guardKey);
+        noteOwnWrite = prepared.noteOwnWrite;
+      }
+      if (!opts?.newTask) return gatedPasteSubmit(approvalGate, writeToPty, ptyId, text, agent, deps.sleep, undefined, guard);
       // #1680 — a new task: the fresh-context step runs inside the gated
       // delivery, and the pane is held through the text's Enter. The pane's
       // conversation is kept when the renderer knows of other open tasks on it,
@@ -1580,10 +1717,16 @@ export function registerInputRpc(
               ptyId,
               await bindingFor(ptyId),
               workspaceId,
-              (data) => writeToPty(ptyId, data),
+              // The step's own keys (its command, Enter or erase) are not the
+              // person typing: the guard counts each, one key apiece, as the
+              // step itself verifies.
+              (data) => {
+                writeToPty(ptyId, data);
+                noteOwnWrite();
+              },
               keepContext,
             );
-          }),
+          }, guard),
         deps.freshContextLockWaitMs,
       ).catch((err: unknown): GatedSubmitResult => {
         if (!(err instanceof FreshContextBusy)) throw err;

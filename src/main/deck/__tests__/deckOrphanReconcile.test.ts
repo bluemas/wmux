@@ -36,6 +36,7 @@ import {
   saveDeckSchedules,
   loadDeckSchedules,
 } from '../deckScheduleStore';
+import { setHqWorkspaceId, getDeckHqPath, __resetHqMemoryForTest } from '../deckHqStore';
 import {
   getWorkspaceMirror,
   __resetWorkspaceMirrorForTest,
@@ -55,6 +56,13 @@ afterEach(() => {
 });
 
 describe('deckOrphanReconcile', () => {
+  it('never treats Moa\'s "Remember this?" card key as a workspace', async () => {
+    await raiseDecision('_moa-memory', { question: 'Remember this?', options: ['Save', 'Discard'] }, dir);
+    expect(collectDeckWorkspaceIds(dir).has('_moa-memory')).toBe(false);
+    await reconcileOrphanDeckState(['ws-live'], { dir });
+    expect(loadWorkspaceDecision('_moa-memory', dir)).not.toBeNull();
+  });
+
   it('reconciles three orphan ids and one live id across all six files -> only live id remains, archive holds orphan work', async () => {
     // 3 orphans: 'ws-orphan1', 'ws-orphan2', 'ws-orphan3'
     // 1 live: 'ws-live'
@@ -360,5 +368,37 @@ describe('deckOrphanReconcile', () => {
     });
     await tryStartupDeckReconcile({ dir });
     expect(loadActiveDeckWork('ws-real', dir)).not.toBeNull();
+  });
+});
+
+describe('deckOrphanReconcile — the HQ workspace', () => {
+  it('sweeps nothing while deck-hq.json is unreadable (the HQ is unknown)', async () => {
+    __resetHqMemoryForTest();
+    await setWorkspaceMode('ws-gone', 'danger', dir);
+    fs.writeFileSync(getDeckHqPath(dir), '{ torn');
+    const report = await reconcileOrphanDeckState(['ws-live'], { dir, log: () => undefined });
+    expect(report.tornDown).toEqual([]);
+    expect(report.skipped).toMatch(/unreadable/);
+    expect(collectDeckWorkspaceIds(dir).has('ws-gone')).toBe(true);
+  });
+
+  it('never sweeps the HQ, even when its workspace is gone', async () => {
+    await setHqWorkspaceId('ws-hq', dir);
+    beginOrContinueDeckWork('ws-hq', 'hq work', dir);
+    await setWorkspaceMode('ws-hq', 'danger', dir);
+    await raiseDecision('ws-hq', { question: 'q', options: [], context: '' }, dir);
+    await setWorkspaceMode('ws-gone', 'danger', dir);
+
+    const lines: string[] = [];
+    const report = await reconcileOrphanDeckState(['ws-live'], { dir, log: (l) => lines.push(l) });
+
+    expect(report.orphans).toEqual(['ws-gone', 'ws-hq']);
+    expect(report.tornDown).toEqual(['ws-gone']);
+    expect(report.skippedIds).toEqual(['ws-hq']);
+    expect(lines.join(' ')).toMatch(/skipping orphan ws-hq: it is the HQ workspace/);
+    expect(loadActiveDeckWork('ws-hq', dir)).not.toBeNull();
+    expect(loadArchivedDeckWorks(dir)).toEqual([]);
+    expect(loadWorkspaceDecision('ws-hq', dir)).not.toBeNull();
+    expect(collectDeckWorkspaceIds(dir)).toEqual(new Set(['ws-hq']));
   });
 });

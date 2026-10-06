@@ -464,6 +464,17 @@ export function renderStrandedDeckWorkBlock(work: ActiveDeckWork): string {
   return lines.join('\n');
 }
 
+/** What the operator reads for a decision's context. Main raises some
+ *  decisions with a brain block as the context ([active-work], [dropped-work]):
+ *  the brain needs its ids and rules, but shown verbatim the operator reads
+ *  instructions meant for Moa. Such a context is reduced to the request it is
+ *  about; any other context is the brain's own prose and passes through. */
+export function operatorDecisionContext(context: string): string {
+  if (!/^\[(?:active-work(?: PARKED)?|dropped-work)\] id: /.test(context)) return context;
+  const objective = /^objective: (.*)$/m.exec(context)?.[1]?.trim();
+  return objective ? `Earlier request: "${objective}"` : '';
+}
+
 /** Trusted runtime context. The objective/follow-ups originated from the human;
  * A2A rows are pointers only and carry no worker-authored body text. */
 export function renderActiveDeckWorkBlock(work: ActiveDeckWork): string {
@@ -506,8 +517,10 @@ export function renderActiveDeckWorkBlock(work: ActiveDeckWork): string {
     'Continue delegating, unblock workers, inspect artifacts, and run or delegate independent verification.',
     'Only after every required pane/A2A task is complete and the acceptance checks pass, call',
     'deck_complete_work({summary, verification}). The server rejects finalization while tracked work is outstanding.',
-    'Do not tell the operator the work is done unless that tool call succeeds. If blocked on a real human fork,',
-    'use deck_ask_decision and leave this work active.',
+    'Do not tell the operator the work is done unless that tool call succeeds; that one final report is all they',
+    'hear, so no progress reports. Settle forks yourself (lookups first, then production impact). Use',
+    'deck_ask_decision only for taste, a release, an irreversible outside action, a security-boundary change or',
+    'ambiguous operator intent, with your recommended option first, and leave this work active.',
   );
   return lines.join('\n');
 }

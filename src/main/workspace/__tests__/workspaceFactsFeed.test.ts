@@ -149,3 +149,109 @@ describe('createWorkspaceFactsPublisher', () => {
     p.dispose();
   });
 });
+
+describe('buildWorkspaceFacts — the owner live mode (C2 v2)', () => {
+  const owned = (rows: { taskWorkspaceId: string; ownerWorkspaceId: string }[]) =>
+    () => ({ list: () => rows }) as unknown as TaskLedger;
+
+  it("publishes the single open owner's CURRENT mode, and follows it when it changes", () => {
+    const modes: Record<string, { mode: string; approvalPress: boolean }> = {
+      'ws-own': { mode: 'danger', approvalPress: true },
+      'ws-task': { mode: 'danger', approvalPress: true },
+    };
+    const build = () =>
+      buildWorkspaceFacts({
+        push: async () => undefined,
+        ledger: owned([{ taskWorkspaceId: 'ws-task', ownerWorkspaceId: 'ws-own' }]),
+        autonomy: () => modes as never,
+      }).find((r) => r.workspaceId === 'ws-task');
+    expect(build()).toMatchObject({ ownerMode: 'danger' });
+    modes['ws-own'] = { mode: 'assist', approvalPress: false };
+    expect(build()).toMatchObject({ ownerMode: 'assist', autonomyMode: 'danger' });
+  });
+
+  it('publishes no owner mode when several open tasks name different owners', () => {
+    const rows = buildWorkspaceFacts({
+      push: async () => undefined,
+      ledger: owned([
+        { taskWorkspaceId: 'ws-task', ownerWorkspaceId: 'ws-a' },
+        { taskWorkspaceId: 'ws-task', ownerWorkspaceId: 'ws-b' },
+      ]),
+      autonomy: () => ({ 'ws-a': { mode: 'danger' }, 'ws-b': { mode: 'danger' } }),
+    });
+    expect(rows.find((r) => r.workspaceId === 'ws-task')).not.toHaveProperty('ownerMode');
+  });
+
+  it('reads an owner with no autonomy entry as off', () => {
+    const rows = buildWorkspaceFacts({
+      push: async () => undefined,
+      ledger: owned([{ taskWorkspaceId: 'ws-task', ownerWorkspaceId: 'ws-own' }]),
+      autonomy: () => ({}),
+    });
+    expect(rows.find((r) => r.workspaceId === 'ws-task')).toMatchObject({ ownerMode: 'off' });
+  });
+});
+
+describe('createWorkspaceFactsPublisher — acknowledgement and the HQ lane (#1767 review)', () => {
+  const base = { ledger: fakeLedger([]), autonomy: () => ({}) };
+
+  it('reads unsettled while a push is on the wire (real delay), settled once the daemon acks it', async () => {
+    let release!: () => void;
+    const pub = createWorkspaceFactsPublisher({
+      ...base,
+      push: () => new Promise<void>((resolve) => { release = resolve; }),
+    });
+    expect(pub.settled()).toBe(true);
+    const pushing = pub.publishNow();
+    expect(pub.settled()).toBe(false);
+    release();
+    await pushing;
+    expect(pub.settled()).toBe(true);
+    expect(pub.ackedSeq()).toBe(1);
+  });
+
+  it('stays unsettled after a failed push, until a later push lands', async () => {
+    let fail = true;
+    const pub = createWorkspaceFactsPublisher({
+      ...base,
+      push: async () => { if (fail) throw new Error('daemon gone'); },
+    });
+    await pub.publishNow();
+    expect(pub.settled()).toBe(false);
+    expect(pub.ackedSeq()).toBe(0);
+    fail = false;
+    await pub.publishNow();
+    expect(pub.settled()).toBe(true);
+  });
+
+  it('reads unsettled while a change is only debounced', () => {
+    vi.useFakeTimers();
+    const pub = createWorkspaceFactsPublisher({ ...base, push: async () => undefined });
+    pub.schedule();
+    expect(pub.settled()).toBe(false);
+    pub.dispose();
+  });
+
+  it('sends the lane policy and moves its generation only when the policy changes', async () => {
+    const sent: Array<{ open: boolean; generation: number }> = [];
+    let policy = { open: true, hq: 'ws-hq' as string | null };
+    const pub = createWorkspaceFactsPublisher({
+      ...base,
+      lanePolicy: () => policy,
+      push: async (_rows, _seq, lane) => { sent.push(lane); },
+    });
+    await pub.publishNow();
+    pub.publishIfLaneChanged(); // unchanged: no push
+    await pub.publishNow();
+    policy = { open: false, hq: 'ws-hq' };
+    pub.publishIfLaneChanged();
+    await Promise.resolve();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sent).toEqual([
+      { open: true, generation: 1 },
+      { open: true, generation: 1 },
+      { open: false, generation: 2 },
+    ]);
+    expect(pub.ackedLaneGeneration()).toBe(2);
+  });
+});

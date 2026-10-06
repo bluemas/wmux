@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef, useCallback, lazy, Suspense } from 'react';
+import { useEffect, useState, useRef, useCallback, useSyncExternalStore, lazy, Suspense } from 'react';
 import { isBrowserBackend } from '../../../shared/browserBackend';
 import { deliverChatDrop } from '../Chat/chatAttachments';
 import type { AgentSlug } from '../../../shared/events';
@@ -7,13 +7,16 @@ import { useStore } from '../../stores';
 import { useT } from '../../hooks/useT';
 import Sidebar from '../Sidebar/Sidebar';
 import MiniSidebar from '../Sidebar/MiniSidebar';
+import { SidebarSlot } from './SidebarSlot';
 import { WorkspaceCenter } from './WorkspaceCenter';
 import { EmptyLeafFunnel } from './EmptyLeafFunnel';
 import { selectProjectCwdSignature } from '../../stores/selectors/appLayout';
 import { selectInboxOwnsApprovals } from '../../stores/selectors/approvalInbox';
 import { shouldShowInstallError, shouldReannounceAfterError, isSmartAppControlHold, truncateReason } from './updateNoticePolicy';
 import { isInstallBlockedByWindowsReason } from '../../../shared/installAbortReasons';
-import { hooksLaunchCheck, shouldShowAutoUpdatePrompt, shouldShowCheatSheet, shouldStartOnboarding } from './firstBootSequence';
+import { hooksLaunchCheck, nextFirstBootSurface } from './firstBootSequence';
+import { markPrWakeNoticeSeen, prWakeNoticePending, showPrWakeNoticeOnce } from '../../hooks/prWakeNotice';
+import { openModalLayerCount, subscribeModalLayers } from '../ui/modalLayer';
 import { registerSessionSaver, saveSessionNow } from '../../utils/sessionSaveBridge';
 import { resolveReconcileRebind } from '../../hooks/resolveReconcileRebind';
 import { getLeafPanes, getWorkspaceLeafPanes } from '../../../shared/paneUtils';
@@ -39,10 +42,12 @@ import OnboardingOverlay from '../Onboarding/OnboardingOverlay';
 import FirstRunWizard from '../FirstRunWizard';
 import KeyboardCheatSheet from '../KeyboardCheatSheet';
 import ToastContainer from '../Toast/ToastContainer';
+import MoaHqMissingNotice from '../Moa/MoaHqMissingNotice';
 import { HooksInstallPromptContainer } from '../Deck/HooksInstallPrompt';
 import FloatingPane from '../Terminal/FloatingPane';
 import SearchResultsPanel from '../Search/SearchResultsPanel';
 import ChannelDock from '../Channels/ChannelDock';
+import { useDockMode } from './dockLayout';
 import { ErrorBoundary } from '../ErrorBoundary';
 import { useKeyboard } from '../../hooks/useKeyboard';
 import { FocusManager } from './LayoutLogicMounts';
@@ -52,11 +57,14 @@ import { useNotificationListener } from '../../hooks/useNotificationListener';
 import { useRpcBridge } from '../../hooks/useRpcBridge';
 import { useCloseTabOnShellExit } from '../../hooks/useCloseTabOnShellExit';
 import AgentMentionPicker from '../Palette/AgentMentionPicker';
+import HandoffPopover from '../Git/HandoffPopover';
 import { useWorkspaceMirrorPush } from '../../hooks/useWorkspaceMirrorPush';
+import { useMoaSync } from '../../hooks/useMoaSync';
 import { useResizeGuard } from '../../hooks/useResizeGuard';
 import { useApprovalInboxBridge } from '../../hooks/useApprovalInboxBridge';
 import { useBrowserHelpBridge } from '../../hooks/useBrowserHelpBridge';
 import { useUsageLimitBridge } from '../../hooks/useUsageLimitBridge';
+import { useWorkspaceSettleBridge } from '../../hooks/useWorkspaceSettleBridge';
 import { useRemoteInboxBridge } from '../../hooks/useRemoteInboxBridge';
 import { useRemoteAttachmentsLifecycle } from '../../hooks/useRemoteAttachmentsLifecycle';
 import { useDeckStream } from '../../hooks/useDeckStream';
@@ -93,6 +101,8 @@ import {
 } from '../../../shared/ptyRecovery';
 import { isChatV2Covering } from '../ChatV2/coverage';
 import { overlayColors } from '../../utils/titlebarOverlay';
+import { dockShownOn } from './pagesBesideDock';
+import { selectDockOpen, selectMoaOn, useMoaDockGate } from './moaDockGate';
 
 interface ReconcilePtySession extends DeadPaneSessionSnapshot {
   id: string;
@@ -736,8 +746,34 @@ export default function AppLayout() {
   // theme (overlay colors) does — see useUiScaleSync below.
   useUiScaleSync(uiScale);
   const sidebarVisible = useStore((s) => s.sidebarVisible);
-  const channelDockVisible = useStore((s) => s.channelDockVisible);
+  // The right panel renders only while Moa is on (moaDockGate); with Moa off
+  // the persisted open flag is kept but nothing is drawn.
+  const dockOpen = useStore(selectDockOpen);
+  useMoaDockGate();
   const sidebarPosition = useStore((s) => s.sidebarPosition);
+  // The dock never pushes the sheet past the window: when inline would leave
+  // the panes under their floor, it collapses and reopens as an overlay
+  // (dockLayout.ts). Re-opened when the window is wide enough again, if it
+  // was open when it collapsed.
+  const sidebarWidth = useStore((s) => s.sidebarWidth);
+  const sidebarWidthPx = sidebarVisible ? sidebarWidth : 0;
+  const [dockMode, shellRef] = useDockMode(sidebarWidthPx);
+  const dockAutoCollapsed = useRef(false);
+  useEffect(() => {
+    const st = useStore.getState();
+    // With Moa off there is no panel to collapse or restore: leave its flag,
+    // and forget a collapse from before, so it cannot reopen the panel later.
+    if (!selectMoaOn(st)) { dockAutoCollapsed.current = false; return; }
+    if (dockMode === 'overlay' && st.channelDockVisible) {
+      dockAutoCollapsed.current = true;
+      st.setChannelDockVisible(false);
+    } else if (dockMode === 'inline' && dockAutoCollapsed.current) {
+      dockAutoCollapsed.current = false;
+      if (!st.channelDockVisible) st.setChannelDockVisible(true);
+    }
+    // Only a mode change collapses or restores; opening the overlay later
+    // must not be undone.
+  }, [dockMode]);
   const fileTreeVisible = useStore((s) => s.fileTreeVisible);
   const companyViewVisible = useStore((s) => s.companyViewVisible);
   const setCompanyViewVisible = useStore((s) => s.setCompanyViewVisible);
@@ -750,7 +786,6 @@ export default function AppLayout() {
   // stores/selectors/appLayout.ts) that don't change on churn or switch.
   const hasActiveWorkspace = useStore((s) => s.workspaces.some((w) => w.id === s.activeWorkspaceId));
   const projectCwdSignature = useStore(selectProjectCwdSignature);
-  const workspaceCount = useStore((s) => s.workspaces.length);
   // Fix 0 startup gate. See state machine diagram at top of file.
   const paneGate = useStore((s) => s.paneGate);
   const setPaneGate = useStore((s) => s.setPaneGate);
@@ -789,16 +824,11 @@ export default function AppLayout() {
 
   // ─── First-run wizard + cheat sheet (T8a) ───────────────────────────────
   // Local visibility state for the wizard (null = hidden, otherwise mode).
-  // The cheat sheet visibility is derived from uiSlice: it mounts whenever
-  // the first run is completed AND the user has not permanently dismissed it.
-  // Flipping `cheatSheetDismissed` back to false from Settings (T8b) is what
-  // re-mounts the cheat sheet — observing the slice directly here removes the
-  // earlier local-state gate that left the Settings button dead (C1 fix).
+  // The cheat sheet mounts only while `cheatSheetForceShown` is set: the `?`
+  // prefix action and the Settings button force-show it immediately, and the
+  // first-boot queue auto-shows it once (using up `!cheatSheetDismissed`).
   const firstRunCompleted = useStore((s) => s.firstRunCompleted);
   const cheatSheetDismissed = useStore((s) => s.cheatSheetDismissed);
-  // Bypasses the dismissed gate when the `?` prefix action sets it. Without
-  // this subscription here the component never mounts after a permanent
-  // dismissal, so the override would have nothing to react to.
   const cheatSheetForceShown = useStore((s) => s.cheatSheetForceShown);
   const setFirstRunCompleted = useStore((s) => s.setFirstRunCompleted);
   const [showFirstRunWizard, setShowFirstRunWizard] = useState<'firstRun' | 'reopen' | null>(null);
@@ -811,7 +841,27 @@ export default function AppLayout() {
   // wizard is coming.
   const [firstRunProbeSettled, setFirstRunProbeSettled] = useState(false);
 
+  // Pending = an upgrade from a build that never stored the choice; showing =
+  // the first-boot queue opened it (latched until a button is pressed).
   const [showAutoUpdatePrompt, setShowAutoUpdatePrompt] = useState(false);
+  const [autoUpdatePromptOpen, setAutoUpdatePromptOpen] = useState(false);
+  // The one-time "New: …" announcement, decided once the first-run probe
+  // says whether this is a fresh install.
+  const [featureNoticePending, setFeatureNoticePending] = useState(false);
+  // The announcement toast is not a modal layer, so the queue holds while it
+  // is still on screen (persistent until dismissed).
+  const [featureNoticeToastId, setFeatureNoticeToastId] = useState<string | null>(null);
+  const featureNoticeShowing = useStore(
+    (s) => featureNoticeToastId !== null && s.toasts.some((toast) => toast.id === featureNoticeToastId),
+  );
+  const settingsPanelVisible = useStore((s) => s.settingsPanelVisible);
+  const modalLayerCount = useSyncExternalStore(subscribeModalLayers, openModalLayerCount);
+  // The launch-time hooks check has answered (or has no bridge to ask): its
+  // dialog opens after an async probe, so the queue waits for that answer.
+  const [hooksLaunchCheckDone, setHooksLaunchCheckDone] = useState(
+    () => !window.electronAPI?.deck?.hooksBridge,
+  );
+  const handleHooksLaunchCheckDone = useCallback(() => setHooksLaunchCheckDone(true), []);
   const t = useT();
 
   useRefusedInstallNotice(t);
@@ -838,6 +888,7 @@ export default function AppLayout() {
   // per-pane agent status whenever it changes, so main resolves hooks/routing
   // locally instead of round-tripping workspace.list back to the renderer.
   useWorkspaceMirrorPush();
+  useMoaSync();
   // S-C2 Approval Inbox bridge: the SINGLE owner of permissionPrompt.onOpen /
   // onClosed (guard #2). Always-on (not gated on fleetViewVisible) so MCP
   // prompts accumulate in the store before the cockpit's Approvals tab opens.
@@ -847,6 +898,9 @@ export default function AppLayout() {
   // the store (and jump to its pane) whichever surface the operator is on.
   useBrowserHelpBridge();
   useUsageLimitBridge();
+  // Workspace settle / snooze — main owns the state; this mirrors it and
+  // raises the Undo toasts.
+  useWorkspaceSettleBridge();
   // LanLink PR-2 — own the remote-inbox subscription (always-on, mounted once)
   // so remote peer messages accumulate in the store before any surface opens.
   useRemoteInboxBridge();
@@ -1370,8 +1424,7 @@ export default function AppLayout() {
           useStore.getState().markSessionSettingsLoaded();
           sessionLoadedRef.current = true;
           setSessionLoaded(true);
-          // First ever launch — ask about auto-update
-          setShowAutoUpdatePrompt(true);
+          // First ever launch: the welcome dialog's auto-update row asks.
           return;
         }
 
@@ -1513,8 +1566,11 @@ export default function AppLayout() {
       if (!result.shown) {
         setShowFirstRunWizard('firstRun');
         setFirstRunWizardRanThisBoot(true);
+        // A fresh install has no earlier behaviour to announce a change to.
+        markPrWakeNoticeSeen();
       } else {
         setFirstRunCompleted(true);
+        setFeatureNoticePending(prWakeNoticePending());
       }
     }).catch(() => {
       // Best-effort. If main is unreachable, fall back to "completed" so
@@ -1522,6 +1578,8 @@ export default function AppLayout() {
       if (!cancelled) {
         setFirstRunCompleted(true);
         setFirstRunProbeSettled(true);
+        // No announcement: a failed probe cannot tell a fresh install from an
+        // upgrade, and a fresh install must never get a "New: …" toast.
       }
     });
     return () => {
@@ -1564,25 +1622,65 @@ export default function AppLayout() {
     void window.electronAPI?.deck?.modelSet?.(deckBrainModelLive, deckBrainEffortLive);
   }, [deckBrainModelLive, deckBrainEffortLive]);
 
-  // ─── First-run onboarding (spotlight) detection ─────────────────────
-  // D8: spotlight stays gated behind firstRunCompleted so the wizard always
-  // wins the first impression. Once the wizard completes/dismisses, the
-  // spotlight tutorial picks up the UI tour for single-workspace users.
-  // #1164: it also waits out a pending auto-update consent — the spotlight's
-  // z-9999 backdrop would cover the prompt's buttons, the same stacked-overlay
-  // pointer-deadness the wizard/prompt pair had. First-boot order: wizard →
-  // consent → spotlight.
+  // An upgrader may answer the update question in Settings › General before
+  // the queue reaches the prompt: any change after hydration answers it.
+  const autoUpdateEnabled = useStore((s) => s.autoUpdateEnabled);
+  const hydratedAutoUpdateRef = useRef<boolean | null>(null);
   useEffect(() => {
-    if (shouldStartOnboarding({
-      sessionLoaded,
-      autoUpdatePromptPending: showAutoUpdatePrompt,
-      firstRunCompleted,
-      onboardingCompleted,
-      workspaceCount,
-    })) {
-      startOnboarding();
+    if (!sessionLoaded) return;
+    if (hydratedAutoUpdateRef.current === null) {
+      hydratedAutoUpdateRef.current = autoUpdateEnabled;
+      return;
     }
-  }, [sessionLoaded, firstRunCompleted, onboardingCompleted, workspaceCount, showAutoUpdatePrompt, startOnboarding]);
+    if (autoUpdateEnabled !== hydratedAutoUpdateRef.current) setShowAutoUpdatePrompt(false);
+  }, [sessionLoaded, autoUpdateEnabled]);
+
+  // ─── First-boot queue: one self-opening surface at a time ────────────
+  // The wizard owns the first impression; after it, the legacy update
+  // question (upgraders only), the one-time "New: …" toast (upgraders only),
+  // the spotlight tour (first visit to the Fleet page) and the keyboard cheat
+  // sheet (once, after the tour) each wait until nothing else is open — no
+  // dialog, no Settings panel, no other queued surface. Each start is latched
+  // here: the surface's own modal layer must not count against itself.
+  const firstBootNext = nextFirstBootSurface({
+    firstRunSettled: firstRunProbeSettled,
+    sessionSettled: sessionLoaded || sessionLoadFailed,
+    launchChecksSettled: hooksLaunchCheckDone
+      || hooksLaunchCheck({ firstRunSettled: firstRunProbeSettled, firstRunWizardRanThisBoot }) === 'skip',
+    wizardOpen: showFirstRunWizard !== null,
+    wizardRanThisBoot: firstRunWizardRanThisBoot,
+    otherSurfaceOpen: modalLayerCount > 0 || settingsPanelVisible,
+    surfaceShowing: autoUpdatePromptOpen || onboardingActive || cheatSheetForceShown || featureNoticeShowing,
+    autoUpdatePromptPending: showAutoUpdatePrompt,
+    featureNoticePending,
+    firstRunCompleted,
+    onboardingCompleted,
+    onFleetPage: appRoute === 'fleet',
+    cheatSheetPending: !cheatSheetDismissed,
+  });
+  useEffect(() => {
+    // A dialog that mounted in this same commit has registered its layer
+    // already (child effects run first) but not yet re-rendered us.
+    if (!firstBootNext || openModalLayerCount() > 0) return;
+    const st = useStore.getState();
+    switch (firstBootNext) {
+      case 'autoUpdatePrompt':
+        setAutoUpdatePromptOpen(true);
+        break;
+      case 'featureNotice':
+        setFeatureNoticePending(false);
+        setFeatureNoticeToastId(showPrWakeNoticeOnce());
+        break;
+      case 'onboarding':
+        startOnboarding();
+        break;
+      case 'cheatSheet':
+        // Shown once: used up as it opens, then shown like the `?` action.
+        st.setCheatSheetDismissed(true);
+        st.setCheatSheetForceShown(true);
+        break;
+    }
+  }, [firstBootNext, modalLayerCount, startOnboarding]);
 
   // Re-reconcile when daemon connects late (respawn/reconnect after the
   // startup reconcile already ran). Gating + abort/timeout/preserve logic
@@ -1955,15 +2053,17 @@ export default function AppLayout() {
       <ErrorBoundary name="SidebarRail">
         <MiniSidebar rail collapsed={!sidebarVisible} />
       </ErrorBoundary>
-      <div className={`wmux-shell-body relative flex flex-1 min-h-0 min-w-0 ${sidebarPosition === 'right' ? 'flex-row-reverse' : ''}`}>
+      <div ref={shellRef} className={`wmux-shell-body relative flex flex-1 min-h-0 min-w-0 ${sidebarPosition === 'right' ? 'flex-row-reverse' : ''}`}>
       {/* The Workspaces page. Another rail page covers it (RailPage) while it
           stays mounted, full size and inert, so no PTY is resized or lost. */}
       <div className="contents" inert={appRoute !== 'workspaces' && !inspectModeActive} data-workspaces-page>
-      {sidebarVisible && (
+      {/* The column animates a toggle and holds terminal fits until it ends
+          (SidebarSlot), so panes refit once instead of per frame. */}
+      <SidebarSlot visible={sidebarVisible} width={sidebarWidth} position={sidebarPosition}>
         <ErrorBoundary name="Sidebar">
           <Sidebar chrome="sheet" />
         </ErrorBoundary>
-      )}
+      </SidebarSlot>
       <ErrorBoundary name="Main">
       {/* `relative` anchors ToolbarHost: the agent toolbar overlays this column
           rather than taking a row, so revealing it never resizes a PTY. */}
@@ -2014,16 +2114,38 @@ export default function AppLayout() {
           reflows the panes instead of the old fixed overlay that covered them.
           Holds the channel list + active conversation; collapsible. */}
       {/* Collapsed, the deck renders NOTHING here — the terminals take the
-          whole width. The way back is the titlebar's DeckToggle beside
-          Settings (owner decision 2026-08-18, replacing the 36px glyph rail).
+          whole width. The way back is Moa's titlebar button; with Moa off
+          there is no panel at all (owner decision 2026-08-18, replacing the 36px glyph rail).
           The rail spent a full-height column on four glyphs and an expand
           chevron, ~85% of it empty; one button on a row that already exists
           costs the terminals nothing. */}
-      {channelDockVisible && (
+      </div>
+      {/* The dock stays interactive beside every rail page but Settings (they
+          cover only the sidebar and the panes, so Moa is in reach); Settings
+          covers it, inert, like the rest of the Workspaces page. Both dock
+          modes live in this region: `contents` keeps the inline dock the same
+          flex item it always was, and the overlay still positions against
+          the sheet. */}
+      <div className="contents" inert={!dockShownOn(appRoute) && !inspectModeActive} data-dock-region>
+      {dockOpen && dockMode === 'inline' && (
         <ErrorBoundary name="ChannelDock">
           <ChannelDock />
         </ErrorBoundary>
       )}
+      {/* Too narrow for the dock beside the panes: it floats over them on the
+          far edge instead, and never reflows a PTY. */}
+      {dockOpen && dockMode === 'overlay' && (
+        <div
+          data-dock-overlay
+          className={`absolute inset-y-0 z-30 flex max-w-full ${sidebarPosition === 'right' ? 'left-0' : 'right-0'}`}
+        >
+          <ErrorBoundary name="ChannelDock">
+            <ChannelDock />
+          </ErrorBoundary>
+        </div>
+      )}
+      </div>
+      <div className="contents" inert={appRoute !== 'workspaces' && !inspectModeActive} data-workspaces-page>
       {fileTreeVisible && (
         <ErrorBoundary name="FileTree">
           <FileTreePanel position={sidebarPosition === 'left' ? 'right' : 'left'} />
@@ -2048,6 +2170,8 @@ export default function AppLayout() {
       {/* Always mounted: it opens on an event (⌘⇧2 / F2, sidebar) and renders
           nothing until then. */}
       <ErrorBoundary name="AgentMentionPicker"><AgentMentionPicker /></ErrorBoundary>
+      {/* The Git page's hand-off confirm (a drop on an agent pane / workspace row, or Send to agent…). */}
+      <ErrorBoundary name="HandoffPopover"><HandoffPopover /></ErrorBoundary>
       {commandPaletteVisible && (
         <ErrorBoundary name="CommandPalette">
           <Suspense fallback={null}><CommandPalette /></Suspense>
@@ -2085,26 +2209,17 @@ export default function AppLayout() {
         <OnboardingOverlay onComplete={() => { completeOnboarding(); }} />
       )}
 
-      {/* First-run auto-update prompt. #1164 — gated behind the first-run
-          wizard: on a fresh boot both surfaces fire at once (session.load()
-          nulls → prompt, firstRun.check() → wizard), and the wizard's
-          --z-dialog backdrop then covers the prompt's buttons, producing a
-          pointer-dead stack that only the keyboard can escape. Sequencing
-          instead of stacking: the wizard owns the first impression (the same
-          D8 ruling that gates the onboarding spotlight), and the consent
-          question — still pending — appears the moment it closes. It also
-          waits for the wizard probe to settle (firstRunCompleted), or it
-          would flash for a frame before the wizard mounts over it. */}
-      {shouldShowAutoUpdatePrompt({
-        pending: showAutoUpdatePrompt,
-        wizardOpen: showFirstRunWizard !== null,
-        firstRunSettled: firstRunCompleted,
-      }) && (
+      {/* Auto-update consent for an upgrade that never stored the choice
+          (#1164). A fresh install answers it in the welcome dialog's row;
+          this one opens through the first-boot queue, never over another
+          surface. */}
+      {autoUpdatePromptOpen && (
         <AutoUpdatePrompt
           onChoose={(enabled) => {
             useStore.getState().setAutoUpdateEnabled(enabled);
             window.electronAPI.settings.setAutoUpdateEnabled(enabled);
             setShowAutoUpdatePrompt(false);
+            setAutoUpdatePromptOpen(false);
           }}
         />
       )}
@@ -2117,27 +2232,11 @@ export default function AppLayout() {
         <FirstRunWizard mode={showFirstRunWizard} onClose={handleWizardClose} />
       )}
 
-      {/* Keyboard cheat sheet (T8a / Plan 1.18). Mounts derivatively from
-          firstRunCompleted + !cheatSheetDismissed so that flipping
-          cheatSheetDismissed=false from Settings (T8b) immediately re-mounts
-          the sheet. The component itself is a no-op when dismissed (D11).
-          `cheatSheetForceShown` (set by the `?` prefix action) bypasses the
-          permanent dismissal so the cheat sheet can always be pulled back up. */}
-      {/* #1276: waits its turn after the consent prompt and the spotlight tour. */}
-      {shouldShowCheatSheet({
-        firstRunCompleted,
-        sessionSettled: sessionLoaded || sessionLoadFailed,
-        dismissed: cheatSheetDismissed,
-        forceShown: cheatSheetForceShown,
-        autoUpdatePromptPending: showAutoUpdatePrompt,
-        onboardingActiveOrStarting: onboardingActive || shouldStartOnboarding({
-          sessionLoaded,
-          autoUpdatePromptPending: showAutoUpdatePrompt,
-          firstRunCompleted,
-          onboardingCompleted,
-          workspaceCount,
-        }),
-      }) && <KeyboardCheatSheet />}
+      {/* Keyboard cheat sheet (T8a / Plan 1.18). Mounted only while shown:
+          the `?` prefix action and Settings › First-run setup force-show it
+          immediately; the first-boot queue auto-shows it once, after the tour
+          (#1276) — never by itself on a first run. */}
+      {firstRunCompleted && cheatSheetForceShown && <KeyboardCheatSheet />}
 
       {companyViewVisible && (
         <CompanyView onClose={() => setCompanyViewVisible(false)} />
@@ -2159,10 +2258,12 @@ export default function AppLayout() {
       )}
       <FloatingPane />
       <ToastContainer />
+      <MoaHqMissingNotice />
       <HooksInstallPromptContainer
         t={t}
         launchCheck={hooksLaunchCheck({ firstRunSettled: firstRunProbeSettled, firstRunWizardRanThisBoot })}
         deferred={showFirstRunWizard !== null}
+        onLaunchCheckDone={handleHooksLaunchCheckDone}
       />
       </div>
       </div>

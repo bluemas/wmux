@@ -2,7 +2,20 @@ import { describe, it, expect, vi } from 'vitest';
 import { PrStatusCache, mapGhPrView } from '../PrStatusCache';
 
 describe('mapGhPrView', () => {
-  it('maps an open PR with passing checks', () => {
+  it('marks a conflicting PR, and only that one', () => {
+    const base = { number: 7, state: 'OPEN', isDraft: false, url: 'u', statusCheckRollup: [] };
+    expect(mapGhPrView({ ...base, mergeable: 'CONFLICTING' })?.conflicting).toBe(true);
+    expect(mapGhPrView({ ...base, mergeable: 'MERGEABLE' })).not.toHaveProperty('conflicting');
+    expect(mapGhPrView({ ...base, mergeable: 'UNKNOWN' })).not.toHaveProperty('conflicting');
+  });
+
+  it('carries the head commit only when it looks like one', () => {
+    const base = { number: 7, state: 'OPEN', isDraft: false, url: 'u', statusCheckRollup: [] };
+    expect(mapGhPrView({ ...base, headRefOid: '8f560cbee476d5849458403f7d9685ac8d197e74' })?.headSha).toBe('8f560cbee476d5849458403f7d9685ac8d197e74');
+    expect(mapGhPrView({ ...base, headRefOid: 'not a sha; rm' })).not.toHaveProperty('headSha');
+  });
+
+    it('maps an open PR with passing checks', () => {
     expect(mapGhPrView({
       number: 42,
       state: 'OPEN',
@@ -168,5 +181,31 @@ describe('PrStatusCache', () => {
     cache.invalidate('D:\\repo', 'main');
     await cache.get('D:\\repo', 'main');
     expect(exec).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('PrStatusCache.observe', () => {
+  const fail = (stderr: string) => Object.assign(new Error('Command failed'), { stderr });
+
+  it('tells a branch with no PR from a failed lookup', async () => {
+    const exec = vi.fn().mockRejectedValueOnce(fail('no pull requests found for branch "x"'));
+    const cache = new PrStatusCache(() => 0, exec);
+    expect(await cache.observe('/r', 'x')).toEqual({ pr: null, failed: false });
+
+    const exec2 = vi.fn().mockRejectedValueOnce(fail('error connecting to api.github.com'));
+    const cache2 = new PrStatusCache(() => 0, exec2);
+    expect(await cache2.observe('/r', 'x')).toEqual({ pr: null, failed: true });
+  });
+
+  it('counts a missing gh as a failed lookup', async () => {
+    const exec = vi.fn().mockRejectedValueOnce(Object.assign(new Error('spawn gh ENOENT'), { code: 'ENOENT' }));
+    const cache = new PrStatusCache(() => 0, exec);
+    expect((await cache.observe('/r', 'x')).failed).toBe(true);
+  });
+
+  it('reports a found PR as not failed', async () => {
+    const exec = vi.fn().mockResolvedValueOnce({ stdout: JSON.stringify({ number: 3, state: 'MERGED', isDraft: false, url: 'u' }) });
+    const cache = new PrStatusCache(() => 0, exec);
+    expect(await cache.observe('/r', 'x')).toEqual({ pr: expect.objectContaining({ number: 3, state: 'merged' }), failed: false });
   });
 });

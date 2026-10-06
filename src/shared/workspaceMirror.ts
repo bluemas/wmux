@@ -103,4 +103,25 @@ export interface WorkspaceMirrorPushPayload {
    * which counts as false.
    */
   sessionRestored?: boolean;
+  /**
+   * Workspace ids pinned to the top of the sidebar (`sidebarPinnedIds`). The
+   * settle rules exempt a pinned workspace. An old renderer omits the field,
+   * which main reads as "nothing pinned".
+   */
+  pinnedIds?: string[];
+  /**
+   * What the human is looking at: the active workspace and its active pane.
+   * Feeds the HQ brain's context line (main/deck/viewContext.ts). An old
+   * renderer omits it, which main reads as "unknown" (no context line).
+   */
+  viewed?: ViewedPointer;
+}
+
+/** The viewed workspace, its active pane, and that pane's active surface's own
+ *  cwd and branch (absent when that surface never reported one). */
+export interface ViewedPointer {
+  workspaceId: string;
+  paneId: string | null;
+  cwd?: string;
+  branch?: string;
 }

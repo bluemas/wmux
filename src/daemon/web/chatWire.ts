@@ -90,7 +90,7 @@ function skillsAgent(agent: string | undefined): boolean {
 export function buildChatObject(
   resolution: ChatResolution,
   blocked: ChatBlocked | undefined,
-  opts: { turn?: ChatTurn; chatCancel?: boolean; queue?: ChatQueueItemView[]; accountStatus?: boolean } = {},
+  opts: { turn?: ChatTurn; chatCancel?: boolean; queue?: ChatQueueItemView[]; accountStatus?: boolean; resumable?: boolean } = {},
 ): Record<string, unknown> {
   const { status } = resolution;
   const liveness = {
@@ -157,6 +157,8 @@ export function buildChatObject(
     historyTruncated: terminal?.historyTruncated === true,
     ...(resolution.source === 'tui' ? { maxSendBytes: OPENCODE_MAX_SEND_BYTES } : {}),
     ...liveness,
+    // `POST chat/launch {resume:true}` would continue this very conversation now.
+    resumable: opts.resumable === true,
     // Additive: the route passes it only to a caller that declared
     // `chat-cancel` or `chat-queue`, so an older client's object is unchanged.
     ...(opts.turn ? { turn: { ...opts.turn } } : {}),
@@ -304,10 +306,12 @@ export interface LaunchBody {
   mode: TerminalLaunchMode;
   confirm?: string;
   clientLaunchId: string;
-  prompt: string;
+  /** Absent: the agent starts with no first message. */
+  prompt?: string;
+  resume: boolean;
 }
 
-const LAUNCH_KEYS = ['agent', 'mode', 'confirm', 'clientLaunchId', 'prompt'] as const;
+const LAUNCH_KEYS = ['agent', 'mode', 'confirm', 'clientLaunchId', 'prompt', 'resume'] as const;
 
 /**
  * The launcher prompt rule, restated from `terminalLaunchCommand` so the route
@@ -336,9 +340,11 @@ export function parseLaunchBody(body: unknown): { ok: true; value: LaunchBody } 
   if (!validTerminalLaunchMode(o.agent, o.mode)) return refuse(`mode ${String(o.mode)} is not valid for ${o.agent}`);
   if (o.confirm !== undefined && typeof o.confirm !== 'string') return refuse('confirm must be a string');
   if (typeof o.clientLaunchId !== 'string') return refuse('clientLaunchId must be a string');
-  if (typeof o.prompt !== 'string' || !validLaunchPrompt(o.prompt)) {
-    return refuse(`prompt must be non-blank, at most ${CHAT_LAUNCH_MAX_UNITS} UTF-16 units, without control characters other than newline`);
+  // Omitted or '' is a bare launch; any other text must be a valid first message.
+  if (o.prompt !== undefined && o.prompt !== '' && (typeof o.prompt !== 'string' || !validLaunchPrompt(o.prompt))) {
+    return refuse(`prompt must be omitted, empty, or non-blank text of at most ${CHAT_LAUNCH_MAX_UNITS} UTF-16 units without control characters other than newline`);
   }
+  if (o.resume !== undefined && typeof o.resume !== 'boolean') return refuse('resume must be a boolean');
   return {
     ok: true,
     value: {
@@ -346,7 +352,8 @@ export function parseLaunchBody(body: unknown): { ok: true; value: LaunchBody } 
       mode: (o.mode ?? 'default') as TerminalLaunchMode,
       ...(typeof o.confirm === 'string' ? { confirm: o.confirm } : {}),
       clientLaunchId: o.clientLaunchId,
-      prompt: o.prompt,
+      ...(typeof o.prompt === 'string' && o.prompt !== '' ? { prompt: o.prompt } : {}),
+      resume: o.resume === true,
     },
   };
 }

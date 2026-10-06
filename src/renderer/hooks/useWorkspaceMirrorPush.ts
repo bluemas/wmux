@@ -81,8 +81,15 @@ export function useWorkspaceMirrorPush(): void {
 
       // Structural: workspaces array identity (tree / activePaneId mutations all
       // produce a fresh immutable array) or the active workspace switching.
+      // Pins are structural too: main's settle rules exempt a pinned workspace,
+      // so a pin must land at once rather than wait for the periodic refresh.
       const structural =
-        s.workspaces !== prev.workspaces || s.activeWorkspaceId !== prev.activeWorkspaceId;
+        s.workspaces !== prev.workspaces ||
+        s.activeWorkspaceId !== prev.activeWorkspaceId ||
+        s.sidebarPinnedIds !== prev.sidebarPinnedIds ||
+        // The viewed pane's branch (Moa's view pointer) has no tree change
+        // of its own when the workspace metadata already held that value.
+        s.surfaceGitBranch !== prev.surfaceGitBranch;
       if (structural) {
         flushLeading();
         return;

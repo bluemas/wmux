@@ -8,6 +8,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import {
   HooksInstallPrompt,
+  LAUNCH_CHECK_REPORT_TIMEOUT_MS,
   requestHooksInstallPrompt,
   type HooksBridgeApi,
 } from '../HooksInstallPrompt';
@@ -643,5 +644,47 @@ describe('HooksInstallPrompt — first boot (never on top of the Welcome dialog)
     await act(async () => { finish({ ok: true, error: null }); });
     await flush();
     expect(el.textContent).toContain('hooks.prompt.doneTitle');
+  });
+});
+
+describe('HooksInstallPrompt launch-check signal (first-boot queue)', () => {
+  it('reports the launch check done after it asked, and when there was nothing to ask', async () => {
+    const asked = vi.fn();
+    const el = render(<HooksInstallPrompt api={apiOf()} t={t} onLaunchCheckDone={asked} />);
+    await flush();
+    await flush();
+    expect(el.querySelector('[data-hooks-install-prompt]')).toBeTruthy();
+    expect(asked).toHaveBeenCalledTimes(1);
+
+    const quiet = vi.fn();
+    render(
+      <HooksInstallPrompt api={apiOf({ status: async () => ({ installed: true }) })} t={t} onLaunchCheckDone={quiet} />,
+    );
+    await flush();
+    await flush();
+    expect(quiet).toHaveBeenCalledTimes(1);
+  });
+
+  it('a skipped launch check is done at once', async () => {
+    const done = vi.fn();
+    render(<HooksInstallPrompt api={apiOf()} t={t} launchCheck="skip" onLaunchCheckDone={done} />);
+    await flush();
+    expect(done).toHaveBeenCalledTimes(1);
+  });
+
+  it('a bridge that never answers is reported done after the bound, once', async () => {
+    vi.useFakeTimers();
+    try {
+      const done = vi.fn();
+      render(
+        <HooksInstallPrompt api={apiOf({ status: () => new Promise(() => undefined) })} t={t} onLaunchCheckDone={done} />,
+      );
+      await act(async () => { await Promise.resolve(); });
+      expect(done).not.toHaveBeenCalled();
+      await act(async () => { vi.advanceTimersByTime(LAUNCH_CHECK_REPORT_TIMEOUT_MS); });
+      expect(done).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
