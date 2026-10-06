@@ -16,7 +16,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { planAutoResume, planRecoveryPillType } from '../Pane';
+import { claimAutoResume, markResumePillUsed, planAutoResume, planRecoveryPillType } from '../Pane';
 import type { RoleBinding } from '../../../../shared/orchestratorRole';
 
 const SID = 'a1b2c3d4-0000-0000-0000-9f8e7d6c5b4a';
@@ -319,5 +319,35 @@ describe('planAutoResume — the opt-in setting (#1826)', () => {
     expect(source).not.toMatch(/useStore\(\(s\) => s\.claudeResumeOnStart\)/);
     expect(source).toMatch(/\[activeSurfacePtyId, resumePtyReady, resumeHint, resumeBinding, supervision, chatV2OwnsPane\]\);/);
     expect(source).toMatch(/if \(!useStore\.getState\(\)\.claudeResumeOnStart\) return;[^\n]*\n\s*if \(useStore\.getState\(\)\.resumeHintByPtyId/);
+  });
+});
+
+describe('planAutoResume — session id validation', () => {
+  it('types only a well-formed session id, otherwise falls back to --continue', () => {
+    const base = { enabled: true, agent: 'claude', paneCwds: ['C:/git/wmux'], roleBinding: undefined };
+    expect(planAutoResume({ ...base, binding: { agent: 'claude', cwd: 'C:/git/wmux', sessionId: SID } }))
+      .toBe(`claude --resume ${SID}`);
+    for (const sessionId of ['not a session id', `${SID} extra`, 'rollout-2026-10-01', SID.toUpperCase(), '']) {
+      expect(planAutoResume({ ...base, binding: { agent: 'claude', cwd: 'C:/git/wmux', sessionId, permissionMode: 'acceptEdits' } }))
+        .toBe('claude --continue');
+    }
+  });
+});
+
+describe('automatic resume vs the Resume pill', () => {
+  it('a pill click on a pty blocks the automatic resume for it', () => {
+    markResumePillUsed('pty-pill-clicked');
+    expect(claimAutoResume('pty-pill-clicked')).toBe(false);
+  });
+
+  it('each pty is resumed automatically at most once', () => {
+    expect(claimAutoResume('pty-auto-once')).toBe(true);
+    expect(claimAutoResume('pty-auto-once')).toBe(false);
+  });
+
+  it('the pill marks the pty before typing, and the timer claims it before writing', () => {
+    const source = readFileSync(resolve(__dirname, '../Pane.tsx'), 'utf8');
+    expect(source).toMatch(/markResumePillUsed\(ptyId\);[\s\S]{0,600}?if \(plan\.clearHint\) typeAndClear\(plan\.text\);/);
+    expect(source).toMatch(/if \(!claimAutoResume\(ptyId\)\) return;[^\n]*\n\s*window\.electronAPI\.pty\.write\(ptyId, `\$\{line\}\\r`\);/);
   });
 });
