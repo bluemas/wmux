@@ -90,8 +90,7 @@ describe("Moa's HQ is left out of the workspace list", () => {
     expect(container.querySelector('[data-sidebar-total]')?.textContent).toBe('2');
     // Ctrl+N skips the HQ: `b` is stored third but is the second listed.
     const b = [...document.querySelectorAll('.sidebar-row')].find((r) => r.textContent?.startsWith('b')) as HTMLElement;
-    expect(b.textContent).toContain('^2');
-    expect(b.textContent).not.toContain('^3');
+    expect(b.querySelector('[data-shortcut-number]')?.getAttribute('data-shortcut-number')).toBe('2');
     // Not active: no HQ row either.
     expect(hqRow()).toBeNull();
   });

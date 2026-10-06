@@ -45,12 +45,13 @@ export function isSidebarSortMode(value: unknown): value is SidebarSortMode {
 }
 
 /**
- * Resolve the persisted sort mode (owner decision 2026-09-25: Attention is the
- * default). A mode the user explicitly chose in Settings (`sidebarSortModeChosen`)
- * is kept, Manual included. 'recent' was only ever reachable by choosing it, so
- * it is kept too. Anything else — an old session with only the attention
- * flag, or a stored 'manual' that was merely the previous default — becomes
- * Attention.
+ * Resolve the persisted sort mode (owner decision 2026-10-04: Manual is the
+ * default again, so rows keep the order the user dragged them into and a
+ * working workspace never moves on its own). A mode the user explicitly chose
+ * in Settings (`sidebarSortModeChosen`) is kept. 'recent' was only ever
+ * reachable by choosing it, so it is kept too. Anything else — including an
+ * old session that only carried the attention flag or the 2026-09-25 default —
+ * becomes Manual.
  */
 export function resolveSidebarSortMode(data: {
   sidebarSortMode?: unknown;
@@ -59,7 +60,7 @@ export function resolveSidebarSortMode(data: {
 }): SidebarSortMode {
   if (data.sidebarSortModeChosen === true && isSidebarSortMode(data.sidebarSortMode)) return data.sidebarSortMode;
   if (data.sidebarSortMode === 'recent') return 'recent';
-  return 'attention';
+  return 'manual';
 }
 
 /**

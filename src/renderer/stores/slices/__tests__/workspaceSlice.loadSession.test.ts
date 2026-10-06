@@ -623,17 +623,17 @@ describe('loadSession — sidebar attention-first ordering', () => {
     // separate edits; without this the pref silently resets on every restart.
     const store = createTestStore();
     expect(store.getState().sidebarAttentionFirst).toBe(false);
-    store.getState().loadSession(sessionWith(true));
+    store.getState().loadSession({ ...sessionWith(true), sidebarSortMode: 'attention', sidebarSortModeChosen: true } as SessionData);
     expect(store.getState().sidebarAttentionFirst).toBe(true);
   });
 
-  // Owner decision 2026-09-25: Attention is the default order. Only a mode the
-  // user explicitly chose survives the flip.
-  it('defaults a session with no explicit choice to Attention', () => {
+  // Owner decision 2026-10-04: Manual is the default order. Only a mode the
+  // user explicitly chose survives.
+  it('defaults a session with no explicit choice to Manual', () => {
     const store = createTestStore();
     store.getState().loadSession(sessionWith('false'));
-    expect(store.getState().sidebarSortMode).toBe('attention');
-    expect(store.getState().sidebarAttentionFirst).toBe(true);
+    expect(store.getState().sidebarSortMode).toBe('manual');
+    expect(store.getState().sidebarAttentionFirst).toBe(false);
   });
 
   it('keeps an explicitly chosen Manual order', () => {

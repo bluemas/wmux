@@ -43,12 +43,12 @@ describe('resolveSidebarSortMode (#1481)', () => {
     expect(resolveSidebarSortMode({ sidebarSortMode: 'recent' })).toBe('recent');
   });
 
-  it('migrates everything else to Attention (2026-09-25 default)', () => {
-    expect(resolveSidebarSortMode({ sidebarAttentionFirst: true })).toBe('attention');
-    expect(resolveSidebarSortMode({ sidebarAttentionFirst: false })).toBe('attention');
-    expect(resolveSidebarSortMode({})).toBe('attention');
-    expect(resolveSidebarSortMode({ sidebarSortMode: 'manual' })).toBe('attention');
-    expect(resolveSidebarSortMode({ sidebarSortMode: 'alphabetical', sidebarSortModeChosen: true })).toBe('attention');
+  it('resolves everything else to Manual (2026-10-04 default)', () => {
+    expect(resolveSidebarSortMode({ sidebarAttentionFirst: true })).toBe('manual');
+    expect(resolveSidebarSortMode({ sidebarAttentionFirst: false })).toBe('manual');
+    expect(resolveSidebarSortMode({})).toBe('manual');
+    expect(resolveSidebarSortMode({ sidebarSortMode: 'attention' })).toBe('manual');
+    expect(resolveSidebarSortMode({ sidebarSortMode: 'alphabetical', sidebarSortModeChosen: true })).toBe('manual');
   });
 });
 
@@ -97,9 +97,9 @@ describe('pruneTaskGroupExpanded', () => {
 
 // Review #10 — who gets the one-time "now sorts by attention" notice.
 describe('sortModeMigratedToAttention', () => {
-  it('is true for a list that was showing Manual without a recorded choice', () => {
-    expect(sortModeMigratedToAttention({ sidebarSortMode: 'manual' })).toBe(true);
-    expect(sortModeMigratedToAttention({ sidebarAttentionFirst: false })).toBe(true);
+  it('is never true now that Manual is the default again (2026-10-04)', () => {
+    expect(sortModeMigratedToAttention({ sidebarSortMode: 'manual' })).toBe(false);
+    expect(sortModeMigratedToAttention({ sidebarAttentionFirst: false })).toBe(false);
   });
   it('is false for a chosen Manual, an attention list, and Recent activity', () => {
     expect(sortModeMigratedToAttention({ sidebarSortMode: 'manual', sidebarSortModeChosen: true })).toBe(false);
