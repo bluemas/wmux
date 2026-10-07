@@ -61,6 +61,7 @@ export const SHORTCUT_ACTION_IDS = [
   // can put on a key of their choosing.
   'stashPane', 'movePaneLeft', 'movePaneRight', 'movePaneUp', 'movePaneDown',
   'multiTask', 'toggleToolbarPin', 'openWorktaskCleanup', 'showGitDiff',
+  'renameTab',
 ] as const;
 
 export type ShortcutActionId = typeof SHORTCUT_ACTION_IDS[number];
@@ -224,6 +225,7 @@ export const UNBOUND_SHORTCUTS: readonly { action: ShortcutActionId; description
   { action: 'toggleToolbarPin', descriptionKey: 'settings.sc.toggleToolbarPin' },
   { action: 'openWorktaskCleanup', descriptionKey: 'settings.sc.openWorktaskCleanup' },
   { action: 'showGitDiff', descriptionKey: 'settings.sc.showGitDiff' },
+  { action: 'renameTab', descriptionKey: 'settings.sc.renameTab' },
 ];
 
 /** The i18n key (and vars) naming `action` in shortcut lists. */

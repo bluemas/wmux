@@ -51,6 +51,9 @@ export interface SurfaceSlice {
   prevSurface: (paneId: string) => void;
   updateSurfacePtyId: (paneId: string, surfaceId: string, ptyId: string) => void;
   updateSurfaceTitle: (surfaceId: string, title: string) => void;
+  /** Undo a manual rename: unlock the title and put back `autoTitle` (the
+   *  title the rename replaced), falling back to the shell name. */
+  resetSurfaceTitle: (surfaceId: string) => void;
   updateSurfaceTitleByPty: (ptyId: string, title: string) => void;
   /** #1086/#1091 — the remote-terminal twin of updateSurfaceTitleByPty. A
    *  remote-terminal surface's ptyId is always '' (see createRemoteSurface),
@@ -464,7 +467,28 @@ export const createSurfaceSlice: StateCreator<StoreState, [['zustand/immer', nev
     for (const ws of state.workspaces) {
       for (const pane of getWorkspaceLeafPanes(ws)) {
         const surface = pane.surfaces.find((s) => s.id === surfaceId);
-        if (surface) { surface.title = title; surface.titleLocked = true; return; }
+        if (surface) {
+          // The first rename keeps the title it replaces, for resetSurfaceTitle.
+          if (!surface.titleLocked) surface.autoTitle = surface.title;
+          surface.title = title;
+          surface.titleLocked = true;
+          return;
+        }
+      }
+    }
+  }),
+
+  resetSurfaceTitle: (surfaceId) => set((state: StoreState) => {
+    for (const ws of state.workspaces) {
+      for (const pane of getWorkspaceLeafPanes(ws)) {
+        const surface = pane.surfaces.find((s) => s.id === surfaceId);
+        if (!surface) continue;
+        if (surface.titleLocked) {
+          surface.title = surface.autoTitle || surface.shell || surface.title;
+          delete surface.titleLocked;
+          delete surface.autoTitle;
+        }
+        return;
       }
     }
   }),

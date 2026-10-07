@@ -231,9 +231,11 @@ describe('the ⋮ menu offers exactly what the cluster does', () => {
     // icon cluster. split-right-remote / split-down-remote (#1140) are the
     // same pattern again — conditionally rendered on onSplitHorizontalRemote
     // / onSplitVerticalRemote, menu-only rather than icon cluster.
+    // rename-tab renames the right-clicked tab (else the active one): the
+    // double-click on a tab was its only entry point before.
     for (const key of cluster) expect(menu).toContain(key);
     expect(menu.filter((k) => !cluster.includes(k))).toEqual([
-      'new-remote', 'rename-pane', 'split-down-remote', 'split-right-remote',
+      'new-remote', 'rename-pane', 'rename-tab', 'split-down-remote', 'split-right-remote',
     ]);
   });
 });

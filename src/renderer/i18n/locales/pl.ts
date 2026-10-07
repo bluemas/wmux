@@ -606,6 +606,7 @@ export const pl = {
   // The wording carries the whole promise: "stash" removes, "close" destroys,
   // and every string here says which one is happening.
   'pane.rename': 'Zmień nazwę panelu',
+  'pane.renameTab': 'Zmień nazwę karty',
   'pane.stash': 'Odłóż panel',
   'pane.stashHint': 'Znika z układu — sesja działa dalej',
   'pane.unstash': 'Przywróć',
@@ -682,6 +683,7 @@ export const pl = {
   'palette.cmd.toggleToolbarPin': 'Przypnij / odepnij pasek narzędzi agenta',
   'palette.cmd.openWorktaskCleanup': 'Otwórz listę porządkowania zadań',
   'palette.cmd.showGitDiff': 'Pokaż diff Git',
+  'palette.cmd.renameTab': 'Zmień nazwę karty',
   'palette.cmd.showTaskDiff': 'Pokaż diff zadania',
   // J3 — task cleanup list (WorktaskCleanupView)
   'worktask.cleanup.title': 'Lista porządkowania zadań',
@@ -2088,6 +2090,7 @@ export const pl = {
   'settings.sc.toggleToolbarPin': 'Przypnij / odepnij pasek agenta',
   'settings.sc.openWorktaskCleanup': 'Otwórz listę porządkowania zadań',
   'settings.sc.showGitDiff': 'Pokaż diff git',
+  'settings.sc.renameTab': 'Zmień nazwę karty',
   'settings.sc.unset': 'Brak',
   'mention.title': 'Wspomnij agenta',
   'mention.placeholder': 'Wspomnij agenta…',

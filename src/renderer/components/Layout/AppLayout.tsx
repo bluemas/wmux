@@ -338,6 +338,7 @@ function cloneStashedPanes(
             // Without this a user's manual tab rename comes back as a shell
             // title on the next OSC 0 — a small loss, but a silent one.
             titleLocked: s.titleLocked,
+            autoTitle: s.autoTitle,
           })),
         },
         ...(entry.origin ? { origin: entry.origin } : {}),

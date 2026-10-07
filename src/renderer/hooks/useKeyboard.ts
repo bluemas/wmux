@@ -23,6 +23,7 @@ import { listedWorkspaces, moaHqId, refuseWorkspaceClose } from '../components/M
 import {
   openMultiTask,
   openWorktaskCleanup,
+  renameActiveTab,
   showGitDiff,
   stashActivePane,
   toggleAgentToolbarPin,
@@ -87,7 +88,7 @@ export const WORKSPACES_ONLY_ACTIONS: ReadonlySet<ShortcutActionId> = new Set<Sh
   'focusUpAlt', 'focusDownAlt', 'focusLeftAlt', 'focusRightAlt',
   'clearMultiview', 'openBrowser', 'addBookmark', 'zoomIn', 'zoomOut', 'zoomReset',
   'stashPane', 'movePaneLeft', 'movePaneRight', 'movePaneUp', 'movePaneDown',
-  'multiTask', 'showGitDiff',
+  'multiTask', 'showGitDiff', 'renameTab',
 ]);
 
 const STOP_PROPAGATION_ACTIONS: ReadonlySet<ShortcutActionId> = new Set<ShortcutActionId>([
@@ -581,6 +582,7 @@ export function useKeyboard() {
       toggleToolbarPin: toggleAgentToolbarPin,
       openWorktaskCleanup,
       showGitDiff,
+      renameTab: renameActiveTab,
     };
 
     /** Clear the prefix timeout if running */

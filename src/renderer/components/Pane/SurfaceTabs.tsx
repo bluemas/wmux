@@ -23,6 +23,7 @@ import {
   bindingEnforcesModel, bindingEnforcesSkipPermissions, bindingSkipPermissionsFlag, type RoleBinding,
 } from '../../../shared/orchestratorRole';
 import { paneHeaderTailGap } from './paneChrome';
+import { RENAME_ACTIVE_TAB_EVENT } from '../../utils/commandActions';
 
 /** D2 — only a terminal surface can launch an agent, so only a terminal surface
  *  may claim a role-enforced model. An undefined `surfaceType` is a legacy
@@ -478,11 +479,18 @@ export default function SurfaceTabs({
     { top: number; left: number; right: number; bottom: number } | null
   >(null);
   const [menuOpen, setMenuOpen] = useState(false);
+  // The tab a right-click landed on, which "Rename tab" renames. Null when the
+  // menu came from the ⋮ trigger or the bare header: the active tab then.
+  const [menuTabId, setMenuTabId] = useState<string | null>(null);
   const overflowBtnRef = useRef<HTMLButtonElement>(null);
   const closeMenu = useCallback(() => setMenuOpen(false), []);
 
-  const openMenuAt = useCallback((rect: { top: number; left: number; right: number; bottom: number }) => {
+  const openMenuAt = useCallback((
+    rect: { top: number; left: number; right: number; bottom: number },
+    tabId: string | null = null,
+  ) => {
     setMenuAnchor(rect);
+    setMenuTabId(tabId);
     setMenuOpen(true);
   }, []);
 
@@ -503,7 +511,7 @@ export default function SurfaceTabs({
       // menu's LEFT edge at the cursor; the viewport clamp still applies.
       right: e.clientX + PANE_ACTIONS_MENU_WIDTH,
       bottom: e.clientY,
-    });
+    }, (e.target as HTMLElement).closest<HTMLElement>('[data-surface-tab-id]')?.dataset.surfaceTabId ?? null);
   }, [readOnly, mode, paneActionsSetting, openMenuAt]);
   // P2: pane-level identity + rename (distinct from the per-surface tab rename
   // below). The pane's display name is its user label (paneLabel mirror) or the
@@ -530,10 +538,17 @@ export default function SurfaceTabs({
   // Double-click a tab to rename it (a free-text "mark" so a powershell is
   // easier to recognise). Edits surface.title directly — nothing auto-updates
   // it, so the user's name sticks. Mirrors the workspace double-click rename.
+  // Also reachable from the header menu and the renameTab action. An empty
+  // name gives the tab back to the shell (resetSurfaceTitle).
   const updateSurfaceTitle = useStore((s) => s.updateSurfaceTitle);
+  const resetSurfaceTitle = useStore((s) => s.resetSurfaceTitle);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
+  // Same Escape-vs-blur problem as the pane rename below: Escape unmounts the
+  // field, whose blur would commit. With an empty name now meaning "reset",
+  // that blur would wipe a rename the user meant to cancel.
+  const tabRenameCancelRef = useRef(false);
 
   useEffect(() => {
     if (editingId) {
@@ -542,18 +557,40 @@ export default function SurfaceTabs({
     }
   }, [editingId]);
 
-  const startRename = (s: Surface) => {
+  const startRename = useCallback((s: Surface) => {
     // Suppress the rename that a double-click would trigger right after a drag.
     if (Date.now() - dragStartTimeRef.current < 300) return;
+    tabRenameCancelRef.current = false;
     setEditName(s.title || '');
     setEditingId(s.id);
-  };
+  }, []);
 
   const commitRename = (surfaceId: string) => {
+    if (tabRenameCancelRef.current) {
+      tabRenameCancelRef.current = false;
+      setEditingId(null);
+      return;
+    }
     const trimmed = editName.trim();
     if (trimmed) updateSurfaceTitle(surfaceId, trimmed);
+    else resetSurfaceTitle(surfaceId);
     setEditingId(null);
   };
+
+  // The renameTab action (palette / shortcut) renames the active tab of the
+  // focused pane in the shown workspace — that pane's strip answers.
+  useEffect(() => {
+    if (readOnly) return;
+    const onRenameActiveTab = (): void => {
+      const st = useStore.getState();
+      const ws = st.workspaces.find((w) => w.id === st.activeWorkspaceId);
+      if (!ws || ws.id !== workspace.id || ws.activePaneId !== paneId) return;
+      const target = surfaces.find((s) => s.id === activeSurfaceId) ?? surfaces[0];
+      if (target) startRename(target);
+    };
+    document.addEventListener(RENAME_ACTIVE_TAB_EVENT, onRenameActiveTab);
+    return () => document.removeEventListener(RENAME_ACTIVE_TAB_EVENT, onRenameActiveTab);
+  }, [readOnly, workspace.id, paneId, surfaces, activeSurfaceId, startRename]);
 
   useEffect(() => {
     if (paneEditing) {
@@ -594,6 +631,11 @@ export default function SurfaceTabs({
 
   // Below startPaneRename (not with the other useCallbacks above) because the
   // rename item needs it in scope — a const arrow is TDZ-dead until defined.
+  // "Rename tab" target: the right-clicked tab, else the active one. None in
+  // read-only mode, where the double-click rename is off too.
+  const menuTabSurface = readOnly
+    ? undefined
+    : (surfaces.find((s) => s.id === menuTabId) ?? activeSurface);
   const menuItems: PaneActionItem[] = useMemo(() => [
     {
       key: 'split-right',
@@ -632,6 +674,12 @@ export default function SurfaceTabs({
       label: t('pane.splitDownRemote'),
       icon: <IconSplitDown size={14} />,
       onSelect: onSplitVerticalRemote,
+    }] : []),
+    ...(menuTabSurface ? [{
+      key: 'rename-tab',
+      label: t('pane.renameTab'),
+      icon: <IconPencil size={14} />,
+      onSelect: () => startRename(menuTabSurface),
     }] : []),
     {
       key: 'rename-pane',
@@ -676,6 +724,7 @@ export default function SurfaceTabs({
   ], [
     t, onSplitHorizontal, onSplitVertical, onAddBrowser, onAddRemote,
     onSplitHorizontalRemote, onSplitVerticalRemote, startPaneRename,
+    menuTabSurface, startRename,
     stashChord, stashDisabled, stashTooltip, stashThisPane, isZoomed, toggleZoom,
     layoutTemplates,
   ]);
@@ -829,6 +878,7 @@ export default function SurfaceTabs({
           // --selection fill + full text; inactive = 50% text, hover fill.
           // pr-3 keeps the 12px right padding the close button's refund uses.
           data-active={s.id === activeSurfaceId ? 'true' : undefined}
+          data-surface-tab-id={s.id}
           className={`wmux-surface-tab group flex items-center gap-2 pl-3 pr-3 cursor-pointer text-[13px] transition-colors ${
             s.id === activeSurfaceId
               ? 'text-[var(--text-main)]'
@@ -862,7 +912,10 @@ export default function SurfaceTabs({
               onBlur={() => commitRename(s.id)}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') commitRename(s.id);
-                if (e.key === 'Escape') setEditingId(null);
+                if (e.key === 'Escape') {
+                  tabRenameCancelRef.current = true;
+                  setEditingId(null);
+                }
               }}
               onClick={(e) => e.stopPropagation()}
               onDoubleClick={(e) => e.stopPropagation()}
