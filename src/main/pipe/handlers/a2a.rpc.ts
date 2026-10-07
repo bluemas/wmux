@@ -25,6 +25,7 @@ import { recordSentTask, recordTaskState, reopenedState, stateOfTask, workLinkFr
 import { noteTrackReply } from '../../deck/trackRecordFeed';
 import { A2A_BRAIN_ALIAS, isRemoteTaskId } from '../../../shared/a2aRemote';
 import {
+  isRemoteWorkspaceId,
   remoteWorkspaceId,
   type A2aRemoteReplyInput,
   type A2aRemoteSendTaskInput,
@@ -250,11 +251,14 @@ export function registerA2aRpc(
   const getDaemonClient = opts.getDaemonClient;
   const remote = opts.remote;
 
-  /** Active links whose alias is EXACTLY `to` (no trimming, no partial match). */
+  /**
+   * Active links `to` names EXACTLY (no trimming, no partial match): by alias,
+   * or by the `remote:<linkId>` id a2a.discover lists for the remote end.
+   */
   async function remoteTargetsFor(to: unknown): Promise<A2aRemoteTarget[]> {
-    if (!remote || typeof to !== 'string' || !to.includes('/')) return [];
+    if (!remote || typeof to !== 'string' || (!to.includes('/') && !isRemoteWorkspaceId(to))) return [];
     try {
-      return (await remote.listTargets()).filter((t) => t.alias === to);
+      return (await remote.listTargets()).filter((t) => t.alias === to || remoteWorkspaceId(t.linkId) === to);
     } catch {
       return [];
     }
@@ -893,6 +897,8 @@ export function registerA2aRpc(
     if (!params.taskId) {
       const matches = await remoteTargetsFor(params.to);
       if (matches.length > 0) return sendRemoteTask(params, matches, ctx);
+      // A remote end's id never names a local workspace: no active link, no send.
+      if (isRemoteWorkspaceId(params.to)) return { error: `a2a.task.send: "${params.to}" is not an active link to another PC` };
     }
     // Forward the VALIDATED commander binding (RpcRouter set it from the
     // per-spawn token; never read from the wire, so any caller-supplied value

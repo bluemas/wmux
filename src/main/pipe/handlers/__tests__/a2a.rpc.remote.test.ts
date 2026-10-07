@@ -89,6 +89,17 @@ describe('a2a.task.send — remote alias', () => {
     expect(rendererCalls('a2a.task.send')).toEqual([]);
   });
 
+  it('the remote:<linkId> id a2a.discover lists sends like the alias; an id with no active link is refused', async () => {
+    const router = setup();
+    const res = await call(router, 'a2a.task.send', { workspaceId: 'ws-a', senderPtyId: 'pty-a', to: `remote:${LINK}`, message: 'by id' });
+    expect(res).toMatchObject({ ok: true, taskId: RT, remote: true });
+    expect(remote.sendTask).toHaveBeenCalledWith(expect.objectContaining({ linkId: LINK, text: 'by id' }));
+    const gone = await call(router, 'a2a.task.send', { workspaceId: 'ws-a', senderPtyId: 'pty-a', to: 'remote:99999999-9999-4999-8999-999999999999', message: 'x' });
+    expect(gone.error).toMatch(/not an active link/);
+    expect(remote.sendTask).toHaveBeenCalledTimes(1);
+    expect(rendererCalls('a2a.task.send')).toEqual([]);
+  });
+
   it('a partial alias match takes the local path', async () => {
     for (const to of ['pc-b/ws-b', 'pc-b/ws-b/code', ` ${ALIAS}`, 'codex']) {
       await call(setup(), 'a2a.task.send', { workspaceId: 'ws-a', senderPtyId: 'pty-a', to, message: 'hi' });

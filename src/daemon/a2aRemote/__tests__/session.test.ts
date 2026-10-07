@@ -72,3 +72,50 @@ describe('JoinerSession pump', () => {
     expect(s.posts()).toBeLessThanOrEqual(5);
   });
 });
+
+describe('JoinerSession status', () => {
+  it('shows connected as soon as a send gets through, without waiting out the stream backoff', async () => {
+    const states: string[] = [];
+    let stream = 0;
+    const rec = record();
+    let open = 1;
+    const client: SessionClient = {
+      requestJson: async () => ({ status: 200, json: { ok: true, duplicate: false } }),
+      // The first stream attempt fails (server down) and leaves a long backoff;
+      // the redial afterwards hangs open without a hello yet.
+      openStream: async function* (_p, { signal }) {
+        stream += 1;
+        if (stream === 1) throw new Error('stream refused');
+        await new Promise<void>((r) => signal.addEventListener('abort', () => r(), { once: true }));
+      },
+    };
+    const session = new JoinerSession({
+      hostId: HOST,
+      host: () => ({ v: 1, hostId: HOST, name: 'B', addresses: ['127.0.0.1'], port: 1, fingerprint256: 'AB', peerId: 'p', createdAt: 'x' }),
+      credential: () => ({ peerId: '22222222-2222-4222-8222-222222222222', secret: 'a'.repeat(43) }),
+      outbox: {
+        epoch: 'e',
+        head: () => (open > 0 ? structuredClone(rec) : undefined),
+        openCount: () => open,
+        markSent: () => rec,
+        markOutcomeUnknown: () => rec,
+        ack: () => { open = 0; return 1; },
+        refuse: () => rec,
+      },
+      accept: async () => ({ ok: true, duplicate: false }),
+      onRefused: () => undefined,
+      reconcileLinks: async () => undefined,
+      onStatus: (s) => states.push(s.state),
+      timing: { backoffMinMs: 5_000, backoffMaxMs: 5_000, livenessMs: 60_000 },
+      client: () => client,
+      log: () => undefined,
+    });
+    sessions.push(session);
+    session.start();
+    await new Promise((r) => setTimeout(r, 200));
+    expect(states).toContain('connected');
+    expect(session.current()).toMatchObject({ state: 'connected', pending: 0 });
+    // The send also cut the stream's long backoff short (a redial happened).
+    expect(stream).toBeGreaterThanOrEqual(2);
+  });
+});

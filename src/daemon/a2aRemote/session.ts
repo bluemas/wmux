@@ -172,7 +172,8 @@ export class JoinerSession {
         await this.sleep(this.timing.backoffMaxMs);
         continue;
       }
-      this.setState('connecting');
+      // A send that just got through already showed connected: keep it while the stream redials.
+      if (this.status.state !== 'connected') this.setState('connecting');
       const abort = new AbortController();
       this.abort = abort;
       let liveness: ReturnType<typeof setTimeout> | null = null;
@@ -292,6 +293,7 @@ export class JoinerSession {
       return 'retry';
     }
     const body = isPlainObject(answer.json) ? answer.json : null;
+    if (body?.['ok'] === true) this.reached();
     if (body?.['ok'] === true) {
       // An ack we could not record here: back off (the server dedupes the resend).
       return this.tryOutbox(() => this.deps.outbox.ack(hostId, { epoch: this.deps.outbox.epoch, seq: rec.seq })) ? 'next' : 'retry';
@@ -309,6 +311,17 @@ export class JoinerSession {
     }
     if (code === 'unauthorized') this.setState('disconnected', 'unauthorized');
     return 'retry';
+  }
+
+  /**
+   * The server answered a send: it is reachable now. Show connected at once
+   * and redial a stream that is still waiting out its backoff.
+   */
+  private reached(): void {
+    if (this.status.state === 'connected' || this.status.state === 'identity-changed') return;
+    this.setState('connected');
+    this.streamBackoff = 0;
+    this.wakeStream?.();
   }
 
   /** The connection is back: drop any pump backoff and send now. */

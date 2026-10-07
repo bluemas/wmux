@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { useStore } from '../../stores';
 import { getWorkspaceLeafPanes } from '../../../shared/paneUtils';
-import { computePaneAutoName, paneDisplayName } from '../../utils/paneNaming';
+import { activeAgentSlug, leafDisplayName } from '../../utils/paneNaming';
 import Checkbox from '../ui/Checkbox';
 import { moaBrainEnd } from '../../hooks/useA2aRemoteSnapshot';
 import { listedWorkspaces, moaHqId } from '../../stores/slices/moaSlice';
@@ -115,7 +115,7 @@ export function A2aExposureChecklist({ hostId, pcName, t }: { hostId: string; pc
       name: ws.name,
       panes: getWorkspaceLeafPanes(ws).map((l) => ({
         id: l.id,
-        name: paneDisplayName(l.metadata?.label, computePaneAutoName(ws.wsOrdinal ?? 0, l.ordinal ?? 0)),
+        name: leafDisplayName(s.paneLabel, ws, l, activeAgentSlug(s.surfaceAgent, l)),
       })),
     }),
   )));

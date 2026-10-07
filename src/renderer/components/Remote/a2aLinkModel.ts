@@ -1,7 +1,8 @@
 import { a2aEndpointAlias, type A2aExposedPane, type A2aLinkRecordV1 } from '../../../shared/a2aRemote';
 import type { Workspace } from '../../../shared/types';
 import { getWorkspaceLeafPanes } from '../../../shared/paneUtils';
-import { computePaneAutoName, paneDisplayName } from '../../utils/paneNaming';
+import { activeAgentSlug, leafDisplayName } from '../../utils/paneNaming';
+import type { AgentSlug } from '../../../shared/events';
 
 // Pure helpers behind the cross-PC pane link UI (matching dialog, accept
 // cards, link list, exposure checklist), kept store-free for tests.
@@ -52,10 +53,15 @@ export function remoteAlias(pcName: string, remote: A2aLinkRecordV1['remote']): 
  * stores — so a card shows exactly the pane an accept binds, never a name the
  * other PC reported. Falls back to the ids when the pane is gone.
  */
-export function localPaneName(workspaces: Workspace[], local: A2aLinkRecordV1['local']): { workspace: string; pane: string } {
+export function localPaneName(
+  workspaces: Workspace[],
+  local: A2aLinkRecordV1['local'],
+  paneLabel?: Record<string, string>,
+  surfaceAgent?: Record<string, { slug?: AgentSlug }>,
+): { workspace: string; pane: string } {
   const ws = workspaces.find((w) => w.id === local.workspaceId);
   const leaf = ws ? getWorkspaceLeafPanes(ws).find((p) => p.id === local.paneId) : undefined;
-  const pane = ws && leaf ? paneDisplayName(leaf.metadata?.label, computePaneAutoName(ws.wsOrdinal ?? 0, leaf.ordinal ?? 0)) : local.paneId ?? '';
+  const pane = ws && leaf ? leafDisplayName(paneLabel, ws, leaf, activeAgentSlug(surfaceAgent, leaf)) : local.paneId ?? '';
   return { workspace: ws?.name ?? local.workspaceId, pane };
 }
 
