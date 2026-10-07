@@ -2,6 +2,8 @@ import { useStore } from '../../stores';
 import { useT } from '../../hooks/useT';
 import { findLeaf } from '../../../shared/paneUtils';
 import { destroySurfaceRemoteSession } from '../../utils/remoteSessionTeardown';
+import { resolveActivePanePtyId } from '../../hooks/useActivePaneFocus';
+import { terminalRegistry } from '../../hooks/useTerminal';
 import Dialog, { DialogFooter, DialogHeader } from '../ui/Dialog';
 import Button from '../ui/Button';
 
@@ -29,25 +31,49 @@ export function closeTabNow(target: CloseTabTarget): void {
   if (wasLastSurface) state.closePane(pane.id, target.workspaceId);
 }
 
-/** The one close-tab confirm, raised by the tab × and the close-tab shortcut. */
+/** Hand the keyboard back to the active pane's terminal once the dialog is
+ *  gone. After a click on a tab's ×, the dialog would otherwise return focus
+ *  to that button (or to nothing, when the tab it sat on was closed). */
+function refocusActiveTerminal(): void {
+  requestAnimationFrame(() => {
+    const ptyId = resolveActivePanePtyId(useStore.getState());
+    if (ptyId) terminalRegistry.get(ptyId)?.focus();
+  });
+}
+
+/** The one close-tab confirm, raised by the tab × and the close-tab shortcut.
+ *  Cancel holds the initial focus, so Enter keeps the tab; Escape cancels too. */
 export default function CloseTabConfirm() {
   const t = useT();
   const target = useStore((s) => s.closeTabConfirm);
+  const tabTitle = useStore((s) => {
+    const ws = target ? s.workspaces.find((w) => w.id === target.workspaceId) : undefined;
+    const pane = ws && target ? findLeaf(ws.rootPane, target.paneId) : null;
+    return pane?.surfaces.find((surface) => surface.id === target?.surfaceId)?.title;
+  });
   const dismiss = useStore((s) => s.dismissCloseTab);
   if (!target) return null;
+  const cancel = () => {
+    dismiss();
+    refocusActiveTerminal();
+  };
   const confirm = () => {
     dismiss();
     closeTabNow(target);
+    refocusActiveTerminal();
   };
   return (
-    <Dialog onClose={dismiss} width={360} closeOnBackdrop data-testid="close-tab-confirm">
-      <DialogHeader title={t('surface.closeConfirm')} />
+    <Dialog onClose={cancel} width={360} closeOnBackdrop data-testid="close-tab-confirm">
+      <DialogHeader
+        title={tabTitle ? t('surface.closeTabNamed', { name: tabTitle }) : t('surface.closeTab')}
+        description={t('surface.closeConfirm')}
+      />
       <DialogFooter>
-        <Button variant="secondary" size="sm" onClick={dismiss} data-close-tab-cancel>
+        <Button variant="secondary" size="sm" onClick={cancel} data-close-tab-cancel>
           {t('common.cancel')}
         </Button>
         <Button variant="danger" size="sm" onClick={confirm} data-close-tab-confirm>
-          {t('workspace.closeConfirmYes')}
+          {t('surface.closeTab')}
         </Button>
       </DialogFooter>
     </Dialog>

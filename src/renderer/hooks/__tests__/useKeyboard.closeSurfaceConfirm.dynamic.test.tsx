@@ -8,6 +8,7 @@ import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { useKeyboard } from '../useKeyboard';
 import CloseTabConfirm from '../../components/Pane/CloseTabConfirm';
+import { terminalRegistry } from '../useTerminal';
 import { useStore } from '../../stores';
 import type { Workspace } from '../../../shared/types';
 
@@ -27,6 +28,31 @@ function click(selector: string): void {
   const el = document.querySelector<HTMLButtonElement>(selector);
   if (!el) throw new Error(`missing ${selector}`);
   act(() => el.click());
+}
+
+function dialog(): HTMLElement | null {
+  return document.querySelector<HTMLElement>('[data-testid="close-tab-confirm"]');
+}
+
+function keydown(key: string, init: KeyboardEventInit = {}): void {
+  act(() => {
+    (document.activeElement ?? document.body).dispatchEvent(
+      new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, ...init }),
+    );
+  });
+}
+
+async function nextFrame(): Promise<void> {
+  await act(async () => {
+    await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)));
+  });
+}
+
+/** Stand-in xterm for the tab left active, so focus return can be observed. */
+function registerTerminal(ptyId: string) {
+  const term = { focus: vi.fn() };
+  terminalRegistry.set(ptyId, term as never);
+  return term;
 }
 
 function confirmOpen(): boolean {
@@ -78,6 +104,8 @@ afterEach(() => {
   act(() => root.unmount());
   container.remove();
   act(() => useStore.getState().dismissCloseTab());
+  terminalRegistry.delete('pty-1');
+  terminalRegistry.delete('pty-2');
 });
 
 describe('close-tab shortcut confirmation', () => {
@@ -106,5 +134,41 @@ describe('close-tab shortcut confirmation', () => {
     pressCloseTab(true);
     expect(confirmOpen()).toBe(false);
     expect(surfaceIds()).toEqual(['s-1', 's-2']);
+  });
+
+  it('names the tab and labels the button as closing a tab, not a workspace', () => {
+    pressCloseTab();
+    const text = dialog()?.textContent ?? '';
+    expect(text).toContain('Close two');
+    expect(document.querySelector('[data-close-tab-confirm]')?.textContent).toBe('Close tab');
+  });
+
+  it('starts on Cancel and lets the keyboard reach Close', () => {
+    pressCloseTab();
+    const cancel = document.querySelector('[data-close-tab-cancel]');
+    const close = document.querySelector('[data-close-tab-confirm]');
+    expect(document.activeElement).toBe(cancel);
+    // Shift+Tab from the first control wraps to the last one: Close.
+    keydown('Tab', { shiftKey: true });
+    expect(document.activeElement).toBe(close);
+  });
+
+  it('cancels on Escape and hands focus back to the terminal', async () => {
+    const term = registerTerminal('pty-2');
+    pressCloseTab();
+    keydown('Escape');
+    expect(confirmOpen()).toBe(false);
+    expect(surfaceIds()).toEqual(['s-1', 's-2']);
+    await nextFrame();
+    expect(term.focus).toHaveBeenCalled();
+  });
+
+  it('focuses the terminal left active after the tab closes', async () => {
+    const term = registerTerminal('pty-1');
+    pressCloseTab();
+    click('[data-close-tab-confirm]');
+    expect(surfaceIds()).toEqual(['s-1']);
+    await nextFrame();
+    expect(term.focus).toHaveBeenCalled();
   });
 });
