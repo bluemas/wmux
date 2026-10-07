@@ -5988,7 +5988,9 @@ function wireEvents(
       const event: DaemonEvent = {
         type: 'session.died',
         sessionId: payload.id,
-        data: { exitCode: payload.exitCode },
+        // signal: a killed shell reports exitCode 0 with the signal beside it,
+        // so the renderer needs both to tell `exit` from `kill -9` (#1838).
+        data: { exitCode: payload.exitCode, ...(typeof payload.signal === 'number' ? { signal: payload.signal } : {}) },
       };
       pipeServer.broadcast(event);
     } catch (err) {

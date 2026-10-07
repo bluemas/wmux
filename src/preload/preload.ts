@@ -298,8 +298,11 @@ const electronAPI = {
       ipcRenderer.on(IPC.PTY_DATA, listener);
       return () => { ipcRenderer.removeListener(IPC.PTY_DATA, listener); };
     },
-    onExit: (callback: (id: string, exitCode: number) => void) => {
-      const listener = (_event: Electron.IpcRendererEvent, id: string, exitCode: number) => callback(id, exitCode);
+    // `signal` is the killing signal (non-zero) or null/0 for a normal exit;
+    // node-pty reports a signalled process with exitCode 0.
+    onExit: (callback: (id: string, exitCode: number, signal?: number | null) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, id: string, exitCode: number, signal?: number | null) =>
+        callback(id, exitCode, signal);
       ipcRenderer.on(IPC.PTY_EXIT, listener);
       return () => { ipcRenderer.removeListener(IPC.PTY_EXIT, listener); };
     },

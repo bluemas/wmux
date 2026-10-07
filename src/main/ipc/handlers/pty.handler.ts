@@ -1438,16 +1438,16 @@ export function registerPTYHandlers(
   }));
 
   // Listen for daemon session:died events and forward to renderer
-  let onDaemonSessionDied: ((payload: { sessionId: string; exitCode: number | null }) => void) | null = null;
+  let onDaemonSessionDied: ((payload: { sessionId: string; exitCode: number | null; signal?: number }) => void) | null = null;
   if (useDaemon && daemonClient) {
-    onDaemonSessionDied = (payload: { sessionId: string; exitCode: number | null }) => {
+    onDaemonSessionDied = (payload: { sessionId: string; exitCode: number | null; signal?: number }) => {
       // P1-3 ordering rule: drain buffered output before the exit marker so
       // the shell's final lines land ahead of "[Process exited...]" (same
       // drain-before-exit contract as local-mode PTYBridge).
       dataBatcher.flushSession(payload.sessionId);
       const win = getWindow?.();
       if (win && !win.isDestroyed()) {
-        win.webContents.send(IPC.PTY_EXIT, payload.sessionId, payload.exitCode ?? -1);
+        win.webContents.send(IPC.PTY_EXIT, payload.sessionId, payload.exitCode ?? -1, payload.signal ?? null);
       }
       daemonClient.disconnectSessionPipe(payload.sessionId).catch(() => {});
       // Prune this session's pid-map anchor now that the shell is gone, so the
