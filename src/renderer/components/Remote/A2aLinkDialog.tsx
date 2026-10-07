@@ -183,7 +183,7 @@ export default function A2aLinkDialog({ local: end, onClose }: A2aLinkDialogProp
     const ws = s.workspaces.find((w) => w.id === workspaceId);
     if (ws && !paneId) return { found: true, workspaceName: ws.name, label: A2A_BRAIN_ALIAS, cwd: '' };
     if (!ws || !getWorkspaceLeafPanes(ws).some((l) => l.id === paneId)) return { found: false, workspaceName: '', label: paneId, cwd: '' };
-    const pane = buildPaneSnapshot({ workspaces: [ws], surfaceAgent: s.surfaceAgent }).workspaces[0].panes.find((x) => x.paneId === paneId);
+    const pane = buildPaneSnapshot({ workspaces: [ws], surfaceAgent: s.surfaceAgent, paneLabel: s.paneLabel }).workspaces[0].panes.find((x) => x.paneId === paneId);
     return { found: true, workspaceName: ws.name, label: pane?.label ?? paneId, cwd: pane?.cwd ?? '' };
   }));
 

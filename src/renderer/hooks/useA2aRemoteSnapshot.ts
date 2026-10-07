@@ -5,7 +5,7 @@ import type { AgentSlug } from '../../shared/events';
 import type { A2aRemotePaneSnapshot } from '../../shared/rpc';
 import type { MoaState } from '../../shared/moa';
 import { getWorkspaceLeafPanes } from '../../shared/paneUtils';
-import { computePaneAutoName, paneDisplayName } from '../utils/paneNaming';
+import { leafDisplayName } from '../utils/paneNaming';
 
 /** Coalesce bursts (a split, a rename, a cwd change) into one send. */
 export const A2A_SNAPSHOT_DEBOUNCE_MS = 400;
@@ -13,6 +13,8 @@ export const A2A_SNAPSHOT_DEBOUNCE_MS = 400;
 interface SnapshotSource {
   workspaces: Workspace[];
   surfaceAgent: Record<string, { name: string; slug?: AgentSlug }>;
+  /** User pane labels (the header's source); absent in callers that have none. */
+  paneLabel?: Record<string, string>;
   /** Main's Moa state; null/absent = unknown, treated as no Moa. */
   moa?: MoaState | null;
 }
@@ -57,7 +59,7 @@ export function buildPaneSnapshot(s: SnapshotSource): A2aRemotePaneSnapshot {
       panes: getWorkspaceLeafPanes(ws).map((leaf) => {
         const surface = leaf.surfaces.find((x) => x.id === leaf.activeSurfaceId) ?? leaf.surfaces[0];
         const agent = surface?.ptyId ? s.surfaceAgent[surface.ptyId] : undefined;
-        const label = paneDisplayName(leaf.metadata?.label, computePaneAutoName(ws.wsOrdinal ?? 0, leaf.ordinal ?? 0, agent?.slug));
+        const label = leafDisplayName(s.paneLabel, ws, leaf, agent?.slug);
         const cwd = surface?.cwd || ws.metadata?.cwd;
         const agentName = agent?.slug ?? agent?.name;
         return {
@@ -87,8 +89,9 @@ export function useA2aRemoteSnapshot(): void {
     const flush = (): void => {
       timer = null;
       const state = useStore.getState();
-      if (!state.sessionRestored) return;
-      // Restored: from here an empty tree is real (main believes it).
+      // Only after the startup load settled (a first run with no session
+      // included): from here an empty tree is real (main believes it).
+      if (!state.sessionRestored && !state.sessionLoadSettled) return;
       const snapshot: A2aRemotePaneSnapshot = { ...buildPaneSnapshot(state), sessionRestored: true };
       const key = JSON.stringify(snapshot);
       if (key === lastKey) return;
@@ -105,8 +108,10 @@ export function useA2aRemoteSnapshot(): void {
       if (
         s.workspaces !== prev.workspaces ||
         s.surfaceAgent !== prev.surfaceAgent ||
+        s.paneLabel !== prev.paneLabel ||
         s.moa !== prev.moa ||
-        s.sessionRestored !== prev.sessionRestored
+        s.sessionRestored !== prev.sessionRestored ||
+        s.sessionLoadSettled !== prev.sessionLoadSettled
       ) schedule();
     });
     schedule();
