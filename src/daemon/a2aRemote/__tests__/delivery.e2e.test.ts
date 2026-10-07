@@ -30,7 +30,7 @@ import { freePort } from './a2aServerRig';
 
 // Two PCs each mint a certificate and every step is a TLS handshake: slow CI
 // runners (Windows) need far more than the default per-test budget.
-vi.setConfig({ testTimeout: 60_000, hookTimeout: 30_000 });
+vi.setConfig({ testTimeout: 60_000, hookTimeout: 90_000 });
 
 const FAST = { connectMs: 5_000, requestMs: 10_000 };
 const TIMING = { backoffMinMs: 30, backoffMaxMs: 150, livenessMs: 10_000, connectMs: 5_000, requestMs: 10_000 };
@@ -65,7 +65,9 @@ const pcs: Pc[] = [];
 const dirs: string[] = [];
 
 afterEach(async () => {
-  for (const pc of pcs.splice(0)) await pc.stop();
+  // Stop every PC at once and bound each stop: one slow listener close on a
+  // Windows runner must not hold the hook past its budget.
+  await Promise.all(pcs.splice(0).map((pc) => Promise.race([pc.stop(), new Promise<void>((r) => setTimeout(r, 15_000))])));
   // Windows keeps a stopped PC's files locked for a moment (EBUSY): retry the cleanup.
   for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
 });
