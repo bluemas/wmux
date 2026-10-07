@@ -1,0 +1,176 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { formatPeerCredential, parsePeerCredential } from '../../../shared/a2aRemote';
+import { atomicWriteJSONSync } from '../../util/atomicWrite';
+import { LAST_SEEN_PERSIST_MS } from '../../web/DeviceStore';
+import { PEERS_FILE, PeerStore, type PeerStoreOptions } from '../peerStore';
+
+const HOST = '11111111-1111-4111-8111-111111111111';
+const HOST2 = '22222222-2222-4222-8222-222222222222';
+
+let dir: string;
+let fail = false;
+let writes = 0;
+let clock = 1_700_000_000_000;
+const flakyWrite = (p: string, d: unknown): void => {
+  writes += 1;
+  if (fail) throw new Error('disk full');
+  atomicWriteJSONSync(p, d);
+};
+const make = (o: Partial<PeerStoreOptions> = {}): PeerStore =>
+  new PeerStore({ dir, now: () => clock, scheduleHarden: () => undefined, write: flakyWrite, ...o });
+
+beforeEach(() => {
+  fail = false;
+  writes = 0;
+  clock = 1_700_000_000_000;
+  dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a2a-peers-'));
+});
+afterEach(() => {
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+describe('PeerStore', () => {
+  it('mint issues a credential the contract parser accepts', async () => {
+    const s = make();
+    const c = await s.mint({ hostId: HOST, name: 'Desk PC' });
+    expect(parsePeerCredential(formatPeerCredential(c))).toEqual(c);
+    expect(Buffer.from(c.secret, 'base64url')).toHaveLength(32);
+  });
+
+  it('never writes the secret to disk', async () => {
+    const s = make();
+    const c = await s.mint({ hostId: HOST, name: 'Desk PC' });
+    const raw = fs.readFileSync(path.join(dir, PEERS_FILE), 'utf-8');
+    expect(raw).not.toContain(c.secret);
+    expect(JSON.parse(raw)).toMatchObject({ v: 1, peers: [{ v: 1, peerId: c.peerId, hostId: HOST }] });
+  });
+
+  it('resolves the right secret, and a fresh instance (no cache) does too', async () => {
+    const s = make();
+    const c = await s.mint({ hostId: HOST, name: 'Desk PC' });
+    const want = { ok: true, peerId: c.peerId, hostId: HOST, name: 'Desk PC' };
+    expect(await s.resolve(c.peerId, c.secret)).toEqual(want);
+    expect(await make().resolve(c.peerId, c.secret)).toEqual(want);
+  });
+
+  it('a wrong secret is unknown (cached and uncached)', async () => {
+    const s = make();
+    const c = await s.mint({ hostId: HOST, name: 'a' });
+    const wrong = `${c.secret.slice(0, -1)}${c.secret.endsWith('A') ? 'B' : 'A'}`;
+    expect(await s.resolve(c.peerId, wrong)).toEqual({ ok: false, reason: 'unknown' });
+    expect(await make().resolve(c.peerId, wrong)).toEqual({ ok: false, reason: 'unknown' });
+    expect(await s.resolve(c.peerId, '')).toEqual({ ok: false, reason: 'unknown' });
+  });
+
+  it("another peer's secret is unknown", async () => {
+    const s = make();
+    const a = await s.mint({ hostId: HOST, name: 'a' });
+    const b = await s.mint({ hostId: HOST2, name: 'b' });
+    expect(await s.resolve(a.peerId, b.secret)).toEqual({ ok: false, reason: 'unknown' });
+    expect(await s.resolve(b.peerId, a.secret)).toEqual({ ok: false, reason: 'unknown' });
+  });
+
+  it('an unknown peerId is unknown', async () => {
+    const c = await make().mint({ hostId: HOST, name: 'a' });
+    expect(await make().resolve('33333333-3333-4333-8333-333333333333', c.secret)).toEqual({ ok: false, reason: 'unknown' });
+  });
+
+  it('revoked answers revoked — even with a wrong secret — and survives a restart', async () => {
+    const s = make();
+    const c = await s.mint({ hostId: HOST, name: 'a' });
+    expect(s.revoke(c.peerId)).toBe(true);
+    expect(s.revoke(c.peerId)).toBe(false);
+    expect(await s.resolve(c.peerId, c.secret)).toEqual({ ok: false, reason: 'revoked' });
+    expect(await s.resolve(c.peerId, 'wrong')).toEqual({ ok: false, reason: 'revoked' });
+    expect(await make().resolve(c.peerId, c.secret)).toEqual({ ok: false, reason: 'revoked' });
+  });
+
+  it('list never exposes hash, salt or kdf', async () => {
+    const s = make();
+    const c = await s.mint({ hostId: HOST, name: '  Desk\u0007PC  ' });
+    expect(s.list()).toEqual([
+      { v: 1, peerId: c.peerId, hostId: HOST, name: 'Desk PC', createdAt: new Date(clock).toISOString() },
+    ]);
+  });
+
+  it('touch updates lastSeenAt in memory and persists at most once per window', async () => {
+    const s = make();
+    const c = await s.mint({ hostId: HOST, name: 'a' });
+    const base = writes;
+    clock += 1000;
+    s.touch(c.peerId);
+    expect(writes).toBe(base);
+    expect(s.list()[0].lastSeenAt).toBe(new Date(clock).toISOString());
+    clock += LAST_SEEN_PERSIST_MS;
+    s.touch(c.peerId);
+    expect(writes).toBe(base + 1);
+    expect(make().list()[0].lastSeenAt).toBe(new Date(clock).toISOString());
+  });
+
+  it('touch swallows a write failure', async () => {
+    const s = make();
+    const c = await s.mint({ hostId: HOST, name: 'a' });
+    fail = true;
+    clock += LAST_SEEN_PERSIST_MS;
+    expect(() => s.touch(c.peerId)).not.toThrow();
+  });
+
+  it('mint rolls back and throws when the write fails', async () => {
+    const s = make();
+    fail = true;
+    await expect(s.mint({ hostId: HOST, name: 'a' })).rejects.toThrow('disk full');
+    expect(s.list()).toEqual([]);
+  });
+
+  it('revoke keeps the in-memory revocation when the write fails', async () => {
+    const s = make();
+    const c = await s.mint({ hostId: HOST, name: 'a' });
+    fail = true;
+    expect(() => s.revoke(c.peerId)).toThrow('disk full');
+    expect(await s.resolve(c.peerId, c.secret)).toEqual({ ok: false, reason: 'revoked' });
+  });
+
+  it('rejects an invalid hostId', async () => {
+    await expect(make().mint({ hostId: 'nope', name: 'a' })).rejects.toThrow();
+  });
+
+  describe('corrupt file is fail-closed', () => {
+    it('malformed JSON: nobody authenticates, original kept, error logged', async () => {
+      const c = await make().mint({ hostId: HOST, name: 'a' });
+      const file = path.join(dir, PEERS_FILE);
+      fs.writeFileSync(file, '{"v":1,"peers":[');
+      const log = vi.fn();
+      const s = make({ log });
+      expect(await s.resolve(c.peerId, c.secret)).toEqual({ ok: false, reason: 'unknown' });
+      expect(s.list()).toEqual([]);
+      expect(fs.existsSync(`${file}.corrupt-${clock}`)).toBe(true);
+      expect(log).toHaveBeenCalledWith('error', expect.stringContaining('corrupt'));
+    });
+
+    it('one bad record rejects every record, and .bak is not resurrected', async () => {
+      const s = make();
+      const a = await s.mint({ hostId: HOST, name: 'a' });
+      await s.mint({ hostId: HOST2, name: 'b' }); // leaves a .bak holding peer a
+      const file = path.join(dir, PEERS_FILE);
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf-8'));
+      parsed.peers[1].kdf.N = 1 << 30; // out of bounds
+      fs.writeFileSync(file, JSON.stringify(parsed));
+      const t = make();
+      expect(await t.resolve(a.peerId, a.secret)).toEqual({ ok: false, reason: 'unknown' });
+    });
+
+    it('a malformed revokedAt rejects the file rather than reviving the peer', async () => {
+      const s = make();
+      const a = await s.mint({ hostId: HOST, name: 'a' });
+      s.revoke(a.peerId);
+      const file = path.join(dir, PEERS_FILE);
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf-8'));
+      parsed.peers[0].revokedAt = 'not a date';
+      fs.writeFileSync(file, JSON.stringify(parsed));
+      expect(await make().resolve(a.peerId, a.secret)).toEqual({ ok: false, reason: 'unknown' });
+    });
+  });
+});
