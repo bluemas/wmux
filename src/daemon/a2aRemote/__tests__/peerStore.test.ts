@@ -174,6 +174,27 @@ describe('PeerStore', () => {
     expect(await s.resolve(a.peerId, a.secret)).toMatchObject({ ok: true });
   });
 
+  it('concurrent wrong secrets for one peer derive at most the budget', async () => {
+    const c = await make().mint({ hostId: HOST, name: 'a' });
+    const t = make(); // fresh instance: no verified cache
+    const results = await Promise.all(
+      Array.from({ length: 20 }, (_, i) => t.resolve(c.peerId, `${'w'.repeat(42)}${String.fromCharCode(65 + i)}`)),
+    );
+    expect(results.every((r) => !r.ok && r.reason === 'unknown')).toBe(true);
+    expect(t.stats().derivations).toBe(FAILURES_PER_WINDOW);
+    // The budget is spent, so even the right secret is refused inside the window.
+    expect(await t.resolve(c.peerId, c.secret)).toEqual({ ok: false, reason: 'unknown' });
+    expect(t.stats().derivations).toBe(FAILURES_PER_WINDOW);
+  });
+
+  it('concurrent right secrets for one peer cost a single derivation', async () => {
+    const c = await make().mint({ hostId: HOST, name: 'a' });
+    const t = make();
+    const results = await Promise.all(Array.from({ length: 10 }, () => t.resolve(c.peerId, c.secret)));
+    expect(results.every((r) => r.ok)).toBe(true);
+    expect(t.stats().derivations).toBe(1);
+  });
+
   it('a failed lastSeenAt write is retried on the next touch', async () => {
     const s = make();
     const c = await s.mint({ hostId: HOST, name: 'a' });

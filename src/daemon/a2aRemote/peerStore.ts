@@ -37,7 +37,10 @@ import {
  * the derivation is the ASYNC `crypto.scrypt` (a wrong secret must not stall
  * the event loop) and wrong secrets are rate-limited per peerId: past
  * `FAILURES_PER_WINDOW` failures in `FAILURE_WINDOW_MS`, `resolve` answers
- * `unknown` without deriving.
+ * `unknown` without deriving. Derivations are SERIALIZED per peerId, and
+ * each one re-checks the cache and the budget once its turn comes, so N
+ * concurrent wrong secrets cost at most the budget in derivations (not N in
+ * parallel) and N concurrent right ones cost a single derivation.
  *
  * One live peer per hostId: `mint` refuses a hostId that already has an
  * unrevoked peer, so a joiner cannot quietly re-pair as (or over) a host the
@@ -107,6 +110,8 @@ export class PeerStore {
   private readonly verified = new Map<string, { secretDigest: Buffer; hashHex: string }>();
   private readonly lastSeenPersistedAt = new Map<string, number>();
   private readonly failures = new Map<string, { windowStart: number; count: number }>();
+  /** Tail of each peerId's derivation queue; absent when nothing is queued. */
+  private readonly kdfChains = new Map<string, Promise<void>>();
   private writable = true;
   private derivations = 0;
 
@@ -198,10 +203,9 @@ export class PeerStore {
       this.noteFailure(rec.peerId);
       return REJECT_UNKNOWN;
     }
-    if (!(await this.verify(rec, secret))) {
-      this.noteFailure(rec.peerId);
-      return REJECT_UNKNOWN;
-    }
+    // `verify` records its own failures inside the per-peer queue, so the next
+    // queued attempt already sees them.
+    if (!(await this.verify(rec, secret))) return REJECT_UNKNOWN;
     // Revoked while the derivation was in flight.
     if (rec.revokedAt !== undefined || this.peers.get(rec.peerId) !== rec) return REJECT_REVOKED;
     return { ok: true, peerId: rec.peerId, hostId: rec.hostId, name: rec.name };
@@ -268,27 +272,55 @@ export class PeerStore {
     else f.count += 1;
   }
 
-  /** Constant-time; no branch on the presented secret's length (see DeviceStore.verify). */
+  /**
+   * Constant-time; no branch on the presented secret's length (see
+   * DeviceStore.verify). A cache hit answers at once; a miss waits its turn in
+   * the peer's derivation queue, then re-checks the cache (an earlier turn may
+   * have verified this very secret) and the failure budget (earlier turns may
+   * have spent it) before deriving. Failures are recorded inside the turn.
+   */
   private async verify(rec: StoredPeer, secret: string): Promise<boolean> {
     const secretBuf = Buffer.from(secret, 'utf8');
     const digest = sha256(secretBuf);
+    if (this.cacheHit(rec, digest)) return true;
+    return this.serializeKdf(rec.peerId, async () => {
+      if (this.cacheHit(rec, digest)) return true;
+      if (this.overBudget(rec.peerId)) return false;
+      let derived: Buffer;
+      try {
+        this.derivations += 1;
+        derived = await derive(secretBuf, Buffer.from(rec.salt, 'hex'), rec.kdf);
+      } catch (err) {
+        this.log('warn', `[a2a-remote] peer ${rec.peerId} hash could not be derived: ${errMsg(err)}`);
+        this.noteFailure(rec.peerId);
+        return false;
+      }
+      const expected = Buffer.from(rec.secretHash, 'hex');
+      const ok = expected.length === derived.length && crypto.timingSafeEqual(derived, expected);
+      if (ok) this.rememberVerified(rec.peerId, digest, rec.secretHash);
+      else this.noteFailure(rec.peerId);
+      return ok;
+    });
+  }
+
+  private cacheHit(rec: StoredPeer, digest: Buffer): boolean {
     const cached = this.verified.get(rec.peerId);
-    if (cached && cached.hashHex === rec.secretHash && crypto.timingSafeEqual(digest, cached.secretDigest)) {
-      return true;
-    }
-    let derived: Buffer;
-    try {
-      this.derivations += 1;
-      derived = await derive(secretBuf, Buffer.from(rec.salt, 'hex'), rec.kdf);
-    } catch (err) {
-      this.log('warn', `[a2a-remote] peer ${rec.peerId} hash could not be derived: ${errMsg(err)}`);
-      return false;
-    }
-    const expected = Buffer.from(rec.secretHash, 'hex');
-    if (expected.length !== derived.length) return false;
-    const ok = crypto.timingSafeEqual(derived, expected);
-    if (ok) this.rememberVerified(rec.peerId, digest, rec.secretHash);
-    return ok;
+    return cached !== undefined && cached.hashHex === rec.secretHash && crypto.timingSafeEqual(digest, cached.secretDigest);
+  }
+
+  /** Run `fn` after every earlier queued derivation for `peerId` has settled. */
+  private serializeKdf<T>(peerId: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.kdfChains.get(peerId) ?? Promise.resolve();
+    const run = prev.then(fn);
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.kdfChains.set(peerId, tail);
+    void tail.then(() => {
+      if (this.kdfChains.get(peerId) === tail) this.kdfChains.delete(peerId);
+    });
+    return run;
   }
 
   private rememberVerified(peerId: string, secretDigest: Buffer, hashHex: string): void {
