@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { useStore } from '../../stores';
 import { getWorkspaceLeafPanes } from '../../../shared/paneUtils';
@@ -100,8 +100,14 @@ export function A2aExposureChecklistView(p: A2aExposureChecklistViewProps) {
 export function A2aExposureChecklist({ hostId, pcName, t }: { hostId: string; pcName: string; t: T }) {
   const api = window.electronAPI?.a2aRemote;
   const [exposure, setExposure] = useState<ExposureLists>({ workspaceIds: [], paneIds: {} });
+  // Nothing can be ticked until the saved exposure is read: a tick before
+  // that would write over it from an empty start.
+  const [loaded, setLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState(false);
+  // Writes run one at a time, each applied to the latest saved exposure.
+  const latest = useRef<ExposureLists>({ workspaceIds: [], paneIds: {} });
+  const queue = useRef<Promise<void>>(Promise.resolve());
   const moaAvailable = useStore((s) => moaBrainEnd(s) !== null);
   const shape = useStore(useShallow((s) => listedWorkspaces(s.workspaces, moaHqId(s)).map((ws) =>
     JSON.stringify({
@@ -117,24 +123,33 @@ export function A2aExposureChecklist({ hostId, pcName, t }: { hostId: string; pc
 
   useEffect(() => {
     let live = true;
-    void api?.exposureGet(hostId).then((r) => {
-      if (!live || !r?.exposure) return;
-      setExposure(listsOf(r.exposure));
-    }).catch(() => undefined);
+    setLoaded(false);
+    if (!api) return;
+    void api.exposureGet(hostId).then((r) => {
+      if (!live) return;
+      const next = r?.exposure ? listsOf(r.exposure) : { workspaceIds: [], paneIds: {} };
+      latest.current = next;
+      setExposure(next);
+      setLoaded(true);
+    }).catch(() => { if (live) setFailed(true); });
     return () => { live = false; };
   }, [api, hostId]);
 
-  const write = useCallback(async (next: ExposureLists) => {
+  const write = useCallback((op: (cur: ExposureLists) => ExposureLists) => {
     if (!api) return;
     setBusy(true); setFailed(false);
-    try {
-      const r = await api.exposureSet(hostId, next.workspaceIds, next.paneIds, next.brain === true);
-      if (r?.exposure) setExposure(listsOf(r.exposure));
-    } catch {
-      setFailed(true);
-    } finally {
-      setBusy(false);
-    }
+    queue.current = queue.current.then(async () => {
+      const next = op(latest.current);
+      try {
+        const r = await api.exposureSet(hostId, next.workspaceIds, next.paneIds, next.brain === true);
+        if (r?.exposure) {
+          latest.current = listsOf(r.exposure);
+          setExposure(latest.current);
+        }
+      } catch {
+        setFailed(true);
+      }
+    }).finally(() => setBusy(false));
   }, [api, hostId]);
 
   return (
@@ -143,11 +158,14 @@ export function A2aExposureChecklist({ hostId, pcName, t }: { hostId: string; pc
         pcName={pcName}
         workspaces={workspaces}
         exposure={exposure}
-        busy={busy}
+        busy={busy || !loaded}
         moaAvailable={moaAvailable}
-        onToggleBrain={(on) => void write({ ...exposure, brain: on })}
-        onToggleWorkspace={(ws, on) => void write(toggleWorkspaceExposure(exposure, ws, workspaces.find((w) => w.id === ws)?.panes.map((x) => x.id) ?? [], on))}
-        onTogglePane={(ws, pane, on) => void write(togglePaneExposure(exposure, ws, pane, on))}
+        onToggleBrain={(on) => write((cur) => ({ ...cur, brain: on }))}
+        onToggleWorkspace={(ws, on) => {
+          const ids = workspaces.find((w) => w.id === ws)?.panes.map((x) => x.id) ?? [];
+          write((cur) => toggleWorkspaceExposure(cur, ws, ids, on));
+        }}
+        onTogglePane={(ws, pane, on) => write((cur) => togglePaneExposure(cur, ws, pane, on))}
         t={t}
       />
       {failed && <p className="wmux-a2a-note" data-tone="danger">{t('settings.a2aRemoteActionFailed')}</p>}

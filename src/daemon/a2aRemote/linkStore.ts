@@ -68,7 +68,7 @@ export const LINKS_PER_HOST_MAX = 64;
 export const TERMINAL_KEEP = 256;
 
 type EndedReason = NonNullable<A2aLinkRecordV1['endedReason']>;
-export type BrokenReason = Extract<EndedReason, 'pane-closed' | 'pane-moved' | 'workspace-gone'>;
+export type BrokenReason = Extract<EndedReason, 'pane-closed' | 'pane-moved' | 'workspace-gone' | 'exposure-revoked'>;
 /** The `link` field of a lifecycle envelope. */
 export type LinkNotice = NonNullable<A2aRemoteEnvelope['link']>;
 
@@ -93,7 +93,9 @@ export type LinkCheckResult =
     };
 
 const TERMINAL: ReadonlySet<A2aLinkState> = new Set(['revoked', 'broken']);
-const BROKEN_REASONS: ReadonlySet<string> = new Set(['pane-closed', 'pane-moved', 'workspace-gone']);
+const BROKEN_REASONS: ReadonlySet<string> = new Set(['pane-closed', 'pane-moved', 'workspace-gone', 'exposure-revoked']);
+/** A `proposed-in` link nobody decided on is dropped after this long. */
+export const PROPOSAL_TTL_MS = 24 * 60 * 60 * 1000;
 const REVOKED_REASONS: ReadonlySet<string> = new Set(['revoked-local', 'revoked-remote']);
 const STATES: ReadonlySet<string> = new Set(['proposed-out', 'proposed-in', 'active', 'revoked', 'broken']);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -220,6 +222,27 @@ export class LinkStore {
       this.links.set(linkId, rec);
       throw err;
     }
+  }
+
+  /**
+   * Drop (`revoked-local`) every `proposed-in` link older than `ttlMs` that
+   * nobody accepted or declined, so a proposal whose sender went silent does
+   * not stay acceptable forever. Returns the links it ended.
+   */
+  expireProposals(ttlMs: number = PROPOSAL_TTL_MS): A2aLinkRecordV1[] {
+    const cutoff = this.now() - ttlMs;
+    const stale = [...this.links.values()].filter((r) => r.state === 'proposed-in' && Date.parse(r.createdAt) < cutoff);
+    const ended: A2aLinkRecordV1[] = [];
+    for (const rec of stale) {
+      try {
+        ended.push(this.revoke(rec.linkId, 'local'));
+      } catch (err) {
+        this.log('error', `[a2a-remote] expired proposal ${rec.linkId} not persisted: ${err instanceof Error ? err.message : String(err)}`);
+        const now = this.links.get(rec.linkId);
+        if (now) ended.push(structuredClone(now));
+      }
+    }
+    return ended;
   }
 
   /** Our human accepted a `proposed-in` link. */
@@ -381,7 +404,8 @@ export class LinkStore {
     }
 
     const at = new Date(this.now()).toISOString();
-    const rec: A2aLinkRecordV1 = { v: A2A_REMOTE_RECORD_V, linkId, version: 1, state, ...clean, createdAt: at, updatedAt: at };
+    const proposer = state === 'proposed-out' ? 'local' : 'remote';
+    const rec: A2aLinkRecordV1 = { v: A2A_REMOTE_RECORD_V, linkId, version: 1, state, ...clean, proposer, createdAt: at, updatedAt: at };
     this.links.set(linkId, rec);
     try {
       this.persist();
@@ -526,7 +550,9 @@ function coerceFile(raw: unknown): A2aLinkRecordV1[] | null {
   const seen = new Set<string>();
   for (const r of raw['links']) {
     if (!isPlainObject(r) || r['v'] !== 1) return null;
-    const { linkId, version, state, endedReason, createdAt, updatedAt } = r;
+    const { linkId, version, state, endedReason, proposer, createdAt, updatedAt } = r;
+    if (proposer !== 'local' && proposer !== 'remote') return null;
+    if ((state === 'proposed-out' && proposer !== 'local') || (state === 'proposed-in' && proposer !== 'remote')) return null;
     if (typeof linkId !== 'string' || !UUID_RE.test(linkId) || seen.has(linkId)) return null;
     if (typeof version !== 'number' || !Number.isInteger(version) || version < 1) return null;
     if (typeof state !== 'string' || !STATES.has(state)) return null;
@@ -544,6 +570,7 @@ function coerceFile(raw: unknown): A2aLinkRecordV1[] | null {
       version,
       state: state as A2aLinkState,
       ...clean,
+      proposer,
       createdAt,
       updatedAt,
       ...(endedReason !== undefined ? { endedReason: endedReason as EndedReason } : {}),

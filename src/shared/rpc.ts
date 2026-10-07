@@ -1458,7 +1458,12 @@ export interface A2aRemoteLinksListResult {
  */
 export type A2aRemoteLinkResult =
   | { ok: true; link: A2aLinkRecordV1; remoteNotified?: boolean }
-  | { ok: false; error: A2aRemoteCallError; message?: string };
+  /**
+   * `uncertain` (propose only): the request went out but no answer came back,
+   * so the other PC may hold it. `link` stays `proposed-out` here; Check
+   * (`refresh`) settles it.
+   */
+  | { ok: false; error: A2aRemoteCallError; message?: string; uncertain?: boolean; link?: A2aLinkRecordV1 };
 
 /** One end of a joiner's proposal; names and repo are display only on the other PC. */
 export interface A2aRemoteProposePane {
@@ -1508,4 +1513,12 @@ export interface A2aRemotePaneSnapshot {
   }>;
   /** This PC's Moa: present while Moa is on and its HQ workspace exists. */
   brain?: { workspaceId: string; name: string };
+  /**
+   * How sure the renderer is about Moa: 'present' (brain above), 'off'
+   * (turned off, or no HQ: its links may break), 'unknown' (state not read
+   * yet, or the HQ briefly missing: keep the last known Moa for a while).
+   */
+  brainState?: 'present' | 'off' | 'unknown';
+  /** Sent once the saved session is restored: an empty tree then is real. */
+  sessionRestored?: true;
 }

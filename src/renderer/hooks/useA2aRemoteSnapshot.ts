@@ -9,8 +9,6 @@ import { computePaneAutoName, paneDisplayName } from '../utils/paneNaming';
 
 /** Coalesce bursts (a split, a rename, a cwd change) into one send. */
 export const A2A_SNAPSHOT_DEBOUNCE_MS = 400;
-/** How long the first snapshot waits for Moa's state before going without it. */
-export const A2A_MOA_WAIT_MS = 15_000;
 
 interface SnapshotSource {
   workspaces: Workspace[];
@@ -33,10 +31,26 @@ export function moaBrainEnd(s: SnapshotSource): { workspaceId: string; name: str
  * PC's Moa while it is on. Pure, so
  * the shape is testable without a store.
  */
+/**
+ * How sure we are about this PC's Moa. 'off' only when that is settled (Moa
+ * turned off, or no HQ / HQ deleted); a state not read yet, an unreadable HQ
+ * store or an HQ not in the tree right now is 'unknown', which main rides out
+ * on the last known Moa instead of breaking its links.
+ */
+export function moaBrainState(s: SnapshotSource): 'present' | 'off' | 'unknown' {
+  if (moaBrainEnd(s)) return 'present';
+  if (!s.moa) return 'unknown';
+  if (!s.moa.config.enabled) return 'off';
+  const hq = s.moa.hq;
+  if (hq.state === 'unset' || hq.state === 'hq-missing') return 'off';
+  return 'unknown';
+}
+
 export function buildPaneSnapshot(s: SnapshotSource): A2aRemotePaneSnapshot {
   const brain = moaBrainEnd(s);
   return {
     ...(brain ? { brain } : {}),
+    brainState: moaBrainState(s),
     workspaces: s.workspaces.map((ws) => ({
       id: ws.id,
       name: ws.name,
@@ -68,21 +82,14 @@ export function useA2aRemoteSnapshot(): void {
   useEffect(() => {
     const api = window.electronAPI?.a2aRemote;
     if (!api?.snapshot) return;
-    const mountedAt = Date.now();
     let lastKey = '';
     let timer: ReturnType<typeof setTimeout> | null = null;
     const flush = (): void => {
       timer = null;
       const state = useStore.getState();
       if (!state.sessionRestored) return;
-      // Moa's state not read yet: a snapshot without it would read as "Moa
-      // went away" and break its links. Wait for the first read, but not
-      // forever (a read that keeps failing must not stop publishing).
-      if (state.moa === null && typeof window.electronAPI?.deck?.moa?.state === 'function' && Date.now() - mountedAt < A2A_MOA_WAIT_MS) {
-        schedule();
-        return;
-      }
-      const snapshot = buildPaneSnapshot(state);
+      // Restored: from here an empty tree is real (main believes it).
+      const snapshot: A2aRemotePaneSnapshot = { ...buildPaneSnapshot(state), sessionRestored: true };
       const key = JSON.stringify(snapshot);
       if (key === lastKey) return;
       lastKey = key;

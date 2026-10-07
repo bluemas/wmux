@@ -9,6 +9,7 @@ import {
   LINKS_FILE,
   LINKS_PER_HOST_MAX,
   LinkStore,
+  PROPOSAL_TTL_MS,
   TERMINAL_KEEP,
   linkFromProposal,
   type LinkNotice,
@@ -368,6 +369,7 @@ describe('LinkStore persistence', () => {
     local: { kind: 'pane', workspaceId: 'ws1', paneId: 'p1' },
     remote: { hostId: HOST, kind: 'pane', workspaceId: 'rws', paneId: 'rp' },
     allow: { outbound: true, inbound: true },
+    proposer: 'local',
     createdAt: new Date(clock).toISOString(),
     updatedAt: new Date(clock).toISOString(),
     ...o,
@@ -387,6 +389,11 @@ describe('LinkStore persistence', () => {
     const t = make();
     expect(t.list()).toEqual(s.list());
     expect(t.checkMessage(a, 2, HOST, 'outbound', 'task')).toMatchObject({ ok: true });
+  });
+
+  it('a record without a proposer, or one that contradicts its state, is rejected', () => {
+    expectRejected([{ ...rawLink(), proposer: undefined }]);
+    expectRejected([rawLink({ state: 'proposed-in', proposer: 'local' })]);
   });
 
   it('a hand-written valid file loads', () => {
@@ -533,5 +540,30 @@ describe('LinkStore Moa (brain) ends', () => {
     raw.links[0].local['paneId'] = 'p';
     fs.writeFileSync(path.join(dir, LINKS_FILE), JSON.stringify(raw));
     expect(make().get(id)).toBeUndefined();
+  });
+});
+
+describe('LinkStore proposal expiry and proposer', () => {
+  it('records who proposed, and drops undecided incoming proposals after the TTL', () => {
+    const s = make();
+    const out = linkIn(s, 'proposed-out');
+    const inn = linkIn(s, 'proposed-in', at(2));
+    const act = linkIn(s, 'active', at(3));
+    expect(s.get(out)?.proposer).toBe('local');
+    expect(s.get(inn)?.proposer).toBe('remote');
+    clock += PROPOSAL_TTL_MS - 1;
+    expect(s.expireProposals()).toEqual([]);
+    clock += 2;
+    expect(s.expireProposals().map((l) => l.linkId)).toEqual([inn]);
+    expect(s.get(inn)).toMatchObject({ state: 'revoked', endedReason: 'revoked-local' });
+    expect(s.get(out)?.state).toBe('proposed-out');
+    expect(s.get(act)?.state).toBe('active');
+  });
+
+  it('breaks with exposure-revoked', () => {
+    const s = make();
+    const id = linkIn(s, 'active');
+    expect(s.markBroken(id, 'exposure-revoked')).toMatchObject({ state: 'broken', endedReason: 'exposure-revoked' });
+    expect(make().get(id)?.endedReason).toBe('exposure-revoked');
   });
 });

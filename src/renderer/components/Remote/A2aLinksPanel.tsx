@@ -84,6 +84,7 @@ export function A2aLinksView(p: A2aLinksViewProps) {
                       : t('a2aLink.requestTitle', { pc: pcName(l.remote.hostId) })}
                   </span>
                 </span>
+                <span className="wmux-a2a-meta" data-testid="a2a-link-reported">{t('a2aLink.reportedBy', { pc: pcName(l.remote.hostId) })}</span>
                 <span className="wmux-a2a-meta">{t('a2aLink.theirPane', { pane: remoteAlias(pcName(l.remote.hostId), l.remote) })}</span>
                 {l.remote.gitRemote && <span className="wmux-a2a-meta ui-code truncate">{l.remote.gitRemote}</span>}
                 <span className="wmux-a2a-meta">{t('a2aLink.yourPane', { pane: localLine(l) })}</span>
@@ -125,7 +126,7 @@ export function A2aLinksView(p: A2aLinksViewProps) {
                   <span className="wmux-a2a-meta flex-1">
                     {terminal && l.endedReason ? t(`a2aLink.ended.${l.endedReason}`) : t(DIRECTION_KEY[linkDirection(l.allow)])}
                   </span>
-                  {l.state === 'proposed-out' && (
+                  {!terminal && l.proposer === 'local' && (
                     <UiButton variant="ghost" size="sm" disabled={p.busy === l.linkId} onClick={() => p.onCheck(l.linkId)}>
                       {t('a2aLink.check')}
                     </UiButton>

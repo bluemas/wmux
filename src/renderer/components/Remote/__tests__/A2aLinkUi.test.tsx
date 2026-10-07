@@ -113,6 +113,12 @@ describe('A2aLinkDialogView', () => {
     expect((body.querySelector('[data-testid="a2a-link-propose"]') as HTMLButtonElement).disabled).toBe(false);
   });
 
+  it('an unanswered proposal says it may have arrived, and offers no resend', () => {
+    const body = render(createElement(A2aLinkDialogView, dialogProps({ selected: pane('same', 'x/o/api'), outcome: { ok: false, error: 'timeout', uncertain: true } })));
+    expect(body.querySelector('[data-testid="a2a-link-outcome"]')?.textContent).toBe('a2aLink.uncertain');
+    expect(body.querySelector('[data-testid="a2a-link-propose"]')).toBeNull();
+  });
+
   it('says so when that PC shows nothing', () => {
     const body = render(createElement(A2aLinkDialogView, dialogProps({ panes: [] })));
     expect(body.querySelector('[data-testid="a2a-link-none-exposed"]')).not.toBeNull();
@@ -123,7 +129,7 @@ const link = (over: Partial<A2aLinkRecordV1> = {}): A2aLinkRecordV1 => ({
   v: 1, linkId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', version: 1, state: 'proposed-in',
   local: { kind: 'pane', workspaceId: 'w1', paneId: 'p1' },
   remote: { hostId: HOST, kind: 'pane', workspaceId: 'rw', paneId: 'rp', workspaceName: 'Web', label: 'w2-1', gitRemote: 'x/o/web' },
-  allow: { outbound: true, inbound: false },
+  allow: { outbound: true, inbound: false }, proposer: 'remote',
   createdAt: '2026-10-07T00:00:00.000Z', updatedAt: '2026-10-07T00:00:00.000Z',
   ...over,
 });
@@ -156,6 +162,30 @@ describe('A2aLinksView', () => {
     expect(body.querySelector('[data-testid="a2a-link-request-mismatch"]')).not.toBeNull();
     act(() => (body.querySelector('[data-testid="a2a-link-accept"]') as HTMLButtonElement).click());
     expect(onAccept).toHaveBeenCalledWith(link().linkId);
+  });
+
+  it('a request card marks the other PC\'s fields as reported, renders them as text, and names this PC\'s pane by the stored ids', () => {
+    const ws = {
+      id: 'w1', name: 'API', wsOrdinal: 3, activePaneId: 'p1',
+      rootPane: { id: 'p1', type: 'leaf' as const, surfaces: [], activeSurfaceId: '', ordinal: 2, metadata: { label: 'build' } },
+    };
+    const body = render(createElement(A2aLinksView, linksProps({
+      links: [link({ remote: { hostId: HOST, kind: 'pane', workspaceId: 'rw', paneId: 'rp', label: '<b>x</b>' } })],
+      workspaces: [ws as never],
+    })));
+    const card = body.querySelector('[data-testid="a2a-link-requests"]')!;
+    expect(card.querySelector('[data-testid="a2a-link-reported"]')?.textContent).toBe('a2aLink.reportedBy(DESK)');
+    expect(card.querySelector('b')).toBeNull();
+    expect(card.textContent).toContain('<b>x</b>');
+    expect(card.textContent).toContain('a2aLink.yourPane(API / build)');
+  });
+
+  it('offers Check on a live link this PC proposed, not on one it received', () => {
+    const body = render(createElement(A2aLinksView, linksProps({
+      links: [link({ state: 'active', proposer: 'local' }), link({ linkId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', state: 'active', proposer: 'remote', local: { kind: 'pane', workspaceId: 'w2', paneId: 'p2' } })],
+    })));
+    const checks = [...body.querySelectorAll('[data-testid="a2a-link-list"] button')].filter((b) => b.textContent === 'a2aLink.check');
+    expect(checks).toHaveLength(1);
   });
 
   it('a Moa request card says Moa <-> Moa', () => {

@@ -1,6 +1,7 @@
 import { a2aEndpointAlias, type A2aExposedPane, type A2aLinkRecordV1 } from '../../../shared/a2aRemote';
 import type { Workspace } from '../../../shared/types';
 import { getWorkspaceLeafPanes } from '../../../shared/paneUtils';
+import { computePaneAutoName, paneDisplayName } from '../../utils/paneNaming';
 
 // Pure helpers behind the cross-PC pane link UI (matching dialog, accept
 // cards, link list, exposure checklist), kept store-free for tests.
@@ -46,11 +47,16 @@ export function remoteAlias(pcName: string, remote: A2aLinkRecordV1['remote']): 
   return a2aEndpointAlias(pcName, remote);
 }
 
-/** Local pane name for a link row, from the live store (falls back to the id). */
+/**
+ * This PC's end of a link, named from the live store BY THE IDS the link
+ * stores — so a card shows exactly the pane an accept binds, never a name the
+ * other PC reported. Falls back to the ids when the pane is gone.
+ */
 export function localPaneName(workspaces: Workspace[], local: A2aLinkRecordV1['local']): { workspace: string; pane: string } {
   const ws = workspaces.find((w) => w.id === local.workspaceId);
   const leaf = ws ? getWorkspaceLeafPanes(ws).find((p) => p.id === local.paneId) : undefined;
-  return { workspace: ws?.name ?? local.workspaceId, pane: leaf?.metadata?.label?.trim() || local.paneId || '' };
+  const pane = ws && leaf ? paneDisplayName(leaf.metadata?.label, computePaneAutoName(ws.wsOrdinal ?? 0, leaf.ordinal ?? 0)) : local.paneId ?? '';
+  return { workspace: ws?.name ?? local.workspaceId, pane };
 }
 
 /** An exposure as the checklist edits it: always an explicit pane list per workspace. */

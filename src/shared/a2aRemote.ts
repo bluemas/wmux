@@ -396,7 +396,13 @@ export interface A2aLinkRecordV1 {
   createdAt: string;
   updatedAt: string;
   /** Why the link ended, for 'revoked' / 'broken'. */
-  endedReason?: 'revoked-local' | 'revoked-remote' | 'pane-closed' | 'pane-moved' | 'workspace-gone';
+  endedReason?: 'revoked-local' | 'revoked-remote' | 'pane-closed' | 'pane-moved' | 'workspace-gone' | 'exposure-revoked';
+  /**
+   * Which side proposed it: 'remote' means this host is the SERVER of the
+   * pair for this link (it received the proposal and its human accepts);
+   * 'local' means this host is the joiner. Exposure applies to 'remote' links.
+   */
+  proposer: 'local' | 'remote';
 }
 
 // ─── Layer 2/3 wire ─────────────────────────────────────────────────────────

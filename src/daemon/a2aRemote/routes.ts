@@ -47,8 +47,10 @@ export interface A2aRouteLinks {
 
 export interface A2aRouteDeps {
   exposures: ExposureCheck;
-  panes: Pick<ExposedPaneCache, 'visibleTo' | 'brain'>;
+  panes: Pick<ExposedPaneCache, 'visibleTo'>;
   links: A2aRouteLinks;
+  /** Drop stale undecided proposals (LinkStore.expireProposals); called before answering a link's state. */
+  expireProposals?: () => void;
   /** Daemon -> app nudge (`pipeServer.broadcast`). */
   broadcast: (event: A2aRemoteLinkEvent) => void;
   log: (level: 'info' | 'warn' | 'error', msg: string) => void;
@@ -110,9 +112,32 @@ function refuse(res: http.ServerResponse, status: number, error: A2aRemoteErrorC
   sendJson(res, status, { ok: false, error, ...(message ? { message } : {}) });
 }
 
+/**
+ * Is `end` (this host's side) one `hostId` may see right now? Exposed to it
+ * by the exposure store AND present in the app's latest snapshot. Shared by
+ * the proposal route and the accept RPC.
+ */
+export function isVisibleEnd(
+  panes: Pick<ExposedPaneCache, 'visibleTo'>,
+  exposures: ExposureCheck,
+  hostId: string,
+  end: { kind: string; workspaceId: string; paneId?: string },
+): boolean {
+  return panes
+    .visibleTo(hostId, exposures)
+    .some((p) => p.kind === end.kind && p.workspaceId === end.workspaceId && (end.kind === 'brain' || p.paneId === end.paneId));
+}
+
 /** Layers 2-3: exposed, link propose / status / revoke. */
 export function createA2aRoutes(deps: A2aRouteDeps): A2aRouteTable {
   const table = new A2aRouteTable();
+  const expireProposals = (): void => {
+    try {
+      deps.expireProposals?.();
+    } catch (err) {
+      deps.log('warn', `[a2a-remote] proposal expiry failed: ${errMsg(err)}`);
+    }
+  };
   const linkPath = `${A2A_ROUTES.links}/:linkId`;
 
   // What this host shows THIS peer: the app's last snapshot, filtered by the
@@ -132,9 +157,9 @@ export function createA2aRoutes(deps: A2aRouteDeps): A2aRouteTable {
     const proposal = parseProposal(body);
     if (!proposal) return refuse(res, 400, 'bad-request');
     // Like with like only (no Moa <-> pane in v1), and the receiver's end
-    // must be one this peer may see: an exposed pane, or this PC's Moa while
-    // exposed and only under its current HQ. Same answer whether the end
-    // exists or not: nothing about unexposed panes leaks.
+    // must be one this peer may see right now: exposed to it AND live in the
+    // app's latest snapshot (a closed pane or a replaced HQ is refused). Same
+    // answer whether the end exists or not: nothing about unexposed panes leaks.
     if (!isAllowedEndpointPair(proposal.from.kind, proposal.to.kind) || !mayLinkTo(peer, proposal.to)) {
       return refuse(res, 403, 'forbidden');
     }
@@ -155,6 +180,7 @@ export function createA2aRoutes(deps: A2aRouteDeps): A2aRouteTable {
   });
 
   table.add('GET', linkPath, ({ res, params, peer }) => {
+    expireProposals();
     const link = ownedLink(params['linkId'], peer, res);
     if (!link) return;
     const answer: A2aLinkStatusResponse = {
@@ -183,9 +209,9 @@ export function createA2aRoutes(deps: A2aRouteDeps): A2aRouteTable {
     sendJson(res, 200, { ok: true, state: ended.state });
   });
 
+  /** The end is in what this peer can see right now: exposed AND present in the app's latest snapshot. */
   function mayLinkTo(peer: WebA2aPeer, to: A2aLinkProposeRequest['to']): boolean {
-    if (to.kind === 'pane') return deps.exposures.isPaneExposed(peer.hostId, to.workspaceId, to.paneId ?? '');
-    return deps.exposures.isBrainExposed(peer.hostId) && deps.panes.brain()?.workspaceId === to.workspaceId;
+    return isVisibleEnd(deps.panes, deps.exposures, peer.hostId, to);
   }
 
   /** The link, when it exists AND belongs to the calling peer's host; otherwise answered here. */

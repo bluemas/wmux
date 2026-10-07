@@ -7903,6 +7903,9 @@ async function main(): Promise<void> {
         panes: a2aExposedPanes,
         links: a2aLinks,
         broadcast: a2aBroadcast,
+        expireProposals: () => {
+          for (const l of a2aLinks.expireProposals()) a2aBroadcast({ type: 'a2a.remote.link.changed', linkId: l.linkId, state: l.state });
+        },
         log: a2aLog,
       }),
       log: a2aLog,

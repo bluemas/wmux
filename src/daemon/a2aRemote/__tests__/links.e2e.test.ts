@@ -13,7 +13,7 @@ import { ExposureStore } from '../exposureStore';
 import { joinRemoteHost } from '../joiner';
 import { registerA2aLinkRpc } from '../linkRpc';
 import { LinkStore } from '../linkStore';
-import { PinnedTlsClient } from '../pinnedClient';
+import { PinnedClientError, PinnedTlsClient } from '../pinnedClient';
 import { createA2aRoutes } from '../routes';
 import { disposeAll, makePc, type Pc } from './a2aServerRig';
 
@@ -255,6 +255,68 @@ describe('cross-host exposure and pane links, end to end', () => {
     expect(a.links.list()).toHaveLength(0);
   });
 
+  describe('review fixes', () => {
+    it('a proposal to a closed (exposed but gone) pane is refused (403)', async () => {
+      const a = await makeSide('PC A');
+      const b = await makeSide('PC B');
+      await pair(a, b, 'PC A');
+      await exposeOne(a, b);
+      // pane-1 closed: the app's snapshot no longer has it, the exposure list still names it.
+      await b.rpc('a2a.remote.exposure.publish', { panes: B_PANES.slice(1) });
+      expect(await propose(a, b, { kind: 'pane', workspaceId: 'ws-api', paneId: 'pane-1' })).toMatchObject({ ok: false, error: 'forbidden' });
+      expect(b.links.list()).toHaveLength(0);
+    });
+
+    it('accept re-checks the end: gone or hidden refuses and leaves the proposal pending', async () => {
+      const a = await makeSide('PC A');
+      const b = await makeSide('PC B');
+      await pair(a, b, 'PC A');
+      await exposeOne(a, b);
+      const { link } = await propose(a, b, { kind: 'pane', workspaceId: 'ws-api', paneId: 'pane-1' });
+      await b.rpc('a2a.remote.exposure.publish', { panes: B_PANES.slice(1) });
+      expect(await b.rpc('a2a.remote.links.accept', { linkId: link!.linkId })).toMatchObject({ ok: false, error: 'forbidden' });
+      expect(b.links.get(link!.linkId)?.state).toBe('proposed-in');
+      await b.rpc('a2a.remote.exposure.publish', { panes: B_PANES });
+      expect(await b.rpc('a2a.remote.links.accept', { linkId: link!.linkId })).toMatchObject({ ok: true });
+    });
+
+    it('un-exposing breaks that PC\'s links to the hidden end (exposure-revoked); the joiner sees it', async () => {
+      const a = await makeSide('PC A');
+      const b = await makeSide('PC B');
+      await pair(a, b, 'PC A');
+      await exposeOne(a, b);
+      const { link } = await propose(a, b, { kind: 'pane', workspaceId: 'ws-api', paneId: 'pane-1' });
+      await b.rpc('a2a.remote.links.accept', { linkId: link!.linkId });
+      await a.rpc('a2a.remote.links.refresh', { linkId: link!.linkId });
+      await b.rpc('a2a.remote.exposure.set', { hostId: a.hostId, workspaceIds: ['ws-api'], paneIds: { 'ws-api': ['pane-2'] } });
+      expect(b.links.get(link!.linkId)).toMatchObject({ state: 'broken', endedReason: 'exposure-revoked' });
+      expect(await a.rpc('a2a.remote.links.refresh', { linkId: link!.linkId })).toMatchObject({ ok: true, link: { state: 'broken', endedReason: 'exposure-revoked' } });
+    });
+
+    it('a joiner\'s own proposals are not touched by its exposure settings', async () => {
+      const a = await makeSide('PC A');
+      const b = await makeSide('PC B');
+      await pair(a, b, 'PC A');
+      await exposeOne(a, b);
+      const { link } = await propose(a, b, { kind: 'pane', workspaceId: 'ws-api', paneId: 'pane-1' });
+      await a.rpc('a2a.remote.exposure.set', { hostId: b.hostId, workspaceIds: [], paneIds: {} });
+      expect(a.links.get(link!.linkId)?.state).toBe('proposed-out');
+    });
+
+    it('Moa hidden from that PC breaks its Moa link', async () => {
+      const a = await makeSide('PC A');
+      const b = await makeSide('PC B');
+      await pair(a, b, 'PC A');
+      await b.rpc('a2a.remote.exposure.publish', { panes: [{ kind: 'brain', workspaceId: 'ws-hq-b', workspaceName: 'Moa' }] });
+      await b.rpc('a2a.remote.exposure.set', { hostId: a.hostId, workspaceIds: [], brain: true });
+      const r = (await a.rpc('a2a.remote.links.propose', {
+        hostId: b.hostId, local: { kind: 'brain', workspaceId: 'ws-hq-a' }, remote: { kind: 'brain', workspaceId: 'ws-hq-b' }, allow: { outbound: true, inbound: true },
+      })) as { link: A2aLinkRecordV1 };
+      await b.rpc('a2a.remote.exposure.set', { hostId: a.hostId, workspaceIds: [], brain: false });
+      expect(b.links.get(r.link.linkId)).toMatchObject({ state: 'broken', endedReason: 'exposure-revoked' });
+    });
+  });
+
   describe('Moa (brain) ends', () => {
     const MOA = { kind: 'brain', workspaceId: 'ws-hq-b', workspaceName: 'Moa' };
     const A_MOA = { kind: 'brain', workspaceId: 'ws-hq-a', workspaceName: 'Moa' };
@@ -335,3 +397,67 @@ describe('cross-host exposure and pane links, end to end', () => {
   });
 });
 
+
+describe('link RPCs against an unreliable other PC', () => {
+  const HOST_B = '22222222-2222-4222-8222-222222222222';
+  function side(answer: (method: string, path: string) => Promise<{ status: number; json: unknown }>) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'a2a-links-'));
+    dirs.push(dir);
+    const stores = { dir, scheduleHarden: (): void => undefined };
+    const links = new LinkStore(stores);
+    const handlers = new Map<string, (p: Record<string, unknown>) => Promise<unknown>>();
+    registerA2aLinkRpc((m, h) => handlers.set(m, h), {
+      links,
+      exposures: new ExposureStore(stores),
+      panes: new ExposedPaneCache(),
+      remoteHosts: {
+        get: (id) => (id === HOST_B ? { v: 1, hostId: HOST_B, name: 'B', addresses: ['127.0.0.1'], port: 1, fingerprint256: 'AA', peerId: crypto.randomUUID(), createdAt: '' } : undefined),
+        credentialFor: (id) => (id === HOST_B ? { peerId: crypto.randomUUID(), secret: 'x'.repeat(43) } : null),
+      },
+      broadcast: () => undefined,
+      log: () => undefined,
+      client: () => ({ requestJson: (method, p) => answer(method, p) }),
+    });
+    return { links, rpc: (m: string, p: Record<string, unknown> = {}) => handlers.get(m)!(p) };
+  }
+  const proposeTo = (rpc: (m: string, p?: Record<string, unknown>) => Promise<unknown>) => rpc('a2a.remote.links.propose', {
+    hostId: HOST_B, local: { kind: 'pane', workspaceId: 'w', paneId: 'p' }, remote: { kind: 'pane', workspaceId: 'rw', paneId: 'rp' }, allow: { outbound: true, inbound: true },
+  }) as Promise<{ ok: boolean; uncertain?: boolean; link?: A2aLinkRecordV1 }>;
+
+  it('a proposal that went out without an answer stays proposed-out; Check settles it', async () => {
+    let server: 'hang' | 'unknown' = 'hang';
+    const { links, rpc } = side(async () => {
+      if (server === 'hang') throw new PinnedClientError('timeout', 'no answer', { sent: true });
+      return { status: 404, json: { ok: false, error: 'unknown-link' } };
+    });
+    const r = await proposeTo(rpc);
+    expect(r).toMatchObject({ ok: false, uncertain: true });
+    expect(links.get(r.link!.linkId)?.state).toBe('proposed-out');
+    server = 'unknown';
+    await rpc('a2a.remote.links.refresh', { linkId: r.link!.linkId });
+    expect(links.get(r.link!.linkId)).toMatchObject({ state: 'revoked', endedReason: 'revoked-remote' });
+  });
+
+  it('a refused or unsent proposal leaves nothing', async () => {
+    const refused = side(async () => ({ status: 403, json: { ok: false, error: 'forbidden' } }));
+    expect(await proposeTo(refused.rpc)).toMatchObject({ ok: false, error: 'forbidden' });
+    expect(refused.links.list()).toHaveLength(0);
+    const down = side(async () => { throw new PinnedClientError('connect-failed', 'refused', { sent: false }); });
+    expect(await proposeTo(down.rpc)).toMatchObject({ ok: false, error: 'unreachable' });
+    expect(down.links.list()).toHaveLength(0);
+  });
+
+  it('an active link the other PC no longer knows ends on Check', async () => {
+    let known = true;
+    const { links, rpc } = side(async (method) => {
+      if (method === 'POST') return { status: 200, json: { linkId: 'x', state: 'proposed-in' } };
+      return known ? { status: 200, json: {} } : { status: 404, json: { ok: false, error: 'unknown-link' } };
+    });
+    const r = await proposeTo(rpc);
+    const id = r.link!.linkId;
+    links.applyRemoteAccept(id, 2);
+    known = false;
+    await rpc('a2a.remote.links.refresh', { linkId: id });
+    expect(links.get(id)).toMatchObject({ state: 'revoked', endedReason: 'revoked-remote' });
+  });
+});

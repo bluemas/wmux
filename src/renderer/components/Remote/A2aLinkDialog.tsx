@@ -42,7 +42,8 @@ export interface A2aLinkDialogViewProps {
   onSend: (v: boolean) => void;
   onReceive: (v: boolean) => void;
   busy: boolean;
-  outcome: { ok: true } | { ok: false; error: A2aRemoteCallError } | null;
+  /** `uncertain`: sent, no answer — it may have reached that PC; Check settles it. */
+  outcome: { ok: true } | { ok: false; error: A2aRemoteCallError; uncertain?: boolean } | null;
   onPropose: () => void;
   onClose: () => void;
   t: T;
@@ -150,13 +151,13 @@ export function A2aLinkDialogView(p: A2aLinkDialogViewProps) {
         )}
         {p.outcome && (
           <p className="wmux-a2a-note" data-tone={p.outcome.ok ? undefined : 'danger'} data-testid="a2a-link-outcome">
-            {p.outcome.ok ? t('a2aLink.sent') : t(`a2aLink.error.${p.outcome.error}`)}
+            {p.outcome.ok ? t('a2aLink.sent') : p.outcome.uncertain ? t('a2aLink.uncertain') : t(`a2aLink.error.${p.outcome.error}`)}
           </p>
         )}
       </DialogBody>
       <DialogFooter>
-        <UiButton variant="ghost" size="md" onClick={p.onClose}>{p.outcome?.ok ? t('a2aLink.done') : t('a2aLink.cancel')}</UiButton>
-        {!p.outcome?.ok && (
+        <UiButton variant="ghost" size="md" onClick={p.onClose}>{p.outcome?.ok || (p.outcome && p.outcome.uncertain) ? t('a2aLink.done') : t('a2aLink.cancel')}</UiButton>
+        {!p.outcome?.ok && !(p.outcome && p.outcome.uncertain) && (
           <UiButton variant="primary" size="md" disabled={!canSend} onClick={p.onPropose} data-testid="a2a-link-propose">
             {p.busy ? t('a2aLink.sending') : t('a2aLink.propose')}
           </UiButton>
@@ -257,7 +258,7 @@ export default function A2aLinkDialog({ local: end, onClose }: A2aLinkDialogProp
             },
         allow: { outbound: send, inbound: receive },
       });
-      setOutcome(r.ok ? { ok: true } : { ok: false, error: r.error });
+      setOutcome(r.ok ? { ok: true } : { ok: false, error: r.error, ...(r.uncertain ? { uncertain: true } : {}) });
     } catch {
       setOutcome({ ok: false, error: 'failed' });
     } finally {

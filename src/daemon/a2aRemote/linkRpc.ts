@@ -20,7 +20,8 @@ import type {
   A2aRemoteLinkResult,
   A2aRemotePaneGoneParams,
 } from '../../shared/rpc';
-import { cleanExposedPane, type ExposedPaneCache } from './exposedPanes';
+import { cleanExposedPane, type ExposedPaneCache, type ExposureCheck } from './exposedPanes';
+import { isVisibleEnd } from './routes';
 import type { JsonClient } from './joiner';
 import type { BrokenReason, LinkStore } from './linkStore';
 import { PinnedClientError, PinnedTlsClient, type PinnedClientOptions } from './pinnedClient';
@@ -50,7 +51,7 @@ export type NotifyLinkChange = (hostId: HostId, linkId: string, state: 'active' 
 
 export interface A2aLinkRpcDeps {
   links: LinkStore;
-  exposures: {
+  exposures: ExposureCheck & {
     get(hostId: HostId): A2aExposureV1 | undefined;
     list(): A2aExposureV1[];
     set(hostId: HostId, input: { workspaceIds: string[]; paneIds?: Record<string, string[]>; brain?: boolean }): A2aExposureV1;
@@ -79,9 +80,15 @@ const REMOTE_ERRORS: ReadonlySet<string> = new Set<A2aRemoteErrorCode>([
   'unknown-task', 'conflict', 'too-large', 'bad-request', 'protocol', 'unavailable',
 ]);
 const GONE_REASONS: ReadonlySet<string> = new Set(['pane-closed', 'pane-moved', 'workspace-gone']);
+/** Broken reasons the other PC may report for its end (`refresh`). */
+const SERVER_BROKEN_REASONS: ReadonlySet<string> = new Set([...GONE_REASONS, 'exposure-revoked']);
 
 class CallFailure extends Error {
-  constructor(readonly code: A2aRemoteCallError, detail: string, readonly sent = false) {
+  /**
+   * `sent`: request bytes may have reached the other PC. `answered`: it
+   * replied (a definite refusal). Sent but not answered = outcome unknown.
+   */
+  constructor(readonly code: A2aRemoteCallError, detail: string, readonly sent = false, readonly answered = false) {
     super(detail);
   }
 }
@@ -127,6 +134,7 @@ export function registerA2aLinkRpc(onRpc: (method: string, handler: RpcHandler) 
       typeof code === 'string' && REMOTE_ERRORS.has(code) ? (code as A2aRemoteErrorCode) : 'failed',
       `the other PC answered HTTP ${answer.status}`,
       true,
+      true,
     );
   };
 
@@ -160,7 +168,17 @@ export function registerA2aLinkRpc(onRpc: (method: string, handler: RpcHandler) 
     if (params['brain'] !== undefined && typeof params['brain'] !== 'boolean') {
       throw new Error('a2a.remote.exposure.set: brain must be boolean');
     }
-    return { exposure: deps.exposures.set(hostId, { workspaceIds, paneIds, brain: params['brain'] === true }) };
+    const exposure = deps.exposures.set(hostId, { workspaceIds, paneIds, brain: params['brain'] === true });
+    // Hidden means unlinked: a live link from that PC to an end it can no
+    // longer see breaks now (only links that PC proposed to this one).
+    for (const rec of links.listByHost(hostId)) {
+      if (rec.proposer !== 'remote' || !NON_TERMINAL.has(rec.state)) continue;
+      const stillShown = rec.local.kind === 'brain'
+        ? deps.exposures.isBrainExposed(hostId)
+        : deps.exposures.isPaneExposed(hostId, rec.local.workspaceId, rec.local.paneId ?? '');
+      if (!stillShown) breakLink(rec, 'exposure-revoked');
+    }
+    return { exposure };
   });
 
   onRpc('a2a.remote.hosts.exposed', async (params): Promise<A2aRemoteHostsExposedResult> => {
@@ -178,7 +196,19 @@ export function registerA2aLinkRpc(onRpc: (method: string, handler: RpcHandler) 
 
   // --- links ------------------------------------------------------------------
 
-  onRpc('a2a.remote.links.list', async () => ({ links: links.list() }));
+  /** Undecided proposals past their TTL end here (and the app hears it). */
+  const expire = (): void => {
+    try {
+      for (const link of links.expireProposals()) changed(link);
+    } catch (err) {
+      deps.log('warn', `[a2a-remote] proposal expiry failed: ${errMsg(err)}`);
+    }
+  };
+
+  onRpc('a2a.remote.links.list', async () => {
+    expire();
+    return { links: links.list() };
+  });
 
   onRpc('a2a.remote.links.propose', async (params): Promise<A2aRemoteLinkResult> => {
     const hostId = str(params, 'hostId');
@@ -213,15 +243,18 @@ export function registerA2aLinkRpc(onRpc: (method: string, handler: RpcHandler) 
     try {
       await call(hostId, 'POST', A2A_ROUTES.links, request);
     } catch (err) {
-      // The other PC does not hold the proposal (or may, when the request
-      // went out but no answer came back): drop ours, and withdraw theirs.
+      // Went out, no answer: the other PC may hold it. Keep ours as
+      // proposed-out so Check (refresh) can settle it either way; dropping it
+      // would leave an acceptable proposal there that this PC cannot see.
+      if (!(err instanceof CallFailure) || (err.sent && !err.answered)) {
+        const r = fail(err);
+        return r.ok ? r : { ...r, uncertain: true, link };
+      }
+      // Refused, or never sent: the other PC does not hold it.
       try {
         links.discard(link.linkId);
       } catch (discardErr) {
         deps.log('error', `[a2a-remote] could not drop failed proposal ${link.linkId}: ${errMsg(discardErr)}`);
-      }
-      if (err instanceof CallFailure && err.sent && err.code !== 'forbidden' && err.code !== 'conflict') {
-        await call(hostId, 'POST', a2aLinkPath(link.linkId) + A2A_ROUTES.linkRevokeSuffix, {}).catch(() => undefined);
       }
       return fail(err);
     }
@@ -231,9 +264,16 @@ export function registerA2aLinkRpc(onRpc: (method: string, handler: RpcHandler) 
   });
 
   onRpc('a2a.remote.links.accept', async (params): Promise<A2aRemoteLinkResult> => {
+    expire();
     const rec = links.get(str(params, 'linkId'));
     if (!rec) return { ok: false, error: 'unknown-link' };
     if (rec.state !== 'proposed-in') return { ok: false, error: 'invalid-state' };
+    // Re-checked at the moment of the human's yes: the pane (or Moa) must
+    // still be shown to that PC and still exist. Otherwise the link stays
+    // pending and the answer says why.
+    if (!isVisibleEnd(deps.panes, deps.exposures, rec.remote.hostId, rec.local)) {
+      return { ok: false, error: 'forbidden', message: 'that end is no longer shown to that PC' };
+    }
     try {
       const link = links.accept(rec.linkId);
       notify(link.remote.hostId, link.linkId, 'active', link.version);
@@ -282,7 +322,7 @@ export function registerA2aLinkRpc(onRpc: (method: string, handler: RpcHandler) 
       status = json;
     } catch (err) {
       // The server no longer knows a link we still wait on: it is over there.
-      if (err instanceof CallFailure && err.code === 'unknown-link' && rec.state === 'proposed-out') {
+      if (err instanceof CallFailure && err.code === 'unknown-link') {
         changed(endRemotely(rec));
       }
       return fail(err);
@@ -311,17 +351,8 @@ export function registerA2aLinkRpc(onRpc: (method: string, handler: RpcHandler) 
       if (!NON_TERMINAL.has(rec.state) || rec.local.workspaceId !== workspaceId) continue;
       if (brainGone && rec.local.kind !== 'brain') continue;
       if (reason !== 'workspace-gone' && (rec.local.kind !== 'pane' || rec.local.paneId !== paneId)) continue;
-      let link: A2aLinkRecordV1;
-      try {
-        link = links.markBroken(rec.linkId, reason as BrokenReason);
-      } catch (err) {
-        // Broken in memory regardless (LinkStore rule).
-        deps.log('error', `[a2a-remote] link ${rec.linkId} broken but not persisted: ${errMsg(err)}`);
-        link = links.get(rec.linkId) ?? rec;
-      }
+      breakLink(rec, reason as BrokenReason);
       broken += 1;
-      notify(link.remote.hostId, link.linkId, 'broken', link.version);
-      changed(link);
     }
     try {
       if (brainGone) {
@@ -338,6 +369,19 @@ export function registerA2aLinkRpc(onRpc: (method: string, handler: RpcHandler) 
     }
     return { ok: true, broken };
   });
+
+  /** Break here; a failed write keeps it broken in memory (LinkStore rule). */
+  function breakLink(rec: A2aLinkRecordV1, reason: BrokenReason): void {
+    let link: A2aLinkRecordV1;
+    try {
+      link = links.markBroken(rec.linkId, reason);
+    } catch (err) {
+      deps.log('error', `[a2a-remote] link ${rec.linkId} broken but not persisted: ${errMsg(err)}`);
+      link = links.get(rec.linkId) ?? rec;
+    }
+    notify(link.remote.hostId, link.linkId, 'broken', link.version);
+    changed(link);
+  }
 
   /** Revoke here; a failed write keeps the revocation in memory (LinkStore rule). */
   function endLocally(rec: A2aLinkRecordV1): A2aLinkRecordV1 {
@@ -372,7 +416,7 @@ export function registerA2aLinkRpc(onRpc: (method: string, handler: RpcHandler) 
     if (state === 'revoked') return links.revoke(rec.linkId, 'remote');
     if (state === 'broken') {
       const reason = status['endedReason'];
-      return links.markBroken(rec.linkId, GONE_REASONS.has(reason as string) ? (reason as BrokenReason) : 'pane-closed');
+      return links.markBroken(rec.linkId, SERVER_BROKEN_REASONS.has(reason as string) ? (reason as BrokenReason) : 'pane-closed');
     }
     return null;
   }
