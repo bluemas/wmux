@@ -89,6 +89,12 @@ describe('generateSelfSignedCert', () => {
     expect(() => make({ commonName: '' })).toThrow(RangeError);
   });
 
+  it('counts the CN limit in characters, not UTF-16 units', () => {
+    const astral = '😀'.repeat(64); // 128 UTF-16 units
+    expect(new crypto.X509Certificate(make({ commonName: astral }).certPem).verify).toBeTypeOf('function');
+    expect(() => make({ commonName: '😀'.repeat(65) })).toThrow(RangeError);
+  });
+
   it('encodes a non-ASCII CN as UTF8String', () => {
     const x = new crypto.X509Certificate(make({ commonName: '개발-PC' }).certPem);
     expect(x.subject).toBe('CN=개발-PC');
@@ -106,6 +112,7 @@ describe('generateSelfSignedCert', () => {
   it('rejects non-IPv4 addresses and non-ASCII DNS names', () => {
     expect(() => make({ ipAddresses: ['::1'] })).toThrow(RangeError);
     expect(() => make({ ipAddresses: ['10.0.0'] })).toThrow(RangeError);
+    expect(() => make({ ipAddresses: ['010.001.002.003'] })).toThrow(RangeError);
     expect(() => make({ dnsNames: ['개발'] })).toThrow(RangeError);
     expect(() => make({ dnsNames: ['bad host'] })).toThrow(RangeError);
     expect(() => make({ validDays: 0 })).toThrow(RangeError);

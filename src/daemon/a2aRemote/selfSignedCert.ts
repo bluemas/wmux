@@ -22,11 +22,11 @@ import {
 } from './der';
 
 export interface SelfSignedCertOptions {
-  /** Subject and issuer CN. 1..64 characters (RFC 5280 ub-common-name). */
+  /** Subject and issuer CN. 1..64 characters, counted by code point (RFC 5280 ub-common-name). */
   commonName: string;
   /** SAN dNSName entries (ASCII host names). */
   dnsNames: string[];
-  /** SAN iPAddress entries — IPv4 dotted quads only (4-byte form). */
+  /** SAN iPAddress entries — canonical IPv4 dotted quads only (4-byte form). */
   ipAddresses: string[];
   /** Validity length in whole days from `now`. */
   validDays: number;
@@ -68,8 +68,10 @@ function extension(extnId: string, critical: boolean, value: Buffer): Buffer {
 }
 
 function ipv4Bytes(ip: string): Buffer {
-  if (!net.isIPv4(ip)) throw new RangeError(`SAN iPAddress must be IPv4: ${JSON.stringify(ip)}`);
-  return Buffer.from(ip.split('.').map(Number));
+  const octets = ip.split('.').map(Number);
+  // Canonical dotted quad only: '010.1.2.3' is ambiguous (octal in some parsers).
+  if (!net.isIPv4(ip) || octets.join('.') !== ip) throw new RangeError(`SAN iPAddress must be a canonical IPv4: ${JSON.stringify(ip)}`);
+  return Buffer.from(octets);
 }
 
 /** Upper-case colon-separated SHA-256 of the DER, i.e. `X509Certificate.fingerprint256` form. */
@@ -85,9 +87,8 @@ function toPem(der: Buffer): string {
 
 export function generateSelfSignedCert(opts: SelfSignedCertOptions): SelfSignedCert {
   const { commonName, dnsNames, ipAddresses, validDays } = opts;
-  if (commonName.length < 1 || commonName.length > 64) {
-    throw new RangeError(`commonName must be 1..64 characters (got ${commonName.length})`);
-  }
+  const cnLength = Array.from(commonName).length; // characters, not UTF-16 units
+  if (cnLength < 1 || cnLength > 64) throw new RangeError(`commonName must be 1..64 characters (got ${cnLength})`);
   if (!Number.isInteger(validDays) || validDays < 1) throw new RangeError(`validDays must be a positive integer: ${validDays}`);
   for (const name of dnsNames) {
     if (!isSanDnsName(name)) throw new RangeError(`SAN dNSName is not an ASCII host name: ${JSON.stringify(name)}`);
