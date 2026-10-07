@@ -4,6 +4,7 @@ import {
   builtinCombosFor,
   collidesWithKeymap,
   ADVERTISED_SHORTCUTS,
+  UNBOUND_SHORTCUTS,
   SHORTCUT_ACTION_IDS,
   comboFromEvent,
   concreteCombo,
@@ -18,6 +19,7 @@ import {
   sanitizeShortcutOverrides,
   ShortcutPressGuard,
   type ShortcutKeyEventLike,
+  workspaceShortcutNumber,
 } from '../keymap';
 
 /**
@@ -122,8 +124,11 @@ describe('ADVERTISED_SHORTCUTS', () => {
   it('has exactly one row per action (the rest are aliases)', () => {
     const actions = ADVERTISED_SHORTCUTS.map((e) => e.action);
     expect(new Set(actions).size).toBe(actions.length);
-    // Every action the table binds can be listed, changed and switched off.
-    expect([...new Set(actions)].sort()).toEqual([...SHORTCUT_ACTION_IDS].sort());
+    // Every action is either bound by the table (listed, changed, switched
+    // off) or ships unbound (UNBOUND_SHORTCUTS) — and never both.
+    const unbound = UNBOUND_SHORTCUTS.map((e) => e.action);
+    expect(unbound.filter((a) => actions.includes(a))).toEqual([]);
+    expect([...actions, ...unbound].sort()).toEqual([...SHORTCUT_ACTION_IDS].sort());
   });
 
   it('puts an action\'s primary row before its aliases', () => {
@@ -260,6 +265,26 @@ describe('comboFromEvent — recording a new binding', () => {
 
   it('waits while only modifiers are held', () => {
     expect(comboFromEvent(ev({ key: 'Control', code: 'ControlLeft' }))).toBeNull();
+  });
+
+  it('records a shifted symbol by its key, so the conflict check sees it', () => {
+    // Windows reports '}' for Ctrl+Shift+] (#1422). Recorded by the glyph it
+    // was 'Ctrl+Shift+}', which next tab's 'Ctrl+Shift+]' never matched.
+    const e = ev({ key: '}', code: 'BracketRight', shiftKey: true });
+    const combo = comboFromEvent(e);
+    expect(combo).toBe('Ctrl+Shift+]');
+    expect(rebindProblem('toggleSidebar', combo as string, win, 'win32', 'KeyB'))
+      .toEqual({ kind: 'taken', by: 'nextSurface' });
+    expect(comboFromEvent(ev({ key: '!', code: 'Digit1', shiftKey: true }))).toBe('Ctrl+Shift+1');
+    // Still the key the resolver matches.
+    expect(resolveShortcut(e, [{ action: 'toggleSidebar', combo: combo as string }])).toBe('toggleSidebar');
+    // Letters and digits are unchanged by Shift.
+    expect(comboFromEvent(ev({ key: 'D', code: 'KeyD', shiftKey: true }))).toBe('Ctrl+Shift+D');
+  });
+
+  it('keeps resolving a shifted-glyph combo recorded before', () => {
+    const e = ev({ key: '}', code: 'BracketRight', shiftKey: true });
+    expect(resolveShortcut(e, [{ action: 'toggleSidebar', combo: 'Ctrl+Shift+}' }])).toBe('toggleSidebar');
   });
 });
 
@@ -426,5 +451,49 @@ describe('ShortcutPressGuard (IME double keydown)', () => {
     const g = new ShortcutPressGuard();
     g.noteActed(ev('ㅅ', 'KeyT'));
     expect(g.isDuplicate(ev('t', 'KeyT'))).toBe(true);
+  });
+});
+
+// ─── Unbound actions (command-palette shortcuts) ─────────────────────────────
+
+describe('UNBOUND_SHORTCUTS', () => {
+  it('bind nothing until the user gives them a key', () => {
+    const unbound = new Set(UNBOUND_SHORTCUTS.map((e) => e.action));
+    for (const platform of ['win32', 'darwin', 'linux'] as const) {
+      expect(defaultBindings(platform).filter((b) => unbound.has(b.action))).toEqual([]);
+    }
+    // And so reserve no menu accelerator either.
+    expect(WMUX_KEYMAP.filter((e) => unbound.has(e.action as never))).toEqual([]);
+  });
+
+  it('take an override like any built-in, and survive the session loader', () => {
+    const overrides = sanitizeShortcutOverrides({ movePaneRight: 'Ctrl+Alt+P', stashPane: null });
+    expect(overrides).toEqual({ movePaneRight: 'Ctrl+Alt+P', stashPane: null });
+    const bindings = effectiveBindings('win32', overrides);
+    expect(resolveShortcut(ev({ key: 'p', code: 'KeyP', altKey: true }), bindings)).toBe('movePaneRight');
+  });
+
+  it('are checked for conflicts like any built-in', () => {
+    const bindings = effectiveBindings('win32', {});
+    expect(rebindProblem('movePaneRight', 'Ctrl+D', bindings, 'win32', 'KeyB'))
+      .toEqual({ kind: 'taken', by: 'splitHorizontal' });
+    expect(rebindProblem('movePaneRight', 'Ctrl+Alt+P', bindings, 'win32', 'KeyB')).toBeNull();
+  });
+});
+
+describe('workspaceShortcutNumber', () => {
+  it('numbers the first eight and gives 9 to the last, like Ctrl+9 (12 workspaces)', () => {
+    const numbers = Array.from({ length: 12 }, (_, i) => workspaceShortcutNumber(i, 12));
+    expect(numbers).toEqual([1, 2, 3, 4, 5, 6, 7, 8, undefined, undefined, undefined, 9]);
+  });
+
+  it('keeps the last row on its own digit when there are eight or fewer', () => {
+    expect(Array.from({ length: 5 }, (_, i) => workspaceShortcutNumber(i, 5))).toEqual([1, 2, 3, 4, 5]);
+    expect(workspaceShortcutNumber(8, 9)).toBe(9);
+  });
+
+  it('has no digit for a row outside the list', () => {
+    expect(workspaceShortcutNumber(-1, 12)).toBeUndefined();
+    expect(workspaceShortcutNumber(12, 12)).toBeUndefined();
   });
 });

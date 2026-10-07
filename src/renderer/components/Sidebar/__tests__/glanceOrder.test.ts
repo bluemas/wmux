@@ -25,10 +25,15 @@ describe('glanceOrder', () => {
     expect(ids(out)).toEqual(['needNew', 'needOld', 'done', 'run', 'unconf', 'idle']);
   });
 
-  it('holds a just-created workspace on top, then lets it sort normally', () => {
-    const newAt = { idle: 1_000 };
+  it('holds a just-created workspace at the bottom, then lets it sort normally', () => {
+    const newAt = { needNew: 1_000 };
     expect(ids(glanceOrder(ws('needNew', 'idle'), scoreOf, newAt, 1_000 + 60_000))).toEqual(['idle', 'needNew']);
     expect(ids(glanceOrder(ws('needNew', 'idle'), scoreOf, newAt, 1_000 + NEW_WORKSPACE_HOLD_MS))).toEqual(['needNew', 'idle']);
+  });
+
+  it('puts the newest held workspace last', () => {
+    const newAt = { run: 1_000, idle: 2_000 };
+    expect(ids(glanceOrder(ws('idle', 'run', 'done'), scoreOf, newAt, 3_000))).toEqual(['done', 'run', 'idle']);
   });
 });
 
@@ -66,9 +71,10 @@ describe('boardOrder — pinned group first', () => {
     expect(flat(boardOrder({ ...base, manual, pinned, mode: 'recent' }))).toEqual(['pinIdle', 'pinNeed', 'run', 'needNew', 'idle']);
   });
 
-  it('a new workspace holds the top of the rest, not above the pins', () => {
+  it('a new workspace holds the end of the list, below the pins and the rest', () => {
     const out = boardOrder({ ...base, manual: [...manual, { id: 'fresh' }], pinned, mode: 'attention', newAt: { fresh: 1_000 }, now: 2_000 });
-    expect(flat(out).slice(0, 3)).toEqual(['pinIdle', 'pinNeed', 'fresh']);
+    expect(flat(out).slice(-1)).toEqual(['fresh']);
+    expect(flat(out).slice(0, 2)).toEqual(['pinIdle', 'pinNeed']);
   });
 
   it('follows a reorder inside the group in every mode', () => {

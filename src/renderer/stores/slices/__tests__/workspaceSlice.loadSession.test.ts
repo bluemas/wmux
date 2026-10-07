@@ -32,6 +32,7 @@ type TestState = WorkspaceSlice & {
   notificationRingEnabled: boolean;
   anthropicUsageEnabled: boolean;
   usageLimitAutoResume: boolean;
+  claudeResumeOnStart: boolean;
   customKeybindings: unknown[];
   autoUpdateEnabled: boolean;
   sidebarMode: 'workspaces' | 'company';
@@ -91,6 +92,7 @@ function createTestStore() {
       notificationRingEnabled: true,
       anthropicUsageEnabled: false,
       usageLimitAutoResume: false,
+      claudeResumeOnStart: false,
       customKeybindings: [],
       autoUpdateEnabled: true,
       sidebarMode: 'workspaces',
@@ -623,17 +625,17 @@ describe('loadSession — sidebar attention-first ordering', () => {
     // separate edits; without this the pref silently resets on every restart.
     const store = createTestStore();
     expect(store.getState().sidebarAttentionFirst).toBe(false);
-    store.getState().loadSession(sessionWith(true));
+    store.getState().loadSession({ ...sessionWith(true), sidebarSortMode: 'attention', sidebarSortModeChosen: true } as SessionData);
     expect(store.getState().sidebarAttentionFirst).toBe(true);
   });
 
-  // Owner decision 2026-09-25: Attention is the default order. Only a mode the
-  // user explicitly chose survives the flip.
-  it('defaults a session with no explicit choice to Attention', () => {
+  // Owner decision 2026-10-04: Manual is the default order. Only a mode the
+  // user explicitly chose survives.
+  it('defaults a session with no explicit choice to Manual', () => {
     const store = createTestStore();
     store.getState().loadSession(sessionWith('false'));
-    expect(store.getState().sidebarSortMode).toBe('attention');
-    expect(store.getState().sidebarAttentionFirst).toBe(true);
+    expect(store.getState().sidebarSortMode).toBe('manual');
+    expect(store.getState().sidebarAttentionFirst).toBe(false);
   });
 
   it('keeps an explicitly chosen Manual order', () => {
@@ -1482,5 +1484,38 @@ describe('WorkspaceSlice.loadSession — first-run system locale detection', () 
     } finally {
       (globalThis.window as unknown as { electronAPI?: unknown }).electronAPI = saved;
     }
+  });
+});
+
+describe('loadSession — Claude resume-on-start setting (#1826)', () => {
+  function sessionWith(value: unknown): SessionData {
+    const ws: Workspace = {
+      id: 'ws-resume',
+      name: 'Resume',
+      rootPane: makeBrowserSurfaceTree('https://example.com'),
+      activePaneId: 'pane-root',
+    };
+    return {
+      workspaces: [ws],
+      activeWorkspaceId: ws.id,
+      sidebarVisible: true,
+      ...(value !== undefined ? { claudeResumeOnStart: value } : {}),
+    } as unknown as SessionData;
+  }
+
+  it('stays off for a session saved before the setting existed', () => {
+    const store = createTestStore();
+    store.getState().loadSession(sessionWith(undefined));
+    expect(store.getState().claudeResumeOnStart).toBe(false);
+  });
+
+  it('restores a saved boolean and ignores a malformed value', () => {
+    const store = createTestStore();
+    store.getState().loadSession(sessionWith(true));
+    expect(store.getState().claudeResumeOnStart).toBe(true);
+    store.getState().loadSession(sessionWith('false'));
+    expect(store.getState().claudeResumeOnStart).toBe(true);
+    store.getState().loadSession(sessionWith(false));
+    expect(store.getState().claudeResumeOnStart).toBe(false);
   });
 });

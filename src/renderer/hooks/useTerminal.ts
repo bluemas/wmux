@@ -36,6 +36,7 @@ import {
 import { terminalFontFamilyCss } from '../utils/terminalFont';
 import { createPathLinkProvider } from '../terminal/pathLinkProvider';
 import { resolveNewlineKeyByte, wantsAltEnterNewline, foldAtPromptCarry, noteCodexEndedByPrompt } from '../terminal/newlineKeys';
+import { resolveMacLineDeleteByte } from '../terminal/macLineDeleteKey';
 import { isWslShell } from '../../shared/imagePaste';
 import { encodeEscape, isBareEscape } from '../terminal/escapeKeys';
 import { resolveCtrlLetterByte } from '../terminal/ctrlLetterKeys';
@@ -68,7 +69,6 @@ import {
   noteTerminalInput,
   discardTerminalOutput,
   isTerminalDirty,
-  isTerminalRetained,
   markTerminalDirty,
   markTerminalClean,
   getQueuedCharCount,
@@ -444,9 +444,16 @@ function writePtyDataImmediately(
  * would clamp the PTY side to MIN_SAFE_COLS anyway, splitting the two sides
  * of the pipe. Callers skip; a later resize tick (layout settled, pane
  * revealed, font swapped) re-proposes.
+ *
+ * A container that is not laid out (display:none workspace) is not
+ * measurable even when FitAddon returns numbers: its computed width/height
+ * read back as the declared "100%", which FitAddon parses as 100px and turns
+ * into a ~11x5 proposal that clears the floor. Sending that on a daemon
+ * reattach shrank every background pane's PTY at app start.
  */
 function proposedSafeDimensions(
   addon: FitAddon | null | undefined,
+  container: HTMLElement | null | undefined,
 ): { cols: number; rows: number } | null {
   if (!addon) return null;
   try {
@@ -455,6 +462,7 @@ function proposedSafeDimensions(
     // A fixed grid is the owner's size, not a transient measurement: the
     // floor protects against mid-layout fits, which this never is.
     if (addon instanceof FixedGeometryFitAddon) return dims;
+    if (!container || container.offsetWidth === 0 || container.offsetHeight === 0) return null;
     if (!isSafeGeometry(dims.cols, dims.rows)) return null;
     return dims;
   } catch {
@@ -469,17 +477,17 @@ function hiddenRetentionActive(): boolean {
 /** Reveal-time flush cap (GPU repaint-burst fix, 2026-07-21). A retained
  *  backlog handed to xterm in one shot on reveal is a single giant parse that
  *  dirties the whole viewport and rasters it across many consecutive frames —
- *  the measured workspace-switch burst. Above this size we discard the backlog
- *  and re-synchronize a bounded screen snapshot from the daemon instead, which
- *  is cheaper than parsing to reconstruct a screen the daemon can serialize in
- *  a few KB (one clean repaint vs. a multi-frame raster storm).
+ *  the measured workspace-switch burst. Above this size the backlog goes to
+ *  the budgeted priority drain instead, which catches up over frames.
+ *
+ *  It used to be discarded for a daemon resync instead; that re-parsed the
+ *  whole ring at the current width and garbled history written at another
+ *  width. MAX_QUEUE_CHARS (2 MB, scheduler) is still the HARD (memory) cap
+ *  that force-discards and resyncs.
  *
  *  Threshold: xterm parses ~5–35 MB/s (xterm.js flow-control docs), so 256 KB
  *  is ~7–50 ms of parse — the point where a reveal starts spanning multiple
- *  frames and the raster becomes perceptible. This is the SOFT (perf) cap;
- *  MAX_QUEUE_CHARS (2 MB, scheduler) is the HARD (memory) cap that force-
- *  discards. Both use the identical discard→dirty→resync mechanism and safety;
- *  they differ only in trigger (perceptible parse vs. unbounded memory). */
+ *  frames and the raster becomes perceptible. */
 const REVEAL_FLUSH_MAX_CHARS = 256 * 1024;
 
 /** One-shot diagnostic latch: logged at the first data event that arrives for
@@ -540,25 +548,20 @@ export async function hydrateTerminalForRead(ptyId: string): Promise<void> {
 // the pool's accounting must treat them as distinct slots.
 let webglTokenSeq = 0;
 
-// RCA (2026-05-29 view-switch lag): when a terminal is hidden we DEFER releasing
-// its WebGL context (back to the shared pool) by this delay instead of freeing
-// it immediately. A hidden terminal usually reappears within seconds (workspace
-// switch back, multiview<->single toggle); immediate release+reload thrashes GPU
-// context creation, which is the main source of the view-switch lag the user
-// reported. If the terminal becomes visible again before the timer fires, the
-// release is cancelled and the live context reused. The HARD ceiling on
-// simultaneous contexts is enforced by webglContextPool (LRU eviction under
-// Chromium's ~16 cap); this timer is only the no-pressure cleanup.
-// 2026-07 perf pass (TASK-8): 10s → 5s. 10s effectively pinned contexts on
-// hidden panes long enough that >12-pane fleets leaned on LRU eviction (the
-// expensive path) instead of this cheap timer. 5s still covers the common
-// quick switch-back; if rapid workspace cycling ever shows blank-pane thrash,
-// revert toward 7s.
-export const WEBGL_HIDDEN_DISPOSE_DELAY_MS = 5_000;
+// A hidden terminal KEEPS its WebGL context. It gives the context back only
+// when webglContextPool evicts it (LRU, once more terminals want one than the
+// budget allows) or when it unmounts. Rebuilding the renderer on reveal is the
+// expensive part of a view switch: context creation plus a synchronous shader
+// compile, measured at ~225 ms per terminal (2026-10-06), and it runs inside
+// the switch's input task, so the pane paints only after it. A 5 s hidden-release
+// timer used to free contexts with no budget pressure, which made every reveal
+// of a pane hidden longer than that pay this cost (switch input-to-paint
+// 300–600 ms, against 40–70 ms with the context kept). A hidden xterm does not
+// render, so a held context costs GPU memory only, and the pool bounds it.
 
 // RCA A1 — reconnect-with-retry policy lives in its own module so it can be
 // unit-tested without xterm/zustand/electron. Bound to the live deps here.
-function reconnectPtyWithRetry(ptyId: string, isCurrent: () => boolean, onRecoveryError?: (message: string | null, info?: { cwdMissing?: boolean }) => void): Promise<void> {
+function reconnectPtyWithRetry(ptyId: string, isCurrent: () => boolean, onRecoveryError?: (message: string | null, info?: { cwdMissing?: boolean }) => void): Promise<{ cols: number; rows: number } | null> {
   return reconnectPtyWithRetryImpl(ptyId, isCurrent, {
     reconnect: (id) => window.electronAPI.pty.reconnect(id),
     onRecoveryError,
@@ -791,8 +794,6 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
   // Stable unique token for this terminal's slot in the shared WebGL pool.
   const webglTokenRef = useRef<string>('');
   if (!webglTokenRef.current) webglTokenRef.current = `wgl-${++webglTokenSeq}`;
-  // Pending deferred-WebGL-release timer (see WEBGL_HIDDEN_DISPOSE_DELAY_MS).
-  const webglDisposeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Glyph-corruption repair scheduler (issue #166) — created by the main
   // effect, also poked by the visibility effect on regain.
   const glyphRepaintRef = useRef<GlyphRepaintScheduler | null>(null);
@@ -1120,7 +1121,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // the reflow re-wraps the whole scrollback at that width — damage a later
     // correct fit does not undo. The ResizeObserver re-fires when the layout
     // settles, so skipping is self-healing.
-    if (!proposedSafeDimensions(fitAddonRef.current)) return;
+    if (!proposedSafeDimensions(fitAddonRef.current, container)) return;
     try {
       fitAddonRef.current.fit();
       // This path fits and resizes too, so it settles any deferred debt (#747) —
@@ -1700,7 +1701,8 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // #1255: sub-floor proposals (mid-split/restoring container) are treated
     // exactly like a hidden container — no fit, and an adoption holds its
     // parked viewport until a real fit runs.
-    if (container.offsetWidth > 0 && container.offsetHeight > 0 && proposedSafeDimensions(fitAddon)) {
+    const initialFitRan = container.offsetWidth > 0 && container.offsetHeight > 0 && !!proposedSafeDimensions(fitAddon, container);
+    if (initialFitRan) {
       fitAddon.fit();
       // #1002: the fit runs AFTER the adopted element is back in the DOM and
       // can change how many rows the viewport holds, which moves what "the
@@ -1792,7 +1794,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         // records no fit debt: layout settling re-fires the ResizeObserver,
         // which is the retry. (Checked before claimFit so the debt mechanism
         // stays reserved for selection-deferred fits.)
-        const proposed = proposedSafeDimensions(fitAddon);
+        const proposed = proposedSafeDimensions(fitAddon, container);
         if (!proposed) return;
 
         // Selection-preservation guard: xterm's SelectionService clears the
@@ -2172,6 +2174,16 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         if (customKeybindings.some((kb) => kb.key === combo)) {
           return false; // let useKeyboard handle it
         }
+      }
+
+      // ⌘Backspace deletes to the start of the line (xterm encodes no ⌘ chord).
+      // Below the shortcut checks so a user binding on it still wins.
+      const lineDeleteByte = resolveMacLineDeleteByte(e, isMac);
+      if (lineDeleteByte !== null) {
+        e.preventDefault();
+        window.electronAPI.pty.write(ptyId, lineDeleteByte);
+        noteUserKeystroke(lineDeleteByte);
+        return false;
       }
 
       // macOS-native clipboard: ⌘C copies the selection, ⌘V pastes. The Ctrl
@@ -2591,7 +2603,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // lastSentCols cache already "matches" — a transient sub-floor fit
       // could have left the daemon pinned at its MIN_SAFE_COLS clamp while
       // the cache believed otherwise. sendResize carries no dedup.
-      const dims = proposedSafeDimensions(fitAddon);
+      const dims = proposedSafeDimensions(fitAddon, container);
       if (dims) sendResize(ptyId, dims.cols, dims.rows);
       st.resolvers.splice(0).forEach((r) => r());
       return true;
@@ -2907,9 +2919,11 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       });
     }
 
-    // Resize PTY on initial fit — only when we actually have valid dimensions.
+    // Resize PTY on initial fit — only when that fit ran. Unfitted, xterm still
+    // holds its 80x24 default, which would shrink a background pane's PTY to
+    // a size nothing displays; the first fit after reveal sends the real one.
     const { cols, rows } = terminal;
-    if (cols > 0 && rows > 0) {
+    if (initialFitRan && cols > 0 && rows > 0) {
       lastSentCols = cols;
       lastSentRows = rows;
       sendResize(ptyId, cols, rows);
@@ -3088,10 +3102,6 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       removeDaemonConnectedForRestore?.();
       removeFlushListener?.();
       terminalRegistry.delete(ptyId);
-      if (webglDisposeTimerRef.current) {
-        clearTimeout(webglDisposeTimerRef.current);
-        webglDisposeTimerRef.current = null;
-      }
       // Release our pool slot (disposes the addon if we held a context) so the
       // budget frees for other terminals. The backstop teardown covers the
       // unlikely case of an addon created outside a pool grant (e.g. the
@@ -3197,7 +3207,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       reconnectInFlightRef.current = true;
       console.log(`[useTerminal] daemon reattach ptyId=${id} (${reason})`);
       return reconnectPtyWithRetry(id, () => ptyIdRef.current === id && terminalRef.current !== null, (message, info) => onRecoveryErrorRef.current?.(message, info))
-        .then(() => {
+        .then((stored) => {
           // #882 — the daemon starts every managed session at `viewerVisible:
           // true` and resets to true on detach, so a reattach that lands while
           // this pane is hidden (background workspace, minimized window) leaves
@@ -3211,8 +3221,27 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
           // daemon session was recreated at its default/clamped size; the
           // renderer's dedup cache may already "match" that stale value, so
           // the resize goes out unconditionally via sendResize (no dedup).
-          const dims = proposedSafeDimensions(fitAddonRef.current);
-          if (dims) sendResize(id, dims.cols, dims.rows);
+          const dims = proposedSafeDimensions(fitAddonRef.current, containerRef.current);
+          if (dims) {
+            sendResize(id, dims.cols, dims.rows);
+            return;
+          }
+          // #1847: a hidden pane cannot measure itself, so it takes the
+          // session's stored size instead. Resizing xterm to it means output
+          // parsed while hidden (or flushed on reveal, before the reveal fit)
+          // wraps at the width the program drew for. Sending the same size
+          // back is not a SIGWINCH (the daemon skips unchanged geometry), but
+          // it is the desk's first resize, which unmutes a recovered session:
+          // without it that session's output stays out of the ring until the
+          // pane is shown, and anything past the held-output cap is lost.
+          const container = containerRef.current;
+          const term = terminalRef.current;
+          if (!stored || !term || fixedGeometryRef.current) return;
+          if (container && container.offsetWidth > 0 && container.offsetHeight > 0) return;
+          if (isSafeGeometry(stored.cols, stored.rows) && (term.cols !== stored.cols || term.rows !== stored.rows)) {
+            term.resize(stored.cols, stored.rows);
+          }
+          sendResize(id, stored.cols, stored.rows);
         })
         .finally(() => { inFlight = false; reconnectInFlightRef.current = false; });
     };
@@ -3293,7 +3322,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     }
     // #1255: floor gate — a font change re-measures the container; skip
     // sub-floor proposals instead of reflowing the buffer at a broken width.
-    if (!proposedSafeDimensions(fitAddonRef.current)) {
+    if (!proposedSafeDimensions(fitAddonRef.current, container)) {
       console.debug('[Terminal] font/theme fit skipped — sub-floor dimensions');
       return;
     }
@@ -3308,8 +3337,8 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
   }, [fixedCols, fixedRows, fit]);
 
   // Manage WebGL lifecycle based on visibility.
-  // Load WebGL when visible (GPU-accelerated rendering), dispose when hidden
-  // to free the WebGL context for other terminals.  Also re-fit so a terminal
+  // Request a WebGL context when visible (GPU-accelerated rendering); a hidden
+  // terminal keeps it until the pool evicts it. Also re-fit so a terminal
   // that was initialized while hidden displays at the correct size.
   useEffect(() => {
     const token = webglTokenRef.current;
@@ -3329,43 +3358,16 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
           // to keep the main log usable; anything that had retained backlog
           // logs the catch-up size.
           const queued = getQueuedCharCount(terminalRef.current);
-          // Reveal-backlog-cap: a large RETAINED backlog handed to xterm in one
-          // shot is the workspace-switch raster burst. Above the cap, discard it
-          // and re-synchronize a bounded snapshot from the daemon — identical
-          // mechanism and safety to the retention overflow→dirty path, just at a
-          // lower (perf, not memory) threshold.
-          //
-          // Two-part gate (review-team 2026-07-21):
-          //  - isTerminalRetained (per-pane): a retained entry is only ever
-          //    produced by the retainWhenHidden write path, so its bytes came
-          //    from the daemon and are in the RingBuffer. A non-retained backlog
-          //    (background drain / a local pane) is NEVER capped — discarding it
-          //    could lose the pane's only copy (GLM+Codex round-1 P1).
-          //  - isDaemonModeActive (current reachability): `retained` is
-          //    historical — the daemon could have disconnected AFTER the bytes
-          //    were retained. Without this the reveal would discard the only
-          //    copy while resync fails with local-mode/session-gone (Codex
-          //    round-2 P1). Requiring the daemon to be live NOW means resync can
-          //    actually replace what we discard; on resync failure the pane
-          //    stays dirty and retries, and the daemon still holds the bytes.
-          // Caveat: a renderer-only exit marker (terminal.exitedBracket) in the
-          // backlog is dropped — the same tradeoff as the overflow path, now
-          // more frequent at the 256KB cap; the daemon resync replays the PTY's
-          // real final screen, which conveys the exit, just not the localized
-          // bracket.
-          if (
-            queued > REVEAL_FLUSH_MAX_CHARS &&
-            isTerminalRetained(terminalRef.current) &&
-            isDaemonModeActive()
-          ) {
-            console.log(`[wmux:reveal] ptyId=${ptyIdRef.current} mechanism=reveal-backlog-cap queuedChars=${queued}`);
-            markTerminalDirty(terminalRef.current);
-            void startResync('reveal-backlog-cap');
-          } else if (queued > REVEAL_FLUSH_MAX_CHARS) {
-            // Large but NON-retained (or daemon down): we can't discard it (the
-            // queue is the only copy), but flushing it inline would burst. Hand
-            // it to the budgeted priority drain so it catches up over frames
-            // instead of one giant parse — data-loss-safe, order preserved.
+          // A large backlog is never discarded for a daemon resync here. The
+          // resync re-parses the whole ring (up to 8 MB) at the CURRENT width,
+          // and history written at another width (a window or font resize)
+          // re-wraps wrong — Claude Code's cursor-up redraws then stack into
+          // garbled frames. Parsing only the backlog is what the live pane
+          // would have done anyway. Above the cap it goes to the budgeted
+          // priority drain so it catches up over frames instead of one giant
+          // parse, with the old frame up meanwhile; only an overflowed (dirty)
+          // backlog still needs the resync above.
+          if (queued > REVEAL_FLUSH_MAX_CHARS) {
             console.log(`[wmux:reveal] ptyId=${ptyIdRef.current} mechanism=reveal-budgeted-catchup queuedChars=${queued}`);
             promoteTerminalToPriorityDrain(terminalRef.current);
           } else {
@@ -3375,14 +3377,6 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
             flushTerminalOutput(terminalRef.current);
           }
         }
-      }
-      // Cancel any pending deferred release — the terminal is visible again
-      // (fast workspace switch / multiview<->single toggle), so keep our slot
-      // instead of freeing and rebuilding it. This is the de-thrash that
-      // removes the view-switch lag.
-      if (webglDisposeTimerRef.current) {
-        clearTimeout(webglDisposeTimerRef.current);
-        webglDisposeTimerRef.current = null;
       }
       // Ask the shared pool for a context. Under budget → granted immediately;
       // at budget → the pool evicts the least-recently-shown terminal (it drops
@@ -3412,20 +3406,10 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         fit();
       });
       return () => cancelAnimationFrame(id);
-    } else {
-      // DEFER the pool release rather than freeing the instant the terminal is
-      // hidden (see WEBGL_HIDDEN_DISPOSE_DELAY_MS). A hidden terminal usually
-      // reappears within seconds; releasing immediately is the view-switch lag.
-      // If another terminal needs the budget sooner, the pool evicts us anyway
-      // (we are the least-recently-shown), so this timer is only the no-pressure
-      // cleanup that frees the slot when nothing else is contending for it.
-      if (!webglDisposeTimerRef.current) {
-        webglDisposeTimerRef.current = setTimeout(() => {
-          webglDisposeTimerRef.current = null;
-          webglContextPool.release(token);
-        }, WEBGL_HIDDEN_DISPOSE_DELAY_MS);
-      }
     }
+    // Hidden: keep the WebGL context ("A hidden terminal KEEPS its WebGL
+    // context", near the top of this file). The pool evicts it if a visible
+    // terminal needs the slot.
   }, [isVisible, fit, startResync]);
 
   // #766 — visibility-based size ownership. Report to the daemon whether this

@@ -90,8 +90,7 @@ describe("Moa's HQ is left out of the workspace list", () => {
     expect(container.querySelector('[data-sidebar-total]')?.textContent).toBe('2');
     // Ctrl+N skips the HQ: `b` is stored third but is the second listed.
     const b = [...document.querySelectorAll('.sidebar-row')].find((r) => r.textContent?.startsWith('b')) as HTMLElement;
-    expect(b.textContent).toContain('^2');
-    expect(b.textContent).not.toContain('^3');
+    expect(b.querySelector('[data-shortcut-number]')?.getAttribute('data-shortcut-number')).toBe('2');
     // Not active: no HQ row either.
     expect(hqRow()).toBeNull();
   });
@@ -127,6 +126,30 @@ describe("Moa's HQ is left out of the workspace list", () => {
     act(() => useStore.setState({ activeWorkspaceId: 'a' }));
     press('9');
     expect(useStore.getState().activeWorkspaceId).toBe('b');
+  });
+
+  it('past eight workspaces only the last listed row is numbered 9, the row Ctrl+9 opens', () => {
+    seed();
+    const names = 'abcdefghijkl'.split('');
+    act(() => useStore.setState({ workspaces: [...names.slice(0, 4), 'moa', ...names.slice(4)].map(ws) } as never));
+    act(() => root.render(<Sidebar />));
+    const numberOf = (name: string) => ([...document.querySelectorAll('.sidebar-row')]
+      .find((r) => r.textContent?.startsWith(name)) as HTMLElement)
+      .querySelector('[data-shortcut-number]')?.getAttribute('data-shortcut-number') ?? null;
+    expect(names.map(numberOf)).toEqual(['1', '2', '3', '4', '5', '6', '7', '8', null, null, null, '9']);
+
+    act(() => root.render(<MiniSidebar />));
+    const titles = [...container.querySelectorAll('button[title]')].map((b) => b.getAttribute('title'))
+      .filter((t) => /\(Ctrl\+\d\)$/.test(t ?? ''));
+    // The HQ is stored fifth; the rail skips it exactly as the keymap does.
+    expect(titles).toEqual([...names.slice(0, 8).map((n, i) => `${n} (Ctrl+${i + 1})`), 'l (Ctrl+9)']);
+
+    function Harness(): null { useKeyboard(); return null; }
+    act(() => root.render(<Harness />));
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, ctrlKey: true, key: '9', code: 'Digit9' }));
+    });
+    expect(useStore.getState().activeWorkspaceId).toBe('l');
   });
 });
 

@@ -39,6 +39,7 @@ import {
 
 import PresetPicker from './PresetPicker';
 import { COMPANY_MODE_ENABLED } from '../../../shared/featureFlags';
+import { workspaceShortcutNumber } from '../../../shared/keymap';
 import { listedWorkspaces, moaHqId as selectMoaHqId, refuseWorkspaceClose } from '../Moa/moaHqGuard';
 
 /** Namespaces a remote row's id in the shared glance order. */
@@ -393,7 +394,7 @@ export default function Sidebar({ chrome = 'full' }: { chrome?: 'full' | 'sheet'
       isActive={id === shownActiveId}
       isMultiview={multiviewIds.includes(id)}
       index={workspaces.findIndex((w) => w.id === id)}
-      shortcutIndex={listed.findIndex((w) => w.id === id)}
+      shortcutNumber={workspaceShortcutNumber(listed.findIndex((w) => w.id === id), listed.length)}
       onSelect={setActiveWorkspace}
       onCtrlSelect={handleCtrlSelect}
       onRename={renameWorkspace}
@@ -437,7 +438,7 @@ export default function Sidebar({ chrome = 'full' }: { chrome?: 'full' | 'sheet'
           isActive={ws.id === shownActiveId}
           isMultiview={multiviewIds.includes(ws.id)}
           index={workspaces.indexOf(ws)}
-          shortcutIndex={listed.indexOf(ws)}
+          shortcutNumber={workspaceShortcutNumber(listed.indexOf(ws), listed.length)}
           onSelect={setActiveWorkspace}
           onCtrlSelect={handleCtrlSelect}
           onRename={renameWorkspace}
@@ -496,10 +497,22 @@ export default function Sidebar({ chrome = 'full' }: { chrome?: 'full' | 'sheet'
         </div>
       )}
       <div className="wmux-sidebar-section">
-        <span className="truncate">{t('sidebar.workspaces')}</span>
-        <span className="wmux-sidebar-total" data-sidebar-total>
-          {narrowed ? t('sidebar.filter.count', { shown: shownCount, total: listedCount }) : listedCount}
-        </span>
+        <span className="min-w-0 truncate">{t('sidebar.workspaces')}</span>
+        {/* Filtered, the count is the compact "shown/total" so it never wraps in a
+            narrow sidebar; the full sentence stays as the tooltip and as the text a
+            screen reader reads (aria-label on a plain span is not exposed). */}
+        {narrowed ? (
+          <span
+            className="wmux-sidebar-total"
+            data-sidebar-total
+            title={t('sidebar.filter.count', { shown: shownCount, total: listedCount })}
+          >
+            <span aria-hidden="true" data-sidebar-total-compact>{`${shownCount}/${listedCount}`}</span>
+            <span className="sr-only">{t('sidebar.filter.count', { shown: shownCount, total: listedCount })}</span>
+          </span>
+        ) : (
+          <span className="wmux-sidebar-total" data-sidebar-total>{listedCount}</span>
+        )}
         {/* The order is a visible choice here, not only in Settings. */}
         {listedCount >= 2 && <span className="ml-auto flex">
           <SidebarSortMenu />

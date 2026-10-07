@@ -65,8 +65,9 @@ import { scheduleTokenFileReHarden } from '../shared/security';
 import { applyTaskQueryView } from '../shared/a2aTaskQueryView';
 import { normalizeLivePaneIds } from '../shared/a2aOrphanedTask';
 import type { WebTlsConfig } from '../shared/web';
-import { generateSnapshot, generateSnapshotUnqueued, enqueueSnapshotJob, generateTextSnapshot, generateTextSnapshotUnqueued, capTextRowsToFrameBudget, MAX_SCROLLBACK, type TextSnapshotOutcome } from './HeadlessSnapshot';
+import { generateSnapshotUnqueued, enqueueSnapshotJob, generateTextSnapshot, generateTextSnapshotUnqueued, capTextRowsToFrameBudget, MAX_SCROLLBACK, type TextSnapshotOutcome } from './HeadlessSnapshot';
 import { readSessionTextReplay } from './sessionTextReplay';
+import { serializeSession } from './sessionSerialize';
 import { AwaitingScreenVerifier, renderPaneScreen } from './AwaitingScreenVerifier';
 import { screenShowsAgentDialog } from './transcript/chatScreenGate';
 import { ApprovalPushRouter } from './push/approvalPushRouter';
@@ -125,7 +126,7 @@ import { isWslDistroSpawnArgs } from '../shared/wslDistro';
 import { randomUUID } from 'node:crypto';
 import { monitorEventLoopDelay, performance as nodePerformance } from 'node:perf_hooks';
 import { DAEMON_EXIT_ALREADY_RUNNING, ENV_KEYS, isBrainPty } from '../shared/constants';
-import { toResumeCommand, resumeOfferForRecovered, mergeResumeBinding, isProvisionalCapture, normalizeResumeCwd, isUsableResumeBinding } from '../shared/agentResume';
+import { toResumeCommand, resumeOfferForRecovered, mergeResumeBinding, isProvisionalCapture, normalizeResumeCwd, isUsableResumeBinding, isPlausibleResumeSessionId } from '../shared/agentResume';
 import type { ResumeBinding } from '../shared/agentResume';
 import { agentDisplayToSlug, AGENT_SLUG_SET, isAgentSlug } from '../shared/agentIdentity';
 import type { AgentEventStatus } from '../main/pty/AgentDetector';
@@ -587,7 +588,7 @@ function createApprovalRegistry(sessionManager: DaemonSessionManager): ApprovalR
         cols: managed.meta.cols ?? 80,
         rows: managed.meta.rows ?? 24,
         scrollback: 0,
-        initial: managed.ringBuffer.readAll(),
+        initial: readSessionTextReplay(managed.ringBuffer, managed.bridge.outputModes),
       });
       if (!outcome.ok) return null;
       return outcome.rows.map((r) => r.text);
@@ -1233,6 +1234,8 @@ function spoolRecordToBinding(rec: Record<string, unknown>): { ptyId: string; bi
   const cwd = typeof rec.cwd === 'string' ? rec.cwd : null;
   const agent = typeof rec.agent === 'string' ? rec.agent : 'claude';
   if (!ptyId || !sessionId || !cwd || !KNOWN_AGENT_SLUGS.has(agent)) return null;
+  // #1823: a spooled rollout stem under agent 'claude' would re-poison at boot.
+  if (!isPlausibleResumeSessionId(agent, sessionId)) return null;
   const permissionMode = typeof rec.permissionMode === 'string' && KNOWN_PERMISSION_MODES.has(rec.permissionMode)
     ? (rec.permissionMode as ResumeBinding['permissionMode'])
     : undefined;
@@ -2583,7 +2586,7 @@ function registerRpcHandlers(
           cols: live?.meta.cols ?? managed.meta.cols ?? 80,
           rows: live?.meta.rows ?? managed.meta.rows ?? 24,
         };
-      });
+      }, () => sessionManager.getSession(p.id)?.bridge.outputModes ?? managed.bridge.outputModes);
       sessionPipes.set(p.id, pipe);
 
       // #557: demote a stuck-'attached' session to 'detached' if its authed
@@ -2735,33 +2738,16 @@ function registerRpcHandlers(
     if (!managed) {
       throw new Error(`SESSION_NOT_FOUND: ${p.id}`);
     }
-    const MAX_RPC_PAYLOAD_BYTES = 512 * 1024; // base64 ×1.37 + JSON stays < 1 MB
-    const scrollback = Math.min(typeof p.scrollback === 'number' ? p.scrollback : 2000, 10_000);
-    const base = {
-      cols: managed.meta.cols,
-      rows: managed.meta.rows,
-      initial: managed.ringBuffer.readAll(),
-    };
-    let outcome = await generateSnapshot({ ...base, scrollback });
-    if (outcome.ok && outcome.payload.length > MAX_RPC_PAYLOAD_BYTES) {
-      outcome = await generateSnapshot({ ...base, scrollback: 0 });
-    }
-    if (!outcome.ok) {
-      log('info', `[serialize] session=${p.id} unavailable reason=${outcome.reason}`);
-      return { ok: true, mode: 'unavailable', reason: outcome.reason };
-    }
-    if (outcome.payload.length > MAX_RPC_PAYLOAD_BYTES) {
-      log('info', `[serialize] session=${p.id} unavailable reason=too-large bytes=${outcome.payload.length}`);
-      return { ok: true, mode: 'unavailable', reason: 'too-large' };
-    }
-    log('info', `[serialize] session=${p.id} mode=snapshot payload=${outcome.payload.length}`);
-    return {
-      ok: true,
-      mode: 'snapshot',
-      payloadBase64: outcome.payload.toString('base64'),
-      cols: managed.meta.cols,
-      rows: managed.meta.rows,
-    };
+    return serializeSession(
+      {
+        ringBuffer: managed.ringBuffer,
+        outputModes: managed.bridge.outputModes,
+        cols: managed.meta.cols,
+        rows: managed.meta.rows,
+      },
+      p.scrollback,
+      (line) => log('info', `[serialize] session=${p.id} ${line}`),
+    );
   });
 
   // daemon.readSessionText (TASK-9 cold-park) — read-only PLAIN-TEXT snapshot
@@ -3437,6 +3423,12 @@ function registerRpcHandlers(
     // A binding without its folder can never be resumed (`--resume` is
     // cwd-scoped) and must not be stored: refuse it like an empty one.
     if (!managed || !isUsableResumeBinding(resumeBinding)) return false;
+    // #1823: the RPC and main's hooks.signal fallback reach here without
+    // HookIngest's checks; an id the agent cannot resume is never stored.
+    if (!isPlausibleResumeSessionId(resumeBinding.agent, resumeBinding.sessionId)) {
+      log('warn', `[resume] refused ${resumeBinding.agent} binding for ${id}: session id is not ${resumeBinding.agent}-shaped`);
+      return false;
+    }
     // The daemon's own hook ingest validates the claimed transcript path before
     // it gets here, but this function is ALSO the body of the
     // `daemon.setResumeBinding` RPC, and main's hooks.signal fallback calls that
@@ -3947,7 +3939,7 @@ function registerRpcHandlers(
         cols: managed.meta.cols ?? 80,
         rows: managed.meta.rows ?? 24,
         scrollback: 0,
-        initial: managed.ringBuffer.readAll(),
+        initial: readSessionTextReplay(managed.ringBuffer, managed.bridge.outputModes),
         // The composer check tells a dimmed suggested prompt from typed input.
         undimmed: true,
       });
@@ -4146,6 +4138,10 @@ function registerRpcHandlers(
         }
       },
       applyResumeBinding: (id, binding) => { applyResumeBinding(id, binding); },
+      liveAgentFor: (id) => {
+        const tracked = agentProcessTracker.identityFor(id);
+        return tracked?.alive ? tracked.slug : undefined;
+      },
       log: (level, message) => log(level, message),
       isAutomationPane: (id) => automationEngine?.ownsPane(id) === true,
       // M2 — hook-sourced awaiting_input is the ONLY thing that mints an
@@ -4799,7 +4795,7 @@ function registerRpcHandlers(
         cols: managed.meta.cols ?? 80,
         rows: managed.meta.rows ?? 24,
         scrollback: 0,
-        initial: managed.ringBuffer.readAll(),
+        initial: readSessionTextReplay(managed.ringBuffer, managed.bridge.outputModes),
       });
       return outcome.ok ? outcome.rows.map((r) => r.text).join('\n') : '';
     },
@@ -5988,7 +5984,9 @@ function wireEvents(
       const event: DaemonEvent = {
         type: 'session.died',
         sessionId: payload.id,
-        data: { exitCode: payload.exitCode },
+        // signal: a killed shell reports exitCode 0 with the signal beside it,
+        // so the renderer needs both to tell `exit` from `kill -9` (#1838).
+        data: { exitCode: payload.exitCode, ...(typeof payload.signal === 'number' ? { signal: payload.signal } : {}) },
       };
       pipeServer.broadcast(event);
     } catch (err) {

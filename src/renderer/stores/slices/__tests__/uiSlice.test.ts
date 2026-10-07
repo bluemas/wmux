@@ -815,9 +815,9 @@ describe('UISlice — sidebar attention-first ordering', () => {
   let store: ReturnType<typeof createTestStore>;
   beforeEach(() => { store = createTestStore(); });
 
-  it('defaults to on — Attention is the default order (owner decision 2026-09-25)', () => {
-    expect(store.getState().sidebarAttentionFirst).toBe(true);
-    expect(store.getState().sidebarSortMode).toBe('attention');
+  it('defaults to off — Manual is the default order (owner decision 2026-10-04)', () => {
+    expect(store.getState().sidebarAttentionFirst).toBe(false);
+    expect(store.getState().sidebarSortMode).toBe('manual');
   });
 
   it('setSidebarAttentionFirst flips the flag both ways', () => {
@@ -946,5 +946,14 @@ describe('UISlice — rail route', () => {
     expect(store.getState().inspectModeActive).toBe(true);
     store.getState().setAppRoute('workspaces');
     expect(store.getState().inspectModeActive).toBe(false);
+  });
+});
+
+describe('UISlice — Claude resume on start (#1826)', () => {
+  it('is off by default and the setter flips it', () => {
+    const store = createTestStore();
+    expect(store.getState().claudeResumeOnStart).toBe(false);
+    store.getState().setClaudeResumeOnStart(true);
+    expect(store.getState().claudeResumeOnStart).toBe(true);
   });
 });

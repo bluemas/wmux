@@ -749,6 +749,62 @@ describe('DaemonClient', () => {
       await new Promise<void>(resolve => server.close(() => resolve()));
     });
 
+    it('carries the killing signal on session:died', async () => {
+      const pipeName = testPipeName('ev1sig');
+      const sockets = new Set<net.Socket>();
+
+      const server = net.createServer((socket) => {
+        sockets.add(socket);
+        socket.on('close', () => sockets.delete(socket));
+
+        let buffer = '';
+        socket.setEncoding('utf8');
+        socket.on('data', (chunk: string) => {
+          buffer += chunk;
+          const lines = buffer.split('\n');
+          buffer = lines.pop() ?? '';
+          // Just accept all messages (no RPC handling needed)
+        });
+      });
+
+      await new Promise<void>((resolve, reject) => {
+        server.on('error', reject);
+        server.listen(pipeName, () => resolve());
+      });
+
+      client = new DaemonClient(pipeName, AUTH_TOKEN);
+      await client.connect();
+
+      const diedEvents: Array<{ sessionId: string; exitCode: number | null }> = [];
+      client.on('session:died', (payload: { sessionId: string; exitCode: number | null }) => {
+        diedEvents.push(payload);
+      });
+
+      // Wait for socket to be tracked in server
+      await new Promise(r => setTimeout(r, 100));
+
+      // Simulate daemon broadcasting a session.died event
+      const event = JSON.stringify({
+        type: 'session.died',
+        sessionId: 'test-sess-1',
+        data: { exitCode: 0, signal: 9 },
+      }) + '\n';
+
+      expect(sockets.size).toBeGreaterThan(0);
+      for (const socket of sockets) {
+        socket.write(event);
+      }
+
+      await new Promise(r => setTimeout(r, 200));
+
+      expect(diedEvents).toHaveLength(1);
+      expect(diedEvents[0]).toEqual({ sessionId: 'test-sess-1', exitCode: 0, signal: 9 });
+
+      await client.disconnect();
+      sockets.forEach(s => s.destroy());
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    });
+
     it('should emit session:cwd event from a cwd.changed daemon broadcast', async () => {
       const pipeName = testPipeName('evcwd');
       const sockets = new Set<net.Socket>();

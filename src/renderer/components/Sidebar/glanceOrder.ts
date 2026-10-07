@@ -2,8 +2,9 @@
 //
 // The Attention order: most-urgent first (see selectWorkspaceAttentionScores:
 // needs you → finished → running → unconfirmed → idle, newest first within a
-// class). A workspace created in the last few minutes stays on top so the row
-// you just made does not jump away from you. It orders only the rows below the
+// class). A workspace created in the last few minutes stays at the bottom (newest
+// last) so the row you just made lands at the end of the list instead of jumping
+// to the top (owner decision 2026-10-07). It orders only the rows below the
 // pinned group (2026-09-26): pinned rows stay first, in the user's order, and
 // never re-sort — see splitPinnedGroup.
 //
@@ -14,7 +15,7 @@
 import type { SidebarSortMode } from '../../utils/sidebarLayout';
 import { orderByRecentActivity } from './attentionOrder';
 
-/** A just-created workspace holds the top slot this long. */
+/** A just-created workspace holds the last slot this long. */
 export const NEW_WORKSPACE_HOLD_MS = 3 * 60_000;
 /** A pending re-sort applies after the list has been quiet this long. */
 export const GLANCE_SETTLE_MS = 3_000;
@@ -58,9 +59,9 @@ export function glanceOrder<T extends { id: string }>(
     const ha = held(a.item.id);
     const hb = held(b.item.id);
     if (ha !== undefined || hb !== undefined) {
-      if (ha === undefined) return 1;
-      if (hb === undefined) return -1;
-      if (ha !== hb) return hb - ha;
+      if (ha === undefined) return -1;
+      if (hb === undefined) return 1;
+      if (ha !== hb) return ha - hb;
     }
     return scoreOf(a.item.id) - scoreOf(b.item.id) || a.index - b.index;
   });
@@ -122,7 +123,7 @@ export function boardOrder<T extends { id: string }>(opts: {
 /**
  * Keep the order on screen (`applied`) while absorbing membership changes at
  * once: removed ids drop out, new ids take their place in `desired` (so a new
- * workspace appears where the board puts it — on top while held). Returns the
+ * workspace appears where the board puts it — at the bottom while held). Returns the
  * order to show now and whether it still differs from `desired`, i.e. whether
  * a re-sort is pending.
  */

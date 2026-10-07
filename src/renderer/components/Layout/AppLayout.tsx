@@ -56,6 +56,7 @@ import { useAgentActivityClock } from '../../hooks/useAgentActivityClock';
 import { useTerminalCopyShortcut } from '../../hooks/useTerminalCopyShortcut';
 import { useNotificationListener } from '../../hooks/useNotificationListener';
 import { useRpcBridge } from '../../hooks/useRpcBridge';
+import { useCloseTabOnShellExit } from '../../hooks/useCloseTabOnShellExit';
 import AgentMentionPicker from '../Palette/AgentMentionPicker';
 import HandoffPopover from '../Git/HandoffPopover';
 import { useWorkspaceMirrorPush } from '../../hooks/useWorkspaceMirrorPush';
@@ -415,6 +416,7 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
     titlebarClockVisible: state.titlebarClockVisible,
     paneNewTerminalButton: state.paneNewTerminalButton,
     splitInheritsCwd: state.splitInheritsCwd,
+    closeTabOnShellExit: state.closeTabOnShellExit,
     imeResidueGuardEnabled: state.imeResidueGuardEnabled,
     hiddenPaneRetentionEnabled: state.hiddenPaneRetentionEnabled,
     coldParkEnabled: state.coldParkEnabled,
@@ -431,6 +433,9 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
     sidebarPosition: state.sidebarPosition,
     sidebarAttentionFirst: state.sidebarAttentionFirst,
     sidebarShowPaneCoordinates: state.sidebarShowPaneCoordinates,
+    attentionBlink: state.attentionBlink,
+    attentionBlinkRemindMs: state.attentionBlinkRemindMs,
+    attentionBlinkFinished: state.attentionBlinkFinished,
     sidebarSortMode: state.sidebarSortMode,
     sidebarSortModeChosen: state.sidebarSortModeChosen,
     sidebarPinnedIds: state.sidebarPinnedIds,
@@ -442,6 +447,7 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
     notificationRingEnabled: state.notificationRingEnabled,
     anthropicUsageEnabled: state.anthropicUsageEnabled,
     usageLimitAutoResume: state.usageLimitAutoResume,
+    claudeResumeOnStart: state.claudeResumeOnStart,
     mutedNotificationCategories: state.mutedNotificationCategories,
     customKeybindings: state.customKeybindings,
     shortcutOverrides: state.shortcutOverrides,
@@ -882,6 +888,8 @@ export default function AppLayout() {
   useTerminalCopyShortcut();
   useNotificationListener();
   useRpcBridge();
+  // `exit` in a shell closes its tab (clean exit only).
+  useCloseTabOnShellExit();
   // Keep the main-process WorkspaceMirror warm: push the workspace tree +
   // per-pane agent status whenever it changes, so main resolves hooks/routing
   // locally instead of round-tripping workspace.list back to the renderer.

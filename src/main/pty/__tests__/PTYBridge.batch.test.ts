@@ -48,17 +48,17 @@ interface MockProcess {
   onData: (cb: (data: string) => void) => void;
   onExit: (cb: (info: { exitCode: number }) => void) => void;
   emitData: (data: string) => void;
-  emitExit: (code: number) => void;
+  emitExit: (code: number, signal?: number) => void;
 }
 
 function makeMockProcess(): MockProcess {
   let dataCb: ((data: string) => void) | null = null;
-  let exitCb: ((info: { exitCode: number }) => void) | null = null;
+  let exitCb: ((info: { exitCode: number; signal?: number }) => void) | null = null;
   return {
     onData: (cb) => { dataCb = cb; },
     onExit: (cb) => { exitCb = cb; },
     emitData: (d) => { dataCb?.(d); },
-    emitExit: (c) => { exitCb?.({ exitCode: c }); },
+    emitExit: (c, signal) => { exitCb?.({ exitCode: c, signal }); },
   };
 }
 
@@ -173,6 +173,23 @@ describe('PTYBridge micro-batch', () => {
     expect(ptyData).toHaveLength(2);
     expect(ptyData[0].args).toEqual(['p1', 'A']);
     expect(ptyData[1].args).toEqual(['p1', 'B']);
+  });
+
+  it('forwards the killing signal with PTY_EXIT (node-pty reports a kill as exit 0)', () => {
+    const proc = makeMockProcess();
+    const instance: PTYInstance = {
+      id: 'p1',
+      process: proc as unknown as PTYInstance['process'],
+      shell: 'bash',
+    };
+    const { win, calls } = makeMockSend();
+    const bridge = new PTYBridge(makeMockManager(instance), () => win as never);
+    bridge.setupDataForwarding('p1');
+
+    proc.emitExit(0, 9);
+
+    const exit = calls.find((c) => c.channel === 'pty:exit');
+    expect(exit?.args).toEqual(['p1', 0, 9]);
   });
 
   it('drains pending data on exit before sending PTY_EXIT', () => {

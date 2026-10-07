@@ -152,7 +152,12 @@ function cap(s: string, max: number): string {
  * inflated every count.
  */
 function agentPanes(snapshot: FleetSnapshot | null): FleetSnapshot['panes'] {
-  return (snapshot?.panes ?? []).filter((p) => p.ptyId !== '');
+  return (snapshot?.panes ?? [])
+    .filter((p) => p.ptyId !== '')
+    // The sidebar and Fleet rule (fleetAttentionClass): a turn that ended with
+    // no question (`waiting`) is idle. One that ended on a question already
+    // arrives as awaiting_input, so it stays blocked (2026-10-07).
+    .map((p) => (p.agentStatus === 'waiting' ? { ...p, agentStatus: 'idle' as const } : p));
 }
 
 function reasonFor(status: AgentStatus): BriefingReason {

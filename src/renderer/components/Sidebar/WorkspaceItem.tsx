@@ -9,7 +9,9 @@ import { useT } from '../../hooks/useT';
 import type { TranslationKey } from '../../i18n/locales/en';
 import { AGENT_STATUS_ICON } from './agentStatusIcon';
 import { StatusMarkView } from './AgentMarks';
-import { selectSidebarUnseenWorkspaces } from '../../stores/selectors/sidebarSeen';
+import { selectSidebarUnseenWorkspaces, visibleWorkspaceIds } from '../../stores/selectors/sidebarSeen';
+import { attentionPulseClass } from './attentionBlink';
+import { usePrefersReducedMotion } from '../ui/MediaPreview';
 import { workspaceHasUsageLimitWaiting } from '../../stores/slices/usageLimitSlice';
 import { selectWorkspaceAttentionClasses } from '../../stores/selectors/fleet';
 import { IconCopy, IconX, IconGear, IconChevron, IconBell, IconFolder, IconTerminal, IconExternalLink, IconCheck, IconGitBranch, IconWorktree, IconWarning, IconFanOut, IconPin } from '../icons';
@@ -46,9 +48,9 @@ interface WorkspaceItemProps {
   isActive: boolean;
   isMultiview: boolean;
   index: number;
-  /** Position in the list the operator sees (Moa's HQ left out), which is
-   *  what Ctrl+N counts. Defaults to `index`. */
-  shortcutIndex?: number;
+  /** The Ctrl+N digit that reaches this row (see workspaceShortcutNumber), or
+   *  undefined when no digit does. */
+  shortcutNumber?: number;
   onSelect: (id: string) => void;
   onCtrlSelect: (id: string) => void;
   onRename: (id: string, name: string) => void;
@@ -445,7 +447,7 @@ function shortenPath(path: string, maxLen = 25): string {
   return `.../${parts.slice(-2).join('/')}`;
 }
 
-function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutIndex = index, onSelect, onCtrlSelect, onRename, onClose, onArchive, onCopyInfo, onDuplicate, onReorder, taskRow = false, shortcutHintHidden = false, nestedTaskIds, renderTask, onCloseTask, moaHq = false, tabStop = false }: WorkspaceItemProps) {
+function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumber, onSelect, onCtrlSelect, onRename, onClose, onArchive, onCopyInfo, onDuplicate, onReorder, taskRow = false, shortcutHintHidden = false, nestedTaskIds, renderTask, onCloseTask, moaHq = false, tabStop = false }: WorkspaceItemProps) {
   const t = useT();
   // A1: 자기 ws만 구독 — 배경 ws churn/다른 항목 변경에는 리렌더되지 않는다.
   const workspace = useStore(selectWorkspaceById(workspaceId));
@@ -544,6 +546,29 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutInde
   // Glance board (2026-09-25): something here changed since it was last in
   // view, and it wants a look. Fleet's changed-dot rule: --text-main, never amber.
   const unseen = useStore((s) => !!selectSidebarUnseenWorkspaces(s)[workspaceId]);
+  // 2026-10-07 — a turn that finished with no question draws no needs-you
+  // border; the unseen dot is its "done" dot, cleared when the workspace is
+  // viewed. A turn that ended on a question is needs you, not done.
+  const done = unseen && attentionClass === 'finished';
+  // Attention blink: a CSS class picked from state (attentionBlink.ts). Never
+  // on a row whose workspace is on screen, never under reduced motion.
+  const blinkMode = useStore((s) => s.attentionBlink);
+  const blinkRemindMs = useStore((s) => s.attentionBlinkRemindMs);
+  const blinkFinished = useStore((s) => s.attentionBlinkFinished);
+  const onScreen = useStore((s) => visibleWorkspaceIds(s).has(workspaceId));
+  const reducedMotion = usePrefersReducedMotion();
+  const visible = isActive || onScreen;
+  // Whether this wait has already been on screen: "once" is then spent and
+  // "remind" waits a full interval. Reset when the wait ends (render-time
+  // derived state, no effect).
+  const [seenThisWait, setSeenThisWait] = useState(false);
+  if (needsYou && visible && !seenThisWait) setSeenThisWait(true);
+  if (!needsYou && seenThisWait) setSeenThisWait(false);
+  // A nested task row draws no box of its own, so it does not pulse either.
+  const pulseClass = taskRow ? '' : attentionPulseClass({
+    needsYou, done, visible, reducedMotion, seenThisWait,
+    mode: blinkMode, remindMs: blinkRemindMs, finished: blinkFinished,
+  });
   const toggleSidebarPin = useStore((s) => s.toggleSidebarPin);
   // Settle / snooze (main owns both; the menu only sends the verbs). Scalars,
   // so a push about another workspace does not re-render this row.
@@ -1193,7 +1218,7 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutInde
         {...tokenAttrs('bgSurface', 'bg')}
         // Card states (idle / hover / active / needs you) are painted by the
         // .wmux-sidebar .sidebar-row rules in ui.css.
-        className={`sidebar-row px-2.5 ${taskRow ? 'sidebar-row-task py-1.5' : 'py-2'} cursor-pointer rounded-md select-none ${needsYou ? 'sidebar-row-needs' : ''} ${
+        className={`sidebar-row px-2.5 ${taskRow ? 'sidebar-row-task py-1.5' : 'py-2'} cursor-pointer rounded-md select-none ${needsYou ? 'sidebar-row-needs' : ''} ${pulseClass} ${
           isActive ? 'sidebar-row-active' : ''
         }`}
         style={isMultiview ? { borderLeft: '2px solid var(--accent-blue)' } : undefined}
@@ -1242,6 +1267,9 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutInde
         <span className="mt-1 flex-none">
           <StatusMarkView
             status={markStatus}
+            // The row's pulse setting owns its motion, so the mark does not
+            // breathe on its own (Off means still).
+            quiet={needsYou}
             unverifiable={unverifiableMinutes > 0}
             usageWaiting={usageWaiting}
             label={unverifiableMinutes > 0
@@ -1286,6 +1314,21 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutInde
                     <IconFanOut size={10} />
                   </span>
                 )}
+                {/* Ctrl+N follows the stored order, so each row always shows the
+                    number its shortcut jumps to, left of the name, in every sort
+                    mode — the numbers may read out of sequence in a sorted order.
+                    Ctrl+9 is the last workspace, so past eight rows only the last
+                    one shows 9 and the rows between show nothing. A nested task
+                    row, Moa's HQ and a row in the Snoozed/Settled group have none. */}
+                {!taskRow && !moaHq && !shortcutHintHidden && shortcutNumber !== undefined && (
+                  // Drawn by CSS so the digit is not part of the row's text
+                  // (selection, copy, accessible name).
+                  <span
+                    aria-hidden
+                    className="flex-none text-[11px] font-semibold tabular-nums text-[var(--text-muted)] before:content-[attr(data-shortcut-number)]"
+                    data-shortcut-number={shortcutNumber}
+                  />
+                )}
                 <span
                   className="wmux-row-title font-sans text-[13px] leading-snug truncate font-semibold text-[var(--text-main)]"
                   title={idleLabel ? `${displayName} · ${t('workspace.idleTooltip', { time: idleLabel })}` : displayName}
@@ -1299,6 +1342,7 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutInde
                     aria-label={t('sidebar.changedSinceSeen')}
                     title={t('sidebar.changedSinceSeen')}
                     data-sidebar-unseen
+                    data-sidebar-done={done ? '' : undefined}
                   />
                 )}
                 {pinned && !taskRow && (
@@ -1430,23 +1474,6 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutInde
                 {errored && !taskRow && (
                   <span className="font-sans text-[11px] font-medium text-[var(--accent-red)] flex-shrink-0" data-row-error>
                     {t('workspace.agentError')}
-                  </span>
-                )}
-
-                {/* Shortcut hint */}
-                {/* #1481 — a nested task row is indented, so even the active one gives
-                    the hint back to its name at rest. */}
-                {/* #1481 review — Ctrl+N follows the stored order, which nesting no
-                    longer mirrors on screen; a nested task row would show a hint out
-                    of sequence with the rows around it, so it shows none. */}
-                {/* Ctrl+N follows the stored (manual) order, which only Manual shows
-                    on screen; in the other orders a hint would name a shortcut out of
-                    sequence with the rows around it, so none is drawn — except on a
-                    pinned row: the pinned group leads the stored order and is shown
-                    as stored, so its numbers match the screen. */}
-                {!taskRow && !moaHq && !shortcutHintHidden && (!sortPaused || pinned) && (
-                  <span className={`text-[11px] tabular-nums text-[color-mix(in_srgb,var(--text-main)_35%,transparent)] flex-shrink-0 ${restHiddenNameLine}`}>
-                    {shortcutIndex >= 0 && shortcutIndex < 9 ? `^${shortcutIndex + 1}` : ''}
                   </span>
                 )}
                 </span>

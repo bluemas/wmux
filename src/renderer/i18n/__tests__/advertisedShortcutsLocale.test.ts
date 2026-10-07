@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ADVERTISED_SHORTCUTS } from '../../../shared/keymap';
+import { ADVERTISED_SHORTCUTS, UNBOUND_SHORTCUTS } from '../../../shared/keymap';
 import { en } from '../locales/en';
 import { ko } from '../locales/ko';
 import { zh } from '../locales/zh';
@@ -29,6 +29,18 @@ describe('advertised shortcut labels', () => {
       expect(value, `en missing "${entry.descriptionKey}" for ${entry.combo}`)
         .toBeTruthy();
       expect(value).not.toBe(entry.descriptionKey);
+    }
+  });
+
+  it('every unbound (palette) action has a label in en, ko and zh', () => {
+    for (const entry of UNBOUND_SHORTCUTS) {
+      for (const [name, strings] of [
+        ['en', enStrings],
+        ['ko', ko as unknown as Record<string, string>],
+        ['zh', zh as unknown as Record<string, string>],
+      ] as const) {
+        expect(strings[entry.descriptionKey], `${name} missing "${entry.descriptionKey}"`).toBeTruthy();
+      }
     }
   });
 

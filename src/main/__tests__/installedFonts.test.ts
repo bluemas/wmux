@@ -67,19 +67,41 @@ describe('listInstalledFonts', () => {
     expect(mockExecFileAsync).not.toHaveBeenCalled();
   });
 
-  it('enumerates via system_profiler on darwin', async () => {
+  it('enumerates via NSFontManager (osascript) on darwin', async () => {
     setPlatform('darwin');
-    mockExecFileAsync.mockResolvedValue({
-      stdout: JSON.stringify({ SPFontsDataType: [{ typefaces: [{ family: 'Menlo' }, { family: 'SF Mono' }] }] }),
-      stderr: '',
+    mockExecFileAsync.mockResolvedValue({ stdout: 'Menlo\nHack Nerd Font Mono\nSF Mono\n', stderr: '' });
+    await expect(listInstalledFonts()).resolves.toEqual(['Hack Nerd Font Mono', 'Menlo', 'SF Mono']);
+    expect(mockExecFileAsync).toHaveBeenCalledOnce();
+    const [exe, args] = mockExecFileAsync.mock.calls[0] as [string, string[]];
+    expect(exe).toBe('/usr/bin/osascript');
+    expect(args.slice(0, 2)).toEqual(['-l', 'JavaScript']);
+  });
+
+  it('falls back to system_profiler on darwin when osascript fails', async () => {
+    setPlatform('darwin');
+    mockExecFileAsync.mockImplementation(async (exe: string) => {
+      if (exe === '/usr/bin/osascript') throw new Error('osascript failed');
+      return {
+        stdout: JSON.stringify({ SPFontsDataType: [{ typefaces: [{ family: 'Menlo' }, { family: 'SF Mono' }] }] }),
+        stderr: '',
+      };
     });
     await expect(listInstalledFonts()).resolves.toEqual(['Menlo', 'SF Mono']);
-    const [exe, args] = mockExecFileAsync.mock.calls[0] as [string, string[]];
+    const [exe, args] = mockExecFileAsync.mock.calls[1] as [string, string[]];
     expect(exe).toBe('/usr/sbin/system_profiler');
     expect(args).toEqual(['SPFontsDataType', '-json']);
   });
 
-  it('returns [] (never throws) when system_profiler fails on darwin', async () => {
+  it('falls back to system_profiler on darwin when osascript returns nothing', async () => {
+    setPlatform('darwin');
+    mockExecFileAsync.mockImplementation(async (exe: string) => {
+      if (exe === '/usr/bin/osascript') return { stdout: '\n', stderr: '' };
+      return { stdout: JSON.stringify({ SPFontsDataType: [{ typefaces: [{ family: 'Menlo' }] }] }), stderr: '' };
+    });
+    await expect(listInstalledFonts()).resolves.toEqual(['Menlo']);
+  });
+
+  it('returns [] (never throws) when every enumerator fails on darwin', async () => {
     setPlatform('darwin');
     mockExecFileAsync.mockRejectedValue(new Error('spawn ENOENT'));
     await expect(listInstalledFonts()).resolves.toEqual([]);

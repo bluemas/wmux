@@ -475,6 +475,9 @@ const config: ForgeConfig = {
               name: 'wmux',
               productName: 'wmux',
               categories: ['Utility', 'Development'],
+              // Without this the installer ships its bundled Electron logo as
+              // /usr/share/pixmaps/wmux.png, which GNOME shows in the dock.
+              icon: './assets/icon.png',
             },
           }),
           new MakerRpm({
@@ -482,6 +485,9 @@ const config: ForgeConfig = {
               name: 'wmux',
               productName: 'wmux',
               categories: ['Utility', 'Development'],
+              // Without this the installer ships its bundled Electron logo as
+              // /usr/share/pixmaps/wmux.png, which GNOME shows in the dock.
+              icon: './assets/icon.png',
             },
           }),
           // AppImage: distro-independent single-file portable binary (like the

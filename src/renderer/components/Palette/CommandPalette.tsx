@@ -15,9 +15,18 @@ import { postPluginCommand } from '../../plugins/pluginFrameRegistry';
 import { runProjectCommand } from '../../utils/projectCommands';
 import { applyProjectLayoutFresh } from '../../utils/projectConfigProbe';
 import { COMPANY_MODE_ENABLED } from '../../../shared/featureFlags';
-import { isRemoteMirrorVisible } from '../../stores/slices/remoteWorkspacesSlice';
 import { isChatV2Covering } from '../ChatV2/coverage';
 import { showWorkspaces } from '../../utils/showWorkspaces';
+import { comboFromEvent, displayCombo, effectiveBindings, type ShortcutActionId } from '../../../shared/keymap';
+import { shortcutPlatform, shortcutPressGuard } from '../../utils/shortcutBindings';
+import { clearShortcut, describeShortcut, rebindProblemText } from '../../utils/shortcutRebind';
+import {
+  openMultiTask,
+  openWorktaskCleanup,
+  showGitDiff,
+  stashActivePane,
+  toggleAgentToolbarPin,
+} from '../../utils/commandActions';
 
 // ---------------------------------------------------------------------------
 // SVG Icons (inline, no external dependency)
@@ -123,6 +132,11 @@ function fuzzyScore(str: string, query: string): number | null {
   return qi === q.length ? score : null;
 }
 
+// The keymap action behind each "Move Pane …" command.
+const MOVE_PANE_ACTIONS = {
+  left: 'movePaneLeft', right: 'movePaneRight', up: 'movePaneUp', down: 'movePaneDown',
+} as const satisfies Record<string, ShortcutActionId>;
+
 // ---------------------------------------------------------------------------
 // CommandPalette component
 // ---------------------------------------------------------------------------
@@ -148,7 +162,31 @@ export default function CommandPalette() {
   const [activeIdx, setActiveIdx] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
+  const recordingRef = useRef<HTMLSpanElement>(null);
   const { invoke: ipcInvoke } = useIpc();
+
+  // Giving a command a shortcut without leaving the palette: Ctrl+Enter on
+  // the active row (or a click on its key chip) records the next chord, with
+  // the same rules Settings → Shortcuts applies (shortcutRebind).
+  const [recording, setRecording] = useState<ShortcutActionId | null>(null);
+  const [recordNote, setRecordNote] = useState<string | null>(null);
+  const shortcutOverrides = useStore((s) => s.shortcutOverrides);
+  const setShortcutOverride = useStore((s) => s.setShortcutOverride);
+  const setKeyCaptureActive = useStore((s) => s.setKeyCaptureActive);
+  const platform = shortcutPlatform();
+  // The key each action runs on right now, as displayed. An action's first
+  // binding is its primary (aliases follow it; an override replaces them all).
+  const comboByAction = useMemo(() => {
+    const map = new Map<ShortcutActionId, string>();
+    for (const b of effectiveBindings(platform, shortcutOverrides)) {
+      if (!map.has(b.action)) map.set(b.action, displayCombo(b.combo, platform));
+    }
+    return map;
+  }, [platform, shortcutOverrides]);
+  const startRecording = useCallback((action: ShortcutActionId) => {
+    setRecordNote(null);
+    setRecording(action);
+  }, []);
 
   // -------------------------------------------------------------------------
   // Build item list
@@ -211,13 +249,17 @@ export default function CommandPalette() {
     }
 
     // Built-in commands
-    const commands: Array<{ label: string; action: () => void }> = [
+    // `shortcut` names the keymap action the command runs, so its key shows
+    // on the row and can be changed right here (Ctrl+Enter or the key chip).
+    const commands: Array<{ label: string; action: () => void; shortcut?: ShortcutActionId }> = [
       {
         label: t('palette.cmd.toggleSidebar'),
+        shortcut: 'toggleSidebar',
         action: () => { useStore.getState().toggleSidebar(); setVisible(false); },
       },
       {
         label: t('palette.cmd.splitRight'),
+        shortcut: 'splitHorizontal',
         action: () => {
           const state = useStore.getState();
           const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
@@ -228,6 +270,7 @@ export default function CommandPalette() {
       },
       {
         label: t('palette.cmd.splitDown'),
+        shortcut: 'splitVertical',
         action: () => {
           const state = useStore.getState();
           const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
@@ -242,27 +285,25 @@ export default function CommandPalette() {
         // stashed panes with a click that brings each one back. A palette entry
         // would have to invent a second picker for a list that already exists.
         label: t('palette.cmd.stashPane'),
-        action: () => {
-          const state = useStore.getState();
-          const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
-          if (ws) state.stashPane(ws.activePaneId, ws.id);
-          showWorkspaces(useStore.getState());
-          setVisible(false);
-        },
+        shortcut: 'stashPane',
+        action: () => { stashActivePane(); setVisible(false); },
       },
       // #645 — move the active pane. Four entries rather than one "move pane"
       // with a follow-up prompt: the palette is a single-stage list, and
       // typing "move pane l" should just do it.
       ...(['left', 'right', 'up', 'down'] as const).map((dir) => ({
         label: t(`palette.cmd.movePane.${dir}` as Parameters<typeof t>[0]),
+        shortcut: MOVE_PANE_ACTIONS[dir],
         action: () => { useStore.getState().moveActivePaneDirection(dir); showWorkspaces(useStore.getState()); setVisible(false); },
       })),
       {
         label: t('palette.cmd.newWorkspace'),
+        shortcut: 'newWorkspace',
         action: () => { useStore.getState().addWorkspace(); showWorkspaces(useStore.getState()); setVisible(false); },
       },
       {
         label: t('palette.cmd.newSurface'),
+        shortcut: 'newSurface',
         action: () => {
           const state = useStore.getState();
           // S-A Step 1 — gate event-driven pty.create until the startup
@@ -292,51 +333,34 @@ export default function CommandPalette() {
       },
       {
         label: t('palette.cmd.showNotifications'),
+        shortcut: 'toggleNotifications',
         action: () => { useStore.getState().setNotificationPanelVisible(true); setVisible(false); },
       },
       {
         label: t('palette.cmd.openFleetView'),
+        shortcut: 'toggleFleetView',
         action: () => { useStore.getState().setFleetViewVisible(true); setVisible(false); },
       },
       {
-        // The keyboard route to fan-out. Its only other entry point is a button
-        // on the agent toolbar, which a minimal chrome preset switches off
-        // entirely — leaving the one path that creates task worktrees
-        // unreachable. This command does not care whether the bar exists.
+        // The keyboard route to fan-out (see openMultiTask). This command does
+        // not care whether the agent toolbar exists.
         label: t('palette.cmd.multiTask'),
-        action: () => {
-          const state = useStore.getState();
-          // Same guard ToolbarHost applies: fan-out targets the LOCAL active
-          // workspace, so firing it while a remote view is on screen would dig
-          // worktrees in a repo the user is not looking at. Suppressing the
-          // toolbar for remote views and then adding an unguarded keyboard
-          // route would have reopened the hole from the other side.
-          if (isRemoteMirrorVisible(state)) { setVisible(false); return; }
-          if (state.activeWorkspaceId) {
-            state.openFanOut(state.activeWorkspaceId, null);
-            // The fan-out dialog opens over the Workspaces page.
-            showWorkspaces(useStore.getState());
-          }
-          setVisible(false);
-        },
+        shortcut: 'multiTask',
+        action: () => { openMultiTask(); setVisible(false); },
       },
       {
-        // Pin/unpin the agent toolbar. Unpinned it is pointer-summoned, so
-        // without this a keyboard-only user has no way to make it stay.
         label: t('palette.cmd.toggleToolbarPin'),
-        action: () => {
-          const state = useStore.getState();
-          state.setAgentToolbarPinned(!state.agentToolbarPinned);
-          setVisible(false);
-        },
+        shortcut: 'toggleToolbarPin',
+        action: () => { toggleAgentToolbarPin(); setVisible(false); },
       },
       {
-        // J3 §1 — 태스크 정리 목록(전용 루트 디스크 정본 스캔).
         label: t('palette.cmd.openWorktaskCleanup'),
-        action: () => { useStore.getState().setWorktaskCleanupVisible(true); setVisible(false); },
+        shortcut: 'openWorktaskCleanup',
+        action: () => { openWorktaskCleanup(); setVisible(false); },
       },
       {
         label: t('palette.cmd.openBrowser'),
+        shortcut: 'openBrowser',
         action: () => {
           // forceNew: the explicit "Open Browser" command always creates a
           // fresh split — reuse is for link/port clicks (browserPaneActions).
@@ -346,45 +370,9 @@ export default function CommandPalette() {
         },
       },
       {
-        // 워크스페이스 git diff — 활성 pane의 cwd를 diff:resolveRepo로 worktree
-        // toplevel로 정규화한 뒤 읽기 전용 diff 서피스를 연다. 비-git cwd는 토스트.
         label: t('palette.cmd.showGitDiff'),
-        action: () => {
-          const state = useStore.getState();
-          const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
-          if (!ws) { setVisible(false); return; }
-          const findLeaf = (pane: import('../../../shared/types').Pane): import('../../../shared/types').PaneLeaf | null => {
-            if (pane.type === 'leaf') return pane.id === ws.activePaneId ? pane : null;
-            for (const child of pane.children) {
-              const found = findLeaf(child);
-              if (found) return found;
-            }
-            return null;
-          };
-          const leaf = findLeaf(ws.rootPane);
-          if (!leaf) { setVisible(false); return; }
-          const activeSurface = leaf.surfaces.find((s) => s.id === leaf.activeSurfaceId);
-          // cwd 우선순위: 활성 surface의 라이브 cwd(OSC 7) > 프로필 startupCwd > 전역.
-          const cwd =
-            activeSurface?.cwd ||
-            resolveStartupCwd({ splitInheritsCwd: false, profile: ws.profile, startupDirectory: state.startupDirectory }) ||
-            ''; // 빈 cwd는 resolveRepo가 ok:false로 거부 → noRepo 토스트.
-          void window.electronAPI.diff.resolveRepo(cwd).then((r) => {
-            const st = useStore.getState();
-            if (!r.ok) {
-              st.pushToast({ level: 'warn', message: t('diff.noRepo') });
-              return;
-            }
-            const repoName = r.repoPath.split(/[/\\]/).filter(Boolean).pop() || r.repoPath;
-            st.addWorkspaceDiffSurface(leaf.id, r.repoPath, `diff: ${repoName}`);
-            showWorkspaces(st);
-          }).catch((err) => {
-            // IPC reject(핸들러 미등록·직렬화 실패 등)도 무음이 아니라 토스트로.
-            useStore.getState().pushToast({ level: 'warn', message: t('diff.noRepo') });
-            console.error('[wmux:palette] diff.resolveRepo failed:', err);
-          });
-          setVisible(false);
-        },
+        shortcut: 'showGitDiff',
+        action: () => { showGitDiff(); setVisible(false); },
       },
     ];
 
@@ -395,6 +383,7 @@ export default function CommandPalette() {
         category: 'command' as PaletteCategory,
         icon: <IconCommand />,
         action: cmd.action,
+        shortcut: cmd.shortcut,
       });
     });
 
@@ -724,6 +713,10 @@ export default function CommandPalette() {
   // -------------------------------------------------------------------------
 
   useEffect(() => {
+    // Closing mid-recording (backdrop click) must not leave the recorder
+    // listening behind a palette that is gone.
+    setRecording(null);
+    setRecordNote(null);
     if (visible) {
       setQuery('');
       setActiveIdx(0);
@@ -733,6 +726,55 @@ export default function CommandPalette() {
       });
     }
   }, [visible]);
+
+  // -------------------------------------------------------------------------
+  // Shortcut recording
+  // -------------------------------------------------------------------------
+
+  useEffect(() => {
+    if (!recording) return;
+    // useKeyboard stands down while this is set, so a chord that is already
+    // a shortcut reaches the recorder instead of running.
+    setKeyCaptureActive(true);
+    // The search input just unmounted, and focus fell back to the terminal.
+    // With a Hangul IME on, keys pressed while recording would compose there
+    // and the text would reach the shell. A focused non-editable prompt has
+    // no composition, so focus that.
+    recordingRef.current?.focus();
+    const finish = () => {
+      setRecording(null);
+      setRecordNote(null);
+    };
+    const handler = (e: KeyboardEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.key === 'Escape') { finish(); return; }
+      // A bare Backspace / Delete can never be a shortcut (it needs a
+      // modifier), so it is free to mean "take the key off".
+      const bare = !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey;
+      if (bare && (e.key === 'Backspace' || e.key === 'Delete')) {
+        clearShortcut(recording);
+        finish();
+        return;
+      }
+      const combo = comboFromEvent(e);
+      if (combo === null) return; // only modifiers held so far
+      // Recorded on an IME `Process` keydown, the follow-up keydown would
+      // otherwise arrive after the recorder closed and run the new binding.
+      shortcutPressGuard.noteActed(e);
+      const problem = rebindProblemText(recording, combo);
+      if (problem) { setRecordNote(problem); return; }
+      setShortcutOverride(recording, combo);
+      finish();
+    };
+    window.addEventListener('keydown', handler, true);
+    return () => {
+      window.removeEventListener('keydown', handler, true);
+      setKeyCaptureActive(false);
+      // The search input was swapped out for the prompt; give it focus back.
+      requestAnimationFrame(() => inputRef.current?.focus());
+    };
+  }, [recording, setKeyCaptureActive, setShortcutOverride]);
 
   // -------------------------------------------------------------------------
   // Keep activeIdx in bounds when results change
@@ -773,12 +815,21 @@ export default function CommandPalette() {
       setActiveIdx((prev) => (prev - 1 + Math.max(results.length, 1)) % Math.max(results.length, 1));
       return;
     }
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      const shortcut = results[activeIdx]?.shortcut;
+      if (shortcut) startRecording(shortcut);
+      return;
+    }
     if (e.key === 'Enter') {
       e.preventDefault();
       results[activeIdx]?.action();
       return;
     }
   };
+
+  const activeShortcut = results[activeIdx]?.shortcut;
+  const setShortcutKeyHint = platform === 'darwin' ? '⌘Enter' : 'Ctrl+Enter';
 
   if (!visible) return null;
 
@@ -808,6 +859,17 @@ export default function CommandPalette() {
           <span className="shrink-0 text-[var(--text-sub)]" {...tokenAttrs('textSub', 'text')}>
             <IconSearch />
           </span>
+          {recording ? (
+            <span
+              ref={recordingRef}
+              tabIndex={-1}
+              className="flex-1 truncate text-[14px] leading-5 text-[var(--text-main)] outline-none"
+              role="status"
+              data-testid="palette-recording"
+            >
+              {t('settings.sc.pressNewKey', { name: describeShortcut(recording) })}
+            </span>
+          ) : (
           <input
             ref={inputRef}
             type="text"
@@ -823,10 +885,21 @@ export default function CommandPalette() {
             autoComplete="off"
             {...tokenAttrs('textMain', 'text')}
           />
+          )}
           <kbd className="ui-kbd shrink-0" {...tokenAttrs('textSub', 'text')}>
             ESC
           </kbd>
         </div>
+
+        {recording && recordNote && (
+          <p
+            role="alert"
+            className="px-4 py-2 text-[12px] leading-4"
+            style={{ color: 'var(--accent-yellow)', borderBottom: '1px solid var(--surface-hairline)' }}
+          >
+            {recordNote}
+          </p>
+        )}
 
         {/* Results list */}
         <div ref={listRef} className="overflow-y-auto flex-1 py-1.5">
@@ -849,6 +922,8 @@ export default function CommandPalette() {
                   item={item}
                   isActive={idx === activeIdx}
                   onClick={item.action}
+                  combo={item.shortcut ? comboByAction.get(item.shortcut) ?? null : undefined}
+                  onSetShortcut={startRecording}
                 />
               </div>
             ))
@@ -860,18 +935,39 @@ export default function CommandPalette() {
           className="flex items-center gap-4 px-4 py-2.5"
           style={{ borderTop: '1px solid var(--surface-hairline)' }}
         >
-          <span className="ui-note flex items-center gap-1.5">
-            <kbd className="ui-kbd">↑↓</kbd>
-            {t('palette.navigate')}
-          </span>
-          <span className="ui-note flex items-center gap-1.5">
-            <kbd className="ui-kbd">Enter</kbd>
-            {t('palette.select')}
-          </span>
-          <span className="ui-note flex items-center gap-1.5">
-            <kbd className="ui-kbd">Esc</kbd>
-            {t('palette.close')}
-          </span>
+          {recording ? (
+            <>
+              <span className="ui-note flex items-center gap-1.5">
+                <kbd className="ui-kbd">Backspace</kbd>
+                {t('palette.removeShortcut')}
+              </span>
+              <span className="ui-note flex items-center gap-1.5">
+                <kbd className="ui-kbd">Esc</kbd>
+                {t('palette.cancel')}
+              </span>
+            </>
+          ) : (
+            <>
+              <span className="ui-note flex items-center gap-1.5">
+                <kbd className="ui-kbd">↑↓</kbd>
+                {t('palette.navigate')}
+              </span>
+              <span className="ui-note flex items-center gap-1.5">
+                <kbd className="ui-kbd">Enter</kbd>
+                {t('palette.select')}
+              </span>
+              {activeShortcut && (
+                <span className="ui-note flex items-center gap-1.5">
+                  <kbd className="ui-kbd">{setShortcutKeyHint}</kbd>
+                  {t('palette.setShortcut')}
+                </span>
+              )}
+              <span className="ui-note flex items-center gap-1.5">
+                <kbd className="ui-kbd">Esc</kbd>
+                {t('palette.close')}
+              </span>
+            </>
+          )}
         </div>
       </div>
     </div>

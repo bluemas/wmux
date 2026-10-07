@@ -262,7 +262,7 @@ const electronAPI = {
       // `cwdMissing` (#1305) rides the recoveryPending shape: the WSL directory
       // itself is gone, so Retry cannot succeed until it is restored and the
       // pane is offered a fresh start in the home directory instead.
-      ipcRenderer.invoke(IPC.PTY_RECONNECT, id) as Promise<{ success: boolean; id?: string; shell?: string; error?: string; code?: string; transient?: boolean; recoveryPending?: boolean; cwdMissing?: boolean; recovery?: DeadPaneRecovery }>,
+      ipcRenderer.invoke(IPC.PTY_RECONNECT, id) as Promise<{ success: boolean; id?: string; shell?: string; cols?: number; rows?: number; error?: string; code?: string; transient?: boolean; recoveryPending?: boolean; cwdMissing?: boolean; recovery?: DeadPaneRecovery }>,
     // Fix B — on-demand promote of a cap-skipped suspended session.
     // #1305 — `fresh` promotes it in the home directory WITHOUT resuming the
     // recorded conversation: the way out when its own directory is gone.
@@ -298,8 +298,11 @@ const electronAPI = {
       ipcRenderer.on(IPC.PTY_DATA, listener);
       return () => { ipcRenderer.removeListener(IPC.PTY_DATA, listener); };
     },
-    onExit: (callback: (id: string, exitCode: number) => void) => {
-      const listener = (_event: Electron.IpcRendererEvent, id: string, exitCode: number) => callback(id, exitCode);
+    // `signal` is the killing signal (non-zero) or null/0 for a normal exit;
+    // node-pty reports a signalled process with exitCode 0.
+    onExit: (callback: (id: string, exitCode: number, signal?: number | null) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, id: string, exitCode: number, signal?: number | null) =>
+        callback(id, exitCode, signal);
       ipcRenderer.on(IPC.PTY_EXIT, listener);
       return () => { ipcRenderer.removeListener(IPC.PTY_EXIT, listener); };
     },
@@ -809,6 +812,8 @@ const electronAPI = {
         ipcRenderer.invoke(IPC.DECK_MOA_ARCHIVE_LIST) as Promise<{ decisions: import('../shared/moa').MoaArchivedDecision[] }>,
       archiveAck: () => ipcRenderer.invoke(IPC.DECK_MOA_ARCHIVE_ACK) as Promise<{ ok: boolean }>,
       resetStore: () => ipcRenderer.invoke(IPC.DECK_MOA_STORE_RESET) as Promise<{ ok: boolean }>,
+      shadowStats: () =>
+        ipcRenderer.invoke(IPC.DECK_MOA_SHADOW_STATS) as Promise<import('../shared/moa').MoaShadowStats>,
       memoryList: () =>
         ipcRenderer.invoke(IPC.DECK_MOA_MEMORY_LIST) as Promise<{ items: import('../shared/moa').MoaMemoryItem[] }>,
       memoryDelete: (kind: import('../shared/moa').MoaMemoryItem['kind'], name: string) =>

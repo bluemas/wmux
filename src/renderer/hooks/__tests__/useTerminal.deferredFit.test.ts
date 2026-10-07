@@ -113,7 +113,7 @@ describe('#1255 — every fit() apply site is floor-gated, every recovery re-ass
     const start = src.indexOf('const fit = useCallback');
     const block = src.slice(start, src.indexOf('}, [ptyId, containerRef]', start));
     const zero = block.indexOf('offsetWidth === 0');
-    const gate = block.indexOf('proposedSafeDimensions(fitAddonRef.current)');
+    const gate = block.indexOf('proposedSafeDimensions(fitAddonRef.current, container)');
     const fitCall = block.indexOf('fitAddonRef.current.fit()');
     expect(zero).toBeGreaterThan(-1);
     expect(gate).toBeGreaterThan(zero);
@@ -121,7 +121,7 @@ describe('#1255 — every fit() apply site is floor-gated, every recovery re-ass
   });
 
   it('the initial mount fit treats a sub-floor container like a hidden one', () => {
-    const anchor = 'container.offsetWidth > 0 && container.offsetHeight > 0 && proposedSafeDimensions(fitAddon)';
+    const anchor = 'container.offsetWidth > 0 && container.offsetHeight > 0 && !!proposedSafeDimensions(fitAddon, container)';
     expect(src).toContain(anchor);
   });
 
@@ -137,8 +137,8 @@ describe('#1255 — every fit() apply site is floor-gated, every recovery re-ass
     // #1436 turned the gate into a captured proposal (the shrink path sends
     // those dims to the PTY before xterm applies them), so anchor on the
     // capture + its early return rather than the old one-liner.
-    const gate = runFit.indexOf('const proposed = proposedSafeDimensions(fitAddon);');
-    expect(runFit.slice(gate)).toMatch(/const proposed = proposedSafeDimensions\(fitAddon\);\s+if \(!proposed\) return;/);
+    const gate = runFit.indexOf('const proposed = proposedSafeDimensions(fitAddon, container);');
+    expect(runFit.slice(gate)).toMatch(/const proposed = proposedSafeDimensions\(fitAddon, container\);\s+if \(!proposed\) return;/);
     const claim = runFit.indexOf('claimFit(');
     expect(gate).toBeGreaterThan(-1);
     expect(claim).toBeGreaterThan(gate);
@@ -150,7 +150,7 @@ describe('#1255 — every fit() apply site is floor-gated, every recovery re-ass
     const start = src.indexOf('[Terminal] font/theme fit skipped — sub-floor dimensions');
     expect(start).toBeGreaterThan(-1);
     const block = src.slice(start - 500, start);
-    expect(block).toMatch(/proposedSafeDimensions\(fitAddonRef\.current\)/);
+    expect(block).toMatch(/proposedSafeDimensions\(fitAddonRef\.current, container\)/);
   });
 
   it('a resync settle and a daemon reattach both re-assert DOM geometry (no dedup)', () => {
@@ -160,12 +160,12 @@ describe('#1255 — every fit() apply site is floor-gated, every recovery re-ass
     // Window covers the whole settle fn — #1258's scroll-preservation block
     // also lives inside it, ahead of the re-assert.
     const resync = src.slice(src.indexOf('const completeResyncFromFlush'), src.indexOf('const completeResyncFromFlush') + 2700);
-    expect(resync).toMatch(/proposedSafeDimensions\(fitAddon\)/);
+    expect(resync).toMatch(/proposedSafeDimensions\(fitAddon, container\)/);
     expect(resync).toMatch(/sendResize\(ptyId, dims\.cols, dims\.rows\)/);
     // Anchor on the reattach log line itself — plain "daemon reattach" also
     // appears in unrelated comments above this effect.
     const reattach = src.slice(src.indexOf('[useTerminal] daemon reattach ptyId='), src.indexOf('[useTerminal] daemon reattach ptyId=') + 2200);
-    expect(reattach).toMatch(/proposedSafeDimensions\(fitAddonRef\.current\)/);
+    expect(reattach).toMatch(/proposedSafeDimensions\(fitAddonRef\.current, containerRef\.current\)/);
     expect(reattach).toMatch(/sendResize\(id, dims\.cols, dims\.rows\)/);
   });
 });
