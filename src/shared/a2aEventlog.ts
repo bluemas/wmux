@@ -63,7 +63,7 @@ export interface A2aTaskTransitionPayload {
    * input-required→failed는 그래프상 불가한데 수신자 소멸로 어떤 non-terminal도
    * 전진 불가하므로 정당). 일반 transition API로는 이 값이 실리지 않는다.
    */
-  forced?: 'workspace_removed' | 'remote_state' | 'remote_held_rejected' | 'remote_link_ended';
+  forced?: 'workspace_removed' | 'remote_state' | 'remote_held_rejected' | 'remote_link_ended' | 'remote_refused';
   /**
    * Cross-host A2A: the peer's messageId when this transition came from the
    * other host (`forced: 'remote_state'` for a terminal one). Replay re-seeds the

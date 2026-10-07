@@ -65,6 +65,8 @@ export interface OutboxStoreOptions {
   scheduleHarden?: (filePath: string) => void;
   /** Test seam for the epoch (defaults to a random UUID). */
   mintEpoch?: () => string;
+  /** Called after a record was queued and persisted (the transport sends it now). */
+  onEnqueue?: (record: A2aOutboxRecordV1) => void;
 }
 
 export class OutboxStore {
@@ -73,6 +75,7 @@ export class OutboxStore {
   private readonly log: StoreLog;
   private readonly write: (filePath: string, data: unknown) => void;
   private readonly scheduleHarden: (filePath: string) => void;
+  private readonly onEnqueue: (record: A2aOutboxRecordV1) => void;
   private epochValue = '';
   private seqByHost: Record<HostId, number> = {};
   /** Keyed `${hostId}:${seq}`. */
@@ -85,6 +88,7 @@ export class OutboxStore {
     this.log = opts.log ?? ((): void => undefined);
     this.write = opts.write ?? ((p, d): void => atomicWriteJSONSync(p, d));
     this.scheduleHarden = opts.scheduleHarden ?? scheduleTokenFileReHarden;
+    this.onEnqueue = opts.onEnqueue ?? ((): void => undefined);
     this.load(opts.mintEpoch ?? ((): string => crypto.randomUUID()));
   }
 
@@ -134,6 +138,11 @@ export class OutboxStore {
       this.seqByHost[hostId] = seq;
       this.records.set(key(hostId, seq), rec);
     });
+    try {
+      this.onEnqueue(structuredClone(rec));
+    } catch (err) {
+      this.log('warn', `[a2a-remote] outbox listener failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
     return structuredClone(rec);
   }
 
