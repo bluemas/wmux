@@ -59,6 +59,14 @@ import type {
   LanLinkPeersListResult,
 } from '../shared/lanlink';
 import type {
+  A2aRemoteHostsListResult,
+  A2aRemoteJoinResult,
+  A2aRemotePairBeginResult,
+  A2aRemotePairStatus,
+  A2aRemotePeersListResult,
+  A2aRemoteStatus,
+} from '../shared/rpc';
+import type {
   PairFlow,
   WebDeviceListError,
   WebDeviceRevokeResult,
@@ -1962,6 +1970,22 @@ document.addEventListener('DOMContentLoaded', () => {
   peersList: () => ipcRenderer.invoke(IPC.LANLINK_PEERS_LIST) as Promise<LanLinkPeersListResult>,
   peersRemove: (peerUuid: string) =>
     ipcRenderer.invoke(IPC.LANLINK_PEERS_REMOVE, peerUuid) as Promise<{ ok: true }>,
+};
+
+// Cross-host A2A control plane (Settings → LAN). Request/response via invoke,
+// mirroring .lanlink above; the daemon re-validates every argument.
+(electronAPI as Record<string, unknown>).a2aRemote = {
+  status: () => ipcRenderer.invoke(IPC.A2A_REMOTE_STATUS) as Promise<A2aRemoteStatus>,
+  configure: (patch: { enabled?: boolean; port?: number }) =>
+    ipcRenderer.invoke(IPC.A2A_REMOTE_CONFIGURE, patch) as Promise<A2aRemoteStatus>,
+  pairBegin: () => ipcRenderer.invoke(IPC.A2A_REMOTE_PAIR_BEGIN) as Promise<A2aRemotePairBeginResult>,
+  pairCancel: () => ipcRenderer.invoke(IPC.A2A_REMOTE_PAIR_CANCEL) as Promise<{ ok: true }>,
+  pairStatus: () => ipcRenderer.invoke(IPC.A2A_REMOTE_PAIR_STATUS) as Promise<A2aRemotePairStatus>,
+  join: (invite: string) => ipcRenderer.invoke(IPC.A2A_REMOTE_JOIN, invite) as Promise<A2aRemoteJoinResult>,
+  hostsList: () => ipcRenderer.invoke(IPC.A2A_REMOTE_HOSTS_LIST) as Promise<A2aRemoteHostsListResult>,
+  hostsRemove: (hostId: string) => ipcRenderer.invoke(IPC.A2A_REMOTE_HOSTS_REMOVE, hostId) as Promise<{ ok: boolean }>,
+  peersList: () => ipcRenderer.invoke(IPC.A2A_REMOTE_PEERS_LIST) as Promise<A2aRemotePeersListResult>,
+  peersRevoke: (peerId: string) => ipcRenderer.invoke(IPC.A2A_REMOTE_PEERS_REVOKE, peerId) as Promise<{ ok: boolean }>,
 };
 
 // wmux web — titlebar toggle bridge (renderer → main → daemon control pipe).

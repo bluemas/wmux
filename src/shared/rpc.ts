@@ -510,6 +510,16 @@ export type RpcMethod =
   | 'lanlink.send'
   | 'lanlink.peers.list'
   | 'lanlink.peers.remove'
+  | 'a2a.remote.status'
+  | 'a2a.remote.configure'
+  | 'a2a.remote.pair.begin'
+  | 'a2a.remote.pair.cancel'
+  | 'a2a.remote.pair.status'
+  | 'a2a.remote.join'
+  | 'a2a.remote.hosts.list'
+  | 'a2a.remote.hosts.remove'
+  | 'a2a.remote.peers.list'
+  | 'a2a.remote.peers.revoke'
   | 'a2a.resolve.identity'
   | 'a2a.whoami'
   | 'a2a.discover'
@@ -748,6 +758,16 @@ export const ALL_RPC_METHODS = [
   'lanlink.send',
   'lanlink.peers.list',
   'lanlink.peers.remove',
+  'a2a.remote.status',
+  'a2a.remote.configure',
+  'a2a.remote.pair.begin',
+  'a2a.remote.pair.cancel',
+  'a2a.remote.pair.status',
+  'a2a.remote.join',
+  'a2a.remote.hosts.list',
+  'a2a.remote.hosts.remove',
+  'a2a.remote.peers.list',
+  'a2a.remote.peers.revoke',
   'a2a.resolve.identity',
   'a2a.whoami',
   'a2a.discover',
