@@ -411,6 +411,10 @@ export interface UISlice {
   splitInheritsCwd: boolean;
   setSplitInheritsCwd: (enabled: boolean) => void;
 
+  // #1838: a shell that exits cleanly (code 0) closes its tab (default on).
+  closeTabOnShellExit: boolean;
+  setCloseTabOnShellExit: (enabled: boolean) => void;
+
   // Idle-clearing of xterm's hidden IME textarea (issue #167, AutoGLM-style
   // voice injectors). Default OFF since v3.1.1: the programmatic wipe is the
   // prime suspect for field-reported IME claim storms that kill keyboard
@@ -1434,6 +1438,12 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
 
   setSplitInheritsCwd: (enabled) => set((state) => {
     state.splitInheritsCwd = enabled;
+  }),
+
+  closeTabOnShellExit: true,
+
+  setCloseTabOnShellExit: (enabled) => set((state) => {
+    state.closeTabOnShellExit = enabled;
   }),
 
   imeResidueGuardEnabled: false,

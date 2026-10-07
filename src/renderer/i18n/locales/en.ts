@@ -1900,6 +1900,8 @@ export const en = {
   'settings.startupDirectoryPlaceholder': 'e.g. C:\\Projects',
   'settings.splitInheritsCwd': 'Splits inherit directory',
   'settings.splitInheritsCwdDesc': 'A pane created by splitting starts in the original pane\'s current directory.',
+  'settings.closeTabOnShellExit': 'Close the tab when its shell exits cleanly',
+  'settings.closeTabOnShellExitDesc': 'Typing exit or pressing Ctrl+D closes the tab. A shell that ends with an error, and a pane wmux restarts on its own, stay open.',
   'settings.imeResidueGuard': 'Clear IME residue while idle',
   'settings.imeResidueGuardDesc': 'Protects against voice-input tools that replace leftover IME text destructively. Leave off unless you use such a tool — the clearing can confuse some IMEs.',
   'settings.hiddenPaneRetention': 'Pause hidden pane rendering',

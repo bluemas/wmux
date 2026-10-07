@@ -1861,6 +1861,8 @@ export const zh = {
   'settings.startupDirectoryPlaceholder': '例如 C:\\Projects',
   'settings.splitInheritsCwd': '分割继承目录',
   'settings.splitInheritsCwdDesc': '通过分割创建的面板会从原始面板的当前目录启动。',
+  'settings.closeTabOnShellExit': 'Shell 正常退出时关闭标签页',
+  'settings.closeTabOnShellExitDesc': '输入 exit 或按 Ctrl+D 会关闭标签页。以错误结束的 Shell，以及由 wmux 自动重启的面板，会保持打开。',
   'settings.imeResidueGuard': '空闲时清除 IME 残留',
   'settings.imeResidueGuardDesc': '防止语音输入工具破坏性替换残留的 IME 文本。除非你使用此类工具，否则请保持关闭 — 清除操作可能会让某些 IME 困惑。',
   'settings.hiddenPaneRetention': '暂停隐藏面板渲染',

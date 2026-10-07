@@ -866,6 +866,8 @@ export interface SessionData {
    * pane's current working directory (OSC 7-tracked). Default true.
    */
   splitInheritsCwd?: boolean;
+  /** #1838: a clean shell exit (code 0) closes its tab. Default true. */
+  closeTabOnShellExit?: boolean;
   /**
    * Issue #167 idle-clearing of xterm's hidden IME textarea (protects
    * against field-replacing voice injectors). Default false since v3.1.1 —

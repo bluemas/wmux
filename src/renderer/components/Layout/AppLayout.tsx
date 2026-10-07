@@ -415,6 +415,7 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
     titlebarClockVisible: state.titlebarClockVisible,
     paneNewTerminalButton: state.paneNewTerminalButton,
     splitInheritsCwd: state.splitInheritsCwd,
+    closeTabOnShellExit: state.closeTabOnShellExit,
     imeResidueGuardEnabled: state.imeResidueGuardEnabled,
     hiddenPaneRetentionEnabled: state.hiddenPaneRetentionEnabled,
     coldParkEnabled: state.coldParkEnabled,

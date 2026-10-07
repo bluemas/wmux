@@ -1878,6 +1878,8 @@ export const pl = {
   'settings.startupDirectoryPlaceholder': 'np. C:\\Projekty',
   'settings.splitInheritsCwd': 'Podziały dziedziczą katalog',
   'settings.splitInheritsCwdDesc': 'Panel utworzony przez podział startuje w bieżącym katalogu panelu źródłowego.',
+  'settings.closeTabOnShellExit': 'Zamknij kartę, gdy powłoka zakończy się poprawnie',
+  'settings.closeTabOnShellExitDesc': 'Wpisanie exit lub naciśnięcie Ctrl+D zamyka kartę. Powłoka zakończona błędem oraz panel, który wmux sam uruchamia ponownie, pozostają otwarte.',
   'settings.imeResidueGuard': 'Czyść pozostałości IME w bezczynności',
   'settings.imeResidueGuardDesc': 'Chroni przed narzędziami głosowego wejścia, które destrukcyjnie zastępują pozostały tekst IME. Zostaw wyłączone, chyba że używasz takiego narzędzia — czyszczenie może zmylić niektóre IME.',
   'settings.hiddenPaneRetention': 'Wstrzymaj renderowanie ukrytych paneli',
