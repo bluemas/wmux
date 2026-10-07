@@ -22,7 +22,7 @@ import { walkToOwningAnchor } from '../../pty/serverSidePidWalk';
 import type { OwningAnchor } from '../../pty/serverSidePidWalk';
 import { recordSentTask, recordTaskState, reopenedState, stateOfTask, workLinkFromSentTask } from '../../workLink/a2aProducer';
 import { noteTrackReply } from '../../deck/trackRecordFeed';
-import { isRemoteTaskId } from '../../../shared/a2aRemote';
+import { A2A_BRAIN_ALIAS, isRemoteTaskId } from '../../../shared/a2aRemote';
 import {
   remoteWorkspaceId,
   type A2aRemoteReplyInput,
@@ -263,17 +263,41 @@ export function registerA2aRpc(
   ): Promise<unknown> {
     const alias = params.to as string;
     if (params.execute === true) return { error: 'a2a.task.send: execute is not available for a remote pane (message only)' };
-    if (ctx?.commanderWorkspace) return { error: 'a2a.task.send: a remote pane is addressed from its linked pane only' };
     let message: string;
     try { message = validateMessage(typeof params.message === 'string' ? params.message : ''); } catch (e) {
       return { error: `a2a.task.send: ${e instanceof Error ? e.message : 'invalid'}` };
+    }
+    if (ctx?.commanderWorkspace) {
+      // A brain sends only on a brain link of its own workspace: Moa to
+      // another PC's Moa. The sender is the token-verified commander binding,
+      // never a wire value.
+      const hq = ctx.commanderWorkspace;
+      const brainLink = matches.find((t) => t.kind === 'brain' && t.local.workspaceId === hq);
+      if (!brainLink) {
+        return matches.some((t) => t.kind === 'brain')
+          ? { error: `a2a.task.send: "${alias}" is linked to another workspace's Moa, not to this one` }
+          : {
+            error:
+              `a2a.task.send: Moa does not send work straight to an agent ("${alias}" is a remote pane). ` +
+              'Ask its PC\'s Moa instead (its <PC>/Moa alias from a2a_discover), or propose the work to the operator with moa_propose_handoff.',
+          };
+      }
+      if (!brainLink.allowOutbound) return { error: `a2a.task.send: the link to "${alias}" does not allow sending from this side` };
+      const res = await remote!.sendTask({
+        linkId: brainLink.linkId,
+        from: { workspaceId: hq, name: A2A_BRAIN_ALIAS },
+        title: typeof params.title === 'string' ? params.title : '',
+        text: message,
+      }).catch((err: unknown): RemoteOpResult => ({ ok: false, error: err instanceof Error ? err.message : String(err) }));
+      if (!res.ok) return { error: `a2a.task.send: remote send refused (${res.error})` };
+      return { ok: true, taskId: res.taskId, remote: true, delivery: REMOTE_QUEUED };
     }
     const workspaceId = typeof params.workspaceId === 'string' ? params.workspaceId : '';
     const caller = await resolveCallerPane(getWindow, workspaceId, params.senderPtyId);
     if (caller.kind !== 'resolved') {
       return { error: `a2a.task.send: "${alias}" is a remote pane; sending to it needs the caller's verified pane` };
     }
-    const link = matches.find((t) => t.local.workspaceId === workspaceId && t.local.paneId === caller.paneId);
+    const link = matches.find((t) => t.kind !== 'brain' && t.local.workspaceId === workspaceId && t.local.paneId === caller.paneId);
     if (!link) return { error: `a2a.task.send: this pane is not linked to "${alias}"` };
     if (!link.allowOutbound) return { error: `a2a.task.send: the link to "${alias}" does not allow sending from this side` };
     const res = await remote!.sendTask({
@@ -289,14 +313,15 @@ export function registerA2aRpc(
   }
 
   /** A reply on a remote task: stored in the ledger and queued for the peer. */
-  async function replyRemote(method: string, taskId: string, params: Record<string, unknown>): Promise<unknown> {
+  async function replyRemote(method: string, taskId: string, params: Record<string, unknown>, ctx: RpcContext | undefined): Promise<unknown> {
     let message: string;
     try { message = validateMessage(typeof params.message === 'string' ? params.message : ''); } catch (e) {
       return { error: `${method}: ${e instanceof Error ? e.message : 'invalid'}` };
     }
     const res = await remote!.reply({
       taskId,
-      workspaceId: typeof params.workspaceId === 'string' ? params.workspaceId : '',
+      // A brain answers as its token-verified workspace (Moa: the HQ).
+      workspaceId: ctx?.commanderWorkspace ?? (typeof params.workspaceId === 'string' ? params.workspaceId : ''),
       text: message,
     }).catch((err: unknown): RemoteOpResult => ({ ok: false, error: err instanceof Error ? err.message : String(err) }));
     if (!res.ok) return { error: `${method}: remote reply refused (${res.error})` };
@@ -568,7 +593,9 @@ export function registerA2aRpc(
       .filter((t) => !ws || t.local.workspaceId === ws)
       .map((t) => ({
         name: t.alias,
-        description: `Remote pane ${t.alias} (linked to local pane ${t.local.paneId}; message only)`,
+        description: t.kind === 'brain'
+          ? `Moa of PC ${t.alias.split('/')[0]} (linked to this PC's Moa; send_message to: "${t.alias}"; message only)`
+          : `Remote pane ${t.alias} (linked to local pane ${t.local.paneId}; message only)`,
         url: remoteWorkspaceId(t.linkId),
         version: '1.0',
         capabilities: { stateTransitionHistory: true },
@@ -585,7 +612,8 @@ export function registerA2aRpc(
           remote: true,
           linkId: t.linkId,
           hostId: t.hostId,
-          localPaneId: t.local.paneId,
+          ...(t.local.paneId ? { localPaneId: t.local.paneId } : {}),
+          endpoint: t.kind,
           allowOutbound: t.allowOutbound,
         },
       }));
@@ -805,7 +833,7 @@ export function registerA2aRpc(
     }
     // A message on a remote task is a reply for the peer host.
     if (typeof params.message === 'string' && remote && typeof params.taskId === 'string' && isRemoteTaskId(params.taskId)) {
-      return replyRemote('a2a.task.update', params.taskId, params);
+      return replyRemote('a2a.task.update', params.taskId, params, ctx);
     }
     // Message-only update: may reopen an ended task (daemon first).
     if (typeof params.message === 'string') {
@@ -833,7 +861,7 @@ export function registerA2aRpc(
     // pane's exact alias, goes to the peer host instead of a local pane.
     if (remote && typeof params.taskId === 'string' && isRemoteTaskId(params.taskId)) {
       if (params.execute === true) return { error: 'a2a.task.send: execute is only supported for new tasks' };
-      return replyRemote('a2a.task.send', params.taskId, params);
+      return replyRemote('a2a.task.send', params.taskId, params, ctx);
     }
     if (!params.taskId) {
       const matches = await remoteTargetsFor(params.to);
