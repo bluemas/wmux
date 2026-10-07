@@ -9,6 +9,8 @@ import { computePaneAutoName, paneDisplayName } from '../utils/paneNaming';
 
 /** Coalesce bursts (a split, a rename, a cwd change) into one send. */
 export const A2A_SNAPSHOT_DEBOUNCE_MS = 400;
+/** How long the first snapshot waits for Moa's state before going without it. */
+export const A2A_MOA_WAIT_MS = 15_000;
 
 interface SnapshotSource {
   workspaces: Workspace[];
@@ -66,6 +68,7 @@ export function useA2aRemoteSnapshot(): void {
   useEffect(() => {
     const api = window.electronAPI?.a2aRemote;
     if (!api?.snapshot) return;
+    const mountedAt = Date.now();
     let lastKey = '';
     let timer: ReturnType<typeof setTimeout> | null = null;
     const flush = (): void => {
@@ -73,8 +76,12 @@ export function useA2aRemoteSnapshot(): void {
       const state = useStore.getState();
       if (!state.sessionRestored) return;
       // Moa's state not read yet: a snapshot without it would read as "Moa
-      // went away" and break its links. Wait for the first read.
-      if (state.moa === null && typeof window.electronAPI?.deck?.moa?.state === 'function') return;
+      // went away" and break its links. Wait for the first read, but not
+      // forever (a read that keeps failing must not stop publishing).
+      if (state.moa === null && typeof window.electronAPI?.deck?.moa?.state === 'function' && Date.now() - mountedAt < A2A_MOA_WAIT_MS) {
+        schedule();
+        return;
+      }
       const snapshot = buildPaneSnapshot(state);
       const key = JSON.stringify(snapshot);
       if (key === lastKey) return;

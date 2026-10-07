@@ -46,6 +46,14 @@ describe('A2aExposurePublisher', () => {
     expect(gone).toEqual([{ workspaceId: 'w2', reason: 'workspace-gone' }]);
   });
 
+  it('an empty tree after a real one breaks nothing (a reloading window)', async () => {
+    const { pub, gone } = rig(['w1']);
+    await pub.accept(snap([['w1', ['a']]]));
+    await pub.accept({ workspaces: [] });
+    await pub.accept(snap([['w1', ['a']]]));
+    expect(gone).toEqual([]);
+  });
+
   it('publishes nothing while nothing is exposed', async () => {
     const { pub, published } = rig([]);
     await pub.accept(snap([['w1', ['a']]]));

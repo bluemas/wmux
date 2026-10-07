@@ -71,6 +71,9 @@ export class A2aExposurePublisher {
   /** A new snapshot from the renderer. Resolves once its effects ran. */
   accept(snapshot: A2aRemotePaneSnapshot): Promise<void> {
     return this.enqueue(async () => {
+      // A window always holds a workspace: an empty tree is a renderer that
+      // is (re)loading, not every workspace closing. Links are not broken on it.
+      if (this.last && this.last.workspaces.length > 0 && snapshot.workspaces.length === 0) return;
       const prev = this.last;
       this.last = snapshot;
       if (prev) {
