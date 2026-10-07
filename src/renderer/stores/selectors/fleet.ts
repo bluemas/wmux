@@ -607,9 +607,13 @@ export function selectFleetPanes(state: FleetSelectorState): FleetPane[] {
       // #1509 — 'awaiting_input' is vetoed for the same reason as 'running':
       // the per-pty scan above carries it on the pane that raised it, so the
       // shared slot could only add it to a same-named sibling as well.
+      // 'complete' is vetoed too: its per-pty carrier is cleared when the user
+      // focuses the pane, but this slot keeps it until the next turn, so
+      // inheriting it pinned a seen pane in Finished.
       const metaStatus =
         isActivePane && metaMatchesPane
           && wsMeta?.agentStatus !== 'running' && wsMeta?.agentStatus !== 'awaiting_input'
+          && wsMeta?.agentStatus !== 'complete'
           && !isQuietUsageLimitError(state.usageLimitWaiting, ptyId, wsMeta?.agentStatus)
           ? wsMeta?.agentStatus
           : undefined;
@@ -797,13 +801,11 @@ export function selectLatestCompletionEvidenceTask(
   return best;
 }
 
-// Statuses that count toward the "N need you" header chip: awaiting_input is the
-// precise blocked-mid-turn state; waiting means the turn ended and a fresh
-// instruction is wanted. Both are "the agent is idle on you".
+// Panes that need you, by the shared class (fleetAttentionClass): a dialog is
+// open or the turn ended on a question (both read awaiting_input here), or
+// supervision stopped. A turn that ended with no question is not one.
 export function countNeedsAttention(panes: FleetPane[]): number {
-  return panes.filter(
-    (p) => p.agentStatus === 'awaiting_input' || p.agentStatus === 'waiting',
-  ).length;
+  return panes.filter((p) => fleetAttentionClass(p) === 'needsYou').length;
 }
 
 // ─── Per-workspace status roll-up — the sidebar dot's source ─────────────────

@@ -129,6 +129,7 @@
  * (prefix key, bindings) that open key capture. */
 .settings-kbd-hint { min-height: 22px; padding: 0 7px; }
 .settings-kbd-hint[data-disabled] { text-decoration: line-through; color: var(--text-muted); }
+.settings-kbd-hint[data-unset] { color: var(--text-muted); }
 button.settings-kbd { cursor: pointer; }
 button.settings-kbd:hover { color: var(--text-main); background: var(--surface-fill-hover); }
 

@@ -20,6 +20,13 @@ import { OPEN_MENTION_PICKER_EVENT } from '../utils/agentMentionInsert';
 import { isChatV2Covering } from '../components/ChatV2/coverage';
 import { showWorkspaces } from '../utils/showWorkspaces';
 import { listedWorkspaces, moaHqId, refuseWorkspaceClose } from '../components/Moa/moaHqGuard';
+import {
+  openMultiTask,
+  openWorktaskCleanup,
+  showGitDiff,
+  stashActivePane,
+  toggleAgentToolbarPin,
+} from '../utils/commandActions';
 
 // Lightweight bookmark toast — reuses the same DOM element pattern as showCopyToast
 let bookmarkToastTimer: ReturnType<typeof setTimeout> | null = null;
@@ -79,6 +86,8 @@ export const WORKSPACES_ONLY_ACTIONS: ReadonlySet<ShortcutActionId> = new Set<Sh
   'focusUp', 'focusDown', 'focusLeft', 'focusRight',
   'focusUpAlt', 'focusDownAlt', 'focusLeftAlt', 'focusRightAlt',
   'clearMultiview', 'openBrowser', 'addBookmark', 'zoomIn', 'zoomOut', 'zoomReset',
+  'stashPane', 'movePaneLeft', 'movePaneRight', 'movePaneUp', 'movePaneDown',
+  'multiTask', 'showGitDiff',
 ]);
 
 const STOP_PROPAGATION_ACTIONS: ReadonlySet<ShortcutActionId> = new Set<ShortcutActionId>([
@@ -88,10 +97,10 @@ const STOP_PROPAGATION_ACTIONS: ReadonlySet<ShortcutActionId> = new Set<Shortcut
 ]);
 
 // Terminal font-size zoom bounds. Kept in lockstep with the Appearance tab's
-// font-size slider (SettingsPanel TabAppearance: min 12 / max 24) and the
+// font-size slider (SettingsPanel TabAppearance: min 8 / max 24) and the
 // store default (uiSlice terminalFontSize: 14) so keyboard zoom and the slider
 // never disagree on the reachable range. One-px steps mirror the slider grain.
-const FONT_SIZE_MIN = 12;
+const FONT_SIZE_MIN = 8;
 const FONT_SIZE_MAX = 24;
 const FONT_SIZE_DEFAULT = 14;
 const FONT_SIZE_STEP = 1;
@@ -560,6 +569,18 @@ export function useKeyboard() {
         }
       },
       mentionAgent: () => { document.dispatchEvent(new CustomEvent(OPEN_MENTION_PICKER_EVENT)); },
+      // No default key (UNBOUND_SHORTCUTS) — these run only once the user
+      // binds one, from the command palette or Settings → Shortcuts. Each
+      // runs exactly what its palette row runs.
+      stashPane: stashActivePane,
+      movePaneLeft: () => { store.getState().moveActivePaneDirection('left'); },
+      movePaneRight: () => { store.getState().moveActivePaneDirection('right'); },
+      movePaneUp: () => { store.getState().moveActivePaneDirection('up'); },
+      movePaneDown: () => { store.getState().moveActivePaneDirection('down'); },
+      multiTask: openMultiTask,
+      toggleToolbarPin: toggleAgentToolbarPin,
+      openWorktaskCleanup,
+      showGitDiff,
     };
 
     /** Clear the prefix timeout if running */
@@ -749,7 +770,11 @@ export function useKeyboard() {
       // Allow shortcuts to fire inside editable fields when any modifier (Ctrl,
       // ⌘, or Alt) is pressed — covers both literal-Ctrl bindings (tmux prefix)
       // and cmdOrCtrl bindings (palette, settings, …).
-      if (isEditable && !literalCtrl && !cmdOrCtrl && !alt && !isFunctionKey) return;
+      // A Win / Super chord has no Ctrl or Alt, so the check above would drop
+      // it wherever the user types — the terminal included — and a Win+J the
+      // user recorded would never run. Let it through when it is a shortcut.
+      const metaShortcut = e.metaKey && !isMac && resolveShortcut(e, currentShortcutBindings()) !== null;
+      if (isEditable && !literalCtrl && !cmdOrCtrl && !alt && !isFunctionKey && !metaShortcut) return;
 
       // Ctrl+<prefixKey>: Enter prefix mode (configurable, default Ctrl+B)
       // Use e.code for Korean IME compatibility (see commit 60e39b0)

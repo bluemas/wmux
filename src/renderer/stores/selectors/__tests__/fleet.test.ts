@@ -225,6 +225,26 @@ describe('selectFleetPanes', () => {
     expect(btop.agentStatus).toBe('idle');    // must NOT show "waiting"
   });
 
+  it("a seen finished turn does NOT come back from the workspace 'complete' slot", () => {
+    // Focusing the pane clears its per-pty 'complete' ("the user has seen
+    // this"), but the workspace-wide slot keeps 'complete' until the next
+    // turn. Inheriting it pinned the active pane in Finished forever.
+    const ws = workspace(
+      'ws-seen', 'seen',
+      leaf('p-seen', [surface('s-seen', 'pty-seen')]),
+      'p-seen',
+      { agentName: 'Claude Code', agentStatus: 'complete' },
+    );
+    const [pane] = selectFleetPanes({
+      workspaces: [ws],
+      surfaceAgentStatus: {}, // focus-cleared
+      surfaceActivity: {},
+      surfaceAgent: { 'pty-seen': { name: 'Claude Code', status: 'complete' } },
+    });
+    expect(pane.isActivePane).toBe(true);
+    expect(pane.agentStatus).toBe('idle');
+  });
+
   it("a confirmed agent pane still does NOT borrow workspace 'running' from a same-named sibling (#837 + #850)", () => {
     // The shape #850's name match cannot distinguish: orchestrator and worker
     // are both "Claude Code", so the name matches on BOTH panes. The worker's
@@ -357,12 +377,13 @@ describe('sortFleetPanes', () => {
 // ─── countNeedsAttention ─────────────────────────────────────────────────────
 
 describe('countNeedsAttention', () => {
-  it('counts awaiting_input and waiting, ignores everything else', () => {
+  it('counts awaiting_input, ignores everything else', () => {
     const panes = selectFleetPanes(fixture());
     expect(countNeedsAttention(panes)).toBe(1); // only p1 (awaiting_input)
   });
 
-  it('counts both awaiting_input and waiting states', () => {
+  // 2026-10-07 — the shared class: a turn-end `waiting` is not needs you.
+  it('counts an open dialog, not a turn-end waiting', () => {
     const base: FleetPane = { workspaceId: 'w', workspaceName: 'w', paneId: 'x', surfaceId: 'x', ptyId: 'x', agentStatus: 'idle', title: 'x', surfaceType: 'terminal', isActivePane: false, unverifiable: false };
     const panes: FleetPane[] = [
       { ...base, paneId: '1', agentStatus: 'awaiting_input' },
@@ -370,7 +391,7 @@ describe('countNeedsAttention', () => {
       { ...base, paneId: '3', agentStatus: 'running' },
       { ...base, paneId: '4', agentStatus: 'complete' },
     ];
-    expect(countNeedsAttention(panes)).toBe(2);
+    expect(countNeedsAttention(panes)).toBe(1);
   });
 });
 

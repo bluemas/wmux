@@ -82,6 +82,20 @@ describe('terminalOutputScheduler', () => {
     expect(getQueuedCharCount(t)).toBe(0);
   });
 
+  it('promoteTerminalToPriorityDrain releases a retained backlog with no further PTY write', () => {
+    // A quiet hidden pane revealed: nothing else will arrive to release the
+    // retained bytes, so the promotion itself must.
+    const t = makeTerminal();
+    writeTerminalOutput(t, 'hidden1', { foreground: false, retainWhenHidden: true });
+    writeTerminalOutput(t, 'hidden2', { foreground: false, retainWhenHidden: true });
+    vi.runAllTimers();
+    expect(t.writes).toEqual([]); // retained: never parsed while hidden
+    promoteTerminalToPriorityDrain(t);
+    vi.runAllTimers();
+    expect(joined(t)).toBe('hidden1hidden2');
+    expect(getQueuedCharCount(t)).toBe(0);
+  });
+
   it('promoteTerminalToPriorityDrain is a no-op on an empty queue', () => {
     const t = makeTerminal();
     promoteTerminalToPriorityDrain(t); // nothing queued

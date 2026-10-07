@@ -113,6 +113,7 @@ import { createWorkspaceFactsPublisher, invalidateAutonomyCache, registerWorkspa
 import { publishMoaPane, setMoaPanePush } from './deck/moaPaneFeed';
 import { reconcileOwnerDowngrades } from './worktask/taskAutonomy';
 import { createHqAutoPress, setHqAutoPress } from './deck/hqApprovalLane';
+import { startMoaShadow } from './deck/moaShadowHost';
 import { getTaskLedger } from './deck/taskLedgerHost';
 import { createTrackRecordFeed, setTrackRecordFeed, type TrackApprovalRecord } from './deck/trackRecordFeed';
 import { getTrackRecordStore } from './deck/trackRecordStore';
@@ -139,6 +140,7 @@ import { ClaudeWorker } from './a2a/ClaudeWorker';
 import { AutoUpdater } from './updater/AutoUpdater';
 import { warnOnInstallIntegrityGap } from './updater/installIntegrity';
 import { readDaemonPid } from './updater/installTeardown';
+import { isAltF4Held, isAltF4KeyDown } from './altF4';
 import { McpRegistrar } from './mcp/McpRegistrar';
 import { BrokerSupervisor, isMcpBrokerEnabled } from './mcp/BrokerSupervisor';
 import { WebviewCdpManager } from './browser-session/WebviewCdpManager';
@@ -1943,6 +1945,11 @@ app.on('ready', async () => {
       // A new approval, or one settled elsewhere: the lane re-lists.
       client.on('approvals:changed', () => { void hqAutoPress.run(); });
       client.on('approvals:changed', () => { void trackRecordFeed.onApprovalsChanged(); });
+      // Moa's shadow judge (records only); a first pass catches questions
+      // already waiting on this daemon.
+      const moaShadow = startMoaShadow(() => daemonClient);
+      client.on('approvals:changed', () => { void moaShadow.onApprovalsChanged(); });
+      void moaShadow.onApprovalsChanged();
       // Handler swap to daemon-routed mode. The microsecond window where
       // pty/* handlers are torn down and re-registered is the same
       // surface the original code used; the swap is logged for the
@@ -2416,6 +2423,29 @@ app.on('window-all-closed', () => {
   // Actual quit is triggered from the tray "Quit" menu item.
 });
 
+// Alt+F4: ask before quitting. A normal Quit only detaches from the daemon, so
+// live sessions keep running and reattach on the next launch.
+let quitConfirmOpen = false;
+async function confirmQuit(win: BrowserWindow): Promise<void> {
+  if (quitConfirmOpen) return;
+  quitConfirmOpen = true;
+  try {
+    const { response } = await dialog.showMessageBox(win, {
+      type: 'question',
+      title: 'Quit wmux',
+      message: 'Quit wmux?',
+      detail: 'Your terminal sessions keep running in the background and reattach the next time you open wmux.',
+      buttons: ['Quit', 'Cancel'],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true,
+    });
+    if (response === 0) app.quit();
+  } finally {
+    quitConfirmOpen = false;
+  }
+}
+
 // quitAndInstall() closes every window and only installs once the window list
 // empties. With isQuitting still false the hide-to-tray close intercept above
 // cancels that close, so the window list never empties, the install never runs,
@@ -2447,10 +2477,28 @@ function adoptMainWindow(win: BrowserWindow): void {
     if (mainWindow === win) mainWindow = null;
   });
 
-  // Intercept window close — hide to tray instead of destroying
+  // Intercept window close — hide to tray instead of destroying, except for
+  // Alt+F4, which asks to quit. The OS delivers Alt+F4 and the title-bar X as the
+  // same close request (and the key may never reach the page), so the key state
+  // is read from the OS when the request arrives; the input event is a second hint.
+  let altF4At = 0;
+  win.webContents.on('before-input-event', (event, input) => {
+    if (!isAltF4KeyDown(input)) return;
+    altF4At = Date.now();
+    // A focused terminal cancels Alt+F4 (xterm sends it to the shell), so no
+    // close request ever follows. On Windows, take the key here and ask.
+    if (process.platform === 'win32' && !isQuitting) {
+      event.preventDefault();
+      void confirmQuit(win);
+    }
+  });
   win.on('close', (e) => {
-    if (!isQuitting) {
-      e.preventDefault();
+    if (isQuitting) return;
+    e.preventDefault();
+    if (isAltF4Held() || Date.now() - altF4At < 1000) {
+      altF4At = 0;
+      void confirmQuit(win);
+    } else {
       win.hide();
     }
   });

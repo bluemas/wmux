@@ -37,7 +37,7 @@ describe('resolveMinimumContrastRatio', () => {
 describe('resolveMinimumContrastRatio — every built-in xterm palette', () => {
   const DARK_PALETTES = [
     'amber-graphite', 'catppuccin-mocha', 'tokyo-night', 'one-dark',
-    'gruvbox-dark', 'solarized-dark', 'nord', 'monochrome',
+    'gruvbox-dark', 'gruvbox-dark-hard', 'solarized-dark', 'nord', 'monochrome',
   ] as const;
   const LIGHT_PALETTES = ['sandstone-light', 'paper-light'] as const;
 

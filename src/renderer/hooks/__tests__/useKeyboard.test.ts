@@ -514,16 +514,16 @@ describe('useKeyboard handler — inspect suppression (D-exclusive)', () => {
 // ─── Terminal font zoom (#171) ──────────────────────────────────────────────
 
 describe('clampFontSize', () => {
-  it('passes through values inside the [12, 24] range', () => {
+  it('passes through values inside the [8, 24] range', () => {
     expect(clampFontSize(14)).toBe(14);
-    expect(clampFontSize(12)).toBe(12);
+    expect(clampFontSize(8)).toBe(8);
     expect(clampFontSize(24)).toBe(24);
   });
 
-  it('clamps below the minimum up to 12', () => {
-    expect(clampFontSize(11)).toBe(12);
-    expect(clampFontSize(-5)).toBe(12);
-    expect(clampFontSize(0)).toBe(12);
+  it('clamps below the minimum up to 8', () => {
+    expect(clampFontSize(7)).toBe(8);
+    expect(clampFontSize(-5)).toBe(8);
+    expect(clampFontSize(0)).toBe(8);
   });
 
   it('clamps above the maximum down to 24', () => {
@@ -539,7 +539,7 @@ describe('useKeyboard handler — zoom shortcuts (#171)', () => {
   );
 
   it('zoom range constants stay aligned with the Settings slider + store default', () => {
-    expect(src).toContain('const FONT_SIZE_MIN = 12;');
+    expect(src).toContain('const FONT_SIZE_MIN = 8;');
     expect(src).toContain('const FONT_SIZE_MAX = 24;');
     expect(src).toContain('const FONT_SIZE_DEFAULT = 14;');
   });

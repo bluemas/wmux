@@ -739,17 +739,19 @@ export function flushTerminalOutput(terminal: SchedulableTerminal): void {
 }
 
 /** Promote a queued terminal's backlog to the PRIORITY drain cadence without a
- *  synchronous full flush. Used on reveal for a large NON-retained backlog that
- *  cannot be discarded (no daemon authority to resync from) but would burst if
+ *  synchronous full flush. Used on reveal for a backlog that would burst if
  *  parsed in one shot: the budgeted drain (8 writes/tick under an 8ms
  *  wall-clock ceiling) spreads it across frames instead of pinning the renderer
- *  in one giant parse. Byte order is preserved and nothing is dropped — this is
- *  the data-loss-safe counterpart to the reveal-backlog-cap's discard+resync.
- *  No-op for a retained entry (that path is the resync cap) or an empty queue. */
+ *  in one giant parse. Byte order is preserved and nothing is dropped.
+ *  A retained (hidden, never-parsed) backlog is released here too — the pane
+ *  is visible now, and leaving it retained parked the catch-up until the next
+ *  PTY write, so a quiet pane kept its stale frame. No-op for a held sync
+ *  frame (its close releases it) or an empty queue. */
 export function promoteTerminalToPriorityDrain(terminal: SchedulableTerminal): void {
   const entry = queue.get(terminal);
-  if (!entry || entry.retained || entry.heldForSync) return;
+  if (!entry || entry.heldForSync) return;
   if (!hasQueuedChunks(entry)) return;
+  entry.retained = false;
   entry.priority = true;
   scheduleDrain(0);
 }
@@ -781,8 +783,8 @@ export function isTerminalDirty(terminal: SchedulableTerminal): boolean {
  *  historical and stays true if the daemon later disconnects. A caller using
  *  this to justify discarding the backlog must ALSO confirm the daemon is live
  *  now (isDaemonModeActive) so resync can replace what it discards. The
- *  scheduler stays daemon-agnostic on purpose; that check lives at the call
- *  site (useTerminal reveal-backlog-cap). */
+ *  scheduler stays daemon-agnostic on purpose; that check belongs at the
+ *  call site. */
 export function isTerminalRetained(terminal: SchedulableTerminal): boolean {
   return queue.get(terminal)?.retained === true;
 }

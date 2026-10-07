@@ -57,6 +57,10 @@ export const SHORTCUT_ACTION_IDS = [
   'clearMultiview', 'openBrowser', 'addBookmark', 'toggleMessageFeed',
   'zoomIn', 'zoomOut', 'zoomReset',
   'mentionAgent',
+  // Unbound by default (UNBOUND_SHORTCUTS): command-palette commands a user
+  // can put on a key of their choosing.
+  'stashPane', 'movePaneLeft', 'movePaneRight', 'movePaneUp', 'movePaneDown',
+  'multiTask', 'toggleToolbarPin', 'openWorktaskCleanup', 'showGitDiff',
 ] as const;
 
 export type ShortcutActionId = typeof SHORTCUT_ACTION_IDS[number];
@@ -203,6 +207,34 @@ export const ADVERTISED_SHORTCUTS: readonly (KeymapEntry & { action: ShortcutAct
     (e): e is KeymapEntry & { action: ShortcutActionId; descriptionKey: string } =>
       e.descriptionKey !== null && e.action !== 'prefix',
   );
+
+/**
+ * Actions that ship with NO key. They exist so a command-palette command can
+ * be given a shortcut (from the palette or Settings → Shortcuts): an override
+ * binds one, and with no override nothing is bound — so they take no key from
+ * a TUI and reserve no accelerator. Not in WMUX_KEYMAP for that reason.
+ */
+export const UNBOUND_SHORTCUTS: readonly { action: ShortcutActionId; descriptionKey: string }[] = [
+  { action: 'stashPane', descriptionKey: 'settings.sc.stashPane' },
+  { action: 'movePaneLeft', descriptionKey: 'settings.sc.movePaneLeft' },
+  { action: 'movePaneRight', descriptionKey: 'settings.sc.movePaneRight' },
+  { action: 'movePaneUp', descriptionKey: 'settings.sc.movePaneUp' },
+  { action: 'movePaneDown', descriptionKey: 'settings.sc.movePaneDown' },
+  { action: 'multiTask', descriptionKey: 'settings.sc.multiTask' },
+  { action: 'toggleToolbarPin', descriptionKey: 'settings.sc.toggleToolbarPin' },
+  { action: 'openWorktaskCleanup', descriptionKey: 'settings.sc.openWorktaskCleanup' },
+  { action: 'showGitDiff', descriptionKey: 'settings.sc.showGitDiff' },
+];
+
+/** The i18n key (and vars) naming `action` in shortcut lists. */
+export function shortcutDescription(
+  action: ShortcutActionId,
+): { key: string; vars?: Record<string, number> } {
+  const advertised = ADVERTISED_SHORTCUTS.find((e) => e.action === action);
+  if (advertised) return { key: advertised.descriptionKey, vars: advertised.descriptionVars };
+  const unbound = UNBOUND_SHORTCUTS.find((e) => e.action === action);
+  return { key: unbound ? unbound.descriptionKey : action };
+}
 
 /**
  * The user's changes to the defaults, per action: a concrete combo moves the
@@ -419,7 +451,15 @@ export function comboFromEvent(e: ShortcutKeyEventLike): string | null {
   // Record the physical key when the logical one is a non-ASCII glyph (IME):
   // the glyph changes with the input mode, the code does not.
   const physical = comboKeyFromCode(e.code);
-  const key = /^[\x20-\x7e]$/.test(first) || first.length > 1 || physical === null ? first : physical;
+  // With Shift held a symbol key reports its shifted glyph (Windows sends '}'
+  // for Shift+], #1422), while the defaults and the conflict check spell it by
+  // the key itself: recorded as 'Ctrl+Shift+}', Ctrl+Shift+] slipped past the
+  // "already used by next tab" check and then shadowed it. Record the physical
+  // key instead; an existing 'Ctrl+Shift+}' override still resolves.
+  const shiftedSymbol = e.shiftKey && first.length === 1 && !/^[A-Z0-9]$/.test(first);
+  const key = physical !== null && (shiftedSymbol || !/^[\x20-\x7e]$/.test(first)) && first.length === 1
+    ? physical
+    : first;
   return modifierPrefix(e) + key;
 }
 
@@ -485,7 +525,10 @@ export function rebindProblem(
 export function sanitizeShortcutOverrides(raw: unknown): ShortcutOverrides {
   const out: ShortcutOverrides = {};
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
-  const configurable = new Set<string>(ADVERTISED_SHORTCUTS.map((e) => e.action));
+  const configurable = new Set<string>([
+    ...ADVERTISED_SHORTCUTS.map((e) => e.action),
+    ...UNBOUND_SHORTCUTS.map((e) => e.action),
+  ]);
   for (const [action, combo] of Object.entries(raw as Record<string, unknown>)) {
     if (!isShortcutActionId(action) || !configurable.has(action)) continue;
     if (combo === null) out[action] = null;
