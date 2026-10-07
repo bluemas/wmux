@@ -40,6 +40,15 @@ describe('loadOrCreateHostIdentity', () => {
     }
   });
 
+  it('refuses to mint a hostId when host.json is gone but the cert/key remain', () => {
+    const a = load();
+    const certBefore = fs.readFileSync(a.certPath, 'utf8');
+    fs.unlinkSync(hostJson());
+    expect(() => load()).toThrow(/missing/);
+    expect(fs.existsSync(hostJson())).toBe(false);
+    expect(fs.readFileSync(a.certPath, 'utf8')).toBe(certBefore);
+  });
+
   it('creates host.json, key and certificate on first run', () => {
     const id = load();
     expect(id.created).toBe(true);

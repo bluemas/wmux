@@ -58,11 +58,13 @@ export interface HostIdentity {
 }
 
 /**
- * Read host.json, or mint it when it does not exist. A host.json that exists
- * but does not parse to a valid v1 record THROWS: silently minting a new
- * hostId would invalidate every link this host has, so a human must look.
+ * Read host.json, or mint it on a fresh directory. A host.json that exists
+ * but does not parse to a valid v1 record THROWS, and so does a missing
+ * host.json beside an existing cert/key (a partially lost identity, not a
+ * fresh install): silently minting a new hostId would invalidate every link
+ * this host has, so a human must look.
  */
-function loadOrMintHostId(file: string, now: Date): HostId {
+function loadOrMintHostId(file: string, pemPaths: string[], now: Date): HostId {
   let raw: string | null = null;
   try {
     raw = fs.readFileSync(file, 'utf8');
@@ -81,6 +83,9 @@ function loadOrMintHostId(file: string, now: Date): HostId {
       throw new Error(`A2A host identity file is corrupt; refusing to mint a new hostId: ${file}`);
     }
     return rec.hostId;
+  }
+  if (pemPaths.some((p) => fs.existsSync(p))) {
+    throw new Error(`A2A host identity file is missing beside an existing certificate/key; refusing to mint a new hostId: ${file}`);
   }
   const record: HostRecordV1 = { v: A2A_REMOTE_RECORD_V, hostId: crypto.randomUUID(), createdAt: now.toISOString() };
   atomicWriteJSONSync(file, record, { durable: true });
@@ -123,7 +128,7 @@ export function loadOrCreateHostIdentity(opts: HostIdentityOptions): HostIdentit
   const certPath = path.join(dir, 'cert.pem');
   const keyPath = path.join(dir, 'key.pem');
 
-  const hostId = loadOrMintHostId(path.join(dir, 'host.json'), now);
+  const hostId = loadOrMintHostId(path.join(dir, 'host.json'), [certPath, keyPath], now);
 
   const hostname = opts.hostname.trim();
   const dnsNames = isSanDnsName(hostname) ? [hostname.toLowerCase()] : [];
