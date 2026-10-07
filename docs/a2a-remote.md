@@ -183,6 +183,7 @@ When **Connect** fails on the joiner, the message tells you which case it is:
 | That PC finished another pairing with this PC at the same moment. | Two pairings of the same PC raced. | Try again. |
 | Too many failed attempts from this PC. | The server is rate-limiting this address after repeated failures. | Wait a minute, then try again with a correct invite. |
 | The other PC runs an incompatible wmux version. | The two PCs speak different protocol versions. | Update both PCs to the same wmux version. |
+| Connecting failed. Try again. | Any other failure, such as an unreadable answer from the server or this PC failing to save the pairing. | Try again. If it keeps failing, check that both PCs run the same wmux version. |
 
 On the server, "Not listening: …" means the listener could not start, most
 often because another program already uses the port. Pick another port.
@@ -194,6 +195,8 @@ to a PC whose certificate does not match.
 <!-- verify against PR2b/PR3 before merge -->
 
 ## Security model
+
+<!-- verify against PR2b/PR3 before merge: link lifecycle (broken on pane close/move, in-flight tasks fail on revoke) -->
 
 The trust boundary of this experimental version is **your own PCs**. Pair
 only machines you control. Support for colleagues' PCs needs further
