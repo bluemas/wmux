@@ -149,4 +149,17 @@ describe('WebglContextPool', () => {
     expect(pool.grantedCount()).toBe(1);
     expect(pool.grantedTokens()).toEqual(['b']); // most recent wins
   });
+
+  it('acquireWouldEvict is true only for a terminal without a context when the budget is full', () => {
+    const pool = new WebglContextPool(2);
+    const [a, b, c] = ['a', 'b', 'c'].map(makeTerm);
+    expect(pool.acquireWouldEvict('a')).toBe(false); // free slot
+    request(pool, a);
+    request(pool, b);
+    expect(pool.acquireWouldEvict('a')).toBe(false); // already holds one
+    expect(pool.acquireWouldEvict('c')).toBe(true);  // full, would take one
+    request(pool, c);                                  // evicts a
+    expect(pool.acquireWouldEvict('a')).toBe(true);
+    expect(pool.acquireWouldEvict('c')).toBe(false);
+  });
 });

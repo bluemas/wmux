@@ -117,6 +117,16 @@ export class WebglContextPool {
     entry.granted = false;
   }
 
+  /**
+   * Whether granting `token` now would take another terminal's context: it
+   * holds none and the budget is full. Such a grant rebuilds a renderer
+   * (~0.5 s of synchronous GPU setup) on top of tearing one down.
+   */
+  acquireWouldEvict(token: string): boolean {
+    if (this.entries.get(token)?.granted) return false;
+    return this.grantedCount() >= this.max;
+  }
+
   /** Number of terminals currently holding a live context. */
   grantedCount(): number {
     let n = 0;
