@@ -559,25 +559,6 @@ let webglTokenSeq = 0;
 // 300–600 ms, against 40–70 ms with the context kept). A hidden xterm does not
 // render, so a held context costs GPU memory only, and the pool bounds it.
 
-/** How long a pane must stay shown before it may take another terminal's
- *  WebGL context (see the visibility effect). Shorter than a deliberate look,
- *  longer than one step of cycling through workspaces by shortcut. */
-export const WEBGL_EVICTING_ACQUIRE_DWELL_MS = 500;
-/** After the dwell, the grant waits for an idle moment, at most this long. */
-const WEBGL_EVICTING_ACQUIRE_IDLE_TIMEOUT_MS = 1_000;
-
-// requestIdleCallback with a timer fallback (jsdom has none).
-function requestIdle(cb: () => void, timeoutMs: number): number {
-  if (typeof window.requestIdleCallback === 'function') {
-    return window.requestIdleCallback(cb, { timeout: timeoutMs });
-  }
-  return window.setTimeout(cb, 0);
-}
-function cancelIdle(handle: number): void {
-  if (typeof window.cancelIdleCallback === 'function') window.cancelIdleCallback(handle);
-  else window.clearTimeout(handle);
-}
-
 // RCA A1 — reconnect-with-retry policy lives in its own module so it can be
 // unit-tested without xterm/zustand/electron. Bound to the live deps here.
 function reconnectPtyWithRetry(ptyId: string, isCurrent: () => boolean, onRecoveryError?: (message: string | null, info?: { cwdMissing?: boolean }) => void): Promise<{ cols: number; rows: number } | null> {
@@ -3401,33 +3382,24 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
           }
         }
       }
-      // Ask the shared pool for a context. Under budget → granted immediately;
-      // at budget → the pool evicts the least-recently-shown terminal (it drops
-      // to the DOM renderer) and grants us. This hard-bounds the live context
-      // count below Chromium's cap, so no terminal is ever force-evicted into a
-      // blank pane. Idempotent if we already hold one (just bumps our LRU rank).
+      // Ask the shared pool for a context: idempotent if we already hold one
+      // (just bumps our LRU rank), granted at once when a slot is free. The
+      // pool bounds the live context count below Chromium's cap, so no
+      // terminal is ever force-evicted into a blank pane.
       //
-      // With more terminals than the budget, cycling through workspaces always
-      // lands on the least-recently-shown one, whose context was the last taken:
-      // every switch evicted another terminal and rebuilt a renderer (measured
-      // ~0.5 s, synchronous) before the pane could paint. Such a grant now waits
-      // until the pane has stayed shown for WEBGL_EVICTING_ACQUIRE_DWELL_MS and
-      // the page is idle; the DOM renderer paints it meanwhile. A pane that
-      // holds a context, or finds a free slot, is granted at once as before.
-      let acquireTimer: ReturnType<typeof setTimeout> | null = null;
-      let acquireIdle: number | null = null;
-      const acquire = (): void => {
-        if (loadWebglRef.current && disposeWebglRef.current) {
-          webglContextPool.acquire(token, loadWebglRef.current, disposeWebglRef.current);
-        }
-      };
-      if (webglContextPool.acquireWouldEvict(token)) {
-        acquireTimer = setTimeout(() => {
-          acquireTimer = null;
-          acquireIdle = requestIdle(() => { acquireIdle = null; acquire(); }, WEBGL_EVICTING_ACQUIRE_IDLE_TIMEOUT_MS);
-        }, WEBGL_EVICTING_ACQUIRE_DWELL_MS);
-      } else {
-        acquire();
+      // A grant that would take another terminal's context is not asked for:
+      // the pane keeps the DOM renderer it was left with. Evicting on reveal
+      // rebuilt a renderer (~0.5 s, synchronous) before the pane could paint,
+      // on every step of cycling workspaces once terminals outnumber the
+      // budget; doing it a moment after the paint instead swapped renderers
+      // under the reader's eyes, and the two lay glyphs out up to a pixel
+      // apart. Such a pane takes a context on a later reveal once one is free.
+      if (
+        loadWebglRef.current &&
+        disposeWebglRef.current &&
+        !webglContextPool.acquireWouldEvict(token)
+      ) {
+        webglContextPool.acquire(token, loadWebglRef.current, disposeWebglRef.current);
       }
       // Defer fit to allow CSS display change to take effect before measuring.
       // Selection-preservation guard — workspace/tab switch then immediate
@@ -3448,13 +3420,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         }
         fit();
       });
-      return () => {
-        cancelAnimationFrame(id);
-        // Hidden again (or unmounting) before the deferred grant ran: drop it,
-        // so a quick pass through a workspace never takes a context.
-        if (acquireTimer !== null) clearTimeout(acquireTimer);
-        if (acquireIdle !== null) cancelIdle(acquireIdle);
-      };
+      return () => cancelAnimationFrame(id);
     }
     // Hidden: keep the WebGL context ("A hidden terminal KEEPS its WebGL
     // context", near the top of this file). The pool evicts it if a visible
