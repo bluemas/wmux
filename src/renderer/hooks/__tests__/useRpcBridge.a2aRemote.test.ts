@@ -5,7 +5,7 @@
 // link's pane, through the gated delivery, and HOLD (never re-route) when that
 // pane is gone or another pty holds it now.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { PaneBranch, PaneLeaf, Surface, Workspace } from '../../../shared/types';
+import type { PaneBranch, PaneLeaf, Surface, Task, Workspace } from '../../../shared/types';
 import { useStore } from '../../stores';
 import { handleRpcMethod } from '../useRpcBridge';
 
@@ -49,7 +49,7 @@ function remoteParams(o: Record<string, unknown> = {}): Record<string, unknown> 
   };
 }
 
-type Result = { ok?: boolean; delivered?: boolean; held?: string; reason?: string; duplicate?: boolean; error?: string; taskId?: string };
+type Result = { ok?: boolean; delivered?: boolean; held?: string; reason?: string; duplicate?: boolean; error?: string; taskId?: string; ptyId?: string; note?: string };
 
 const send = async (o: Record<string, unknown> = {}): Promise<Result> =>
   (await handleRpcMethod('a2a.task.send', remoteParams(o))) as Result;
@@ -87,7 +87,7 @@ afterEach(() => {
 describe('remote task delivery', () => {
   it('lands on the pinned pane through the gated delivery and records the snapshot', async () => {
     const r = await send();
-    expect(r).toEqual({ ok: true, delivered: true });
+    expect(r).toEqual({ ok: true, delivered: true, ptyId: PINNED_PTY });
     expect(written).toEqual([PINNED_PTY]);
     // A live agent gets the one-line pointer naming the task, never a sibling pane.
     expect(gate).toHaveBeenCalledWith(PINNED_PTY, expect.stringContaining(RT), 'Claude Code', expect.objectContaining({ waitQuiet: true, newTask: true, taskId: RT, expectAgent: 'Claude Code' }));
@@ -132,16 +132,27 @@ describe('remote task delivery', () => {
     refusal = { ok: false, reason: 'user_typing', detail: 'typing' };
     await send();
     refusal = null;
-    expect(await send()).toEqual({ ok: true, delivered: true });
+    expect(await send()).toEqual({ ok: true, delivered: true, ptyId: PINNED_PTY });
     expect(written).toEqual([PINNED_PTY]);
   });
 
-  it('a paste left in the composer is not pasted again', async () => {
+  it('a paste left in the composer counts as delivered and is not pasted again', async () => {
     refusal = { ok: false, reason: 'approval_pending', detail: 'x', pasted: true, cleared: false };
-    await send();
+    expect(await send()).toEqual({ ok: true, delivered: true, ptyId: PINNED_PTY, note: 'pasted-not-submitted' });
     refusal = null;
-    expect(await send()).toEqual({ ok: true, delivered: false, reason: 'pasted_not_submitted' });
+    expect(await send()).toEqual({ ok: true, delivered: true, duplicate: true });
     expect(gate).toHaveBeenCalledTimes(1);
+  });
+
+  it('a person-approved retry snapshots the new occupant and delivers to it', async () => {
+    refusal = { ok: false, reason: 'approval_pending', detail: 'approval' };
+    await send();
+    useStore.setState({ workspaces: [target('pty-new')] });
+    refusal = null;
+    expect(await send()).toEqual({ ok: true, delivered: false, held: 'occupant-changed' });
+    expect(await send({ resnapshot: true })).toEqual({ ok: true, delivered: true, ptyId: 'pty-new' });
+    expect(written).toEqual(['pty-new']);
+    expect(useStore.getState().getTask(RT)!.metadata.to.ptyId).toBe('pty-new');
   });
 
   it('refuses a sender that is not the link remote workspace, and an id without rt- shape', async () => {
@@ -168,5 +179,70 @@ describe('local sends keep their behaviour', () => {
     expect(r.ok).toBe(true);
     expect(r.taskId).not.toBe(RT);
     expect(r.taskId).toMatch(/^task-/);
+  });
+});
+
+// A reply / state the peer sent into a remote task (main's bridge, a2a.remote.notify).
+describe('remote reply and state delivery', () => {
+  /** Our outbound task: we are `from` (the pinned pane), the peer is `to`. */
+  function outboundTask(o: { fromPty?: string; inbox?: unknown[]; state?: string } = {}): Task {
+    return {
+      kind: 'task',
+      id: RT,
+      status: { state: (o.state ?? 'working') as Task['status']['state'], timestamp: '2026-10-07T00:00:01.000Z' },
+      history: [
+        { kind: 'message', messageId: 'm0', role: 'user', parts: [{ kind: 'text', text: 'please' }] },
+        { kind: 'message', messageId: 'r1', role: 'agent', parts: [{ kind: 'text', text: 'here is the answer' }] },
+      ],
+      artifacts: [],
+      metadata: {
+        title: 't',
+        from: { workspaceId: 'ws-target', name: 'Target', paneId: 'pane-pinned', ptyId: o.fromPty ?? PINNED_PTY },
+        to: { workspaceId: `remote:${LINK}`, name: 'pc-b/ws-b/codex' },
+        createdAt: '2026-10-07T00:00:00.000Z',
+        updatedAt: '2026-10-07T00:00:01.000Z',
+        remote: { v: 1, linkId: LINK, hostId: HOST, messageId: 'm0', direction: 'outbound', inbox: o.inbox ?? [{ messageId: 'r1', kind: 'reply', delivered: false }] },
+      },
+    };
+  }
+  const notify = async (task: Task, messageId: string, extra: Record<string, unknown> = {}): Promise<Result> =>
+    (await handleRpcMethod('a2a.remote.notify', { task, messageId, ...extra })) as Result;
+
+  it('writes the reply to the sending pane, as a local reply would', async () => {
+    useStore.getState().hydrateAgentAlive({});
+    useStore.getState().setSurfaceAgent(PINNED_PTY, 'Claude Code', 'complete', 'claude');
+    expect(await notify(outboundTask(), 'r1')).toEqual({ ok: true, delivered: true, ptyId: PINNED_PTY });
+    expect(written).toEqual([PINNED_PTY]);
+    // Not a live agent: the body itself, named as from the remote pane.
+    expect(gate.mock.calls[0][0]).toBe(PINNED_PTY);
+    expect(gate.mock.calls[0][1]).toContain('here is the answer');
+    expect(gate.mock.calls[0][1]).toContain('From: pc-b/ws-b/codex');
+  });
+
+  it('a live agent gets the one-line reply pointer', async () => {
+    expect(await notify(outboundTask(), 'r1')).toMatchObject({ delivered: true });
+    expect(gate.mock.calls[0][1]).toMatch(/reply on A2A task/);
+  });
+
+  it('holds when the sending pane is gone or holds another pty, never a sibling', async () => {
+    useStore.setState({ workspaces: [target(PINNED_PTY, false)] });
+    expect(await notify(outboundTask(), 'r1')).toEqual({ ok: true, delivered: false, held: 'pane-missing' });
+    useStore.setState({ workspaces: [target('pty-new')] });
+    expect(await notify(outboundTask(), 'r1')).toEqual({ ok: true, delivered: false, held: 'occupant-changed' });
+    expect(gate).not.toHaveBeenCalled();
+    expect(await notify(outboundTask(), 'r1', { resnapshot: true })).toEqual({ ok: true, delivered: true, ptyId: 'pty-new' });
+    expect(written).toEqual(['pty-new']);
+  });
+
+  it('a state change writes nothing to the pane and tees the event pointer', async () => {
+    const task = outboundTask({ state: 'completed', inbox: [{ messageId: 's1', kind: 'state', delivered: false }] });
+    expect(await notify(task, 's1')).toEqual({ ok: true, delivered: true });
+    expect(gate).not.toHaveBeenCalled();
+    expect(useStore.getState().getTask(RT)!.status.state).toBe('completed');
+  });
+
+  it('refuses an item the task does not owe', async () => {
+    expect((await notify(outboundTask(), 'nope')).error).toBeDefined();
+    expect((await notify({ ...outboundTask(), id: 'task-1' }, 'r1')).error).toBeDefined();
   });
 });

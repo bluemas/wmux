@@ -1,33 +1,41 @@
-import { isRemoteTaskId, type A2aRemoteTaskMarkerV1 } from '../../shared/a2aRemote';
+import { isRemoteTaskId } from '../../shared/a2aRemote';
 import {
   A2A_REMOTE_INBOUND_EVENT,
+  A2A_REMOTE_NOTIFY_METHOD,
   A2A_REMOTE_RPC,
   type A2aRemoteDeliveryResult,
   type A2aRemoteHeldReason,
+  type A2aRemoteInboxItem,
+  type A2aRemoteTaskState,
 } from '../../shared/a2aRemoteDelivery';
 import { GATED_DELIVERY_DEADLINE_MARGIN_MS, GATED_NEW_TASK_SEND_MAIN_TIMEOUT_MS } from '../../shared/freshContext';
-import type { Task } from '../../shared/types';
+import { TERMINAL_STATES, type Task } from '../../shared/types';
 
 /**
- * Cross-host A2A, receiving side in main: hand every inbound remote task the
- * daemon holds (undelivered) to the renderer for the gated delivery into its
- * linked pane, then record the outcome in the daemon ledger.
+ * Cross-host A2A, receiving side in main: hand the remote work the daemon
+ * holds to the renderer, then record the outcome in the daemon ledger. Two
+ * kinds of work:
+ *   - an inbound remote task, not yet delivered: the gated new-task delivery
+ *     into its linked pane;
+ *   - a reply or state change the peer sent into a remote task (an "inbox
+ *     item"): a reply is written to our local pane like a local reply, a
+ *     state change is announced on the event bus. Items of an inbound task
+ *     wait until the task itself was delivered.
  *
  * Triggers: the daemon's `a2a.remote.inbound` broadcast, (re)connection to the
- * daemon, and a periodic backstop — so a lost broadcast only delays a task by
- * one backstop period. Each trigger PULLS `listRemotePending`; the broadcast
- * carries no payload this code trusts.
+ * daemon, and a periodic backstop — so a lost broadcast only delays work by
+ * one backstop period. Each trigger PULLS `listRemotePending`, which carries no
+ * held work: a hold waits for a person (`retryHeld`) or the daemon's hold TTL.
  *
- * At most one delivery per task is in flight, a task the renderer delivered is
- * marked before it can be handed over again (and the renderer itself answers
- * `duplicate` for a task it already delivered), and a task held as
- * `occupant-changed` is never retried automatically: the pane now holds a
- * different agent than the one the task was aimed at.
+ * Exactly once: one delivery per task / item in flight, a delivered mark is
+ * recorded before the work can be handed over again (a lost mark is retried on
+ * its own, never by re-delivering), and the renderer answers `duplicate` for a
+ * task it already delivered.
  *
  * This is a main-internal call straight to the renderer, NOT through the pipe
- * router: no operator origin is stamped, so the renderer's approval gate and
- * quiet hold apply. LanLink's RemoteInboxBridge is deliberately not reused —
- * it avoids the A2A path on purpose.
+ * router: no operator origin is stamped, so the renderer's approval gate
+ * applies. LanLink's RemoteInboxBridge is deliberately not reused — it avoids
+ * the A2A path on purpose.
  */
 
 export const REMOTE_BRIDGE_BACKSTOP_MS = 5_000;
@@ -47,14 +55,30 @@ export interface RemoteA2aBridgeDeps {
   log?: (level: 'info' | 'warn', msg: string) => void;
 }
 
-type Mark = { delivered: true } | { held: A2aRemoteHeldReason };
+type Mark =
+  | { delivered: true; ptyId?: string; note?: 'pasted-not-submitted' }
+  | { held: A2aRemoteHeldReason };
+
+/** One unit of work: the task itself, or one inbox item of it. */
+interface Work {
+  key: string;
+  task: Task;
+  item?: A2aRemoteInboxItem;
+}
+
+export interface RetryHeldResult {
+  ok: boolean;
+  /** One entry per held unit tried: delivered, still held (reason), or not written. */
+  results: Array<{ messageId?: string; outcome: 'delivered' | A2aRemoteHeldReason | 'not-delivered' }>;
+  error?: string;
+}
 
 export class RemoteA2aBridge {
   private readonly deps: RemoteA2aBridgeDeps;
   private readonly now: () => number;
   private readonly inFlight = new Set<string>();
   /** A mark the daemon did not take yet: retried before anything else, never re-delivered. */
-  private readonly pendingMarks = new Map<string, Mark>();
+  private readonly pendingMarks = new Map<string, { taskId: string; messageId?: string; mark: Mark }>();
   private readonly retry = new Map<string, { at: number; delayMs: number }>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private unsubscribe: (() => void) | null = null;
@@ -104,7 +128,42 @@ export class RemoteA2aBridge {
     return this.running;
   }
 
-  /** Test/diagnostic view: ids with a delivery in flight. */
+  /**
+   * A person approved delivering a HELD task to its pane as the pane is NOW:
+   * the pty snapshot is retaken from the pane's current occupant and every
+   * held unit of the task is handed over again (the task first). Call only on
+   * that explicit approval — never automatically.
+   */
+  async retryHeld(taskId: string): Promise<RetryHeldResult> {
+    let res: unknown;
+    try {
+      res = await this.deps.daemonRpc(A2A_REMOTE_RPC.held, {});
+    } catch (err) {
+      return { ok: false, results: [], error: err instanceof Error ? err.message : String(err) };
+    }
+    const task = (isRecord(res) && Array.isArray(res.tasks) ? (res.tasks as Task[]) : []).find((t) => t?.id === taskId);
+    const marker = task?.metadata?.remote as A2aRemoteTaskState | undefined;
+    if (!task || !marker) return { ok: false, results: [], error: 'not-held' };
+    const units: Work[] = [];
+    if (marker.held) units.push({ key: task.id, task });
+    for (const item of marker.inbox ?? []) if (item.held) units.push({ key: itemKey(task.id, item.messageId), task, item });
+    const results: RetryHeldResult['results'] = [];
+    for (const unit of units) {
+      if (this.inFlight.has(unit.key)) continue;
+      this.inFlight.add(unit.key);
+      try {
+        // eslint-disable-next-line no-await-in-loop -- the task lands before its replies
+        const outcome = await this.deliver(unit, true);
+        results.push({ ...(unit.item ? { messageId: unit.item.messageId } : {}), outcome });
+        if (!unit.item && outcome !== 'delivered') break; // its replies wait for the task
+      } finally {
+        this.inFlight.delete(unit.key);
+      }
+    }
+    return { ok: true, results };
+  }
+
+  /** Test/diagnostic view: keys with a delivery in flight. */
   get inFlightIds(): string[] {
     return [...this.inFlight];
   }
@@ -116,95 +175,130 @@ export class RemoteA2aBridge {
     } catch {
       return; // daemon down: the next trigger retries
     }
-    const tasks = isRecord(res) && Array.isArray(res.tasks) ? (res.tasks as Task[]) : [];
-    // Forget state for tasks the daemon no longer lists (delivered, ended).
-    const listed = new Set(tasks.map((t) => t?.id));
-    for (const id of this.retry.keys()) if (!listed.has(id)) this.retry.delete(id);
-    for (const id of this.pendingMarks.keys()) if (!listed.has(id)) this.pendingMarks.delete(id);
-    for (const task of tasks) {
-      if (!task || typeof task.id !== 'string' || !isRemoteTaskId(task.id)) continue;
-      if (this.inFlight.has(task.id)) continue;
-      const pendingMark = this.pendingMarks.get(task.id);
+    const tasks = (isRecord(res) && Array.isArray(res.tasks) ? (res.tasks as Task[]) : [])
+      .filter((t) => t && typeof t.id === 'string' && isRemoteTaskId(t.id));
+    const work = tasks.flatMap(workOf);
+    // Forget state for work the daemon no longer lists (delivered, held, ended).
+    const listed = new Set(work.map((w) => w.key));
+    for (const key of this.retry.keys()) if (!listed.has(key)) this.retry.delete(key);
+    for (const key of this.pendingMarks.keys()) if (!listed.has(key)) this.pendingMarks.delete(key);
+    for (const unit of work) {
+      if (this.inFlight.has(unit.key)) continue;
+      const pendingMark = this.pendingMarks.get(unit.key);
       if (pendingMark) {
-        void this.mark(task.id, pendingMark);
+        void this.mark(unit.key, pendingMark);
         continue;
       }
-      const marker = task.metadata?.remote as A2aRemoteTaskMarkerV1 | undefined;
-      if (!marker || marker.direction !== 'inbound' || marker.delivered === true) continue;
-      if (marker.held === 'occupant-changed') continue;
-      const wait = this.retry.get(task.id);
+      const wait = this.retry.get(unit.key);
       if (wait && wait.at > this.now()) continue;
-      this.inFlight.add(task.id);
-      void this.deliver(task, marker).finally(() => this.inFlight.delete(task.id));
+      this.inFlight.add(unit.key);
+      void this.deliver(unit, false).finally(() => this.inFlight.delete(unit.key));
     }
   }
 
-  private async deliver(task: Task, marker: A2aRemoteTaskMarkerV1): Promise<void> {
-    const first = task.history[0]?.parts.find((p) => p.kind === 'text');
-    const message = first && first.kind === 'text' ? first.text : '';
+  /** Hand one unit to the renderer and record the outcome. */
+  private async deliver(unit: Work, resnapshot: boolean): Promise<RetryHeldResult['results'][number]['outcome']> {
+    const { task, item } = unit;
+    const marker = task.metadata.remote as A2aRemoteTaskState;
     let res: unknown;
     try {
-      res = await this.deps.sendToRenderer(
-        'a2a.task.send',
-        {
-          workspaceId: task.metadata.to.workspaceId,
-          to: task.metadata.to.workspaceId,
-          ...(task.metadata.to.paneId ? { paneId: task.metadata.to.paneId } : {}),
-          title: task.metadata.title,
-          message,
-          presetTaskId: task.id,
-          remoteFrom: { workspaceId: task.metadata.from.workspaceId, name: task.metadata.from.name },
-          remoteMarker: marker,
-          gatedDelivery: true,
-          execute: false,
-          // Stamped here because this call skips the router, which stamps it
-          // for every other gated new task: nothing is written after it.
-          deliveryDeadlineAt: this.now() + GATED_NEW_TASK_SEND_MAIN_TIMEOUT_MS - GATED_DELIVERY_DEADLINE_MARGIN_MS,
-        },
-        { timeoutMs: GATED_NEW_TASK_SEND_MAIN_TIMEOUT_MS },
-      );
+      res = item
+        ? await this.deps.sendToRenderer(A2A_REMOTE_NOTIFY_METHOD, { task, messageId: item.messageId, ...(resnapshot ? { resnapshot: true } : {}) })
+        : await this.deps.sendToRenderer('a2a.task.send', this.taskParams(task, marker, resnapshot), { timeoutMs: GATED_NEW_TASK_SEND_MAIN_TIMEOUT_MS });
     } catch (err) {
-      this.backoff(task.id);
-      this.deps.log?.('warn', `[a2a-remote] delivery of ${task.id} failed: ${err instanceof Error ? err.message : String(err)}`);
-      return;
+      this.backoff(unit.key);
+      this.deps.log?.('warn', `[a2a-remote] delivery of ${unit.key} failed: ${err instanceof Error ? err.message : String(err)}`);
+      return 'not-delivered';
     }
     const result = res as A2aRemoteDeliveryResult;
+    const ref = { taskId: task.id, ...(item ? { messageId: item.messageId } : {}) };
     if (isRecord(result) && result.ok === true && result.delivered === true) {
-      this.retry.delete(task.id);
-      await this.mark(task.id, { delivered: true });
-      return;
+      this.retry.delete(unit.key);
+      await this.mark(unit.key, {
+        ...ref,
+        mark: { delivered: true, ...(result.ptyId ? { ptyId: result.ptyId } : {}), ...(result.note ? { note: result.note } : {}) },
+      });
+      return 'delivered';
     }
-    this.backoff(task.id);
+    this.backoff(unit.key);
     if (isRecord(result) && result.ok === true && result.delivered === false && result.held) {
-      if (marker.held !== result.held) await this.mark(task.id, { held: result.held });
-      return;
+      const current = item ? item.held : marker.held;
+      if (current !== result.held) await this.mark(unit.key, { ...ref, mark: { held: result.held } });
+      return result.held;
     }
     if (isRecord(result) && 'error' in result && typeof result.error === 'string') {
-      this.deps.log?.('warn', `[a2a-remote] renderer refused ${task.id}: ${result.error}`);
+      this.deps.log?.('warn', `[a2a-remote] renderer refused ${unit.key}: ${result.error}`);
     }
+    return 'not-delivered';
   }
 
-  private async mark(taskId: string, mark: Mark): Promise<void> {
-    this.pendingMarks.set(taskId, mark);
+  private taskParams(task: Task, marker: A2aRemoteTaskState, resnapshot: boolean): Record<string, unknown> {
+    const first = task.history[0]?.parts.find((p) => p.kind === 'text');
+    return {
+      workspaceId: task.metadata.to.workspaceId,
+      to: task.metadata.to.workspaceId,
+      ...(task.metadata.to.paneId ? { paneId: task.metadata.to.paneId } : {}),
+      title: task.metadata.title,
+      message: first && first.kind === 'text' ? first.text : '',
+      presetTaskId: task.id,
+      remoteFrom: { workspaceId: task.metadata.from.workspaceId, name: task.metadata.from.name },
+      // The contract marker only: local bookkeeping stays in the daemon.
+      remoteMarker: { v: marker.v, linkId: marker.linkId, hostId: marker.hostId, messageId: marker.messageId, direction: marker.direction, delivered: false },
+      gatedDelivery: true,
+      execute: false,
+      ...(resnapshot ? { resnapshot: true } : {}),
+      // Stamped here because this call skips the router, which stamps it
+      // for every other gated new task: nothing is written after it.
+      deliveryDeadlineAt: this.now() + GATED_NEW_TASK_SEND_MAIN_TIMEOUT_MS - GATED_DELIVERY_DEADLINE_MARGIN_MS,
+    };
+  }
+
+  private async mark(key: string, entry: { taskId: string; messageId?: string; mark: Mark }): Promise<void> {
+    this.pendingMarks.set(key, entry);
     try {
-      const res = await this.deps.daemonRpc(A2A_REMOTE_RPC.mark, { taskId, ...mark });
+      const res = await this.deps.daemonRpc(A2A_REMOTE_RPC.mark, {
+        taskId: entry.taskId,
+        ...(entry.messageId ? { messageId: entry.messageId } : {}),
+        ...entry.mark,
+      });
       if (isRecord(res) && res.ok === true) {
-        this.pendingMarks.delete(taskId);
-        if ('delivered' in mark) this.retry.delete(taskId);
+        this.pendingMarks.delete(key);
+        if ('delivered' in entry.mark) this.retry.delete(key);
         return;
       }
       // A refusal (e.g. the task ended meanwhile) will not change on retry.
-      if (isRecord(res) && typeof res.error === 'string') this.pendingMarks.delete(taskId);
+      if (isRecord(res) && typeof res.error === 'string') this.pendingMarks.delete(key);
     } catch {
       // daemon unreachable: kept in pendingMarks, retried on the next pull
     }
   }
 
-  private backoff(taskId: string): void {
-    const prev = this.retry.get(taskId);
+  private backoff(key: string): void {
+    const prev = this.retry.get(key);
     const delayMs = prev ? Math.min(prev.delayMs * 2, REMOTE_BRIDGE_RETRY_MAX_MS) : REMOTE_BRIDGE_RETRY_MIN_MS;
-    this.retry.set(taskId, { at: this.now() + delayMs, delayMs });
+    this.retry.set(key, { at: this.now() + delayMs, delayMs });
   }
+}
+
+/** The deliverable, unheld units of one listed task, the task itself first. */
+function workOf(task: Task): Work[] {
+  const marker = task.metadata?.remote as A2aRemoteTaskState | undefined;
+  if (!marker || marker.v !== 1) return [];
+  const ended = (TERMINAL_STATES as readonly string[]).includes(task.status.state);
+  const out: Work[] = [];
+  const taskOwed = marker.direction === 'inbound' && marker.delivered !== true;
+  if (taskOwed && !marker.held && !ended) out.push({ key: task.id, task });
+  for (const item of marker.inbox ?? []) {
+    if (item.delivered === true || item.held) continue;
+    // A reply into an inbound task waits until the task itself is in the pane.
+    if (item.kind === 'reply' && taskOwed) continue;
+    out.push({ key: itemKey(task.id, item.messageId), task, item });
+  }
+  return out;
+}
+
+function itemKey(taskId: string, messageId: string): string {
+  return `${taskId}#${messageId}`;
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {

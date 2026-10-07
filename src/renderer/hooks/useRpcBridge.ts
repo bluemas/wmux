@@ -58,7 +58,7 @@ import { paneAddressOfPty, paneHasOtherOpenA2aTask } from './a2aFreshContext';
 import { publishA2aTask } from '../events/publisher';
 import { isReceiverPaneGone } from '../../shared/a2aOrphanedTask';
 import { isRemoteTaskId, type A2aRemoteTaskMarkerV1 } from '../../shared/a2aRemote';
-import { isRemoteWorkspaceId, remoteWorkspaceId, type A2aRemoteDeliveryResult, type A2aRemoteHeldReason } from '../../shared/a2aRemoteDelivery';
+import { A2A_REMOTE_NOTIFY_METHOD, isRemoteWorkspaceId, localSideOf, remoteWorkspaceId, type A2aRemoteDeliveryResult, type A2aRemoteHeldReason, type A2aRemoteTaskState } from '../../shared/a2aRemoteDelivery';
 import { resolvePaneAddress, activePaneTerminalPty, resolveUnaddressedDelivery, paneHasDetectedAgent, describeAmbiguousDelivery, wsMetadataMayStandIn, NO_AGENT_PANE_HINT, decideSameWsSend, decideReplyDelivery, REPLY_SUPPRESS_HINTS, submitReceiptFields, countRoundTrips, maxSideMessages, REPLY_ROUND_CAP, isTerminalPtyInLeaves, resolveSelfPaneIdentity, resolveSenderPaneAddress, resolvePaneRole, findLeafPanes, detectedAgentTuiSlug, type PaneAddress } from './a2aAddressing';
 import { resolveWorkspaceTarget } from './workspaceTargeting';
 import { destroyRemoteSessions, destroySurfaceRemoteSession, destroyWorkspaceRemoteSessions } from '../utils/remoteSessionTeardown';
@@ -891,10 +891,6 @@ function emitA2aTaskEvent(
 // snapshotted when the task was stored here, HOLDS the task instead.
 // ---------------------------------------------------------------------------
 
-/** Remote tasks whose paste stayed in the composer (Enter withheld, not
- *  cleared): never pasted a second time automatically. */
-const remotePastedUnsubmitted = new Set<string>();
-
 function isInboundRemoteMarker(v: unknown): v is A2aRemoteTaskMarkerV1 {
   if (!v || typeof v !== 'object') return false;
   const m = v as Partial<A2aRemoteTaskMarkerV1>;
@@ -902,20 +898,53 @@ function isInboundRemoteMarker(v: unknown): v is A2aRemoteTaskMarkerV1 {
     && typeof m.hostId === 'string' && typeof m.messageId === 'string' && !!m.messageId;
 }
 
-/** Why the pinned pane cannot take the task now, or null when it still can. */
-function remoteTaskHold(task: Task): A2aRemoteHeldReason | null {
-  const { to } = task.metadata;
-  const ws = useStore.getState().workspaces.find((w) => w.id === to.workspaceId);
-  const leaf = ws ? getWorkspaceLeafPanes(ws).find((l) => l.id === to.paneId) : undefined;
-  if (!leaf) return 'pane-missing';
-  const held = leaf.surfaces.some((s) => s.surfaceType !== 'browser' && !!s.ptyId && s.ptyId === to.ptyId);
-  return held ? null : 'occupant-changed';
+type RemoteAnchor = { workspaceId: string; paneId?: string; ptyId?: string };
+
+/**
+ * Where a remote delivery for `anchor` (our local side of the task) may go:
+ * the pinned pane's snapshotted pty, or — with `resnapshot`, a person having
+ * approved it — whatever terminal the pane holds now. Otherwise the reason it
+ * is held: the pane is gone, or another pty holds it now.
+ */
+function remoteAnchorTarget(
+  anchor: RemoteAnchor,
+  resnapshot: boolean,
+): { ws: Workspace; pty: string; surfaceId: string } | { held: A2aRemoteHeldReason } {
+  const ws = useStore.getState().workspaces.find((w) => w.id === anchor.workspaceId);
+  if (!ws || !anchor.paneId) return { held: 'pane-missing' };
+  const addr = resolvePaneAddress(getWorkspaceLeafPanes(ws), anchor.paneId, '');
+  if ('error' in addr) return { held: 'pane-missing' };
+  if (resnapshot) return { ws, pty: addr.ptyId, surfaceId: addr.surfaceId };
+  const leaf = getWorkspaceLeafPanes(ws).find((l) => l.id === anchor.paneId);
+  const snap = leaf?.surfaces.find((su) => su.surfaceType !== 'browser' && !!su.ptyId && su.ptyId === anchor.ptyId);
+  return snap && anchor.ptyId ? { ws, pty: anchor.ptyId, surfaceId: snap.id } : { held: 'occupant-changed' };
+}
+
+/**
+ * One gated write of a remote delivery to `pty`, with the outcome in the
+ * bridge's terms. A paste left in the composer (Enter withheld, not cleared)
+ * counts as delivered: pasting it again would duplicate it.
+ */
+async function writeRemoteDelivery(
+  anchor: RemoteAnchor,
+  target: { ws: Workspace; pty: string },
+  write: () => Promise<A2aPtyWrite>,
+): Promise<A2aRemoteDeliveryResult> {
+  if (!a2aTargetHasAgent(target.ws, target.pty)) return { ok: true, delivered: false, reason: 'no_agent_pane' };
+  const res = await write();
+  if (res.ptyId) return { ok: true, delivered: true, ptyId: res.ptyId };
+  if (res.refused?.pasted && !res.refused.cleared) return { ok: true, delivered: true, ptyId: target.pty, note: 'pasted-not-submitted' };
+  // The pane may have changed while the delivery waited.
+  const after = remoteAnchorTarget({ ...anchor, ptyId: target.pty }, false);
+  if ('held' in after) return { ok: true, delivered: false, held: after.held };
+  return { ok: true, delivered: false, reason: res.refused?.reason ?? 'no_target_pty' };
 }
 
 async function handleRemoteTaskSend(params: RpcParams): Promise<A2aRemoteDeliveryResult> {
   const marker = params.remoteMarker;
   const from = params.remoteFrom as { workspaceId?: unknown; name?: unknown } | undefined;
   const taskId = typeof params.presetTaskId === 'string' ? params.presetTaskId : '';
+  const resnapshot = params.resnapshot === true;
   if (!isInboundRemoteMarker(marker)) return { error: 'a2a.task.send: invalid remote task marker' };
   // An rt- id is accepted only here, next to its marker.
   if (!isRemoteTaskId(taskId)) return { error: 'a2a.task.send: a remote task needs its rt- id' };
@@ -959,17 +988,18 @@ async function handleRemoteTaskSend(params: RpcParams): Promise<A2aRemoteDeliver
     emitA2aTaskEvent(task, 'created');
   }
 
-  if (remotePastedUnsubmitted.has(taskId)) return { ok: true, delivered: false, reason: 'pasted_not_submitted' };
-  const before = remoteTaskHold(task);
-  if (before) return { ok: true, delivered: false, held: before };
-  const pty = task.metadata.to.ptyId as string;
-  const ws = store.workspaces.find((w) => w.id === task.metadata.to.workspaceId) as Workspace;
-  if (!a2aTargetHasAgent(ws, pty)) return { ok: true, delivered: false, reason: 'no_agent_pane' };
-
-  const senderName = task.metadata.from.name;
-  const firstPart = task.history[0]?.parts.find((p) => p.kind === 'text');
+  const target = remoteAnchorTarget(task.metadata.to, resnapshot);
+  if ('held' in target) return { ok: true, delivered: false, held: target.held };
+  if (resnapshot && target.pty !== task.metadata.to.ptyId) {
+    // A person approved the pane's current occupant: it is the snapshot now.
+    store.setRemoteTaskTarget(taskId, target.pty, target.surfaceId);
+  }
+  const t = useStore.getState().getTask(taskId) as Task;
+  const pty = target.pty;
+  const senderName = t.metadata.from.name;
+  const firstPart = t.history[0]?.parts.find((p) => p.kind === 'text');
   const body = firstPart && firstPart.kind === 'text' ? firstPart.text : '';
-  const liveMeta = deliveryLiveMeta(store.surfaceAgent, pty, ws.metadata);
+  const liveMeta = deliveryLiveMeta(store.surfaceAgent, pty, target.ws.metadata);
   // Always the gated delivery: wait for the person to stop typing, re-check
   // the agent before the paste and the Enter, never past main's deadline.
   const gated: NewTaskDelivery = {
@@ -978,18 +1008,52 @@ async function handleRemoteTaskSend(params: RpcParams): Promise<A2aRemoteDeliver
     ...(liveMeta?.agentName ? { expectAgent: liveMeta.agentName } : {}),
     ...(typeof params.deliveryDeadlineAt === 'number' ? { deadlineAt: params.deliveryDeadlineAt } : {}),
   };
-  const write = isLiveTuiAgent(liveMeta)
-    ? await deliverPtyNudge(ws, (p) => buildA2aNudge(taskId, senderName, 'new', a2aFormatOptionsFor(p).multiline ? task.metadata.title : undefined), pty, false, gated)
-    : await deliverPtyNotification(ws, senderName, body, pty, false, gated);
-  if (write.ptyId) {
-    useStore.getState().markRemoteTaskDelivered(taskId);
+  const result = await writeRemoteDelivery({ ...t.metadata.to }, target, () => (isLiveTuiAgent(liveMeta)
+    ? deliverPtyNudge(target.ws, (p) => buildA2aNudge(taskId, senderName, 'new', a2aFormatOptionsFor(p).multiline ? t.metadata.title : undefined), pty, false, gated)
+    : deliverPtyNotification(target.ws, senderName, body, pty, false, gated)));
+  if (result.ok === true && result.delivered) useStore.getState().markRemoteTaskDelivered(taskId);
+  return result;
+}
+
+/**
+ * Cross-host A2A: one reply or state change the peer sent into a remote task
+ * (`task` is the daemon's snapshot, `messageId` names the item). Main's
+ * RemoteA2aBridge only. A reply is written to our local pane the way a local
+ * reply is (a one-line pointer to a live agent, the body otherwise), held under
+ * the same pane rules as a new remote task. A state change follows the local
+ * convention for status updates: no pane write, the event-bus pointer only.
+ */
+async function handleRemoteNotify(params: RpcParams): Promise<A2aRemoteDeliveryResult> {
+  const task = params.task as Task | undefined;
+  const messageId = typeof params.messageId === 'string' ? params.messageId : '';
+  if (!task || typeof task !== 'object' || !isRemoteTaskId(task.id) || !task.metadata) {
+    return { error: `${A2A_REMOTE_NOTIFY_METHOD}: invalid task` };
+  }
+  const marker = task.metadata.remote as A2aRemoteTaskState | undefined;
+  const item = marker?.inbox?.find((i) => i.messageId === messageId);
+  if (!marker || marker.v !== 1 || !item) return { error: `${A2A_REMOTE_NOTIFY_METHOD}: no such item` };
+
+  if (item.kind === 'state') {
+    useStore.getState().applyDaemonTaskUpdate(task);
+    const cached = useStore.getState().getTask(task.id) ?? task;
+    const state = task.status.state;
+    emitA2aTaskEvent(cached, state === 'canceled' ? 'cancelled' : 'updated', state);
     return { ok: true, delivered: true };
   }
-  // The pane may have changed while the delivery waited for quiet.
-  const after = remoteTaskHold(task);
-  if (after) return { ok: true, delivered: false, held: after };
-  if (write.refused?.pasted && !write.refused.cleared) remotePastedUnsubmitted.add(taskId);
-  return { ok: true, delivered: false, reason: write.refused?.reason ?? 'no_target_pty' };
+
+  const side = localSideOf(task);
+  const anchor = task.metadata[side];
+  const target = remoteAnchorTarget(anchor, params.resnapshot === true);
+  if ('held' in target) return { ok: true, delivered: false, held: target.held };
+  const msg = task.history.find((h) => h.messageId === messageId);
+  const part = msg?.parts.find((p) => p.kind === 'text');
+  const text = part && part.kind === 'text' ? part.text : '';
+  if (!text) return { error: `${A2A_REMOTE_NOTIFY_METHOD}: the reply has no text` };
+  const senderName = task.metadata[side === 'from' ? 'to' : 'from'].name;
+  const liveMeta = deliveryLiveMeta(useStore.getState().surfaceAgent, target.pty, target.ws.metadata);
+  return writeRemoteDelivery({ ...anchor, ptyId: target.pty }, target, () => (isLiveTuiAgent(liveMeta)
+    ? deliverPtyNudge(target.ws, buildA2aNudge(task.id, senderName, 'reply'), target.pty, false)
+    : deliverPtyNotification(target.ws, senderName, text, target.pty, false)));
 }
 
 // ---------------------------------------------------------------------------
@@ -2861,6 +2925,8 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
       }),
     };
   }
+
+  if (method === A2A_REMOTE_NOTIFY_METHOD) return handleRemoteNotify(params);
 
   if (method === 'a2a.task.send') {
     if (params.remoteMarker !== undefined || params.remoteFrom !== undefined) return handleRemoteTaskSend(params);

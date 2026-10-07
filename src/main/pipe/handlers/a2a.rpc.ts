@@ -278,7 +278,9 @@ export function registerA2aRpc(
     if (!link.allowOutbound) return { error: `a2a.task.send: the link to "${alias}" does not allow sending from this side` };
     const res = await remote!.sendTask({
       linkId: link.linkId,
-      from: { workspaceId, name: workspaceId, paneId: caller.paneId },
+      // The verified sender pty: a reply from the peer is held if another
+      // agent holds this pane by then.
+      from: { workspaceId, name: workspaceId, paneId: caller.paneId, ptyId: params.senderPtyId as string },
       title: typeof params.title === 'string' ? params.title : '',
       text: message,
     }).catch((err: unknown): RemoteOpResult => ({ ok: false, error: err instanceof Error ? err.message : String(err) }));

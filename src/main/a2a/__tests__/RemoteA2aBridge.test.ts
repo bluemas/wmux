@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { A2aRemoteTaskMarkerV1 } from '../../../shared/a2aRemote';
-import type { A2aRemoteDeliveryResult } from '../../../shared/a2aRemoteDelivery';
+import type { A2aRemoteDeliveryResult, A2aRemoteTaskState } from '../../../shared/a2aRemoteDelivery';
 import type { Task } from '../../../shared/types';
 import { REMOTE_BRIDGE_RETRY_MIN_MS, RemoteA2aBridge } from '../RemoteA2aBridge';
 
@@ -32,9 +32,21 @@ class FakeDaemon {
   tasks = new Map<string, Task>();
   marks: Array<Record<string, unknown>> = [];
   failMarks = 0;
+  private marker(t: Task): A2aRemoteTaskState {
+    return t.metadata.remote as A2aRemoteTaskState;
+  }
   async rpc(method: string, params: Record<string, unknown>): Promise<unknown> {
     if (method === 'a2a.remote.pending') {
-      return { tasks: [...this.tasks.values()].filter((t) => (t.metadata.remote as A2aRemoteTaskMarkerV1).delivered !== true).map((t) => structuredClone(t)) };
+      return {
+        tasks: [...this.tasks.values()].filter((t) => {
+          const m = this.marker(t);
+          const taskWork = m.direction === 'inbound' && m.delivered !== true && !m.held;
+          return taskWork || (m.inbox ?? []).some((i) => i.delivered !== true && !i.held);
+        }).map((t) => structuredClone(t)),
+      };
+    }
+    if (method === 'a2a.remote.held') {
+      return { tasks: [...this.tasks.values()].filter((t) => this.marker(t).held || (this.marker(t).inbox ?? []).some((i) => i.held)).map((t) => structuredClone(t)) };
     }
     if (method === 'a2a.remote.mark') {
       if (this.failMarks > 0) {
@@ -42,11 +54,13 @@ class FakeDaemon {
         throw new Error('pipe closed');
       }
       this.marks.push(params);
-      const marker = this.tasks.get(params.taskId as string)!.metadata.remote as A2aRemoteTaskMarkerV1;
+      const task = this.tasks.get(params.taskId as string)!;
+      const m = this.marker(task);
+      const target = params.messageId ? m.inbox!.find((i) => i.messageId === params.messageId)! : m;
       if (params.delivered === true) {
-        marker.delivered = true;
-        delete marker.held;
-      } else marker.held = params.held as A2aRemoteTaskMarkerV1['held'];
+        target.delivered = true;
+        delete target.held;
+      } else target.held = params.held as A2aRemoteTaskMarkerV1['held'];
       return { ok: true };
     }
     throw new Error(`unexpected ${method}`);
@@ -153,7 +167,7 @@ describe('RemoteA2aBridge', () => {
     expect(daemon.marks).toEqual([{ taskId: id(5), delivered: true }]);
   });
 
-  it('records a hold; pane-missing is retried later, occupant-changed never', async () => {
+  it('records a hold and never retries it on its own; retryHeld re-delivers with a new snapshot', async () => {
     daemon.tasks.set(id(6), remoteTask(6));
     daemon.tasks.set(id(7), remoteTask(7));
     answer = (p) => ({ ok: true, delivered: false, held: p.presetTaskId === id(6) ? 'pane-missing' : 'occupant-changed' });
@@ -163,22 +177,85 @@ describe('RemoteA2aBridge', () => {
       { taskId: id(6), held: 'pane-missing' },
       { taskId: id(7), held: 'occupant-changed' },
     ]);
-    answer = () => ({ ok: true, delivered: true });
-    await vi.advanceTimersByTimeAsync(REMOTE_BRIDGE_RETRY_MIN_MS + 5_000);
-    expect(renderer.mock.calls.map(([, p]) => p.presetTaskId)).toEqual([id(6), id(7), id(6)]);
-    expect(daemon.marks.at(-1)).toEqual({ taskId: id(6), delivered: true });
     await vi.advanceTimersByTimeAsync(10 * 60_000);
-    expect(renderer.mock.calls.filter(([, p]) => p.presetTaskId === id(7))).toHaveLength(1);
+    expect(renderer).toHaveBeenCalledTimes(2);
+
+    answer = () => ({ ok: true, delivered: true, ptyId: 'pty-now' });
+    expect(await bridge.retryHeld(id(7))).toEqual({ ok: true, results: [{ outcome: 'delivered' }] });
+    expect(renderer.mock.calls.at(-1)![1]).toMatchObject({ presetTaskId: id(7), resnapshot: true });
+    expect(daemon.marks.at(-1)).toEqual({ taskId: id(7), delivered: true, ptyId: 'pty-now' });
+    expect(await bridge.retryHeld(id(7))).toMatchObject({ ok: false, error: 'not-held' });
   });
 
-  it('a same-reason hold is not marked twice, and a transient miss backs off', async () => {
+  it('a transient miss backs off', async () => {
     daemon.tasks.set(id(8), remoteTask(8));
-    answer = () => ({ ok: true, delivered: false, held: 'pane-missing' });
+    answer = () => ({ ok: true, delivered: false, reason: 'approval_pending' });
     bridge.start();
     await settle();
     await vi.advanceTimersByTimeAsync(REMOTE_BRIDGE_RETRY_MIN_MS + 5_000);
     expect(renderer).toHaveBeenCalledTimes(2);
-    expect(daemon.marks).toEqual([{ taskId: id(8), held: 'pane-missing' }]);
+    expect(daemon.marks).toEqual([]);
+  });
+
+  it('a paste left in the composer is recorded as delivered with its note', async () => {
+    daemon.tasks.set(id(10), remoteTask(10));
+    answer = () => ({ ok: true, delivered: true, ptyId: 'pty-b', note: 'pasted-not-submitted' });
+    bridge.start();
+    await settle();
+    expect(daemon.marks).toEqual([{ taskId: id(10), delivered: true, ptyId: 'pty-b', note: 'pasted-not-submitted' }]);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(renderer).toHaveBeenCalledTimes(1);
+  });
+
+  it('delivers each peer reply once, after its inbound task, and marks it per message', async () => {
+    const t = remoteTask(11);
+    (t.metadata.remote as A2aRemoteTaskState).inbox = [
+      { messageId: 'r1', kind: 'reply', delivered: false },
+      { messageId: 's1', kind: 'state', delivered: false },
+    ];
+    daemon.tasks.set(t.id, t);
+    let taskDelivered = false;
+    answer = (p) => {
+      if (p.presetTaskId) taskDelivered = true;
+      return { ok: true, delivered: true };
+    };
+    renderer.mockImplementation(async (m: string, p: Record<string, unknown>) => {
+      if (m === 'a2a.remote.notify' && p.messageId === 'r1') expect(taskDelivered).toBe(true);
+      return answer(p);
+    });
+    bridge.start();
+    await settle();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(renderer.mock.calls.map(([m, p]) => [m, p.presetTaskId ?? p.messageId])).toEqual([
+      ['a2a.task.send', id(11)],
+      ['a2a.remote.notify', 's1'],
+      ['a2a.remote.notify', 'r1'],
+    ]);
+    expect(daemon.marks).toEqual([
+      { taskId: id(11), delivered: true },
+      { taskId: id(11), messageId: 's1', delivered: true },
+      { taskId: id(11), messageId: 'r1', delivered: true },
+    ]);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(renderer).toHaveBeenCalledTimes(3);
+  });
+
+  it('a held reply is retried only through retryHeld', async () => {
+    const t = remoteTask(12);
+    const marker = t.metadata.remote as A2aRemoteTaskState;
+    marker.direction = 'outbound';
+    delete marker.delivered;
+    marker.inbox = [{ messageId: 'r1', kind: 'reply', delivered: false }];
+    daemon.tasks.set(t.id, t);
+    answer = () => ({ ok: true, delivered: false, held: 'occupant-changed' });
+    bridge.start();
+    await settle();
+    expect(daemon.marks).toEqual([{ taskId: id(12), messageId: 'r1', held: 'occupant-changed' }]);
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(renderer).toHaveBeenCalledTimes(1);
+    answer = () => ({ ok: true, delivered: true, ptyId: 'pty-x' });
+    expect(await bridge.retryHeld(id(12))).toEqual({ ok: true, results: [{ messageId: 'r1', outcome: 'delivered' }] });
+    expect(renderer.mock.calls.at(-1)).toEqual(['a2a.remote.notify', expect.objectContaining({ messageId: 'r1', resnapshot: true })]);
   });
 
   it('ignores other daemon events and stops cleanly', async () => {

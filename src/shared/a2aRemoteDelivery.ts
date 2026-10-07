@@ -36,6 +36,13 @@ export const A2A_REMOTE_RPC = Object.freeze({
   rejectHeld: 'a2a.remote.rejectHeld',
 } as const);
 
+/**
+ * Renderer method main's RemoteA2aBridge calls for one reply/state item the
+ * peer sent (`{ task, messageId, resnapshot? }` → `A2aRemoteDeliveryResult`).
+ * Never registered on the pipe router: only main calls it.
+ */
+export const A2A_REMOTE_NOTIFY_METHOD = 'a2a.remote.notify';
+
 /** Daemon broadcast when an inbound remote task was written to the ledger. */
 export const A2A_REMOTE_INBOUND_EVENT = 'a2a.remote.inbound';
 

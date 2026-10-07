@@ -82,7 +82,7 @@ describe('a2a.task.send — remote alias', () => {
   it('an exact alias from the linked pane goes to the outbox, not the renderer', async () => {
     const res = await call(setup(), 'a2a.task.send', { workspaceId: 'ws-a', senderPtyId: 'pty-a', to: ALIAS, message: 'run it', title: 'T' });
     expect(res).toMatchObject({ ok: true, taskId: RT, remote: true });
-    expect(remote.sendTask).toHaveBeenCalledWith({ linkId: LINK, from: { workspaceId: 'ws-a', name: 'ws-a', paneId: 'pane-a' }, title: 'T', text: 'run it' });
+    expect(remote.sendTask).toHaveBeenCalledWith({ linkId: LINK, from: { workspaceId: 'ws-a', name: 'ws-a', paneId: 'pane-a', ptyId: 'pty-a' }, title: 'T', text: 'run it' });
     expect(rendererCalls('a2a.task.send')).toEqual([]);
   });
 

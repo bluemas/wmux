@@ -122,6 +122,8 @@ export interface A2aSlice {
   }) => string;
   /** Cross-host A2A: the remote task was written to its pinned pane. */
   markRemoteTaskDelivered: (taskId: string) => void;
+  /** Cross-host A2A: a person approved the pinned pane's current occupant. */
+  setRemoteTaskTarget: (taskId: string, ptyId: string, surfaceId: string) => void;
   addTaskMessage: (taskId: string, message: Message) => void;
   // P2 (S-C2): `callerAddr` is the caller's verified pane. When present AND the
   // task is pinned to a specific receiver pane (`to.paneId`), the status update
@@ -257,6 +259,12 @@ export const createA2aSlice: StateCreator<StoreState, [['zustand/immer', never]]
     });
     return id;
   },
+
+  setRemoteTaskTarget: (taskId, ptyId, surfaceId) => set((state: StoreState) => {
+    const task = state.a2aTasks[taskId];
+    if (!task?.metadata.remote) return;
+    task.metadata.to = { ...task.metadata.to, ptyId, surfaceId };
+  }),
 
   markRemoteTaskDelivered: (taskId) => set((state: StoreState) => {
     const marker = state.a2aTasks[taskId]?.metadata.remote as A2aRemoteTaskMarkerV1 | undefined;
