@@ -9,7 +9,7 @@ import {
   type A2aRemoteTaskMarkerV1,
   type HostId,
 } from '../../shared/a2aRemote';
-import { A2A_REMOTE_INBOUND_EVENT, remoteWorkspaceId, type A2aRemoteInboundEvent } from '../../shared/a2aRemoteDelivery';
+import { A2A_REMOTE_INBOUND_EVENT, remoteWorkspaceId, sanitizeRemoteText, type A2aRemoteInboundEvent } from '../../shared/a2aRemoteDelivery';
 import { isTaskState, type Message } from '../../shared/types';
 import type { A2aTaskService } from '../a2a/A2aTaskService';
 import { remoteTaskId } from './ids';
@@ -51,7 +51,11 @@ export async function acceptInbound(
 ): Promise<A2aRemoteDeliverResponse> {
   const parsed = parseEnvelope(raw);
   if ('error' in parsed) return fail(parsed.error);
-  const env = parsed.envelope;
+  // Peer text is pasted into a terminal later: control characters and escape
+  // sequences go here, before anything is stored (and again before the write).
+  const env: A2aRemoteEnvelope =
+    typeof parsed.envelope.text === 'string' ? { ...parsed.envelope, text: sanitizeRemoteText(parsed.envelope.text) } : parsed.envelope;
+  if ((env.kind === 'task' || env.kind === 'reply') && !env.text) return fail('bad-request');
 
   if (env.kind === 'link') return applyLinkNotice(env, peer.hostId, deps);
 

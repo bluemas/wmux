@@ -219,6 +219,19 @@ describe('remote reply and state delivery', () => {
     expect(gate.mock.calls[0][1]).toContain('From: pc-b/ws-b/codex');
   });
 
+  it('filters peer text again right before the pane write (escapes, OSC 52, paste end, CR)', async () => {
+    useStore.getState().hydrateAgentAlive({});
+    useStore.getState().setSurfaceAgent(PINNED_PTY, 'Claude Code', 'complete', 'claude');
+    const task = outboundTask();
+    task.history[1] = { kind: 'message', messageId: 'r1', role: 'agent', parts: [{ kind: 'text', text: 'ans\x1b]52;c;eA==\x07wer\x1b[201~\rx' }] };
+    task.metadata.to = { ...task.metadata.to, name: 'pc-b\x1b[31m/ws/codex' };
+    expect(await notify(task, 'r1')).toMatchObject({ ok: true, delivered: true });
+    const pasted = gate.mock.calls[0][1] as string;
+    expect(pasted).toContain('From: pc-b/ws/codex');
+    expect(pasted).toMatch(/answer.x/);
+    expect(pasted).not.toMatch(/\x1b|\r|\x07/);
+  });
+
   it('a live agent gets the one-line reply pointer', async () => {
     expect(await notify(outboundTask(), 'r1')).toMatchObject({ delivered: true });
     expect(gate.mock.calls[0][1]).toMatch(/reply on A2A task/);

@@ -117,6 +117,12 @@ export interface A2aRemoteMarkPayload {
   note?: 'pasted-not-submitted';
   /** With `delivered`: the pty written to — the local pane's new occupant snapshot. */
   ptyId?: string;
+  /** true: main is about to paste (recorded BEFORE the write); false: that attempt wrote nothing. */
+  attempted?: boolean;
+  /** Task-level: this state was queued for the peer (it no longer owes it). */
+  stateSync?: TaskState;
+  /** Task-level: this reply of ours was queued for the peer. */
+  sent?: string;
   timestamp: string;
 }
 

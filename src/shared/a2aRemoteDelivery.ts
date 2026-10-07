@@ -9,7 +9,7 @@
 // Pure module: no node:* imports (the renderer imports it).
 
 import type { A2aRemoteTaskMarkerV1, HostId } from './a2aRemote';
-import type { Task } from './types';
+import type { Task, TaskState } from './types';
 
 /**
  * Daemon RPC method names for the delivery layer. Registered in the daemon's
@@ -74,7 +74,38 @@ export function isRemoteWorkspaceId(v: unknown): v is string {
  * three parts and one part can never impersonate two.
  */
 export function remoteAlias(hostName: string, workspaceName: string, paneLabel: string): string {
-  return [hostName, workspaceName, paneLabel].map((p) => p.replace(/\//g, '-').trim() || '?').join('/');
+  return [hostName, workspaceName, paneLabel].map((p) => aliasPart(p)).join('/');
+}
+
+/**
+ * One alias part: printable characters only (letters, marks, digits,
+ * punctuation, symbols, plain spaces), '/' as '-', bounded. A remote name
+ * can never carry a control character or an escape into an agent's prompt.
+ */
+export function aliasPart(raw: string): string {
+  const kept = [...raw].filter((ch) => /[\p{L}\p{M}\p{N}\p{P}\p{S} ]/u.test(ch)).join('');
+  return kept.replace(/\//g, '-').replace(/ {2,}/g, ' ').trim().slice(0, 64) || '?';
+}
+
+/**
+ * Text a peer sent, made safe to paste into a terminal: ESC-introduced
+ * sequences (CSI, OSC — e.g. OSC 52 clipboard writes —, DCS/SOS/PM/APC and
+ * any other ESC pair, including the bracketed-paste end `ESC[201~`) are
+ * removed, CR becomes a newline (no overwritten-line forgery), and every
+ * other C0/C1 control and DEL is dropped. `\n` and `\t` stay. Applied where
+ * the text is received AND again right before a pane write.
+ */
+export function sanitizeRemoteText(raw: string): string {
+  return raw
+    .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\|$)/g, '')
+    .replace(/\x1b[PX^_][\s\S]*?(?:\x1b\\|$)/g, '')
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]?/g, '')
+    .replace(/\x9b[0-?]*[ -/]*[@-~]?/g, '')
+    .replace(/\x9d[\s\S]*?(?:\x07|\x9c|$)/g, '')
+    .replace(/\x1b[\s\S]?/g, '')
+    .replace(/\r\n?/g, '\n')
+    // eslint-disable-next-line no-control-regex -- stripping controls is the point
+    .replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '');
 }
 
 // ─── Daemon RPC payloads ────────────────────────────────────────────────────
@@ -131,6 +162,8 @@ export interface A2aRemoteInboxItem {
   /** When it was first held (the 24 h hold TTL counts from here). */
   heldAt?: string;
   note?: 'pasted-not-submitted';
+  /** main started a paste and has not confirmed it yet. */
+  attempted?: boolean;
 }
 
 /**
@@ -138,6 +171,12 @@ export interface A2aRemoteInboxItem {
  * plus local delivery bookkeeping (never sent over the wire).
  */
 export type A2aRemoteTaskState = A2aRemoteTaskMarkerV1 & {
+  /** Inbound task: main started a paste and has not confirmed it yet. */
+  attempted?: boolean;
+  /** The last task state exchanged with the peer (sent, or applied from it). */
+  stateSync?: TaskState;
+  /** Our own replies on this task already queued for the peer (messageIds). */
+  sent?: string[];
   /** Inbound task: its paste stayed in the composer; counted as delivered. */
   note?: 'pasted-not-submitted';
   /** Inbound task: when it was first held. */

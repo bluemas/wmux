@@ -140,3 +140,16 @@ describe('OutboxStore', () => {
     expect(make().pending(HOST)).toEqual([]);
   });
 });
+
+describe('OutboxStore — the pump reads one record', () => {
+  it('head is the oldest open record, openCount counts the open ones', () => {
+    const s = make();
+    expect(s.head(HOST)).toBeUndefined();
+    s.enqueue(HOST, env('m1'));
+    s.enqueue(HOST, env('m2'));
+    s.enqueue(HOST, env('m3'));
+    s.ack(HOST, { epoch: s.epoch, seq: 1 });
+    expect(s.head(HOST)?.seq).toBe(2);
+    expect(s.openCount(HOST)).toBe(2);
+  });
+});

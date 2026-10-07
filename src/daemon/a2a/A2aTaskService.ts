@@ -196,6 +196,9 @@ export interface QueryFilters {
   updatedSince?: string;
 }
 
+/** Peer state message ids remembered per task (dedupe window). */
+export const REMOTE_STATE_IDS_MAX = 64;
+
 export class A2aTaskService {
   private readonly log: A2aLogLike;
   private readonly origin: { machineId: string; daemonEpoch: number };
@@ -300,7 +303,12 @@ export class A2aTaskService {
         ...(t.evidence ? { evidence: t.evidence } : {}),
       };
       task.metadata.updatedAt = t.timestamp;
-      if (t.remoteMessageId) addInboxItem(task, t.remoteMessageId, 'state');
+      if (t.remoteMessageId) {
+        addInboxItem(task, t.remoteMessageId, 'state');
+        // The peer told us this state: nothing to tell it back.
+        const m = remoteMarkerOf(task);
+        if (m) m.stateSync = t.to;
+      }
       return;
     }
     if (p.kind === 'task.cancel') {
@@ -309,7 +317,11 @@ export class A2aTaskService {
       if (!task) return;
       task.status = { state: 'canceled', timestamp: c.timestamp };
       task.metadata.updatedAt = c.timestamp;
-      if (c.remoteMessageId) addInboxItem(task, c.remoteMessageId, 'state');
+      if (c.remoteMessageId) {
+        addInboxItem(task, c.remoteMessageId, 'state');
+        const m = remoteMarkerOf(task);
+        if (m) m.stateSync = 'canceled';
+      }
       return;
     }
     if (p.kind === 'task.message') {
@@ -331,8 +343,19 @@ export class A2aTaskService {
         ? marker.inbox?.find((i) => i.messageId === r.messageId)
         : marker;
       if (!target) return;
+      if (r.stateSync !== undefined || r.sent !== undefined) {
+        if (r.stateSync !== undefined) marker.stateSync = r.stateSync;
+        if (r.sent !== undefined && !(marker.sent ?? []).includes(r.sent)) (marker.sent ??= []).push(r.sent);
+        return;
+      }
+      if (r.attempted !== undefined) {
+        if (r.attempted) target.attempted = true;
+        else delete target.attempted;
+        return;
+      }
       if (r.delivered === true) {
         target.delivered = true;
+        delete target.attempted;
         delete target.held;
         delete target.heldAt;
         if (r.note) target.note = r.note;
@@ -340,6 +363,7 @@ export class A2aTaskService {
         if (r.ptyId) task.metadata[localSideOf(task)].ptyId = r.ptyId;
       } else if (r.held) {
         target.delivered = false;
+        delete target.attempted;
         if (target.held !== r.held || !target.heldAt) target.heldAt = r.timestamp;
         target.held = r.held;
       }
@@ -685,6 +709,9 @@ export class A2aTaskService {
     held?: A2aRemoteHeldReason;
     note?: 'pasted-not-submitted';
     ptyId?: string;
+    attempted?: boolean;
+    stateSync?: TaskState;
+    sent?: string;
   }): Promise<{ ok: true; task: Task } | OpErr> {
     return this.withTaskLock(input.taskId, async () => {
       const task = this.tasks.get(input.taskId);
@@ -694,22 +721,39 @@ export class A2aTaskService {
       if (input.messageId !== undefined) {
         target = marker.inbox?.find((i) => i.messageId === input.messageId);
         if (!target) return { ok: false, error: `a2a.remote.mark: no inbound item ${input.messageId} on ${input.taskId}` };
-      } else if (marker.direction !== 'inbound') {
+      } else if (marker.direction !== 'inbound' && input.stateSync === undefined && input.sent === undefined) {
         return { ok: false, error: 'a2a.remote.mark: only an inbound remote task has a delivery state' };
       }
-      if (input.delivered !== true && !input.held) return { ok: false, error: 'a2a.remote.mark: nothing to mark' };
+      const bookkeeping = input.stateSync !== undefined || input.sent !== undefined;
+      if (bookkeeping && input.messageId !== undefined) return { ok: false, error: 'a2a.remote.mark: stateSync/sent are task-level' };
+      if (input.delivered !== true && !input.held && input.attempted === undefined && !bookkeeping) {
+        return { ok: false, error: 'a2a.remote.mark: nothing to mark' };
+      }
       const side = task.metadata[localSideOf(task)];
-      const unchanged = input.delivered === true
-        ? target.delivered === true && (!input.note || target.note === input.note) && (!input.ptyId || side.ptyId === input.ptyId)
-        : target.delivered !== true && target.held === input.held;
+      let unchanged: boolean;
+      let body: Partial<A2aRemoteMarkPayload>;
+      if (bookkeeping) {
+        unchanged = (input.stateSync === undefined || marker.stateSync === input.stateSync)
+          && (input.sent === undefined || (marker.sent ?? []).includes(input.sent));
+        body = { ...(input.stateSync !== undefined ? { stateSync: input.stateSync } : {}), ...(input.sent !== undefined ? { sent: input.sent } : {}) };
+      } else if (input.delivered === true) {
+        unchanged = target.delivered === true && (!input.note || target.note === input.note) && (!input.ptyId || side.ptyId === input.ptyId);
+        body = { delivered: true, ...(input.note ? { note: input.note } : {}), ...(input.ptyId ? { ptyId: input.ptyId } : {}) };
+      } else if (input.held) {
+        unchanged = target.delivered !== true && target.held === input.held;
+        body = { held: input.held };
+      } else {
+        // An attempt only matters while the unit is still owed.
+        if (target.delivered === true || target.held) return { ok: true, task };
+        unchanged = (target.attempted === true) === input.attempted;
+        body = { attempted: input.attempted };
+      }
       if (unchanged) return { ok: true, task };
       const payload: A2aRemoteMarkPayload = {
         kind: 'remote.mark',
         taskId: input.taskId,
         ...(input.messageId !== undefined ? { messageId: input.messageId } : {}),
-        ...(input.delivered === true
-          ? { delivered: true, ...(input.note ? { note: input.note } : {}), ...(input.ptyId ? { ptyId: input.ptyId } : {}) }
-          : { held: input.held }),
+        ...body,
         timestamp: this.isoNow(),
       };
       const ws = side.workspaceId;
@@ -748,6 +792,11 @@ export class A2aTaskService {
       if (marker.held || (marker.inbox ?? []).some((i) => !!i.held)) out.push(task);
     }
     return out;
+  }
+
+  /** Every remote task, ended or not (the outbound sync walks these). */
+  listRemote(): Task[] {
+    return [...this.tasks.values()].filter((t) => remoteMarkerOf(t) !== undefined);
   }
 
   /** Remote tasks on `linkId` that have not ended. */
@@ -870,9 +919,10 @@ export class A2aTaskService {
         if (!isSender && task.metadata.to.workspaceId !== remoteWs) {
           return { ok: false, error: 'a2a.remote.state: the peer is not a party to this task' };
         }
+        // Already over: nothing changes, and the id is not kept (a peer
+        // repeating cancels under new ids must not grow memory).
         if ((TERMINAL_STATES as readonly string[]).includes(task.status.state)) {
-          this.recordRemoteState(input.taskId, input.messageId, input.to);
-          return { ok: true, task, duplicate: false };
+          return { ok: true, task, duplicate: true };
         }
         const payload: A2aTaskCancelPayload = { kind: 'task.cancel', taskId: input.taskId, timestamp, remoteMessageId: input.messageId };
         const committed = await this.log.append(
@@ -921,6 +971,8 @@ export class A2aTaskService {
       this.remoteStates.set(taskId, seen);
     }
     seen.set(messageId, to);
+    // Bounded per task: the oldest ids go first (a resend that old is a new state).
+    while (seen.size > REMOTE_STATE_IDS_MAX) seen.delete(seen.keys().next().value as string);
   }
 
   // ── read ───────────────────────────────────────────────────────────

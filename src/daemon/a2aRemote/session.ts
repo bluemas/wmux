@@ -79,7 +79,7 @@ export interface JoinerSessionDeps {
   /** Re-read on every dial: an address or fingerprint update applies to the next one. */
   host: () => A2aRemoteHostRecordV1 | undefined;
   credential: () => PeerCredential | null;
-  outbox: Pick<OutboxStore, 'epoch' | 'pending' | 'markSent' | 'markOutcomeUnknown' | 'refuse' | 'ack'>;
+  outbox: Pick<OutboxStore, 'epoch' | 'head' | 'openCount' | 'markSent' | 'markOutcomeUnknown' | 'refuse' | 'ack'>;
   /** Apply one server -> joiner envelope (`acceptInbound`). */
   accept: (envelope: unknown, peer: { hostId: HostId }) => Promise<A2aRemoteDeliverResponse>;
   /** The server refused a record for good: end what it was about. */
@@ -120,7 +120,7 @@ export class JoinerSession {
   }
 
   current(): A2aRemoteHostStatus {
-    return { ...this.status, name: this.deps.host()?.name ?? this.status.name, pending: this.deps.outbox.pending(this.deps.hostId).length };
+    return { ...this.status, name: this.deps.host()?.name ?? this.status.name, pending: this.deps.outbox.openCount(this.deps.hostId) };
   }
 
   start(): void {
@@ -254,7 +254,7 @@ export class JoinerSession {
     if (!client) return;
     for (;;) {
       if (!this.running) return;
-      const rec = this.deps.outbox.pending(this.deps.hostId)[0];
+      const rec = this.deps.outbox.head(this.deps.hostId);
       if (!rec) {
         this.pumpBackoff = 0;
         this.refreshPending();
@@ -293,12 +293,12 @@ export class JoinerSession {
     }
     const body = isPlainObject(answer.json) ? answer.json : null;
     if (body?.['ok'] === true) {
-      this.tryOutbox(() => this.deps.outbox.ack(hostId, { epoch: this.deps.outbox.epoch, seq: rec.seq }));
-      return 'next';
+      // An ack we could not record here: back off (the server dedupes the resend).
+      return this.tryOutbox(() => this.deps.outbox.ack(hostId, { epoch: this.deps.outbox.epoch, seq: rec.seq })) ? 'next' : 'retry';
     }
     const code = typeof body?.['error'] === 'string' ? (body['error'] as A2aRemoteErrorCode) : null;
     if (code && TERMINAL_REFUSALS.has(code)) {
-      this.tryOutbox(() => this.deps.outbox.refuse(hostId, rec.seq, code));
+      if (!this.tryOutbox(() => this.deps.outbox.refuse(hostId, rec.seq, code))) return 'retry';
       try {
         await this.deps.onRefused(rec, code);
       } catch (err) {
@@ -376,18 +376,21 @@ export class JoinerSession {
   }
 
   private refreshPending(): void {
-    const pending = this.deps.outbox.pending(this.deps.hostId).length;
+    const pending = this.deps.outbox.openCount(this.deps.hostId);
     if (pending !== this.status.pending) {
       this.status = { ...this.status, pending };
       this.deps.onStatus(this.current());
     }
   }
 
-  private tryOutbox(op: () => unknown): void {
+  /** Run one outbox write; false (logged) when it did not land. */
+  private tryOutbox(op: () => unknown): boolean {
     try {
       op();
+      return true;
     } catch (err) {
       this.deps.log('warn', `[a2a-remote] ${this.deps.hostId}: outbox write failed: ${errMsg(err)}`);
+      return false;
     }
   }
 

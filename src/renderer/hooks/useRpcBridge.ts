@@ -58,7 +58,7 @@ import { paneAddressOfPty, paneHasOtherOpenA2aTask } from './a2aFreshContext';
 import { publishA2aTask } from '../events/publisher';
 import { isReceiverPaneGone } from '../../shared/a2aOrphanedTask';
 import { isRemoteTaskId, type A2aRemoteTaskMarkerV1 } from '../../shared/a2aRemote';
-import { A2A_REMOTE_NOTIFY_METHOD, isRemoteWorkspaceId, localSideOf, remoteWorkspaceId, type A2aRemoteDeliveryResult, type A2aRemoteHeldReason, type A2aRemoteTaskState } from '../../shared/a2aRemoteDelivery';
+import { A2A_REMOTE_NOTIFY_METHOD, isRemoteWorkspaceId, localSideOf, remoteWorkspaceId, sanitizeRemoteText, type A2aRemoteDeliveryResult, type A2aRemoteHeldReason, type A2aRemoteTaskState } from '../../shared/a2aRemoteDelivery';
 import { resolvePaneAddress, activePaneTerminalPty, resolveUnaddressedDelivery, paneHasDetectedAgent, describeAmbiguousDelivery, wsMetadataMayStandIn, NO_AGENT_PANE_HINT, decideSameWsSend, decideReplyDelivery, REPLY_SUPPRESS_HINTS, submitReceiptFields, countRoundTrips, maxSideMessages, REPLY_ROUND_CAP, isTerminalPtyInLeaves, resolveSelfPaneIdentity, resolveSenderPaneAddress, resolvePaneRole, findLeafPanes, detectedAgentTuiSlug, type PaneAddress } from './a2aAddressing';
 import { resolveWorkspaceTarget } from './workspaceTargeting';
 import { destroyRemoteSessions, destroySurfaceRemoteSession, destroyWorkspaceRemoteSessions } from '../utils/remoteSessionTeardown';
@@ -962,7 +962,7 @@ async function handleRemoteTaskSend(params: RpcParams): Promise<A2aRemoteDeliver
   } else {
     const rawMessage = typeof params.message === 'string' ? params.message : '';
     let message: string;
-    try { message = validateMessage(rawMessage); } catch (e) {
+    try { message = validateMessage(sanitizeRemoteText(rawMessage)); } catch (e) {
       return { error: `a2a.task.send: ${e instanceof Error ? e.message : 'invalid'}` };
     }
     const toWsId = typeof params.to === 'string' ? params.to : '';
@@ -996,9 +996,10 @@ async function handleRemoteTaskSend(params: RpcParams): Promise<A2aRemoteDeliver
   }
   const t = useStore.getState().getTask(taskId) as Task;
   const pty = target.pty;
-  const senderName = t.metadata.from.name;
+  // Peer text, filtered again right before the pane write (the daemon filtered it on receipt).
+  const senderName = sanitizeRemoteText(t.metadata.from.name);
   const firstPart = t.history[0]?.parts.find((p) => p.kind === 'text');
-  const body = firstPart && firstPart.kind === 'text' ? firstPart.text : '';
+  const body = sanitizeRemoteText(firstPart && firstPart.kind === 'text' ? firstPart.text : '');
   const liveMeta = deliveryLiveMeta(store.surfaceAgent, pty, target.ws.metadata);
   // Always the gated delivery: wait for the person to stop typing, re-check
   // the agent before the paste and the Enter, never past main's deadline.
@@ -1047,9 +1048,9 @@ async function handleRemoteNotify(params: RpcParams): Promise<A2aRemoteDeliveryR
   if ('held' in target) return { ok: true, delivered: false, held: target.held };
   const msg = task.history.find((h) => h.messageId === messageId);
   const part = msg?.parts.find((p) => p.kind === 'text');
-  const text = part && part.kind === 'text' ? part.text : '';
+  const text = sanitizeRemoteText(part && part.kind === 'text' ? part.text : '');
   if (!text) return { error: `${A2A_REMOTE_NOTIFY_METHOD}: the reply has no text` };
-  const senderName = task.metadata[side === 'from' ? 'to' : 'from'].name;
+  const senderName = sanitizeRemoteText(task.metadata[side === 'from' ? 'to' : 'from'].name);
   const liveMeta = deliveryLiveMeta(useStore.getState().surfaceAgent, target.pty, target.ws.metadata);
   return writeRemoteDelivery({ ...anchor, ptyId: target.pty }, target, () => (isLiveTuiAgent(liveMeta)
     ? deliverPtyNudge(target.ws, buildA2aNudge(task.id, senderName, 'reply'), target.pty, false)

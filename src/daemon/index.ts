@@ -92,6 +92,7 @@ import { ExposedPaneCache } from './a2aRemote/exposedPanes';
 import { createA2aRoutes } from './a2aRemote/routes';
 import { registerA2aLinkRpc } from './a2aRemote/linkRpc';
 import { A2aRemoteDelivery } from './a2aRemote/delivery';
+import { isRemoteTaskId } from '../shared/a2aRemote';
 import type { A2aRemoteLinkEvent } from '../shared/rpc';
 import { ChannelService, ChannelStateWriter, ChannelWakeWorker, wakeAgentSlug, wrapChannelMessageEnvelope, wrapChannelCatalogEnvelope, stampChannelCaller, type CallerFieldSpec, type ChannelServiceEventLog } from './channels';
 import { AppendOnlyLog } from './eventlog/AppendOnlyLog';
@@ -5607,7 +5608,7 @@ function registerRpcHandlers(
     // Only the app's main process reads the pane tree; take the list from it
     // alone. Anything else leaves it unknown (no relaxation).
     const livePaneIds = pipeServer.isFirstParty(ctx.clientId) ? normalizeLivePaneIds(p.livePaneIds) : undefined;
-    return a2aTaskService.transition({
+    const moved = await a2aTaskService.transition({
       taskId,
       to: status,
       callerWorkspaceId: workspaceId,
@@ -5629,6 +5630,9 @@ function registerRpcHandlers(
       ...(p.evidence !== undefined ? { evidence: p.evidence } : {}),
       ...(typeof p.idempotencyKey === 'string' ? { idempotencyKey: p.idempotencyKey } : {}),
     });
+    // A cross-host task: the peer hears this state in the same call (ledger first, then outbox).
+    if (moved.ok && isRemoteTaskId(taskId)) await a2aDeliveryRef?.syncTask(taskId);
+    return moved;
   });
 
   pipeServer.onRpc('a2a.task.cancel', async (rawParams) => {
@@ -5637,11 +5641,13 @@ function registerRpcHandlers(
     const taskId = typeof p.taskId === 'string' ? p.taskId : '';
     const workspaceId = typeof p.workspaceId === 'string' ? p.workspaceId : '';
     if (!taskId || !workspaceId) return { ok: false, error: 'a2a.task.cancel: taskId and workspaceId are required' };
-    return a2aTaskService.cancelTask({
+    const canceled = await a2aTaskService.cancelTask({
       taskId,
       callerWorkspaceId: workspaceId,
       ...(typeof p.idempotencyKey === 'string' ? { idempotencyKey: p.idempotencyKey } : {}),
     });
+    if (canceled.ok && isRemoteTaskId(taskId)) await a2aDeliveryRef?.syncTask(taskId);
+    return canceled;
   });
 
   pipeServer.onRpc('a2a.task.reopen', async (rawParams) => {
