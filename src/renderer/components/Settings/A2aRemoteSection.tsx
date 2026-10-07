@@ -21,10 +21,31 @@ import { SettingsSection, SettingRow, SettingNote } from './SettingsLayout';
 type T = (key: string, vars?: Record<string, string | number>) => string;
 
 export type A2aRemoteConfirm = { kind: 'host' | 'peer'; id: string } | null;
-export type A2aRemoteJoinOutcome = { ok: true; name: string } | { ok: false; error: A2aRemoteJoinError } | null;
+export type A2aRemoteJoinOutcome =
+  | { ok: true; name: string }
+  /** `retryAfterSec`: for a rate-limited try, seconds until the other PC accepts another. */
+  | { ok: false; error: A2aRemoteJoinError; retryAfterSec?: number }
+  | null;
+
+export type A2aRemotePlatform = 'darwin' | 'win32' | 'linux';
+
+/** Bytes shown in the fingerprint chip; the full value is in the tooltip and the copy button. */
+export const FINGERPRINT_CHIP_BYTES = 6;
+
+/** The first `bytes` bytes of a `AA:BB:…` fingerprint, cut on a byte boundary, with an ellipsis. */
+export function fingerprintPrefix(fp: string, bytes = FINGERPRINT_CHIP_BYTES): string {
+  const parts = fp.split(':');
+  return parts.length > bytes ? `${parts.slice(0, bytes).join(':')}…` : fp;
+}
 
 export interface A2aRemoteViewProps {
   status: A2aRemoteStatus;
+  /** Picks the firewall hint under the port. */
+  platform: A2aRemotePlatform;
+  fingerprintCopied: boolean;
+  onCopyFingerprint: () => void;
+  /** Seconds some PC stays locked out of pairing after repeated failures; null when none is. */
+  lockedSec: number | null;
   busy: boolean;
   onToggleEnabled: (v: boolean) => void;
   portDraft: string;
@@ -66,7 +87,7 @@ export function formatRemaining(sec: number): string {
 
 export function A2aRemoteView(props: A2aRemoteViewProps) {
   const {
-    status, busy, onToggleEnabled, portDraft, onPortDraft, onPortCommit,
+    status, platform, fingerprintCopied, onCopyFingerprint, lockedSec, busy, onToggleEnabled, portDraft, onPortDraft, onPortCommit,
     invite, inviteAddresses, remainingSec, copied, onCreateInvite, onCopyInvite, onCancelInvite,
     joinInput, onJoinInput, onJoin, joinBusy, joinOutcome,
     hosts, peers, confirming, removed, onAsk, onConfirm, onCancelConfirm, error, t,
@@ -95,7 +116,7 @@ export function A2aRemoteView(props: A2aRemoteViewProps) {
             disabled={busy}
           />
         </SettingRow>
-        <SettingRow label={t('settings.a2aRemotePort')} description={t('settings.a2aRemotePortDesc')}>
+        <SettingRow label={t('settings.a2aRemotePort')} description={t(`settings.a2aRemotePortDesc.${platform}`)}>
           <Input
             type="number"
             aria-label={t('settings.a2aRemotePort')}
@@ -111,9 +132,16 @@ export function A2aRemoteView(props: A2aRemoteViewProps) {
           />
         </SettingRow>
         <SettingRow label={t('settings.a2aRemoteThisPc')} description={status.name}>
-          <span data-testid="a2a-remote-fingerprint" className="ui-code" title={status.fingerprint256 ?? undefined}>
-            {status.fingerprint256 ? status.fingerprint256.slice(0, 16) : '—'}
-          </span>
+          <div className="flex items-center gap-2">
+            <span data-testid="a2a-remote-fingerprint" className="ui-code" title={status.fingerprint256 ?? undefined}>
+              {status.fingerprint256 ? fingerprintPrefix(status.fingerprint256) : '—'}
+            </span>
+            {status.fingerprint256 && (
+              <UiButton variant="secondary" size="md" onClick={onCopyFingerprint} aria-label={t('settings.a2aRemoteFingerprintCopy')}>
+                {fingerprintCopied ? t('settings.a2aRemoteInviteCopied') : t('settings.a2aRemoteInviteCopy')}
+              </UiButton>
+            )}
+          </div>
         </SettingRow>
         {status.enabled && (
           <SettingNote data-testid="a2a-remote-listening" tone={status.listening && !status.lastError ? 'muted' : 'warning'}>
@@ -153,6 +181,11 @@ export function A2aRemoteView(props: A2aRemoteViewProps) {
         {!status.listening && !invite && (
           <SettingNote>{t('settings.a2aRemoteInviteNeedsListener')}</SettingNote>
         )}
+        {lockedSec != null && lockedSec > 0 && (
+          <SettingNote data-testid="a2a-remote-invite-locked" tone="warning">
+            {t('settings.a2aRemoteInviteLocked', { time: formatRemaining(lockedSec) })}
+          </SettingNote>
+        )}
 
         <SettingRow label={t('settings.a2aRemoteJoin')} description={t('settings.a2aRemoteJoinDesc')} layout="stacked">
           <div className="flex flex-wrap items-center gap-2">
@@ -178,6 +211,9 @@ export function A2aRemoteView(props: A2aRemoteViewProps) {
             {joinOutcome.ok
               ? t('settings.a2aRemoteJoinOk', { name: joinOutcome.name })
               : t(`settings.a2aRemoteJoinError.${joinOutcome.error}`)}
+            {!joinOutcome.ok && joinOutcome.retryAfterSec != null && joinOutcome.retryAfterSec > 0 && (
+              <> {t('settings.a2aRemoteJoinRetryIn', { time: formatRemaining(joinOutcome.retryAfterSec) })}</>
+            )}
           </SettingNote>
         )}
         {error && <SettingNote tone="danger">{error}</SettingNote>}
@@ -241,7 +277,11 @@ export function A2aRemoteSection() {
   const [copied, setCopied] = useState(false);
   const [joinInput, setJoinInput] = useState('');
   const [joinBusy, setJoinBusy] = useState(false);
-  const [joinOutcome, setJoinOutcome] = useState<A2aRemoteJoinOutcome>(null);
+  const [joinResult, setJoinResult] = useState<
+    { ok: true; name: string } | { ok: false; error: A2aRemoteJoinError; retryUntil?: number } | null
+  >(null);
+  const [lockedUntil, setLockedUntil] = useState<number | null>(null);
+  const [fingerprintCopied, setFingerprintCopied] = useState(false);
   const [hosts, setHosts] = useState<A2aRemoteHostRecordV1[]>([]);
   const [peers, setPeers] = useState<A2aPeerRecordV1[]>([]);
   const [confirming, setConfirming] = useState<A2aRemoteConfirm>(null);
@@ -273,6 +313,7 @@ export function A2aRemoteSection() {
     if (p.ok && Array.isArray(p.data?.peers)) setPeers(p.data.peers.filter((x) => x.revokedAt === undefined));
     // The invite was redeemed, cancelled or burned on the daemon side.
     if (pair.ok && pair.data?.active === false) { setInvite(null); setDeadline(null); }
+    if (pair.ok) setLockedUntil(typeof pair.data?.lockedUntil === 'number' ? pair.data.lockedUntil : null);
   }, [api, ipcInvoke, applyStatus]);
 
   useEffect(() => {
@@ -286,11 +327,15 @@ export function A2aRemoteSection() {
     return () => { off?.(); clearInterval(poll); };
   }, [refresh]);
 
+  // A 1s tick only while something counts down.
+  const retryUntil = joinResult && !joinResult.ok ? joinResult.retryUntil ?? null : null;
+  const counting = deadline != null || (lockedUntil != null && lockedUntil > now) || (retryUntil != null && retryUntil > now);
   useEffect(() => {
-    if (deadline == null) return;
+    if (!counting) return;
+    setNow(Date.now());
     const tick = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(tick);
-  }, [deadline]);
+  }, [counting]);
 
   const configure = useCallback(async (patch: { enabled?: boolean; port?: number }) => {
     if (!api) return;
@@ -345,18 +390,34 @@ export function A2aRemoteSection() {
 
   const onJoin = useCallback(async () => {
     if (!api || !joinInput.trim()) return;
-    setJoinBusy(true); setJoinOutcome(null);
+    setJoinBusy(true); setJoinResult(null);
     const r = await ipcInvoke(() => api.join(joinInput.trim()));
     setJoinBusy(false);
-    if (!r.ok) { setJoinOutcome({ ok: false, error: 'failed' }); return; }
+    if (!r.ok) { setJoinResult({ ok: false, error: 'failed' }); return; }
     if (r.data.ok) {
-      setJoinOutcome({ ok: true, name: r.data.host.name });
+      setJoinResult({ ok: true, name: r.data.host.name });
       setJoinInput('');
       void refresh();
     } else {
-      setJoinOutcome({ ok: false, error: r.data.error });
+      const after = r.data.retryAfterMs;
+      setJoinResult({
+        ok: false,
+        error: r.data.error,
+        ...(typeof after === 'number' && after > 0 ? { retryUntil: Date.now() + after } : {}),
+      });
     }
   }, [api, ipcInvoke, joinInput, refresh]);
+
+  const onCopyFingerprint = useCallback(async () => {
+    if (!status?.fingerprint256) return;
+    try {
+      await window.clipboardAPI.writeText(status.fingerprint256);
+      setFingerprintCopied(true);
+      setTimeout(() => setFingerprintCopied(false), 2000);
+    } catch {
+      setError(t('settings.a2aRemoteActionFailed'));
+    }
+  }, [status, t]);
 
   const onConfirm = useCallback(async (c: Exclude<A2aRemoteConfirm, null>) => {
     if (!api) return;
@@ -389,9 +450,25 @@ export function A2aRemoteSection() {
     );
   }
 
+  const platform: A2aRemotePlatform =
+    window.electronAPI?.platform === 'darwin' ? 'darwin' : window.electronAPI?.platform === 'linux' ? 'linux' : 'win32';
+  const joinOutcome: A2aRemoteJoinOutcome = !joinResult
+    ? null
+    : joinResult.ok
+      ? joinResult
+      : {
+          ok: false,
+          error: joinResult.error,
+          ...(joinResult.retryUntil != null ? { retryAfterSec: Math.ceil((joinResult.retryUntil - now) / 1000) } : {}),
+        };
+
   return (
     <A2aRemoteView
       status={status}
+      platform={platform}
+      fingerprintCopied={fingerprintCopied}
+      onCopyFingerprint={() => void onCopyFingerprint()}
+      lockedSec={lockedUntil != null ? Math.ceil((lockedUntil - now) / 1000) : null}
       busy={busy}
       onToggleEnabled={(v) => void configure({ enabled: v })}
       portDraft={portDraft}
