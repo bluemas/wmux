@@ -600,7 +600,7 @@ export interface A2aRemoteTaskMarkerV1 {
   /** Inbound only: false until main confirms the gated delivery. */
   delivered?: boolean;
   /** Inbound only: why delivery is held. */
-  held?: 'occupant-changed' | 'pane-missing' | 'link-not-active';
+  held?: 'occupant-changed' | 'pane-missing' | 'link-not-active' | 'brain-delivery-pending';
 }
 
 export const A2A_REMOTE_TASK_ID_PREFIX = 'rt-';

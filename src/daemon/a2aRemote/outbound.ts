@@ -42,15 +42,36 @@ export interface OutboundDeps {
 }
 
 /**
- * `<PC name>/<workspace>/<pane>` for a link's remote pane. The link record
- * stores no remote workspace NAME, so the workspace part is its id until the
- * exposure listing's name is kept on the link (contract follow-up); the pane
- * part is the label, else the pane id.
+ * `<PC name>/<workspace>/<pane>` for a link's remote pane, `<PC name>/Moa`
+ * for a brain end. The workspace part is the remote workspace's name, the
+ * pane part its label; each falls back to its id when the link has no name.
  */
 export function linkAlias(link: A2aLinkRecordV1, hostName: string | undefined): string {
   const pc = hostName || link.remote.hostId.slice(0, 8);
-  if (link.remote.kind === 'brain') return `${pc.replace(/\//g, '-')}/${A2A_BRAIN_ALIAS}`;
-  return remoteAlias(pc, link.remote.workspaceId, link.remote.label || link.remote.paneId || '');
+  if (link.remote.kind === 'brain') return `${pc.replace(/\//g, '-').trim() || '?'}/${A2A_BRAIN_ALIAS}`;
+  return remoteAlias(pc, link.remote.workspaceName || link.remote.workspaceId, link.remote.label || link.remote.paneId || '');
+}
+
+/**
+ * Aliases of every ACTIVE link, unique: when two links would read the same,
+ * the later one (by creation) gets `#2`, the next `#3`, so an agent's exact
+ * alias names exactly one link. Inbound task senders and the send targets
+ * read this one table, so discover and send always agree.
+ */
+export function aliasTable(links: readonly A2aLinkRecordV1[], hostName: (hostId: string) => string | undefined): Map<string, string> {
+  const active = links
+    .filter((l) => l.state === 'active')
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.linkId.localeCompare(b.linkId));
+  const used = new Set<string>();
+  const out = new Map<string, string>();
+  for (const link of active) {
+    const base = linkAlias(link, hostName(link.remote.hostId));
+    let alias = base;
+    for (let n = 2; used.has(alias); n++) alias = `${base}#${n}`;
+    used.add(alias);
+    out.set(link.linkId, alias);
+  }
+  return out;
 }
 
 /** Every ACTIVE link as an addressable target. */

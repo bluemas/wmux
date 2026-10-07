@@ -767,7 +767,7 @@ export class A2aTaskService {
   forceFailRemote(input: {
     taskId: string;
     reason: string;
-    forced: 'remote_held_rejected' | 'remote_link_ended';
+    forced: 'remote_held_rejected' | 'remote_link_ended' | 'remote_refused';
   }): Promise<{ ok: true; task: Task; failed: boolean } | OpErr> {
     return this.withTaskLock(input.taskId, async () => {
       const task = this.tasks.get(input.taskId);

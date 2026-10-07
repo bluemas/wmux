@@ -1107,6 +1107,12 @@ export class DaemonClient extends EventEmitter {
           this.emit('lanlink:nudge', { seq: data?.seq ?? 0 });
           break;
         }
+        case 'a2a.remote.inbound':
+          // Cross-host A2A — a peer's task landed in the ledger, undelivered.
+          // A NUDGE only: RemoteA2aBridge re-pulls a2a.remote.pending (it also
+          // listens on the generic 'event' above); its backstop covers a drop.
+          this.emit('a2a:remoteInbound', { data: event.data });
+          break;
         case 'channel.message':
           // A2A channels (a2a-channels U4) — every successful post on the
           // daemon side is broadcast as `channel.message` with the full

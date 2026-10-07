@@ -820,6 +820,12 @@ export const IPC = {
   A2A_REMOTE_LINKS_REVOKE: 'a2aRemote:links:revoke',
   A2A_REMOTE_LINKS_REFRESH: 'a2aRemote:links:refresh',
   A2A_REMOTE_LINK_EVENT: 'a2aRemote:link-event',
+  // Delivery: per-PC connection state, and remote work held for a person.
+  A2A_REMOTE_HOSTS_STATUS: 'a2aRemote:hosts:status',
+  A2A_REMOTE_HOST_STATUS_EVENT: 'a2aRemote:host-status-event',
+  A2A_REMOTE_HELD_LIST: 'a2aRemote:held:list',
+  A2A_REMOTE_HELD_RETRY: 'a2aRemote:held:retry',
+  A2A_REMOTE_HELD_REJECT: 'a2aRemote:held:reject',
   // Scheduled runs (renderer → main → daemon `automation.*`). Invoke channels
   // resolve even with no daemon (empty lists / `{ ok:false }`). AUTOMATION_PUSH
   // carries daemon events and connect-time snapshots main → renderer;

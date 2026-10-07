@@ -26,7 +26,7 @@ returns `EPERM`. Wire framing: newline-delimited JSON, one object per line.
 
 ## RPC methods
 
-Total: **222** methods (`ALL_RPC_METHODS` in
+Total: **231** methods (`ALL_RPC_METHODS` in
 `src/shared/rpc.ts`). Capability and risk class are read from
 `src/main/mcp/methodCapabilityMap.ts`:
 
@@ -207,6 +207,15 @@ Total: **222** methods (`ALL_RPC_METHODS` in
 | `a2a.remote.links.revoke` | `wmux.internal` |  |
 | `a2a.remote.links.refresh` | `wmux.internal` |  |
 | `a2a.remote.local.paneGone` | `wmux.internal` |  |
+| `a2a.remote.pending` | `wmux.internal` |  |
+| `a2a.remote.mark` | `wmux.internal` |  |
+| `a2a.remote.targets` | `wmux.internal` |  |
+| `a2a.remote.sendTask` | `wmux.internal` |  |
+| `a2a.remote.reply` | `wmux.internal` |  |
+| `a2a.remote.state` | `wmux.internal` |  |
+| `a2a.remote.held` | `wmux.internal` |  |
+| `a2a.remote.rejectHeld` | `wmux.internal` |  |
+| `a2a.remote.hosts.status` | `wmux.internal` |  |
 | `a2a.resolve.identity` | `a2a.read` | `a2a` |
 | `a2a.whoami` | `a2a.read` | `a2a` |
 | `a2a.discover` | `a2a.read` | `a2a` |

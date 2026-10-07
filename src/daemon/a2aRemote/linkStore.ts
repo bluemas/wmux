@@ -131,6 +131,12 @@ export interface LinkStoreOptions {
   scheduleHarden?: (filePath: string) => void;
   /** Test seam for `proposeOut` link ids (must return UUIDs). */
   mintId?: () => string;
+  /**
+   * Called after every state change of an existing link (accept, revoke,
+   * broken, the host cascade) — also when the write failed but the change
+   * stands in memory. The delivery layer ends the link's tasks from here.
+   */
+  onTransition?: (link: A2aLinkRecordV1) => void;
 }
 
 export class LinkStore {
@@ -140,6 +146,7 @@ export class LinkStore {
   private readonly write: (filePath: string, data: unknown) => void;
   private readonly scheduleHarden: (filePath: string) => void;
   private readonly mintId: () => string;
+  private readonly onTransition: (link: A2aLinkRecordV1) => void;
   private readonly links = new Map<string, A2aLinkRecordV1>();
   private writable = true;
 
@@ -150,6 +157,7 @@ export class LinkStore {
     this.write = opts.write ?? ((p, d): void => atomicWriteJSONSync(p, d));
     this.scheduleHarden = opts.scheduleHarden ?? scheduleTokenFileReHarden;
     this.mintId = opts.mintId ?? ((): string => crypto.randomUUID());
+    this.onTransition = opts.onTransition ?? ((): void => undefined);
     this.load();
   }
 
@@ -299,15 +307,18 @@ export class LinkStore {
     this.assertWritable();
     const at = new Date(this.now()).toISOString();
     let ended = 0;
+    const changed: A2aLinkRecordV1[] = [];
     for (const rec of [...this.links.values()]) {
       if (rec.remote.hostId !== hostId || TERMINAL.has(rec.state)) continue;
-      this.links.set(rec.linkId, {
+      const next: A2aLinkRecordV1 = {
         ...rec,
         state: 'revoked',
         version: rec.version + 1,
         endedReason: 'revoked-remote',
         updatedAt: at,
-      });
+      };
+      this.links.set(rec.linkId, next);
+      changed.push(next);
       ended += 1;
     }
     if (ended === 0) return 0;
@@ -315,8 +326,10 @@ export class LinkStore {
       this.persist();
     } catch (err) {
       this.log('error', `[a2a-remote] ${ended} link(s) to host ${hostId} are revoked in memory but could not be persisted`);
+      this.announce(changed);
       throw err;
     }
+    this.announce(changed);
     return ended;
   }
 
@@ -436,10 +449,25 @@ export class LinkStore {
       this.persist();
     } catch (err) {
       if (rollback) this.links.set(rec.linkId, rec);
-      else this.log('error', `[a2a-remote] link ${rec.linkId} is ${next.state} in memory but could not be persisted`);
+      else {
+        this.log('error', `[a2a-remote] link ${rec.linkId} is ${next.state} in memory but could not be persisted`);
+        this.announce([next]);
+      }
       throw err;
     }
+    this.announce([next]);
     return structuredClone(next);
+  }
+
+  /** Tell `onTransition` (a throwing listener never undoes a transition). */
+  private announce(changed: A2aLinkRecordV1[]): void {
+    for (const rec of changed) {
+      try {
+        this.onTransition(structuredClone(rec));
+      } catch (err) {
+        this.log('error', `[a2a-remote] link ${rec.linkId} transition listener failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
   }
 
   private assertWritable(): void {

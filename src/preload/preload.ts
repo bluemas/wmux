@@ -60,6 +60,11 @@ import type {
 } from '../shared/lanlink';
 import type {
   A2aRemoteExposureGetResult,
+  A2aRemoteHeldListResult,
+  A2aRemoteHeldRejectResult,
+  A2aRemoteHeldRetryResult,
+  A2aRemoteHostStatus,
+  A2aRemoteHostsStatusResult,
   A2aRemoteHostsExposedResult,
   A2aRemoteLinkEvent,
   A2aRemoteLinkProposeParams,
@@ -2018,6 +2023,15 @@ document.addEventListener('DOMContentLoaded', () => {
     ipcRenderer.on(IPC.A2A_REMOTE_LINK_EVENT, listener);
     return () => { ipcRenderer.removeListener(IPC.A2A_REMOTE_LINK_EVENT, listener); };
   },
+  hostsStatus: () => ipcRenderer.invoke(IPC.A2A_REMOTE_HOSTS_STATUS) as Promise<A2aRemoteHostsStatusResult>,
+  onHostStatus: (callback: (status: A2aRemoteHostStatus) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: A2aRemoteHostStatus) => callback(payload);
+    ipcRenderer.on(IPC.A2A_REMOTE_HOST_STATUS_EVENT, listener);
+    return () => { ipcRenderer.removeListener(IPC.A2A_REMOTE_HOST_STATUS_EVENT, listener); };
+  },
+  heldList: () => ipcRenderer.invoke(IPC.A2A_REMOTE_HELD_LIST) as Promise<A2aRemoteHeldListResult>,
+  heldRetry: (taskId: string) => ipcRenderer.invoke(IPC.A2A_REMOTE_HELD_RETRY, taskId) as Promise<A2aRemoteHeldRetryResult>,
+  heldReject: (taskId: string) => ipcRenderer.invoke(IPC.A2A_REMOTE_HELD_REJECT, taskId) as Promise<A2aRemoteHeldRejectResult>,
 };
 
 // wmux web — titlebar toggle bridge (renderer → main → daemon control pipe).

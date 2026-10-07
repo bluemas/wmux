@@ -43,7 +43,7 @@ export interface InboundDeps {
   localWorkspaceName?: (workspaceId: string) => string | undefined;
 }
 
-const BROKEN: ReadonlySet<string> = new Set(['pane-closed', 'pane-moved', 'workspace-gone']);
+const BROKEN: ReadonlySet<string> = new Set(['pane-closed', 'pane-moved', 'workspace-gone', 'exposure-revoked']);
 
 export async function acceptInbound(
   raw: unknown,

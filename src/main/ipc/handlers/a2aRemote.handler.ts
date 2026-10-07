@@ -1,10 +1,12 @@
 import { BrowserWindow, ipcMain } from 'electron';
 import { IPC } from '../../../shared/constants';
-import type { A2aRemoteLinkEvent, A2aRemoteLinkProposeParams } from '../../../shared/rpc';
+import { A2A_REMOTE_RPC } from '../../../shared/a2aRemoteDelivery';
+import type { A2aRemoteHostStatus, A2aRemoteLinkEvent, A2aRemoteLinkProposeParams } from '../../../shared/rpc';
 import { wrapHandler } from '../wrapHandler';
 import type { DaemonClient } from '../../DaemonClient';
 import { detectRemote } from '../../github/PrProvider';
 import { A2aExposurePublisher, coercePaneSnapshot } from '../../a2aRemote/exposurePublisher';
+import type { RemoteA2aBridge } from '../../a2a/RemoteA2aBridge';
 
 // Module scope: the handlers are re-registered on every daemon (re)connect,
 // but the last pane snapshot (the gone-pane baseline) must outlive that.
@@ -16,6 +18,12 @@ const publisher = new A2aExposurePublisher({
 });
 
 const LINK_EVENTS: ReadonlySet<string> = new Set(['a2a.remote.link.proposed', 'a2a.remote.link.changed']);
+
+/** main's delivery bridge (set per daemon connection): the only path that may retry a hold. */
+let remoteBridge: RemoteA2aBridge | null = null;
+export function setA2aRemoteBridge(bridge: RemoteA2aBridge | null): void {
+  remoteBridge = bridge;
+}
 
 /**
  * Cross-host A2A — Settings ↔ daemon control-plane IPC. Thin pass-throughs
@@ -70,6 +78,14 @@ export function registerA2aRemoteHandlers(daemonClient: DaemonClient): () => voi
     [IPC.A2A_REMOTE_LINKS_REJECT, (linkId) => daemonClient.a2aRemoteLinkAction('reject', str(linkId))],
     [IPC.A2A_REMOTE_LINKS_REVOKE, (linkId) => daemonClient.a2aRemoteLinkAction('revoke', str(linkId))],
     [IPC.A2A_REMOTE_LINKS_REFRESH, (linkId) => daemonClient.a2aRemoteLinkAction('refresh', str(linkId))],
+    [IPC.A2A_REMOTE_HOSTS_STATUS, () => daemonClient.rpc('a2a.remote.hosts.status', {})],
+    [IPC.A2A_REMOTE_HELD_LIST, () => daemonClient.rpc(A2A_REMOTE_RPC.held, {})],
+    [
+      IPC.A2A_REMOTE_HELD_RETRY,
+      async (taskId) => remoteBridge ? remoteBridge.retryHeld(str(taskId)) : { ok: false, results: [], error: 'unavailable' },
+    ],
+    // A person's reject from the held list.
+    [IPC.A2A_REMOTE_HELD_REJECT, (taskId) => daemonClient.rpc(A2A_REMOTE_RPC.rejectHeld, { taskId: str(taskId), reason: 'rejected-by-person' })],
   ];
   for (const [channel, fn] of handlers) {
     ipcMain.removeHandler(channel);
@@ -77,10 +93,14 @@ export function registerA2aRemoteHandlers(daemonClient: DaemonClient): () => voi
   }
   // Daemon link nudges → every window (the renderer re-reads the link list).
   const onEvent = (event: { type?: unknown; data?: unknown }): void => {
-    if (typeof event.type !== 'string' || !LINK_EVENTS.has(event.type)) return;
-    const payload = event.data as A2aRemoteLinkEvent;
+    if (typeof event.type !== 'string') return;
+    let channel: string;
+    if (LINK_EVENTS.has(event.type)) channel = IPC.A2A_REMOTE_LINK_EVENT;
+    else if (event.type === 'a2a.remote.hosts.status') channel = IPC.A2A_REMOTE_HOST_STATUS_EVENT;
+    else return;
+    const payload = event.data as A2aRemoteLinkEvent | A2aRemoteHostStatus;
     for (const win of BrowserWindow.getAllWindows()) {
-      if (!win.isDestroyed()) win.webContents.send(IPC.A2A_REMOTE_LINK_EVENT, payload);
+      if (!win.isDestroyed()) win.webContents.send(channel, payload);
     }
   };
   daemonClient.on('event', onEvent);

@@ -85,6 +85,29 @@ describe('acceptInbound — task', () => {
     expect(tasks.listRemotePending().map((x) => x.id)).toEqual([id]);
   });
 
+  it('a task to a brain (Moa) end is pending for main to wake Moa, never held; its reply is owed the same way', async () => {
+    const linkId = crypto.randomUUID();
+    links.receiveProposal({
+      linkId,
+      local: { kind: 'brain', workspaceId: 'ws-hq' },
+      remote: { hostId: HOST, kind: 'brain', workspaceId: 'ws-hq-a' },
+      allow: { outbound: true, inbound: true },
+    });
+    links.accept(linkId);
+    const e = env(linkId, {});
+    expect(await acceptInbound(e, peer, deps)).toMatchObject({ ok: true, duplicate: false });
+    const id = remoteTaskId(linkId, e.messageId);
+    expect(tasks.getTask(id)!.metadata.remote).toMatchObject({ delivered: false });
+    expect(tasks.getTask(id)!.metadata.remote).not.toHaveProperty('held');
+    expect(tasks.listRemotePending().map((t) => t.id)).toEqual([id]);
+    expect(broadcast).toHaveBeenCalledWith({ type: 'a2a.remote.inbound', taskId: id });
+    const reply = env(linkId, { kind: 'reply', taskId: id, text: 'more' });
+    expect(await acceptInbound(reply, peer, deps)).toMatchObject({ ok: true, duplicate: false });
+    const inbox = (tasks.getTask(id)!.metadata.remote as { inbox?: Array<{ messageId: string; held?: string }> }).inbox;
+    expect(inbox?.find((i) => i.messageId === reply.messageId)).toMatchObject({ messageId: reply.messageId });
+    expect(inbox?.find((i) => i.messageId === reply.messageId)?.held).toBeUndefined();
+  });
+
   it('the same message again is a duplicate; same id with another body is a conflict', async () => {
     const linkId = activeLink();
     const e = env(linkId, {});
