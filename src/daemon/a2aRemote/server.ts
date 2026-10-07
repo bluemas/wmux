@@ -90,7 +90,7 @@ export interface A2aServerDeps {
   routes?: WebA2aRoutes;
   /** This machine's name. Default `os.hostname()`. */
   hostname?: () => string;
-  /** This machine's external IPv4s, best first. Default `rankedExternalIpv4s()`. */
+  /** The IPv4s another LAN PC should try, best first. Default `inviteIpv4s()`. */
   ipv4s?: () => string[];
   /** Bind address. Default `0.0.0.0` (PoC); tests bind loopback. */
   bindHost?: string;
@@ -104,26 +104,57 @@ export interface A2aServerDeps {
 /** Interface names of virtual adapters, whose addresses another PC usually cannot reach. */
 const VIRTUAL_NIC_RE = /vEthernet|docker|^br-|veth|vmnet|virtualbox|vboxnet|utun|tailscale|wsl|hyper-v/i;
 
+function octets(ip: string): number[] {
+  return ip.split('.').map(Number);
+}
+
 function isRfc1918(ip: string): boolean {
-  const [a, b] = ip.split('.').map(Number);
+  const [a, b] = octets(ip);
   return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+}
+
+/** 100.64.0.0/10: carrier-grade NAT, and the Tailscale tailnet range — not the company LAN. */
+function isCgnat(ip: string): boolean {
+  const [a, b] = octets(ip);
+  return a === 100 && b >= 64 && b <= 127;
+}
+
+export interface RankedIpv4 {
+  address: string;
+  /** A physical adapter's address outside the CGNAT range: worth offering to another LAN PC. */
+  preferred: boolean;
 }
 
 /**
  * External IPv4s, best candidate for another LAN PC first: physical adapters
- * before virtual ones (Hyper-V, WSL, Docker, VPN tunnels…), then RFC1918
- * private addresses before others. Link-local is left out.
+ * before virtual ones (Hyper-V, WSL, Docker, VPN tunnels…) and before the
+ * CGNAT/Tailscale range, then RFC1918 private addresses before others.
+ * Link-local (169.254/16) is left out.
  */
-export function rankedExternalIpv4s(ifaces: NodeJS.Dict<os.NetworkInterfaceInfo[]> = os.networkInterfaces()): string[] {
-  const found: Array<{ address: string; virtual: boolean; priv: boolean; order: number }> = [];
+export function rankedExternalIpv4s(ifaces: NodeJS.Dict<os.NetworkInterfaceInfo[]> = os.networkInterfaces()): RankedIpv4[] {
+  const found: Array<RankedIpv4 & { priv: boolean; order: number }> = [];
+  const seen = new Set<string>();
   for (const [name, list] of Object.entries(ifaces)) {
     for (const nic of list ?? []) {
-      if (nic.family !== 'IPv4' || nic.internal || nic.address.startsWith('169.254.')) continue;
-      found.push({ address: nic.address, virtual: VIRTUAL_NIC_RE.test(name), priv: isRfc1918(nic.address), order: found.length });
+      if (nic.family !== 'IPv4' || nic.internal || nic.address.startsWith('169.254.') || seen.has(nic.address)) continue;
+      seen.add(nic.address);
+      const preferred = !VIRTUAL_NIC_RE.test(name) && !isCgnat(nic.address);
+      found.push({ address: nic.address, preferred, priv: isRfc1918(nic.address), order: found.length });
     }
   }
-  found.sort((x, y) => Number(x.virtual) - Number(y.virtual) || Number(y.priv) - Number(x.priv) || x.order - y.order);
-  return [...new Set(found.map((f) => f.address))];
+  found.sort((x, y) => Number(y.preferred) - Number(x.preferred) || Number(y.priv) - Number(x.priv) || x.order - y.order);
+  return found.map(({ address, preferred }) => ({ address, preferred }));
+}
+
+/**
+ * The addresses an invite offers: the preferred ones only, when there are
+ * any (a virtual adapter's or a tailnet address would only cost the other PC
+ * a timeout); everything ranked otherwise, so a PC whose adapters all look
+ * virtual can still be reached.
+ */
+export function inviteIpv4s(ranked: RankedIpv4[] = rankedExternalIpv4s()): string[] {
+  const preferred = ranked.filter((r) => r.preferred);
+  return (preferred.length > 0 ? preferred : ranked).map((r) => r.address);
 }
 
 export class A2aServer {
@@ -148,7 +179,7 @@ export class A2aServer {
   constructor(deps: A2aServerDeps) {
     this.deps = deps;
     this.hostname = deps.hostname ?? ((): string => os.hostname());
-    this.ipv4s = deps.ipv4s ?? ((): string[] => rankedExternalIpv4s());
+    this.ipv4s = deps.ipv4s ?? ((): string[] => inviteIpv4s());
     this.now = deps.now ?? Date.now;
     this.loadIdentity = deps.loadIdentity ?? loadOrCreateHostIdentity;
     this.pairing = new PairingSlot({ now: this.now });
@@ -215,8 +246,18 @@ export class A2aServer {
     this.pairing.cancel();
   }
 
+  /**
+   * The invite slot plus the per-address lockout: while some address is
+   * locked out, even the right code from it is refused, so the UI must say
+   * so rather than show the attempts left as if they were usable.
+   */
   pairingStatus(): A2aRemotePairStatus {
-    return this.pairing.status();
+    const now = this.now();
+    let lockedUntil: number | null = null;
+    for (const f of this.pairFailures.values()) {
+      if (f.blockedUntil > now && (lockedUntil === null || f.blockedUntil > lockedUntil)) lockedUntil = f.blockedUntil;
+    }
+    return { ...this.pairing.status(), lockedUntil };
   }
 
   dispose(): void {
@@ -481,7 +522,11 @@ export class A2aServer {
     if (protocol !== A2A_REMOTE_PROTOCOL) return refusePair(400, 'protocol');
 
     const source = req.socket.remoteAddress ?? '';
-    if (this.pairBlocked(source)) return refusePair(429, 'forbidden', 'rate-limited');
+    const retryAfterMs = this.pairRetryAfterMs(source);
+    if (retryAfterMs > 0) {
+      res.setHeader('Retry-After', String(Math.ceil(retryAfterMs / 1000)));
+      return sendJson(res, 429, { ok: false, error: 'forbidden', reason: 'rate-limited', retryAfterMs });
+    }
 
     const identity = this.identity;
     if (!identity) return refusePair(503, 'unavailable');
@@ -525,9 +570,10 @@ export class A2aServer {
     sendJson(res, 200, response);
   }
 
-  private pairBlocked(source: string): boolean {
+  /** How long `source` is still locked out of pairing; 0 when it is not. */
+  private pairRetryAfterMs(source: string): number {
     const f = this.pairFailures.get(source);
-    return f !== undefined && this.now() < f.blockedUntil;
+    return f === undefined ? 0 : Math.max(0, f.blockedUntil - this.now());
   }
 
   private notePairFailure(source: string): void {

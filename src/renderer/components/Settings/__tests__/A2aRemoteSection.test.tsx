@@ -6,7 +6,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { A2aRemoteView, formatRemaining, type A2aRemoteViewProps } from '../A2aRemoteSection';
+import { A2aRemoteView, fingerprintPrefix, formatRemaining, type A2aRemoteViewProps } from '../A2aRemoteSection';
 import { en } from '../../../i18n/locales/en';
 import type { A2aRemoteJoinError } from '../../../../shared/rpc';
 
@@ -21,6 +21,7 @@ function props(over: Partial<A2aRemoteViewProps> = {}): A2aRemoteViewProps {
       enabled: true, port: 45660, listening: true, hostId: '11111111-1111-4111-8111-111111111111',
       name: 'DESK-PC', fingerprint256: FP, lastError: null,
     },
+    platform: 'darwin', fingerprintCopied: false, onCopyFingerprint: () => undefined, lockedSec: null,
     busy: false, onToggleEnabled: () => undefined, portDraft: '45660', onPortDraft: () => undefined, onPortCommit: () => undefined,
     invite: null, inviteAddresses: [], remainingSec: null, copied: false,
     onCreateInvite: () => undefined, onCopyInvite: () => undefined, onCancelInvite: () => undefined,
@@ -39,8 +40,10 @@ describe('A2aRemoteView', () => {
   it('shows this PC’s name, the first 16 fingerprint characters and the listening port', () => {
     const html = render(props());
     expect(html).toContain('DESK-PC');
-    // Visible text is the 16-character prefix; the full value is only the hover title.
-    expect(html).toContain(`>${FP.slice(0, 16)}</span>`);
+    // Visible text is cut on a byte boundary with an ellipsis; the full value is the title.
+    expect(html).toContain('>10:11:12:13:14:15…</span>');
+    expect(html).toContain(`title="${FP}"`);
+    expect(html).toContain('settings.a2aRemoteFingerprintCopy');
     expect(html).toContain('settings.a2aRemoteListening(45660)');
   });
 
@@ -131,6 +134,34 @@ describe('A2aRemoteView — addresses and outcomes', () => {
   it('a failed port change shows the error while the old port keeps serving', () => {
     const html = render(props({ status: { ...props().status, lastError: 'EADDRINUSE' } }));
     expect(html).toContain('settings.a2aRemotePortFailed(EADDRINUSE,45660)');
+  });
+});
+
+describe('A2aRemoteView — platform, lockout and retry', () => {
+  it('words the port hint for the platform', () => {
+    expect(render(props({ platform: 'darwin' }))).toContain('settings.a2aRemotePortDesc.darwin');
+    expect(render(props({ platform: 'win32' }))).toContain('settings.a2aRemotePortDesc.win32');
+    for (const p of ['darwin', 'win32', 'linux']) expect(en).toHaveProperty([`settings.a2aRemotePortDesc.${p}`]);
+    expect(en['settings.a2aRemotePortDesc.darwin']).not.toMatch(/Windows/);
+  });
+
+  it('says when a PC is locked out instead of only showing attempts left', () => {
+    expect(render(props())).not.toContain('settings.a2aRemoteInviteLocked');
+    const html = render(props({ invite: 'wmux-a2a://desk:45660/ABCDEFGH#sha256=x', remainingSec: 500, lockedSec: 8 }));
+    expect(html).toContain('settings.a2aRemoteInviteLocked(0:08)');
+  });
+
+  it('a rate-limited join says when to retry', () => {
+    const html = render(props({ joinOutcome: { ok: false, error: 'rate-limited', retryAfterSec: 30 } }));
+    expect(html).toContain('settings.a2aRemoteJoinError.rate-limited');
+    expect(html).toContain('settings.a2aRemoteJoinRetryIn(0:30)');
+  });
+});
+
+describe('fingerprintPrefix', () => {
+  it('cuts on a byte boundary', () => {
+    expect(fingerprintPrefix('03:5C:37:EC:BF:1A:22:33')).toBe('03:5C:37:EC:BF:1A…');
+    expect(fingerprintPrefix('03:5C')).toBe('03:5C');
   });
 });
 

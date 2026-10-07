@@ -6,7 +6,7 @@ import { joinRemoteHost, type JoinDeps } from '../joiner';
 import { A2A_PAIR_TTL_MS } from '../pairing';
 import { PinnedTlsClient } from '../pinnedClient';
 import { forgetHostCascade, registerA2aRemoteRpc } from '../rpc';
-import { PAIR_BACKOFF_MAX_MS, PAIR_FREE_FAILURES } from '../server';
+import { PAIR_BACKOFF_BASE_MS, PAIR_BACKOFF_MAX_MS, PAIR_FREE_FAILURES } from '../server';
 import { disposeAll, freePort, makePc, type Pc } from './a2aServerRig';
 
 afterEach(async () => {
@@ -119,7 +119,12 @@ describe('cross-host pairing, end to end', () => {
     const invite = inviteOf(a);
     const wrong = formatInvite({ ...invite, code: invite.code === 'ZZZZZZZZ' ? 'YYYYYYYY' : 'ZZZZZZZZ' });
     for (let i = 0; i < PAIR_FREE_FAILURES; i++) await joinRemoteHost(wrong, joinerDeps(b));
-    expect(await joinRemoteHost(formatInvite(invite), joinerDeps(b))).toMatchObject({ ok: false, error: 'rate-limited' });
+    expect(await joinRemoteHost(formatInvite(invite), joinerDeps(b))).toMatchObject({
+      ok: false,
+      error: 'rate-limited',
+      retryAfterMs: PAIR_BACKOFF_BASE_MS,
+    });
+    expect(a.server.pairingStatus().lockedUntil).toBe(1_800_000_000_000 + PAIR_BACKOFF_BASE_MS);
   });
 
   it('a new invite re-pairs the same PC and retires the old credential', async () => {

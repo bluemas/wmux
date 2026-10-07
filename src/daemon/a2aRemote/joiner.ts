@@ -44,7 +44,11 @@ export interface JoinDeps {
 const DEFAULT_TIMEOUTS = { connectMs: 5_000, requestMs: 10_000 };
 
 class JoinFailure extends Error {
-  constructor(readonly code: A2aRemoteJoinError, detail: string) {
+  constructor(
+    readonly code: A2aRemoteJoinError,
+    detail: string,
+    readonly retryAfterMs?: number,
+  ) {
     super(detail);
   }
 }
@@ -63,7 +67,14 @@ export async function joinRemoteHost(inviteString: string, deps: JoinDeps): Prom
   try {
     return { ok: true, host: await join(inviteString, deps) };
   } catch (err) {
-    if (err instanceof JoinFailure) return { ok: false, error: err.code, detail: err.message };
+    if (err instanceof JoinFailure) {
+      return {
+        ok: false,
+        error: err.code,
+        detail: err.message,
+        ...(err.retryAfterMs !== undefined ? { retryAfterMs: err.retryAfterMs } : {}),
+      };
+    }
     return { ok: false, error: 'failed', detail: err instanceof Error ? err.message : String(err) };
   }
 }
@@ -223,7 +234,11 @@ function pairRefusal(status: number, json: unknown): JoinFailure {
   const body = isRecord(json) ? json : {};
   const reason = body['reason'];
   const error = body['error'];
-  if (status === 429 || reason === 'rate-limited') return new JoinFailure('rate-limited', 'too many failed attempts; wait and retry');
+  if (status === 429 || reason === 'rate-limited') {
+    const after = body['retryAfterMs'];
+    const retryAfterMs = typeof after === 'number' && Number.isFinite(after) && after > 0 ? Math.ceil(after) : undefined;
+    return new JoinFailure('rate-limited', 'too many failed attempts; wait and retry', retryAfterMs);
+  }
   if (status === 409) return new JoinFailure('already-paired', 'another pairing for this PC finished at the same time');
   if (reason === 'self') return new JoinFailure('self', 'the invite was made on this PC');
   if (reason === 'expired') return new JoinFailure('code-expired', 'the invite expired or was cancelled');

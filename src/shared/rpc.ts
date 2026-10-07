@@ -1348,6 +1348,11 @@ export interface A2aRemotePairStatus {
   active: boolean;
   expiresAt: number | null;
   attemptsLeft: number;
+  /**
+   * Epoch ms until which some address is locked out after repeated failures
+   * (even the right code from it is refused until then); null when none is.
+   */
+  lockedUntil: number | null;
 }
 
 /** Why `a2a.remote.join` failed, worded for the person pasting the invite. */
@@ -1380,7 +1385,13 @@ export type A2aRemoteJoinError =
 /** `a2a.remote.join` */
 export type A2aRemoteJoinResult =
   | { ok: true; host: A2aRemoteHostRecordV1 }
-  | { ok: false; error: A2aRemoteJoinError; detail?: string };
+  | {
+      ok: false;
+      error: A2aRemoteJoinError;
+      detail?: string;
+      /** For `rate-limited`: how long until the other PC accepts another try. */
+      retryAfterMs?: number;
+    };
 
 /** `a2a.remote.hosts.list` — PCs this PC joined. Never carries a credential. */
 export interface A2aRemoteHostsListResult {
