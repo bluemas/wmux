@@ -22,6 +22,14 @@ import { walkToOwningAnchor } from '../../pty/serverSidePidWalk';
 import type { OwningAnchor } from '../../pty/serverSidePidWalk';
 import { recordSentTask, recordTaskState, reopenedState, stateOfTask, workLinkFromSentTask } from '../../workLink/a2aProducer';
 import { noteTrackReply } from '../../deck/trackRecordFeed';
+import { isRemoteTaskId } from '../../../shared/a2aRemote';
+import {
+  remoteWorkspaceId,
+  type A2aRemoteReplyInput,
+  type A2aRemoteSendTaskInput,
+  type A2aRemoteStateInput,
+  type A2aRemoteTarget,
+} from '../../../shared/a2aRemoteDelivery';
 
 type GetWindow = () => BrowserWindow | null;
 
@@ -57,6 +65,10 @@ const INTERNAL_RENDERER_FIELDS = [
   'deliveryGuardKey',
   'presetTaskId',
   'hqHandoffOnly',
+  // Cross-host A2A: only main's RemoteA2aBridge sets these, calling the
+  // renderer directly (never through this router).
+  'remoteFrom',
+  'remoteMarker',
 ] as const;
 
 /**
@@ -200,13 +212,108 @@ function withDeadline<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
  *  scan so a hung Win32_Process query can't sink the legacy fallback response. */
 const RPC_SNAPSHOT_DEADLINE_MS = 8000;
 
+type RemoteOpResult = { ok: true; taskId: string } | { ok: false; error: string };
+
+/**
+ * Cross-host A2A hooks into this handler set. Each is a daemon RPC in the
+ * wiring step (`A2A_REMOTE_RPC`); absent = no remote addressing at all.
+ */
+export interface RemoteA2aRpcDeps {
+  /** Every ACTIVE link as an alias target. */
+  listTargets: () => Promise<A2aRemoteTarget[]>;
+  /** Create the outbound ledger task and queue its envelope. */
+  sendTask: (input: A2aRemoteSendTaskInput) => Promise<RemoteOpResult>;
+  /** Append a reply to a remote task and queue it. */
+  reply: (input: A2aRemoteReplyInput) => Promise<RemoteOpResult>;
+  /** Queue a state the ledger already committed on a remote task. */
+  state: (input: A2aRemoteStateInput) => Promise<RemoteOpResult>;
+}
+
+const REMOTE_QUEUED = { stored: true, notified: false, queued: true, reason: 'queued_for_remote_host' } as const;
+const REMOTE_STATES: ReadonlySet<string> = new Set(['working', 'input-required', 'completed', 'failed', 'canceled']);
+
 export function registerA2aRpc(
   router: RpcRouter,
   getWindow: GetWindow,
   claudeWorker: ClaudeWorker,
-  opts: { snapshot?: SnapshotFn; getDaemonClient?: () => DaemonClient | null } = {},
+  opts: { snapshot?: SnapshotFn; getDaemonClient?: () => DaemonClient | null; remote?: RemoteA2aRpcDeps } = {},
 ): void {
   const getDaemonClient = opts.getDaemonClient;
+  const remote = opts.remote;
+
+  /** Active links whose alias is EXACTLY `to` (no trimming, no partial match). */
+  async function remoteTargetsFor(to: unknown): Promise<A2aRemoteTarget[]> {
+    if (!remote || typeof to !== 'string' || !to.includes('/')) return [];
+    try {
+      return (await remote.listTargets()).filter((t) => t.alias === to);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * A new task addressed to a remote pane's alias. Only the link's own local
+   * pane may send on it, so the caller's pane must be proven; the task is
+   * message-only (no worker is ever spawned for a remote pane).
+   */
+  async function sendRemoteTask(
+    params: Record<string, unknown>,
+    matches: A2aRemoteTarget[],
+    ctx: RpcContext | undefined,
+  ): Promise<unknown> {
+    const alias = params.to as string;
+    if (params.execute === true) return { error: 'a2a.task.send: execute is not available for a remote pane (message only)' };
+    if (ctx?.commanderWorkspace) return { error: 'a2a.task.send: a remote pane is addressed from its linked pane only' };
+    let message: string;
+    try { message = validateMessage(typeof params.message === 'string' ? params.message : ''); } catch (e) {
+      return { error: `a2a.task.send: ${e instanceof Error ? e.message : 'invalid'}` };
+    }
+    const workspaceId = typeof params.workspaceId === 'string' ? params.workspaceId : '';
+    const caller = await resolveCallerPane(getWindow, workspaceId, params.senderPtyId);
+    if (caller.kind !== 'resolved') {
+      return { error: `a2a.task.send: "${alias}" is a remote pane; sending to it needs the caller's verified pane` };
+    }
+    const link = matches.find((t) => t.local.workspaceId === workspaceId && t.local.paneId === caller.paneId);
+    if (!link) return { error: `a2a.task.send: this pane is not linked to "${alias}"` };
+    if (!link.allowOutbound) return { error: `a2a.task.send: the link to "${alias}" does not allow sending from this side` };
+    const res = await remote!.sendTask({
+      linkId: link.linkId,
+      // The verified sender pty: a reply from the peer is held if another
+      // agent holds this pane by then.
+      from: { workspaceId, name: workspaceId, paneId: caller.paneId, ptyId: params.senderPtyId as string },
+      title: typeof params.title === 'string' ? params.title : '',
+      text: message,
+    }).catch((err: unknown): RemoteOpResult => ({ ok: false, error: err instanceof Error ? err.message : String(err) }));
+    if (!res.ok) return { error: `a2a.task.send: remote send refused (${res.error})` };
+    return { ok: true, taskId: res.taskId, remote: true, delivery: REMOTE_QUEUED };
+  }
+
+  /** A reply on a remote task: stored in the ledger and queued for the peer. */
+  async function replyRemote(method: string, taskId: string, params: Record<string, unknown>): Promise<unknown> {
+    let message: string;
+    try { message = validateMessage(typeof params.message === 'string' ? params.message : ''); } catch (e) {
+      return { error: `${method}: ${e instanceof Error ? e.message : 'invalid'}` };
+    }
+    const res = await remote!.reply({
+      taskId,
+      workspaceId: typeof params.workspaceId === 'string' ? params.workspaceId : '',
+      text: message,
+    }).catch((err: unknown): RemoteOpResult => ({ ok: false, error: err instanceof Error ? err.message : String(err) }));
+    if (!res.ok) return { error: `${method}: remote reply refused (${res.error})` };
+    return { ok: true, taskId, remote: true, delivery: REMOTE_QUEUED };
+  }
+
+  /** After the ledger committed a state on a remote task, tell the peer. Best effort. */
+  async function queueRemoteState(taskId: string, state: unknown, evidence: unknown): Promise<void> {
+    if (!remote || !isRemoteTaskId(taskId) || typeof state !== 'string' || !REMOTE_STATES.has(state)) return;
+    const summary = isRecord(evidence) && typeof evidence.summary === 'string' ? evidence.summary : undefined;
+    try {
+      const res = await remote.state({ taskId, state: state as A2aRemoteStateInput['state'], ...(summary ? { summary } : {}) });
+      if (!res.ok) console.warn(`[a2a.rpc] state ${state} of remote task ${taskId} was not queued: ${res.error}`);
+    } catch (err) {
+      console.warn(`[a2a.rpc] state ${state} of remote task ${taskId} was not queued:`, err);
+    }
+  }
   // Server-side process-tree snapshot for handshake identity resolution. Shared
   // across CONCURRENT handshakes (in-flight coalescing) so the multi-agent launch
   // burst triggers ONE Win32_Process spawn, not one per agent. The MCP side
@@ -449,7 +556,41 @@ export function registerA2aRpc(
 
   // A2A protocol — whoami/discover/broadcast/skills는 렌더러 소유 그대로.
   router.register('a2a.whoami', (params) => sendToRenderer(getWindow, 'a2a.whoami', params));
-  router.register('a2a.discover', (params) => sendToRenderer(getWindow, 'a2a.discover', params));
+  router.register('a2a.discover', async (params) => {
+    const res = await sendToRenderer(getWindow, 'a2a.discover', params);
+    if (!remote || !isRecord(res) || !Array.isArray(res.agents)) return res;
+    let targets: A2aRemoteTarget[] = [];
+    try { targets = await remote.listTargets(); } catch { return res; }
+    // A remote pane is addressable only from its linked local pane: list the
+    // links of the caller's workspace (every link when no workspace is named).
+    const ws = typeof params.workspaceId === 'string' && params.workspaceId ? params.workspaceId : '';
+    const entries = targets
+      .filter((t) => !ws || t.local.workspaceId === ws)
+      .map((t) => ({
+        name: t.alias,
+        description: `Remote pane ${t.alias} (linked to local pane ${t.local.paneId}; message only)`,
+        url: remoteWorkspaceId(t.linkId),
+        version: '1.0',
+        capabilities: { stateTransitionHistory: true },
+        skills: [],
+        skillsRegistered: false,
+        live: false,
+        remote: true,
+        panes: [],
+        metadata: {
+          workspaceId: remoteWorkspaceId(t.linkId),
+          status: 'remote',
+          agentName: null,
+          live: false,
+          remote: true,
+          linkId: t.linkId,
+          hostId: t.hostId,
+          localPaneId: t.local.paneId,
+          allowOutbound: t.allowOutbound,
+        },
+      }));
+    return entries.length ? { ...res, agents: [...res.agents, ...entries] } : res;
+  });
   router.register('a2a.broadcast', async (params, ctx) =>
     refuseHandoffMarker('a2a.broadcast', params.message, ctx)
     ?? sendToRenderer(getWindow, 'a2a.broadcast', withOperatorOrigin(params, ctx)));
@@ -550,6 +691,9 @@ export function registerA2aRpc(
     const merged = rendererTasks.map((rt) => {
       const dt = daemonById.get(rt.id);
       if (!dt) return rt;
+      // A remote task's history grows in the daemon (the peer's replies), so
+      // the daemon copy is the whole truth for it.
+      if (isRemoteTaskId(rt.id)) return dt;
       // 데몬 정본이 렌더러 캐시보다 최신이면(렌더러가 daemonCommitted 미적용) status/
       // updatedAt을 데몬 값으로 덮되 렌더러 전용 증분(history·artifacts)은 보존.
       if (updatedAtOf(dt) > updatedAtOf(rt)) {
@@ -640,11 +784,13 @@ export function registerA2aRpc(
         if (cancelWorker) claudeWorker.cancel(cancelWorker);
         // Work link (best-effort): the daemon's committed state is the truth.
         void recordTaskState(params.taskId, stateOfTask(gate.result.task), undefined, gate.result.task);
-        return sendToRenderer(getWindow, 'a2a.task.update', {
+        const applied = await sendToRenderer(getWindow, 'a2a.task.update', {
           ...params,
           daemonCommitted: true,
           committedTask: gate.result.task,
         });
+        if (typeof params.taskId === 'string') await queueRemoteState(params.taskId, params.status, params.evidence);
+        return applied;
       }
       // unavailable → the renderer's own checked writer (fallback). Only an
       // explicit ok from it counts as a committed cancel.
@@ -656,6 +802,10 @@ export function registerA2aRpc(
           { status: { state: params.status, message: params.message, evidence: params.evidence } });
       }
       return res;
+    }
+    // A message on a remote task is a reply for the peer host.
+    if (typeof params.message === 'string' && remote && typeof params.taskId === 'string' && isRemoteTaskId(params.taskId)) {
+      return replyRemote('a2a.task.update', params.taskId, params);
     }
     // Message-only update: may reopen an ended task (daemon first).
     if (typeof params.message === 'string') {
@@ -679,6 +829,16 @@ export function registerA2aRpc(
   router.register('a2a.task.send', async (params, ctx) => {
     const marked = refuseHandoffMarker('a2a.task.send', [params.message, params.title], ctx);
     if (marked) return marked;
+    // Cross-host A2A: a reply on a remote task, or a new task to a remote
+    // pane's exact alias, goes to the peer host instead of a local pane.
+    if (remote && typeof params.taskId === 'string' && isRemoteTaskId(params.taskId)) {
+      if (params.execute === true) return { error: 'a2a.task.send: execute is only supported for new tasks' };
+      return replyRemote('a2a.task.send', params.taskId, params);
+    }
+    if (!params.taskId) {
+      const matches = await remoteTargetsFor(params.to);
+      if (matches.length > 0) return sendRemoteTask(params, matches, ctx);
+    }
     // Forward the VALIDATED commander binding (RpcRouter set it from the
     // per-spawn token; never read from the wire, so any caller-supplied value
     // is dropped first). The renderer's reply-delivery guards need it: an
@@ -697,7 +857,7 @@ export function registerA2aRpc(
       sendParams.deliveryGuardKey = params.deliveryGuardKey;
     }
     // A task id main minted for a new operator send (moaHandoff.ts).
-    if (ctx?.operator === true && typeof params.presetTaskId === 'string' && !params.taskId) {
+    if (ctx?.operator === true && typeof params.presetTaskId === 'string' && !params.taskId && !isRemoteTaskId(params.presetTaskId)) {
       sendParams.presetTaskId = params.presetTaskId;
     }
     // A trusted in-process caller (Git page, fanout, Moa) that created the work
@@ -835,11 +995,13 @@ export function registerA2aRpc(
         committed && isRecord(committed.status) ? committed.status.state : undefined;
       if (committedState === 'canceled') {
         void recordTaskState(taskId, 'canceled');
-        return sendToRenderer(getWindow, 'a2a.task.cancel', {
+        const applied = await sendToRenderer(getWindow, 'a2a.task.cancel', {
           ...params,
           daemonCommitted: true,
           committedTask: gate.result.task,
         });
+        await queueRemoteState(taskId, 'canceled', undefined);
+        return applied;
       }
       return { ok: true, taskId };
     }
