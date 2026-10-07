@@ -3,7 +3,14 @@ import path from 'node:path';
 import { atomicWriteJSONSync } from '../util/atomicWrite';
 import { scheduleTokenFileReHarden } from '../../shared/security';
 import { DEVICE_KDF, DEVICE_SALT_BYTES, DEVICE_SECRET_BYTES, LAST_SEEN_PERSIST_MS, type DeviceKdfParams } from '../web/DeviceStore';
-import { A2A_REMOTE_RECORD_V, isHostId, type A2aPeerRecordV1, type HostId } from '../../shared/a2aRemote';
+import {
+  A2A_REMOTE_RECORD_V,
+  formatPeerCredential,
+  isHostId,
+  parsePeerCredential,
+  type A2aPeerRecordV1,
+  type HostId,
+} from '../../shared/a2aRemote';
 import { promisify } from 'node:util';
 import {
   errMsg,
@@ -101,6 +108,7 @@ export class PeerStore {
   private readonly lastSeenPersistedAt = new Map<string, number>();
   private readonly failures = new Map<string, { windowStart: number; count: number }>();
   private writable = true;
+  private derivations = 0;
 
   constructor(opts: PeerStoreOptions) {
     this.filePath = path.join(opts.dir, PEERS_FILE);
@@ -172,7 +180,10 @@ export class PeerStore {
    *      joiner's reconnect loop force a derivation per retry, and the id is a
    *      128-bit random handle only that joiner ever held.
    *   3. Over the wrong-secret budget → `unknown` without deriving.
-   *   4. Otherwise constant-time verify; a wrong secret is `unknown`, never
+   *   4. A secret outside the contract's shape (`SECRET_RE`, 32-128 base64url
+   *      chars, checked through `parsePeerCredential`) → `unknown` without
+   *      deriving.
+   *   5. Otherwise constant-time verify; a wrong secret is `unknown`, never
    *      revealing which half of the credential was right.
    */
   async resolve(
@@ -183,7 +194,11 @@ export class PeerStore {
     if (!rec) return REJECT_UNKNOWN;
     if (rec.revokedAt !== undefined) return REJECT_REVOKED;
     if (this.overBudget(rec.peerId)) return REJECT_UNKNOWN;
-    if (typeof secret !== 'string' || !(await this.verify(rec, secret))) {
+    if (typeof secret !== 'string' || !parsePeerCredential(formatPeerCredential({ peerId: rec.peerId, secret }))) {
+      this.noteFailure(rec.peerId);
+      return REJECT_UNKNOWN;
+    }
+    if (!(await this.verify(rec, secret))) {
       this.noteFailure(rec.peerId);
       return REJECT_UNKNOWN;
     }
@@ -229,6 +244,11 @@ export class PeerStore {
     return true;
   }
 
+  /** Test/diagnostic view (DeviceStore precedent). Holds no secret material. */
+  stats(): { derivations: number; peers: number } {
+    return { derivations: this.derivations, peers: this.peers.size };
+  }
+
   // --- internals --------------------------------------------------------------
 
   private assertHostFree(hostId: HostId): void {
@@ -258,6 +278,7 @@ export class PeerStore {
     }
     let derived: Buffer;
     try {
+      this.derivations += 1;
       derived = await derive(secretBuf, Buffer.from(rec.salt, 'hex'), rec.kdf);
     } catch (err) {
       this.log('warn', `[a2a-remote] peer ${rec.peerId} hash could not be derived: ${errMsg(err)}`);

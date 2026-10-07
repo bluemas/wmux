@@ -29,9 +29,10 @@ import { errMsg, isIsoString, isPlainObject, loadStore, sanitizeName, storeUnava
  *   - POSIX: `atomicWriteJSONSync`, whose temp file is created 0600 before the
  *     rename; the rotated `.bak` is removed after every successful write.
  * On a failed Windows write both the primary and `.bak` are removed
- * best-effort; if either removal fails the store goes UNAVAILABLE (every
- * later mutation throws) so nothing keeps writing next to a bearer of
- * unknown protection. `get` / `list` never carry the secret; only
+ * best-effort, every host is dropped from memory too (so memory never claims
+ * pairings the disk no longer holds), and the store goes UNAVAILABLE until
+ * restart (every later mutation throws; nothing keeps writing next to a
+ * bearer of unknown protection). `get` / `list` never carry the secret; only
  * `credentialFor` does.
  *
  * Load: the existing file is re-hardened first (`reHardenTokenFileAcl`:
@@ -220,6 +221,8 @@ export class RemoteHostStore {
     try {
       this.persist();
     } catch (err) {
+      // A failed Windows write already emptied memory and disabled the store.
+      if (!this.writable) throw err;
       if (prevRec) this.hosts.set(hostId, prevRec);
       else this.hosts.delete(hostId);
       if (prevSecret !== undefined) this.secrets.set(hostId, prevSecret);
@@ -255,17 +258,21 @@ export class RemoteHostStore {
 
   /**
    * A Windows bearer write failed: whatever is left at the primary or `.bak`
-   * is of unknown protection. Remove both; if that fails, stop writing.
+   * is of unknown protection. Remove both, forget every host in memory to
+   * match, and stop writing until restart.
    */
   private scrubAfterFailedWrite(): void {
     for (const p of [this.filePath, `${this.filePath}.bak`]) {
       try {
         this.remove_(p);
       } catch (err) {
-        this.writable = false;
-        this.log('error', `[a2a-remote] could not remove ${p} after a failed credential write (${errMsg(err)}); store is unavailable`);
+        this.log('error', `[a2a-remote] could not remove ${p} after a failed credential write: ${errMsg(err)}`);
       }
     }
+    this.hosts.clear();
+    this.secrets.clear();
+    this.writable = false;
+    this.log('error', `[a2a-remote] credential write failed; ${REMOTE_HOSTS_FILE} removed, every remote host must be re-paired; store is unavailable until restart`);
   }
 
   private load(): void {

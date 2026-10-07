@@ -145,35 +145,35 @@ describe('RemoteHostStore', () => {
     expect(s.credentialFor(HOST)).toBeNull();
   });
 
-  it('win32: a failed credential write removes the primary and .bak', () => {
+  it('win32: a failed credential write removes primary and .bak, empties memory, and disables the store', () => {
     const file = path.join(dir, REMOTE_HOSTS_FILE);
-    const s = make({ win32: true });
+    const log = vi.fn();
+    const s = make({ win32: true, log });
     s.add(host(), { peerId: PEER, secret: SECRET });
     fs.writeFileSync(`${file}.bak`, 'older generation');
     fail = true;
     expect(() => s.add(host({ hostId: HOST2, peerId: PEER2 }), { peerId: PEER2, secret: SECRET2 })).toThrow('disk full');
     expect(fs.existsSync(file)).toBe(false);
     expect(fs.existsSync(`${file}.bak`)).toBe(false);
-    expect(s.get(HOST2)).toBeUndefined();
-    // Removal worked, so the store stays usable and the next write restores the file.
+    // Memory matches the (now empty) disk: no host survives in memory only.
+    expect(s.list()).toEqual([]);
+    expect(s.credentialFor(HOST)).toBeNull();
     fail = false;
-    s.updateAddresses(HOST, ['desk-pc']);
-    expect(make().credentialFor(HOST)).toEqual({ peerId: PEER, secret: SECRET });
+    expect(() => s.add(host(), { peerId: PEER, secret: SECRET })).toThrow(/unavailable/);
+    expect(log).toHaveBeenCalledWith('error', expect.stringContaining('store is unavailable'));
+    // A restart starts clean from the empty disk.
+    expect(make().list()).toEqual([]);
   });
 
-  it('win32: if the scrub cannot remove a file, the store goes unavailable', () => {
-    const log = vi.fn();
-    const s = make({ win32: true, log, remove: () => { throw new Error('EPERM'); } });
+  it('win32: the same holds when the scrub cannot remove a file', () => {
+    const s = make({ win32: true, remove: () => { throw new Error('EPERM'); } });
     s.add(host(), { peerId: PEER, secret: SECRET });
     fail = true;
-    expect(() => s.add(host({ hostId: HOST2, peerId: PEER2 }), { peerId: PEER2, secret: SECRET2 })).toThrow('disk full');
+    expect(() => s.updateAddresses(HOST, ['other'])).toThrow('disk full');
     fail = false;
-    expect(() => s.add(host({ hostId: HOST2, peerId: PEER2 }), { peerId: PEER2, secret: SECRET2 })).toThrow(/unavailable/);
-    expect(() => s.updateAddresses(HOST, ['x'])).toThrow(/unavailable/);
-    // A removal still takes effect in memory.
-    expect(() => s.remove(HOST)).toThrow(/unavailable/);
     expect(s.credentialFor(HOST)).toBeNull();
-    expect(log).toHaveBeenCalledWith('error', expect.stringContaining('store is unavailable'));
+    expect(() => s.add(host(), { peerId: PEER, secret: SECRET })).toThrow(/unavailable/);
+    expect(() => s.remove(HOST)).not.toThrow();
   });
 
   it('off win32 a failed write leaves the previous file in place', () => {

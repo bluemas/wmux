@@ -75,7 +75,13 @@ export type LinkCheckResult =
       ok: false;
       error: Extract<
         A2aRemoteErrorCode,
-        'unknown-link' | 'link-not-active' | 'stale-link-version' | 'direction-not-allowed' | 'forbidden' | 'bad-request'
+        | 'unknown-link'
+        | 'link-not-active'
+        | 'stale-link-version'
+        | 'direction-not-allowed'
+        | 'forbidden'
+        | 'bad-request'
+        | 'unknown-task'
       >;
     };
 
@@ -275,9 +281,12 @@ export class LinkStore {
    *   - `task`: needs an active link at exactly this version, and the
    *     direction flag (`allow.inbound` for a received task, `allow.outbound`
    *     for one we send).
-   *   - `reply` / `state`: active link at this version, any direction. Whether
-   *     the task they name exists is the caller's `unknown-task` check — this
-   *     store does not track tasks.
+   *   - `reply` / `state`: active link at this version, and ONLY for a task
+   *     that really belongs to this link — the caller decides that from the
+   *     ledger's remote-task marker and passes `task.onThisLink`; anything else
+   *     is `unknown-task`. Direction flags do not apply: a reply into an
+   *     existing task on this link is allowed either way, but a reply cannot
+   *     be used to inject text or state into an arbitrary task id.
    *   - `link` (lifecycle notice): pass the envelope's `link` as `notice`; the
    *     envelope's `linkVersion` is not used, `notice.version` is. Missing
    *     notice → `bad-request`.
@@ -296,6 +305,7 @@ export class LinkStore {
     direction: 'inbound' | 'outbound',
     kind: A2aRemoteMessageKind,
     notice?: LinkNotice,
+    task?: { onThisLink: boolean },
   ): LinkCheckResult {
     const rec = this.links.get(linkId);
     if (!rec) return { ok: false, error: 'unknown-link' };
@@ -320,8 +330,12 @@ export class LinkStore {
     }
     if (rec.state !== 'active') return { ok: false, error: 'link-not-active' };
     if (version !== rec.version) return { ok: false, error: 'stale-link-version' };
-    if (kind === 'task' && !(direction === 'inbound' ? rec.allow.inbound : rec.allow.outbound)) {
-      return { ok: false, error: 'direction-not-allowed' };
+    if (kind === 'task') {
+      if (!(direction === 'inbound' ? rec.allow.inbound : rec.allow.outbound)) {
+        return { ok: false, error: 'direction-not-allowed' };
+      }
+    } else if (task?.onThisLink !== true) {
+      return { ok: false, error: 'unknown-task' };
     }
     return { ok: true, link: structuredClone(rec) };
   }

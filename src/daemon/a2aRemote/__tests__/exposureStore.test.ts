@@ -123,6 +123,28 @@ describe('ExposureStore', () => {
     expect(s.isPaneExposed(HOST2, 'ws1', 'p1')).toBe(false);
   });
 
+  it('no forget path ever widens exposure; only set() re-adds', () => {
+    const s = make();
+    s.set(HOST, { workspaceIds: ['ws1', 'ws2'], paneIds: { ws1: ['p1'], ws2: ['p2'] } });
+    // Forgetting the workspace removes it from workspaceIds, not just the
+    // pane-list key — otherwise "absent key = every pane" would widen it.
+    s.forgetWorkspace('ws1');
+    expect(s.get(HOST)?.workspaceIds).toEqual(['ws2']);
+    for (const pane of ['p1', 'p2', 'other']) expect(s.isPaneExposed(HOST, 'ws1', pane)).toBe(false);
+    // Forgetting the last listed pane leaves an empty list, not an absent key.
+    s.forgetPane('p2');
+    for (const pane of ['p1', 'p2', 'other']) expect(s.isPaneExposed(HOST, 'ws2', pane)).toBe(false);
+    // Same after a restart.
+    const t = make();
+    for (const [ws, pane] of [['ws1', 'p1'], ['ws1', 'x'], ['ws2', 'p2'], ['ws2', 'x']]) {
+      expect(t.isPaneExposed(HOST, ws, pane)).toBe(false);
+    }
+    // Re-exposing is a whole-record replacement through set().
+    t.set(HOST, { workspaceIds: ['ws1'] });
+    expect(t.isPaneExposed(HOST, 'ws1', 'x')).toBe(true);
+    expect(t.isPaneExposed(HOST, 'ws2', 'p2')).toBe(false);
+  });
+
   it('forgetHost drops everything exposed to that host', () => {
     const s = make();
     s.set(HOST, { workspaceIds: ['ws1'] });

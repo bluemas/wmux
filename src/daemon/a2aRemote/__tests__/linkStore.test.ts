@@ -242,7 +242,15 @@ describe('LinkStore queries', () => {
 });
 
 describe('LinkStore.checkMessage', () => {
-  type Args = { v?: number; host?: string; dir: 'inbound' | 'outbound'; kind: A2aRemoteMessageKind; notice?: LinkNotice };
+  type Args = {
+    v?: number;
+    host?: string;
+    dir: 'inbound' | 'outbound';
+    kind: A2aRemoteMessageKind;
+    notice?: LinkNotice;
+    /** Default `{ onThisLink: true }`; `null` passes no task at all. */
+    task?: { onThisLink: boolean } | null;
+  };
   type Row = [label: string, state: A2aLinkState, allow: NewLinkInput['allow'], args: Args, expected: string];
   const both = { outbound: true, inbound: true };
   const outOnly = { outbound: true, inbound: false };
@@ -258,6 +266,11 @@ describe('LinkStore.checkMessage', () => {
     ['outbound reply, no direction', 'active', none, { dir: 'outbound', kind: 'reply' }, 'ok'],
     ['inbound state, no direction', 'active', none, { dir: 'inbound', kind: 'state' }, 'ok'],
     ['outbound state, no direction', 'active', none, { dir: 'outbound', kind: 'state' }, 'ok'],
+    ['reply for a task not on this link', 'active', both, { dir: 'inbound', kind: 'reply', task: { onThisLink: false } }, 'unknown-task'],
+    ['reply with no task verdict', 'active', both, { dir: 'inbound', kind: 'reply', task: null }, 'unknown-task'],
+    ['state for a task not on this link', 'active', both, { dir: 'outbound', kind: 'state', task: { onThisLink: false } }, 'unknown-task'],
+    ['state with no task verdict', 'active', both, { dir: 'inbound', kind: 'state', task: null }, 'unknown-task'],
+    ['task needs no task verdict', 'active', both, { dir: 'inbound', kind: 'task', task: null }, 'ok'],
     ['older version', 'active', both, { v: 1, dir: 'inbound', kind: 'reply' }, 'stale-link-version'],
     ['newer version', 'active', both, { v: 3, dir: 'inbound', kind: 'task' }, 'stale-link-version'],
     ['wrong host', 'active', both, { host: HOST2, dir: 'inbound', kind: 'task' }, 'forbidden'],
@@ -285,10 +298,36 @@ describe('LinkStore.checkMessage', () => {
     it(`${label} -> ${expected}`, () => {
       const s = make();
       const id = linkIn(s, state, { allow });
-      const r = s.checkMessage(id, a.v ?? 2, a.host ?? HOST, a.dir, a.kind, a.notice);
+      const task = a.task === null ? undefined : (a.task ?? { onThisLink: true });
+      const r = s.checkMessage(id, a.v ?? 2, a.host ?? HOST, a.dir, a.kind, a.notice, task);
       if (expected === 'ok') expect(r).toMatchObject({ ok: true, link: { linkId: id } });
       else expect(r).toEqual({ ok: false, error: expected });
     });
+  }
+
+  // Lifecycle notices from every state: accept only from proposed-out at
+  // exactly ours + 1; broken from any live state at exactly ours + 1; revoke
+  // from any live state at any version; nothing on a terminal link.
+  const STATES: A2aLinkState[] = ['proposed-out', 'proposed-in', 'active', 'revoked', 'broken'];
+  const NOTICE_TABLE: Array<[LinkNotice['state'], (st: A2aLinkState, exact: boolean) => string]> = [
+    ['active', (st, exact) => (st === 'proposed-out' ? (exact ? 'ok' : 'stale-link-version') : 'link-not-active')],
+    ['broken', (st, exact) => (st === 'revoked' || st === 'broken' ? 'link-not-active' : exact ? 'ok' : 'stale-link-version')],
+    ['revoked', (st) => (st === 'revoked' || st === 'broken' ? 'link-not-active' : 'ok')],
+  ];
+  for (const [noticeState, expectFor] of NOTICE_TABLE) {
+    for (const st of STATES) {
+      for (const exact of [true, false]) {
+        const expected = expectFor(st, exact);
+        it(`${noticeState} notice on ${st} at ${exact ? 'ours + 1' : 'a stale version'} -> ${expected}`, () => {
+          const s = make();
+          const id = linkIn(s, st);
+          const ours = s.get(id)?.version ?? 0;
+          const r = s.checkMessage(id, 0, HOST, 'inbound', 'link', { state: noticeState, version: exact ? ours + 1 : ours });
+          if (expected === 'ok') expect(r).toMatchObject({ ok: true });
+          else expect(r).toEqual({ ok: false, error: expected });
+        });
+      }
+    }
   }
 
   it('unknown link -> unknown-link', () => {

@@ -65,6 +65,19 @@ describe('PeerStore', () => {
     expect(await s.resolve(c.peerId, '')).toEqual({ ok: false, reason: 'unknown' });
   });
 
+  it('a secret outside the contract shape is unknown without deriving', async () => {
+    const s = make();
+    const c = await s.mint({ hostId: HOST, name: 'a' });
+    const t = make();
+    for (const bad of ['short', 'x'.repeat(129), `${c.secret.slice(0, 40)}.~!`, '']) {
+      expect(await t.resolve(c.peerId, bad)).toEqual({ ok: false, reason: 'unknown' });
+    }
+    expect(t.stats().derivations).toBe(0);
+    // A well-formed wrong secret does derive (and is still refused).
+    expect(await t.resolve(c.peerId, 'x'.repeat(43))).toEqual({ ok: false, reason: 'unknown' });
+    expect(t.stats().derivations).toBe(1);
+  });
+
   it("another peer's secret is unknown", async () => {
     const s = make();
     const a = await s.mint({ hostId: HOST, name: 'a' });
