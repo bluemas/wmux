@@ -37,6 +37,7 @@ import {
 import http from 'node:http';
 import type { AgentStatus } from '../../shared/types';
 import { isRemoteAgentStatus } from '../../shared/remoteHosts';
+import { isA2aRoute, looksLikePeerCredential, parsePeerCredential, type A2aRemoteErrorCode } from '../../shared/a2aRemote';
 import { createSidebarDropLog, parsePhoneSidebarSnapshot, phoneTaskNesting, phoneWorkspaceLayout, type PhoneSidebarSnapshot, type PhoneSidebarTaskSummary, type PhoneSidebarWorkspace, type PhoneTaskNestedUnder } from '../../shared/phoneFleetSidebar';
 import https from 'node:https';
 import crypto from 'node:crypto';
@@ -526,6 +527,36 @@ export interface WebDeviceResolver {
   ): WebDeviceSetInputResult;
 }
 
+/** A paired A2A peer, as authenticated by `WebPeerResolver`. Never a `WebPrincipal`. */
+export interface WebA2aPeer {
+  peerId: string;
+  hostId: string;
+  name: string;
+}
+
+/**
+ * Cross-host A2A peer credential store (`wmuxpeer~<peerId>~<secret>`). A
+ * DIFFERENT credential type from a device: it authenticates `/api/a2a/*` and
+ * nothing else, and is resolved by the peer gate in `handleApi` before the
+ * operator/device `authenticate()` ever runs.
+ */
+export interface WebPeerResolver {
+  resolve(
+    peerId: string,
+    secret: string,
+  ):
+    | Promise<{ ok: true; peerId: string; hostId: string; name: string } | { ok: false; reason: 'unknown' | 'revoked' }>
+    | { ok: true; peerId: string; hostId: string; name: string }
+    | { ok: false; reason: 'unknown' | 'revoked' };
+  /** Bookkeeping after a successful resolve, like `WebDeviceResolver.touch`. Never fatal. */
+  touch?(peerId: string): void;
+}
+
+/** The `/api/a2a/*` route table, reached only with an authenticated peer. */
+export interface WebA2aRoutes {
+  handle(req: http.IncomingMessage, res: http.ServerResponse, url: URL, pathname: string, peer: WebA2aPeer): Promise<void>;
+}
+
 /**
  * What `setInput` answers. `changed` is true only when the call changed the
  * grant; `retried` when it re-attempted the write of an earlier change that
@@ -655,6 +686,13 @@ interface WebTerminalServerDeps {
    * rather than leaving the operator unable to pair anything at all.
    */
   devices?: WebDeviceResolver;
+  /**
+   * Cross-host A2A peers. Absent: every `/api/a2a/*` request answers 503 —
+   * and a peer credential is still refused (403) on every other route.
+   */
+  peers?: WebPeerResolver;
+  /** The `/api/a2a/*` handlers. Absent: an authenticated peer gets 503. */
+  a2a?: WebA2aRoutes;
   /**
    * The daemon's approval registry. Optional: a daemon that has not wired one
    * (or a unit test that does not care) still serves every other route, and the
@@ -2425,6 +2463,10 @@ export class WebTerminalServer {
     url: URL,
     p: string,
   ): Promise<void> {
+    // Peer credentials and peer routes are judged BEFORE `authenticate()`, so a
+    // peer can never become a `WebPrincipal` and never reach the route table
+    // below. Placed after the Host guard (in `handle`), before any activity stamp.
+    if (await this.a2aGate(req, res, url, p)) return;
     // `/api/events` answers in two shapes on one route: an EventSource (which
     // cannot set headers, so it gets the same `?token=` exception as
     // `/api/stream`) and a plain JSON backlog fetch (Bearer only, like every
@@ -8941,6 +8983,67 @@ export class WebTerminalServer {
   }
 
   // --- helpers ------------------------------------------------------------
+
+  /**
+   * The cross-host A2A peer gate. Returns true when it answered the request.
+   *
+   *   - `/api/a2a/*` accepts a PEER credential and nothing else: no browser
+   *     (`Origin` present — server-to-server calls carry none), no operator
+   *     token, no device credential, no `?token=` and no stream ticket.
+   *   - Every other route refuses anything that claims to be a peer credential,
+   *     without attempting to authenticate it.
+   *
+   * Fail closed: no resolver or no handler is 503, never a fallthrough.
+   */
+  private async a2aGate(req: http.IncomingMessage, res: http.ServerResponse, url: URL, p: string): Promise<boolean> {
+    const header = req.headers['authorization'];
+    const bearer = typeof header === 'string' && header.startsWith('Bearer ') ? header.slice('Bearer '.length) : null;
+    const refuse = (status: number, error: A2aRemoteErrorCode, extra?: Record<string, unknown>): true => {
+      this.json(res, status, { ok: false, error, ...extra });
+      return true;
+    };
+
+    if (!isA2aRoute(p)) {
+      return looksLikePeerCredential(bearer) ? refuse(403, 'forbidden') : false;
+    }
+
+    if (req.headers['origin'] !== undefined) return refuse(403, 'forbidden');
+    const cred = parsePeerCredential(bearer);
+    if (!cred) {
+      // A malformed peer credential is a failed peer login (401). Any OTHER
+      // credential is a principal that is never allowed here (403). The operator
+      // check is a constant-time compare, not an authentication.
+      if (looksLikePeerCredential(bearer)) return refuse(401, 'unauthorized');
+      const otherCredential =
+        (bearer !== null && !!this.token && timingSafeEquals(bearer, this.token)) ||
+        (bearer !== null && bearer.indexOf(DEVICE_CREDENTIAL_SEP) > 0) ||
+        url.searchParams.has('token') ||
+        url.searchParams.has('ticket');
+      return otherCredential ? refuse(403, 'forbidden') : refuse(401, 'unauthorized');
+    }
+
+    const peers = this.deps.peers;
+    if (!peers) return refuse(503, 'unavailable');
+    let result: Awaited<ReturnType<WebPeerResolver['resolve']>>;
+    try {
+      result = await peers.resolve(cred.peerId, cred.secret);
+    } catch (err) {
+      // A store that cannot answer is not an authorization.
+      this.deps.log('warn', `[web] peer auth failed: ${errMsg(err)}`);
+      return refuse(401, 'unauthorized', { reason: 'unknown' });
+    }
+    if (!result.ok) return refuse(401, 'unauthorized', { reason: result.reason });
+    try {
+      peers.touch?.(result.peerId);
+    } catch (err) {
+      this.deps.log('warn', `[web] peer touch failed: ${errMsg(err)}`);
+    }
+
+    const routes = this.deps.a2a;
+    if (!routes) return refuse(503, 'unavailable');
+    await routes.handle(req, res, url, p, { peerId: result.peerId, hostId: result.hostId, name: result.name });
+    return true;
+  }
 
   /**
    * Authenticate an `/api/*` request. Two credential forms, one gate:
