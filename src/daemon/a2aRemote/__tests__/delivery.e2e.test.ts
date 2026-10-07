@@ -66,7 +66,8 @@ const dirs: string[] = [];
 
 afterEach(async () => {
   for (const pc of pcs.splice(0)) await pc.stop();
-  for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
+  // Windows keeps a stopped PC's files locked for a moment (EBUSY): retry the cleanup.
+  for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 });
 });
 
 /** A client seam: lets a test break the first POST of a message after it was really sent. */
