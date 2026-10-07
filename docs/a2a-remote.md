@@ -33,8 +33,9 @@ section; turning one on does not turn on the other.
   open inbound port. The joiner connects out, sends its messages over that
   connection, and holds a stream open for messages coming back.
 - **Nothing is shown by default.** For each paired PC you choose which
-  workspaces and panes it may see. A pane you did not choose is invisible to
-  that PC: no name, no path, no sign that it exists.
+  workspaces and panes, and whether this PC's Moa, it may see. A pane you did
+  not choose is invisible to that PC: no name, no path, no sign that it
+  exists.
 - **Links are made by people.** A link joins one pane on each PC, or the Moa
   of each PC. Someone on the joiner proposes it, and someone on the server
   accepts it. Agents cannot create links. A pane links only with a pane, and
@@ -295,9 +296,9 @@ hardening and will come later.
   delivered as a message to the linked pane, and only to that pane. wmux does
   not spawn a worker, open a pane, or run a command for it, and it goes
   through the same approval and hold checks as a local task. If the pane is
-  gone, or another agent is in it by the time a message arrives, the message
-  is held for you instead of being delivered or re-routed to another pane
-  (see [Delivery, receipts and held work](#delivery-receipts-and-held-work)).
+  gone, or the agent in it is no longer the one the task belongs to, the
+  message is held for you instead of being delivered or re-routed to another
+  pane (see [Delivery, receipts and held work](#delivery-receipts-and-held-work)).
   What the receiving agent decides to do with a message is up to that agent
   and its own permissions, just as with a message you type yourself.
 - **What a link covers.** A link joins exactly one pane on each side, or the
