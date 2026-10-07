@@ -1,0 +1,392 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { A2aPeerRecordV1, A2aRemoteHostRecordV1 } from '../../../shared/a2aRemote';
+import type { A2aRemoteJoinError, A2aRemoteStatus } from '../../../shared/rpc';
+import { useT } from '../../hooks/useT';
+import { useIpc } from '../../hooks/useIpc';
+import UiButton from '../ui/Button';
+import Switch from '../ui/Switch';
+import Input from '../ui/Input';
+import { SettingsSection, SettingRow, SettingNote } from './SettingsLayout';
+
+// ─── Cross-PC A2A (experimental) ─────────────────────────────────────────────
+//
+// Settings → LAN. The daemon is the source of truth (`a2a.remote.*` over the
+// control pipe); this section reads it on mount, polls lightly while open and
+// writes through configure / invite / join / remove / revoke. The VIEW is pure
+// (props only) so it renders under renderToStaticMarkup in a node test.
+//
+// The LAN tab already spends its one primary button on LanLink's "Generate
+// PIN", so every action here is secondary (DESIGN.md: one primary per tab).
+
+type T = (key: string, vars?: Record<string, string | number>) => string;
+
+export type A2aRemoteConfirm = { kind: 'host' | 'peer'; id: string } | null;
+export type A2aRemoteJoinOutcome = { ok: true; name: string } | { ok: false; error: A2aRemoteJoinError } | null;
+
+export interface A2aRemoteViewProps {
+  status: A2aRemoteStatus;
+  busy: boolean;
+  onToggleEnabled: (v: boolean) => void;
+  portDraft: string;
+  onPortDraft: (v: string) => void;
+  onPortCommit: () => void;
+  // invite (this PC)
+  invite: string | null;
+  remainingSec: number | null;
+  copied: boolean;
+  onCreateInvite: () => void;
+  onCopyInvite: () => void;
+  onCancelInvite: () => void;
+  // join (another PC)
+  joinInput: string;
+  onJoinInput: (v: string) => void;
+  onJoin: () => void;
+  joinBusy: boolean;
+  joinOutcome: A2aRemoteJoinOutcome;
+  // lists
+  hosts: A2aRemoteHostRecordV1[];
+  peers: A2aPeerRecordV1[];
+  confirming: A2aRemoteConfirm;
+  onAsk: (c: Exclude<A2aRemoteConfirm, null>) => void;
+  onConfirm: (c: Exclude<A2aRemoteConfirm, null>) => void;
+  onCancelConfirm: () => void;
+  error: string | null;
+  t: T;
+}
+
+/** `m:ss` for the invite countdown. */
+export function formatRemaining(sec: number): string {
+  const s = Math.max(0, Math.floor(sec));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+export function A2aRemoteView(props: A2aRemoteViewProps) {
+  const {
+    status, busy, onToggleEnabled, portDraft, onPortDraft, onPortCommit,
+    invite, remainingSec, copied, onCreateInvite, onCopyInvite, onCancelInvite,
+    joinInput, onJoinInput, onJoin, joinBusy, joinOutcome,
+    hosts, peers, confirming, onAsk, onConfirm, onCancelConfirm, error, t,
+  } = props;
+
+  const confirmRow = (kind: 'host' | 'peer', id: string, label: string) =>
+    confirming?.kind === kind && confirming.id === id ? (
+      <div className="flex items-center gap-2 shrink-0">
+        <UiButton variant="ghost" size="md" onClick={onCancelConfirm}>{t('settings.a2aRemoteKeep')}</UiButton>
+        <UiButton variant="danger" size="md" onClick={() => onConfirm({ kind, id })}>{label}</UiButton>
+      </div>
+    ) : (
+      <UiButton variant="destructive" size="md" className="shrink-0" onClick={() => onAsk({ kind, id })}>
+        {label}
+      </UiButton>
+    );
+
+  return (
+    <>
+      <SettingsSection title={t('settings.a2aRemote')} data-testid="a2a-remote-section">
+        <SettingRow label={t('settings.a2aRemoteEnable')} description={t('settings.a2aRemoteEnableDesc')}>
+          <Switch
+            checked={status.enabled}
+            onCheckedChange={onToggleEnabled}
+            aria-label={t('settings.a2aRemoteEnable')}
+            disabled={busy}
+          />
+        </SettingRow>
+        <SettingRow label={t('settings.a2aRemotePort')} description={t('settings.a2aRemotePortDesc')}>
+          <Input
+            type="number"
+            aria-label={t('settings.a2aRemotePort')}
+            value={portDraft}
+            min={1024}
+            max={65535}
+            disabled={busy}
+            onChange={(e) => onPortDraft(e.target.value)}
+            onBlur={onPortCommit}
+            onKeyDown={(e) => { if (e.key === 'Enter') onPortCommit(); }}
+            className="settings-input tabular-nums text-center"
+            style={{ width: 96 }}
+          />
+        </SettingRow>
+        <SettingRow label={t('settings.a2aRemoteThisPc')} description={status.name}>
+          <span data-testid="a2a-remote-fingerprint" className="ui-code" title={status.fingerprint256 ?? undefined}>
+            {status.fingerprint256 ? status.fingerprint256.slice(0, 16) : '—'}
+          </span>
+        </SettingRow>
+        {status.enabled && (
+          <SettingNote data-testid="a2a-remote-listening" tone={status.listening ? 'muted' : 'warning'}>
+            {status.listening
+              ? t('settings.a2aRemoteListening', { port: status.port })
+              : t('settings.a2aRemoteNotListening', { error: status.lastError ?? '—' })}
+          </SettingNote>
+        )}
+
+        <SettingRow label={t('settings.a2aRemoteInvite')} description={t('settings.a2aRemoteInviteDesc')} layout="stacked">
+          {invite ? (
+            <div className="flex flex-wrap items-center gap-2">
+              <span data-testid="a2a-remote-invite" className="ui-code break-all select-all">{invite}</span>
+              <UiButton variant="secondary" size="md" onClick={onCopyInvite}>
+                {copied ? t('settings.a2aRemoteInviteCopied') : t('settings.a2aRemoteInviteCopy')}
+              </UiButton>
+              <span className="ui-field-description tabular-nums">
+                {remainingSec != null && remainingSec > 0
+                  ? t('settings.a2aRemoteInviteExpires', { time: formatRemaining(remainingSec) })
+                  : t('settings.a2aRemoteInviteExpired')}
+              </span>
+              <UiButton variant="ghost" size="md" onClick={onCancelInvite}>{t('settings.a2aRemoteInviteCancel')}</UiButton>
+            </div>
+          ) : (
+            <UiButton variant="secondary" size="md" onClick={onCreateInvite} disabled={!status.listening}>
+              {t('settings.a2aRemoteInviteButton')}
+            </UiButton>
+          )}
+        </SettingRow>
+        {!status.listening && !invite && (
+          <SettingNote>{t('settings.a2aRemoteInviteNeedsListener')}</SettingNote>
+        )}
+
+        <SettingRow label={t('settings.a2aRemoteJoin')} description={t('settings.a2aRemoteJoinDesc')} layout="stacked">
+          <div className="flex flex-wrap items-center gap-2">
+            <Input
+              type="text"
+              value={joinInput}
+              placeholder="wmux-a2a://…"
+              aria-label={t('settings.a2aRemoteJoin')}
+              spellCheck={false}
+              autoCapitalize="off"
+              autoCorrect="off"
+              onChange={(e) => onJoinInput(e.target.value)}
+              className="settings-input font-mono"
+              style={{ flex: '1 1 260px', minWidth: 0 }}
+            />
+            <UiButton variant="secondary" size="md" onClick={onJoin} disabled={joinBusy || !joinInput.trim()}>
+              {joinBusy ? t('settings.a2aRemoteJoinBusy') : t('settings.a2aRemoteJoinButton')}
+            </UiButton>
+          </div>
+        </SettingRow>
+        {joinOutcome && (
+          <SettingNote data-testid="a2a-remote-join-outcome" tone={joinOutcome.ok ? 'muted' : 'danger'}>
+            {joinOutcome.ok
+              ? t('settings.a2aRemoteJoinOk', { name: joinOutcome.name })
+              : t(`settings.a2aRemoteJoinError.${joinOutcome.error}`)}
+          </SettingNote>
+        )}
+        {error && <SettingNote tone="danger">{error}</SettingNote>}
+      </SettingsSection>
+
+      <SettingsSection title={t('settings.a2aRemoteHosts')}>
+        {hosts.length === 0 ? (
+          <SettingNote>{t('settings.a2aRemoteListEmpty')}</SettingNote>
+        ) : (
+          <div className="contents" data-testid="a2a-remote-hosts">
+            {hosts.map((h) => (
+              <div key={h.hostId} className="settings-row ui-row" style={{ flexDirection: 'row' }}>
+                <span className="ui-field-label truncate">{h.name}</span>
+                <span className="ui-code truncate">{`${h.addresses[0] ?? ''}:${h.port}`}</span>
+                <div className="flex-1" />
+                {confirmRow('host', h.hostId, t('settings.a2aRemoteHostRemove'))}
+              </div>
+            ))}
+          </div>
+        )}
+      </SettingsSection>
+
+      <SettingsSection title={t('settings.a2aRemotePeers')}>
+        {peers.length === 0 ? (
+          <SettingNote>{t('settings.a2aRemoteListEmpty')}</SettingNote>
+        ) : (
+          <div className="contents" data-testid="a2a-remote-peers">
+            {peers.map((p) => (
+              <div key={p.peerId} className="settings-row ui-row" style={{ flexDirection: 'row' }}>
+                <span className="ui-field-label truncate">{p.name}</span>
+                <div className="flex-1" />
+                {confirmRow('peer', p.peerId, t('settings.a2aRemotePeerRevoke'))}
+              </div>
+            ))}
+          </div>
+        )}
+      </SettingsSection>
+    </>
+  );
+}
+
+export function A2aRemoteSection() {
+  const t = useT();
+  const { invoke: ipcInvoke } = useIpc({ silent: ['NOT_FOUND', 'UNKNOWN', 'DAEMON_DISCONNECTED'] });
+  const api = window.electronAPI?.a2aRemote;
+
+  const [status, setStatus] = useState<A2aRemoteStatus | null>(null);
+  const [unavailable, setUnavailable] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [portDraft, setPortDraft] = useState('');
+  const [invite, setInvite] = useState<string | null>(null);
+  const [deadline, setDeadline] = useState<number | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+  const [copied, setCopied] = useState(false);
+  const [joinInput, setJoinInput] = useState('');
+  const [joinBusy, setJoinBusy] = useState(false);
+  const [joinOutcome, setJoinOutcome] = useState<A2aRemoteJoinOutcome>(null);
+  const [hosts, setHosts] = useState<A2aRemoteHostRecordV1[]>([]);
+  const [peers, setPeers] = useState<A2aPeerRecordV1[]>([]);
+  const [confirming, setConfirming] = useState<A2aRemoteConfirm>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  // The port last shown, so a poll does not overwrite a port being typed.
+  const shownPort = useRef<number | null>(null);
+  const applyStatus = useCallback((s: A2aRemoteStatus) => {
+    setStatus(s);
+    if (shownPort.current !== s.port) {
+      shownPort.current = s.port;
+      setPortDraft(String(s.port));
+    }
+  }, []);
+
+  const refresh = useCallback(async () => {
+    if (!api) { setUnavailable(true); return; }
+    const r = await ipcInvoke(() => api.status());
+    // A daemon too old to know `a2a.remote.*` answers nothing usable.
+    if (!r.ok || typeof r.data?.port !== 'number') { setUnavailable(true); return; }
+    setUnavailable(false);
+    applyStatus(r.data);
+    const [h, p, pair] = await Promise.all([
+      ipcInvoke(() => api.hostsList()),
+      ipcInvoke(() => api.peersList()),
+      ipcInvoke(() => api.pairStatus()),
+    ]);
+    if (h.ok && Array.isArray(h.data?.hosts)) setHosts(h.data.hosts);
+    if (p.ok && Array.isArray(p.data?.peers)) setPeers(p.data.peers.filter((x) => x.revokedAt === undefined));
+    // The invite was redeemed, cancelled or burned on the daemon side.
+    if (pair.ok && pair.data?.active === false) { setInvite(null); setDeadline(null); }
+  }, [api, ipcInvoke, applyStatus]);
+
+  useEffect(() => {
+    void refresh();
+    const daemonApi = (
+      window.electronAPI as unknown as { daemon?: { onConnected?: (cb: () => void) => () => void } }
+    ).daemon;
+    const off = daemonApi?.onConnected?.(() => void refresh());
+    // Light poll while the LAN tab is open: a PC that joins this one shows up without a refresh.
+    const poll = setInterval(() => void refresh(), 3000);
+    return () => { off?.(); clearInterval(poll); };
+  }, [refresh]);
+
+  useEffect(() => {
+    if (deadline == null) return;
+    const tick = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(tick);
+  }, [deadline]);
+
+  const configure = useCallback(async (patch: { enabled?: boolean; port?: number }) => {
+    if (!api) return;
+    setBusy(true); setError(null);
+    try {
+      const r = await ipcInvoke(() => api.configure(patch));
+      if (r.ok && typeof r.data?.port === 'number') applyStatus(r.data);
+      else setError(t('settings.a2aRemoteActionFailed'));
+    } finally {
+      setBusy(false);
+    }
+    // A stop or rebind drops the open invite daemon-side.
+    setInvite(null); setDeadline(null);
+  }, [api, ipcInvoke, applyStatus, t]);
+
+  const onPortCommit = useCallback(() => {
+    if (!status) return;
+    const n = Number(portDraft);
+    if (!Number.isInteger(n) || n < 1024 || n > 65535) { setPortDraft(String(status.port)); return; }
+    if (n !== status.port) void configure({ port: n });
+  }, [status, portDraft, configure]);
+
+  const onCreateInvite = useCallback(async () => {
+    if (!api) return;
+    setError(null); setCopied(false);
+    const r = await ipcInvoke(() => api.pairBegin());
+    if (r.ok) { setInvite(r.data.invite); setDeadline(r.data.expiresAt); setNow(Date.now()); }
+    else setError(t('settings.a2aRemoteActionFailed'));
+  }, [api, ipcInvoke, t]);
+
+  const onCancelInvite = useCallback(async () => {
+    if (!api) return;
+    const r = await ipcInvoke(() => api.pairCancel());
+    if (r.ok) { setInvite(null); setDeadline(null); }
+  }, [api, ipcInvoke]);
+
+  const onCopyInvite = useCallback(async () => {
+    if (!invite) return;
+    try {
+      await window.clipboardAPI.writeText(invite);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      setError(t('settings.a2aRemoteActionFailed'));
+    }
+  }, [invite, t]);
+
+  const onJoin = useCallback(async () => {
+    if (!api || !joinInput.trim()) return;
+    setJoinBusy(true); setJoinOutcome(null);
+    const r = await ipcInvoke(() => api.join(joinInput.trim()));
+    setJoinBusy(false);
+    if (!r.ok) { setJoinOutcome({ ok: false, error: 'failed' }); return; }
+    if (r.data.ok) {
+      setJoinOutcome({ ok: true, name: r.data.host.name });
+      setJoinInput('');
+      void refresh();
+    } else {
+      setJoinOutcome({ ok: false, error: r.data.error });
+    }
+  }, [api, ipcInvoke, joinInput, refresh]);
+
+  const onConfirm = useCallback(async (c: Exclude<A2aRemoteConfirm, null>) => {
+    if (!api) return;
+    setConfirming(null);
+    const r = c.kind === 'host'
+      ? await ipcInvoke(() => api.hostsRemove(c.id))
+      : await ipcInvoke(() => api.peersRevoke(c.id));
+    if (!r.ok) setError(t('settings.a2aRemoteActionFailed'));
+    void refresh();
+  }, [api, ipcInvoke, refresh, t]);
+
+  if (unavailable) {
+    return (
+      <SettingsSection title={t('settings.a2aRemote')}>
+        <SettingNote>{t('settings.a2aRemoteUnavailable')}</SettingNote>
+      </SettingsSection>
+    );
+  }
+  if (!status) {
+    return (
+      <SettingsSection title={t('settings.a2aRemote')}>
+        <SettingNote>{t('settings.a2aRemoteLoading')}</SettingNote>
+      </SettingsSection>
+    );
+  }
+
+  return (
+    <A2aRemoteView
+      status={status}
+      busy={busy}
+      onToggleEnabled={(v) => void configure({ enabled: v })}
+      portDraft={portDraft}
+      onPortDraft={setPortDraft}
+      onPortCommit={onPortCommit}
+      invite={invite}
+      remainingSec={deadline != null ? Math.ceil((deadline - now) / 1000) : null}
+      copied={copied}
+      onCreateInvite={() => void onCreateInvite()}
+      onCopyInvite={() => void onCopyInvite()}
+      onCancelInvite={() => void onCancelInvite()}
+      joinInput={joinInput}
+      onJoinInput={setJoinInput}
+      onJoin={() => void onJoin()}
+      joinBusy={joinBusy}
+      joinOutcome={joinOutcome}
+      hosts={hosts}
+      peers={peers}
+      confirming={confirming}
+      onAsk={setConfirming}
+      onConfirm={(c) => void onConfirm(c)}
+      onCancelConfirm={() => setConfirming(null)}
+      error={error}
+      t={t}
+    />
+  );
+}

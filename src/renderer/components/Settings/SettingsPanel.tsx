@@ -72,6 +72,7 @@ import { IntegrationSetupSectionContainer, MCP_STATUS_CHANGED_EVENT } from './In
 import { McpStatusSection } from './McpStatusSection';
 import { AccountsSection } from './AccountsSection';
 import { FanoutPresetsSection } from './FanoutPresetsSection';
+import { A2aRemoteSection } from './A2aRemoteSection';
 import { terminalFontFamilyCss } from '../../utils/terminalFont';
 import { hasBareFunctionKeyBinding } from '../../utils/functionKeyBinding';
 import { Icon, IconX, IconCheck, IconChevron, IconExternalLink, IconBrowser, IconComputer, IconUsers, IconRobot, IconRemoteDevices, IconPlus, IconWarning } from '../icons';
@@ -5419,7 +5420,7 @@ export default function SettingsPanel({ initialTab }: { initialTab?: string }) {
                     {activeTab === 'browser'            && <TabBrowser />}
                     {activeTab === 'computer-use'       && <TabComputerUse />}
                     {activeTab === 'remote'             && <TabRemote />}
-                    {activeTab === 'lanlink'            && <><LanLinkSection /><LanLinkPairingSection /></>}
+                    {activeTab === 'lanlink'            && <><LanLinkSection /><LanLinkPairingSection /><A2aRemoteSection /></>}
                     {activeTab === 'about'              && <TabAbout />}
                   </div>
                 </>
