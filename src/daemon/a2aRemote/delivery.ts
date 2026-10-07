@@ -17,7 +17,7 @@ import { remoteTaskId } from './ids';
 import { acceptInbound, type InboundDeps } from './inbound';
 import type { NotifyLinkChange } from './linkRpc';
 import type { LinkStore } from './linkStore';
-import { aliasTable, linkAlias, listRemoteTargets, sendRemoteReply, sendRemoteState, sendRemoteTask, type OutboundDeps } from './outbound';
+import { aliasTable, linkAlias, listRemoteTargets, sendRemoteReply, sendRemoteState, sendRemoteTask, syncRemoteTask, type OutboundDeps } from './outbound';
 import { OutboxStore } from './outboxStore';
 import type { A2aRouteTable } from './routes';
 import { JoinerSession, taskOfEnvelope, type SessionClient, type SessionTiming } from './session';
@@ -66,7 +66,11 @@ export interface A2aRemoteDeliveryDeps {
 
 const SYNC_MS = 5_000;
 const MAINTENANCE_MS = 60_000;
-const HELD_REASONS: ReadonlySet<string> = new Set<A2aRemoteHeldReason>(['occupant-changed', 'pane-missing', 'link-not-active', 'brain-delivery-pending', 'brain-unavailable']);
+const HELD_REASONS: ReadonlySet<string> = new Set<A2aRemoteHeldReason>([
+  'occupant-changed', 'pane-missing', 'link-not-active', 'brain-delivery-pending', 'brain-unavailable', 'delivery-unconfirmed', 'no-agent',
+]);
+/** What the sender's ledger shows while our pane has no agent to take its task. */
+export const NO_AGENT_SUMMARY = 'The linked pane on the receiving PC has no agent running; the task is held until someone there acts.';
 const STATES: ReadonlySet<string> = new Set(['working', 'input-required', 'completed', 'failed', 'canceled']);
 const TERMINAL_LINK: ReadonlySet<string> = new Set(['revoked', 'broken']);
 
@@ -198,8 +202,25 @@ export class A2aRemoteDelivery {
     return out;
   }
 
-  /** Periodic upkeep: drop old acked records, reject holds past their TTL. */
+  /** Queue what the peer is owed for one remote task (our replies, our latest state). */
+  async syncTask(taskId: string, summary?: string): Promise<void> {
+    const res = await syncRemoteTask(this.outboundDeps(), taskId, summary !== undefined ? { summary } : {});
+    if (!res.ok && !res.error.startsWith('link-not-active') && res.error !== 'unknown-link') {
+      this.deps.log('warn', `[a2a-remote] ${taskId}: not queued for the peer yet: ${res.error}`);
+    }
+  }
+
+  /** The ledger is the source of truth: re-queue anything a failed or interrupted send left owed. */
+  async syncAll(): Promise<void> {
+    for (const task of this.deps.taskService.listRemote()) {
+      // eslint-disable-next-line no-await-in-loop -- one task at a time keeps the outbox order
+      await syncRemoteTask(this.outboundDeps(), task.id).catch(() => undefined);
+    }
+  }
+
+  /** Periodic upkeep: drop old acked records, reject holds past their TTL, re-queue what is owed. */
   async maintain(): Promise<void> {
+    await this.syncAll().catch((err: unknown) => this.deps.log('warn', `[a2a-remote] outbound sync failed: ${errMsg(err)}`));
     try {
       this.outbox.prune();
     } catch (err) {
@@ -228,14 +249,17 @@ export class A2aRemoteDelivery {
       if (!taskId) return { ok: false, error: 'bad-request: taskId is required' };
       const held = p['held'];
       if (held !== undefined && (typeof held !== 'string' || !HELD_REASONS.has(held))) return { ok: false, error: 'bad-request: unknown held reason' };
+      const messageId = typeof p['messageId'] === 'string' ? p['messageId'] : undefined;
       const res = await svc.markRemote({
         taskId,
-        ...(typeof p['messageId'] === 'string' ? { messageId: p['messageId'] } : {}),
+        ...(messageId !== undefined ? { messageId } : {}),
         ...(p['delivered'] === true ? { delivered: true } : {}),
         ...(typeof held === 'string' ? { held: held as A2aRemoteHeldReason } : {}),
+        ...(typeof p['attempted'] === 'boolean' && p['delivered'] !== true && held === undefined ? { attempted: p['attempted'] } : {}),
         ...(p['note'] === 'pasted-not-submitted' ? { note: 'pasted-not-submitted' as const } : {}),
         ...(typeof p['ptyId'] === 'string' && isSafeId(p['ptyId']) ? { ptyId: p['ptyId'] } : {}),
       });
+      if (res.ok && held === 'no-agent' && messageId === undefined) await this.noAgent(taskId);
       return res.ok ? { ok: true } : res;
     });
 
@@ -286,6 +310,20 @@ export class A2aRemoteDelivery {
 
   // --- internals ------------------------------------------------------------
 
+  /**
+   * Our pane kept having no agent for the peer's task: the sender hears why,
+   * once, as a reply from this side (its task stays open; `submitted` has no
+   * edge to `input-required`, and nothing here has started the work).
+   */
+  private async noAgent(taskId: string): Promise<void> {
+    const task = this.deps.taskService.getTask(taskId);
+    if (!task || task.status.state !== 'submitted') return;
+    const said = task.history.some((m) => m.parts.some((p) => p.kind === 'text' && p.text === NO_AGENT_SUMMARY));
+    if (said) return;
+    const res = await sendRemoteReply(this.outboundDeps(), { taskId, workspaceId: task.metadata.to.workspaceId, text: NO_AGENT_SUMMARY });
+    if (!res.ok) this.deps.log('warn', `[a2a-remote] ${taskId}: could not tell the sender its pane has no agent: ${res.error}`);
+  }
+
   private newSession(hostId: HostId): JoinerSession {
     return new JoinerSession({
       hostId,
@@ -331,7 +369,7 @@ export class A2aRemoteDelivery {
       name,
       role: 'server',
       state: this.hub.isConnected(hostId) ? 'connected' : 'disconnected',
-      pending: this.outbox.pending(hostId).length,
+      pending: this.outbox.openCount(hostId),
       ...(since !== undefined ? { connectedAt: new Date(since).toISOString() } : {}),
     };
   }

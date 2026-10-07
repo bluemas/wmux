@@ -604,7 +604,16 @@ export interface A2aRemoteTaskMarkerV1 {
    * which cannot take it right now (Moa off, no HQ, or not started); it is
    * delivered as soon as Moa can.
    */
-  held?: 'occupant-changed' | 'pane-missing' | 'link-not-active' | 'brain-delivery-pending' | 'brain-unavailable';
+  held?:
+    | 'occupant-changed'
+    | 'pane-missing'
+    | 'link-not-active'
+    | 'brain-delivery-pending'
+    | 'brain-unavailable'
+    /** A paste was attempted but never confirmed (main restarted mid-delivery): a person decides. */
+    | 'delivery-unconfirmed'
+    /** The pane kept having no agent to deliver to. */
+    | 'no-agent';
   /**
    * This side's link endpoint kind when the task was stored. `brain` = the
    * task is this PC's Moa's, delivered as a wake, never to a pane. Absent on a

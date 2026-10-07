@@ -136,3 +136,17 @@ describe('failTasksForLink', () => {
     expect(await failTasksForLink(deps, linkId, 'link_revoked')).toEqual({ failed: [], refused: 0 });
   });
 });
+
+describe('failTasksForLink — what is still owed to our pane', () => {
+  it('holds a peer reply our pane never got as link-not-active, so it is never pasted later', async () => {
+    const outId = await outboundTask();
+    const reply = { protocol: A2A_REMOTE_PROTOCOL, linkId, linkVersion: 2, messageId: crypto.randomUUID(), kind: 'reply' as const, taskId: outId, text: 'late answer', sentAt: 'x' };
+    await acceptInbound(reply, { hostId: HOST }, { linkStore: links, taskService: tasks, broadcast: () => undefined, aliasFor: (l) => linkAlias(l, 'pc-a') });
+    expect(tasks.listRemotePending().map((t) => t.id)).toEqual([outId]);
+    links.revoke(linkId, 'local');
+    await failTasksForLink(deps, linkId, 'link_revoked');
+    expect(tasks.listRemotePending()).toEqual([]);
+    const marker = tasks.getTask(outId)!.metadata.remote as { inbox?: Array<{ messageId: string; held?: string }> };
+    expect(marker.inbox?.find((i) => i.messageId === reply.messageId)?.held).toBe('link-not-active');
+  });
+});

@@ -31,6 +31,7 @@ function remoteTask(n: number): Task {
 class FakeDaemon {
   tasks = new Map<string, Task>();
   marks: Array<Record<string, unknown>> = [];
+  attempts: Array<Record<string, unknown>> = [];
   failMarks = 0;
   private marker(t: Task): A2aRemoteTaskState {
     return t.metadata.remote as A2aRemoteTaskState;
@@ -50,6 +51,17 @@ class FakeDaemon {
     if (method === 'a2a.remote.held') {
       return { tasks: [...this.tasks.values()].filter((t) => this.marker(t).held || (this.marker(t).inbox ?? []).some((i) => i.held)).map((t) => structuredClone(t)) };
     }
+    if (method === 'a2a.remote.mark' && typeof params.attempted === 'boolean') {
+      // The daemon's attempt bookkeeping (kept apart from the outcome marks below).
+      this.attempts.push(params);
+      const task = this.tasks.get(params.taskId as string)!;
+      const m = this.marker(task);
+      const target = params.messageId ? m.inbox!.find((i) => i.messageId === params.messageId)! : m;
+      if (target.delivered === true || target.held) return { ok: true };
+      if (params.attempted) target.attempted = true;
+      else delete target.attempted;
+      return { ok: true };
+    }
     if (method === 'a2a.remote.mark') {
       if (this.failMarks > 0) {
         this.failMarks -= 1;
@@ -59,6 +71,7 @@ class FakeDaemon {
       const task = this.tasks.get(params.taskId as string)!;
       const m = this.marker(task);
       const target = params.messageId ? m.inbox!.find((i) => i.messageId === params.messageId)! : m;
+      delete target.attempted;
       if (params.delivered === true) {
         target.delivered = true;
         delete target.held;
@@ -271,6 +284,67 @@ describe('RemoteA2aBridge', () => {
     expect(listener).toBeNull();
     await vi.advanceTimersByTimeAsync(60_000);
     expect(renderer).not.toHaveBeenCalled();
+  });
+
+  it('records the attempt before the paste; after a main restart an unconfirmed paste is held, never pasted again', async () => {
+    daemon.tasks.set(id(20), remoteTask(20));
+    // main "dies" mid-paste: the renderer never answers.
+    answer = () => new Promise<A2aRemoteDeliveryResult>(() => undefined);
+    bridge.start();
+    await settle();
+    expect(daemon.attempts).toEqual([{ taskId: id(20), attempted: true }]);
+    expect(renderer).toHaveBeenCalledTimes(1);
+    bridge.stop();
+
+    // A new main process: same daemon state, empty memory.
+    renderer.mockClear();
+    answer = () => ({ ok: true, delivered: true });
+    bridge = new RemoteA2aBridge({ daemonRpc: (m, p) => daemon.rpc(m, p), sendToRenderer: (m, p) => renderer(m, p), onDaemonEvent: () => () => undefined });
+    bridge.start();
+    await settle();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(renderer).not.toHaveBeenCalled();
+    expect(daemon.marks).toEqual([{ taskId: id(20), held: 'delivery-unconfirmed' }]);
+  });
+
+  it('a refused delivered-mark keeps the obligation and retries only the mark', async () => {
+    daemon.tasks.set(id(21), remoteTask(21));
+    let refuse = 2;
+    const real = daemon.rpc.bind(daemon);
+    daemon.rpc = async (m, p) => {
+      if (m === 'a2a.remote.mark' && p.delivered === true && refuse > 0) {
+        refuse -= 1;
+        return { ok: false, error: 'a2a.remote.mark: daemon log append failed (uncommitted)' };
+      }
+      return real(m, p);
+    };
+    bridge.start();
+    await settle();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(renderer).toHaveBeenCalledTimes(1);
+    expect(daemon.marks).toEqual([{ taskId: id(21), delivered: true }]);
+  });
+
+  it('a pane that keeps having no agent is held as no-agent instead of retried forever', async () => {
+    daemon.tasks.set(id(22), remoteTask(22));
+    answer = () => ({ ok: true, delivered: false, reason: 'no_agent_pane' });
+    bridge.start();
+    await settle();
+    await vi.advanceTimersByTimeAsync(60 * 60_000);
+    expect(renderer).toHaveBeenCalledTimes(5);
+    expect(daemon.marks).toEqual([{ taskId: id(22), held: 'no-agent' }]);
+    // Each miss cleared its attempt, so the hold is "no agent", not "unconfirmed".
+    expect(daemon.attempts.filter((a) => a.attempted === false)).toHaveLength(4);
+  });
+
+  it('a renderer timeout leaves the attempt standing: held as unconfirmed, not pasted again', async () => {
+    daemon.tasks.set(id(23), remoteTask(23));
+    answer = () => Promise.reject(new Error('RPC timeout: a2a.task.send (130000ms)'));
+    bridge.start();
+    await settle();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(renderer).toHaveBeenCalledTimes(1);
+    expect(daemon.marks).toEqual([{ taskId: id(23), held: 'delivery-unconfirmed' }]);
   });
 });
 

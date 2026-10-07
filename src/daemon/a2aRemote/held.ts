@@ -3,7 +3,7 @@ import type { Task } from '../../shared/types';
 import type { A2aTaskService } from '../a2a/A2aTaskService';
 import type { LinkStore } from './linkStore';
 import type { OutboxStore } from './outboxStore';
-import { sendRemoteState } from './outbound';
+import { syncRemoteTask } from './outbound';
 
 /**
  * Cross-host A2A: ending remote work that cannot be delivered.
@@ -21,7 +21,7 @@ import { sendRemoteState } from './outbound';
  */
 
 export interface HeldDeps {
-  taskService: Pick<A2aTaskService, 'getTask' | 'cancelTask' | 'forceFailRemote' | 'listRemoteHeld' | 'listRemoteByLink'>;
+  taskService: Pick<A2aTaskService, 'getTask' | 'cancelTask' | 'forceFailRemote' | 'listRemoteHeld' | 'listRemoteByLink' | 'listRemotePending' | 'markRemote'>;
   linkStore: Pick<LinkStore, 'get' | 'list' | 'checkMessage'>;
   outbox: Pick<OutboxStore, 'enqueue' | 'pending' | 'refuse'>;
   now?: () => number;
@@ -56,7 +56,7 @@ export async function rejectHeld(deps: HeldDeps, taskId: string, reason: string)
     if (!res.ok) return res;
     state = 'canceled';
   }
-  const queued = sendRemoteState(deps, { taskId, state, summary });
+  const queued = await syncRemoteTask(deps, taskId, { summary });
   return { ok: true, taskId, state, queued: queued.ok };
 }
 
@@ -89,6 +89,20 @@ export async function failTasksForLink(
     // eslint-disable-next-line no-await-in-loop -- per-task lock order
     const res = await deps.taskService.forceFailRemote({ taskId: task.id, reason, forced: 'remote_link_ended' });
     if (res.ok && res.failed) failed.push(task.id);
+  }
+  // Nothing more is delivered on an ended link: what the peer sent and our
+  // pane never got is held (link-not-active), never pasted later.
+  for (const task of deps.taskService.listRemotePending()) {
+    const marker = task.metadata.remote as A2aRemoteTaskState | undefined;
+    if (marker?.linkId !== linkId) continue;
+    const units = [
+      ...(marker.direction === 'inbound' && marker.delivered !== true && !marker.held ? [undefined] : []),
+      ...(marker.inbox ?? []).filter((i) => i.delivered !== true && !i.held).map((i) => i.messageId),
+    ];
+    for (const messageId of units) {
+      // eslint-disable-next-line no-await-in-loop -- per-task lock order
+      await deps.taskService.markRemote({ taskId: task.id, ...(messageId ? { messageId } : {}), held: 'link-not-active' });
+    }
   }
   let refused = 0;
   const link = deps.linkStore.get(linkId);

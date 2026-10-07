@@ -5,7 +5,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { A2A_ROUTES, formatPeerCredential, type A2aLinkRecordV1 } from '../../../shared/a2aRemote';
 import { A2A_REMOTE_NOTIFY_METHOD, A2A_REMOTE_RPC } from '../../../shared/a2aRemoteDelivery';
 import type { DaemonConfig } from '../../types';
@@ -28,8 +28,12 @@ import { A2aServer } from '../server';
 import type { SessionClient } from '../session';
 import { freePort } from './a2aServerRig';
 
-const FAST = { connectMs: 2_000, requestMs: 4_000 };
-const TIMING = { backoffMinMs: 30, backoffMaxMs: 150, livenessMs: 3_000, connectMs: 2_000, requestMs: 4_000 };
+// Two PCs each mint a certificate and every step is a TLS handshake: slow CI
+// runners (Windows) need far more than the default per-test budget.
+vi.setConfig({ testTimeout: 60_000, hookTimeout: 30_000 });
+
+const FAST = { connectMs: 5_000, requestMs: 10_000 };
+const TIMING = { backoffMinMs: 30, backoffMaxMs: 150, livenessMs: 10_000, connectMs: 5_000, requestMs: 10_000 };
 
 type Rpc = (method: string, params?: Record<string, unknown>) => Promise<unknown>;
 
@@ -68,7 +72,10 @@ afterEach(async () => {
 /** A client seam: lets a test break the first POST of a message after it was really sent. */
 type ClientHook = (opts: PinnedClientOptions) => SessionClient;
 
-async function makePc(name: string, opts: { dir?: string; port?: number; client?: ClientHook } = {}): Promise<Pc> {
+async function makePc(
+  name: string,
+  opts: { dir?: string; port?: number; client?: ClientHook; render?: (method: string) => Promise<unknown> } = {},
+): Promise<Pc> {
   const dir = opts.dir ?? fs.mkdtempSync(path.join(os.tmpdir(), 'a2a-deliv-'));
   if (!opts.dir) dirs.push(dir);
   const a2aDir = path.join(dir, 'a2a');
@@ -154,6 +161,7 @@ async function makePc(name: string, opts: { dir?: string; port?: number; client?
     daemonRpc: (method, params) => rpc(method, params),
     sendToRenderer: async (method, params) => {
       rendered.push({ method, params });
+      if (opts.render) return opts.render(method);
       return { ok: true, delivered: true, ptyId: 'pty-1' };
     },
     onDaemonEvent: (l) => {
@@ -227,7 +235,7 @@ async function linked(a: Pc, b: Pc): Promise<string> {
   return linkId;
 }
 
-async function until(cond: () => boolean, ms = 8_000): Promise<void> {
+async function until(cond: () => boolean, ms = 30_000): Promise<void> {
   const end = Date.now() + ms;
   while (!cond()) {
     if (Date.now() > end) throw new Error('timed out waiting');
@@ -313,7 +321,7 @@ describe('cross-host delivery, end to end', () => {
     await until(() => a.delivery.status()[0]?.state !== 'connected');
 
     b = await makePc('PC-B', { dir: bDir, port: bPort });
-    await until(() => taskSends(b).length === 1, 10_000);
+    await until(() => taskSends(b).length === 1);
     expect(taskSends(b)[0]).toMatchObject({ presetTaskId: taskId });
     // B -> A: still exactly the one task from before the restart.
     const more = (await b.rpc(A2A_REMOTE_RPC.sendTask, {
@@ -417,6 +425,48 @@ describe('cross-host delivery, end to end', () => {
     second.abort();
     first.abort();
     await Promise.all([firstRun, secondRun]);
+  });
+
+  it('main restarting mid-paste: the task is not pasted again and shows as delivery-unconfirmed', async () => {
+    // B's renderer takes the paste and never answers (main dies right there).
+    const b = await makePc('PC-B', { render: () => new Promise(() => undefined) });
+    const a = await makePc('PC-A');
+    const linkId = await linked(a, b);
+    const taskId = await sendTask(a, linkId, 'paste me once');
+    await until(() => taskSends(b).length === 1);
+    await until(() => (b.tasks.getTask(taskId)?.metadata.remote as { attempted?: boolean })?.attempted === true);
+
+    // A new main: fresh bridge, same daemon.
+    b.bridge.stop();
+    const reRendered: string[] = [];
+    const fresh = new RemoteA2aBridge({
+      daemonRpc: (m, p) => b.rpc(m, p),
+      sendToRenderer: async (m) => {
+        reRendered.push(m);
+        return { ok: true, delivered: true };
+      },
+      onDaemonEvent: () => () => undefined,
+      backstopMs: 100,
+    });
+    fresh.start();
+    try {
+      const held = async (): Promise<string | undefined> => {
+        const res = (await b.rpc(A2A_REMOTE_RPC.held)) as { tasks: Array<{ id: string; metadata: { remote: { held?: string } } }> };
+        return res.tasks.find((t) => t.id === taskId)?.metadata.remote.held;
+      };
+      const end = Date.now() + 30_000;
+      while ((await held()) !== 'delivery-unconfirmed') {
+        if (Date.now() > end) throw new Error('not held');
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      await new Promise((r) => setTimeout(r, 400));
+      expect(reRendered).toEqual([]);
+      // A person's "send again" is the only way it is written once more.
+      expect(await fresh.retryHeld(taskId)).toMatchObject({ ok: true, results: [{ outcome: 'delivered' }] });
+      expect(reRendered).toEqual(['a2a.task.send']);
+    } finally {
+      fresh.stop();
+    }
   });
 });
 

@@ -107,6 +107,22 @@ export class OutboxStore {
       .map((r) => structuredClone(r));
   }
 
+  /** The oldest record still owed to `hostId` (one copy, not the whole queue). */
+  head(hostId: HostId): A2aOutboxRecordV1 | undefined {
+    let first: A2aOutboxRecordV1 | undefined;
+    for (const r of this.records.values()) {
+      if (r.hostId === hostId && OPEN.has(r.state) && (!first || r.seq < first.seq)) first = r;
+    }
+    return first ? structuredClone(first) : undefined;
+  }
+
+  /** How many records are still owed to `hostId`. */
+  openCount(hostId: HostId): number {
+    let n = 0;
+    for (const r of this.records.values()) if (r.hostId === hostId && OPEN.has(r.state)) n += 1;
+    return n;
+  }
+
   get(hostId: HostId, seq: number): A2aOutboxRecordV1 | undefined {
     const rec = this.records.get(key(hostId, seq));
     return rec ? structuredClone(rec) : undefined;

@@ -54,6 +54,9 @@ export const REMOTE_BRIDGE_BACKSTOP_MS = 5_000;
 /** Retry delay after a delivery that did not land (doubles up to the max). */
 export const REMOTE_BRIDGE_RETRY_MIN_MS = 10_000;
 export const REMOTE_BRIDGE_RETRY_MAX_MS = 5 * 60_000;
+/** A unit that found no agent this many times in a row, or for this long, is held as `no-agent`. */
+export const REMOTE_BRIDGE_NO_AGENT_TRIES = 5;
+export const REMOTE_BRIDGE_NO_AGENT_MS = 10 * 60_000;
 
 export interface RemoteA2aBridgeDeps {
   /** Daemon RPC (DaemonClient.rpc in the wiring step). */
@@ -75,7 +78,8 @@ export interface RemoteA2aBridgeDeps {
 
 type Mark =
   | { delivered: true; ptyId?: string; note?: 'pasted-not-submitted' }
-  | { held: A2aRemoteHeldReason };
+  | { held: A2aRemoteHeldReason }
+  | { attempted: false };
 
 /** One unit of work: the task itself, or one inbox item of it. */
 interface Work {
@@ -100,6 +104,8 @@ export class RemoteA2aBridge {
   private readonly retry = new Map<string, { at: number; delayMs: number }>();
   /** Brain-link work held because Moa could not take it. */
   private readonly brainWaiting = new Set<string>();
+  /** Consecutive "written nowhere" answers per unit (no agent in the pane). */
+  private readonly misses = new Map<string, { count: number; since: number }>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private unsubscribe: (() => void) | null = null;
   private unsubscribeBrain: (() => void) | null = null;
@@ -211,11 +217,21 @@ export class RemoteA2aBridge {
     for (const key of this.retry.keys()) if (!listed.has(key)) this.retry.delete(key);
     for (const key of this.pendingMarks.keys()) if (!listed.has(key)) this.pendingMarks.delete(key);
     for (const key of this.brainWaiting) if (!listed.has(key)) this.brainWaiting.delete(key);
+    for (const key of this.misses.keys()) if (!listed.has(key)) this.misses.delete(key);
     for (const unit of work) {
       if (this.inFlight.has(unit.key)) continue;
       const pendingMark = this.pendingMarks.get(unit.key);
       if (pendingMark) {
+        // Only the mark is retried: the body is never written again for it.
         void this.mark(unit.key, pendingMark);
+        continue;
+      }
+      if ((unit.item ?? (unit.task.metadata.remote as A2aRemoteTaskState)).attempted) {
+        // A paste was started and never confirmed (main restarted mid-way, or
+        // the renderer did not answer). It may be in the pane already: a
+        // person decides, it is never pasted again on its own.
+        const ref = { taskId: unit.task.id, ...(unit.item ? { messageId: unit.item.messageId } : {}) };
+        void this.mark(unit.key, { ...ref, mark: { held: 'delivery-unconfirmed' } });
         continue;
       }
       const wait = this.retry.get(unit.key);
@@ -238,6 +254,17 @@ export class RemoteA2aBridge {
       }
       return 'pane-missing';
     }
+    const ref = { taskId: task.id, ...(item ? { messageId: item.messageId } : {}) };
+    // Durable BEFORE the write: if main dies after the paste, the daemon knows
+    // a paste may have happened and the unit is not pasted again on its own.
+    try {
+      const started = await this.deps.daemonRpc(A2A_REMOTE_RPC.mark, { ...ref, attempted: true });
+      if (!isRecord(started) || started.ok !== true) throw new Error(isRecord(started) && typeof started.error === 'string' ? started.error : 'not recorded');
+    } catch (err) {
+      this.backoff(unit.key);
+      this.deps.log?.('warn', `[a2a-remote] ${unit.key}: could not record the attempt, not delivered: ${err instanceof Error ? err.message : String(err)}`);
+      return 'not-delivered';
+    }
     let res: unknown;
     try {
       res = item
@@ -245,13 +272,17 @@ export class RemoteA2aBridge {
         : await this.deps.sendToRenderer('a2a.task.send', this.taskParams(task, marker, resnapshot), { timeoutMs: GATED_NEW_TASK_SEND_MAIN_TIMEOUT_MS });
     } catch (err) {
       this.backoff(unit.key);
-      this.deps.log?.('warn', `[a2a-remote] delivery of ${unit.key} failed: ${err instanceof Error ? err.message : String(err)}`);
+      const msg = err instanceof Error ? err.message : String(err);
+      this.deps.log?.('warn', `[a2a-remote] delivery of ${unit.key} failed: ${msg}`);
+      // No window: nothing was written. Anything else (a timeout) may have
+      // pasted, so the attempt stands and the unit goes to a person.
+      if (/BrowserWindow is not available/.test(msg)) await this.mark(unit.key, { ...ref, mark: { attempted: false } });
       return 'not-delivered';
     }
     const result = res as A2aRemoteDeliveryResult;
-    const ref = { taskId: task.id, ...(item ? { messageId: item.messageId } : {}) };
     if (isRecord(result) && result.ok === true && result.delivered === true) {
       this.retry.delete(unit.key);
+      this.misses.delete(unit.key);
       await this.mark(unit.key, {
         ...ref,
         mark: { delivered: true, ...(result.ptyId ? { ptyId: result.ptyId } : {}), ...(result.note ? { note: result.note } : {}) },
@@ -267,6 +298,18 @@ export class RemoteA2aBridge {
     if (isRecord(result) && 'error' in result && typeof result.error === 'string') {
       this.deps.log?.('warn', `[a2a-remote] renderer refused ${unit.key}: ${result.error}`);
     }
+    // Written nowhere (no agent in the pane, a person typing): the attempt is
+    // cleared so a later try may write. A pane that keeps having no agent is
+    // held for a person instead of being retried forever.
+    const miss = this.misses.get(unit.key) ?? { count: 0, since: this.now() };
+    miss.count += 1;
+    this.misses.set(unit.key, miss);
+    if (miss.count >= REMOTE_BRIDGE_NO_AGENT_TRIES || this.now() - miss.since >= REMOTE_BRIDGE_NO_AGENT_MS) {
+      this.misses.delete(unit.key);
+      await this.mark(unit.key, { ...ref, mark: { held: 'no-agent' } });
+      return 'no-agent';
+    }
+    await this.mark(unit.key, { ...ref, mark: { attempted: false } });
     return 'not-delivered';
   }
 
@@ -348,8 +391,8 @@ export class RemoteA2aBridge {
         if ('delivered' in entry.mark) this.retry.delete(key);
         return;
       }
-      // A refusal (e.g. the task ended meanwhile) will not change on retry.
-      if (isRecord(res) && typeof res.error === 'string') this.pendingMarks.delete(key);
+      // Refused or unreachable: kept, and only the mark is retried on the
+      // next pull (it is dropped once the daemon no longer lists the unit).
     } catch {
       // daemon unreachable: kept in pendingMarks, retried on the next pull
     }

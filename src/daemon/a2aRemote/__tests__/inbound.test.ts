@@ -277,3 +277,19 @@ describe('acceptInbound — message id', () => {
   });
 });
 
+describe('acceptInbound — peer text is made safe before it is stored', () => {
+  it('drops escapes (CSI, OSC 52, bracketed-paste end), controls and CR line forgery, keeps newlines and tabs', async () => {
+    const linkId = activeLink();
+    const evil = 'ok\x1b[2J\x1b]52;c;cm0gLXJmIH4=\x07 line\x1b[201~rm -rf ~\rforged\ttab\nnext\x00\x9b31m\x7f';
+    const e = env(linkId, { text: evil });
+    expect(await acceptInbound(e, peer, deps)).toMatchObject({ ok: true });
+    const text = (tasks.getTask(remoteTaskId(linkId, e.messageId))!.history[0].parts[0] as { text: string }).text;
+    expect(text).toBe('ok linerm -rf ~\nforged\ttab\nnext');
+    expect(text).not.toMatch(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/);
+  });
+
+  it('a task whose text is nothing but escapes is refused', async () => {
+    const linkId = activeLink();
+    expect(await acceptInbound(env(linkId, { text: '\x1b[201~\x1b]0;x\x07' }), peer, deps)).toMatchObject({ ok: false, error: 'bad-request' });
+  });
+});

@@ -4,7 +4,7 @@ import path from 'node:path';
 import os from 'node:os';
 
 import { AppendOnlyLog } from '../../eventlog/AppendOnlyLog';
-import { A2aTaskService } from '../A2aTaskService';
+import { A2aTaskService, REMOTE_STATE_IDS_MAX } from '../A2aTaskService';
 import type { A2aRemoteTaskMarkerV1 } from '../../../shared/a2aRemote';
 import type { Message } from '../../../shared/types';
 
@@ -281,3 +281,28 @@ describe('A2aTaskService — remote messages and states', () => {
     expect(r.ok).toBe(false);
   });
 });
+
+describe('peer state ids are bounded', () => {
+  it('cancels repeated on an ended task under new ids are not kept', async () => {
+    const svc = newService(newLog());
+    await outbound(svc);
+    await svc.cancelTask({ taskId: 'rt-out', callerWorkspaceId: 'ws-local' });
+    for (let i = 0; i < 200; i++) {
+      // eslint-disable-next-line no-await-in-loop -- sequential by design
+      expect(await svc.applyRemoteState({ taskId: 'rt-out', linkId: LINK, messageId: `c-${i}`, to: 'canceled' })).toMatchObject({ ok: true });
+    }
+    expect((svc as unknown as { remoteStates: Map<string, Map<string, string>> }).remoteStates.get('rt-out')?.size ?? 0).toBe(0);
+  });
+
+  it('the per-task dedupe window is capped', async () => {
+    const svc = newService(newLog());
+    await inbound(svc, 'rt-cap');
+    const states = (svc as unknown as { remoteStates: Map<string, Map<string, string>> }).remoteStates;
+    // Fill the window directly through the recorder (each real transition needs a new state).
+    const record = (svc as unknown as { recordRemoteState(t: string, m: string, s: string): void }).recordRemoteState.bind(svc);
+    for (let i = 0; i < 500; i++) record('rt-cap', `m-${i}`, 'working');
+    expect(states.get('rt-cap')!.size).toBe(REMOTE_STATE_IDS_MAX);
+    expect(states.get('rt-cap')!.has('m-499')).toBe(true);
+  });
+});
+

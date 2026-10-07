@@ -8,7 +8,7 @@ import { AppendOnlyLog } from '../../eventlog/AppendOnlyLog';
 import { remoteTaskId } from '../ids';
 import { LinkStore } from '../linkStore';
 import { OutboxStore } from '../outboxStore';
-import { aliasTable, linkAlias, listRemoteTargets, sendRemoteReply, sendRemoteState, sendRemoteTask, type OutboundDeps } from '../outbound';
+import { aliasTable, linkAlias, listRemoteTargets, sendRemoteReply, sendRemoteState, sendRemoteTask, stateMessageId, syncRemoteTask, type OutboundDeps } from '../outbound';
 
 const HOST = '11111111-1111-4111-8111-111111111111';
 
@@ -188,10 +188,39 @@ describe('sendRemoteReply / sendRemoteState', () => {
 
   it('queues only a state the ledger is really in', async () => {
     const { id } = await outboundTask();
-    expect(sendRemoteState(deps, { taskId: id, state: 'completed' })).toMatchObject({ ok: false });
+    expect(await sendRemoteState(deps, { taskId: id, state: 'completed' })).toMatchObject({ ok: false });
     await tasks.cancelTask({ taskId: id, callerWorkspaceId: 'ws-a' });
-    expect(sendRemoteState(deps, { taskId: id, state: 'canceled', summary: 'not needed' })).toEqual({ ok: true, taskId: id });
+    expect(await sendRemoteState(deps, { taskId: id, state: 'canceled', summary: 'not needed' })).toEqual({ ok: true, taskId: id });
     expect(outbox.pending(HOST).at(-1)!.envelope).toMatchObject({ kind: 'state', taskId: id, state: 'canceled', text: 'not needed' });
+    // Asking again queues nothing more: the state was already told.
+    const before = outbox.pending(HOST).length;
+    expect(await sendRemoteState(deps, { taskId: id, state: 'canceled' })).toEqual({ ok: true, taskId: id });
+    expect(outbox.pending(HOST)).toHaveLength(before);
+  });
+
+  it('the ledger is the source of truth: a reply whose queueing failed is queued by the next sync', async () => {
+    const { id } = await outboundTask();
+    const enqueue = outbox.enqueue.bind(outbox);
+    let broken = true;
+    const flaky = { ...deps, outbox: { enqueue: (h: string, e: Parameters<OutboxStore['enqueue']>[1]) => {
+      if (broken) throw new Error('disk full');
+      return enqueue(h, e);
+    } } };
+    expect(await sendRemoteReply(flaky, { taskId: id, workspaceId: 'ws-a', text: 'kept' })).toEqual({ ok: true, taskId: id });
+    expect(outbox.pending(HOST).filter((r) => r.envelope.kind === 'reply')).toHaveLength(0);
+    broken = false;
+    expect(await syncRemoteTask(flaky, id)).toEqual({ ok: true, queued: 1 });
+    const reply = outbox.pending(HOST).find((r) => r.envelope.kind === 'reply')!;
+    expect(reply.envelope).toMatchObject({ text: 'kept' });
+    // Recorded as sent: a second sync queues nothing.
+    expect(await syncRemoteTask(flaky, id)).toEqual({ ok: true, queued: 0 });
+  });
+
+  it('a state is queued under an id derived from the ledger transition', async () => {
+    const { id } = await outboundTask();
+    await tasks.cancelTask({ taskId: id, callerWorkspaceId: 'ws-a' });
+    await syncRemoteTask(deps, id);
+    expect(outbox.pending(HOST).at(-1)!.envelope.messageId).toBe(stateMessageId(tasks.getTask(id)!));
   });
 
   it('nothing is queued on a revoked link', async () => {

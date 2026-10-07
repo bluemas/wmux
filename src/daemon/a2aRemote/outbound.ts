@@ -15,6 +15,7 @@ import {
   type A2aRemoteSendTaskInput,
   type A2aRemoteStateInput,
   type A2aRemoteTarget,
+  type A2aRemoteTaskState,
 } from '../../shared/a2aRemoteDelivery';
 import type { Message, Task } from '../../shared/types';
 import type { A2aTaskService } from '../a2a/A2aTaskService';
@@ -32,13 +33,14 @@ export type OutboundResult = { ok: true; taskId: string } | { ok: false; error: 
 
 export interface OutboundDeps {
   linkStore: Pick<LinkStore, 'get' | 'list' | 'checkMessage'>;
-  taskService: Pick<A2aTaskService, 'getTask' | 'createTask' | 'appendRemoteMessage' | 'cancelTask'>;
+  taskService: Pick<A2aTaskService, 'getTask' | 'createTask' | 'appendRemoteMessage' | 'cancelTask' | 'markRemote'>;
   outbox: Pick<OutboxStore, 'enqueue'>;
   /** Display alias of a link's remote pane (see `linkAlias`). */
   aliasFor: (link: A2aLinkRecordV1) => string;
   now?: () => number;
   /** Test seam for envelope messageIds (defaults to a random UUID). */
   mintId?: () => string;
+  log?: (level: 'info' | 'warn' | 'error', msg: string) => void;
 }
 
 /**
@@ -162,43 +164,98 @@ export async function sendRemoteReply(deps: OutboundDeps, input: A2aRemoteReplyI
     message: textMessage(messageId, localSide === 'from' ? 'user' : 'agent', input.text),
   });
   if (!appended.ok) return { ok: false, error: appended.error };
-  try {
-    deps.outbox.enqueue(link.remote.hostId, envelope(deps, link, messageId, { kind: 'reply', taskId: task.id, text: input.text }));
-  } catch (err) {
-    return { ok: false, error: `unavailable: the reply is stored here but could not be queued (${errText(err)})` };
-  }
+  // The ledger holds the reply now; queueing it is the sync's job, which the
+  // daemon also re-runs on start and periodically if this attempt fails.
+  const synced = await syncRemoteTask(deps, task.id);
+  if (!synced.ok) deps.log?.('warn', `[a2a-remote] reply on ${task.id} stored, queueing deferred: ${synced.error}`);
   return { ok: true, taskId: task.id };
 }
 
-/**
- * Queue a state change the local ledger ALREADY committed on a remote task.
- * The ledger is checked: a state the task is not in is refused, so this
- * cannot be used to tell the peer something that did not happen here.
- */
-/** What `sendRemoteState` needs: the ledger read, the link gate and the outbox. */
+/** What the outbound sync needs: the ledger (read + bookkeeping), the link gate and the outbox. */
 export type StateDeps = Pick<OutboundDeps, 'linkStore' | 'outbox' | 'now' | 'mintId'> & {
-  taskService: Pick<A2aTaskService, 'getTask'>;
+  taskService: Pick<A2aTaskService, 'getTask' | 'markRemote'>;
+  log?: (level: 'info' | 'warn' | 'error', msg: string) => void;
 };
 
-export function sendRemoteState(deps: StateDeps, input: A2aRemoteStateInput): OutboundResult {
-  const found = remoteTaskAndLink(deps, input.taskId);
-  if (!found.ok) return found;
-  const { task, link } = found;
+/**
+ * A state the local ledger ALREADY committed on a remote task, for the peer.
+ * The ledger is checked: a state the task is not in is refused, so this
+ * cannot tell the peer something that did not happen here. Idempotent: the
+ * sync sends each committed state once.
+ */
+export async function sendRemoteState(deps: StateDeps, input: A2aRemoteStateInput): Promise<OutboundResult> {
+  const task = deps.taskService.getTask(input.taskId);
+  if (!task || !task.metadata.remote) return { ok: false, error: 'unknown-task' };
   if (task.status.state !== input.state) {
     return { ok: false, error: `bad-request: task ${task.id} is ${task.status.state}, not ${input.state}` };
   }
-  const check = deps.linkStore.checkMessage(link.linkId, link.version, link.remote.hostId, 'outbound', 'state', undefined, { onThisLink: true });
+  const synced = await syncRemoteTask(deps, task.id, input.summary !== undefined ? { summary: input.summary } : {});
+  return synced.ok ? { ok: true, taskId: task.id } : synced;
+}
+
+const SYNCED_STATES: ReadonlySet<string> = new Set(['working', 'input-required', 'completed', 'failed', 'canceled']);
+
+/**
+ * The state message id is derived from the ledger transition (task, state,
+ * time), so queueing the same committed state twice is one message to the peer.
+ */
+export function stateMessageId(task: Pick<Task, 'id' | 'status'>): string {
+  const h = crypto.createHash('sha256').update(`${task.id}\0${task.status.state}\0${task.status.timestamp}`).digest('hex');
+  return `st-${h.slice(0, 32)}`;
+}
+
+/**
+ * Bring the peer up to date with OUR side of one remote task, from the ledger
+ * (the source of truth): every reply of ours not yet queued, then the current
+ * state if we have not told it yet. Each queued item is recorded on the
+ * ledger marker afterwards; a crash in between only queues it again under the
+ * same message id, which the peer answers as a duplicate. Run after every
+ * local change, on daemon start and periodically.
+ */
+export async function syncRemoteTask(
+  deps: StateDeps,
+  taskId: string,
+  opts: { summary?: string } = {},
+): Promise<{ ok: true; queued: number } | { ok: false; error: string }> {
+  const found = remoteTaskAndLink(deps, taskId);
+  if (!found.ok) return found;
+  const { task, link } = found;
+  const marker = task.metadata.remote as A2aRemoteTaskState;
+  const check = deps.linkStore.checkMessage(link.linkId, link.version, link.remote.hostId, 'outbound', 'reply', undefined, { onThisLink: true });
   if (!check.ok) return { ok: false, error: check.error };
-  const summary = input.summary?.slice(0, 2000);
+  const ours: Message['role'] = isRemoteWorkspaceId(task.metadata.from.workspaceId) ? 'agent' : 'user';
+  let queued = 0;
   try {
-    deps.outbox.enqueue(
-      link.remote.hostId,
-      envelope(deps, link, mint(deps), { kind: 'state', taskId: task.id, state: input.state, ...(summary ? { text: summary } : {}) }),
-    );
+    for (const m of task.history) {
+      if (m.role !== ours || m.messageId === marker.messageId || (marker.sent ?? []).includes(m.messageId)) continue;
+      const text = m.parts.map((p) => (p.kind === 'text' ? p.text : '')).join('');
+      if (!text) continue;
+      deps.outbox.enqueue(link.remote.hostId, envelope(deps, link, m.messageId, { kind: 'reply', taskId: task.id, text }));
+      // eslint-disable-next-line no-await-in-loop -- recorded in order
+      await deps.taskService.markRemote({ taskId: task.id, sent: m.messageId });
+      queued += 1;
+    }
+    const state = task.status.state;
+    if (SYNCED_STATES.has(state) && marker.stateSync !== state) {
+      const summary = (opts.summary ?? statusSummary(task))?.slice(0, 2000);
+      deps.outbox.enqueue(
+        link.remote.hostId,
+        envelope(deps, link, stateMessageId(task), { kind: 'state', taskId: task.id, state, ...(summary ? { text: summary } : {}) }),
+      );
+      await deps.taskService.markRemote({ taskId: task.id, stateSync: state });
+      queued += 1;
+    }
   } catch (err) {
-    return { ok: false, error: `unavailable: could not queue the state (${errText(err)})` };
+    return { ok: false, error: `unavailable: could not queue for the peer (${errText(err)})` };
   }
-  return { ok: true, taskId: task.id };
+  return { ok: true, queued };
+}
+
+function statusSummary(task: Task): string | undefined {
+  const status = task.status as { evidence?: { summary?: string }; message?: Message };
+  if (status.evidence?.summary) return status.evidence.summary;
+  const part = status.message?.parts?.find((p) => p.kind === 'text');
+  return part && part.kind === 'text' ? part.text : undefined;
 }
 
 // --- helpers --------------------------------------------------------------------
