@@ -552,7 +552,14 @@ export interface WebPeerResolver {
   touch?(peerId: string): void;
 }
 
-/** The `/api/a2a/*` route table, reached only with an authenticated peer. */
+/**
+ * The `/api/a2a/*` route table, reached only with an authenticated peer.
+ *
+ * Match on `pathname` exactly as given — the same raw (not percent-decoded)
+ * pathname the gate judged. Never decode it and dispatch again, and never
+ * hand the request on to another route table: the gate's decision covers this
+ * pathname and nothing else.
+ */
 export interface WebA2aRoutes {
   handle(req: http.IncomingMessage, res: http.ServerResponse, url: URL, pathname: string, peer: WebA2aPeer): Promise<void>;
 }
@@ -2367,6 +2374,18 @@ export class WebTerminalServer {
       return this.json(res, 403, { error: 'host not allowed' });
     }
 
+    // Cross-host A2A peer gate. Judged right after the Host guard and before
+    // EVERY other branch (static pages, `/api/pair`, `authenticate()`, the route
+    // table), so a peer credential reaches nothing but `/api/a2a/*`, and
+    // `/api/a2a/*` never reaches the operator/device routes.
+    if (isA2aRoute(p)) {
+      this.handleA2a(req, res, url, p).catch((err: unknown) => this.failRequest(res, err));
+      return;
+    }
+    if (looksLikePeerCredential(bearerOf(req))) {
+      return this.json(res, 403, { ok: false, error: 'forbidden' satisfies A2aRemoteErrorCode });
+    }
+
     // Static, unauthenticated pages (no secrets live in these). `/` is the
     // browser app (the desktop's own UI, app.html); `/classic` is the flat
     // client it falls back to on browsers that cannot run it, and `/pair` is
@@ -2463,10 +2482,6 @@ export class WebTerminalServer {
     url: URL,
     p: string,
   ): Promise<void> {
-    // Peer credentials and peer routes are judged BEFORE `authenticate()`, so a
-    // peer can never become a `WebPrincipal` and never reach the route table
-    // below. Placed after the Host guard (in `handle`), before any activity stamp.
-    if (await this.a2aGate(req, res, url, p)) return;
     // `/api/events` answers in two shapes on one route: an EventSource (which
     // cannot set headers, so it gets the same `?token=` exception as
     // `/api/stream`) and a plain JSON backlog fetch (Bearer only, like every
@@ -8985,27 +9000,17 @@ export class WebTerminalServer {
   // --- helpers ------------------------------------------------------------
 
   /**
-   * The cross-host A2A peer gate. Returns true when it answered the request.
-   *
-   *   - `/api/a2a/*` accepts a PEER credential and nothing else: no browser
-   *     (`Origin` present — server-to-server calls carry none), no operator
-   *     token, no device credential, no `?token=` and no stream ticket.
-   *   - Every other route refuses anything that claims to be a peer credential,
-   *     without attempting to authenticate it.
+   * `/api/a2a/*` — accepts a PEER credential and nothing else: no browser
+   * (`Origin` present — server-to-server calls carry none), no operator token,
+   * no device credential, no `?token=` and no stream ticket. (Every OTHER route
+   * refuses a peer credential in `handle` before reaching here.)
    *
    * Fail closed: no resolver or no handler is 503, never a fallthrough.
    */
-  private async a2aGate(req: http.IncomingMessage, res: http.ServerResponse, url: URL, p: string): Promise<boolean> {
-    const header = req.headers['authorization'];
-    const bearer = typeof header === 'string' && header.startsWith('Bearer ') ? header.slice('Bearer '.length) : null;
-    const refuse = (status: number, error: A2aRemoteErrorCode, extra?: Record<string, unknown>): true => {
+  private async handleA2a(req: http.IncomingMessage, res: http.ServerResponse, url: URL, p: string): Promise<void> {
+    const bearer = bearerOf(req);
+    const refuse = (status: number, error: A2aRemoteErrorCode, extra?: Record<string, unknown>): void =>
       this.json(res, status, { ok: false, error, ...extra });
-      return true;
-    };
-
-    if (!isA2aRoute(p)) {
-      return looksLikePeerCredential(bearer) ? refuse(403, 'forbidden') : false;
-    }
 
     if (req.headers['origin'] !== undefined) return refuse(403, 'forbidden');
     const cred = parsePeerCredential(bearer);
@@ -9033,16 +9038,24 @@ export class WebTerminalServer {
       return refuse(401, 'unauthorized', { reason: 'unknown' });
     }
     if (!result.ok) return refuse(401, 'unauthorized', { reason: result.reason });
+    // Bookkeeping, never fatal — whether it throws or returns a rejecting promise.
+    const touchFailed = (err: unknown): void => this.deps.log('warn', `[web] peer touch failed: ${errMsg(err)}`);
     try {
-      peers.touch?.(result.peerId);
+      Promise.resolve(peers.touch?.(result.peerId)).catch(touchFailed);
     } catch (err) {
-      this.deps.log('warn', `[web] peer touch failed: ${errMsg(err)}`);
+      touchFailed(err);
     }
 
     const routes = this.deps.a2a;
     if (!routes) return refuse(503, 'unavailable');
-    await routes.handle(req, res, url, p, { peerId: result.peerId, hostId: result.hostId, name: result.name });
-    return true;
+    try {
+      await routes.handle(req, res, url, p, { peerId: result.peerId, hostId: result.hostId, name: result.name });
+    } catch (err) {
+      this.deps.log('warn', `[web] a2a handler threw: ${errMsg(err)}`);
+      if (!res.headersSent) return refuse(500, 'unavailable');
+      // Mid-response: the body is already partial, so end the exchange.
+      res.destroy();
+    }
   }
 
   /**
@@ -9845,6 +9858,12 @@ function readTlsPem(kind: 'certificate' | 'private key', filePath: string): Buff
  * remains observable — as it was before M3, and as it is for every bearer
  * scheme that does not pad.
  */
+/** The `Authorization: Bearer` value, or null when there is none. */
+function bearerOf(req: http.IncomingMessage): string | null {
+  const header = req.headers['authorization'];
+  return typeof header === 'string' && header.startsWith('Bearer ') ? header.slice('Bearer '.length) : null;
+}
+
 function timingSafeEquals(supplied: string, expected: string): boolean {
   const a = Buffer.from(supplied);
   const b = Buffer.from(expected);

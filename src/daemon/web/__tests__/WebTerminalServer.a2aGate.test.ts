@@ -30,11 +30,12 @@ describe('A2A peer gate', () => {
   let peers: { resolve: Mock<WebPeerResolver['resolve']>; touch: Mock<(peerId: string) => void> };
   let a2a: { handle: Mock<WebA2aRoutes['handle']> };
   let devices: { resolve: Mock<WebDeviceResolver['resolve']>; mint: Mock<WebDeviceResolver['mint']> };
+  let listLiveSessions: Mock<() => never[]>;
 
   const makeServer = (deps: { peers?: WebPeerResolver; a2a?: WebA2aRoutes } = { peers, a2a }) => {
     const sessionManager = Object.assign(new EventEmitter(), {
       getSession: () => undefined,
-      listLiveSessions: () => [],
+      listLiveSessions,
     }) as unknown as DaemonSessionManager;
     const s = new WebTerminalServer({
       sessionManager,
@@ -90,6 +91,7 @@ describe('A2A peer gate', () => {
 
   beforeEach(() => {
     servers = [];
+    listLiveSessions = vi.fn<() => never[]>(() => []);
     peers = {
       resolve: vi.fn<WebPeerResolver['resolve']>(async (peerId, secret) =>
         peerId === PEER_ID && secret === SECRET
@@ -140,6 +142,44 @@ describe('A2A peer gate', () => {
       const s = await start(makeServer());
       const out = await call(s, '/api/sessions', { headers: bearer('wmuxpeer~not-a-uuid~x') });
       expect(out).toEqual({ status: 403, body: { ok: false, error: 'forbidden' } });
+    });
+
+    describe('cannot be smuggled past the gate', () => {
+      const attempts: Array<[string, string]> = [
+        ['OPTIONS', '/api/sessions'],
+        ['HEAD', '/api/sessions'],
+        ['GET', '/api//sessions'],
+        ['GET', '/API/a2a/hello'],
+        ['GET', '/api//a2a/hello'],
+        ['GET', '/api/a2a/../sessions'],
+        ['GET', '/api/%61%32%61/hello'],
+        ['GET', '/api/pair?code=K7PXM4QA'],
+        ['GET', '/'],
+        ['GET', '/manifest.webmanifest'],
+      ];
+      for (const [method, path] of attempts) {
+        it(`${method} ${path} is refused and reaches no route`, async () => {
+          const s = await start(makeServer());
+          const out = await call(s, path, { method, headers: bearer(PEER) });
+          expect([403, 404]).toContain(out.status);
+          if (method !== 'HEAD') expect(out.body).toEqual({ ok: false, error: 'forbidden' });
+          expect(peers.resolve).not.toHaveBeenCalled();
+          expect(devices.resolve).not.toHaveBeenCalled();
+          expect(a2a.handle).not.toHaveBeenCalled();
+          expect(listLiveSessions).not.toHaveBeenCalled();
+        });
+      }
+    });
+
+    it('a lower-case "bearer" scheme authenticates nothing on either side of the gate', async () => {
+      const s = await start(makeServer());
+      const out = await call(s, '/api/sessions', { headers: { Authorization: `bearer ${PEER}` } });
+      expect([401, 403]).toContain(out.status);
+      expect(peers.resolve).not.toHaveBeenCalled();
+      expect(listLiveSessions).not.toHaveBeenCalled();
+      const a2aOut = await call(s, '/api/a2a/hello', { headers: { Authorization: `bearer ${PEER}` } });
+      expect(a2aOut.status).toBe(401);
+      expect(a2a.handle).not.toHaveBeenCalled();
     });
 
     it('leaves the operator path untouched', async () => {
@@ -250,6 +290,26 @@ describe('A2A peer gate', () => {
       expect(peer).toEqual({ peerId: PEER_ID, hostId: HOST_ID, name: 'Office PC' });
     });
 
+    it('answers 500 unavailable when the handler throws before responding', async () => {
+      a2a.handle.mockRejectedValueOnce(new Error('boom'));
+      const s = await start(makeServer());
+      const out = await call(s, '/api/a2a/hello', { headers: bearer(PEER) });
+      expect(out).toEqual({ status: 500, body: { ok: false, error: 'unavailable' } });
+      // The server is still serving.
+      expect((await call(s, '/api/a2a/hello', { headers: bearer(PEER) })).status).toBe(200);
+    });
+
+    it('drops the connection when the handler throws mid-response', async () => {
+      a2a.handle.mockImplementationOnce(async (_req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': '100' });
+        res.write('{"partial":');
+        throw new Error('boom');
+      });
+      const s = await start(makeServer());
+      await expect(call(s, '/api/a2a/hello', { headers: bearer(PEER) })).rejects.toThrow();
+      expect((await call(s, '/api/a2a/hello', { headers: bearer(PEER) })).status).toBe(200);
+    });
+
     it('accepts a synchronous resolver', async () => {
       const sync: WebPeerResolver = {
         resolve: (peerId) => ({ ok: true, peerId, hostId: HOST_ID, name: 'Sync' }),
@@ -258,6 +318,21 @@ describe('A2A peer gate', () => {
       const out = await call(s, '/api/a2a/hello', { headers: bearer(PEER) });
       expect(out.status).toBe(200);
       expect(a2a.handle.mock.calls[0][4]).toEqual({ peerId: PEER_ID, hostId: HOST_ID, name: 'Sync' });
+    });
+
+    it('a touch that returns a rejecting promise is logged, not unhandled', async () => {
+      const unhandled = vi.fn();
+      process.on('unhandledRejection', unhandled);
+      try {
+        peers.touch.mockImplementation(() => Promise.reject(new Error('async bookkeeping')) as unknown as void);
+        const s = await start(makeServer());
+        const out = await call(s, '/api/a2a/hello', { headers: bearer(PEER) });
+        expect(out.status).toBe(200);
+        await new Promise((r) => setTimeout(r, 20));
+        expect(unhandled).not.toHaveBeenCalled();
+      } finally {
+        process.off('unhandledRejection', unhandled);
+      }
     });
 
     it('a touch that throws does not fail the request', async () => {
