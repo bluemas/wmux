@@ -162,6 +162,7 @@ import { getAccountStore } from '../../account/accountStore';
 import type { MoaApproval, MoaApprovalAnswerResult, MoaDelegatedApproval, MoaPendingDecision } from '../../../shared/moa';
 import { selectDelegatedApprovals } from '../../deck/moaDelegatedApprovals';
 import { resultFromTask, type MoaTaskResult } from '../../../shared/moaResult';
+import { moaRemoteTasks, type MoaRemoteTask } from '../../../shared/a2aRemoteDelivery';
 import {
   beginOrContinueDeckWork,
   clearActiveDeckWork,
@@ -2160,6 +2161,7 @@ export function registerDeckHandler(
     if (ev.type === 'a2a.received') {
       const hq = getHqWorkspaceId();
       if (hq === null || ev.to !== hq || ev.workspaceId !== hq) return;
+      emitMoaChanged();
       const receipt: CoalescerInput = {
         workspaceId: hq,
         // One subject per item kind: a reply buffered with its task keeps both.
@@ -2777,6 +2779,24 @@ export function registerDeckHandler(
       const list = Array.isArray(tasks) ? tasks : tasks ? [tasks] : [];
       const task = list.find((t) => !!t && typeof t === 'object' && (t as { id?: unknown }).id === taskId);
       return { result: resultFromTask(task) };
+    }),
+  );
+
+  // Work between this PC's Moa and other PCs' Moa, for the Moa panel: the HQ's
+  // newest task summaries in the daemon ledger, narrowed to brain-link tasks.
+  ipcMain.removeHandler(IPC.DECK_MOA_REMOTE_TASKS);
+  ipcMain.handle(
+    IPC.DECK_MOA_REMOTE_TASKS,
+    wrapHandler(IPC.DECK_MOA_REMOTE_TASKS, async (): Promise<{ tasks: MoaRemoteTask[] }> => {
+      const hq = getHqWorkspaceId();
+      const dc = opts.getDaemonClient?.() ?? null;
+      if (!hq || !dc) return { tasks: [] };
+      try {
+        const answer = (await dc.rpc('a2a.task.query', { workspaceId: hq, view: 'page' })) as { tasks?: unknown } | null;
+        return { tasks: moaRemoteTasks(Array.isArray(answer?.tasks) ? answer.tasks : []) };
+      } catch {
+        return { tasks: [] };
+      }
     }),
   );
 
@@ -3934,6 +3954,7 @@ export function registerDeckHandler(
     ipcMain.removeHandler(IPC.DECK_MOA_DELEGATED_APPROVALS);
     ipcMain.removeHandler(IPC.DECK_MOA_DELEGATED_ANSWER);
     ipcMain.removeHandler(IPC.DECK_MOA_TASK_RESULT);
+    ipcMain.removeHandler(IPC.DECK_MOA_REMOTE_TASKS);
     ipcMain.removeHandler(IPC.DECK_MOA_TRANSCRIPT_STATUS);
     ipcMain.removeHandler(IPC.DECK_MOA_TRANSCRIPT_SNAPSHOT);
     ipcMain.removeHandler(IPC.DECK_MOA_TRANSCRIPT_SUBSCRIBE);

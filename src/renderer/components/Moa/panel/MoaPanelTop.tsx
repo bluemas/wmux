@@ -11,9 +11,10 @@ import { useStore } from '../../../stores';
 import type { MoaPendingDecision } from '../../../../shared/moa';
 import { MoaDockContext, MoaWaitingOnYou, answeredElsewhere, useDelegatedApprovals, type DelegatedApprovalsApi, type ResolveDecision } from './MoaWaitingOnYou';
 import { MoaTaskCards } from './MoaTaskCards';
-import { defaultReceiptsApi, selectTaskCards, useWorkLinks, type MoaHandoffReceiptsApi, type WorkLinksApi } from './useMoaPanelData';
+import { defaultReceiptsApi, defaultRemoteTasksApi, selectTaskCards, useWorkLinks, type MoaHandoffReceiptsApi, type MoaRemoteTasksApi, type WorkLinksApi } from './useMoaPanelData';
 import { defaultHandoffResolve, type HandoffResolve } from './MoaHandoffCard';
 import { MoaHandoffReceipts } from './MoaHandoffReceipts';
+import { MoaRemoteTasks } from './MoaRemoteTasks';
 import { focusNotificationTarget, focusPaneByPtyId, type FocusTargetState } from '../../../hooks/useNotificationListener';
 import type { CommanderViewProps } from '../../Deck/CommanderView';
 
@@ -43,6 +44,7 @@ export function MoaPanelTop({
   receiptsApi,
   onOpenPane = openMoaPane,
   approvalsApi,
+  remoteTasksApi = defaultRemoteTasksApi(),
   t,
 }: {
   decisions: readonly MoaPendingDecision[];
@@ -55,6 +57,8 @@ export function MoaPanelTop({
   onOpenPane?: (workspaceId: string, paneId?: string) => void;
   /** Injected in tests; defaults to the preload. */
   approvalsApi?: DelegatedApprovalsApi;
+  /** Work exchanged with other PCs' Moa; defaults to the preload. */
+  remoteTasksApi?: MoaRemoteTasksApi;
   t: T;
 }): React.ReactElement {
   const delegatedApprovals = useDelegatedApprovals(approvalsApi);
@@ -124,6 +128,7 @@ export function MoaPanelTop({
       })()}
       <MoaTaskCards links={cards} pendingDecisions={decisions} workspaceName={workspaceName}
         conversationTaskId={conversationTaskId} onOpenConversation={openConversation} onOpenPane={onOpenPane} t={t} />
+      <MoaRemoteTasks api={remoteTasksApi} t={t} />
     </div>
   );
 }

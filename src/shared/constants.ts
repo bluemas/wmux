@@ -375,6 +375,9 @@ export const IPC = {
   // A delegated task's result from its A2A completion evidence ({ workspaceId,
   // taskId } → { result: MoaTaskResult | null }), for Moa's result card.
   DECK_MOA_TASK_RESULT: 'deck:moa:task-result',
+  // Tasks between this PC's Moa and other PCs' Moa (brain links), newest
+  // first (invoke → { tasks: MoaRemoteTask[] }). Re-read on DECK_MOA_CHANGED.
+  DECK_MOA_REMOTE_TASKS: 'deck:moa:remote-tasks',
   //   DECK_MOA_HANDOFF_RESOLVE (invoke MoaHandoffResolveRequest): answer a
   //   hand-off card by id (main reads the body from its own store; an edited
   //   body is the operator's own input). DECK_MOA_HANDOFF_RECEIPTS (invoke):

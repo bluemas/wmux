@@ -851,6 +851,9 @@ const electronAPI = {
         ipcRenderer.invoke(IPC.DECK_MOA_DECISIONS) as Promise<{ decisions: import('../shared/moa').MoaPendingDecision[] }>,
       taskResult: (args: { workspaceId: string; taskId: string }) =>
         ipcRenderer.invoke(IPC.DECK_MOA_TASK_RESULT, args) as Promise<{ result: import('../shared/moaResult').MoaTaskResult | null }>,
+      // Work exchanged with other PCs' Moa (cross-host A2A brain links).
+      remoteTasks: () =>
+        ipcRenderer.invoke(IPC.DECK_MOA_REMOTE_TASKS) as Promise<{ tasks: import('../shared/a2aRemoteDelivery').MoaRemoteTask[] }>,
       delegatedApprovals: () =>
         ipcRenderer.invoke(IPC.DECK_MOA_DELEGATED_APPROVALS) as Promise<{ approvals: import('../shared/moa').MoaDelegatedApproval[] }>,
       delegatedAnswer: (args: { approvalId: string; choiceKey: string; promptFingerprint: string }) =>

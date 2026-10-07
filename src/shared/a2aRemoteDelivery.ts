@@ -8,8 +8,8 @@
 //
 // Pure module: no node:* imports (the renderer imports it).
 
-import type { A2aEndpointKind, A2aRemoteTaskMarkerV1, HostId } from './a2aRemote';
-import type { Task } from './types';
+import { A2A_BRAIN_ALIAS, isRemoteTaskId, type A2aEndpointKind, type A2aRemoteTaskMarkerV1, type HostId } from './a2aRemote';
+import { isTaskState, type Task, type TaskState } from './types';
 
 /**
  * Daemon RPC method names for the delivery layer. Registered in the daemon's
@@ -183,3 +183,53 @@ export type A2aRemoteDeliveryResult =
   | { ok: true; delivered: true; duplicate?: boolean; ptyId?: string; note?: 'pasted-not-submitted' }
   | { ok: true; delivered: false; held?: A2aRemoteHeldReason; reason?: string }
   | { ok?: false; error: string };
+
+// ─── Moa panel: work exchanged with other PCs' Moa ─────────────────────────
+
+/** One task between this PC's Moa and another PC's Moa, for the Moa panel. */
+export interface MoaRemoteTask {
+  taskId: string;
+  title: string;
+  state: TaskState;
+  /** `sent`: this Moa asked; `received`: the other PC's Moa asked. */
+  direction: 'sent' | 'received';
+  /** The other PC's name. */
+  host: string;
+  updatedAt?: string;
+}
+
+/** The Moa panel lists at most this many, newest first. */
+export const MOA_REMOTE_TASKS_MAX = 20;
+
+/**
+ * Pick the Moa-to-Moa tasks out of the HQ's task summaries (`a2a.task.query`
+ * page view), newest first. One side is named `Moa` and the other `<PC>/Moa` —
+ * a remote pane's alias always has three parts, so a pane task never matches.
+ */
+export function moaRemoteTasks(summaries: readonly unknown[]): MoaRemoteTask[] {
+  const out: MoaRemoteTask[] = [];
+  const peerHost = (name: unknown): string | null => {
+    if (typeof name !== 'string') return null;
+    const parts = name.split('/');
+    return parts.length === 2 && parts[1] === A2A_BRAIN_ALIAS && parts[0] ? parts[0] : null;
+  };
+  for (const raw of summaries) {
+    if (!raw || typeof raw !== 'object') continue;
+    const t = raw as Record<string, unknown>;
+    if (!isRemoteTaskId(t.id) || !isTaskState(t.state)) continue;
+    const sentTo = t.from === A2A_BRAIN_ALIAS ? peerHost(t.to) : null;
+    const receivedFrom = t.to === A2A_BRAIN_ALIAS ? peerHost(t.from) : null;
+    const host = sentTo ?? receivedFrom;
+    if (!host) continue;
+    out.push({
+      taskId: t.id,
+      title: typeof t.title === 'string' ? t.title : '',
+      state: t.state,
+      direction: sentTo ? 'sent' : 'received',
+      host,
+      ...(typeof t.updatedAt === 'string' ? { updatedAt: t.updatedAt } : {}),
+    });
+  }
+  // ISO-8601 sorts as text.
+  return out.sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? '')).slice(0, MOA_REMOTE_TASKS_MAX);
+}
