@@ -28,12 +28,26 @@ describe('a2aRemote invite', () => {
     if (parsed.ok) expect(formatInvite(parsed.invite)).toBe(raw);
   });
 
+  it('lets a fragment extension after the fingerprint through the structure check', () => {
+    const parsed = parseInvite(`wmux-a2a://DESKTOP-WIN2:7681/K7PXM4QA#sha256=${FP}&alt=10.0.0.2,192.168.0.20`);
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) expect(parsed.invite.fingerprint256).toBe(FP);
+  });
+
   it.each([
     ['', 'empty'],
     ['https://host:7681/K7PXM4QA#sha256=' + FP, 'scheme'],
     ['wmux-a2a://bad!host:7681/K7PXM4QA#sha256=' + FP, 'host'],
     ['wmux-a2a://-dash:7681/K7PXM4QA#sha256=' + FP, 'host'],
     ['wmux-a2a://host:70000/K7PXM4QA#sha256=' + FP, 'port'],
+    ['wmux-a2a://h:abc/K7PXM4QA#sha256=' + FP, 'port'],
+    ['wmux-a2a://h:0x1f/K7PXM4QA#sha256=' + FP, 'port'],
+    ['wmux-a2a://h:/K7PXM4QA#sha256=' + FP, 'port'],
+    ['wmux-a2a://h:7681/k7pxm4qa#sha256=' + FP, 'code'],
+    ['wmux-a2a://h:7681/#sha256=' + FP, 'code'],
+    ['wmux-a2a://h:7681/K7PXM4QA#sha256=GG', 'fingerprint'],
+    ['wmux-a2a://h:7681/K7PXM4QA#sha256=', 'fingerprint'],
+    ['wmux-a2a://h:7681/K7PXM4QA#sha256=GG&alt=10.0.0.2', 'fingerprint'],
     ['wmux-a2a://host:7681/K7PXM4Q0#sha256=' + FP, 'code'],
     ['wmux-a2a://host:7681/K7PXM4QA#sha256=ABCD', 'fingerprint'],
   ])('rejects %s as %s', (raw, error) => {
