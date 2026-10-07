@@ -172,6 +172,13 @@ describe('a2a.task.send — Moa to another PC\'s Moa (brain link)', () => {
     expect(remote.reply).toHaveBeenCalledWith({ taskId: RT, workspaceId: 'ws-hq', text: 'done: green' });
   });
 
+  it('a brain\'s status on a remote task uses its verified workspace and is queued for the peer', async () => {
+    const res = await setup().dispatch({ id: 'u', method: 'a2a.task.update', params: { workspaceId: 'ws-forged', taskId: RT, status: 'completed' }, commanderToken: asBrain('ws-hq') });
+    expect(res.ok).toBe(true);
+    expect(daemonCalls.find((c) => c.method === 'a2a.task.update')?.params).toMatchObject({ taskId: RT, workspaceId: 'ws-hq', status: 'completed' });
+    expect(remote.state).toHaveBeenCalledWith({ taskId: RT, state: 'completed' });
+  });
+
   it('discover lists the brain link as <PC>/Moa', async () => {
     remote.listTargets.mockResolvedValue([brainTarget]);
     const res = await call(setup(), 'a2a.discover', { workspaceId: 'ws-hq' });

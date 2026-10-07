@@ -749,6 +749,9 @@ export function registerA2aRpc(
     const marked = refuseHandoffMarker('a2a.task.update', rawParams.message, ctx);
     if (marked) return marked;
     const params = withOperatorOrigin(rawParams, ctx);
+    // A brain moves a remote task as its token-verified workspace (Moa: the
+    // HQ), never a wire value: the state also goes to the other PC.
+    if (ctx?.commanderWorkspace && remote && isRemoteTaskId(params.taskId)) params.workspaceId = ctx.commanderWorkspace;
     // 메시지 선검증(shared validateMessage — 렌더러와 동일 계약): 데몬 커밋 후
     // 렌더러가 메시지를 거부해 캐시-데몬이 갈라지는 창을 닫는다.
     if (typeof params.message === 'string') {
