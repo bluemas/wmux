@@ -384,6 +384,23 @@ describe('#874 attachImeAnchor', () => {
     handle.dispose();
   });
 
+  it('ignores xterm\'s cell height once it disagrees with the box by more than rounding', () => {
+    // A font-size change resizes the grid before xterm re-syncs the textarea,
+    // so `style.height` keeps the OLD cell height for a while. A gap that
+    // wide is staleness, not rounding, and the measured box wins.
+    const dom = buildTerminalDom(10, 14, 39);
+    const { terminal, onRender, state } = makeTerminal(dom);
+    const handle = attachImeAnchor(terminal);
+    Object.assign(state, { baseY: 6, viewportY: 4, cursorY: 10, cursorX: 0 });
+    dom.textarea.style.top = `${10 * 14}px`;
+    dom.textarea.style.left = '0px';
+    dom.textarea.style.height = '17.6px'; // the previous font's cell
+    onRender.fire(undefined);
+    // Two cells of scrolled-viewport drift at the box's 14px.
+    expect(translateOf(dom.textarea)?.dy).toBeCloseTo(28, 6);
+    handle.dispose();
+  });
+
   it('does not sample the cell height from a composition-resized textarea', () => {
     const dom = buildTerminalDom(10, 16, 39);
     const { terminal, onRender, state } = makeTerminal(dom);
