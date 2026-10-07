@@ -114,6 +114,10 @@ describe('RemoteHostStore', () => {
     const t = make();
     expect(t.get(HOST)).toBeUndefined();
     expect(t.credentialFor(HOST)).toBeNull();
+    // The rotated previous generation must not keep the removed bearer.
+    for (const f of fs.readdirSync(dir)) {
+      expect(fs.readFileSync(path.join(dir, f), 'utf-8')).not.toContain(SECRET);
+    }
   });
 
   it('add / updates roll back on a failed write', () => {

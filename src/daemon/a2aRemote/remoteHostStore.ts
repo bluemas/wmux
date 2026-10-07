@@ -212,6 +212,13 @@ export class RemoteHostStore {
       }
       throw new Error(`${REMOTE_HOSTS_FILE}: could not apply owner-only ACL — refusing to persist credentials`);
     }
+    // The write rotated the previous generation to `.bak`. This store never
+    // reads it, and it may still hold a bearer the operator just removed.
+    try {
+      fs.rmSync(`${this.filePath}.bak`, { force: true });
+    } catch (err) {
+      this.log('warn', `[a2a-remote] could not remove ${REMOTE_HOSTS_FILE}.bak: ${errMsg(err)}`);
+    }
   }
 
   private load(): void {
