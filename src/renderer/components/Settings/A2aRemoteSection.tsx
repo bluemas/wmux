@@ -32,6 +32,8 @@ export interface A2aRemoteViewProps {
   onPortCommit: () => void;
   // invite (this PC)
   invite: string | null;
+  /** The addresses the open invite offers, in the order the other PC tries them. */
+  inviteAddresses: string[];
   remainingSec: number | null;
   copied: boolean;
   onCreateInvite: () => void;
@@ -47,6 +49,8 @@ export interface A2aRemoteViewProps {
   hosts: A2aRemoteHostRecordV1[];
   peers: A2aPeerRecordV1[];
   confirming: A2aRemoteConfirm;
+  /** Outcome of the last "Remove" of a PC this PC joined. */
+  removed: { name: string; remoteRevoked: boolean } | null;
   onAsk: (c: Exclude<A2aRemoteConfirm, null>) => void;
   onConfirm: (c: Exclude<A2aRemoteConfirm, null>) => void;
   onCancelConfirm: () => void;
@@ -63,9 +67,9 @@ export function formatRemaining(sec: number): string {
 export function A2aRemoteView(props: A2aRemoteViewProps) {
   const {
     status, busy, onToggleEnabled, portDraft, onPortDraft, onPortCommit,
-    invite, remainingSec, copied, onCreateInvite, onCopyInvite, onCancelInvite,
+    invite, inviteAddresses, remainingSec, copied, onCreateInvite, onCopyInvite, onCancelInvite,
     joinInput, onJoinInput, onJoin, joinBusy, joinOutcome,
-    hosts, peers, confirming, onAsk, onConfirm, onCancelConfirm, error, t,
+    hosts, peers, confirming, removed, onAsk, onConfirm, onCancelConfirm, error, t,
   } = props;
 
   const confirmRow = (kind: 'host' | 'peer', id: string, label: string) =>
@@ -112,10 +116,12 @@ export function A2aRemoteView(props: A2aRemoteViewProps) {
           </span>
         </SettingRow>
         {status.enabled && (
-          <SettingNote data-testid="a2a-remote-listening" tone={status.listening ? 'muted' : 'warning'}>
-            {status.listening
-              ? t('settings.a2aRemoteListening', { port: status.port })
-              : t('settings.a2aRemoteNotListening', { error: status.lastError ?? '—' })}
+          <SettingNote data-testid="a2a-remote-listening" tone={status.listening && !status.lastError ? 'muted' : 'warning'}>
+            {!status.listening
+              ? t('settings.a2aRemoteNotListening', { error: status.lastError ?? '—' })
+              : status.lastError
+                ? t('settings.a2aRemotePortFailed', { error: status.lastError, port: status.port })
+                : t('settings.a2aRemoteListening', { port: status.port })}
           </SettingNote>
         )}
 
@@ -139,6 +145,11 @@ export function A2aRemoteView(props: A2aRemoteViewProps) {
             </UiButton>
           )}
         </SettingRow>
+        {invite && inviteAddresses.length > 0 && (
+          <SettingNote data-testid="a2a-remote-invite-addresses">
+            {t('settings.a2aRemoteInviteAddresses', { addresses: inviteAddresses.join(', ') })}
+          </SettingNote>
+        )}
         {!status.listening && !invite && (
           <SettingNote>{t('settings.a2aRemoteInviteNeedsListener')}</SettingNote>
         )}
@@ -173,6 +184,11 @@ export function A2aRemoteView(props: A2aRemoteViewProps) {
       </SettingsSection>
 
       <SettingsSection title={t('settings.a2aRemoteHosts')}>
+        {removed && (
+          <SettingNote data-testid="a2a-remote-removed" tone={removed.remoteRevoked ? 'muted' : 'warning'}>
+            {t(removed.remoteRevoked ? 'settings.a2aRemoteRemovedBoth' : 'settings.a2aRemoteRemovedLocalOnly', { name: removed.name })}
+          </SettingNote>
+        )}
         {hosts.length === 0 ? (
           <SettingNote>{t('settings.a2aRemoteListEmpty')}</SettingNote>
         ) : (
@@ -218,6 +234,8 @@ export function A2aRemoteSection() {
   const [busy, setBusy] = useState(false);
   const [portDraft, setPortDraft] = useState('');
   const [invite, setInvite] = useState<string | null>(null);
+  const [inviteAddresses, setInviteAddresses] = useState<string[]>([]);
+  const [removed, setRemoved] = useState<{ name: string; remoteRevoked: boolean } | null>(null);
   const [deadline, setDeadline] = useState<number | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const [copied, setCopied] = useState(false);
@@ -299,7 +317,12 @@ export function A2aRemoteSection() {
     if (!api) return;
     setError(null); setCopied(false);
     const r = await ipcInvoke(() => api.pairBegin());
-    if (r.ok) { setInvite(r.data.invite); setDeadline(r.data.expiresAt); setNow(Date.now()); }
+    if (r.ok) {
+      setInvite(r.data.invite);
+      setInviteAddresses(Array.isArray(r.data.addresses) ? r.data.addresses : []);
+      setDeadline(r.data.expiresAt);
+      setNow(Date.now());
+    }
     else setError(t('settings.a2aRemoteActionFailed'));
   }, [api, ipcInvoke, t]);
 
@@ -338,12 +361,18 @@ export function A2aRemoteSection() {
   const onConfirm = useCallback(async (c: Exclude<A2aRemoteConfirm, null>) => {
     if (!api) return;
     setConfirming(null);
-    const r = c.kind === 'host'
-      ? await ipcInvoke(() => api.hostsRemove(c.id))
-      : await ipcInvoke(() => api.peersRevoke(c.id));
-    if (!r.ok) setError(t('settings.a2aRemoteActionFailed'));
+    setRemoved(null);
+    if (c.kind === 'host') {
+      const name = hosts.find((h) => h.hostId === c.id)?.name ?? '';
+      const r = await ipcInvoke(() => api.hostsRemove(c.id));
+      if (r.ok && r.data?.ok) setRemoved({ name, remoteRevoked: r.data.remoteRevoked === true });
+      else setError(t('settings.a2aRemoteActionFailed'));
+    } else {
+      const r = await ipcInvoke(() => api.peersRevoke(c.id));
+      if (!r.ok) setError(t('settings.a2aRemoteActionFailed'));
+    }
     void refresh();
-  }, [api, ipcInvoke, refresh, t]);
+  }, [api, ipcInvoke, refresh, t, hosts]);
 
   if (unavailable) {
     return (
@@ -369,6 +398,7 @@ export function A2aRemoteSection() {
       onPortDraft={setPortDraft}
       onPortCommit={onPortCommit}
       invite={invite}
+      inviteAddresses={inviteAddresses}
       remainingSec={deadline != null ? Math.ceil((deadline - now) / 1000) : null}
       copied={copied}
       onCreateInvite={() => void onCreateInvite()}
@@ -382,6 +412,7 @@ export function A2aRemoteSection() {
       hosts={hosts}
       peers={peers}
       confirming={confirming}
+      removed={removed}
       onAsk={setConfirming}
       onConfirm={(c) => void onConfirm(c)}
       onCancelConfirm={() => setConfirming(null)}

@@ -22,10 +22,10 @@ function props(over: Partial<A2aRemoteViewProps> = {}): A2aRemoteViewProps {
       name: 'DESK-PC', fingerprint256: FP, lastError: null,
     },
     busy: false, onToggleEnabled: () => undefined, portDraft: '45660', onPortDraft: () => undefined, onPortCommit: () => undefined,
-    invite: null, remainingSec: null, copied: false,
+    invite: null, inviteAddresses: [], remainingSec: null, copied: false,
     onCreateInvite: () => undefined, onCopyInvite: () => undefined, onCancelInvite: () => undefined,
     joinInput: '', onJoinInput: () => undefined, onJoin: () => undefined, joinBusy: false, joinOutcome: null,
-    hosts: [], peers: [], confirming: null,
+    hosts: [], peers: [], confirming: null, removed: null,
     onAsk: () => undefined, onConfirm: () => undefined, onCancelConfirm: () => undefined,
     error: null, t: tStub,
     ...over,
@@ -67,7 +67,7 @@ describe('A2aRemoteView', () => {
   it('maps every join error to its own message key, all present in en', () => {
     const codes: A2aRemoteJoinError[] = [
       'invite-invalid', 'self', 'fingerprint-mismatch', 'connect-refused', 'timeout', 'not-found',
-      'code-expired', 'code-invalid', 'already-paired', 'protocol', 'failed',
+      'code-expired', 'code-invalid', 'already-paired', 'rate-limited', 'protocol', 'failed',
     ];
     for (const error of codes) {
       const html = render(props({ joinOutcome: { ok: false, error } }));
@@ -100,6 +100,27 @@ describe('A2aRemoteView', () => {
     const html = render(props({ hosts: [host] }));
     expect(html).toContain('BUILD-BOX');
     expect(html).toContain('build-box:45660');
+  });
+});
+
+describe('A2aRemoteView — addresses and outcomes', () => {
+  it('lists the addresses the open invite offers', () => {
+    const html = render(props({
+      invite: 'wmux-a2a://desk:45660/ABCDEFGH#sha256=x&alt=10.0.0.5',
+      inviteAddresses: ['desk', '10.0.0.5'],
+      remainingSec: 30,
+    }));
+    expect(html).toContain('settings.a2aRemoteInviteAddresses(desk, 10.0.0.5)');
+  });
+
+  it('says whether a removed PC was told', () => {
+    expect(render(props({ removed: { name: 'BOX', remoteRevoked: true } }))).toContain('settings.a2aRemoteRemovedBoth(BOX)');
+    expect(render(props({ removed: { name: 'BOX', remoteRevoked: false } }))).toContain('settings.a2aRemoteRemovedLocalOnly(BOX)');
+  });
+
+  it('a failed port change shows the error while the old port keeps serving', () => {
+    const html = render(props({ status: { ...props().status, lastError: 'EADDRINUSE' } }));
+    expect(html).toContain('settings.a2aRemotePortFailed(EADDRINUSE,45660)');
   });
 });
 

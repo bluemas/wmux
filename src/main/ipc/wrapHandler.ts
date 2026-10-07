@@ -119,6 +119,8 @@ const NO_ARGS_SUMMARY_CHANNELS = new Set([
   'clipboard:has-image',
   'clipboard:write-ephemeral',
   'clipboard:keep-ephemeral',
+  // A pasted cross-PC invite carries a live pairing code.
+  'a2aRemote:join',
 ]);
 
 /** Heuristic classification of an unknown error into one of the known codes. */
