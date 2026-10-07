@@ -58,8 +58,8 @@ describe('scrollback restore — chain instrumentation', () => {
     const flushLog = sessionPipeSrc.indexOf('[SessionPipe.flush]');
     expect(flushLog).toBeGreaterThan(0);
 
-    // readAllWithGeometry() is readAll() plus the sizes the bytes were written at.
-    const readAllMatch = sessionPipeSrc.indexOf('this.ringBuffer.readAllWithGeometry()');
+    // readRing() is readAllWithGeometry() plus the #1843 mode preamble.
+    const readAllMatch = sessionPipeSrc.indexOf('const { raw: buffered, replay, geometry, writtenAt: writtenBefore } = this.readRing()');
     expect(readAllMatch).toBeGreaterThan(0);
     // The log comes after we computed `buffered` from readAll() and
     // before the conditional socket.write that actually emits the bytes.

@@ -27,6 +27,8 @@ import { registerHelpTools } from './playwright/tools/help';
 import { randomUUID } from 'node:crypto';
 import { registerComputerTools } from './computer/tool';
 import { readComputerUseEnabled } from '../shared/computer/config';
+import { readMoaAskEnabled } from '../shared/moaAskSwitch';
+import { registerMoaAskTools } from './moaAsk';
 import { registerReplayTools } from './browser-replay/tool';
 import { ActionRing } from './browser-replay/actionRing';
 import { collectingServer, type CollectedTool } from './playwright/toolCollector';
@@ -455,8 +457,15 @@ const codexCallScope = new AsyncLocalStorage<CodexCallScope>();
 let codexParentClass: 'shared-server' | 'other' | null = null;
 let codexParentHome = '';
 let codexParentCheck: Promise<McpParentClass> | null = null;
+// Where no owner index can exist (Windows today) an 'unknown' parent decides
+// exactly what 'other' does (legacy), so a lookup that keeps timing out would
+// cost its full 5 s on every threaded call for nothing. There it is remembered
+// for a while; elsewhere it fails the call as retryable and is asked again.
+const CODEX_PARENT_UNKNOWN_MEMO_MS = 60_000;
+let codexParentUnknownUntil = 0;
 function classifyCodexParent(): Promise<McpParentClass> {
   if (codexParentClass) return Promise.resolve(codexParentClass);
+  if (Date.now() < codexParentUnknownUntil) return Promise.resolve('unknown');
   codexParentCheck ??= (async () => {
     try {
       const start = ctx.callerPpid ?? (await getParentPid(ctx.callerPid)) ?? -1;
@@ -465,6 +474,8 @@ function classifyCodexParent(): Promise<McpParentClass> {
       if (parentClass !== 'unknown') {
         codexParentClass = parentClass;
         codexParentHome = codexHomeFromParentChain(chain);
+      } else if (!codexOwnerIndexAvailable()) {
+        codexParentUnknownUntil = Date.now() + CODEX_PARENT_UNKNOWN_MEMO_MS;
       }
       logIdentity(`parent ${parentClass}`);
       return parentClass;
@@ -1006,7 +1017,13 @@ async function lookupPidMapWorkspace(): Promise<PidMapLookup> {
   // shell(PTY). The walk queries the OS process table by pid, so it works
   // identically whether we run inside the agent's tree (single child) or in
   // the broker (which starts from the shim's pid asserted at connect).
-  let currentPid = ctx.callerPpid ?? (await getParentPid(ctx.callerPid)) ?? -1;
+  // On Windows callerPpid is only the pid our parent had when we started: an
+  // orphan is never re-parented, so once Windows hands that pid to a newer
+  // process (a new pane's shell) it names a stranger. Ask getParentPid there,
+  // which checks creation times, so the first edge is checked like every later
+  // hop. Elsewhere an orphan is re-parented and callerPpid stays trustworthy.
+  const knownPpid = process.platform === 'win32' ? null : ctx.callerPpid;
+  let currentPid = knownPpid ?? (await getParentPid(ctx.callerPid)) ?? -1;
   let depth = 0;
   for (; depth < 10 && currentPid > 1; depth++) {
     const match = knownPids.get(currentPid);
@@ -1176,9 +1193,15 @@ async function getParentPid(pid: number): Promise<number | null> {
     if (process.platform === 'win32') {
       const path = await import('path');
       const ps = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+      // Windows never re-parents an orphan: a dead parent's pid stays as the
+      // ppid and may since belong to a newer process (a new pane's shell, after
+      // a Codex app-server updated itself). Only a parent created no later than
+      // the child is its parent; anything else ends the walk.
       const { stdout } = await execFileAsync(ps, [
         '-NoProfile', '-Command',
-        `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").ParentProcessId`,
+        `$c=Get-CimInstance Win32_Process -Filter "ProcessId=${pid}"; if ($c) { ` +
+          `$p=Get-CimInstance Win32_Process -Filter ("ProcessId=" + $c.ParentProcessId); ` +
+          `if ($p -and $p.CreationDate -le $c.CreationDate) { $c.ParentProcessId } }`,
       ], { encoding: 'utf8', windowsHide: true, timeout: 5000 });
       const parsed = parseInt(stdout.trim(), 10);
       return isNaN(parsed) ? null : parsed;
@@ -2208,6 +2231,25 @@ registerComputerTools(server, MCP_CATALOG_OPTIONS, {
     return sendRpc(method, { ...params, ...identity }, timeoutMs);
   },
 });
+
+// moa_ask / moa_ask_status — Moa's delegate (src/mcp/moaAsk.ts). Same opt-in
+// pattern as computer use: only when the owner turned the ask mode on
+// (moa-ask.json), only in the full profile, appended after every other
+// full-profile tool, so the published surface is byte-identical for everyone
+// else. Main re-checks its own config on every call.
+if (SURFACE_PROFILE === 'full' && readMoaAskEnabled()) {
+  registerMoaAskTools(server, {
+    callRpc: (method, params) => callRpc(method, params),
+    // Hit-only, like computer use: resolve the workspace first so the
+    // PID-map walk has run, then send the verified pane (never the env hint).
+    getSenderPtyId: async () => {
+      if (!verifiedPtyId()) {
+        try { await requireWorkspaceId(); } catch { /* not-attributed in main */ }
+      }
+      return verifiedPtyId();
+    },
+  });
+}
 
 // === Commander-only registration lane ===
 // Tools that exist ONLY under --commander. They bypass the manifest filter on

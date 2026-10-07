@@ -889,7 +889,8 @@ export class PTYBridge {
 
       const win = this.getWindow();
       if (win && !win.isDestroyed()) {
-        win.webContents.send(IPC.PTY_EXIT, ptyId, exitCode);
+        // The signal rides along: node-pty reports a killed shell as exit 0.
+        win.webContents.send(IPC.PTY_EXIT, ptyId, exitCode, typeof signal === 'number' ? signal : null);
 
         // Clear agentStatus so the sidebar dot stops claiming the agent is
         // still running/waiting after the process is gone. 'idle' is the

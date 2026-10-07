@@ -39,6 +39,7 @@ import type { FanOutRequest, FanOutResult, FanOutService, FanOutStatus } from '.
 import type { RpcRouter } from '../../RpcRouter';
 import { FanOutGuards } from '../../../worktask/fanoutGuards';
 import type { FanoutPreset } from '../../../../shared/fanoutPreset';
+import type { DaemonClient } from '../../../DaemonClient';
 
 const CALLER_WS = 'ws-caller';
 // Resolved to NATIVE form. The handler runs the caller's cwd through
@@ -94,6 +95,8 @@ interface Harness {
   rendererCalls: () => string[];
   /** Params of each fanout.resolveOrigin call. */
   resolveOriginParams: () => Array<Record<string, unknown>>;
+  /** The daemon client's rpc (only reached when daemonSessions is given). */
+  daemonRpc: ReturnType<typeof vi.fn>;
 }
 
 function setup(opts?: {
@@ -114,6 +117,10 @@ function setup(opts?: {
   /** What the renderer answers to fanout.resolveOrigin. Defaults to pane
    *  p1/s1 of the caller's workspace; 'throw' models a renderer miss. */
   resolveOrigin?: unknown | 'throw';
+  /** Host platform the handler resolves paths for. Defaults to the real one. */
+  platform?: NodeJS.Platform;
+  /** What daemon.listSessions answers. Omitted = no daemon client at all. */
+  daemonSessions?: unknown[];
 }): Harness {
   const commanderAnchorPtyId =
     opts?.commanderAnchorPtyId === undefined ? 'pty-1' : opts.commanderAnchorPtyId;
@@ -223,11 +230,16 @@ function setup(opts?: {
       countLiveTasks: () => 0,
       ledgerTaskOwner: () => null,
     });
+  const daemonRpc = vi.fn(async () => opts?.daemonSessions);
   registerFanOutRpc(router, service, () => null, {
     guards,
     workerPermissionMode: () => 'auto',
     requireApproval: () => opts?.requireApproval ?? true,
     presets: () => opts?.presets ?? [],
+    platform: opts?.platform,
+    getDaemonClient: opts?.daemonSessions
+      ? () => ({ isConnected: true, rpc: daemonRpc }) as unknown as DaemonClient
+      : undefined,
   });
   const handler = handlers.get('task.fanout.start');
   if (!handler) throw new Error('task.fanout.start was not registered');
@@ -250,6 +262,7 @@ function setup(opts?: {
     approveHungPrompt: () => releaseApproval?.({ approved: true, outcome: 'approved' }),
     rendererCalls: () => [...rendererCalls],
     resolveOriginParams: () => [...resolveOriginParams],
+    daemonRpc,
   };
 }
 
@@ -1735,5 +1748,119 @@ describe('task.fanout.start — preset and agents', () => {
     expect(err.code).toBe('NOT_AUTHORIZED');
     expect(err.message).toMatch(/fan-out task of ws-brain/);
     expect(h.start).not.toHaveBeenCalled();
+  });
+});
+
+describe('a WSL caller pane is resolved to the Windows path of its directory', () => {
+  // The owner's report: an agent in a WSL pane under /mnt/d/... was refused
+  // "not a git repository" for C:\mnt\d\... — path.resolve on win32 roots a
+  // POSIX path on the current drive.
+  const gitDirs = (): string[] => vi.mocked(git).mock.calls.map((c) => c[1] as string);
+  // `toplevel` is what git prints; it defaults to the root itself. A UNC
+  // answer would send repoRootOf's realpath out over the network on a Windows
+  // runner, so the \\wsl$ case answers with a local path instead.
+  const answerFor = (root: string, toplevel = root.replace(/\\/g, '/')) => {
+    vi.mocked(git).mockImplementation(async (_args: string[], dir: string) =>
+      dir.toLowerCase().startsWith(root.toLowerCase())
+        ? { stdout: `${toplevel}\n`, stderr: '', code: 0 }
+        : { stdout: '', stderr: 'fatal: not a git repository', code: 128 });
+  };
+
+  it('/mnt/d/<path with spaces and dots> becomes D:\\<same path>', async () => {
+    const h = setup({ platform: 'win32', cwd: '/mnt/d/2026/1. coding/1. coding/260618.ax-tm' });
+    answerFor('D:\\2026\\1. coding\\1. coding\\260618.ax-tm');
+    const res = await h.call(goodParams());
+    expect(res).toMatchObject({ ok: true, status: 'accepted', repoPath: 'D:/2026/1. coding/1. coding/260618.ax-tm' });
+    expect(gitDirs()).toContain('D:\\2026\\1. coding\\1. coding\\260618.ax-tm');
+    expect(gitDirs().some((d) => d.startsWith('C:\\mnt'))).toBe(false);
+  });
+
+  it('/mnt/c/... becomes C:\\...', async () => {
+    const h = setup({ platform: 'win32', cwd: '/mnt/c/Users/me/repo' });
+    answerFor('C:\\Users\\me\\repo');
+    expect(await h.call(goodParams())).toMatchObject({ ok: true, repoPath: 'C:/Users/me/repo' });
+  });
+
+  it("a distro-internal path goes through \\\\wsl$\\<the pane's own distro>", async () => {
+    const h = setup({
+      platform: 'win32',
+      cwd: '/home/me/repo',
+      daemonSessions: [
+        { id: 'pty-sibling', wslTarget: { distribution: 'Debian', user: 'me' } },
+        { id: 'pty-1', wslTarget: { distribution: 'Ubuntu-24.04', user: 'me' } },
+      ],
+    });
+    answerFor('\\\\wsl$\\Ubuntu-24.04\\home\\me\\repo', CALLER_REPO_ROOT);
+    expect(await h.call(goodParams())).toMatchObject({ ok: true, status: 'accepted' });
+    expect(gitDirs()).toContain('\\\\wsl$\\Ubuntu-24.04\\home\\me\\repo');
+  });
+
+  it("a \\\\wsl$ repository git refuses names git's cause, not just 'not a repository'", async () => {
+    // Git for Windows refuses a \\wsl$ share it does not trust; seen live on
+    // Windows 11 + Ubuntu 24.04 with Git 2.55.
+    const h = setup({
+      platform: 'win32',
+      cwd: '/home/me/repo',
+      daemonSessions: [{ id: 'pty-1', wslTarget: { distribution: 'Ubuntu', user: 'me' } }],
+    });
+    vi.mocked(git).mockImplementation(async () => ({
+      stdout: '',
+      stderr:
+        "fatal: detected dubious ownership in repository at '//wsl$/Ubuntu/home/me/repo'\n" +
+        "'//wsl$/Ubuntu/home/me/repo' may refer to a non-local directory\n",
+      code: 128,
+    }));
+    const err = errorOf(await h.call(goodParams()));
+    expect(err.code).toBe('FAILED_PRECONDITION');
+    expect(err.message).toContain('\\\\wsl$\\Ubuntu\\home\\me\\repo');
+    expect(err.message).toMatch(/\(git: fatal: detected dubious ownership in repository at '\/\/wsl\$\/Ubuntu\/home\/me\/repo' '\/\/wsl\$/);
+    expect(h.start).not.toHaveBeenCalled();
+  });
+
+  it('a distro-internal path with no known distro is refused by name, not guessed', async () => {
+    const h = setup({ platform: 'win32', cwd: '/home/me/repo', daemonSessions: [{ id: 'pty-1' }] });
+    const err = errorOf(await h.call(goodParams()));
+    expect(err.code).toBe('FAILED_PRECONDITION');
+    expect(err.message).toMatch(/WSL distro is unknown/);
+    expect(vi.mocked(git)).not.toHaveBeenCalled();
+  });
+
+  it('a backslash in a WSL directory name is refused, never resolved to a sibling repo', async () => {
+    const h = setup({
+      platform: 'win32',
+      cwd: '/home/me/repo/..\\other',
+      daemonSessions: [{ id: 'pty-1', wslTarget: { distribution: 'Ubuntu', user: 'me' } }],
+    });
+    const err = errorOf(await h.call(goodParams()));
+    expect(err.code).toBe('FAILED_PRECONDITION');
+    expect(err.message).toMatch(/cannot be translated safely/);
+    expect(vi.mocked(git)).not.toHaveBeenCalled();
+  });
+
+  it('a trailing dot is refused, never stripped onto the sibling repo', async () => {
+    // Win32 opens D:\x\alias for D:\x\alias. — live, that was another repo.
+    const h = setup({ platform: 'win32', cwd: '/mnt/d/x/alias.', daemonSessions: [] });
+    answerFor('D:\\x\\alias');
+    const err = errorOf(await h.call(goodParams()));
+    expect(err.code).toBe('FAILED_PRECONDITION');
+    expect(err.message).toMatch(/cannot be translated safely/);
+    expect(vi.mocked(git)).not.toHaveBeenCalled();
+  });
+
+  it('a trailing space survives the surface read and is refused, not trimmed onto the sibling', async () => {
+    const h = setup({ platform: 'win32', cwd: '/mnt/d/x/alias ', daemonSessions: [] });
+    answerFor('D:\\x\\alias');
+    const err = errorOf(await h.call(goodParams()));
+    expect(err.code).toBe('FAILED_PRECONDITION');
+    expect(err.message).toMatch(/"alias "/);
+    expect(vi.mocked(git)).not.toHaveBeenCalled();
+  });
+
+  it('a non-WSL Windows caller is unchanged', async () => {
+    const h = setup({ platform: 'win32', cwd: 'D:\\work\\repo\\src', daemonSessions: [] });
+    answerFor('D:\\work\\repo');
+    expect(await h.call(goodParams())).toMatchObject({ ok: true, repoPath: 'D:/work/repo' });
+    expect(gitDirs()).toContain('D:\\work\\repo\\src');
+    expect(h.daemonRpc).not.toHaveBeenCalled();
   });
 });

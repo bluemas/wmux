@@ -934,13 +934,19 @@ export function attachImeAnchor(
     const rows = terminal.rows;
     const cols = terminal.cols;
     const fromLayout = rows > 0 ? screen.clientHeight / rows : 0;
-    // Trust xterm's number when it is in the same ballpark as the measured box;
-    // anything wilder means we read something that is not a cell height.
+    // Trust xterm's number only while it agrees with the measured box to
+    // within the sub-pixel rounding it exists to absorb. A wider gap means it
+    // is stale: after a font-size change xterm resizes the grid before it
+    // re-syncs the textarea, so `style.height` still holds the OLD cell height
+    // for the new rows. Trusting it there painted the Korean preedit rows away
+    // from the caret. Compared over the whole grid, not per cell: xterm sizes
+    // the screen to round(cell * rows), so a live cell height is always under
+    // a pixel off the box in total, while one zoom step (as little as 0.5px
+    // per cell on a 2x display) is rows/2 pixels or more.
     const cellHeight = xtermCellHeight !== null
       && xtermCellHeight > 0
       && fromLayout > 0
-      && xtermCellHeight > fromLayout / 2
-      && xtermCellHeight < fromLayout * 2
+      && Math.abs(xtermCellHeight * rows - screen.clientHeight) < 1
       ? xtermCellHeight
       : fromLayout;
     return {
@@ -1115,13 +1121,26 @@ export function attachImeAnchor(
     resetRestingTracker(tracker, b.baseY + b.cursorY, b.cursorX, now(), b.cursorY);
   };
 
-  const onRefreshGeometry = (): void => {
+  // A resize event can fire before the renderer has applied the new cell
+  // size to the screen box (a font-size change resizes the grid first), so
+  // the box is measured again on the next frame, once it has settled.
+  let pendingGeometryFrame: number | null = null;
+  const refreshGeometry = (): void => {
     geometry = readGeometry();
     helpersOrigin = readHelpersOrigin();
+  };
+  const onRefreshGeometry = (): void => {
+    refreshGeometry();
     // Resize reflow re-wraps the buffer — absolute rows recorded before it no
     // longer name the same content, so the resting cell must not survive.
     resetTracker();
     sync();
+    if (pendingGeometryFrame !== null) cancelAnimationFrame(pendingGeometryFrame);
+    pendingGeometryFrame = requestAnimationFrame(() => {
+      pendingGeometryFrame = null;
+      refreshGeometry();
+      sync();
+    });
   };
 
   // Freeze-cell selection of the current composition, for the diagnostic.
@@ -1201,6 +1220,11 @@ export function attachImeAnchor(
       clearTimeout(pendingCompositionSync);
       pendingCompositionSync = null;
     }
+    // Measure the cell grid now rather than trust the cache. The cache is only
+    // refreshed on resize, and a font change that keeps rows/cols fires none;
+    // a stale width per cell paints the preedit columns away from the caret.
+    // compositionstart is user-paced, so this layout read costs nothing.
+    refreshGeometry();
     composing = true;
     const b = bufferState();
     // #1016: while output flows, the cursor never visits the input caret
@@ -1304,6 +1328,7 @@ export function attachImeAnchor(
       textarea.removeEventListener('compositionupdate', onCompositionUpdate);
       textarea.removeEventListener('compositionend', onCompositionEnd);
       if (pendingCompositionSync !== null) clearTimeout(pendingCompositionSync);
+      if (pendingGeometryFrame !== null) cancelAnimationFrame(pendingGeometryFrame);
       textarea.style.transform = '';
       if (compositionView) compositionView.style.transform = '';
     },

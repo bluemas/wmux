@@ -343,12 +343,94 @@ export function tryNativeSnapshot(): NativeSnapshot | null {
 
 const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
 
+/** One process's creation time and cumulative CPU time, both in 100 ns units. */
+export interface ProcessTimesRow {
+  created: bigint;
+  cpu: bigint;
+}
+
+/**
+ * Pure: cumulative CPU time of every process in the trees rooted at
+ * `rootPids`, roots included, from a pid → ppid table. `readTimes` returns
+ * null for a process that cannot be read (protected, or gone since the table
+ * was taken); it is skipped, and its children are still walked.
+ *
+ * A child counts only if it was created no earlier than its parent. Windows
+ * never re-parents an orphan: when a parent exits, its children keep its pid
+ * as their ppid, and once that pid is handed to a new process the orphans look
+ * like the new process's children. Without this check an unrelated orphan
+ * (explorer.exe and every app under it, for one) whose dead parent's pid
+ * went to one of our shells would be summed into wmux's CPU, whole subtree
+ * included, for as long as that shell lives.
+ */
+export function collectTreeCpuTimes(
+  procs: readonly NativeProcRow[],
+  rootPids: readonly number[],
+  readTimes: (pid: number) => ProcessTimesRow | null,
+): Map<number, bigint> {
+  const children = new Map<number, number[]>();
+  for (const { pid, ppid } of procs) {
+    const list = children.get(ppid);
+    if (list) list.push(pid);
+    else children.set(ppid, [pid]);
+  }
+  // Walk down from each root; `seen` also guards against a pid reused as its
+  // own ancestor in a stale table. `parentCreated` is null for a root and for
+  // the children of a process that could not be read.
+  const seen = new Set<number>();
+  const queue: Array<{ pid: number; parentCreated: bigint | null }> =
+    rootPids.map((pid) => ({ pid, parentCreated: null }));
+  const times = new Map<number, bigint>();
+  for (let item = queue.shift(); item !== undefined; item = queue.shift()) {
+    const { pid, parentCreated } = item;
+    if (seen.has(pid)) continue;
+    seen.add(pid);
+    const row = readTimes(pid);
+    // Older than its "parent": the ppid names a dead process whose pid was
+    // reused. Not ours, and neither is anything under it.
+    if (row && parentCreated !== null && row.created < parentCreated) continue;
+    if (row) times.set(pid, row.cpu);
+    const created = row ? row.created : null;
+    for (const child of children.get(pid) ?? []) queue.push({ pid: child, parentCreated: created });
+  }
+  return times;
+}
+
+/**
+ * Creation time of one live process (FILETIME, 100 ns units), or null when it
+ * cannot be read: not Windows, the native path is unavailable, the process is
+ * gone, or it is protected. Used to reject a parent pid that Windows handed to
+ * a newer process (see serverSidePidWalk.ts).
+ */
+export function tryProcessCreatedAt(pid: number): bigint | null {
+  if (!Number.isInteger(pid) || pid <= 0 || loadFailed) return null;
+  const b = loadBindings();
+  if (!b) {
+    loadFailed = true;
+    return null;
+  }
+  try {
+    const raw = b.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+    const handle = typeof raw === 'bigint' ? raw : BigInt(raw);
+    if (handle === 0n) return null;
+    try {
+      const creation = Buffer.alloc(8);
+      if (!b.GetProcessTimes(raw, creation, Buffer.alloc(8), Buffer.alloc(8), Buffer.alloc(8))) return null;
+      return creation.readBigUInt64LE(0);
+    } finally {
+      b.CloseHandle(raw);
+    }
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Cumulative CPU time (kernel + user, in 100 ns units) of every process in the
  * trees rooted at `rootPids`, roots included. Used to turn two samples into a
- * CPU percentage for wmux and everything it started. A process that cannot be
- * opened (protected, or gone since the table was read) is skipped. Returns null
- * when the native path is unavailable, like {@link tryNativeSnapshot}.
+ * CPU percentage for wmux and everything it started. See
+ * {@link collectTreeCpuTimes} for the walk. Returns null when the native path
+ * is unavailable, like {@link tryNativeSnapshot}.
  */
 export function tryProcessTreeCpuTimes(rootPids: readonly number[]): Map<number, bigint> | null {
   if (loadFailed) return null;
@@ -358,37 +440,24 @@ export function tryProcessTreeCpuTimes(rootPids: readonly number[]): Map<number,
     return null;
   }
   try {
-    const children = new Map<number, number[]>();
-    for (const { pid, ppid } of readProcessTable(b)) {
-      const list = children.get(ppid);
-      if (list) list.push(pid);
-      else children.set(ppid, [pid]);
-    }
-    // Walk down from each root; `seen` also guards against a pid reused as its
-    // own ancestor in a stale table.
-    const seen = new Set<number>();
-    const queue = [...rootPids];
-    const times = new Map<number, bigint>();
     const creation = Buffer.alloc(8);
     const exit = Buffer.alloc(8);
     const kernel = Buffer.alloc(8);
     const user = Buffer.alloc(8);
-    for (let pid = queue.shift(); pid !== undefined; pid = queue.shift()) {
-      if (seen.has(pid)) continue;
-      seen.add(pid);
-      for (const child of children.get(pid) ?? []) queue.push(child);
+    return collectTreeCpuTimes(readProcessTable(b), rootPids, (pid) => {
       const raw = b.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
       const handle = typeof raw === 'bigint' ? raw : BigInt(raw);
-      if (handle === 0n) continue;
+      if (handle === 0n) return null;
       try {
-        if (b.GetProcessTimes(raw, creation, exit, kernel, user)) {
-          times.set(pid, kernel.readBigUInt64LE(0) + user.readBigUInt64LE(0));
-        }
+        if (!b.GetProcessTimes(raw, creation, exit, kernel, user)) return null;
+        return {
+          created: creation.readBigUInt64LE(0),
+          cpu: kernel.readBigUInt64LE(0) + user.readBigUInt64LE(0),
+        };
       } finally {
         b.CloseHandle(raw);
       }
-    }
-    return times;
+    });
   } catch (err) {
     warn(`process CPU times failed: ${err instanceof Error ? err.message : String(err)}`);
     return null;

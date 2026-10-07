@@ -61,6 +61,7 @@ export const SHORTCUT_ACTION_IDS = [
   // can put on a key of their choosing.
   'stashPane', 'movePaneLeft', 'movePaneRight', 'movePaneUp', 'movePaneDown',
   'multiTask', 'toggleToolbarPin', 'openWorktaskCleanup', 'showGitDiff',
+  'renameTab',
 ] as const;
 
 export type ShortcutActionId = typeof SHORTCUT_ACTION_IDS[number];
@@ -97,6 +98,18 @@ const ws = (n: number): KeymapEntry => ({
   descriptionKey: 'settings.sc.jumpWorkspace',
   descriptionVars: { n },
 });
+
+/**
+ * The Ctrl+N digit that reaches the workspace at `index` of `count` listed
+ * workspaces, or undefined when none does. Ctrl+1..8 take the first eight and
+ * Ctrl+9 the LAST one (browser tabs), so with more than nine the rows between
+ * the eighth and the last have no number.
+ */
+export function workspaceShortcutNumber(index: number, count: number): number | undefined {
+  if (index < 0 || index >= count) return undefined;
+  if (index < 8) return index + 1;
+  return index === count - 1 ? 9 : undefined;
+}
 
 /**
  * Every default binding, in the order Settings renders them. The first row of
@@ -224,6 +237,7 @@ export const UNBOUND_SHORTCUTS: readonly { action: ShortcutActionId; description
   { action: 'toggleToolbarPin', descriptionKey: 'settings.sc.toggleToolbarPin' },
   { action: 'openWorktaskCleanup', descriptionKey: 'settings.sc.openWorktaskCleanup' },
   { action: 'showGitDiff', descriptionKey: 'settings.sc.showGitDiff' },
+  { action: 'renameTab', descriptionKey: 'settings.sc.renameTab' },
 ];
 
 /** The i18n key (and vars) naming `action` in shortcut lists. */

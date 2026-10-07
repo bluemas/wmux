@@ -228,7 +228,7 @@ describe('selectFleetPanes', () => {
   it("a seen finished turn does NOT come back from the workspace 'complete' slot", () => {
     // Focusing the pane clears its per-pty 'complete' ("the user has seen
     // this"), but the workspace-wide slot keeps 'complete' until the next
-    // turn. Inheriting it pinned the active pane in Ready to review forever.
+    // turn. Inheriting it pinned the active pane in Finished forever.
     const ws = workspace(
       'ws-seen', 'seen',
       leaf('p-seen', [surface('s-seen', 'pty-seen')]),
@@ -386,11 +386,10 @@ describe('countNeedsAttention', () => {
   it('counts an open dialog, not a turn-end waiting', () => {
     const base: FleetPane = { workspaceId: 'w', workspaceName: 'w', paneId: 'x', surfaceId: 'x', ptyId: 'x', agentStatus: 'idle', title: 'x', surfaceType: 'terminal', isActivePane: false, unverifiable: false };
     const panes: FleetPane[] = [
-      { ...base, paneId: '1', ptyId: 'pty-1', agentStatus: 'awaiting_input' },
-      { ...base, paneId: '2', ptyId: 'pty-2', agentStatus: 'waiting' },
-      { ...base, paneId: '3', ptyId: 'pty-3', agentStatus: 'running' },
-      { ...base, paneId: '4', ptyId: 'pty-4', agentStatus: 'complete' },
-      { ...base, paneId: '5', ptyId: 'pty-5', agentStatus: 'waiting' },
+      { ...base, paneId: '1', agentStatus: 'awaiting_input' },
+      { ...base, paneId: '2', agentStatus: 'waiting' },
+      { ...base, paneId: '3', agentStatus: 'running' },
+      { ...base, paneId: '4', agentStatus: 'complete' },
     ];
     expect(countNeedsAttention(panes)).toBe(1);
   });

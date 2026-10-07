@@ -34,6 +34,7 @@ import FileTreePanel from '../FileTree/FileTreePanel';
 import ApprovalDialog from '../Company/ApprovalDialog';
 import ExecuteApprovalDialog from '../A2a/ExecuteApprovalDialog';
 import PermissionApprovalDialogContainer from '../Approval/PermissionApprovalDialogContainer';
+import CloseTabConfirm from '../Pane/CloseTabConfirm';
 import { initAtlasWakeRecovery } from '../../terminal/atlasWakeRecovery';
 import { windowDisplayedStore } from '../../hooks/useWindowDisplayed';
 import CompanyView from '../Company/CompanyView';
@@ -339,6 +340,7 @@ function cloneStashedPanes(
             // Without this a user's manual tab rename comes back as a shell
             // title on the next OSC 0 — a small loss, but a silent one.
             titleLocked: s.titleLocked,
+            autoTitle: s.autoTitle,
           })),
         },
         ...(entry.origin ? { origin: entry.origin } : {}),
@@ -415,6 +417,7 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
     titlebarClockVisible: state.titlebarClockVisible,
     paneNewTerminalButton: state.paneNewTerminalButton,
     splitInheritsCwd: state.splitInheritsCwd,
+    closeTabOnShellExit: state.closeTabOnShellExit,
     imeResidueGuardEnabled: state.imeResidueGuardEnabled,
     hiddenPaneRetentionEnabled: state.hiddenPaneRetentionEnabled,
     coldParkEnabled: state.coldParkEnabled,
@@ -2198,6 +2201,7 @@ export default function AppLayout() {
       <ApprovalDialog />
       {!inboxOwnsApprovals && <ExecuteApprovalDialog />}
       {!inboxOwnsApprovals && <PermissionApprovalDialogContainer />}
+      <CloseTabConfirm />
       <ProjectConfigDialog />
       {/* "Pair again" from a remote workspace whose host rejected us. Lives
           here because re-pairing removes that host's views. */}

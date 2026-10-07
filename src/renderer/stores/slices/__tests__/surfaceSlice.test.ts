@@ -312,6 +312,70 @@ describe('surfaceSlice.updateSurfaceTitleByPty', () => {
   });
 });
 
+describe('surfaceSlice.resetSurfaceTitle', () => {
+  function renamedHarness() {
+    const { state, slice } = createHarness();
+    const paneId = state.workspaces[0].rootPane.id;
+    slice.addSurface(paneId, 'pty-1', 'pwsh', 'C:\\a');
+    const pane = state.workspaces[0].rootPane;
+    if (pane.type !== 'leaf') throw new Error('expected leaf pane');
+    slice.updateSurfaceTitleByPty('pty-1', 'claude: feature-x');
+    return { slice, pane, surfaceId: pane.surfaces[0].id };
+  }
+
+  it('restores the title the rename replaced and unlocks the tab', () => {
+    const { slice, pane, surfaceId } = renamedHarness();
+    slice.updateSurfaceTitle(surfaceId, 'api-server');
+
+    slice.resetSurfaceTitle(surfaceId);
+
+    expect(pane.surfaces[0].title).toBe('claude: feature-x');
+    expect(pane.surfaces[0].titleLocked).toBeUndefined();
+    expect(pane.surfaces[0].autoTitle).toBeUndefined();
+  });
+
+  it('keeps the original title across a second rename', () => {
+    const { slice, pane, surfaceId } = renamedHarness();
+    slice.updateSurfaceTitle(surfaceId, 'first');
+    slice.updateSurfaceTitle(surfaceId, 'second');
+
+    slice.resetSurfaceTitle(surfaceId);
+
+    expect(pane.surfaces[0].title).toBe('claude: feature-x');
+  });
+
+  it('lets shell-set titles through again once reset', () => {
+    const { slice, pane, surfaceId } = renamedHarness();
+    slice.updateSurfaceTitle(surfaceId, 'api-server');
+    slice.resetSurfaceTitle(surfaceId);
+
+    slice.updateSurfaceTitleByPty('pty-1', 'claude: feature-y');
+
+    expect(pane.surfaces[0].title).toBe('claude: feature-y');
+  });
+
+  it('falls back to the shell name when no earlier title was kept', () => {
+    const { slice, pane, surfaceId } = renamedHarness();
+    // A rename saved before autoTitle existed comes back locked without one.
+    pane.surfaces[0].titleLocked = true;
+    pane.surfaces[0].title = 'legacy-name';
+    delete pane.surfaces[0].autoTitle;
+
+    slice.resetSurfaceTitle(surfaceId);
+
+    expect(pane.surfaces[0].title).toBe('pwsh');
+    expect(pane.surfaces[0].titleLocked).toBeUndefined();
+  });
+
+  it('leaves an unlocked tab alone', () => {
+    const { slice, pane, surfaceId } = renamedHarness();
+
+    slice.resetSurfaceTitle(surfaceId);
+
+    expect(pane.surfaces[0].title).toBe('claude: feature-x');
+  });
+});
+
 describe('surfaceSlice.updateBrowserUrl', () => {
   function harnessWithBrowser() {
     const h = createHarness();

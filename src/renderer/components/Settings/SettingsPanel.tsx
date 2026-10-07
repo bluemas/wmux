@@ -71,6 +71,7 @@ import { ClaudeIntegrationSection } from './ClaudeIntegrationSection';
 import { IntegrationSetupSectionContainer, MCP_STATUS_CHANGED_EVENT } from './IntegrationSetupSection';
 import { McpStatusSection } from './McpStatusSection';
 import { AccountsSection } from './AccountsSection';
+import { AgyAccountsSection } from './AgyAccountsSection';
 import { FanoutPresetsSection } from './FanoutPresetsSection';
 import { terminalFontFamilyCss } from '../../utils/terminalFont';
 import { hasBareFunctionKeyBinding } from '../../utils/functionKeyBinding';
@@ -97,6 +98,7 @@ import { SettingsSection, SettingRow, SettingNote } from './SettingsLayout';
 import { MAX_WORKSPACE_IDLE_DAYS, MIN_WORKSPACE_IDLE_DAYS } from '../../../shared/workspaceSettle';
 import { sendWorkspaceSettleIdleDays } from '../../hooks/useWorkspaceSettleBridge';
 import { TabMoa } from './MoaTab';
+import { matchesShortcutQuery } from './shortcutSearch';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -1898,6 +1900,8 @@ function TabTerminal() {
   const setImagePasteMode = useStore((s) => s.setImagePasteMode);
   const splitInheritsCwd = useStore((s) => s.splitInheritsCwd);
   const setSplitInheritsCwd = useStore((s) => s.setSplitInheritsCwd);
+  const closeTabOnShellExit = useStore((s) => s.closeTabOnShellExit);
+  const setCloseTabOnShellExit = useStore((s) => s.setCloseTabOnShellExit);
   const imeResidueGuardEnabled = useStore((s) => s.imeResidueGuardEnabled);
   const setImeResidueGuardEnabled = useStore((s) => s.setImeResidueGuardEnabled);
   const hiddenPaneRetentionEnabled = useStore((s) => s.hiddenPaneRetentionEnabled);
@@ -2000,6 +2004,13 @@ function TabTerminal() {
             checked={splitInheritsCwd}
             onChange={setSplitInheritsCwd}
             label={t('settings.splitInheritsCwd')}
+          />
+        </SettingRow>
+        <SettingRow id="closeonexit" label={t('settings.closeTabOnShellExit')} description={t('settings.closeTabOnShellExitDesc')}>
+          <Toggle
+            checked={closeTabOnShellExit}
+            onChange={setCloseTabOnShellExit}
+            label={t('settings.closeTabOnShellExit')}
           />
         </SettingRow>
       </SettingsSection>
@@ -4469,12 +4480,9 @@ export function TabShortcuts() {
 
   const hasOverrides = Object.keys(shortcutOverrides).length > 0;
 
-  // Case-insensitive; spaces and '+' are ignored so "ctrl n", "ctrl+n" and
-  // "ctrln" all find Ctrl+N.
-  const squash = (text: string) => text.toLowerCase().replace(/[\s+]/g, '');
-  const shortcutNeedle = squash(shortcutQuery);
+  const shortcutNeedle = shortcutQuery.trim();
   const matchesShortcut = (description: string, keys: string) =>
-    !shortcutNeedle || squash(description).includes(shortcutNeedle) || squash(keys).includes(shortcutNeedle);
+    matchesShortcutQuery(shortcutQuery, description, keys);
   const visibleShortcuts = ADVERTISED_SHORTCUTS.filter((entry) => {
     const override = shortcutOverrides[entry.action];
     const combo = typeof override === 'string' ? override : concreteCombo(entry, platform);
@@ -5405,7 +5413,7 @@ export default function SettingsPanel({ initialTab }: { initialTab?: string }) {
                     {activeTab === 'shortcuts'          && <TabShortcuts />}
                     {activeTab === 'notifications'      && <TabNotifications />}
                     {activeTab === 'claude-integration' && <TabClaudeCode />}
-                    {activeTab === 'accounts'           && <AccountsSection />}
+                    {activeTab === 'accounts'           && <><AccountsSection /><AgyAccountsSection /></>}
                     {activeTab === 'moa'                && <TabMoa registerDialog={registerOwnedDialog} />}
                     {activeTab === 'roles'              && <TabRoles />}
           {activeTab === 'tokens'             && <TokenUsageTab onOpenTab={setActiveTab} />}

@@ -111,7 +111,7 @@
     "@agentclientprotocol/sdk": "1.5.0",
     "@anthropic-ai/claude-agent-sdk": "^0.3.206",
     "@assistant-ui/react": "^0.15.21",
-    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@modelcontextprotocol/sdk": "^1.32.1",
     "@opencode-ai/sdk": "1.18.32",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-image": "0.9.0",
@@ -130,7 +130,7 @@
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
     "react-resizable-panels": "^4.7.3",
-    "smol-toml": "^1.7.1",
+    "smol-toml": "^1.9.0",
     "ws": "^8.21.0",
     "zod": "^4.3.6",
     "zustand": "^5.0.12"
@@ -138,6 +138,7 @@
   "overrides": {
     "@tootallnate/once": "^2.0.1",
     "tar": "^7.5.18",
-    "tmp": "^0.2.6"
+    "tmp": "^0.2.6",
+    "postcss-selector-parser": "^7.1.6"
   }
 }

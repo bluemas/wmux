@@ -48,9 +48,9 @@ interface WorkspaceItemProps {
   isActive: boolean;
   isMultiview: boolean;
   index: number;
-  /** Position in the list the operator sees (Moa's HQ left out), which is
-   *  what Ctrl+N counts. Defaults to `index`. */
-  shortcutIndex?: number;
+  /** The Ctrl+N digit that reaches this row (see workspaceShortcutNumber), or
+   *  undefined when no digit does. */
+  shortcutNumber?: number;
   onSelect: (id: string) => void;
   onCtrlSelect: (id: string) => void;
   onRename: (id: string, name: string) => void;
@@ -403,14 +403,6 @@ const REST_HIDDEN =
 const REST_HIDDEN_GAP_ROW = '-ml-2 group-hover:ml-0 group-focus-within:ml-0';
 const REST_HIDDEN_GAP_NAME_LINE = '-ml-1 group-hover:ml-0 group-focus-within:ml-0';
 
-// Shortcut number colour: a blue that contrasts with the sidebar's own tone —
-// light on a dark sidebar, deep on a light one — and never white, whatever the
-// theme's accent is (Zinc's accent is near-white). L flips on the sidebar's
-// lightness; chroma and hue stay fixed.
-const SHORTCUT_NUMBER_STYLE = {
-  color: 'oklch(from var(--bg-mantle) calc(0.4 + 0.38 * (1 - round(l))) 0.13 250)',
-} as const;
-
 /**
  * 2026-09-27 — a task row renders INSIDE its owner's row (under the pane that
  * requested it). Tailwind's `group-hover` matches any `.group` ancestor, so
@@ -455,7 +447,7 @@ function shortenPath(path: string, maxLen = 25): string {
   return `.../${parts.slice(-2).join('/')}`;
 }
 
-function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutIndex = index, onSelect, onCtrlSelect, onRename, onClose, onArchive, onCopyInfo, onDuplicate, onReorder, taskRow = false, shortcutHintHidden = false, nestedTaskIds, renderTask, onCloseTask, moaHq = false, tabStop = false }: WorkspaceItemProps) {
+function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumber, onSelect, onCtrlSelect, onRename, onClose, onArchive, onCopyInfo, onDuplicate, onReorder, taskRow = false, shortcutHintHidden = false, nestedTaskIds, renderTask, onCloseTask, moaHq = false, tabStop = false }: WorkspaceItemProps) {
   const t = useT();
   // A1: 자기 ws만 구독 — 배경 ws churn/다른 항목 변경에는 리렌더되지 않는다.
   const workspace = useStore(selectWorkspaceById(workspaceId));
@@ -1325,16 +1317,16 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutInde
                 {/* Ctrl+N follows the stored order, so each row always shows the
                     number its shortcut jumps to, left of the name, in every sort
                     mode — the numbers may read out of sequence in a sorted order.
-                    A nested task row, Moa's HQ and a row in the Snoozed/Settled
-                    group have none. */}
-                {!taskRow && !moaHq && !shortcutHintHidden && shortcutIndex >= 0 && shortcutIndex < 9 && (
+                    Ctrl+9 is the last workspace, so past eight rows only the last
+                    one shows 9 and the rows between show nothing. A nested task
+                    row, Moa's HQ and a row in the Snoozed/Settled group have none. */}
+                {!taskRow && !moaHq && !shortcutHintHidden && shortcutNumber !== undefined && (
                   // Drawn by CSS so the digit is not part of the row's text
                   // (selection, copy, accessible name).
                   <span
                     aria-hidden
-                    className="flex-none text-[11px] font-semibold tabular-nums before:content-[attr(data-shortcut-number)]"
-                    style={SHORTCUT_NUMBER_STYLE}
-                    data-shortcut-number={shortcutIndex + 1}
+                    className="flex-none text-[11px] font-semibold tabular-nums text-[var(--text-muted)] before:content-[attr(data-shortcut-number)]"
+                    data-shortcut-number={shortcutNumber}
                   />
                 )}
                 <span

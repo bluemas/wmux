@@ -17,6 +17,8 @@
  * life of a production process, and tests need to flip it.
  */
 
+import { isValidWslDistroName } from '../shared/wslDistro';
+
 const DEFAULT_MOUNT_ROOT = '/mnt/';
 
 /**
@@ -69,4 +71,64 @@ export function fromAgentPath(agentPath: string, env: NodeJS.ProcessEnv = proces
     if (m) return `${m[1].toUpperCase()}:\\${(m[2] ?? '').replace(/\//g, '\\')}`;
   }
   return null;
+}
+
+/**
+ * A WSL pane's Linux cwd, as the Windows host process must open it, for a
+ * caller that has no WMUX_WSL_* env of its own (the main process reading a
+ * pane's reported cwd):
+ *  - under the drive mount: `/mnt/d/a b/c` → `D:\a b\c` (the same rule as
+ *    fromAgentPath);
+ *  - anywhere else: `\\wsl$\<distro>\home\me\repo`, when the distro is known.
+ *
+ * `mount` is what `wslpath -u 'C:\'` answers inside the distro; the main
+ * process never learns it, so callers there omit it and the default `/mnt/`
+ * root applies (a wsl.conf `automount.root` elsewhere is then read as a
+ * distro-internal path and goes through `\\wsl$\`, which still names the same
+ * directory). Returns an error string instead of a guess: a distro-internal
+ * path with no (valid) distro, a path holding a character that is a separator
+ * or reserved on Windows, a name Win32 reads as another file (trailing dot or
+ * space, device name), or anything that is not an absolute Linux path.
+ */
+export function wslPathToHost(
+  linuxPath: string,
+  distro: string | undefined,
+  mount = '',
+): { path: string } | { error: string } {
+  if (!linuxPath.startsWith('/') || linuxPath.startsWith('//')) {
+    return { error: `${JSON.stringify(linuxPath)} is not an absolute Linux path` };
+  }
+  // `\` and `:` are ordinary characters in a Linux name but separators on
+  // Windows: `/home/me/repo/..\other` is ONE directory inside repo, yet as
+  // `\\wsl$\…\repo\..\other` it resolves to a sibling of repo. The rest of
+  // the Windows-reserved set cannot name the same file either. Refuse rather
+  // than translate into a different directory.
+  if (/[\\:*?"<>|]/.test(linuxPath)) {
+    return {
+      error: `${JSON.stringify(linuxPath)} contains a character (\\ : * ? " < > |) that means something else in a Windows path, so it cannot be translated safely`,
+    };
+  }
+  // Win32 drops a trailing dot or space from every path segment, so
+  // `/mnt/d/x/repo.` would open `D:\x\repo` (seen live: a different
+  // repository); other trailing whitespace is trimmed by the callers' own
+  // normalizers, with the same effect. A reserved device name (`con`, `nul.txt`, `com1`) opens the
+  // device, not the directory. `.` and `..` are segments, not names.
+  const unsafe = linuxPath
+    .split('/')
+    .find((s) => s !== '.' && s !== '..' && (/[.\s]$/.test(s) || /^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³])(\..*)?$/i.test(s)));
+  if (unsafe !== undefined) {
+    return {
+      error: `${JSON.stringify(linuxPath)} has a name (${JSON.stringify(unsafe)}) that Windows reads as a different file (a trailing dot or space, or a device name), so it cannot be translated safely`,
+    };
+  }
+  // fromAgentPath only needs a non-empty distro to switch on; the drive
+  // mapping itself never reads the name.
+  const drive = fromAgentPath(linuxPath, { WMUX_WSL_DISTRO: distro || 'wsl', WMUX_WSL_MOUNT: mount });
+  if (drive !== null) return { path: drive };
+  if (!distro || !isValidWslDistroName(distro)) {
+    return {
+      error: `${JSON.stringify(linuxPath)} is inside a WSL distro's own filesystem, and the pane's WSL distro is unknown, so it has no Windows path`,
+    };
+  }
+  return { path: `\\\\wsl$\\${distro}${linuxPath.replace(/\//g, '\\')}` };
 }

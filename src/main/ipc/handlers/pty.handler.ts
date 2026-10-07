@@ -18,6 +18,7 @@ import { resolveSpawnEnv } from '../../pty/resolveSpawnEnv';
 import { withFreshWindowsPath } from '../../../shared/windowsPathEnv';
 import { getAccountStore } from '../../account/accountStore';
 import { withAccountQuota } from '../../account/accountQuotaGate';
+import { withDelegateSpawnSettings } from '../../agents/delegateSpawnPolicy';
 import { resolveEnvPolicy, type SpawnKind } from '../../../shared/spawnKind';
 import { withheldCredentialNames } from '../../../shared/envFilter';
 import { getShellUtf8Locale } from '../../pty/shellLocale';
@@ -405,7 +406,7 @@ export function registerPTYHandlers(
       // create and before the PTY (and the agent) exists. A failed stamp fails
       // the create; the renderer rolls the workspace back.
       stampFanoutTaskPane(options);
-      options = withWmuxTools(await withAccountQuota(options));
+      options = withDelegateSpawnSettings(withWmuxTools(await withAccountQuota(options)));
 
       // X8 exec-style unit: a supervised wmux.json leaf runs its command as the
       // pane's root process under a daemon-chosen wrapper shell (the daemon
@@ -640,7 +641,7 @@ export function registerPTYHandlers(
       // create and before the PTY (and the agent) exists. A failed stamp fails
       // the create; the renderer rolls the workspace back.
       stampFanoutTaskPane(options);
-      options = withWmuxTools(await withAccountQuota(options));
+      options = withDelegateSpawnSettings(withWmuxTools(await withAccountQuota(options)));
 
       // X8 — supervision lives inside the daemon (decision ②). In local mode it
       // can't be honored, but a silent drop would be a trust violation: the user
@@ -1152,6 +1153,8 @@ export function registerPTYHandlers(
           cmd: string;
           state: string;
           pid?: number;
+          cols?: number;
+          rows?: number;
           cwd?: string;
           spawnCwd?: string;
           resumeAgent?: string;
@@ -1265,7 +1268,9 @@ export function registerPTYHandlers(
         // The daemon already told us this session's shell — record it, or a
         // pane recovered across an app restart loses its WSL path rewrite.
         recordPtyShell(session.id, session.cmd);
-        return { success: true, id: session.id, shell: session.cmd };
+        // The session's stored geometry: a hidden pane cannot measure its own,
+        // so it adopts this one instead (see the reattach in useTerminal).
+        return { success: true, id: session.id, shell: session.cmd, cols: session.cols, rows: session.rows };
       } catch (err) {
         // RCA A1 — RPC threw (timeout, ECONNRESET, handler swap mid-call).
         // This is a transient infrastructure failure, NOT proof the session is
@@ -1438,16 +1443,16 @@ export function registerPTYHandlers(
   }));
 
   // Listen for daemon session:died events and forward to renderer
-  let onDaemonSessionDied: ((payload: { sessionId: string; exitCode: number | null }) => void) | null = null;
+  let onDaemonSessionDied: ((payload: { sessionId: string; exitCode: number | null; signal?: number }) => void) | null = null;
   if (useDaemon && daemonClient) {
-    onDaemonSessionDied = (payload: { sessionId: string; exitCode: number | null }) => {
+    onDaemonSessionDied = (payload: { sessionId: string; exitCode: number | null; signal?: number }) => {
       // P1-3 ordering rule: drain buffered output before the exit marker so
       // the shell's final lines land ahead of "[Process exited...]" (same
       // drain-before-exit contract as local-mode PTYBridge).
       dataBatcher.flushSession(payload.sessionId);
       const win = getWindow?.();
       if (win && !win.isDestroyed()) {
-        win.webContents.send(IPC.PTY_EXIT, payload.sessionId, payload.exitCode ?? -1);
+        win.webContents.send(IPC.PTY_EXIT, payload.sessionId, payload.exitCode ?? -1, payload.signal ?? null);
       }
       daemonClient.disconnectSessionPipe(payload.sessionId).catch(() => {});
       // Prune this session's pid-map anchor now that the shell is gone, so the

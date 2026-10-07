@@ -1,6 +1,8 @@
 // Moa (the HQ main bot) — the shapes the renderer reads over the deck bridge.
 // Main is the source of truth (src/main/deck/deckHqStore.ts); these mirror it.
 
+import type { MoaAskMode } from './moaAsk';
+
 export type MoaLevel = 1 | 2 | 3;
 
 export type MoaHqState = 'unset' | 'ok' | 'hq-missing' | 'hq-unknown' | 'hq-store-corrupt';
@@ -41,7 +43,24 @@ export interface MoaConfig {
    *  from the policy book, and whether the owner agreed. It answers nothing.
    *  Absent = off. */
   shadowJudge?: boolean;
+  /** moa_ask (shared/moaAsk.ts): off, records only, suggests in the panel, or
+   *  may answer by itself where a rule is auto-eligible. Absent = 'off'. */
+  askMode?: MoaAskMode;
+  /** Policy rule ids the owner allowed to settle by themselves (the per-rule
+   *  toggle, set only through DECK_MOA_DELEGATE_AUTO_SET). Absent = none. */
+  autoRules?: string[];
+  /** Most decisions Moa may settle by itself per local day (auto mode).
+   *  Absent = MOA_AUTO_DAILY_CAP_DEFAULT. */
+  autoDailyCap?: number;
+  /** The kill switch: true stops every automatic answer and merge at once,
+   *  whatever the mode and the per-rule toggles say. Absent = off. */
+  autoPaused?: boolean;
 }
+
+/** Auto answers per local day when the owner set no cap. */
+export const MOA_AUTO_DAILY_CAP_DEFAULT = 10;
+/** Bounds on the auto cap Settings accepts. */
+export const MOA_AUTO_DAILY_CAP_RANGE = { min: 0, max: 200 } as const;
 
 /** The shadow judge's readout (Settings › Moa). */
 export interface MoaShadowStats {
@@ -59,7 +78,7 @@ export interface MoaShadowStats {
   full: boolean;
 }
 
-export type MoaConfigPatch = Partial<Pick<MoaConfig, 'onboarded' | 'level' | 'maxTurnsPerHour' | 'bubbles' | 'reduceMotion' | 'approvalPress' | 'memoryProposals' | 'issueProposals' | 'trustedAuthors' | 'issuePollMinutes' | 'ignoredRepos' | 'autoHandoff' | 'readWithoutAsking' | 'shadowJudge'>>;
+export type MoaConfigPatch = Partial<Pick<MoaConfig, 'onboarded' | 'level' | 'maxTurnsPerHour' | 'bubbles' | 'reduceMotion' | 'approvalPress' | 'memoryProposals' | 'issueProposals' | 'trustedAuthors' | 'issuePollMinutes' | 'ignoredRepos' | 'autoHandoff' | 'readWithoutAsking' | 'shadowJudge' | 'askMode' | 'autoDailyCap' | 'autoPaused'>>;
 
 export interface MoaState {
   config: MoaConfig;

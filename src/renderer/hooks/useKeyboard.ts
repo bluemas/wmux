@@ -11,7 +11,6 @@ import { createTerminalSurface } from '../utils/createTerminalSurface';
 import { openUrlInBrowserPane } from '../utils/browserPaneActions';
 import {
   destroyPaneTreeRemoteSessions,
-  destroySurfaceRemoteSession,
   destroyWorkspaceRemoteSessions,
 } from '../utils/remoteSessionTeardown';
 import { disposePanePtys } from '../utils/paneTeardown';
@@ -23,6 +22,7 @@ import { listedWorkspaces, moaHqId, refuseWorkspaceClose } from '../components/M
 import {
   openMultiTask,
   openWorktaskCleanup,
+  renameActiveTab,
   showGitDiff,
   stashActivePane,
   toggleAgentToolbarPin,
@@ -87,7 +87,7 @@ export const WORKSPACES_ONLY_ACTIONS: ReadonlySet<ShortcutActionId> = new Set<Sh
   'focusUpAlt', 'focusDownAlt', 'focusLeftAlt', 'focusRightAlt',
   'clearMultiview', 'openBrowser', 'addBookmark', 'zoomIn', 'zoomOut', 'zoomReset',
   'stashPane', 'movePaneLeft', 'movePaneRight', 'movePaneUp', 'movePaneDown',
-  'multiTask', 'showGitDiff',
+  'multiTask', 'showGitDiff', 'renameTab',
 ]);
 
 const STOP_PROPAGATION_ACTIONS: ReadonlySet<ShortcutActionId> = new Set<ShortcutActionId>([
@@ -429,30 +429,18 @@ export function useKeyboard() {
       // path was the only way to reach closePane before, and single-tab panes
       // don't render a tab strip at all.
       closeSurface: () => {
-        const state = store.getState();
         const ws = activeWorkspace();
         if (!ws) return;
         const activePane = findLeaf(ws.rootPane, ws.activePaneId);
         if (activePane && activePane.activeSurfaceId) {
           // The shortcut sits next to everyday keys, so a stray press must not
-          // kill a running session without asking.
-          if (!window.confirm(t('surface.closeConfirm'))) return;
-          const surface = activePane.surfaces.find((s) => s.id === activePane.activeSurfaceId);
-          if (surface?.ptyId) {
-            window.electronAPI.pty.dispose(surface.ptyId);
-          }
-          // #1129 — the tab-strip X does the same (Pane.handleCloseSurface);
-          // the two close paths must not diverge on what closing a remote tab
-          // means.
-          destroySurfaceRemoteSession(surface);
-          const wasLastSurface = activePane.surfaces.length <= 1;
-          state.closeSurface(activePane.id, activePane.activeSurfaceId);
-          if (wasLastSurface) {
-            // Non-root panes collapse here; root pane is a no-op (paneSlice
-            // refuses to drop it) so AppLayout's empty-leaf effect refills it
-            // with a fresh PTY — same behaviour as before for the lone pane.
-            state.closePane(activePane.id);
-          }
+          // kill a running session without asking. CloseTabConfirm runs the
+          // same close as the tab-strip X (#1129: remote tabs included).
+          store.getState().requestCloseTab({
+            workspaceId: ws.id,
+            paneId: activePane.id,
+            surfaceId: activePane.activeSurfaceId,
+          });
         }
       },
       // Close active pane outright (tmux 'kill-pane' direct key). Disposes
@@ -584,6 +572,7 @@ export function useKeyboard() {
       toggleToolbarPin: toggleAgentToolbarPin,
       openWorktaskCleanup,
       showGitDiff,
+      renameTab: renameActiveTab,
     };
 
     /** Clear the prefix timeout if running */
@@ -821,7 +810,8 @@ export function useKeyboard() {
         if (mentionClaim === 'noSource') {
           // Once per press: a held chord auto-repeats, and one toast is enough.
           if (!e.repeat) store.getState().pushToast({ message: t('mention.noSource'), level: 'info' });
-        } else {
+        } else if (!(action === 'closeSurface' && e.repeat)) {
+          // A held close-tab chord auto-repeats; only the first press asks.
           run();
         }
         return;

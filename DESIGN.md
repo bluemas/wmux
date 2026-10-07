@@ -480,7 +480,7 @@ leaves the page.
   Tab. Focus is the app's ring: 2px `--accent`, inside the row, never the
   browser default.
 - **Order control:** a sort button in the header, left of the filter, names
-  the current order (`Order: Attention`) and opens a three-item menu —
+  the current order (`Order: Manual`) and opens a three-item menu —
   Attention, Manual, Recent activity — the same setting as Settings ›
   Appearance › Sidebar.
 - **Moa's workspace** is app-owned and never in the list, its count, the
@@ -829,6 +829,8 @@ primitives plus `Settings/SettingsLayout.tsx` (`SettingsSection`,
 | 2026-10-05 | Sidebar row hover actions return to the row's flow: they end the git line in place of the diff counts and PR badge, end the name line on a branchless top-level row, or take a line of their own on a branchless nested task; focus reveals them like hover (amends "row actions floating over a faded right edge", 2026-10-03). No fade on the text column; a nested task row's hover never reveals its owner's actions; the workspace list clips horizontal overflow and the sidebar column clips (not scrolls) while it animates | The overlay covered the roster chip, the fade took the branch and diff with the name, and as a descendant rule it faded every nested task row while the owner card was hovered, so a hovered sidebar read as "fleet: ba", "wtas…". A hidden-overflow column is still a scroll container: a focus inside the half-open sidebar scrolled it 148px sideways |
 | 2026-10-07 | Owner: blink rows that wait on you; per-user setting; default once + remind every 1 min; finished turns drop the needs-you border for a done dot; reduced motion forces off. Needs you = a question or an approval waits: an open dialog, or a turn that ended on a question (`pendingQuestion`); finished (done dot) = a turn that ended with no question. A plain turn-end `waiting` is never needs you, in the sidebar, the rail, Fleet, the titlebar, the deck briefing and the Tasks dot alike. The Continuous option is the documented exception to "perpetual motion only spinners/cursor" | "Done" and "you must act" looked the same, and a question the agent asks in its closing message is the most common thing waiting on the owner, so it stays flagged. A pulse catches the eye for the rows that wait; the setting lets each user choose how loud, and Continuous is allowed because the user opts in |
 | 2026-10-07 | Owner: the needs-you row border goes from dashed to a 1px solid hairline, as quiet as contrast allows: `--attention-hairline` = the look's `--attention` mixed toward transparent at the lowest percentage that keeps 3:1 against `--selection-subtle`, `--selection-hover` and the column behind, measured per look (54–98%; light looks need nearly the full colour). Box shape, radius, the reserved transparent border, the fill and the selected row's accent ring are unchanged; Moa's Waiting on you rows follow | The dash read as busy chrome. One shared percentage could not pass on both dark and light looks, so each look carries its own, pinned by a contrast test |
+| 2026-10-07 | Owner: the sidebar's default order is Manual (supersedes the 2026-09-25 Attention default); in Attention a new workspace lands last instead of holding the top; the Ctrl+N number is always shown, left of the name, in `--text-muted`, in every order | Rows that move on their own when an agent starts working cost the user the order they built. Ctrl+N already follows the stored order in every mode, so showing its number everywhere tells the truth about the key even when a sorted list makes the numbers read out of sequence. The number is a key label, not a state, so it stays neutral |
+| 2026-10-07 | The Ctrl+N number past eight workspaces: 1–8 on the first eight stored rows, 9 on the last, none between (amends the same-day "always shown" row) | Ctrl+9 jumps to the last workspace, not the ninth, so a 9 on the ninth row named a row the key never opens |
 
 ### Desktop conversation view
 
@@ -947,7 +949,7 @@ no empty reply row or reserved gap under the latest prompt.
   truncates first. A closed requester keeps the same coordinate-first order.
   Inside a task workspace the titlebar's workspace name is followed by a muted
   `↰ <owner>` link (steel on hover) that jumps to the owner.
-- **Order:** Attention (default), Manual, or Recent activity — the header's
+- **Order:** Manual (default), Attention, or Recent activity — the header's
   order button or Settings › Appearance › Sidebar. Attention: needs you →
   error (a failed turn: its own tier, so an old error never sinks below a
   fresh finish; Fleet still lists it under Needs you and counts it there) →
@@ -956,16 +958,18 @@ no empty reply row or reserved gap under the latest prompt.
   recent event first. Plain `waiting` with no question is idle here, as in
   Fleet, and draws no "Needs you" wash or label. A fan-out owner scores as its
   most urgent nested task, so a task that needs you lifts its group. A
-  workspace created in the last three minutes holds the top of the unpinned
-  rows. Rows never move under the pointer or keyboard focus: a re-sort
+  workspace created in the last three minutes holds the last slot of the
+  unpinned rows, so a new row lands at the end of the list. Rows never move under the pointer or keyboard focus: a re-sort
   applies after the list has been quiet for 3 s (at most 10 s after the first
   pending change), or at once when the pointer or focus leaves; adds and
   removals land immediately. The non-manual orders are display-only:
-  drag-to-reorder pauses, and the `^N` shortcut hints are hidden because
-  Ctrl+N follows the stored order — except in the pinned group, below.
-  Sessions that never chose an order move to
-  Attention once, with a notice offering to keep the manual order; an explicit
-  choice is kept.
+  drag-to-reorder pauses. Every row (not a nested task, Moa's HQ or a
+  Snoozed/Settled row) shows the number its Ctrl+N jumps to, left of its name,
+  in `--text-muted` and in every order; Ctrl+N follows the stored order, so in
+  a sorted order the numbers can read out of sequence. Ctrl+9 is the last
+  workspace (browser tabs), so the first eight stored rows show 1–8, the last
+  shows 9, and the rows between show none. Sessions that never
+  chose an order use Manual; an explicit choice is kept.
 - **Pinned to top:** row menu › Pin to top / Unpin, in every order (not on a
   nested task row). Nesting wins: a nested task cannot be pinned, and a pinned
   workspace that becomes one leaves the group. Pinned workspaces lead the list and the rail in every
@@ -973,8 +977,8 @@ no empty reply row or reserved gap under the latest prompt.
   below follow the chosen order. A pinned row carries a muted pin glyph
   (`--text-muted`, never amber) and no group header or divider — the glyph
   and the position are the signal. The group is the head of the stored order,
-  so `^N`, the rail numbers and the phone's `order` all read pinned-first, and
-  pinned rows show their `^N` hint in every order. Pin, unpin and reorders
+  so the Ctrl+N numbers, the rail numbers and the phone's `order` all read
+  pinned-first. Pin, unpin and reorders
   inside the group apply at once (they are the user's own act, not a
   re-sort). Drag reorders inside the group in every order; in Manual a drop
   takes the target row's pin state, so dropping beside a pinned row pins and

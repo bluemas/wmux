@@ -100,7 +100,9 @@ describe('destroyPaneTreeRemoteSessions / destroyWorkspaceRemoteSessions', () =>
 describe('every explicit close path is wired to the teardown', () => {
   const cases: Array<[string, RegExp]> = [
     ['components/Pane/Pane.tsx', /destroySurfaceRemoteSession\(/],
-    ['hooks/useKeyboard.ts', /destroySurfaceRemoteSession\(/],
+    // The close-tab shortcut asks first (#1839); the confirm runs the close.
+    ['hooks/useKeyboard.ts', /requestCloseTab\(/],
+    ['components/Pane/CloseTabConfirm.tsx', /destroySurfaceRemoteSession\(/],
     ['hooks/useKeyboard.ts', /destroyPaneTreeRemoteSessions\(/],
     ['hooks/useKeyboard.ts', /destroyWorkspaceRemoteSessions\(/],
     ['hooks/useRpcBridge.ts', /destroySurfaceRemoteSession\(/],

@@ -85,3 +85,15 @@ export function showGitDiff(): void {
     console.error('[wmux:commands] diff.resolveRepo failed:', err);
   });
 }
+
+/** Event the active pane's tab strip answers by opening the rename field on its active tab. */
+export const RENAME_ACTIVE_TAB_EVENT = 'wmux:rename-active-tab';
+
+/**
+ * Rename the active tab. The edit field belongs to the pane's tab strip
+ * (SurfaceTabs), so this brings the Workspaces page forward and asks it.
+ */
+export function renameActiveTab(): void {
+  showWorkspaces(useStore.getState());
+  document.dispatchEvent(new CustomEvent(RENAME_ACTIVE_TAB_EVENT));
+}

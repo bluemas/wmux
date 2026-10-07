@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { fromAgentPath, toAgentPath, wslMountRoot } from '../wslPaths';
+import { fromAgentPath, toAgentPath, wslMountRoot, wslPathToHost } from '../wslPaths';
 
 const wsl = (mount?: string): NodeJS.ProcessEnv => ({
   WMUX_WSL_DISTRO: 'Ubuntu',
@@ -87,5 +87,65 @@ describe('fromAgentPath', () => {
     expect(fromAgentPath('a.png', env)).toBeNull();
     expect(fromAgentPath('./proj', env)).toBeNull();
     expect(fromAgentPath('a.png', {})).toBe('a.png');
+  });
+});
+
+describe('wslPathToHost', () => {
+  it('maps the drive mount without needing a distro, keeping spaces and dots', () => {
+    expect(wslPathToHost('/mnt/d/2026/1. coding/1. coding/260618.ax-tm', undefined))
+      .toEqual({ path: 'D:\\2026\\1. coding\\1. coding\\260618.ax-tm' });
+    expect(wslPathToHost('/mnt/c', undefined)).toEqual({ path: 'C:\\' });
+  });
+
+  it('honours a known automount root', () => {
+    expect(wslPathToHost('/e/x', 'Ubuntu', '/c/')).toEqual({ path: 'E:\\x' });
+  });
+
+  it("maps a distro-internal path into the distro's \\\\wsl$ share", () => {
+    expect(wslPathToHost('/home/me/my repo', 'Ubuntu-24.04')).toEqual({ path: '\\\\wsl$\\Ubuntu-24.04\\home\\me\\my repo' });
+    // `/mnt/cfoo` is not a drive.
+    expect(wslPathToHost('/mnt/cfoo', 'Ubuntu')).toEqual({ path: '\\\\wsl$\\Ubuntu\\mnt\\cfoo' });
+  });
+
+  it('refuses rather than guesses without a valid distro, or for a non-absolute path', () => {
+    expect(wslPathToHost('/home/me/repo', undefined)).toMatchObject({ error: expect.stringMatching(/distro is unknown/) });
+    expect(wslPathToHost('/home/me/repo', 'bad\\name')).toHaveProperty('error');
+    expect(wslPathToHost('repo', 'Ubuntu')).toHaveProperty('error');
+    expect(wslPathToHost('//server/share', 'Ubuntu')).toHaveProperty('error');
+  });
+});
+
+describe('wslPathToHost refuses Linux names Windows would read differently', () => {
+  it('refuses a backslash segment that would climb to a sibling directory', () => {
+    // One directory named `..\other` inside repo, not repo's parent.
+    const res = wslPathToHost('/home/me/repo/..\\other', 'Ubuntu');
+    expect(res).toMatchObject({ error: expect.stringMatching(/cannot be translated safely/) });
+    expect(wslPathToHost('/mnt/d/repo/..\\other', undefined)).toHaveProperty('error');
+  });
+
+  it('refuses a colon and the rest of the Windows-reserved set', () => {
+    for (const ch of [':', '*', '?', '"', '<', '>', '|']) {
+      expect(wslPathToHost(`/home/me/a${ch}b`, 'Ubuntu')).toHaveProperty('error');
+    }
+  });
+
+  it('refuses a trailing dot or space, which Win32 strips onto a sibling', () => {
+    // Seen live on Windows 11: a WSL pane in /mnt/d/x/alias. (not a repo) was
+    // fanned out from D:\x\alias, a different repository.
+    for (const p of ['/mnt/d/x/alias.', '/mnt/d/x/alias ', '/mnt/d/x/alias./sub', '/home/me/repo.', '/home/me/repo..', '/home/me/repo\t']) {
+      expect(wslPathToHost(p, 'Ubuntu')).toMatchObject({ error: expect.stringMatching(/cannot be translated safely/) });
+    }
+  });
+
+  it('refuses a device name, with or without an extension', () => {
+    for (const name of ['con', 'NUL', 'aux.txt', 'com1', 'LPT9.log', 'com¹']) {
+      expect(wslPathToHost(`/mnt/d/x/${name}`, 'Ubuntu')).toHaveProperty('error');
+    }
+  });
+
+  it('keeps names that only resemble those', () => {
+    for (const p of ['/mnt/d/x/.git', '/mnt/d/x/a.b', '/mnt/d/x/console', '/mnt/d/x/com10', '/mnt/d/x/nul_', '/mnt/d/x/..', '/mnt/d/x/./y']) {
+      expect(wslPathToHost(p, 'Ubuntu')).toHaveProperty('path');
+    }
   });
 });

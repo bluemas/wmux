@@ -262,7 +262,7 @@ const electronAPI = {
       // `cwdMissing` (#1305) rides the recoveryPending shape: the WSL directory
       // itself is gone, so Retry cannot succeed until it is restored and the
       // pane is offered a fresh start in the home directory instead.
-      ipcRenderer.invoke(IPC.PTY_RECONNECT, id) as Promise<{ success: boolean; id?: string; shell?: string; error?: string; code?: string; transient?: boolean; recoveryPending?: boolean; cwdMissing?: boolean; recovery?: DeadPaneRecovery }>,
+      ipcRenderer.invoke(IPC.PTY_RECONNECT, id) as Promise<{ success: boolean; id?: string; shell?: string; cols?: number; rows?: number; error?: string; code?: string; transient?: boolean; recoveryPending?: boolean; cwdMissing?: boolean; recovery?: DeadPaneRecovery }>,
     // Fix B — on-demand promote of a cap-skipped suspended session.
     // #1305 — `fresh` promotes it in the home directory WITHOUT resuming the
     // recorded conversation: the way out when its own directory is gone.
@@ -298,8 +298,11 @@ const electronAPI = {
       ipcRenderer.on(IPC.PTY_DATA, listener);
       return () => { ipcRenderer.removeListener(IPC.PTY_DATA, listener); };
     },
-    onExit: (callback: (id: string, exitCode: number) => void) => {
-      const listener = (_event: Electron.IpcRendererEvent, id: string, exitCode: number) => callback(id, exitCode);
+    // `signal` is the killing signal (non-zero) or null/0 for a normal exit;
+    // node-pty reports a signalled process with exitCode 0.
+    onExit: (callback: (id: string, exitCode: number, signal?: number | null) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, id: string, exitCode: number, signal?: number | null) =>
+        callback(id, exitCode, signal);
       ipcRenderer.on(IPC.PTY_EXIT, listener);
       return () => { ipcRenderer.removeListener(IPC.PTY_EXIT, listener); };
     },
@@ -680,6 +683,32 @@ const electronAPI = {
     set: (vendor: 'claude' | 'codex', on: boolean) =>
       ipcRenderer.invoke(IPC.ACCOUNT_ROTATION_SET, { vendor, on }) as Promise<{ ok: boolean }>,
   },
+  // agy (Antigravity CLI) accounts: one machine-wide sign-in, swapped by main.
+  // Snapshots carry emails, labels and quota fractions only — never a credential.
+  agyAccounts: {
+    list: () =>
+      ipcRenderer.invoke(IPC.AGY_ACCOUNT_LIST) as Promise<
+        import('../shared/agyAccounts').AgyAccountsSnapshot & {
+          login: import('../main/account/AgyAccountService').AgyLoginState;
+        }
+      >,
+    addCurrent: (label?: string) =>
+      ipcRenderer.invoke(IPC.AGY_ACCOUNT_ADD_CURRENT, { label }) as Promise<import('../shared/agyAccounts').AgyAccount>,
+    beginLogin: () =>
+      ipcRenderer.invoke(IPC.AGY_ACCOUNT_LOGIN_BEGIN) as Promise<import('../main/account/AgyAccountService').AgyLoginState>,
+    cancelLogin: () => ipcRenderer.invoke(IPC.AGY_ACCOUNT_LOGIN_CANCEL) as Promise<{ ok: boolean }>,
+    activate: (id: string) => ipcRenderer.invoke(IPC.AGY_ACCOUNT_ACTIVATE, { id }) as Promise<{ ok: boolean }>,
+    rename: (id: string, label: string) =>
+      ipcRenderer.invoke(IPC.AGY_ACCOUNT_RENAME, { id, label }) as Promise<{ ok: boolean }>,
+    remove: (id: string) => ipcRenderer.invoke(IPC.AGY_ACCOUNT_REMOVE, { id }) as Promise<{ ok: boolean }>,
+    setAutoRotate: (on: boolean) =>
+      ipcRenderer.invoke(IPC.AGY_ACCOUNT_SET_AUTO_ROTATE, { on }) as Promise<{ ok: boolean }>,
+    onChanged: (callback: () => void) => {
+      const listener = (): void => callback();
+      ipcRenderer.on(IPC.AGY_ACCOUNT_CHANGED, listener);
+      return () => { ipcRenderer.removeListener(IPC.AGY_ACCOUNT_CHANGED, listener); };
+    },
+  },
   // Scheduled runs. Invokes pass through to the daemon's automation.* RPCs and
   // never reject for a missing daemon (empty lists / `{ ok:false }`). onPush
   // carries daemon events + connect-time snapshots; onOpenRun is an OS toast
@@ -836,6 +865,26 @@ const electronAPI = {
         ipcRenderer.invoke(IPC.DECK_MOA_DELEGATED_APPROVALS) as Promise<{ approvals: import('../shared/moa').MoaDelegatedApproval[] }>,
       delegatedAnswer: (args: { approvalId: string; choiceKey: string; promptFingerprint: string }) =>
         ipcRenderer.invoke(IPC.DECK_MOA_DELEGATED_ANSWER, args) as Promise<import('../shared/moa').MoaApprovalAnswerResult>,
+      // Moa's delegate (moa_ask tickets): list, answer an escalated one, the
+      // per-rule auto toggle, and main's change events. Owner-only: no pipe
+      // route reaches these.
+      delegateList: () =>
+        ipcRenderer.invoke(IPC.DECK_MOA_DELEGATE_LIST) as Promise<import('../shared/moaDecision').MoaDelegateListResult>,
+      delegateResolve: (args: import('../shared/moaDecision').MoaResolveRequest) =>
+        ipcRenderer.invoke(IPC.DECK_MOA_DELEGATE_RESOLVE, args) as Promise<import('../shared/moaDecision').MoaResolveResult>,
+      delegateAutoSet: (args: import('../shared/moaDecision').MoaAutoRuleSetRequest) =>
+        ipcRenderer.invoke(IPC.DECK_MOA_DELEGATE_AUTO_SET, args) as Promise<import('../shared/moaDecision').MoaAutoRuleSetResult>,
+      // Decision events; the lane audit's MoaAuditEvent rides the same channel.
+      onDelegateDecision: (callback: (event: import('../shared/moaDecision').MoaDecisionEvent | import('../shared/moaDecision').MoaAuditEvent) => void) => {
+        const listener = (_e: Electron.IpcRendererEvent, data: import('../shared/moaDecision').MoaDecisionEvent | import('../shared/moaDecision').MoaAuditEvent): void => callback(data);
+        ipcRenderer.on(IPC.DECK_MOA_DELEGATE_DECISION_EVENT, listener);
+        return () => { ipcRenderer.removeListener(IPC.DECK_MOA_DELEGATE_DECISION_EVENT, listener); };
+      },
+      onDelegateEffect: (callback: (event: import('../shared/moaDecision').MoaEffectEvent) => void) => {
+        const listener = (_e: Electron.IpcRendererEvent, data: import('../shared/moaDecision').MoaEffectEvent): void => callback(data);
+        ipcRenderer.on(IPC.DECK_MOA_DELEGATE_EFFECT_EVENT, listener);
+        return () => { ipcRenderer.removeListener(IPC.DECK_MOA_DELEGATE_EFFECT_EVENT, listener); };
+      },
       // Moa's hand-offs: answer a hand-off card (a body only when the operator
       // edited it), the recent auto hand-offs, and stopping one of them.
       handoffResolve: (args: import('../shared/moaHandoff').MoaHandoffResolveRequest) =>

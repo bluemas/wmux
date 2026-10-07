@@ -45,7 +45,7 @@ export function isSidebarSortMode(value: unknown): value is SidebarSortMode {
 }
 
 /**
- * Resolve the persisted sort mode (owner decision 2026-10-04: Manual is the
+ * Resolve the persisted sort mode (owner decision 2026-10-07: Manual is the
  * default again, so rows keep the order the user dragged them into and a
  * working workspace never moves on its own). A mode the user explicitly chose
  * in Settings (`sidebarSortModeChosen`) is kept. 'recent' was only ever

@@ -609,7 +609,7 @@ export function selectFleetPanes(state: FleetSelectorState): FleetPane[] {
       // shared slot could only add it to a same-named sibling as well.
       // 'complete' is vetoed too: its per-pty carrier is cleared when the user
       // focuses the pane, but this slot keeps it until the next turn, so
-      // inheriting it pinned a seen pane in Ready to review.
+      // inheriting it pinned a seen pane in Finished.
       const metaStatus =
         isActivePane && metaMatchesPane
           && wsMeta?.agentStatus !== 'running' && wsMeta?.agentStatus !== 'awaiting_input'

@@ -29,6 +29,7 @@ import {
   type PrChecksState,
   type PrCommentRequest,
   type PrFilesState,
+  type PrLaneFacts,
   type PrMergeRequest,
   type PrReviewHead,
   type PrReviewRead,
@@ -78,6 +79,41 @@ const THREADS_QUERY = `query($owner: String!, $repo: String!, $number: Int!) {
   }
 }`;
 
+/**
+ * Moa's merge lane read (PrLaneFacts): state, head, author, merge evidence,
+ * labels, changed files and the last commit's checks with `isRequired`, in one
+ * answer. `isRequired` exists only in GraphQL, per PR. Never cached.
+ */
+export const LANE_PR_QUERY = `query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      number state isDraft isCrossRepository
+      headRefOid headRefName baseRefName
+      mergedAt mergeCommit { oid }
+      author { login }
+      labels(first: 50) { totalCount nodes { name } }
+      files(first: 100) { totalCount nodes { path } }
+      commits(last: 1) {
+        nodes {
+          commit {
+            oid
+            statusCheckRollup {
+              contexts(first: 100) {
+                totalCount
+                nodes {
+                  __typename
+                  ... on CheckRun { name status conclusion detailsUrl startedAt completedAt isRequired(pullRequestNumber: $number) }
+                  ... on StatusContext { context state targetUrl isRequired(pullRequestNumber: $number) }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}`;
+
 class RateLimited extends Error {
   constructor(readonly retryAt: number) {
     super('GitHub rate limit');
@@ -109,6 +145,9 @@ export function mapReviewHead(raw: unknown): PrReviewHead | null {
     ...(Array.isArray(j.labels)
       ? { labels: (j.labels as unknown[]).map((l) => str((l as Record<string, unknown> | null)?.name)).filter(Boolean) }
       : {}),
+    ...('author' in j ? { author: str((j.author as { login?: unknown } | null)?.login) || null } : {}),
+    ...('mergedAt' in j ? { mergedAt: str(j.mergedAt) || null } : {}),
+    ...('mergeCommit' in j ? { mergeCommitOid: str((j.mergeCommit as { oid?: unknown } | null)?.oid) || null } : {}),
   };
 }
 
@@ -153,6 +192,51 @@ export function mapRollup(raw: unknown): PrCheck[] {
       ...(run ? { runId: run.runId, ...(run.jobId ? { jobId: run.jobId } : {}) } : {}),
     }];
   });
+}
+
+/** The lane's facts from LANE_PR_QUERY's answer. Null when it is not a PR.
+ *  A check node without a readable `isRequired` counts as not required. */
+export function mapLaneFacts(raw: unknown): PrLaneFacts | null {
+  const pr = (raw as { data?: { repository?: { pullRequest?: unknown } } })?.data?.repository?.pullRequest as Record<string, unknown> | null | undefined;
+  if (!pr || typeof pr.number !== 'number' || typeof pr.headRefOid !== 'string') return null;
+  type Conn = { totalCount?: unknown; nodes?: unknown };
+  const nodesOf = (c: unknown): unknown[] => (Array.isArray((c as Conn | null)?.nodes) ? ((c as Conn).nodes as unknown[]) : []);
+  const truncated = (c: unknown, read: number): boolean => {
+    const total = (c as Conn | null)?.totalCount;
+    // An unreadable count is not proof that everything was read.
+    return typeof total !== 'number' || total > read;
+  };
+  const labelNodes = nodesOf(pr.labels);
+  const labels = labelNodes.map((l) => str((l as { name?: unknown } | null)?.name)).filter(Boolean);
+  const fileNodes = nodesOf(pr.files);
+  const files = fileNodes.map((f) => str((f as { path?: unknown } | null)?.path)).filter(Boolean);
+  const commit = (nodesOf(pr.commits)[0] as { commit?: Record<string, unknown> } | undefined)?.commit;
+  const contexts = (commit?.statusCheckRollup as { contexts?: unknown } | null | undefined)?.contexts;
+  const checkNodes = nodesOf(contexts);
+  const checks = checkNodes.flatMap((n): PrCheck[] => {
+    const check = mapRollup([n])[0];
+    return check ? [{ ...check, isRequired: (n as { isRequired?: unknown }).isRequired === true }] : [];
+  });
+  return {
+    number: pr.number,
+    state: str(pr.state),
+    isDraft: pr.isDraft === true,
+    isCrossRepository: pr.isCrossRepository !== false,
+    headRefOid: pr.headRefOid,
+    headRefName: str(pr.headRefName),
+    baseRefName: str(pr.baseRefName),
+    author: str((pr.author as { login?: unknown } | null)?.login) || null,
+    mergedAt: str(pr.mergedAt) || null,
+    mergeCommitOid: str((pr.mergeCommit as { oid?: unknown } | null)?.oid) || null,
+    labels,
+    labelsTruncated: truncated(pr.labels, labelNodes.length) || labels.length !== labelNodes.length,
+    files,
+    filesTruncated: truncated(pr.files, fileNodes.length) || files.length !== fileNodes.length,
+    checksHeadOid: typeof commit?.oid === 'string' ? commit.oid : null,
+    checks,
+    // No rollup at all (no checks ever ran) reads as nothing truncated.
+    checksTruncated: contexts === undefined || contexts === null ? false : truncated(contexts, checkNodes.length) || checks.length !== checkNodes.length,
+  };
 }
 
 /** Review threads from the GraphQL answer, comments capped; an outdated
@@ -397,6 +481,41 @@ export class GhPrReviewService {
       ], repoPath);
       return mapThreads(JSON.parse(out), headRefOid);
     }));
+  }
+
+  /** Moa's merge lane read (LANE_PR_QUERY): always fresh, never cached, so a
+   *  lane predicate never runs on an answer older than this call. */
+  laneFacts(repoPath: string, key: string, number: number): Promise<PrReviewRead<PrLaneFacts>> {
+    return this.read(async () => {
+      const { host, owner, repo } = this.repo(key);
+      const out = await this.gh(host, [
+        'api', 'graphql', '--hostname', host,
+        '-f', `query=${LANE_PR_QUERY}`, '-f', `owner=${owner}`, '-f', `repo=${repo}`, '-F', `number=${number}`,
+      ], repoPath);
+      const facts = mapLaneFacts(JSON.parse(out));
+      if (!facts) throw new Error('could not read the pull request');
+      return facts;
+    });
+  }
+
+  /** PRs merged since `sinceIso` (newest first, at most `limit`): the lane
+   *  audit's read. Never cached. */
+  mergedSince(repoPath: string, key: string, sinceIso: string, limit = 50): Promise<PrReviewRead<Array<{ number: number; title: string; mergedAt: string; headRefOid: string }>>> {
+    return this.read(async () => {
+      const { host } = this.repo(key);
+      const out = await this.gh(host, [
+        'pr', 'list', '--repo', key, '--state', 'merged', '--limit', String(limit),
+        '--search', `merged:>=${sinceIso}`, '--json', 'number,title,mergedAt,headRefOid',
+      ], repoPath);
+      const raw = JSON.parse(out) as unknown;
+      if (!Array.isArray(raw)) return [];
+      return raw.flatMap((r) => {
+        const o = r as Record<string, unknown>;
+        return typeof o.number === 'number' && typeof o.mergedAt === 'string' && typeof o.headRefOid === 'string'
+          ? [{ number: o.number, title: str(o.title), mergedAt: o.mergedAt, headRefOid: o.headRefOid }]
+          : [];
+      });
+    });
   }
 
   /** A comment on one line of the diff at the head the person saw. */

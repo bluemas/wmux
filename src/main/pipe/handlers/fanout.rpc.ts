@@ -93,6 +93,8 @@ import { ORCH_ROLES } from '../../../shared/orchestratorRole';
 import { sendToRenderer } from './_bridge';
 import { resolvePtyOwnerWorkspace } from '../../workspace/ptyOwnership';
 import { git as runGit } from '../../git/git';
+import type { DaemonClient } from '../../DaemonClient';
+import { hostCwdForPane, type DaemonRpc } from '../../pty/wslCallerCwd';
 import { loadWorkspaceDecision } from '../../deck/deckDecisionStore';
 import type { FanOutRequest, FanOutService, FanOutTaskResult } from '../../worktask/FanOutService';
 import { getFanOutGuards, promptDigest, type FanOutGuards } from '../../worktask/fanoutGuards';
@@ -277,30 +279,41 @@ function deny(code: string, message: string): { ok: false; error: { code: string
  *  argv element, so this is not the load-bearing defence (R3's toplevel
  *  comparison is) — it just keeps control characters and flag-looking strings
  *  out of the process table and the logs. */
-function normalizeRepoInput(raw: string): string | null {
+function normalizeRepoInput(raw: string, platform: NodeJS.Platform = process.platform): string | null {
   const trimmed = raw.trim();
   if (trimmed.length === 0) return null;
   if (trimmed.startsWith('-')) return null;
   // eslint-disable-next-line no-control-regex
   if (/[\x00-\x1f\x7f]/.test(trimmed)) return null;
-  return path.resolve(trimmed);
+  // The host's own path rules (identical to `path` on a real host; explicit so
+  // a test can stand in for win32).
+  return (platform === 'win32' ? path.win32 : path.posix).resolve(trimmed);
 }
 
 /**
  * git toplevel of `dir`, realpath'd, or null. `--show-toplevel` so any
  * subdirectory of the caller's repo normalises to the same answer, and realpath
  * so a symlinked worktree cannot alias a different repository.
+ *
+ * `refusal` is what git said when it answered no root. It is not always "not a
+ * repository": Git for Windows refuses a WSL caller's `\\wsl$\…` repository
+ * for "dubious ownership", and the caller needs that cause to fix it.
  */
-async function repoRootOf(dir: string): Promise<string | null> {
+async function repoRootOf(dir: string): Promise<{ root: string | null; refusal: string }> {
   const res = await runGit(['rev-parse', '--show-toplevel'], dir);
-  if (res.code !== 0) return null;
+  if (res.code !== 0) return { root: null, refusal: gitRefusal(res.stderr) };
   const top = res.stdout.trim();
-  if (top.length === 0) return null;
+  if (top.length === 0) return { root: null, refusal: '' };
   try {
-    return fs.realpathSync(top);
+    return { root: fs.realpathSync(top), refusal: '' };
   } catch {
-    return top;
+    return { root: top, refusal: '' };
   }
+}
+
+/** git's stderr as one bounded line, for an error message. */
+function gitRefusal(stderr: string): string {
+  return stderr.replace(/\s+/g, ' ').trim().slice(0, 400);
 }
 
 /**
@@ -384,7 +397,10 @@ async function resolveSenderSurfaceCwd(
     if (!entry || typeof entry !== 'object') continue;
     const row = entry as Record<string, unknown>;
     if (row['ptyId'] !== senderPtyId) continue;
-    return typeof row['cwd'] === 'string' ? row['cwd'].trim() : '';
+    // trimStart, not trim: a trailing space is part of a WSL directory name
+    // (`/mnt/d/x/repo `), and dropping it here would name the sibling `repo`.
+    // The host-path normalizer trims what is left after translation.
+    return typeof row['cwd'] === 'string' ? row['cwd'].trimStart() : '';
   }
   return '';
 }
@@ -441,21 +457,27 @@ async function deriveCallerRepoRoot(
   getWindow: GetWindow,
   workspaceId: string,
   senderPtyId: string,
-  opts: { requireRepo: boolean } = { requireRepo: true },
+  opts: { requireRepo: boolean; platform?: NodeJS.Platform; daemonRpc?: DaemonRpc } = { requireRepo: true },
 ): Promise<{ root: string } | { code: string; message: string }> {
-  const cwd = await resolveSenderSurfaceCwd(getWindow, workspaceId, senderPtyId);
-  if (!cwd) {
+  const reported = await resolveSenderSurfaceCwd(getWindow, workspaceId, senderPtyId);
+  if (!reported) {
     return {
       code: 'FAILED_PRECONDITION',
       message:
         "task.fanout.start could not determine the calling terminal's working directory — the fan-out anchors on a pane whose cwd is a git repository",
     };
   }
-  const resolved = normalizeRepoInput(cwd);
+  // A WSL pane reports a Linux cwd; translate it before the host's path rules
+  // touch it (`/mnt/d/x` would otherwise resolve to `C:\mnt\d\x`).
+  const host = await hostCwdForPane(reported, senderPtyId, opts);
+  if ('error' in host) {
+    return { code: 'FAILED_PRECONDITION', message: `the calling terminal's working directory has no Windows path: ${host.error}` };
+  }
+  const resolved = normalizeRepoInput(host.cwd, opts.platform);
   if (!resolved) {
     return { code: 'FAILED_PRECONDITION', message: `the calling terminal has an unusable working directory` };
   }
-  const root = await repoRootOf(resolved);
+  const { root, refusal } = await repoRootOf(resolved);
   if (!root && !opts.requireRepo) {
     // worktree:false needs no repository: the tasks write into their own
     // folders under the wmux data dir. The anchor is still the caller's own
@@ -470,7 +492,7 @@ async function deriveCallerRepoRoot(
   if (!root) {
     return {
       code: 'FAILED_PRECONDITION',
-      message: `the calling terminal's directory is not inside a git repository: ${resolved}`,
+      message: `the calling terminal's directory is not inside a git repository: ${resolved}${refusal ? ` (git: ${refusal})` : ''}`,
     };
   }
   return { root };
@@ -577,6 +599,10 @@ export interface FanOutRpcDeps {
   requireApproval?: () => boolean;
   /** Injected in tests; defaults to the main-side preset store. */
   presets?: () => FanoutPreset[];
+  /** Reads a WSL caller pane's distro (its daemon session's wslTarget). */
+  getDaemonClient?: () => DaemonClient | null;
+  /** Injected in tests; defaults to process.platform. */
+  platform?: NodeJS.Platform;
 }
 
 
@@ -657,6 +683,11 @@ export function registerFanOutRpc(
   deps: FanOutRpcDeps = {},
 ): void {
   const guardsOf = (): FanOutGuards => deps.guards ?? getFanOutGuards();
+  const daemonRpc: DaemonRpc = async (method, params) => {
+    const dc = deps.getDaemonClient?.();
+    if (!dc?.isConnected) throw new Error('daemon not connected');
+    return dc.rpc(method, params);
+  };
   // Gate bookkeeping lives in this closure rather than at module scope: it is
   // per-router state, and a fresh map per registration keeps tests isolated.
   //
@@ -968,7 +999,7 @@ export function registerFanOutRpc(
     const anchorPtyId = commanderWorkspaceId
       ? await resolveCommanderAnchorPtyId(getWindow, commanderWorkspaceId)
       : senderPtyId;
-    const preflight = await deriveCallerRepoRoot(getWindow, callerWorkspaceId, anchorPtyId, { requireRepo: worktree });
+    const preflight = await deriveCallerRepoRoot(getWindow, callerWorkspaceId, anchorPtyId, { requireRepo: worktree, platform: deps.platform, daemonRpc });
     if (!('root' in preflight)) {
       // Nothing was started and nothing was asked, so the key must go back —
       // otherwise a transient renderer miss would brick it until eviction.
@@ -1083,7 +1114,7 @@ export function registerFanOutRpc(
         // sibling pane's if the surface reports no cwd of its own). Re-derive and
         // require the same root, or the approval was given for one repo and spent
         // on another.
-        const atApproval = await deriveCallerRepoRoot(getWindow, callerWorkspaceId, anchorPtyId, { requireRepo: worktree });
+        const atApproval = await deriveCallerRepoRoot(getWindow, callerWorkspaceId, anchorPtyId, { requireRepo: worktree, platform: deps.platform, daemonRpc });
         if (!('root' in atApproval) || atApproval.root !== callerRepoRoot) {
           settle(key, { phase: 'denied', reason: 'repo-moved' });
           guards.release(key);

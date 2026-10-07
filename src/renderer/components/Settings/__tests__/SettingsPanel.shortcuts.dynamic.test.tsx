@@ -186,6 +186,15 @@ describe('Settings → Shortcuts search', () => {
     expect(shown().some((l) => l.startsWith('Next workspace ('))).toBe(false);
   });
 
+  it('finds macOS symbol combos by modifier name', () => {
+    (window as unknown as { electronAPI: { platform: string } }).electronAPI.platform = 'darwin';
+    act(() => root.render(createElement(Harness)));
+    expect(badge(PREV).textContent).toBe('⌥+ArrowUp');
+    type('option arrowup');
+    expect(shown().some((l) => l.startsWith(`${PREV} (`))).toBe(true);
+    expect(shown().some((l) => l.startsWith('Next workspace ('))).toBe(false);
+  });
+
   it('says so when nothing matches, and shows every row again when cleared', () => {
     const all = shown().length;
     type('zzzz-no-such-shortcut');

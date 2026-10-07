@@ -126,5 +126,11 @@ describe('Sidebar — Attention order (render)', () => {
     act(() => root.render(<Sidebar />));
     const nums = [...container.querySelectorAll('[data-shortcut-number]')].map((n) => n.getAttribute('data-shortcut-number'));
     expect(nums.sort()).toEqual(['1', '2']);
+    // A key label, not a state: neutral text token, no colour of its own
+    // (DESIGN.md: colour carries state only).
+    for (const n of container.querySelectorAll<HTMLElement>('[data-shortcut-number]')) {
+      expect(n.className).toContain('text-[var(--text-muted)]');
+      expect(n.style.color).toBe('');
+    }
   });
 });

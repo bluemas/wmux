@@ -1295,6 +1295,7 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
         state.paneNewTerminalButton = data.paneNewTerminalButton;
       }
       if (data.splitInheritsCwd != null) state.splitInheritsCwd = data.splitInheritsCwd;
+      if (data.closeTabOnShellExit != null) state.closeTabOnShellExit = data.closeTabOnShellExit;
       if (data.imeResidueGuardEnabled != null) state.imeResidueGuardEnabled = data.imeResidueGuardEnabled;
       // Fail closed: only an explicit boolean is applied. A corrupted /
       // hand-edited value (e.g. the string "false") must not toggle the
