@@ -724,7 +724,8 @@ export class A2aTaskService {
    * Remote tasks with delivery work main can do now: an inbound task neither
    * delivered nor held (and not ended), or any reply/state item the peer sent
    * that is neither delivered nor held. Held work is NOT here: it waits for a
-   * person (`listRemoteHeld`) or the hold TTL, never for the backstop.
+   * person (`listRemoteHeld`) or the hold TTL, never for the backstop — except
+   * a `brain-unavailable` hold, which waits only for Moa.
    */
   listRemotePending(): Task[] {
     const out: Task[] = [];
@@ -732,8 +733,11 @@ export class A2aTaskService {
       const marker = remoteMarkerOf(task);
       if (!marker) continue;
       const ended = (TERMINAL_STATES as readonly string[]).includes(task.status.state);
-      const taskWork = marker.direction === 'inbound' && marker.delivered !== true && !marker.held && !ended;
-      const itemWork = (marker.inbox ?? []).some((i) => i.delivered !== true && !i.held);
+      // `brain-unavailable` waits for Moa, not for a person: main retries it
+      // as soon as Moa can take it, so it stays listed here.
+      const open = (held: string | undefined): boolean => !held || held === 'brain-unavailable';
+      const taskWork = marker.direction === 'inbound' && marker.delivered !== true && open(marker.held) && !ended;
+      const itemWork = (marker.inbox ?? []).some((i) => i.delivered !== true && open(i.held));
       if (taskWork || itemWork) out.push(task);
     }
     return out;

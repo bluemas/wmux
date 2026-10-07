@@ -1972,6 +1972,7 @@ export const en = {
   'a2aDelivery.reason.occupant-changed': "Another agent is in that pane now.",
   'a2aDelivery.reason.link-not-active': "The link to that PC has ended.",
   'a2aDelivery.reason.brain-delivery-pending': "For Moa: delivery to Moa is not available yet.",
+  'a2aDelivery.reason.brain-unavailable': "For Moa: Moa is off or not ready. It is delivered as soon as Moa is.",
   'a2aDelivery.retry': "Send to the current agent",
   'a2aDelivery.reject': "Reject",
   'a2aDelivery.failed': "That did not work. Try again.",

@@ -97,7 +97,7 @@ describe('sendRemoteTask', () => {
     const t = tasks.getTask(id)!;
     expect(t.metadata.to).toEqual({ workspaceId: `remote:${linkId}`, name: 'pc-b/ws-b/codex' });
     expect(t.metadata.from).toEqual(FROM);
-    expect(t.metadata.remote).toEqual({ v: 1, linkId, hostId: HOST, messageId: 'msg-1', direction: 'outbound' });
+    expect(t.metadata.remote).toEqual({ v: 1, linkId, hostId: HOST, messageId: 'msg-1', direction: 'outbound', kind: 'pane' });
     const [rec] = outbox.pending(HOST);
     expect(rec.envelope).toMatchObject({ linkId, linkVersion: 2, messageId: 'msg-1', kind: 'task', text: 'run the tests' });
     // Outbound tasks are never "pending delivery" here.

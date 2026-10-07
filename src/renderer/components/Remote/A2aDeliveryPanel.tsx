@@ -74,7 +74,8 @@ export function A2aDeliveryView(p: A2aDeliveryViewProps) {
         <ul className="wmux-a2a-list" aria-label={t('a2aDelivery.held')} data-testid="a2a-delivery-held">
           {p.held.map((task) => {
             const reason = heldReason(task) ?? 'pane-missing';
-            const brain = reason === 'brain-delivery-pending';
+            // Work for Moa is never handed to a pane; a brain-unavailable hold goes by itself once Moa can take it.
+            const brain = reason === 'brain-delivery-pending' || reason === 'brain-unavailable';
             return (
               <li key={task.id} className="wmux-a2a-row" data-task-id={task.id}>
                 <span className="wmux-a2a-row-line">

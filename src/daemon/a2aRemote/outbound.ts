@@ -118,7 +118,7 @@ export async function sendRemoteTask(deps: OutboundDeps, input: A2aRemoteSendTas
 
   const messageId = mint(deps);
   const taskId = remoteTaskId(link.linkId, messageId);
-  const marker: A2aRemoteTaskMarkerV1 = { v: 1, linkId: link.linkId, hostId: link.remote.hostId, messageId, direction: 'outbound' };
+  const marker: A2aRemoteTaskMarkerV1 = { v: 1, linkId: link.linkId, hostId: link.remote.hostId, messageId, direction: 'outbound', kind: link.local.kind };
   const created = await deps.taskService.createTask({
     id: taskId,
     title: input.title || input.text.slice(0, 100),

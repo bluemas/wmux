@@ -599,9 +599,25 @@ export interface A2aRemoteTaskMarkerV1 {
   direction: 'inbound' | 'outbound';
   /** Inbound only: false until main confirms the gated delivery. */
   delivered?: boolean;
-  /** Inbound only: why delivery is held. */
-  held?: 'occupant-changed' | 'pane-missing' | 'link-not-active' | 'brain-delivery-pending';
+  /**
+   * Why delivery is held. `brain-unavailable`: the work is for this PC's Moa,
+   * which cannot take it right now (Moa off, no HQ, or not started); it is
+   * delivered as soon as Moa can.
+   */
+  held?: 'occupant-changed' | 'pane-missing' | 'link-not-active' | 'brain-delivery-pending' | 'brain-unavailable';
+  /**
+   * This side's link endpoint kind when the task was stored. `brain` = the
+   * task is this PC's Moa's, delivered as a wake, never to a pane. Absent on a
+   * task stored before it was recorded (treated as a pane task).
+   */
+  kind?: A2aEndpointKind;
 }
+
+/**
+ * A message id the peer chose. It ends up in task ids, ledger keys and the
+ * text that wakes Moa, so only a plain token is accepted.
+ */
+export const A2A_REMOTE_MESSAGE_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
 export const A2A_REMOTE_TASK_ID_PREFIX = 'rt-';
 

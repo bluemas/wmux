@@ -161,6 +161,14 @@ describe('a2a.task.send — Moa to another PC\'s Moa (brain link)', () => {
     expect(remote.sendTask).not.toHaveBeenCalled();
   });
 
+  it('an alias that names two links is refused, never sent on the first one', async () => {
+    const other = '33333333-3333-4333-8333-333333333333';
+    remote.listTargets.mockResolvedValue([brainTarget, { ...brainTarget, linkId: other, hostId: other }]);
+    const res = await brainCall(setup(), { workspaceId: 'ws-hq', to: BRAIN_ALIAS, message: 'x' }, asBrain('ws-hq'));
+    expect(res.error).toMatch(/names 2 links/);
+    expect(remote.sendTask).not.toHaveBeenCalled();
+  });
+
   it('Moa addressing a remote pane alias is refused toward the handoff card', async () => {
     const res = await brainCall(setup(), { workspaceId: 'ws-a', to: ALIAS, message: 'x' }, asBrain('ws-a'));
     expect(res.error).toMatch(/moa_propose_handoff/);

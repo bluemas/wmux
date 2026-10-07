@@ -1,6 +1,7 @@
 import {
   A2A_BRAIN_ALIAS,
   A2A_REMOTE_BODY_MAX,
+  A2A_REMOTE_MESSAGE_ID_RE,
   A2A_REMOTE_PROTOCOL,
   isA2aRemoteMessageKind,
   type A2aLinkRecordV1,
@@ -83,7 +84,7 @@ export async function acceptInbound(
             paneId: link.local.paneId,
           },
         history: [textMessage(env.messageId, 'user', text)],
-        remote: { v: 1, linkId: link.linkId, hostId: peer.hostId, messageId: env.messageId, direction: 'inbound', delivered: false },
+        remote: { v: 1, linkId: link.linkId, hostId: peer.hostId, messageId: env.messageId, direction: 'inbound', delivered: false, kind: link.local.kind },
       },
       { conflictOnBodyMismatch: true },
     );
@@ -162,7 +163,7 @@ function parseEnvelope(raw: unknown): Parsed {
   if (!isPlainObject(raw)) return { error: 'bad-request' };
   if (raw['protocol'] !== A2A_REMOTE_PROTOCOL) return { error: 'protocol' };
   const { linkId, linkVersion, messageId, kind, taskId, text, state, link, sentAt } = raw;
-  if (!isSafeId(linkId) || !isSafeId(messageId) || typeof sentAt !== 'string') return { error: 'bad-request' };
+  if (!isSafeId(linkId) || typeof messageId !== 'string' || !A2A_REMOTE_MESSAGE_ID_RE.test(messageId) || typeof sentAt !== 'string') return { error: 'bad-request' };
   if (typeof linkVersion !== 'number' || !Number.isInteger(linkVersion)) return { error: 'bad-request' };
   if (!isA2aRemoteMessageKind(kind)) return { error: 'bad-request' };
   if (text !== undefined && typeof text !== 'string') return { error: 'bad-request' };

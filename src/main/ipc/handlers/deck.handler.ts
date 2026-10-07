@@ -162,7 +162,9 @@ import { getAccountStore } from '../../account/accountStore';
 import type { MoaApproval, MoaApprovalAnswerResult, MoaDelegatedApproval, MoaPendingDecision } from '../../../shared/moa';
 import { selectDelegatedApprovals } from '../../deck/moaDelegatedApprovals';
 import { resultFromTask, type MoaTaskResult } from '../../../shared/moaResult';
-import { moaRemoteTasks, type MoaRemoteTask } from '../../../shared/a2aRemoteDelivery';
+import { canonicalPcName, moaRemoteTasks, type MoaRemoteTask } from '../../../shared/a2aRemoteDelivery';
+import { isRemoteTaskId } from '../../../shared/a2aRemote';
+import { brainReceiverReady, notifyBrainReceiverChanged, setBrainReceiver } from '../../a2a/brainReceiver';
 import {
   beginOrContinueDeckWork,
   clearActiveDeckWork,
@@ -753,6 +755,8 @@ export function registerDeckHandler(
     moaTranscript.sync();
     const win = getWindow();
     if (win && !win.isDestroyed()) win.webContents.send(IPC.DECK_MOA_CHANGED, {});
+    // Moa on/off or the HQ came and went: cross-host work held for Moa may go.
+    notifyBrainReceiverChanged();
   };
 
   const emit = (workspaceId: string, event: BrainEvent): void => {
@@ -2159,11 +2163,14 @@ export function registerDeckHandler(
     // Cross-host A2A: another PC's Moa sent this PC's Moa work (brain link).
     // Only the current HQ is woken, through the same gates as any receipt.
     if (ev.type === 'a2a.received') {
+      // The bridge sends this only once the probe below says Moa can take it.
+      // A race with Moa switching off or its HQ changing parks it under the
+      // HQ the link names, replayed when a brain boots there.
       const hq = getHqWorkspaceId();
-      if (hq === null || ev.to !== hq || ev.workspaceId !== hq) return;
+      if (ev.workspaceId !== ev.to || !isRemoteTaskId(ev.taskId)) return;
       emitMoaChanged();
       const receipt: CoalescerInput = {
-        workspaceId: hq,
+        workspaceId: ev.to,
         // One subject per item kind: a reply buffered with its task keeps both.
         ptyId: `a2a:${ev.taskId}#${ev.item}`,
         kind: 'a2a.received',
@@ -2171,15 +2178,15 @@ export function registerDeckHandler(
         agent: null,
         seq: ev.seq,
         ts: ev.ts,
-        a2a: { taskId: ev.taskId, from: ev.from, to: hq, state: ev.state, remote: { host: ev.host, item: ev.item } },
+        a2a: { taskId: ev.taskId, from: ev.from, to: ev.to, state: ev.state, remote: { host: canonicalPcName(ev.host), item: ev.item } },
       };
-      if (hqPresence(hq) !== 'present') {
+      if (hq !== ev.to || hqPresence(hq) !== 'present' || !coalescer) {
         void getTaskLedger()
-          .recordOrphanedEvent({ ownerWorkspaceId: hq, seq: ev.seq, payload: receipt })
-          .catch((err) => console.warn(`[deck] could not park a remote Moa receipt for HQ ${hq}: ${String(err)}`));
+          .recordOrphanedEvent({ ownerWorkspaceId: ev.to, seq: ev.seq, payload: receipt })
+          .catch((err) => console.warn(`[deck] could not park a remote Moa receipt for HQ ${ev.to}: ${String(err)}`));
         return;
       }
-      coalescer?.push(receipt);
+      coalescer.push(receipt);
       return;
     }
     // AO-style CI feedback (owner decision 2026-07-18): a pane's PR went red.
@@ -3879,6 +3886,7 @@ export function registerDeckHandler(
   let offMirror: (() => void) | null = null;
   const startRuntime = (): void => {
     if (!offBus) offBus = eventBus.subscribe(onBusEvent);
+    notifyBrainReceiverChanged();
     if (!offMirror) offMirror = getWorkspaceMirror().onSnapshot(onHqMirrorUpdate);
     scheduler.start();
     heartbeat.start();
@@ -3908,6 +3916,19 @@ export function registerDeckHandler(
     globalTurnGate.cancelWaiters();
     for (const workspaceId of [...managers.keys()]) retireBrain(workspaceId);
   };
+  // Cross-host work for Moa (RemoteA2aBridge) is marked delivered only when
+  // this says Moa would see it: on, its HQ present and the one the link names,
+  // and the bus subscription that feeds the coalescer running.
+  setBrainReceiver((linkHq) => {
+    const hq = getHqWorkspaceId();
+    return brainReceiverReady({
+      moaEnabled: isMoaEnabled(),
+      runtimeStarted: offBus !== null,
+      coalescerReady: !!coalescer,
+      hqWorkspaceId: hq,
+      hqPresent: hq !== null && hqPresence(hq) === 'present',
+    }, linkHq);
+  });
   if (isMoaEnabled()) startRuntime();
   // A proposal left from the last run gets its card (or a card left while
   // Moa was switched off is cleared).
@@ -3927,6 +3948,7 @@ export function registerDeckHandler(
     moaIssueProposals.dispose();
     setMoaHandoffService(null);
     setMoaReadRootsRefresher(null);
+    setBrainReceiver(null);
     ipcMain.removeHandler(IPC.DECK_MOA_HANDOFF_RESOLVE);
     ipcMain.removeHandler(IPC.DECK_MOA_HANDOFF_RECEIPTS);
     ipcMain.removeHandler(IPC.DECK_MOA_HANDOFF_STOP);

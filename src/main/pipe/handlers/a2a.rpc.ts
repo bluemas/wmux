@@ -270,6 +270,10 @@ export function registerA2aRpc(
   ): Promise<unknown> {
     const alias = params.to as string;
     if (params.execute === true) return { error: 'a2a.task.send: execute is not available for a remote pane (message only)' };
+    // An alias must name exactly one link: never pick one of several silently.
+    if (matches.length > 1) {
+      return { error: `a2a.task.send: "${alias}" names ${matches.length} links; send to the exact alias a2a_discover lists for the one you mean (a repeated name gets a #2, #3 suffix)` };
+    }
     let message: string;
     try { message = validateMessage(typeof params.message === 'string' ? params.message : ''); } catch (e) {
       return { error: `a2a.task.send: ${e instanceof Error ? e.message : 'invalid'}` };

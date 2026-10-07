@@ -97,7 +97,7 @@ describe('acceptInbound — task', () => {
     const e = env(linkId, {});
     expect(await acceptInbound(e, peer, deps)).toMatchObject({ ok: true, duplicate: false });
     const id = remoteTaskId(linkId, e.messageId);
-    expect(tasks.getTask(id)!.metadata.remote).toMatchObject({ delivered: false });
+    expect(tasks.getTask(id)!.metadata.remote).toMatchObject({ delivered: false, kind: 'brain' });
     expect(tasks.getTask(id)!.metadata.remote).not.toHaveProperty('held');
     expect(tasks.listRemotePending().map((t) => t.id)).toEqual([id]);
     expect(broadcast).toHaveBeenCalledWith({ type: 'a2a.remote.inbound', taskId: id });
@@ -259,3 +259,21 @@ describe('acceptInbound — brain link (Moa to Moa)', () => {
     expect(broadcast).toHaveBeenCalledWith({ type: 'a2a.remote.inbound', taskId: id });
   });
 });
+
+describe('acceptInbound — message id', () => {
+  it('accepts only a plain token as the peer\'s message id', async () => {
+    const linkId = activeLink();
+    for (const messageId of ['a b', 'x"y', 'é', 'a'.repeat(129), 'a/b']) {
+      expect(await acceptInbound(env(linkId, { messageId }), peer, deps)).toMatchObject({ ok: false, error: 'bad-request' });
+    }
+    expect(await acceptInbound(env(linkId, { messageId: 'Abc_123-xyz' }), peer, deps)).toMatchObject({ ok: true });
+  });
+
+  it('records the link endpoint kind on the marker', async () => {
+    const linkId = activeLink();
+    const e = env(linkId, {});
+    await acceptInbound(e, peer, deps);
+    expect(tasks.getTask(remoteTaskId(linkId, e.messageId))!.metadata.remote).toMatchObject({ kind: 'pane' });
+  });
+});
+

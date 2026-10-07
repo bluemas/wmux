@@ -2033,6 +2033,7 @@ export const zh = {
   'a2aDelivery.reason.occupant-changed': "该窗格现在是另一个代理。",
   'a2aDelivery.reason.link-not-active': "与该 PC 的链接已结束。",
   'a2aDelivery.reason.brain-delivery-pending': "发给 Moa:尚不支持向 Moa 投递。",
+  'a2aDelivery.reason.brain-unavailable': "发给 Moa:Moa 已关闭或尚未就绪。Moa 就绪后会立即投递。",
   'a2aDelivery.retry': "交给当前代理",
   'a2aDelivery.reject': "拒绝",
   'a2aDelivery.failed': "操作失败,请重试。",

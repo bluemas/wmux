@@ -66,7 +66,7 @@ export interface A2aRemoteDeliveryDeps {
 
 const SYNC_MS = 5_000;
 const MAINTENANCE_MS = 60_000;
-const HELD_REASONS: ReadonlySet<string> = new Set<A2aRemoteHeldReason>(['occupant-changed', 'pane-missing', 'link-not-active', 'brain-delivery-pending']);
+const HELD_REASONS: ReadonlySet<string> = new Set<A2aRemoteHeldReason>(['occupant-changed', 'pane-missing', 'link-not-active', 'brain-delivery-pending', 'brain-unavailable']);
 const STATES: ReadonlySet<string> = new Set(['working', 'input-required', 'completed', 'failed', 'canceled']);
 const TERMINAL_LINK: ReadonlySet<string> = new Set(['revoked', 'broken']);
 
