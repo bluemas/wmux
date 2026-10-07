@@ -47,6 +47,8 @@ interface Pc {
   rpc: Rpc;
   /** What the fake renderer was handed. */
   rendered: Array<{ method: string; params: Record<string, unknown> }>;
+  /** What main's bridge put on this PC's event bus (brain-link work). */
+  emitted: Array<Record<string, unknown>>;
   /** Envelopes this PC's routes accepted from a peer (any outcome). */
   received: unknown[];
   stop: () => Promise<void>;
@@ -137,7 +139,9 @@ async function makePc(name: string, opts: { dir?: string; port?: number; client?
   const rpc: Rpc = (method, params = {}) => handlers.get(method)!(params);
 
   const rendered: Pc['rendered'] = [];
+  const emitted: Pc['emitted'] = [];
   const bridge = new RemoteA2aBridge({
+    emitEvent: (input) => void emitted.push(input),
     daemonRpc: (method, params) => rpc(method, params),
     sendToRenderer: async (method, params) => {
       rendered.push({ method, params });
@@ -166,6 +170,7 @@ async function makePc(name: string, opts: { dir?: string; port?: number; client?
     bridge,
     rpc,
     rendered,
+    emitted,
     received,
     stop: async () => {
       bridge.stop();
@@ -402,5 +407,122 @@ describe('cross-host delivery, end to end', () => {
     second.abort();
     first.abort();
     await Promise.all([firstRun, secondRun]);
+  });
+});
+
+describe('Moa to Moa across PCs (brain links), end to end', () => {
+  const HQ_A = 'ws-hq-a';
+  const HQ_B = 'ws-hq-b';
+
+  /** Both PCs expose their Moa to each other; A proposes Moa <-> Moa, B accepts. */
+  async function moaLinked(a: Pc, b: Pc): Promise<string> {
+    await pair(a, b);
+    await b.rpc('a2a.remote.exposure.publish', { panes: [{ kind: 'brain', workspaceId: HQ_B, workspaceName: 'Moa' }] });
+    await b.rpc('a2a.remote.exposure.set', { hostId: a.hostId, workspaceIds: [], brain: true });
+    const proposed = (await a.rpc('a2a.remote.links.propose', {
+      hostId: b.hostId,
+      local: { kind: 'brain', workspaceId: HQ_A, workspaceName: 'Moa' },
+      remote: { kind: 'brain', workspaceId: HQ_B, workspaceName: 'Moa' },
+      allow: { outbound: true, inbound: true },
+    })) as { ok: boolean; link: A2aLinkRecordV1 };
+    expect(proposed.ok).toBe(true);
+    const linkId = proposed.link.linkId;
+    expect(await b.rpc('a2a.remote.links.accept', { linkId })).toMatchObject({ ok: true });
+    await until(() => a.links.get(linkId)?.state === 'active');
+    return linkId;
+  }
+
+  const moaSend = async (pc: Pc, hq: string, linkId: string, text: string): Promise<string> => {
+    const res = (await pc.rpc(A2A_REMOTE_RPC.sendTask, { linkId, from: { workspaceId: hq, name: 'Moa' }, title: text, text })) as { ok: boolean; taskId: string };
+    expect(res.ok).toBe(true);
+    return res.taskId;
+  };
+
+  /**
+   * A fake brain: on each `a2a.received` new task, it reads the task (what
+   * a2a_task_query returns), answers it and completes it — what Moa does after
+   * the wake. The state goes out the way main's a2a.task.update does: the
+   * ledger first, then the state RPC.
+   */
+  function fakeBrain(pc: Pc, hq: string): () => void {
+    let seen = 0;
+    let stopped = false;
+    const tick = async (): Promise<void> => {
+      while (!stopped) {
+        const ev = pc.emitted.slice(seen).find((e) => e.type === 'a2a.received' && e.item === 'task');
+        seen = pc.emitted.length;
+        if (ev) {
+          const taskId = ev.taskId as string;
+          const task = pc.tasks.queryTasks(hq, {}).find((t) => t.id === taskId)!;
+          const asked = (task.history[0].parts[0] as { text: string }).text;
+          await pc.rpc(A2A_REMOTE_RPC.reply, { taskId, workspaceId: hq, text: `answer to: ${asked}` });
+          // A brain on its own HQ: no pane to prove, and the task has none.
+          for (const to of ['working', 'completed'] as const) {
+            const evidence = to === 'completed' ? { evidence: { summary: 'answered', items: [{ kind: 'inspection' as const, status: 'unverified' as const, summary: 'replied' }] } } : {};
+            expect(await pc.tasks.transition({ taskId, to, callerWorkspaceId: hq, requirePaneIdentity: true, ...evidence })).toMatchObject({ ok: true });
+            await pc.rpc(A2A_REMOTE_RPC.state, { taskId, state: to });
+          }
+        }
+        await new Promise((r) => setTimeout(r, 20));
+      }
+    };
+    void tick();
+    return () => { stopped = true; };
+  }
+
+  it('A\'s Moa asks B\'s Moa; B is woken (never a pane paste), answers; A is woken by the reply and the completion — both ways', async () => {
+    const b = await makePc('PC-B');
+    const a = await makePc('PC-A');
+    const linkId = await moaLinked(a, b);
+    const stopB = fakeBrain(b, HQ_B);
+    const stopA = fakeBrain(a, HQ_A);
+    try {
+      // Discover on A: B's Moa by its <PC>/Moa alias.
+      const targets = (await a.rpc(A2A_REMOTE_RPC.targets)) as { targets: Array<{ alias: string; kind: string }> };
+      expect(targets.targets).toMatchObject([{ alias: 'PC-B/Moa', kind: 'brain' }]);
+
+      const taskId = await moaSend(a, HQ_A, linkId, 'how is the build?');
+      await until(() => b.emitted.some((e) => e.taskId === taskId && e.item === 'task'));
+      expect(b.emitted.find((e) => e.taskId === taskId)).toMatchObject({
+        type: 'a2a.received', workspaceId: HQ_B, to: HQ_B, from: 'PC-A/Moa', host: 'PC-A', state: 'submitted',
+      });
+      expect(b.tasks.getTask(taskId)!.metadata.to).toEqual({ workspaceId: HQ_B, name: 'Moa' });
+
+      // A: the reply wakes Moa as a2a.received, the completion as the ordinary receipt.
+      await until(() => a.emitted.some((e) => e.type === 'a2a.task' && e.taskId === taskId && e.state === 'completed'));
+      expect(a.emitted).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: 'a2a.received', taskId, item: 'reply', workspaceId: HQ_A, host: 'PC-B' }),
+        expect.objectContaining({ type: 'a2a.task', taskId, from: HQ_A, to: `remote:${linkId}`, state: 'completed', workspaceId: HQ_A }),
+      ]));
+      expect(a.tasks.getTask(taskId)!.history.map((m) => (m.parts[0] as { text: string }).text))
+        .toEqual(['how is the build?', 'answer to: how is the build?']);
+
+      // Reverse: B's Moa asks A's Moa.
+      const back = await moaSend(b, HQ_B, linkId, 'and yours?');
+      await until(() => b.emitted.some((e) => e.type === 'a2a.task' && e.taskId === back && e.state === 'completed'));
+      expect(a.emitted.find((e) => e.taskId === back && e.item === 'task')).toMatchObject({ workspaceId: HQ_A, host: 'PC-B' });
+
+      // Nothing on a brain link ever went to a renderer, and nothing was held.
+      expect(a.rendered).toEqual([]);
+      expect(b.rendered).toEqual([]);
+      expect(a.tasks.listRemoteHeld()).toEqual([]);
+      expect(b.tasks.listRemoteHeld()).toEqual([]);
+      // Exactly one wake per new task.
+      expect(b.emitted.filter((e) => e.taskId === taskId && e.item === 'task')).toHaveLength(1);
+    } finally {
+      stopA();
+      stopB();
+    }
+  });
+
+  it('revoking the Moa link mid-task fails it on both sides', async () => {
+    const b = await makePc('PC-B');
+    const a = await makePc('PC-A');
+    const linkId = await moaLinked(a, b);
+    const taskId = await moaSend(a, HQ_A, linkId, 'long job');
+    await until(() => b.emitted.some((e) => e.taskId === taskId));
+    expect(await a.rpc('a2a.remote.links.revoke', { linkId })).toMatchObject({ ok: true });
+    await until(() => b.links.get(linkId)?.state === 'revoked');
+    await until(() => a.tasks.getTask(taskId)?.status.state === 'failed' && b.tasks.getTask(taskId)?.status.state === 'failed');
   });
 });

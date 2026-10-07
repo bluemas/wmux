@@ -243,15 +243,17 @@ export class A2aRemoteDelivery {
 
     onRpc(A2A_REMOTE_RPC.sendTask, async (p) => {
       const from = isPlainObject(p['from']) ? p['from'] : null;
-      if (!from || typeof from['workspaceId'] !== 'string' || typeof from['paneId'] !== 'string' || typeof p['text'] !== 'string') {
-        return { ok: false, error: 'bad-request: linkId, from{workspaceId, paneId} and text are required' };
+      // A pane sender names its pane; Moa (a brain link) has none. sendRemoteTask
+      // checks it against the link's local end.
+      if (!from || typeof from['workspaceId'] !== 'string' || (from['paneId'] !== undefined && typeof from['paneId'] !== 'string') || typeof p['text'] !== 'string') {
+        return { ok: false, error: 'bad-request: linkId, from{workspaceId, paneId?} and text are required' };
       }
       return sendRemoteTask(this.outboundDeps(), {
         linkId: str(p, 'linkId'),
         from: {
           workspaceId: from['workspaceId'],
           name: typeof from['name'] === 'string' ? from['name'] : from['workspaceId'],
-          paneId: from['paneId'],
+          ...(typeof from['paneId'] === 'string' ? { paneId: from['paneId'] } : {}),
           ...(typeof from['ptyId'] === 'string' ? { ptyId: from['ptyId'] } : {}),
         },
         title: str(p, 'title'),
