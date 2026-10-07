@@ -21,10 +21,18 @@ describe('a2aRemote invite', () => {
     if (parsed.ok) expect(formatInvite(parsed.invite)).toBe(`wmux-a2a://DESKTOP-WIN2:7681/K7PXM4QA#sha256=${FP}`);
   });
 
+  it('round-trips a Windows machine name with an underscore', () => {
+    const raw = `wmux-a2a://DEV_PC_01.corp.local:7681/K7PXM4QA#sha256=${FP}`;
+    const parsed = parseInvite(raw);
+    expect(parsed).toEqual({ ok: true, invite: { host: 'DEV_PC_01.corp.local', port: 7681, code: 'K7PXM4QA', fingerprint256: FP } });
+    if (parsed.ok) expect(formatInvite(parsed.invite)).toBe(raw);
+  });
+
   it.each([
     ['', 'empty'],
     ['https://host:7681/K7PXM4QA#sha256=' + FP, 'scheme'],
-    ['wmux-a2a://bad_host:7681/K7PXM4QA#sha256=' + FP, 'host'],
+    ['wmux-a2a://bad!host:7681/K7PXM4QA#sha256=' + FP, 'host'],
+    ['wmux-a2a://-dash:7681/K7PXM4QA#sha256=' + FP, 'host'],
     ['wmux-a2a://host:70000/K7PXM4QA#sha256=' + FP, 'port'],
     ['wmux-a2a://host:7681/K7PXM4Q0#sha256=' + FP, 'code'],
     ['wmux-a2a://host:7681/K7PXM4QA#sha256=ABCD', 'fingerprint'],

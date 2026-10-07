@@ -14,7 +14,19 @@ describe('remoteTaskId', () => {
 
   it('separates the two halves so a shifted boundary is a different task', () => {
     expect(remoteTaskId('ab', 'c')).not.toBe(remoteTaskId('a', 'bc'));
-    expect(remoteTaskId('a', '')).not.toBe(remoteTaskId('', 'a'));
+  });
+
+  it('refuses a NUL inside either part, which would collide across the separator', () => {
+    // Unchecked, both of these hash the bytes "a\0b\0c".
+    expect(() => remoteTaskId('a\0b', 'c')).toThrow(TypeError);
+    expect(() => remoteTaskId('a', 'b\0c')).toThrow(TypeError);
+  });
+
+  it('refuses empty and oversized parts', () => {
+    expect(() => remoteTaskId('', 'm')).toThrow(TypeError);
+    expect(() => remoteTaskId('l', '')).toThrow(TypeError);
+    expect(() => remoteTaskId('l'.repeat(257), 'm')).toThrow(TypeError);
+    expect(isRemoteTaskId(remoteTaskId('l'.repeat(256), 'm'.repeat(256)))).toBe(true);
   });
 
   it('differs per link and per message', () => {

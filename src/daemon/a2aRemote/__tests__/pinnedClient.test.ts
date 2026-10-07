@@ -122,13 +122,13 @@ describe('PinnedTlsClient — the pin', () => {
     expect(seen[0].headers.host).toBe(`127.0.0.1:${port}`);
   });
 
-  it('sends no Authorization at all without a credential (pre-pairing hello)', async () => {
+  it('sends no Authorization at all without a credential (the /api/pair exchange)', async () => {
     const { port, seen } = await httpsServer((_req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end('{"protocol":1}');
+      res.end('{"paired":true}');
     });
-    const out = await client({ port }).requestJson('GET', '/api/a2a/hello');
-    expect(out).toEqual({ status: 200, json: { protocol: 1 } });
+    const out = await client({ port }).requestJson('GET', '/api/pair?code=K7PXM4QA');
+    expect(out).toEqual({ status: 200, json: { paired: true } });
     expect(seen[0].headers.authorization).toBeUndefined();
   });
 
@@ -167,6 +167,53 @@ describe('PinnedTlsClient — the pin', () => {
     );
     expect((err as PinnedClientError).code).toBe('fingerprint-mismatch');
     await Promise.all(state.closed);
+    expect(state.appBytes).toBe(0);
+  });
+});
+
+describe('PinnedTlsClient — socket lifecycle', () => {
+  /** TLS server on certificate A that drops every connection right after the handshake. */
+  async function dropAfterHandshake() {
+    const state = { closed: [] as Promise<void>[] };
+    const server = tls.createServer({ cert: CERT_A, key: KEY_A }, (sock) => {
+      sock.on('error', () => { /* expected */ });
+      sock.destroy();
+    });
+    server.on('tlsClientError', () => { /* expected */ });
+    server.on('connection', (raw: net.Socket) => {
+      state.closed.push(new Promise((resolve) => raw.on('close', () => resolve())));
+    });
+    track(server, new Set());
+    return { port: await listen(server), state };
+  }
+
+  it('fails a request at once when the socket dies right after the handshake', async () => {
+    const { port } = await dropAfterHandshake();
+    const t0 = Date.now();
+    const err = await client({ port, requestTimeoutMs: 10_000 }).requestJson('GET', '/x').catch((e: unknown) => e);
+    expect((err as PinnedClientError).code).toBe('network');
+    expect(Date.now() - t0).toBeLessThan(5_000);
+  });
+
+  it('fails a stream at once when the socket dies right after the handshake', async () => {
+    const { port } = await dropAfterHandshake();
+    const t0 = Date.now();
+    const ac = new AbortController();
+    const err = await collect(client({ port, requestTimeoutMs: 10_000 }).openStream('/s', { signal: ac.signal })).catch(
+      (e: unknown) => e,
+    );
+    expect((err as PinnedClientError).code).toBe('network');
+    expect(Date.now() - t0).toBeLessThan(5_000);
+  });
+
+  it('closes the pinned socket when building the request throws (invalid header)', async () => {
+    const { port, state } = await rawCountingServer();
+    const c = client({ port, credential: 'bad\r\nX-Injected: 1' });
+    await expect(c.requestJson('GET', '/x')).rejects.toThrow();
+    const ac = new AbortController();
+    await expect(collect(c.openStream('/s', { signal: ac.signal }))).rejects.toThrow();
+    await Promise.all(state.closed);
+    expect(state.connections).toBe(2);
     expect(state.appBytes).toBe(0);
   });
 });
@@ -307,6 +354,104 @@ describe('PinnedTlsClient — event stream', () => {
     expect((err as PinnedClientError).code).toBe('http');
     expect((err as PinnedClientError).status).toBe(401);
     expect((err as PinnedClientError).json).toEqual({ ok: false, error: 'unauthorized', reason: 'revoked' });
+  });
+
+  it('times out a refused stream whose error body never ends', async () => {
+    const { port } = await httpsServer((_req, res) => {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.write('{"ok":false');
+    });
+    const ac = new AbortController();
+    const t0 = Date.now();
+    const err = await collect(client({ port, requestTimeoutMs: 300 }).openStream('/s', { signal: ac.signal })).catch(
+      (e: unknown) => e,
+    );
+    expect((err as PinnedClientError).code).toBe('http');
+    expect((err as PinnedClientError).status).toBe(401);
+    expect(Date.now() - t0).toBeLessThan(3_000);
+  });
+
+  it('ends at once, closing the socket, when aborted during the handshake', async () => {
+    const { port, state } = await rawCountingServer();
+    const ac = new AbortController();
+    const c = client({ port, requestTimeoutMs: 10_000 });
+    const it = c.openStream('/s', { signal: ac.signal });
+    const first = it.next();
+    // Abort while the TLS handshake is in flight.
+    setImmediate(() => ac.abort());
+    expect(await first).toEqual({ done: true, value: undefined });
+    await Promise.all(state.closed);
+    expect(state.appBytes).toBe(0);
+  });
+
+  it('refuses a body that cannot be serialized before dialling', async () => {
+    const { port, state } = await rawCountingServer();
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    await expect(client({ port }).requestJson('POST', '/x', cyclic)).rejects.toThrow();
+    expect(state.connections).toBe(0);
+  });
+
+  it('throws protocol when data lines pile up without ever dispatching', async () => {
+    const { port } = await httpsServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      const line = `data: ${'x'.repeat(64 * 1024)}\n`;
+      const pump = (): void => {
+        while (!res.destroyed && res.write(line)) { /* fill until backpressure */ }
+        if (!res.destroyed) res.once('drain', pump);
+      };
+      res.on('error', () => { /* client hang-up is the expected end */ });
+      pump();
+    });
+    const ac = new AbortController();
+    const err = await collect(client({ port }).openStream('/s', { signal: ac.signal })).catch((e: unknown) => e);
+    expect((err as PinnedClientError).code).toBe('protocol');
+  });
+
+  it('throws protocol on one oversized line, measured in UTF-8 bytes', async () => {
+    const { port } = await httpsServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.on('error', () => { /* client hang-up is the expected end */ });
+      // 1.5M chars is under the cap in UTF-16 units but 4.5 MB in UTF-8.
+      res.end(`event: ${'한'.repeat(1_500_000)}\n\n`);
+    });
+    const ac = new AbortController();
+    const err = await collect(client({ port }).openStream('/s', { signal: ac.signal })).catch((e: unknown) => e);
+    expect((err as PinnedClientError).code).toBe('protocol');
+  });
+
+  it('throws protocol on an event id that cannot travel back as a header', async () => {
+    const { port } = await httpsServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.end('id: a\u0007b\ndata: {}\n\n');
+    });
+    const ac = new AbortController();
+    const err = await collect(client({ port }).openStream('/s', { signal: ac.signal })).catch((e: unknown) => e);
+    expect((err as PinnedClientError).code).toBe('protocol');
+  });
+
+  it('refuses an invalid lastEventId before connecting', async () => {
+    const ac = new AbortController();
+    for (const bad of ['a\r\nX-Injected: 1', 'x'.repeat(1025), 'tab\there']) {
+      const err = await collect(client({ port: 1 }).openStream('/s', { signal: ac.signal, lastEventId: bad })).catch(
+        (e: unknown) => e,
+      );
+      expect((err as PinnedClientError).code).toBe('bad-options');
+    }
+  });
+
+  it('decodes a multi-byte character split across chunks', async () => {
+    const { port } = await httpsServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      const bytes = Buffer.from('data: {"t":"한"}\n\n', 'utf8');
+      const cut = bytes.indexOf(Buffer.from('한', 'utf8')) + 1;
+      res.write(bytes.subarray(0, cut));
+      setTimeout(() => res.end(bytes.subarray(cut)), 20);
+    });
+    const ac = new AbortController();
+    expect(await collect(client({ port }).openStream('/s', { signal: ac.signal }))).toEqual([
+      { event: 'message', data: { t: '한' } },
+    ]);
   });
 
   it('throws protocol on an event whose data is not JSON', async () => {
