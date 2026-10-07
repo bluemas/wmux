@@ -6,7 +6,8 @@
 Cross-PC A2A connects wmux on two PCs you own, pane to pane. An agent on PC A
 sends a task to a linked pane on PC B with `send_message`; B's agent sees it
 like any other A2A task, and its reply comes back to the pane on A that sent
-it. Both directions work over one connection.
+it. Both directions work over one connection. Two PCs can also link their
+Moa, so Moa on one PC can hand work to Moa on the other.
 
 It is **experimental** and **off by default**. Nothing listens and nothing is
 visible to another PC until you turn it on, pair, choose what to show, and
@@ -34,12 +35,15 @@ section; turning one on does not turn on the other.
 - **Nothing is shown by default.** For each paired PC you choose which
   workspaces and panes it may see. A pane you did not choose is invisible to
   that PC: no name, no path, no sign that it exists.
-- **Links are made by people.** A link joins one pane on each PC. Someone
-  proposes it on one PC, and someone accepts it on the other. Agents cannot
-  create links.
+- **Links are made by people.** A link joins one pane on each PC, or the Moa
+  of each PC. Someone on the joiner proposes it, and someone on the server
+  accepts it. Agents cannot create links. A pane links only with a pane, and
+  Moa only with Moa.
 - **Messages only.** A task from another PC is delivered as a message to the
   linked pane, through the same approval and hold checks as a local A2A
   task. It never starts a worker or opens a pane on the receiving PC.
+- **Nothing is lost while a PC is away.** Messages wait in a queue on disk
+  until the other PC confirms them, and are delivered once.
 
 ## Setup
 
@@ -72,36 +76,123 @@ is the one that will accept connections, and PC A is the one that joins it.
    "Connected to *PC B's name*." PC B now appears on A under **PCs I
    connected to**, and PC A appears on B under **PCs connected to me**.
 
-4. **Choose what to show.** Before anything can be linked, the server side
-   decides which of its panes the joiner may see. On PC B, under **PCs
-   connected to me**, open PC A's entry and tick the workspaces and panes to
-   show it. Leave everything else unticked.
-   <!-- verify against PR2b/PR3 before merge -->
+4. **Choose what to show (PC B).** Before anything can be linked, the server
+   decides what the joiner may see. On PC B, under **PCs connected to me**,
+   click **Panes to show** on PC A's row. Tick single panes, or a workspace's
+   box to show every pane it has now (panes you open later are not added).
+   Panes are named as their header shows them. Nothing is shown until you
+   tick it.
 
-5. **Link two panes (PC A, then PC B).** On PC A, right-click the pane that
-   should talk to PC B and choose **Connect to a pane on another PC…**. Pick
-   PC B, then one of the panes it shows you. Each pane is listed with its
-   workspace name, label, agent, working directory and git remote/branch;
-   panes on the same git remote as yours are listed first as recommended, and
-   a different remote shows a warning. Choose the directions (send, receive,
-   or both; both by default) and send the proposal.
+5. **Link two panes (PC A, then PC B).** On PC A, open the pane's menu
+   (right-click the pane header, or click **⋮**) and choose **Link with a
+   pane on another PC…**. Pick PC B, then one of the panes it shows you.
+   Each pane is listed as `<workspace> / <pane>` with its agent, git remote
+   and branch, and working directory. Panes on the same repository as yours
+   come first with a **Same repo** badge, and a different repository shows a
+   warning. Two boxes set the directions, both ticked by default: **This
+   pane may send work there** and **That pane may send work here**. Click
+   **Send link request**.
 
-   On PC B an acceptance card shows both PCs, workspaces, panes, repositories
-   and directions. Accept it there. The link is active once PC B accepts;
-   until then PC A shows it as pending.
-   <!-- verify against PR2b/PR3 before merge -->
+   PC B shows a notice, "Another PC asks to link a pane", whose **Review**
+   button opens the **Remote** page. Under **Links with other PCs**, the
+   request card shows PC A's pane and repository (marked "as PC A reports
+   it, not verified here"), your pane and repository as PC B knows them, the
+   directions, and a warning when the repositories differ. Click **Accept**
+   or **Decline**. When you accept, PC B checks again that the pane is still
+   shown to PC A and still open. A request nobody answers ends after 24
+   hours.
 
-6. **Send work.** The agent in the linked pane on PC A now sees the remote
-   pane in `a2a_discover` under an alias of the form `<PC>/<workspace>/<pane>`
-   (for example `office-pc/api-server/claude`). It sends to that alias with
-   `send_message` exactly as it would to a local pane, and the reply arrives
-   back in the sending pane. If the link allows it, PC B's agent can send to
-   PC A the same way. Progress and replies are visible with
-   `a2a_task_query`.
-   <!-- verify against PR2b/PR3 before merge -->
+   Until PC B accepts, PC A lists the link as **Pending**; **Check** asks
+   PC B for its current state. Both PCs list their links on the Remote page
+   with their state, and a live link has an **Unlink** button.
+
+6. **Send work.** Agents in the linked pane's workspace on PC A now see the
+   remote pane in `a2a_discover` under an alias of the form
+   `<PC>/<workspace>/<pane>`. The pane part is the pane's header name on
+   PC B: its label if someone renamed it, otherwise its automatic name, for
+   example `office-pc/api-server/w1-2(claude)`. The names are taken when the
+   link is made; renaming a pane later does not change the alias. The entry
+   also carries an id of the form `remote:<linkId>`, which works as a
+   target too. If two links would have the same alias, the newer one gets
+   `#2`, `#3` and so on.
+
+   Only the linked pane can send on the link. Its agent calls
+   `send_message` with the alias (or the `remote:` id) as it would for a
+   local pane. The call returns at once with the task queued for PC B. The
+   task is a message only (up to 32 KiB); `execute` is refused for a remote
+   pane. PC B's agent answers on the task with `send_message` (with the
+   task id) or `a2a_task_update`, and the reply arrives back in the sending
+   pane on PC A. If the link allows it, PC B's agent can send to PC A the
+   same way. Progress and replies are visible with `a2a_task_query`.
 
 The two PCs do not need to be paired both ways. One pairing carries traffic
 in both directions over the joiner's connection.
+
+### Linking Moa
+
+Moa on two PCs can be linked the same way. A Moa links only with the other
+PC's Moa, never with a pane.
+
+1. **PC B:** turn Moa on, then in **Panes to show** for PC A tick **Show this
+   PC's Moa**.
+2. **PC A:** with Moa on, open the **Remote** page and click **Link Moa with
+   another PC…**. Pick PC B, choose its Moa and the directions, and send the
+   request.
+3. **PC B:** accept the card "*PC A*'s Moa asks to link with this PC's Moa"
+   on the Remote page.
+
+Moa then reaches the other PC's Moa as `<PC>/Moa` (for example
+`office-pc/Moa`) with `send_message`. Moa cannot send to a remote pane's
+alias; it is told to ask that PC's Moa instead. The Moa panel lists the work
+exchanged with other PCs' Moa under **Other PCs' Moa**, with its state and
+the other PC.
+
+When work from another PC's Moa arrives, Moa is woken with a pointer to the
+task, not its text, and reads it with `a2a_task_query`. The wake says the
+text is a request from another PC, not your instruction, and that Moa should
+do the work itself rather than hand it to another agent. Moa handles it with
+its usual tools, which include asking you with a decision card. Wakes follow
+the usual rules, plus a limit for other PCs:
+
+- With **Auto-wake on pane events** turned off, Moa is not woken for it.
+  The task is still in Moa's list (`a2a_task_query`) for its next turn.
+- While Moa has a decision waiting for you, it is not woken. The pointer is
+  kept and comes back once you answer.
+- One PC can wake Moa at most 3 times in 10 minutes, with at most 5 of its
+  items per wake. The rest wait for a later wake, and the wake says how many
+  are waiting.
+- Work for Moa that arrives before Moa can take it (for example while the
+  app is still starting) is held and goes to Moa as soon as it can.
+
+## Delivery, receipts and held work
+
+The **Remote** page has a **Messages between PCs** section:
+
+- **Connection.** Each paired PC shows as **Connected**, **Connecting**,
+  **Disconnected**, or **Certificate changed**. While a PC is away, the row
+  says how many messages will be sent when it reconnects. Messages stay
+  queued on disk until the other PC confirms them, so a restart or a dropped
+  connection neither loses nor repeats one.
+- **Receipts.** The receiving PC reports twice: when the task reached its
+  pane's agent (or its Moa), and when that side read the task by its id with
+  `a2a_task_query`. The sender sees this as `remoteReceipt` (`delivered` or
+  `read`) in `a2a_task_query`, and the Moa panel shows it as "they got it" or
+  "they read it, answer pending". Receipts never change the task's state.
+- **Held remote work.** Work is held for you, never sent to another pane on
+  its own, when:
+  - the pane it was meant for is gone,
+  - another agent is in that pane now,
+  - the link to that PC has ended,
+  - it is for Moa and Moa cannot take it yet (it goes by itself once Moa
+    can),
+  - a paste was started but never confirmed (check the pane before sending
+    again), or
+  - the pane kept having no agent to take it.
+
+  Each held item has **Reject**, which ends it and tells the other PC, and,
+  except for work meant for Moa, **Send to the current agent**, which
+  delivers it to the agent in that pane now. Held work that nobody handles
+  is rejected automatically after 24 hours.
 
 ## Network and firewall
 
@@ -190,13 +281,11 @@ often because another program already uses the port. Pick another port.
 
 After pairing, if the server's certificate changes (it is re-created only
 when it is missing, damaged or within 30 days of expiry), the joiner stops
-talking to it and shows the PC as needing to be paired again. No data is sent
-to a PC whose certificate does not match.
-<!-- verify against PR2b/PR3 before merge -->
+talking to it. Its row on the joiner's **Remote** page shows **Certificate
+changed**: nothing is sent to that PC until you remove it and pair again. No
+data is sent to a PC whose certificate does not match.
 
 ## Security model
-
-<!-- verify against PR2b/PR3 before merge: link lifecycle (broken on pane close/move, in-flight tasks fail on revoke) -->
 
 The trust boundary of this experimental version is **your own PCs**. Pair
 only machines you control. Support for colleagues' PCs needs further
@@ -205,25 +294,40 @@ hardening and will come later.
 - **Why remote work cannot run anything.** A task from another PC is
   delivered as a message to the linked pane, and only to that pane. wmux does
   not spawn a worker, open a pane, or run a command for it, and it goes
-  through the same approval and hold checks as a local task. If the process
-  in the linked pane changed between sending and delivery, or the pane is
-  gone, the task is held for you instead of being delivered or re-routed to
-  another pane. What the receiving
-  agent decides to do with a message is up to that agent and its own
-  permissions, just as with a message you type yourself.
-- **What a link covers.** A link joins exactly one pane on each side, in the
-  directions you allowed. A paired PC sees only the panes you showed it, can
-  propose links only to those, and can send only over links a person on the
-  receiving PC accepted. The receiving PC decides which pane a message came
-  from by its own link record, never by what the sender claims. A link ends
-  when the pane is closed, the pane moves to another workspace, or the
-  workspace is archived; restoring an archived workspace does not bring the
-  link back.
-- **Removing access.** Either PC can end a link at any time; tasks in flight
-  on it fail. To end the pairing itself, use **Remove** under "PCs I
-  connected to" on the joiner (it also tells the server, when reachable) or
-  **Disconnect** under "PCs connected to me" on the server. Turning off
-  **Accept connections from other PCs** stops the listener.
+  through the same approval and hold checks as a local task. If the pane is
+  gone, or another agent is in it by the time a message arrives, the message
+  is held for you instead of being delivered or re-routed to another pane
+  (see [Delivery, receipts and held work](#delivery-receipts-and-held-work)).
+  What the receiving agent decides to do with a message is up to that agent
+  and its own permissions, just as with a message you type yourself.
+- **What a link covers.** A link joins exactly one pane on each side, or the
+  Moa of each side, in the directions you allowed. A paired PC sees only the
+  panes (and Moa) you showed it, can propose links only to those, and can
+  send only over a link that a person on one PC proposed and a person on the
+  other accepted. The receiving PC decides which pane a message came from by
+  its own link record, never by what the sender claims.
+- **When a link ends by itself.** A link breaks when its pane is closed or
+  moves to another workspace, when its workspace is closed or archived, when
+  the server stops showing that pane (or its Moa) to the other PC, or, for a
+  Moa link, when Moa is turned off or its workspace goes away. The Remote
+  page shows the link as **Disconnected** with the reason. A broken link
+  stays ended: restoring an archived workspace does not bring it back. Link
+  the panes again.
+- **Removing access.** Either PC can end a link at any time with **Unlink**
+  on the Remote page. When a link ends for any reason, its open tasks fail
+  on both PCs, and anything the other PC sent that was not delivered yet is
+  held, never delivered later. To end the pairing itself, use **Remove**
+  under "PCs I connected to" on the joiner (it also tells the server, when
+  reachable) or **Disconnect** under "PCs connected to me" on the server;
+  either ends every link with that PC. Turning off **Accept connections from
+  other PCs** stops the listener.
+- **Text from another PC.** Before a message from another PC is stored, and
+  again right before it is written to a pane, wmux removes terminal escape
+  sequences (including clipboard writes and the end-of-paste marker) and
+  control characters other than newline and tab, and turns a carriage
+  return into a newline. PC, workspace and pane names in an alias keep only
+  printable characters, with `/` turned into `-`. A wake for Moa carries
+  only the task id and the PC name, never the message text.
 - **Where credentials live.** Pairing issues the joiner a peer credential
   that works only on the A2A listener's `/api/a2a/*` routes. It is not a
   phone or device token and opens nothing else. The joiner keeps it in its
@@ -236,16 +340,21 @@ hardening and will come later.
 
 ## Known limitations
 
-- Only the joiner can propose a link. The server accepts or refuses it.
+- Only the joiner can propose a link. The server accepts or declines it.
 - Links are created by people only; agents cannot propose one.
-- Acceptance happens on the server side only; the proposer does not confirm
-  again.
+- A pane links only with a pane, and Moa only with Moa. Moa cannot send to a
+  pane on another PC, and a pane cannot send to another PC's Moa.
+- No delivery without the app: a message reaches a pane or Moa only while
+  the wmux app is open on the receiving PC. With only the daemon running, it
+  waits and is delivered when the app comes back.
+- Not yet verified on real Windows PCs.
+- Each PC's identity is the id it reports when pairing; what wmux verifies
+  is the server's certificate pin. This will be hardened before colleagues'
+  PCs are supported.
+- Moa is told to do work from another PC's Moa itself: an answer from an
+  agent Moa handed it to would not get back to the other PC.
 - No automatic discovery: pair with an invite. There is no PIN alternative.
-- A message arrives in a pane only while the wmux app is open on the
-  receiving PC. With only the daemon running, it waits and is delivered when
-  the app comes back.
 - Accepting a link from a phone is not supported.
-- An archived and restored workspace does not get its links back; link the
-  panes again.
+- Names in an alias are fixed when the link is made.
 - wmux does not add firewall rules for you.
 - Only basic rate limits apply.
