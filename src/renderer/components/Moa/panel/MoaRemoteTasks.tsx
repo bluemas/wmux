@@ -34,6 +34,13 @@ export function MoaRemoteTaskList({ tasks, t }: { tasks: readonly MoaRemoteTask[
               <span className={STATE_CLASS[task.state]}>{t(`moa.panel.a2a.${task.state}`)}</span>
               {' · '}
               {t(task.direction === 'sent' ? 'moa.panel.remoteSent' : 'moa.panel.remoteReceived', { pc: task.host })}
+              {/* While a sent task is open: did the other Moa get it, read it, or is it still on its way. */}
+              {task.direction === 'sent' && (task.state === 'submitted' || task.state === 'working') && (
+                <span data-moa-remote-receipt={task.receipt ?? 'none'}>
+                  {' · '}
+                  {t(task.receipt === 'read' ? 'moa.panel.remoteRead' : task.receipt === 'delivered' ? 'moa.panel.remoteGot' : 'moa.panel.remoteOnItsWay')}
+                </span>
+              )}
             </span>
           </li>
         ))}

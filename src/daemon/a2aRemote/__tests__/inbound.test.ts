@@ -9,7 +9,8 @@ import { AppendOnlyLog } from '../../eventlog/AppendOnlyLog';
 import { remoteTaskId } from '../ids';
 import { acceptInbound, type InboundDeps } from '../inbound';
 import { LinkStore } from '../linkStore';
-import { linkAlias } from '../outbound';
+import { linkAlias, syncRemoteTask } from '../outbound';
+import { OutboxStore } from '../outboxStore';
 
 const HOST = '11111111-1111-4111-8111-111111111111';
 const OTHER_HOST = '22222222-2222-4222-8222-222222222222';
@@ -293,3 +294,52 @@ describe('acceptInbound — peer text is made safe before it is stored', () => {
     expect(await acceptInbound(env(linkId, { text: '\x1b[201~\x1b]0;x\x07' }), peer, deps)).toMatchObject({ ok: false, error: 'bad-request' });
   });
 });
+
+describe('receipts', () => {
+  it('the receiver queues delivered, then read, once each; never a state change', async () => {
+    const linkId = activeLink();
+    const e = env(linkId, {});
+    await acceptInbound(e, peer, deps);
+    const id = remoteTaskId(linkId, e.messageId);
+    const outbox = new OutboxStore({ dir, scheduleHarden: () => undefined });
+    const sync = { linkStore: links, taskService: tasks, outbox };
+    const receipts = (): unknown[] => outbox.pending(HOST).map((r) => r.envelope).filter((x) => x.kind === 'receipt').map((x) => x.receipt);
+    expect(await syncRemoteTask(sync, id)).toEqual({ ok: true, queued: 0 }); // not handed over yet
+    await tasks.markRemote({ taskId: id, delivered: true });
+    await syncRemoteTask(sync, id);
+    await syncRemoteTask(sync, id);
+    expect(receipts()).toEqual(['delivered']);
+    await tasks.markRemote({ taskId: id, read: true });
+    await syncRemoteTask(sync, id);
+    await syncRemoteTask(sync, id);
+    expect(receipts()).toEqual(['delivered', 'read']);
+    expect(tasks.getTask(id)!.status.state).toBe('submitted');
+  });
+
+  it('the sender records the peer\'s receipts on its own task; a receipt for a task it did not send is refused', async () => {
+    const linkId = activeLink();
+    const out = remoteTaskId(linkId, 'mine-1');
+    await tasks.createTask({
+      id: out,
+      title: 'mine',
+      from: { workspaceId: 'ws-b', name: 'Backend', paneId: 'pane-b' },
+      to: { workspaceId: `remote:${linkId}`, name: 'pc-a/ws-a/claude' },
+      history: [{ kind: 'message', messageId: 'mine-1', role: 'user', parts: [{ kind: 'text', text: 'hi' }] }],
+      remote: { v: 1, linkId, hostId: HOST, messageId: 'mine-1', direction: 'outbound', kind: 'pane' },
+    });
+    expect(await acceptInbound(env(linkId, { kind: 'receipt', taskId: out, receipt: 'delivered', text: undefined }), peer, deps)).toMatchObject({ ok: true });
+    expect(tasks.getTask(out)!.metadata.remote).toMatchObject({ remoteDeliveredAt: expect.any(String) });
+    expect(tasks.getTask(out)!.metadata.remote).not.toHaveProperty('remoteReadAt');
+    expect(await acceptInbound(env(linkId, { kind: 'receipt', taskId: out, receipt: 'read', text: undefined }), peer, deps)).toMatchObject({ ok: true });
+    expect(tasks.getTask(out)!.metadata.remote).toMatchObject({ remoteReadAt: expect.any(String) });
+    expect(tasks.getTask(out)!.status.state).toBe('submitted');
+
+    const e = env(linkId, {});
+    await acceptInbound(e, peer, deps);
+    expect(await acceptInbound(env(linkId, { kind: 'receipt', taskId: remoteTaskId(linkId, e.messageId), receipt: 'read', text: undefined }), peer, deps))
+      .toMatchObject({ ok: false, error: 'forbidden' });
+    expect(await acceptInbound(env(linkId, { kind: 'receipt', taskId: out, receipt: 'opened' as never, text: undefined }), peer, deps))
+      .toMatchObject({ ok: false, error: 'bad-request' });
+  });
+});
+

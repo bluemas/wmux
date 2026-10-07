@@ -317,7 +317,8 @@ describe('cross-host delivery, end to end', () => {
     await b.stop();
     const taskId = await sendTask(a, linkId, 'while you were away');
     await new Promise((r) => setTimeout(r, 300));
-    expect(a.delivery.outbox.pending(b.hostId)).toHaveLength(1);
+    // The task, not counting A's receipt for B's earlier task (also owed to B).
+    expect(a.delivery.outbox.pending(b.hostId).filter((r) => r.envelope.kind !== 'receipt')).toHaveLength(1);
     await until(() => a.delivery.status()[0]?.state !== 'connected');
 
     b = await makePc('PC-B', { dir: bDir, port: bPort });
@@ -514,6 +515,8 @@ describe('Moa to Moa across PCs (brain links), end to end', () => {
         if (ev) {
           const taskId = ev.taskId as string;
           const task = pc.tasks.queryTasks(hq, {}).find((t) => t.id === taskId)!;
+          // What main does when Moa reads it with a2a_task_query.
+          await pc.rpc(A2A_REMOTE_RPC.read, { taskId, workspaceId: hq });
           const asked = (task.history[0].parts[0] as { text: string }).text;
           await pc.rpc(A2A_REMOTE_RPC.reply, { taskId, workspaceId: hq, text: `answer to: ${asked}` });
           // A brain on its own HQ: no pane to prove, and the task has none.
@@ -670,5 +673,47 @@ describe('Moa to Moa across PCs (brain links), end to end', () => {
     for (const id of sent) expect(all).toContain(id);
     coalescer.dispose?.();
   }, 30_000);
+
+  it('receipts: the sender learns its task was handed over, then read; a sender that was away gets them once back', async () => {
+    const b = await makePc('PC-B');
+    let a = await makePc('PC-A');
+    const linkId = await moaLinked(a, b);
+    const marker = (pc: Pc, id: string): { remoteDeliveredAt?: string; remoteReadAt?: string } =>
+      (pc.tasks.getTask(id)?.metadata.remote ?? {}) as { remoteDeliveredAt?: string; remoteReadAt?: string };
+
+    // Online: delivered, then read (Moa queried it), while the task stays submitted.
+    const first = await moaSend(a, HQ_A, linkId, 'status?');
+    await until(() => !!marker(a, first).remoteDeliveredAt);
+    expect(a.tasks.getTask(first)!.status.state).toBe('submitted');
+    expect(marker(a, first).remoteReadAt).toBeUndefined();
+    await b.rpc(A2A_REMOTE_RPC.read, { taskId: first, workspaceId: HQ_B });
+    await until(() => !!marker(a, first).remoteReadAt);
+    expect(a.tasks.queryTasks(HQ_A, {}).find((t) => t.id === first)!.status.state).toBe('submitted');
+    // Only the receiving workspace may say it read it.
+    expect(await b.rpc(A2A_REMOTE_RPC.read, { taskId: first, workspaceId: 'ws-other' })).toMatchObject({ ok: false });
+
+    // Away: B holds the next task (Moa off), A goes down, B hands it over: nothing reaches A...
+    b.moa.ready = false;
+    const second = await moaSend(a, HQ_A, linkId, 'and now?');
+    await until(() => (b.tasks.getTask(second)?.metadata.remote as { held?: string } | undefined)?.held === 'brain-unavailable');
+    const aDir = a.dir;
+    pcs.splice(pcs.indexOf(a), 1);
+    await a.stop();
+    b.moa.ready = true;
+    b.moa.changed();
+    await until(() => (b.tasks.getTask(second)?.metadata.remote as { delivered?: boolean }).delivered === true);
+    // ...until A is back, then the receipt arrives from B's outbox.
+    a = await makePc('PC-A', { dir: aDir });
+    await until(() => !!marker(a, second).remoteDeliveredAt, 15_000);
+  }, 40_000);
+
+  it('a pane-to-pane task gets the same delivered receipt once B\'s pane took it', async () => {
+    const b = await makePc('PC-B');
+    const a = await makePc('PC-A');
+    const linkId = await linked(a, b);
+    const taskId = await sendTask(a, linkId, 'pane receipt');
+    await until(() => !!(a.tasks.getTask(taskId)?.metadata.remote as { remoteDeliveredAt?: string }).remoteDeliveredAt);
+    expect(a.tasks.getTask(taskId)!.status.state).toBe('submitted');
+  }, 20_000);
 });
 

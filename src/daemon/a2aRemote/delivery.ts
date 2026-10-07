@@ -260,7 +260,23 @@ export class A2aRemoteDelivery {
         ...(typeof p['ptyId'] === 'string' && isSafeId(p['ptyId']) ? { ptyId: p['ptyId'] } : {}),
       });
       if (res.ok && held === 'no-agent' && messageId === undefined) await this.noAgent(taskId);
+      // Handed over: the sender gets a `delivered` receipt.
+      if (res.ok && p['delivered'] === true && messageId === undefined) await this.syncTask(taskId);
       return res.ok ? { ok: true } : res;
+    });
+
+    onRpc(A2A_REMOTE_RPC.read, async (p) => {
+      const taskId = str(p, 'taskId');
+      const task = taskId ? svc.getTask(taskId) : undefined;
+      const marker = task?.metadata.remote as { direction?: string } | undefined;
+      // Only the receiving side of an inbound task reads it.
+      if (!task || marker?.direction !== 'inbound' || task.metadata.to.workspaceId !== str(p, 'workspaceId')) {
+        return { ok: false, error: 'forbidden: not an inbound remote task of this workspace' };
+      }
+      const res = await svc.markRemote({ taskId, read: true });
+      if (!res.ok) return res;
+      await this.syncTask(taskId);
+      return { ok: true };
     });
 
     onRpc(A2A_REMOTE_RPC.targets, async () => ({ targets: listRemoteTargets({ linkStore: this.deps.links, aliasFor: (l) => this.aliasFor(l) }) }));

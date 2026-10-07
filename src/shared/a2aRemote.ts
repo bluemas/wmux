@@ -486,9 +486,14 @@ export type A2aRemoteMessageKind =
   /** A task state transition. */
   | 'state'
   /** Link lifecycle notice (accept / revoke / broken) — no task. */
-  | 'link';
+  | 'link'
+  /** The receiver's acknowledgement of a task it got: handed over, or read. Never a state change. */
+  | 'receipt';
 
-export const A2A_REMOTE_MESSAGE_KINDS: readonly A2aRemoteMessageKind[] = Object.freeze(['task', 'reply', 'state', 'link']);
+export const A2A_REMOTE_MESSAGE_KINDS: readonly A2aRemoteMessageKind[] = Object.freeze(['task', 'reply', 'state', 'link', 'receipt']);
+
+/** How far the receiver got with a task: handed to its agent (or Moa), or read by it. */
+export type A2aRemoteReceipt = 'delivered' | 'read';
 
 export function isA2aRemoteMessageKind(v: unknown): v is A2aRemoteMessageKind {
   return typeof v === 'string' && (A2A_REMOTE_MESSAGE_KINDS as readonly string[]).includes(v);
@@ -520,6 +525,8 @@ export interface A2aRemoteEnvelope {
   state?: TaskState;
   /** For 'link'. */
   link?: { state: 'active' | 'revoked' | 'broken'; version: number; reason?: A2aLinkRecordV1['endedReason'] };
+  /** For 'receipt' (with `taskId`). */
+  receipt?: A2aRemoteReceipt;
   sentAt: string;
 }
 

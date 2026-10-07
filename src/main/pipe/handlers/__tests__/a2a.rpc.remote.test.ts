@@ -31,7 +31,7 @@ const target: A2aRemoteTarget = {
   allowOutbound: true,
 };
 
-let remote: { [K in keyof RemoteA2aRpcDeps]: ReturnType<typeof vi.fn> };
+let remote: { [K in keyof RemoteA2aRpcDeps]-?: ReturnType<typeof vi.fn> };
 let daemonCalls: Array<{ method: string; params: Record<string, unknown> }>;
 
 function setup(): RpcRouter {
@@ -71,6 +71,7 @@ beforeEach(() => {
     sendTask: vi.fn(async () => ({ ok: true, taskId: RT })),
     reply: vi.fn(async (i: { taskId: string }) => ({ ok: true, taskId: i.taskId })),
     state: vi.fn(async (i: { taskId: string }) => ({ ok: true, taskId: i.taskId })),
+    read: vi.fn(async () => ({ ok: true })),
   };
   sendToRendererMock.mockImplementation(async (_w: unknown, method: string) => {
     if (method === 'pane.list') return [{ id: 'pane-a', surfacePtyIds: ['pty-a'] }, { id: 'pane-a2', surfacePtyIds: ['pty-a2'] }];
@@ -185,6 +186,15 @@ describe('a2a.task.send — Moa to another PC\'s Moa (brain link)', () => {
     expect(res.ok).toBe(true);
     expect(daemonCalls.find((c) => c.method === 'a2a.task.update')?.params).toMatchObject({ taskId: RT, workspaceId: 'ws-hq', status: 'completed' });
     expect(remote.state).toHaveBeenCalledWith({ taskId: RT, state: 'completed' });
+  });
+
+  it('reading a remote task by id sends the read receipt as the verified reader; a list read does not', async () => {
+    const router = setup();
+    await router.dispatch({ id: 'q', method: 'a2a.task.query', params: { workspaceId: 'ws-forged', taskId: RT }, commanderToken: asBrain('ws-hq') });
+    expect(remote.read).toHaveBeenCalledWith({ taskId: RT, workspaceId: 'ws-hq' });
+    remote.read.mockClear();
+    await router.dispatch({ id: 'q2', method: 'a2a.task.query', params: { workspaceId: 'ws-hq' } });
+    expect(remote.read).not.toHaveBeenCalled();
   });
 
   it('discover lists the brain link as <PC>/Moa', async () => {

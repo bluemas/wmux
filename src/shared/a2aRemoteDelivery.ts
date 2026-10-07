@@ -8,7 +8,7 @@
 //
 // Pure module: no node:* imports (the renderer imports it).
 
-import { A2A_BRAIN_ALIAS, isRemoteTaskId, type A2aEndpointKind, type A2aRemoteTaskMarkerV1, type HostId } from './a2aRemote';
+import { A2A_BRAIN_ALIAS, isRemoteTaskId, type A2aEndpointKind, type A2aRemoteReceipt, type A2aRemoteTaskMarkerV1, type HostId } from './a2aRemote';
 import { isTaskState, type Task, type TaskState } from './types';
 
 /**
@@ -34,6 +34,12 @@ export const A2A_REMOTE_RPC = Object.freeze({
   held: 'a2a.remote.held',
   /** `{ taskId, reason }` → `{ ok: true } | { ok: false, error }` — `rejectHeld`. */
   rejectHeld: 'a2a.remote.rejectHeld',
+  /**
+   * `{ taskId, workspaceId }` → `{ ok: true } | { ok: false, error }`: the
+   * receiver of an inbound task read it (a2a_task_query); the sender gets a
+   * `read` receipt.
+   */
+  read: 'a2a.remote.read',
 } as const);
 
 /**
@@ -184,6 +190,13 @@ export type A2aRemoteTaskState = A2aRemoteTaskMarkerV1 & {
   stateSync?: TaskState;
   /** Our own replies on this task already queued for the peer (messageIds). */
   sent?: string[];
+  /** Inbound task: when our side first read it (a2a_task_query). */
+  readAt?: string;
+  /** Inbound task: the furthest receipt already queued for the peer. */
+  receiptSync?: A2aRemoteReceipt;
+  /** Outbound task: when the peer said it handed the task over / its agent read it. */
+  remoteDeliveredAt?: string;
+  remoteReadAt?: string;
   /** Inbound task: its paste stayed in the composer; counted as delivered. */
   note?: 'pasted-not-submitted';
   /** Inbound task: when it was first held. */
@@ -247,6 +260,8 @@ export interface MoaRemoteTask {
   /** The other PC's name. */
   host: string;
   updatedAt?: string;
+  /** `sent` only: how far the other Moa got (its receipts). */
+  receipt?: A2aRemoteReceipt;
 }
 
 /** The Moa panel lists at most this many, newest first. */
@@ -279,6 +294,7 @@ export function moaRemoteTasks(summaries: readonly unknown[]): MoaRemoteTask[] {
       direction: sentTo ? 'sent' : 'received',
       host,
       ...(typeof t.updatedAt === 'string' ? { updatedAt: t.updatedAt } : {}),
+      ...(sentTo && (t.remoteReceipt === 'delivered' || t.remoteReceipt === 'read') ? { receipt: t.remoteReceipt } : {}),
     });
   }
   // ISO-8601 sorts as text.

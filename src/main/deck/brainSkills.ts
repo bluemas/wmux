@@ -108,6 +108,14 @@ agent as the operator's own words. After the card is raised, end your turn.
 - When that worker asks a question, you are woken with it as unverified agent
   text. Relay it to the operator, or propose a follow-up hand-off. You cannot
   type into that pane yourself.
+
+## Work with Moa on another PC
+
+A task you sent to \`<PC>/Moa\` stays \`submitted\` until that Moa answers.
+\`remoteReceipt\` in \`a2a_task_query\` says how far it got: \`delivered\` (it
+arrived) or \`read\` (that Moa read it). Once either is there, the other Moa
+has it: do not raise a decision about it, end your turn and wait to be woken
+with the result.
 `;
 
 const FANOUT_SKILL = `---

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { moaRemoteTasks } from '../a2aRemoteDelivery';
+import { summarizeTask } from '../a2aTaskQueryView';
 import {
   a2aEndpointAlias,
   isAllowedEndpointPair,
@@ -155,3 +156,19 @@ describe('moaRemoteTasks', () => {
     ]);
   });
 });
+
+describe('receipts in summaries', () => {
+  const id = `rt-${'a'.repeat(32)}`;
+  const task = (remote: Record<string, unknown>) => ({
+    id, status: { state: 'submitted' }, history: [],
+    metadata: { title: 't', from: { name: 'Moa' }, to: { name: 'PC2/Moa' }, remote },
+  });
+  it('a2a_task_query summaries carry how far the peer got; the Moa panel shows it for sent tasks', () => {
+    expect(summarizeTask(task({ direction: 'outbound' }))).not.toHaveProperty('remoteReceipt');
+    expect(summarizeTask(task({ remoteDeliveredAt: 'x' }))).toMatchObject({ remoteReceipt: 'delivered' });
+    const read = summarizeTask(task({ remoteDeliveredAt: 'x', remoteReadAt: 'y' }));
+    expect(read).toMatchObject({ remoteReceipt: 'read' });
+    expect(moaRemoteTasks([read])).toMatchObject([{ direction: 'sent', receipt: 'read' }]);
+  });
+});
+

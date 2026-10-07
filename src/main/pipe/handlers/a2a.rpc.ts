@@ -228,6 +228,8 @@ export interface RemoteA2aRpcDeps {
   reply: (input: A2aRemoteReplyInput) => Promise<RemoteOpResult>;
   /** Queue a state the ledger already committed on a remote task. */
   state: (input: A2aRemoteStateInput) => Promise<RemoteOpResult>;
+  /** The receiver of an inbound remote task read it: the sender gets a `read` receipt. */
+  read?: (input: { taskId: string; workspaceId: string }) => Promise<unknown>;
 }
 
 const REMOTE_QUEUED = { stored: true, notified: false, queued: true, reason: 'queued_for_remote_host' } as const;
@@ -648,7 +650,14 @@ export function registerA2aRpc(
   // 더 최신이면 status/updatedAt만 데몬 값으로 덮고, 렌더러 전용 증분(history·
   // artifacts)은 보존한다(§6.F — 증분 히스토리는 아직 데몬 비내구). 데몬-only
   // id(재시작 생존분)는 추가. 데몬 미가용이면 현행 렌더러-only와 동일.
-  router.register('a2a.task.query', async (rawParams) => {
+  router.register('a2a.task.query', async (rawParams, ctx) => {
+    // Reading one remote task by id is what the sender's `read` receipt means.
+    // The daemon checks the caller is the task's receiving workspace.
+    const readId = typeof rawParams.taskId === 'string' ? rawParams.taskId : '';
+    const reader = ctx?.commanderWorkspace ?? (typeof rawParams.workspaceId === 'string' ? rawParams.workspaceId : '');
+    if (remote?.read && isRemoteTaskId(readId) && reader) {
+      void remote.read({ taskId: readId, workspaceId: reader }).catch(() => undefined);
+    }
     // view: 'page' (a2a_task_query): each source returns summaries (or the one
     // named task), and the merged result is paged here — see a2aTaskQueryView.
     const paged = isPagedTaskQuery(rawParams);

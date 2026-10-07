@@ -26,6 +26,7 @@ export function daemonRemoteA2aRpcDeps(
     sendTask: (input) => op(A2A_REMOTE_RPC.sendTask, input),
     reply: (input) => op(A2A_REMOTE_RPC.reply, input),
     state: (input) => op(A2A_REMOTE_RPC.state, input),
+    read: async (input) => getDaemonClient()?.rpc(A2A_REMOTE_RPC.read, { ...input }),
   };
 }
 

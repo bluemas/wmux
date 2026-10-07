@@ -48,4 +48,19 @@ describe('MoaRemoteTasks', () => {
     expect(rows[1].textContent).toContain('moa.panel.a2a.input-required');
     expect(rows[1].textContent).toContain('moa.panel.remoteReceived(LINUX-1)');
   });
+
+  it('a sent task that is still open says whether the other Moa got it, read it, or not yet', async () => {
+    const api = {
+      remoteTasks: vi.fn(async () => ({
+        tasks: [task(1, { state: 'submitted' }), task(2, { state: 'submitted', receipt: 'delivered' }), task(3, { state: 'submitted', receipt: 'read' }), task(4, { state: 'completed', receipt: 'read' })],
+      })),
+    };
+    await act(async () => { root.render(createElement(MoaRemoteTasks, { api, t })); await new Promise((r) => setTimeout(r, 0)); });
+    const shown = [...container.querySelectorAll('[data-moa-remote-receipt]')].map((el) => el.getAttribute('data-moa-remote-receipt'));
+    expect(shown).toEqual(['none', 'delivered', 'read']);
+    expect(container.textContent).toContain('moa.panel.remoteOnItsWay');
+    expect(container.textContent).toContain('moa.panel.remoteGot');
+    expect(container.textContent).toContain('moa.panel.remoteRead');
+  });
 });
+

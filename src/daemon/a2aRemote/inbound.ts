@@ -7,6 +7,7 @@ import {
   type A2aLinkRecordV1,
   type A2aRemoteDeliverResponse,
   type A2aRemoteEnvelope,
+  type A2aRemoteReceipt,
   type A2aRemoteErrorCode,
   type A2aRemoteTaskMarkerV1,
   type HostId,
@@ -36,7 +37,7 @@ import { isPlainObject, isSafeId } from './storeFile';
 
 export interface InboundDeps {
   linkStore: Pick<LinkStore, 'get' | 'checkMessage' | 'applyRemoteAccept' | 'revoke' | 'markBroken'>;
-  taskService: Pick<A2aTaskService, 'getTask' | 'createTask' | 'appendRemoteMessage' | 'applyRemoteState'>;
+  taskService: Pick<A2aTaskService, 'getTask' | 'createTask' | 'appendRemoteMessage' | 'applyRemoteState' | 'markRemote'>;
   broadcast: (event: A2aRemoteInboundEvent) => void;
   /** Display alias of a link's remote pane (`linkAlias`). */
   aliasFor: (link: A2aLinkRecordV1) => string;
@@ -62,7 +63,7 @@ export async function acceptInbound(
   if (env.kind === 'link') return applyLinkNotice(env, peer.hostId, deps);
 
   let onThisLink = false;
-  if (env.kind === 'reply' || env.kind === 'state') {
+  if (env.kind === 'reply' || env.kind === 'state' || env.kind === 'receipt') {
     const marker = deps.taskService.getTask(env.taskId as string)?.metadata.remote as A2aRemoteTaskMarkerV1 | undefined;
     onThisLink = marker?.v === 1 && marker.linkId === env.linkId;
   }
@@ -99,6 +100,14 @@ export async function acceptInbound(
   }
 
   const taskId = env.taskId as string;
+  if (env.kind === 'receipt') {
+    // The peer got (or read) a task WE sent it: bookkeeping only, never a state.
+    const marker = deps.taskService.getTask(taskId)?.metadata.remote as A2aRemoteTaskMarkerV1 | undefined;
+    if (marker?.direction !== 'outbound') return fail('forbidden', 'a receipt is only for a task this host sent');
+    const res = await deps.taskService.markRemote({ taskId, remoteReceipt: env.receipt as A2aRemoteReceipt });
+    if (!res.ok) return fail('unavailable', res.error);
+    return { ok: true, taskId, duplicate: false };
+  }
   if (env.kind === 'reply') {
     const task = deps.taskService.getTask(taskId);
     // The peer is the sender of an inbound task and the receiver of an outbound one.
@@ -184,6 +193,9 @@ function parseEnvelope(raw: unknown): Parsed {
       break;
     case 'link':
       if (!isPlainObject(link) || typeof link['state'] !== 'string' || typeof link['version'] !== 'number') return { error: 'bad-request' };
+      break;
+    case 'receipt':
+      if (!isSafeId(taskId) || (raw['receipt'] !== 'delivered' && raw['receipt'] !== 'read')) return { error: 'bad-request' };
       break;
   }
   return { envelope: raw as unknown as A2aRemoteEnvelope };
