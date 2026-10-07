@@ -9,7 +9,9 @@ import {
   HOST_CERT_RENEW_BEFORE_DAYS,
   HOST_CERT_VALID_DAYS,
   ISSUE_LOCK_STALE_MS,
+  breakStaleIssueLock,
   loadOrCreateHostIdentity,
+  readIssueLockState,
 } from '../hostIdentity';
 import { isHostId } from '../../../shared/a2aRemote';
 
@@ -190,51 +192,132 @@ describe('loadOrCreateHostIdentity', () => {
     expect(x509(long.certPath).subject).toBe(`CN=${'😀'.repeat(64)}`);
   });
 
+  const lockState = (lock: string) => {
+    const st = readIssueLockState(lock);
+    if (!st) throw new Error(`no lock at ${lock}`);
+    return st;
+  };
+
+  const ageLock = (lock: string) => {
+    const old = new Date(Date.now() - ISSUE_LOCK_STALE_MS - 5_000);
+    fs.utimesSync(lock, old, old);
+  };
+
   it('takes over a stale issue lock left by a crashed process', () => {
     fs.mkdirSync(dir, { recursive: true });
     const lock = path.join(dir, 'issue.lock');
     fs.writeFileSync(lock, '99999\n');
-    const old = new Date(Date.now() - ISSUE_LOCK_STALE_MS - 5_000);
-    fs.utimesSync(lock, old, old);
+    ageLock(lock);
     expect(load().created).toBe(true);
-    expect(fs.existsSync(lock)).toBe(false);
+    expect(fs.readdirSync(dir).filter((n) => n.startsWith('issue.lock'))).toEqual([]);
   });
 
-  it('agrees on one hostId and one certificate when several processes start at once', async () => {
-    const bundle = path.join(root, 'hostIdentity.cjs');
-    buildSync({
-      entryPoints: [path.join(__dirname, '..', 'hostIdentity.ts')],
-      bundle: true,
-      platform: 'node',
-      format: 'cjs',
-      outfile: bundle,
-      logLevel: 'silent',
-    });
-    const script =
-      `const m = require(${JSON.stringify(bundle)});` +
-      `const r = m.loadOrCreateHostIdentity({ dir: process.argv[1], hostname: 'devbox', ipAddresses: ['10.0.0.5'] });` +
-      `process.stdout.write('\\nRESULT ' + JSON.stringify(r) + '\\n');`;
-    const run = () =>
-      new Promise<{ hostId: string; fingerprint256: string; created: boolean }>((resolve, reject) => {
-        const child = spawn(process.execPath, ['-e', script, dir], { stdio: ['ignore', 'pipe', 'pipe'] });
-        let out = '';
-        let errOut = '';
-        child.stdout.on('data', (d) => (out += d));
-        child.stderr.on('data', (d) => (errOut += d));
-        child.on('error', reject);
-        child.on('close', (code) => {
-          const line = out.split('\n').find((l) => l.startsWith('RESULT '));
-          if (code !== 0 || !line) reject(new Error(`child exited ${code}: ${errOut}`));
-          else resolve(JSON.parse(line.slice(7)));
-        });
-      });
+  it('lets only one of the waiters that saw the same stale lock break it', () => {
+    fs.mkdirSync(dir, { recursive: true });
+    const lock = path.join(dir, 'issue.lock');
+    fs.writeFileSync(lock, '');
+    ageLock(lock);
+    const seenByA = lockState(lock);
+    const seenByB = lockState(lock);
+    expect(seenByA).toEqual(seenByB);
 
-    const results = await Promise.all(Array.from({ length: 6 }, run));
-    expect(new Set(results.map((r) => r.hostId)).size).toBe(1);
-    expect(new Set(results.map((r) => r.fingerprint256)).size).toBe(1);
-    expect(results.filter((r) => r.created)).toHaveLength(1);
-    expect(genFiles()).toHaveLength(2);
-    expect(fs.readdirSync(dir).filter((n) => n.endsWith('.tmp') || n === 'issue.lock')).toEqual([]);
-    expect(JSON.parse(fs.readFileSync(hostJson(), 'utf8')).hostId).toBe(results[0].hostId);
-  }, 30_000);
+    // B is mid-takeover (holds the marker) when A tries: A must back off.
+    fs.writeFileSync(`${lock}.takeover-${seenByB.key}`, '');
+    expect(breakStaleIssueLock(lock, seenByA.key)).toBe(false);
+    expect(fs.existsSync(lock)).toBe(true);
+    fs.unlinkSync(`${lock}.takeover-${seenByB.key}`);
+
+    expect(breakStaleIssueLock(lock, seenByB.key)).toBe(true);
+    expect(fs.readdirSync(dir)).toEqual([]);
+  });
+
+  it('never removes a fresh lock that replaced the stale one a late waiter saw', () => {
+    fs.mkdirSync(dir, { recursive: true });
+    const lock = path.join(dir, 'issue.lock');
+    fs.writeFileSync(lock, '');
+    ageLock(lock);
+    const seen = lockState(lock);
+
+    // Another waiter broke it and a new holder took the lock...
+    expect(breakStaleIssueLock(lock, seen.key)).toBe(true);
+    fs.writeFileSync(lock, '4242-0123456789abcdef', { flag: 'wx' });
+    // ...so the late waiter's takeover of what it saw must be a no-op.
+    expect(breakStaleIssueLock(lock, seen.key)).toBe(false);
+    expect(fs.readFileSync(lock, 'utf8')).toBe('4242-0123456789abcdef');
+
+    // Same content as the stale one but fresh (a holder mid-write): untouched too.
+    fs.writeFileSync(lock, '');
+    expect(breakStaleIssueLock(lock, seen.key)).toBe(false);
+    expect(fs.existsSync(lock)).toBe(true);
+  });
+
+  it('cleans up against the pointer as re-read after the switch, not the generation it wrote', () => {
+    const a = load();
+    const pointerA = fs.readFileSync(pointer(), 'utf8');
+    // Simulate another issuer flipping the pointer back right after ours.
+    let flipped = false;
+    const realRename = fs.renameSync;
+    const realRead = fs.readFileSync;
+    vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      realRename(from, to);
+      if (String(to) === pointer()) flipped = true;
+    });
+    vi.spyOn(fs, 'readFileSync').mockImplementation(((p: fs.PathOrFileDescriptor, ...rest: unknown[]) =>
+      flipped && String(p) === pointer()
+        ? Buffer.from(pointerA)
+        : (realRead as (...args: unknown[]) => string | Buffer)(p, ...rest)) as typeof fs.readFileSync);
+
+    load({ now: NEAR_EXPIRY });
+    vi.restoreAllMocks();
+    expect(fs.existsSync(a.certPath)).toBe(true);
+    expect(fs.existsSync(a.keyPath)).toBe(true);
+  });
+
+  it.each(['a clean directory', 'a stale lock from a crashed issuer'])(
+    'agrees on one hostId and one certificate when several processes start at once (%s)',
+    async (start) => {
+      if (start !== 'a clean directory') {
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(path.join(dir, 'issue.lock'), '');
+        ageLock(path.join(dir, 'issue.lock'));
+      }
+      const bundle = path.join(root, 'hostIdentity.cjs');
+      buildSync({
+        entryPoints: [path.join(__dirname, '..', 'hostIdentity.ts')],
+        bundle: true,
+        platform: 'node',
+        format: 'cjs',
+        outfile: bundle,
+        logLevel: 'silent',
+      });
+      const script =
+        `const m = require(${JSON.stringify(bundle)});` +
+        `const r = m.loadOrCreateHostIdentity({ dir: process.argv[1], hostname: 'devbox', ipAddresses: ['10.0.0.5'] });` +
+        `process.stdout.write('\\nRESULT ' + JSON.stringify(r) + '\\n');`;
+      const run = () =>
+        new Promise<{ hostId: string; fingerprint256: string; created: boolean; certPath: string }>((resolve, reject) => {
+          const child = spawn(process.execPath, ['-e', script, dir], { stdio: ['ignore', 'pipe', 'pipe'] });
+          let out = '';
+          let errOut = '';
+          child.stdout.on('data', (d) => (out += d));
+          child.stderr.on('data', (d) => (errOut += d));
+          child.on('error', reject);
+          child.on('close', (code) => {
+            const line = out.split('\n').find((l) => l.startsWith('RESULT '));
+            if (code !== 0 || !line) reject(new Error(`child exited ${code}: ${errOut}`));
+            else resolve(JSON.parse(line.slice(7)));
+          });
+        });
+
+      const results = await Promise.all(Array.from({ length: 6 }, run));
+      expect(new Set(results.map((r) => r.hostId)).size).toBe(1);
+      expect(new Set(results.map((r) => r.fingerprint256)).size).toBe(1);
+      expect(results.filter((r) => r.created)).toHaveLength(1);
+      expect(genFiles()).toHaveLength(2);
+      expect(fs.existsSync(results[0].certPath)).toBe(true);
+      expect(fs.readdirSync(dir).filter((n) => n.endsWith('.tmp') || n.startsWith('issue.lock'))).toEqual([]);
+      expect(JSON.parse(fs.readFileSync(hostJson(), 'utf8')).hostId).toBe(results[0].hostId);
+    },
+    30_000,
+  );
 });
