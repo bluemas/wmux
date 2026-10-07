@@ -235,38 +235,108 @@ function hardenKeyMode(keyPath: string): void {
   if ((fs.statSync(keyPath).mode & 0o077) !== 0) fs.chmodSync(keyPath, 0o600);
 }
 
-/** Cross-process mutex around (re-)issuing: exclusive-create lock file with stale takeover. */
+/** What a lock file holds, read through ONE descriptor so content and mtime describe the same file. */
+export interface IssueLockState {
+  /** Short hash of the content (each holder writes a unique token; a crashed create leaves it empty). */
+  key: string;
+  mtimeMs: number;
+}
+
+const lockKey = (content: Buffer): string => crypto.createHash('sha256').update(content).digest('hex').slice(0, 16);
+
+export function readIssueLockState(lock: string): IssueLockState | null {
+  let fd: number;
+  try {
+    fd = fs.openSync(lock, 'r');
+  } catch (err) {
+    if (errCode(err) === 'ENOENT') return null;
+    throw err;
+  }
+  try {
+    const { mtimeMs } = fs.fstatSync(fd);
+    return { key: lockKey(fs.readFileSync(fd)), mtimeMs };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+const isStaleLock = (s: IssueLockState): boolean => Date.now() - s.mtimeMs > ISSUE_LOCK_STALE_MS;
+
+/**
+ * Remove the stale lock a waiter observed (`seenKey`), at most once across all
+ * waiters, and never a lock that replaced it. Every waiter that saw the same
+ * stale lock races to exclusive-create a marker named after its key; exactly
+ * one wins, re-reads the lock, and removes it only if it is STILL that stale
+ * content. A waiter that arrives late finds either no lock or a fresh holder's
+ * lock (different key, or not stale) and touches nothing. Only the marker
+ * owner ever removes a stale lock, so the lock cannot change between that
+ * re-read and the unlink. Returns true when this call removed the lock.
+ */
+export function breakStaleIssueLock(lock: string, seenKey: string): boolean {
+  const marker = `${lock}.takeover-${seenKey}`;
+  try {
+    fs.writeFileSync(marker, '', { flag: 'wx' });
+  } catch (err) {
+    if (errCode(err) !== 'EEXIST') throw err;
+    // A breaker that crashed between claim and release must not block this key forever.
+    try {
+      if (Date.now() - fs.statSync(marker).mtimeMs > ISSUE_LOCK_STALE_MS) unlinkQuietly(marker);
+    } catch {
+      /* gone already */
+    }
+    return false;
+  }
+  try {
+    const current = readIssueLockState(lock);
+    if (!current || current.key !== seenKey || !isStaleLock(current)) return false;
+    try {
+      fs.unlinkSync(lock);
+      return true;
+    } catch (err) {
+      if (errCode(err) === 'ENOENT') return false;
+      throw err;
+    }
+  } finally {
+    unlinkQuietly(marker);
+  }
+}
+
+/** Cross-process mutex around (re-)issuing: exclusive-create lock file with race-free stale takeover. */
 function withIssueLock<T>(dir: string, fn: () => T): T {
   const lock = path.join(dir, LOCK_FILE);
+  const token = `${process.pid}-${crypto.randomBytes(8).toString('hex')}`;
   const deadline = Date.now() + ISSUE_LOCK_WAIT_MS;
   for (;;) {
     try {
-      fs.writeFileSync(lock, `${process.pid}\n`, { flag: 'wx' });
+      fs.writeFileSync(lock, token, { flag: 'wx' });
       break;
     } catch (err) {
       if (errCode(err) !== 'EEXIST') throw err;
     }
-    try {
-      if (Date.now() - fs.statSync(lock).mtimeMs > ISSUE_LOCK_STALE_MS) {
-        unlinkQuietly(lock); // holder crashed mid-issue
-        continue;
-      }
-    } catch (err) {
-      if (errCode(err) === 'ENOENT') continue; // released between our attempts
-      throw err;
-    }
+    const seen = readIssueLockState(lock);
+    if (!seen) continue; // released between our attempts
+    // Holder crashed mid-issue: the one waiter that breaks it retries the
+    // exclusive create at once; everyone else keeps waiting.
+    if (isStaleLock(seen) && breakStaleIssueLock(lock, seen.key)) continue;
     if (Date.now() > deadline) throw new Error(`timed out waiting for the A2A certificate lock: ${lock}`);
     sleepSync(20);
   }
   try {
     return fn();
   } finally {
-    unlinkQuietly(lock);
+    // Release only our own lock, never one that replaced it.
+    if (readIssueLockState(lock)?.key === lockKey(Buffer.from(token))) unlinkQuietly(lock);
   }
 }
 
-/** Remove every generation other than `active`. Failure is harmless: the pointer decides. */
-function removeOtherGenerations(dir: string, active: string): void {
+/**
+ * Remove every generation other than the one the pointer names NOW (re-read,
+ * not assumed to be ours). Skipped when the pointer is unreadable. Failure is
+ * harmless: the pointer decides which pair is used.
+ */
+function removeInactiveGenerations(dir: string): void {
+  const active = readActiveGen(dir);
+  if (!active) return;
   for (const name of fs.readdirSync(dir)) {
     const m = GEN_FILE_RE.exec(name);
     if (m && m[1] !== active) unlinkQuietly(path.join(dir, name));
@@ -300,7 +370,7 @@ function issue(dir: string, opts: HostIdentityOptions, now: Date): { gen: string
     unlinkQuietly(keyPath);
     throw err;
   }
-  removeOtherGenerations(dir, gen);
+  removeInactiveGenerations(dir);
   return { gen, fingerprint256: cert.fingerprint256, notAfter: cert.notAfter };
 }
 

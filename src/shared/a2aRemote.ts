@@ -199,11 +199,16 @@ export function formatInvite(i: A2aInvite): string {
 
 export function parseInvite(raw: unknown): { ok: true; invite: A2aInvite } | { ok: false; error: InviteParseError } {
   if (typeof raw !== 'string' || !raw.trim()) return { ok: false, error: 'empty' };
-  const m = /^wmux-a2a:\/\/([^/:#?\s]+):(\d{1,5})\/([^/#?\s]+)#sha256=([0-9A-Fa-f:]+)(?:&alt=([^&#\s]*))?$/.exec(raw.trim());
+  // Structure only: field boundaries, so each field below reports its OWN
+  // error. The optional `&alt=` extension is captured; anything else after
+  // the fingerprint must start with '&' (reserved for fragment extensions)
+  // and is not interpreted here.
+  const m = /^wmux-a2a:\/\/([^/:#?\s]*):([^/#?\s]*)\/([^/#?\s]*)#sha256=([^&\s]*)(?:&alt=([^&\s]*))?(?:&\S*)?$/.exec(raw.trim());
   if (!m) return { ok: false, error: raw.trim().startsWith(INVITE_SCHEME) ? 'host' : 'scheme' };
   const [, host, portStr, code, fpRaw, altRaw] = m;
   if (!HOSTNAME_RE.test(host) && !IPV4_RE.test(host)) return { ok: false, error: 'host' };
-  const port = Number(portStr);
+  // Digits only: `Number` would also accept '0x1f', '1e3' and ' 80'.
+  const port = /^\d{1,5}$/.test(portStr) ? Number(portStr) : NaN;
   if (!Number.isInteger(port) || port < 1 || port > 65535) return { ok: false, error: 'port' };
   if (!INVITE_CODE_RE.test(code)) return { ok: false, error: 'code' };
   const fingerprint256 = normalizeFingerprint256(fpRaw);
