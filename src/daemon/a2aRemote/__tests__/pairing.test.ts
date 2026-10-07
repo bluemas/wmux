@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { parseInvite } from '../../../shared/a2aRemote';
 import { A2A_PAIR_MAX_ATTEMPTS, A2A_PAIR_TTL_MS, PairingSlot, inviteHost, mintPairCode } from '../pairing';
-import { rankedExternalIpv4s } from '../server';
+import { inviteIpv4s, rankedExternalIpv4s } from '../server';
 
 const FP = Array.from({ length: 32 }, () => 'AB').join(':');
 
@@ -57,7 +57,7 @@ describe('invite addresses', () => {
   const nic = (address: string, internal = false) =>
     ({ address, family: 'IPv4', internal, netmask: '255.255.255.0', mac: '00:00:00:00:00:00', cidr: null }) as const;
 
-  it('ranks physical before virtual adapters, then RFC1918 before other addresses', () => {
+  it('ranks physical before virtual adapters and CGNAT, then RFC1918 first; drops link-local', () => {
     const ranked = rankedExternalIpv4s({
       'vEthernet (WSL)': [nic('172.20.0.1')],
       docker0: [nic('172.17.0.1')],
@@ -65,9 +65,31 @@ describe('invite addresses', () => {
       en7: [nic('203.0.113.5')],
       Ethernet: [nic('10.1.2.3')],
       'Wi-Fi': [nic('169.254.9.9'), nic('192.168.0.20')],
+      en9: [nic('100.101.102.103')],
       utun3: [nic('100.64.0.2')],
     } as never);
-    expect(ranked).toEqual(['10.1.2.3', '192.168.0.20', '203.0.113.5', '172.20.0.1', '172.17.0.1', '100.64.0.2']);
+    expect(ranked).toEqual([
+      { address: '10.1.2.3', preferred: true },
+      { address: '192.168.0.20', preferred: true },
+      { address: '203.0.113.5', preferred: true },
+      { address: '172.20.0.1', preferred: false },
+      { address: '172.17.0.1', preferred: false },
+      { address: '100.101.102.103', preferred: false },
+      { address: '100.64.0.2', preferred: false },
+    ]);
+    // 100.64/10 only: 100.63.x and 100.128.x are ordinary addresses.
+    expect(rankedExternalIpv4s({ en0: [nic('100.63.0.1'), nic('100.128.0.1')] } as never).every((r) => r.preferred)).toBe(true);
+  });
+
+  it('an invite offers only the preferred addresses, or everything when none is preferred', () => {
+    expect(inviteIpv4s([
+      { address: '10.1.2.3', preferred: true },
+      { address: '100.64.0.2', preferred: false },
+    ])).toEqual(['10.1.2.3']);
+    expect(inviteIpv4s([
+      { address: '172.20.0.1', preferred: false },
+      { address: '100.64.0.2', preferred: false },
+    ])).toEqual(['172.20.0.1', '100.64.0.2']);
   });
 
   it('an invite carries the name as host and the ranked IPv4s as alt', () => {

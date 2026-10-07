@@ -210,10 +210,16 @@ describe('A2aServer — pairing', () => {
     // Locked out: even the right code is not judged (so the lockout costs no attempt).
     expect(await raw(port, 'POST', '/api/a2a/pair', { body: pairBody(code) })).toMatchObject({
       status: 429,
-      json: { reason: 'rate-limited' },
+      json: { reason: 'rate-limited', retryAfterMs: PAIR_BACKOFF_BASE_MS },
     });
-    expect(pc.server.pairingStatus().attemptsLeft).toBe(5 - PAIR_FREE_FAILURES);
+    expect(pc.server.pairingStatus()).toEqual({
+      active: true,
+      expiresAt: expect.any(Number),
+      attemptsLeft: 5 - PAIR_FREE_FAILURES,
+      lockedUntil: now + PAIR_BACKOFF_BASE_MS,
+    });
     now += PAIR_BACKOFF_BASE_MS;
+    expect(pc.server.pairingStatus().lockedUntil).toBeNull();
     expect((await raw(port, 'POST', '/api/a2a/pair', { body: pairBody(code) })).status).toBe(200);
   });
 
