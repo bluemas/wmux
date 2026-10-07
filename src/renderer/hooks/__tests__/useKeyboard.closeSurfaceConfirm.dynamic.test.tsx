@@ -1,11 +1,13 @@
 // @vitest-environment jsdom
 //
 // The close-tab shortcut asks before it kills the tab: a declined prompt
-// leaves the tab and its PTY alone, an accepted one closes it as before.
+// leaves the tab and its PTY alone, an accepted one closes it as before. A
+// held Ctrl+W auto-repeats; the repeats must not raise the confirm again.
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import React, { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { useKeyboard } from '../useKeyboard';
+import CloseTabConfirm from '../../components/Pane/CloseTabConfirm';
 import { useStore } from '../../stores';
 import type { Workspace } from '../../../shared/types';
 
@@ -15,10 +17,20 @@ let container: HTMLDivElement;
 let root: Root;
 let dispose: ReturnType<typeof vi.fn>;
 
-function pressCloseTab(): void {
+function pressCloseTab(repeat = false): void {
   act(() => {
-    window.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, ctrlKey: true, key: 'w', code: 'KeyW' }));
+    window.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, ctrlKey: true, key: 'w', code: 'KeyW', repeat }));
   });
+}
+
+function click(selector: string): void {
+  const el = document.querySelector<HTMLButtonElement>(selector);
+  if (!el) throw new Error(`missing ${selector}`);
+  act(() => el.click());
+}
+
+function confirmOpen(): boolean {
+  return document.querySelector('[data-testid="close-tab-confirm"]') !== null;
 }
 
 function surfaceIds(): string[] {
@@ -55,9 +67,9 @@ beforeEach(() => {
   container = document.createElement('div');
   document.body.appendChild(container);
   root = createRoot(container);
-  function Harness(): null {
+  function Harness() {
     useKeyboard();
-    return null;
+    return React.createElement(CloseTabConfirm);
   }
   act(() => root.render(React.createElement(Harness)));
 });
@@ -65,22 +77,34 @@ beforeEach(() => {
 afterEach(() => {
   act(() => root.unmount());
   container.remove();
-  vi.restoreAllMocks();
+  act(() => useStore.getState().dismissCloseTab());
 });
 
 describe('close-tab shortcut confirmation', () => {
-  it('keeps the tab and its PTY when the prompt is declined', () => {
-    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+  it('keeps the tab and its PTY when the prompt is cancelled', () => {
     pressCloseTab();
-    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(confirmOpen()).toBe(true);
+    click('[data-close-tab-cancel]');
+    expect(confirmOpen()).toBe(false);
     expect(dispose).not.toHaveBeenCalled();
     expect(surfaceIds()).toEqual(['s-1', 's-2']);
   });
 
   it('closes the tab when the prompt is accepted', () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     pressCloseTab();
+    click('[data-close-tab-confirm]');
+    expect(confirmOpen()).toBe(false);
     expect(dispose).toHaveBeenCalledWith('pty-2');
     expect(surfaceIds()).toEqual(['s-1']);
+  });
+
+  it('ignores auto-repeat keydowns of a held Ctrl+W', () => {
+    pressCloseTab();
+    click('[data-close-tab-cancel]');
+    // Still held after the cancel: the OS keeps sending repeats.
+    pressCloseTab(true);
+    pressCloseTab(true);
+    expect(confirmOpen()).toBe(false);
+    expect(surfaceIds()).toEqual(['s-1', 's-2']);
   });
 });

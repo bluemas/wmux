@@ -34,6 +34,7 @@ import FileTreePanel from '../FileTree/FileTreePanel';
 import ApprovalDialog from '../Company/ApprovalDialog';
 import ExecuteApprovalDialog from '../A2a/ExecuteApprovalDialog';
 import PermissionApprovalDialogContainer from '../Approval/PermissionApprovalDialogContainer';
+import CloseTabConfirm from '../Pane/CloseTabConfirm';
 import { initAtlasWakeRecovery } from '../../terminal/atlasWakeRecovery';
 import { windowDisplayedStore } from '../../hooks/useWindowDisplayed';
 import CompanyView from '../Company/CompanyView';
@@ -2191,6 +2192,7 @@ export default function AppLayout() {
       <ApprovalDialog />
       {!inboxOwnsApprovals && <ExecuteApprovalDialog />}
       {!inboxOwnsApprovals && <PermissionApprovalDialogContainer />}
+      <CloseTabConfirm />
       <ProjectConfigDialog />
       {/* "Pair again" from a remote workspace whose host rejected us. Lives
           here because re-pairing removes that host's views. */}

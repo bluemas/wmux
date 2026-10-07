@@ -14,6 +14,7 @@ import { createLeafPane, createSurface, createWorkspace } from '../../../shared/
 import { getLeafPanes } from '../../../shared/paneUtils';
 import { useStore } from '../../stores';
 import { useKeyboard } from '../useKeyboard';
+import { closeTabNow } from '../../components/Pane/CloseTabConfirm';
 
 const createTerminalSurface = vi.hoisted(() => vi.fn());
 vi.mock('../../utils/createTerminalSurface', () => ({ createTerminalSurface }));
@@ -22,6 +23,7 @@ vi.mock('../../utils/createTerminalSurface', () => ({ createTerminalSurface }));
 
 let container: HTMLDivElement;
 let root: Root;
+let unsubscribe: () => void;
 
 function mount(): void {
   container = document.createElement('div');
@@ -122,8 +124,14 @@ beforeEach(() => {
     window: { hide: vi.fn() },
     pty: { dispose: vi.fn(), create: vi.fn(), write: vi.fn() },
   };
-  // Ctrl+W asks before closing; accept so the count reflects the shortcut.
-  vi.spyOn(window, 'confirm').mockReturnValue(true);
+  // Ctrl+W asks before closing; accept every confirm so the tab count
+  // reflects how many times the shortcut ran.
+  unsubscribe = useStore.subscribe((state) => {
+    const target = state.closeTabConfirm;
+    if (!target) return;
+    state.dismissCloseTab();
+    closeTabNow(target);
+  });
   seed();
   mount();
 });
@@ -131,7 +139,7 @@ beforeEach(() => {
 afterEach(() => {
   act(() => root.unmount());
   container.remove();
-  vi.restoreAllMocks();
+  unsubscribe();
 });
 
 describe('Windows IME: one physical press runs a shortcut once', () => {

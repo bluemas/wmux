@@ -629,9 +629,8 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
   // The tab strip's X asks first, like the close-tab shortcut. A browser
   // panel closing itself (window.close) goes straight to handleCloseSurface.
   const handleCloseSurfaceFromTab = useCallback((surfaceId: string) => {
-    if (!window.confirm(t('surface.closeConfirm'))) return;
-    handleCloseSurface(surfaceId);
-  }, [handleCloseSurface, t]);
+    useStore.getState().requestCloseTab({ workspaceId: workspace.id, paneId: pane.id, surfaceId });
+  }, [workspace.id, pane.id]);
 
   return (
     <div
