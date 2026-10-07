@@ -90,6 +90,28 @@ describe('CommanderEventCoalescer — a2a.received (remote Moa)', () => {
     expect(prompts).toHaveLength(0);
   });
 
+  it('an answer to work this Moa sent still wakes through a pending decision, and says the card is open', async () => {
+    const parked: CoalescerInput[][] = [];
+    const { c, prompts } = mk({ pendingDecision: true, parked });
+    c.push(received(40, 'state'));
+    c.push(received(41)); // a NEW task from the other PC stays parked
+    vi.advanceTimersByTime(1_000);
+    await settle();
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0]).toContain(rt(40));
+    expect(prompts[0]).not.toContain(rt(41));
+    expect(prompts[0]).toContain('withdraw it with deck_resolve_decision');
+    expect(parked.flat().map((e) => e.a2a?.taskId)).toEqual([rt(41)]);
+  });
+
+  it('the auto-wake switch still blocks an answer during a pending decision', async () => {
+    const { c, prompts } = mk({ pendingDecision: true, autoWake: false });
+    c.push(received(42, 'reply'));
+    vi.advanceTimersByTime(1_000);
+    await settle();
+    expect(prompts).toHaveLength(0);
+  });
+
   it('does not wake with the auto-wake switch off', async () => {
     const { c, prompts } = mk({ autoWake: false });
     c.push(received(4));
