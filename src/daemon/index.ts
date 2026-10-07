@@ -39,6 +39,7 @@ import os from 'node:os';
 import {
   loadConfig,
   saveConfig,
+  saveConfigOrThrow,
   getWmuxDir,
   readNotifySinks,
   readPushPresenceSuppression,
@@ -82,7 +83,7 @@ import { PeerStore } from './lanlink/peers';
 import { coerceLanLinkPatch } from '../shared/lanlink';
 import { A2aRemoteController } from './a2aRemote/controller';
 import { A2aServer } from './a2aRemote/server';
-import { registerA2aRemoteRpc } from './a2aRemote/rpc';
+import { forgetHostCascade, registerA2aRemoteRpc } from './a2aRemote/rpc';
 import { PeerStore as A2aPeerStore } from './a2aRemote/peerStore';
 import { RemoteHostStore } from './a2aRemote/remoteHostStore';
 import { LinkStore } from './a2aRemote/linkStore';
@@ -7879,16 +7880,25 @@ async function main(): Promise<void> {
     const a2aDir = path.join(wmuxDir, 'a2a');
     const a2aLog = (level: 'info' | 'warn' | 'error', msg: string): void => log(level, msg);
     const a2aPeers = new A2aPeerStore({ dir: a2aDir, log: a2aLog });
-    const a2aRemoteController = new A2aRemoteController({ config, persist: saveConfig });
-    const a2aServer = new A2aServer({ controller: a2aRemoteController, identityDir: a2aDir, peers: a2aPeers, log: a2aLog });
+    const a2aCascade = forgetHostCascade(
+      { links: new LinkStore({ dir: a2aDir, log: a2aLog }), exposures: new ExposureStore({ dir: a2aDir, log: a2aLog }) },
+      a2aLog,
+    );
+    const a2aRemoteController = new A2aRemoteController({ config, persist: saveConfigOrThrow });
+    const a2aServer = new A2aServer({
+      controller: a2aRemoteController,
+      identityDir: a2aDir,
+      peers: a2aPeers,
+      onPeerRevoked: a2aCascade,
+      log: a2aLog,
+    });
     a2aServerRef = a2aServer;
     registerA2aRemoteRpc((method, handler) => pipeServer.onRpc(method, handler), {
       controller: a2aRemoteController,
       server: a2aServer,
       peers: a2aPeers,
       remoteHosts: new RemoteHostStore({ dir: a2aDir, log: a2aLog }),
-      links: new LinkStore({ dir: a2aDir, log: a2aLog }),
-      exposures: new ExposureStore({ dir: a2aDir, log: a2aLog }),
+      cascade: a2aCascade,
       log: a2aLog,
     });
   } catch (err) {

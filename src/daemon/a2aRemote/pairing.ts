@@ -73,12 +73,18 @@ export class PairingSlot {
   }
 
   /** Open (or replace) the invite. */
-  begin(params: { host: string; port: number; fingerprint256: CertFingerprint256 }): PairingBeginResult {
+  begin(params: { host: string; port: number; fingerprint256: CertFingerprint256; alt?: string[] }): PairingBeginResult {
     this.code = this.mintCode();
     this.expiresAt = this.now() + A2A_PAIR_TTL_MS;
     this.attemptsLeft = A2A_PAIR_MAX_ATTEMPTS;
     return {
-      invite: formatInvite({ host: params.host, port: params.port, code: this.code, fingerprint256: params.fingerprint256 }),
+      invite: formatInvite({
+        host: params.host,
+        port: params.port,
+        code: this.code,
+        fingerprint256: params.fingerprint256,
+        ...(params.alt && params.alt.length > 0 ? { alt: params.alt } : {}),
+      }),
       expiresAt: this.expiresAt,
     };
   }

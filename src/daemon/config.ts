@@ -526,6 +526,21 @@ export function loadConfig(): DaemonConfig {
 
 /** Atomic write: .tmp then rename (mirrors SessionManager pattern) */
 export function saveConfig(config: DaemonConfig): void {
+  // A directory that cannot be created still throws, as it always did.
+  const dir = path.dirname(getConfigPath());
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  try {
+    saveConfigOrThrow(config);
+  } catch (err) {
+    console.error('[daemon/config] Failed to save config:', err);
+  }
+}
+
+/**
+ * `saveConfig` that reports failure: for callers that must not change their
+ * in-memory state unless the write landed.
+ */
+export function saveConfigOrThrow(config: DaemonConfig): void {
   const configPath = getConfigPath();
   const tmpPath = configPath + '.tmp';
   const dir = path.dirname(configPath);
@@ -539,12 +554,12 @@ export function saveConfig(config: DaemonConfig): void {
     fs.writeFileSync(tmpPath, JSON.stringify(config, null, 2), { encoding: 'utf-8', mode: 0o600 });
     fs.renameSync(tmpPath, configPath);
   } catch (err) {
-    console.error('[daemon/config] Failed to save config:', err);
     try {
       if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
     } catch {
       // ignore cleanup errors
     }
+    throw err;
   }
 }
 

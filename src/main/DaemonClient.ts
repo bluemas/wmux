@@ -16,6 +16,7 @@ import type {
 } from '../shared/lanlink';
 import type {
   A2aRemoteHostsListResult,
+  A2aRemoteHostsRemoveResult,
   A2aRemoteJoinResult,
   A2aRemotePairBeginResult,
   A2aRemotePairStatus,
@@ -601,8 +602,9 @@ export class DaemonClient extends EventEmitter {
     return (await this.rpc('a2a.remote.hosts.list', {})) as A2aRemoteHostsListResult;
   }
 
-  async a2aRemoteHostsRemove(hostId: string): Promise<{ ok: boolean }> {
-    return (await this.rpc('a2a.remote.hosts.remove', { hostId })) as { ok: boolean };
+  /** Also tells the other PC (best effort, over the pinned connection), hence 30s. */
+  async a2aRemoteHostsRemove(hostId: string): Promise<A2aRemoteHostsRemoveResult> {
+    return (await this.rpc('a2a.remote.hosts.remove', { hostId }, { timeoutMs: 30_000 })) as A2aRemoteHostsRemoveResult;
   }
 
   async a2aRemotePeersList(): Promise<A2aRemotePeersListResult> {

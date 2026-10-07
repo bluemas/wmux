@@ -54,6 +54,11 @@ export const A2A_ROUTES = Object.freeze({
    * Body: A2aPairRequest. The ONLY peer route that takes no credential.
    */
   pair: '/api/a2a/pair',
+  /**
+   * POST — the joiner withdraws its own pairing: the server revokes the
+   * calling peer and ends its links and exposure. Peer credential required.
+   */
+  unpair: '/api/a2a/unpair',
   /** GET  — the server's identity + protocol (lets a joiner re-verify after an address change). */
   hello: '/api/a2a/hello',
   /** GET  — what the server exposes to THIS peer (layer 2). */
@@ -154,9 +159,11 @@ export function looksLikePeerCredential(bearer: unknown): boolean {
 /**
  * Paste-only invite string (there is NO `wmux-a2a:` protocol handler):
  *
- *   wmux-a2a://<host>:<port>/<CODE>#sha256=<fingerprint256>
+ *   wmux-a2a://<host>:<port>/<CODE>#sha256=<fingerprint256>[&alt=<ipv4>,<ipv4>]
  *
  * `host` is the server's machine name first (company DNS), an IPv4 otherwise.
+ * `alt` (optional, at most `INVITE_ALT_MAX` canonical IPv4s) lists more
+ * addresses to try in order when `host` does not resolve or answer.
  * `CODE` is the server's one-shot pairing code (same alphabet and slot as the
  * existing pair flows). The fingerprint is what the joiner pins BEFORE sending
  * any credential-bearing byte.
@@ -168,30 +175,43 @@ export interface A2aInvite {
   port: number;
   code: string;
   fingerprint256: CertFingerprint256;
+  /** Fallback IPv4s, tried after `host` in order. Absent when there are none. */
+  alt?: string[];
 }
+
+export const INVITE_ALT_MAX = 4;
 
 const INVITE_CODE_RE = /^[A-HJ-NP-Z2-9]{8}$/;
 const HOSTNAME_RE = /^(?=.{1,253}$)[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?(?:\.[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?)*$/;
 const IPV4_RE = /^(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
 
-export type InviteParseError = 'empty' | 'scheme' | 'host' | 'port' | 'code' | 'fingerprint';
+export type InviteParseError = 'empty' | 'scheme' | 'host' | 'port' | 'code' | 'fingerprint' | 'alt';
+
+/** Canonical dotted-quad IPv4 (no leading zeros). */
+export function isCanonicalIpv4(v: string): boolean {
+  return IPV4_RE.test(v) && v.split('.').map(Number).join('.') === v;
+}
 
 export function formatInvite(i: A2aInvite): string {
-  return `wmux-a2a://${i.host}:${i.port}/${i.code}#sha256=${i.fingerprint256}`;
+  const alt = i.alt && i.alt.length > 0 ? `&alt=${i.alt.join(',')}` : '';
+  return `wmux-a2a://${i.host}:${i.port}/${i.code}#sha256=${i.fingerprint256}${alt}`;
 }
 
 export function parseInvite(raw: unknown): { ok: true; invite: A2aInvite } | { ok: false; error: InviteParseError } {
   if (typeof raw !== 'string' || !raw.trim()) return { ok: false, error: 'empty' };
-  const m = /^wmux-a2a:\/\/([^/:#?\s]+):(\d{1,5})\/([^/#?\s]+)#sha256=([0-9A-Fa-f:]+)$/.exec(raw.trim());
+  const m = /^wmux-a2a:\/\/([^/:#?\s]+):(\d{1,5})\/([^/#?\s]+)#sha256=([0-9A-Fa-f:]+)(?:&alt=([^&#\s]*))?$/.exec(raw.trim());
   if (!m) return { ok: false, error: raw.trim().startsWith(INVITE_SCHEME) ? 'host' : 'scheme' };
-  const [, host, portStr, code, fpRaw] = m;
+  const [, host, portStr, code, fpRaw, altRaw] = m;
   if (!HOSTNAME_RE.test(host) && !IPV4_RE.test(host)) return { ok: false, error: 'host' };
   const port = Number(portStr);
   if (!Number.isInteger(port) || port < 1 || port > 65535) return { ok: false, error: 'port' };
   if (!INVITE_CODE_RE.test(code)) return { ok: false, error: 'code' };
   const fingerprint256 = normalizeFingerprint256(fpRaw);
   if (!fingerprint256) return { ok: false, error: 'fingerprint' };
-  return { ok: true, invite: { host, port, code, fingerprint256 } };
+  if (altRaw === undefined) return { ok: true, invite: { host, port, code, fingerprint256 } };
+  const alt = altRaw.split(',');
+  if (alt.length > INVITE_ALT_MAX || !alt.every(isCanonicalIpv4)) return { ok: false, error: 'alt' };
+  return { ok: true, invite: { host, port, code, fingerprint256, alt } };
 }
 
 /** `POST /api/a2a/pair` body. The joiner reports its own identity. */
@@ -227,7 +247,9 @@ export type A2aPairRefusal =
   /** The code does not match the open invite. */
   | 'invalid-code'
   /** The joiner presented this server's own hostId. */
-  | 'self';
+  | 'self'
+  /** Too many failed pairings from this address; wait and retry (HTTP 429). */
+  | 'rate-limited';
 
 // ─── Persisted records ──────────────────────────────────────────────────────
 

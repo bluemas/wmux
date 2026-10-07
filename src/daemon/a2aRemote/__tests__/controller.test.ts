@@ -42,8 +42,26 @@ describe('a2aRemote config slice', () => {
     c.configure({ enabled: true });
     c.configure({ port: 50001 });
     expect(persist).toHaveBeenCalledTimes(2);
-    expect(changed).toHaveBeenLastCalledWith({ enabled: true, port: 50001 });
+    expect(changed).toHaveBeenLastCalledWith({ enabled: true, port: 50001 }, { enabled: true });
     expect(config.a2aRemote).toEqual({ enabled: true, port: 50001 });
+  });
+
+  it('a failed write applies nothing, and the same value can be retried', () => {
+    const config = {} as DaemonConfig;
+    let fail = true;
+    const persist = vi.fn(() => {
+      if (fail) throw new Error('disk full');
+    });
+    const c = new A2aRemoteController({ config, persist });
+    const changed = vi.fn();
+    c.on(A2A_REMOTE_CONFIG_CHANGED, changed);
+    expect(() => c.configure({ enabled: true })).toThrow(/disk full/);
+    expect(config.a2aRemote).toEqual({ enabled: false });
+    expect(changed).not.toHaveBeenCalled();
+    fail = false;
+    c.configure({ enabled: true });
+    expect(config.a2aRemote).toEqual({ enabled: true });
+    expect(changed).toHaveBeenCalledTimes(1);
   });
 
   it('the default port is clear of the web (7681) and LanLink (45651) defaults', () => {
@@ -94,6 +112,40 @@ describe('A2aServer lifecycle driven by the controller', () => {
     expect(await connectRefused(oldPort)).toBe(true);
     expect(await connectRefused(newPort)).toBe(false);
     expect(pc.server.status().fingerprint256).toBe(fp);
+  });
+
+  it('a port it cannot bind keeps the old listener and puts the old port back', async () => {
+    const pc = await makePc('PC A', { enabled: true });
+    const oldPort = pc.server.boundPort()!;
+    const blocker = net.createServer();
+    const busy = await freePort();
+    await new Promise<void>((resolve) => blocker.listen(busy, '127.0.0.1', resolve));
+    try {
+      pc.controller.configure({ port: busy });
+      await pc.server.whenIdle();
+      expect(pc.server.boundPort()).toBe(oldPort);
+      expect(await connectRefused(oldPort)).toBe(false);
+      expect(pc.server.status()).toMatchObject({ listening: true, port: oldPort, lastError: 'EADDRINUSE' });
+      expect(pc.config.a2aRemote).toEqual({ enabled: true, port: oldPort });
+      // The chain is still alive: a good port afterwards rebinds normally.
+      const good = await freePort();
+      pc.controller.configure({ port: good });
+      await pc.server.whenIdle();
+      expect(pc.server.status()).toMatchObject({ listening: true, port: good, lastError: null });
+    } finally {
+      await new Promise<void>((resolve) => blocker.close(() => resolve()));
+    }
+  });
+
+  it('after dispose a config change starts nothing', async () => {
+    const pc = await makePc('PC A', { enabled: false });
+    pc.server.dispose();
+    await pc.server.whenIdle();
+    expect(pc.controller.listenerCount(A2A_REMOTE_CONFIG_CHANGED)).toBe(0);
+    pc.controller.configure({ enabled: true });
+    await pc.server.whenIdle();
+    expect(pc.server.status().listening).toBe(false);
+    expect(await connectRefused(pc.controller.effectivePort())).toBe(true);
   });
 
   it('a busy port leaves it stopped with lastError, no retry loop', async () => {

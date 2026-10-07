@@ -36,6 +36,7 @@ import type {
 } from './lanlink';
 import type {
   A2aRemoteHostsListResult,
+  A2aRemoteHostsRemoveResult,
   A2aRemoteJoinResult,
   A2aRemotePairBeginResult,
   A2aRemotePairStatus,
@@ -204,7 +205,8 @@ declare global {
         join: (invite: string) => Promise<A2aRemoteJoinResult>;
         /** PCs this PC joined. */
         hostsList: () => Promise<A2aRemoteHostsListResult>;
-        hostsRemove: (hostId: string) => Promise<{ ok: boolean }>;
+        /** Removes here and tells that PC (best effort); `remoteRevoked` says whether it confirmed. */
+        hostsRemove: (hostId: string) => Promise<A2aRemoteHostsRemoveResult>;
         /** PCs that joined this PC. */
         peersList: () => Promise<A2aRemotePeersListResult>;
         peersRevoke: (peerId: string) => Promise<{ ok: boolean }>;

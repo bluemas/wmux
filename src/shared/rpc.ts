@@ -1302,6 +1302,8 @@ export interface A2aRemotePairBeginResult {
   invite: string;
   /** Epoch ms. */
   expiresAt: number;
+  /** The addresses the invite offers, in the order the other PC tries them. */
+  addresses: string[];
 }
 
 /** `a2a.remote.pair.status` */
@@ -1329,8 +1331,10 @@ export type A2aRemoteJoinError =
   | 'code-expired'
   /** The code does not match the PC's open invite. */
   | 'code-invalid'
-  /** That PC already holds a pairing for this PC; it must remove it first. */
+  /** Two pairings for this PC raced on that PC; try again. */
   | 'already-paired'
+  /** Too many failed attempts from this PC; wait a little and retry. */
+  | 'rate-limited'
   /** The PC answered something this version does not understand. */
   | 'protocol'
   /** Anything else (network failure mid-request, local store failure). */
@@ -1344,6 +1348,14 @@ export type A2aRemoteJoinResult =
 /** `a2a.remote.hosts.list` — PCs this PC joined. Never carries a credential. */
 export interface A2aRemoteHostsListResult {
   hosts: A2aRemoteHostRecordV1[];
+}
+
+/** `a2a.remote.hosts.remove` */
+export interface A2aRemoteHostsRemoveResult {
+  /** Removed here (false: it was not paired). */
+  ok: boolean;
+  /** The other PC confirmed it revoked this PC's pairing too. */
+  remoteRevoked: boolean;
 }
 
 /** `a2a.remote.peers.list` — PCs that joined this PC (revoked ones included). */

@@ -67,7 +67,7 @@ export function coerceA2aRemotePatch(raw: unknown): A2aRemoteConfigurePatch {
 export interface A2aRemoteControllerDeps {
   /** The daemon's live boot config; `a2aRemote` is mutated in place. */
   config: DaemonConfig;
-  /** Persist the whole config (saveConfig). */
+  /** Persist the whole config. Must THROW when the write did not land (saveConfigOrThrow). */
   persist: (config: DaemonConfig) => void;
 }
 
@@ -92,8 +92,10 @@ export class A2aRemoteController extends EventEmitter {
   }
 
   /**
-   * Apply an already-validated patch. A no-op patch neither rewrites disk nor
-   * fires `changed`, so the listener never rebinds for nothing.
+   * Apply an already-validated patch. Persists FIRST and only then changes the
+   * in-memory slice, so a failed write (thrown) leaves nothing applied and a
+   * retry with the same value is not mistaken for a no-op. A no-op patch
+   * neither rewrites disk nor fires `changed`. `changed` carries (next, prev).
    */
   configure(patch: A2aRemoteConfigurePatch): A2aRemoteConfig {
     const cur = this.current();
@@ -101,9 +103,19 @@ export class A2aRemoteController extends EventEmitter {
     const port = patch.port ?? cur.port;
     if (port !== undefined) next.port = port;
     if (next.enabled === cur.enabled && (next.port ?? null) === (cur.port ?? null)) return cur;
+    this.persist({ ...this.config, a2aRemote: next });
     this.config.a2aRemote = next;
-    this.persist(this.config);
-    this.emit(A2A_REMOTE_CONFIG_CHANGED, { ...next });
+    this.emit(A2A_REMOTE_CONFIG_CHANGED, { ...next }, cur);
     return { ...next };
+  }
+
+  /**
+   * Put back a slice the listener could not apply (a port it could not bind
+   * while the old one keeps serving). Does not fire `changed`: nothing is
+   * listening differently.
+   */
+  restore(prev: A2aRemoteConfig): void {
+    this.persist({ ...this.config, a2aRemote: { ...prev } });
+    this.config.a2aRemote = { ...prev };
   }
 }

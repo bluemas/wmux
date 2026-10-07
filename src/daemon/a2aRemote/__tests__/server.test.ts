@@ -5,7 +5,7 @@ import {
   parseInvite,
   parsePeerCredential,
 } from '../../../shared/a2aRemote';
-import { A2A_REQUEST_BODY_MAX } from '../server';
+import { A2A_REQUEST_BODY_MAX, PAIR_BACKOFF_BASE_MS, PAIR_FREE_FAILURES } from '../server';
 import { disposeAll, makePc, raw, type Pc } from './a2aServerRig';
 
 const JOINER = '33333333-3333-4333-8333-333333333333';
@@ -170,18 +170,51 @@ describe('A2aServer — pairing', () => {
     expect(pc.peers.list()).toHaveLength(0);
   });
 
-  it('a 409 for an already-paired host does not spend the invite', async () => {
+  it('a valid code re-pairs an already-paired host: the old peer is revoked, with its cascade', async () => {
+    const pc = await makePc('PC A');
+    const old = await pairedCredential(pc);
+    const fresh = await pairedCredential(pc);
+    expect(fresh).not.toBe(old);
+    const live = pc.peers.listByHost(JOINER).filter((r) => r.revokedAt === undefined);
+    expect(live).toHaveLength(1);
+    expect(pc.cascaded).toEqual([JOINER]);
+    const port = portOf(pc);
+    expect((await raw(port, 'GET', '/api/a2a/hello', { headers: { Authorization: `Bearer ${old}` } })).status).toBe(401);
+    expect((await raw(port, 'GET', '/api/a2a/hello', { headers: { Authorization: `Bearer ${fresh}` } })).status).toBe(200);
+  });
+
+  it('judges the code before the hostId: no answer tells a paired host from an unknown one', async () => {
     const pc = await makePc('PC A');
     await pairedCredential(pc);
-    const code = codeOf(pc);
-    const res = await raw(portOf(pc), 'POST', '/api/a2a/pair', { body: pairBody(code) });
-    expect(res).toMatchObject({ status: 409, json: { error: 'conflict' } });
-    expect(pc.server.pairingStatus()).toMatchObject({ active: true, attemptsLeft: 5 });
-    // Another host can still use it.
-    const other = await raw(portOf(pc), 'POST', '/api/a2a/pair', {
-      body: pairBody(code, '44444444-4444-4444-8444-444444444444'),
+    pc.server.beginPairing();
+    const port = portOf(pc);
+    const paired = await raw(port, 'POST', '/api/a2a/pair', { body: pairBody('ZZZZZZZZ', JOINER) });
+    const unknown = await raw(port, 'POST', '/api/a2a/pair', {
+      body: pairBody('ZZZZZZZZ', '55555555-5555-4555-8555-555555555555'),
     });
-    expect(other.status).toBe(200);
+    expect(paired).toEqual(unknown);
+    expect(paired).toMatchObject({ status: 403, json: { reason: 'invalid-code' } });
+    // And with no invite open at all.
+    pc.server.cancelPairing();
+    expect((await raw(port, 'POST', '/api/a2a/pair', { body: pairBody('ZZZZZZZZ', JOINER) })).status).toBe(403);
+  });
+
+  it('backs off a source address after repeated failures, without touching the invite', async () => {
+    let now = 1_800_000_000_000;
+    const pc = await makePc('PC A', { deps: { now: () => now } });
+    const code = codeOf(pc);
+    const port = portOf(pc);
+    const wrong = (): Promise<{ status: number; json: Record<string, unknown> | null }> =>
+      raw(port, 'POST', '/api/a2a/pair', { body: pairBody('ZZZZZZZZ') });
+    for (let i = 0; i < PAIR_FREE_FAILURES; i++) expect((await wrong()).status).toBe(403);
+    // Locked out: even the right code is not judged (so the lockout costs no attempt).
+    expect(await raw(port, 'POST', '/api/a2a/pair', { body: pairBody(code) })).toMatchObject({
+      status: 429,
+      json: { reason: 'rate-limited' },
+    });
+    expect(pc.server.pairingStatus().attemptsLeft).toBe(5 - PAIR_FREE_FAILURES);
+    now += PAIR_BACKOFF_BASE_MS;
+    expect((await raw(port, 'POST', '/api/a2a/pair', { body: pairBody(code) })).status).toBe(200);
   });
 
   it('two concurrent redemptions of one code mint once', async () => {
@@ -193,6 +226,18 @@ describe('A2aServer — pairing', () => {
     ]);
     expect([a.status, b.status].sort()).toEqual([200, 403]);
     expect(pc.peers.list()).toHaveLength(1);
+  });
+
+  it('unpair revokes only the calling peer and runs the cascade', async () => {
+    const pc = await makePc('PC A');
+    const cred = await pairedCredential(pc);
+    const port = portOf(pc);
+    expect((await raw(port, 'POST', '/api/a2a/unpair')).status).toBe(401);
+    const res = await raw(port, 'POST', '/api/a2a/unpair', { headers: { Authorization: `Bearer ${cred}` } });
+    expect(res).toMatchObject({ status: 200, json: { ok: true } });
+    expect(pc.peers.listByHost(JOINER)[0].revokedAt).toBeDefined();
+    expect(pc.cascaded).toEqual([JOINER]);
+    expect((await raw(port, 'GET', '/api/a2a/hello', { headers: { Authorization: `Bearer ${cred}` } })).status).toBe(401);
   });
 
   it('revoked peer gets 401 on hello', async () => {

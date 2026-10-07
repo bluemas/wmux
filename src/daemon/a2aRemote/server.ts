@@ -7,6 +7,7 @@ import {
   A2A_REMOTE_BODY_MAX,
   A2A_REMOTE_PROTOCOL,
   A2A_ROUTES,
+  INVITE_ALT_MAX,
   formatPeerCredential,
   isA2aRoute,
   isHostId,
@@ -19,7 +20,7 @@ import {
 } from '../../shared/a2aRemote';
 import type { A2aRemotePairBeginResult, A2aRemotePairStatus, A2aRemoteStatus } from '../../shared/rpc';
 import type { WebA2aPeer, WebA2aRoutes } from '../web/WebTerminalServer';
-import { A2A_REMOTE_CONFIG_CHANGED, type A2aRemoteController } from './controller';
+import { A2A_REMOTE_CONFIG_CHANGED, type A2aRemoteConfig, type A2aRemoteController } from './controller';
 import { loadOrCreateHostIdentity, type HostIdentity, type HostIdentityOptions } from './hostIdentity';
 import { PairingSlot, inviteHost } from './pairing';
 import type { PeerAuthResult } from './peerStore';
@@ -54,12 +55,23 @@ const KEEP_ALIVE_TIMEOUT_MS = 5_000;
 const HANDSHAKE_TIMEOUT_MS = 10_000;
 const MAX_CONNECTIONS = 64;
 
+/**
+ * Per-source-address backoff on failed pairings (wrong or expired code), on
+ * top of the invite's own 5-attempt burn: the first `PAIR_FREE_FAILURES` are
+ * free, then each further failure doubles a lockout (429) up to the cap.
+ */
+export const PAIR_FREE_FAILURES = 3;
+export const PAIR_BACKOFF_BASE_MS = 1_000;
+export const PAIR_BACKOFF_MAX_MS = 60_000;
+const PAIR_BACKOFF_TRACKED_MAX = 1024;
+
 /** The slice of `PeerStore` the listener needs. */
 export interface A2aPeerSource {
   resolve(peerId: string, secret: string): Promise<PeerAuthResult>;
   touch(peerId: string): void;
   mint(params: { hostId: string; name: string }): Promise<{ peerId: string; secret: string }>;
-  listByHost(hostId: string): Array<{ revokedAt?: string }>;
+  listByHost(hostId: string): Array<{ peerId: string; revokedAt?: string }>;
+  revoke(peerId: string): boolean;
 }
 
 export type A2aServerLog = (level: 'info' | 'warn' | 'error', msg: string) => void;
@@ -69,40 +81,65 @@ export interface A2aServerDeps {
   /** Directory holding the host identity (`<wmux dir>/a2a`). */
   identityDir: string;
   peers: A2aPeerSource;
+  /**
+   * Revoke cascade, run after this listener revoked a peer (a re-pair or an
+   * unpair): end that host's links and drop what it could see.
+   */
+  onPeerRevoked?: (hostId: string) => void;
   /** Every other `/api/a2a/*` route, reached only with an authenticated peer. Absent: 503. */
   routes?: WebA2aRoutes;
   /** This machine's name. Default `os.hostname()`. */
   hostname?: () => string;
-  /** This machine's external IPv4s. Default: `os.networkInterfaces()`. */
+  /** This machine's external IPv4s, best first. Default `rankedExternalIpv4s()`. */
   ipv4s?: () => string[];
   /** Bind address. Default `0.0.0.0` (PoC); tests bind loopback. */
   bindHost?: string;
-  /** Clock for the invite's lifetime. Default `Date.now`. */
+  /** Clock for the invite's lifetime and the pairing backoff. Default `Date.now`. */
   now?: () => number;
   /** Test seam; default `loadOrCreateHostIdentity`. */
   loadIdentity?: (opts: HostIdentityOptions) => HostIdentity;
   log?: A2aServerLog;
 }
 
-export function externalIpv4s(): string[] {
-  const out: string[] = [];
-  for (const list of Object.values(os.networkInterfaces())) {
+/** Interface names of virtual adapters, whose addresses another PC usually cannot reach. */
+const VIRTUAL_NIC_RE = /vEthernet|docker|^br-|veth|vmnet|virtualbox|vboxnet|utun|tailscale|wsl|hyper-v/i;
+
+function isRfc1918(ip: string): boolean {
+  const [a, b] = ip.split('.').map(Number);
+  return a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+}
+
+/**
+ * External IPv4s, best candidate for another LAN PC first: physical adapters
+ * before virtual ones (Hyper-V, WSL, Docker, VPN tunnels…), then RFC1918
+ * private addresses before others. Link-local is left out.
+ */
+export function rankedExternalIpv4s(ifaces: NodeJS.Dict<os.NetworkInterfaceInfo[]> = os.networkInterfaces()): string[] {
+  const found: Array<{ address: string; virtual: boolean; priv: boolean; order: number }> = [];
+  for (const [name, list] of Object.entries(ifaces)) {
     for (const nic of list ?? []) {
-      if (nic.family === 'IPv4' && !nic.internal && !nic.address.startsWith('169.254.')) out.push(nic.address);
+      if (nic.family !== 'IPv4' || nic.internal || nic.address.startsWith('169.254.')) continue;
+      found.push({ address: nic.address, virtual: VIRTUAL_NIC_RE.test(name), priv: isRfc1918(nic.address), order: found.length });
     }
   }
-  return out;
+  found.sort((x, y) => Number(x.virtual) - Number(y.virtual) || Number(y.priv) - Number(x.priv) || x.order - y.order);
+  return [...new Set(found.map((f) => f.address))];
 }
 
 export class A2aServer {
   private readonly deps: A2aServerDeps;
   private readonly hostname: () => string;
   private readonly ipv4s: () => string[];
+  private readonly now: () => number;
   private readonly loadIdentity: (opts: HostIdentityOptions) => HostIdentity;
   private readonly log: A2aServerLog;
   private readonly pairing: PairingSlot;
+  private readonly onChanged = (): void => this.scheduleReconcile();
+  private readonly pairFailures = new Map<string, { count: number; blockedUntil: number }>();
   private server: https.Server | null = null;
   private port: number | null = null;
+  /** The slice the live listener was bound for (what a failed rebind restores). */
+  private boundSlice: A2aRemoteConfig | null = null;
   private identity: HostIdentity | null = null;
   private lastError: string | null = null;
   private chain: Promise<void> = Promise.resolve();
@@ -111,11 +148,12 @@ export class A2aServer {
   constructor(deps: A2aServerDeps) {
     this.deps = deps;
     this.hostname = deps.hostname ?? ((): string => os.hostname());
-    this.ipv4s = deps.ipv4s ?? externalIpv4s;
+    this.ipv4s = deps.ipv4s ?? ((): string[] => rankedExternalIpv4s());
+    this.now = deps.now ?? Date.now;
     this.loadIdentity = deps.loadIdentity ?? loadOrCreateHostIdentity;
-    this.pairing = new PairingSlot({ ...(deps.now ? { now: deps.now } : {}) });
+    this.pairing = new PairingSlot({ now: this.now });
     this.log = deps.log ?? ((level, msg): void => void console[level === 'info' ? 'log' : level](msg));
-    deps.controller.on(A2A_REMOTE_CONFIG_CHANGED, () => this.scheduleReconcile());
+    deps.controller.on(A2A_REMOTE_CONFIG_CHANGED, this.onChanged);
     // `changed` does not fire at boot: an enabled listener starts here.
     if (deps.controller.current().enabled) this.scheduleReconcile();
   }
@@ -156,14 +194,21 @@ export class A2aServer {
     };
   }
 
-  /** Open (or replace) the one-shot invite. Throws while the listener is down. */
+  /**
+   * Open (or replace) the one-shot invite. Throws while the listener is down.
+   * The invite names this PC (its machine name when usable) plus up to
+   * `INVITE_ALT_MAX` fallback IPv4s, best first.
+   */
   beginPairing(): A2aRemotePairBeginResult {
     if (!this.server || this.port === null || !this.identity) {
       throw new Error('a2a.remote.pair.begin: the A2A listener is not running');
     }
-    const host = inviteHost(this.hostname(), this.ipv4s());
+    const ips = this.ipv4s();
+    const host = inviteHost(this.hostname(), ips);
     if (!host) throw new Error('a2a.remote.pair.begin: this PC has no usable name or IPv4 address');
-    return this.pairing.begin({ host, port: this.port, fingerprint256: this.identity.fingerprint256 });
+    const alt = ips.filter((ip) => ip !== host).slice(0, INVITE_ALT_MAX);
+    const opened = this.pairing.begin({ host, port: this.port, fingerprint256: this.identity.fingerprint256, alt });
+    return { ...opened, addresses: [host, ...alt] };
   }
 
   cancelPairing(): void {
@@ -176,6 +221,8 @@ export class A2aServer {
 
   dispose(): void {
     this.disposed = true;
+    // Nothing may restart the listener after this.
+    this.deps.controller.off(A2A_REMOTE_CONFIG_CHANGED, this.onChanged);
     this.pairing.cancel();
     this.scheduleReconcile();
   }
@@ -193,15 +240,16 @@ export class A2aServer {
   }
 
   private async reconcile(): Promise<void> {
-    await this.close();
-    // An invite names the port and fingerprint of the listener it was minted
-    // for; any start/stop/rebind makes it stale.
-    this.pairing.cancel();
     const cfg = this.deps.controller.current();
     if (this.disposed || !cfg.enabled) {
+      // An invite names the listener it was minted for.
+      this.pairing.cancel();
+      await this.closeCurrent();
       this.lastError = null;
       return;
     }
+    const port = this.deps.controller.effectivePort();
+    if (this.server && this.boundSlice && (this.boundSlice.port ?? null) === (cfg.port ?? null)) return;
 
     let identity: HostIdentity;
     try {
@@ -210,14 +258,44 @@ export class A2aServer {
       identity = this.readIdentity();
     } catch (err) {
       this.lastError = `identity: ${errMsg(err)}`;
-      this.log('error', `[a2a-remote] cannot load the host identity, listener stays stopped: ${errMsg(err)}`);
+      this.log('error', `[a2a-remote] cannot load the host identity: ${errMsg(err)}`);
+      this.keepPrevious();
+      return;
+    }
+
+    // Bind the new listener BEFORE closing the old one: a port that cannot be
+    // bound must not cost the PC the listener it already had.
+    const bound = await this.bind(identity, port);
+    if ('error' in bound) {
+      this.lastError = bound.error;
+      this.keepPrevious();
       return;
     }
     if (this.identity && identity.fingerprint256 !== this.identity.fingerprint256) {
       this.log('warn', '[a2a-remote] certificate re-issued: paired PCs must be invited again');
     }
+    const old = this.server;
+    this.pairing.cancel();
     this.identity = identity;
+    this.server = bound.server;
+    this.port = (bound.server.address() as net.AddressInfo).port;
+    this.boundSlice = { ...cfg };
+    this.lastError = null;
+    if (old) await closeServer(old);
+    this.log('info', `[a2a-remote] listening on ${this.deps.bindHost ?? '0.0.0.0'}:${this.port}`);
+  }
 
+  /** A failed (re)bind: an old listener keeps serving, and its slice is put back on disk. */
+  private keepPrevious(): void {
+    if (!this.server || !this.boundSlice) return;
+    try {
+      this.deps.controller.restore(this.boundSlice);
+    } catch (err) {
+      this.log('error', `[a2a-remote] could not restore the previous listener settings: ${errMsg(err)}`);
+    }
+  }
+
+  private async bind(identity: HostIdentity, port: number): Promise<{ server: https.Server } | { error: string }> {
     let server: https.Server;
     try {
       server = https.createServer(
@@ -236,16 +314,14 @@ export class A2aServer {
         },
       );
     } catch (err) {
-      this.lastError = `tls: ${errMsg(err)}`;
       this.log('error', `[a2a-remote] cannot build the TLS listener: ${errMsg(err)}`);
-      return;
+      return { error: `tls: ${errMsg(err)}` };
     }
     server.headersTimeout = HEADERS_TIMEOUT_MS;
     server.requestTimeout = REQUEST_TIMEOUT_MS;
     server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
     server.maxConnections = MAX_CONNECTIONS;
 
-    const port = this.deps.controller.effectivePort();
     const bindHost = this.deps.bindHost ?? '0.0.0.0';
     const listenError = await new Promise<NodeJS.ErrnoException | null>((resolve) => {
       const onError = (err: NodeJS.ErrnoException): void => resolve(err);
@@ -256,29 +332,21 @@ export class A2aServer {
       });
     });
     if (listenError) {
-      // No retry loop: the operator changes the port or frees it.
-      this.lastError = listenError.code ?? errMsg(listenError);
+      // Never listened, so there is nothing to close (close() would throw
+      // ERR_SERVER_NOT_RUNNING). No retry loop: the operator changes the port.
       this.log('warn', `[a2a-remote] cannot listen on ${bindHost}:${port}: ${errMsg(listenError)}`);
-      server.close();
-      return;
+      return { error: listenError.code ?? errMsg(listenError) };
     }
     server.on('error', (err) => this.log('warn', `[a2a-remote] listener error: ${errMsg(err)}`));
-    // A dispose or reconfigure that arrived while binding is already queued behind us.
-    this.server = server;
-    this.port = (server.address() as net.AddressInfo).port;
-    this.lastError = null;
-    this.log('info', `[a2a-remote] listening on ${bindHost}:${this.port}`);
+    return { server };
   }
 
-  private close(): Promise<void> {
+  private async closeCurrent(): Promise<void> {
     const server = this.server;
     this.server = null;
     this.port = null;
-    if (!server) return Promise.resolve();
-    return new Promise((resolve) => {
-      server.close(() => resolve());
-      server.closeAllConnections();
-    });
+    this.boundSlice = null;
+    if (server) await closeServer(server);
   }
 
   // --- requests ---------------------------------------------------------------
@@ -295,10 +363,7 @@ export class A2aServer {
     if (!isA2aRoute(p)) return refuse(404, 'bad-request', { message: 'not found' });
 
     const length = Number(req.headers['content-length'] ?? 0);
-    if (Number.isFinite(length) && length > A2A_REQUEST_BODY_MAX) {
-      res.setHeader('Connection', 'close');
-      return refuse(413, 'too-large');
-    }
+    if (Number.isFinite(length) && length > A2A_REQUEST_BODY_MAX) return refuseTooLarge(req, res);
 
     // The one route that takes no credential: it is how a joiner gets one.
     if (p === A2A_ROUTES.pair) {
@@ -317,9 +382,31 @@ export class A2aServer {
       return sendJson(res, 200, hello);
     }
 
+    if (p === A2A_ROUTES.unpair) {
+      if (req.method !== 'POST') return refuse(405, 'bad-request');
+      // The joiner withdraws its own pairing; it can only ever name itself.
+      try {
+        this.deps.peers.revoke(peer.peerId);
+      } catch (err) {
+        // PeerStore keeps a revocation in memory even when the write failed.
+        this.log('error', `[a2a-remote] unpair of ${peer.peerId} could not be persisted: ${errMsg(err)}`);
+      }
+      this.cascade(peer.hostId);
+      this.log('info', `[a2a-remote] host ${peer.hostId} withdrew its pairing`);
+      return sendJson(res, 200, { ok: true });
+    }
+
     const routes = this.deps.routes;
     if (!routes) return refuse(503, 'unavailable');
     await routes.handle(req, res, url, p, peer);
+  }
+
+  private cascade(hostId: string): void {
+    try {
+      this.deps.onPeerRevoked?.(hostId);
+    } catch (err) {
+      this.log('error', `[a2a-remote] revoke cascade for ${hostId} failed: ${errMsg(err)}`);
+    }
   }
 
   /**
@@ -368,16 +455,24 @@ export class A2aServer {
    * `POST /api/a2a/pair` — redeem the open invite for a PEER credential.
    * Issues nothing else: this listener holds no operator token and no device
    * store.
+   *
+   * The code is judged BEFORE anything about the joiner's hostId, so nothing
+   * about which hosts are paired leaks to a request without the code. A valid
+   * code is the operator's approval: if that host already holds a live peer
+   * (a pairing whose answer never reached it, or a PC re-pairing after losing
+   * its record), the old peer is revoked — with its cascade — and a new one
+   * is minted, so a half-finished pairing never locks the host out.
+   *
+   * Accepted for the owner-only PoC: the joiner REPORTS its hostId, so an
+   * invite holder could claim another host's id. The colleague tier binds the
+   * joiner's certificate fingerprint to its hostId instead.
    */
   private async handlePair(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const refusePair = (status: number, error: A2aRemoteErrorCode, reason?: A2aPairRefusal): void =>
       sendJson(res, status, { ok: false, error, ...(reason ? { reason } : {}) });
 
     const body = await readJsonBody(req, A2A_REMOTE_BODY_MAX);
-    if (body === 'too-large') {
-      res.setHeader('Connection', 'close');
-      return refusePair(413, 'too-large');
-    }
+    if (body === 'too-large') return refuseTooLarge(req, res);
     if (!isRecord(body)) return refusePair(400, 'bad-request');
     const { code, hostId, name, protocol } = body;
     if (typeof code !== 'string' || !isHostId(hostId) || typeof name !== 'string' || typeof protocol !== 'number') {
@@ -385,27 +480,38 @@ export class A2aServer {
     }
     if (protocol !== A2A_REMOTE_PROTOCOL) return refusePair(400, 'protocol');
 
+    const source = req.socket.remoteAddress ?? '';
+    if (this.pairBlocked(source)) return refusePair(429, 'forbidden', 'rate-limited');
+
     const identity = this.identity;
     if (!identity) return refusePair(503, 'unavailable');
-    // No open invite: say only that, whatever else the request claims.
-    if (!this.pairing.status().active) return refusePair(403, 'forbidden', 'expired');
-    if (hostId === identity.hostId) return refusePair(400, 'bad-request', 'self');
-    // One live peer per host (PeerStore rule). Checked before the code so a
-    // refused re-pair does not spend the invite the operator just made.
-    if (this.deps.peers.listByHost(hostId).some((r) => r.revokedAt === undefined)) {
-      return refusePair(409, 'conflict');
-    }
     const check = this.pairing.check(code);
-    if (!check.ok) return refusePair(403, 'forbidden', check.reason);
-    // Consume BEFORE the await: a second request with the same code must not mint again.
+    if (!check.ok) {
+      this.notePairFailure(source);
+      return refusePair(403, 'forbidden', check.reason);
+    }
+    if (hostId === identity.hostId) return refusePair(400, 'bad-request', 'self');
+    // Consume BEFORE any await: a second request with the same code must not mint again.
     this.pairing.consume();
+    this.pairFailures.delete(source);
+
+    for (const stale of this.deps.peers.listByHost(hostId).filter((r) => r.revokedAt === undefined)) {
+      try {
+        this.deps.peers.revoke(stale.peerId);
+      } catch (err) {
+        // Revoked in memory regardless (PeerStore rule); the mint below still runs.
+        this.log('error', `[a2a-remote] re-pair: revoking ${stale.peerId} could not be persisted: ${errMsg(err)}`);
+      }
+      this.cascade(hostId);
+      this.log('info', `[a2a-remote] host ${hostId} re-paired; its previous pairing was revoked`);
+    }
 
     let minted: { peerId: string; secret: string };
     try {
       minted = await this.deps.peers.mint({ hostId, name });
     } catch (err) {
       this.log('warn', `[a2a-remote] pairing could not mint a peer credential: ${errMsg(err)}`);
-      // A concurrent pairing for the same host won the race.
+      // Only a concurrent pairing for the same host winning the race lands here as a conflict.
       if (this.deps.peers.listByHost(hostId).some((r) => r.revokedAt === undefined)) return refusePair(409, 'conflict');
       return refusePair(500, 'unavailable');
     }
@@ -418,28 +524,57 @@ export class A2aServer {
     };
     sendJson(res, 200, response);
   }
+
+  private pairBlocked(source: string): boolean {
+    const f = this.pairFailures.get(source);
+    return f !== undefined && this.now() < f.blockedUntil;
+  }
+
+  private notePairFailure(source: string): void {
+    const f = this.pairFailures.get(source) ?? { count: 0, blockedUntil: 0 };
+    f.count += 1;
+    if (f.count >= PAIR_FREE_FAILURES) {
+      f.blockedUntil = this.now() + Math.min(PAIR_BACKOFF_BASE_MS * 2 ** (f.count - PAIR_FREE_FAILURES), PAIR_BACKOFF_MAX_MS);
+    }
+    this.pairFailures.delete(source);
+    this.pairFailures.set(source, f);
+    // Bounded: forget the longest-quiet address first.
+    if (this.pairFailures.size > PAIR_BACKOFF_TRACKED_MAX) {
+      const oldest = this.pairFailures.keys().next();
+      if (!oldest.done) this.pairFailures.delete(oldest.value);
+    }
+  }
 }
 
-/** Read a JSON body of at most `max` bytes. Non-JSON is `undefined`; over the cap is `'too-large'`. */
+function closeServer(server: https.Server): Promise<void> {
+  return new Promise((resolve) => {
+    server.close(() => resolve());
+    server.closeAllConnections();
+  });
+}
+
+/**
+ * Read a JSON body of at most `max` bytes. Non-JSON is `undefined`; over the
+ * cap is `'too-large'` — reading stops there and the caller answers 413 and
+ * drops the connection (`refuseTooLarge`) instead of draining the rest.
+ */
 export function readJsonBody(req: http.IncomingMessage, max: number): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
-    let done = false;
-    req.on('data', (chunk: Buffer) => {
-      if (done) return;
+    const onData = (chunk: Buffer): void => {
       size += chunk.length;
       if (size > max) {
-        done = true;
-        req.resume();
+        req.off('data', onData);
+        req.pause();
         resolve('too-large');
         return;
       }
       chunks.push(chunk);
-    });
+    };
+    req.on('data', onData);
     req.on('end', () => {
-      if (done) return;
-      done = true;
+      if (size > max) return;
       try {
         resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')) as unknown);
       } catch {
@@ -447,11 +582,16 @@ export function readJsonBody(req: http.IncomingMessage, max: number): Promise<un
       }
     });
     req.on('error', (err) => {
-      if (done) return;
-      done = true;
-      reject(err);
+      if (size <= max) reject(err);
     });
   });
+}
+
+/** 413, then cut the connection once the answer is written — never drain an oversized body. */
+function refuseTooLarge(req: http.IncomingMessage, res: http.ServerResponse): void {
+  res.setHeader('Connection', 'close');
+  res.once('finish', () => req.socket.destroy());
+  sendJson(res, 413, { ok: false, error: 'too-large' satisfies A2aRemoteErrorCode });
 }
 
 function sendJson(res: http.ServerResponse, status: number, body: unknown): void {

@@ -1,7 +1,8 @@
 import type { A2aPeerRecordV1, A2aRemoteHostRecordV1, HostId, PeerCredential } from '../../shared/a2aRemote';
+import type { A2aRemoteHostsRemoveResult } from '../../shared/rpc';
 import type { A2aRemoteController } from './controller';
 import { coerceA2aRemotePatch } from './controller';
-import { joinRemoteHost, type JoinDeps } from './joiner';
+import { joinRemoteHost, unpairRemoteHost, type JoinDeps } from './joiner';
 import type { NewRemoteHost } from './remoteHostStore';
 import type { A2aServer } from './server';
 
@@ -19,14 +20,41 @@ export interface A2aRemoteRpcDeps {
   peers: { list(): A2aPeerRecordV1[]; revoke(peerId: string): boolean };
   remoteHosts: {
     list(): A2aRemoteHostRecordV1[];
+    get(hostId: HostId): A2aRemoteHostRecordV1 | undefined;
+    credentialFor(hostId: HostId): PeerCredential | null;
     remove(hostId: HostId): boolean;
     add(input: NewRemoteHost, credential: PeerCredential): A2aRemoteHostRecordV1;
   };
-  links: { forgetHost(hostId: HostId): number };
-  exposures: { forgetHost(hostId: HostId): boolean };
+  /** End every link to `hostId` and drop what it could see (`forgetHostCascade`). */
+  cascade: (hostId: HostId) => void;
   log: (level: 'info' | 'warn' | 'error', msg: string) => void;
   /** Test seam for the joiner. */
   joinOverrides?: Partial<JoinDeps>;
+  /** Test seam; default `unpairRemoteHost`. */
+  unpair?: (host: A2aRemoteHostRecordV1, credential: PeerCredential) => Promise<boolean>;
+}
+
+/**
+ * The revoke cascade for one host, used wherever a pairing ends (peer revoke,
+ * re-pair, unpair, host remove). Each step on its own, so a failed write in
+ * one does not hide the other.
+ */
+export function forgetHostCascade(
+  stores: { links: { forgetHost(hostId: HostId): number }; exposures: { forgetHost(hostId: HostId): boolean } },
+  log: (level: 'info' | 'warn' | 'error', msg: string) => void,
+): (hostId: HostId) => void {
+  return (hostId) => {
+    try {
+      stores.links.forgetHost(hostId);
+    } catch (err) {
+      log('error', `[a2a-remote] revoke cascade: links for ${hostId}: ${errMsg(err)}`);
+    }
+    try {
+      stores.exposures.forgetHost(hostId);
+    } catch (err) {
+      log('error', `[a2a-remote] revoke cascade: exposure for ${hostId}: ${errMsg(err)}`);
+    }
+  };
 }
 
 export function registerA2aRemoteRpc(onRpc: (method: string, handler: RpcHandler) => void, deps: A2aRemoteRpcDeps): void {
@@ -59,7 +87,17 @@ export function registerA2aRemoteRpc(onRpc: (method: string, handler: RpcHandler
   );
 
   onRpc('a2a.remote.hosts.list', async () => ({ hosts: deps.remoteHosts.list() }));
-  onRpc('a2a.remote.hosts.remove', async (params) => ({ ok: deps.remoteHosts.remove(str(params, 'hostId')) }));
+  onRpc('a2a.remote.hosts.remove', async (params): Promise<A2aRemoteHostsRemoveResult> => {
+    const hostId = str(params, 'hostId');
+    const host = deps.remoteHosts.get(hostId);
+    const credential = deps.remoteHosts.credentialFor(hostId);
+    if (!host || !credential) return { ok: false, remoteRevoked: false };
+    // Tell the other PC first (best effort); remove here whatever it answers.
+    const remoteRevoked = await (deps.unpair ?? unpairRemoteHost)(host, credential).catch(() => false);
+    const ok = deps.remoteHosts.remove(hostId);
+    deps.cascade(hostId);
+    return { ok, remoteRevoked };
+  });
 
   onRpc('a2a.remote.peers.list', async () => ({ peers: deps.peers.list() }));
   onRpc('a2a.remote.peers.revoke', async (params) => {
@@ -68,17 +106,7 @@ export function registerA2aRemoteRpc(onRpc: (method: string, handler: RpcHandler
     if (!rec) return { ok: false };
     const revoked = deps.peers.revoke(peerId);
     // Revoke cascade: end every link to that host and drop what it could see.
-    // Each step on its own, so a failed write in one does not hide the revoke.
-    try {
-      deps.links.forgetHost(rec.hostId);
-    } catch (err) {
-      deps.log('error', `[a2a-remote] revoke cascade: links for ${rec.hostId}: ${errMsg(err)}`);
-    }
-    try {
-      deps.exposures.forgetHost(rec.hostId);
-    } catch (err) {
-      deps.log('error', `[a2a-remote] revoke cascade: exposure for ${rec.hostId}: ${errMsg(err)}`);
-    }
+    deps.cascade(rec.hostId);
     return { ok: revoked };
   });
 }

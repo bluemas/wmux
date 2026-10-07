@@ -5,7 +5,8 @@ import { A2A_ROUTES, formatInvite, formatPeerCredential, parseInvite, type A2aIn
 import { joinRemoteHost, type JoinDeps } from '../joiner';
 import { A2A_PAIR_TTL_MS } from '../pairing';
 import { PinnedTlsClient } from '../pinnedClient';
-import { registerA2aRemoteRpc } from '../rpc';
+import { forgetHostCascade, registerA2aRemoteRpc } from '../rpc';
+import { PAIR_BACKOFF_MAX_MS, PAIR_FREE_FAILURES } from '../server';
 import { disposeAll, freePort, makePc, type Pc } from './a2aServerRig';
 
 afterEach(async () => {
@@ -98,26 +99,111 @@ describe('cross-host pairing, end to end', () => {
     expect(a.peers.list()).toHaveLength(0);
   });
 
-  it('five wrong codes burn the invite', async () => {
-    const a = await makePc('PC A');
+  it('five wrong codes burn the invite (the per-address backoff does not change that)', async () => {
+    let now = Date.now();
+    const a = await makePc('PC A', { deps: { now: () => now } });
     const b = await makePc('PC B');
     const invite = inviteOf(a);
     const wrong = formatInvite({ ...invite, code: invite.code === 'ZZZZZZZZ' ? 'YYYYYYYY' : 'ZZZZZZZZ' });
     for (let i = 0; i < 5; i++) {
       expect(await joinRemoteHost(wrong, joinerDeps(b))).toMatchObject({ ok: false, error: 'code-invalid' });
+      now += PAIR_BACKOFF_MAX_MS;
     }
     expect(await joinRemoteHost(formatInvite(invite), joinerDeps(b))).toMatchObject({ ok: false, error: 'code-expired' });
     expect(a.peers.list()).toHaveLength(0);
   });
 
-  it('re-pairing the same host is a 409 until A revokes', async () => {
+  it('a locked-out address is told to wait', async () => {
+    const a = await makePc('PC A', { deps: { now: () => 1_800_000_000_000 } });
+    const b = await makePc('PC B');
+    const invite = inviteOf(a);
+    const wrong = formatInvite({ ...invite, code: invite.code === 'ZZZZZZZZ' ? 'YYYYYYYY' : 'ZZZZZZZZ' });
+    for (let i = 0; i < PAIR_FREE_FAILURES; i++) await joinRemoteHost(wrong, joinerDeps(b));
+    expect(await joinRemoteHost(formatInvite(invite), joinerDeps(b))).toMatchObject({ ok: false, error: 'rate-limited' });
+  });
+
+  it('a new invite re-pairs the same PC and retires the old credential', async () => {
     const a = await makePc('PC A');
     const b = await makePc('PC B');
-    expect((await joinRemoteHost(formatInvite(inviteOf(a)), joinerDeps(b))).ok).toBe(true);
+    const first = await joinRemoteHost(formatInvite(inviteOf(a)), joinerDeps(b));
+    expect(first.ok).toBe(true);
+    const aId = a.server.status().hostId!;
+    const oldCred = formatPeerCredential(b.remoteHosts.credentialFor(aId)!);
     const again = await joinRemoteHost(formatInvite(inviteOf(a)), joinerDeps(b));
-    expect(again).toMatchObject({ ok: false, error: 'already-paired' });
-    // The invite survives the refusal.
-    expect(a.server.pairingStatus().active).toBe(true);
+    expect(again.ok).toBe(true);
+    expect((await hello(oldCred, a)).status).toBe(401);
+    expect((await hello(formatPeerCredential(b.remoteHosts.credentialFor(aId)!), a)).status).toBe(200);
+    expect(a.peers.list().filter((p) => p.revokedAt === undefined)).toHaveLength(1);
+  });
+
+  it('half pairing, answer lost: the server minted, the joiner never heard; a new invite still works', async () => {
+    const minted: string[] = [];
+    const a = await makePc('PC A');
+    const b = await makePc('PC B');
+    // The mint lands after the joiner gave up waiting for the answer.
+    const realMint = a.peers.mint.bind(a.peers);
+    let slow = true;
+    a.peers.mint = async (params) => {
+      const c = await realMint(params);
+      minted.push(formatPeerCredential(c));
+      if (slow) await new Promise((r) => setTimeout(r, 600));
+      return c;
+    };
+    const lost = await joinRemoteHost(formatInvite(inviteOf(a)), { ...joinerDeps(b), timeouts: { connectMs: 2_000, requestMs: 300 } });
+    expect(lost).toMatchObject({ ok: false, error: 'timeout' });
+    await new Promise((r) => setTimeout(r, 700));
+    expect(a.peers.list().filter((p) => p.revokedAt === undefined)).toHaveLength(1);
+    expect(b.remoteHosts.list()).toHaveLength(0);
+
+    slow = false;
+    const retry = await joinRemoteHost(formatInvite(inviteOf(a)), joinerDeps(b));
+    expect(retry.ok).toBe(true);
+    expect((await hello(minted[0], a)).status).toBe(401);
+  });
+
+  it('half pairing, hello fails: the joiner withdraws the credential it got', async () => {
+    const a = await makePc('PC A');
+    const b = await makePc('PC B');
+    let issued: string | undefined;
+    const client: JoinDeps['client'] = (opts) => {
+      const real = new PinnedTlsClient(opts);
+      return {
+        async requestJson(method, path, body) {
+          if (path === A2A_ROUTES.hello) {
+            issued = opts.credential;
+            return { status: 500, json: null };
+          }
+          return real.requestJson(method, path, body);
+        },
+      };
+    };
+    const failed = await joinRemoteHost(formatInvite(inviteOf(a)), { ...joinerDeps(b), client });
+    expect(failed).toMatchObject({ ok: false, error: 'protocol' });
+    expect(issued).toBeDefined();
+    expect((await hello(issued!, a)).status).toBe(401);
+    expect(a.peers.list().filter((p) => p.revokedAt === undefined)).toHaveLength(0);
+    expect(a.cascaded).toEqual([b.server.status().hostId]);
+    expect((await joinRemoteHost(formatInvite(inviteOf(a)), joinerDeps(b))).ok).toBe(true);
+  });
+
+  it('half pairing, saving fails: the joiner withdraws too', async () => {
+    const a = await makePc('PC A');
+    const b = await makePc('PC B');
+    const failing = { add: () => { throw new Error('disk full'); } };
+    const failed = await joinRemoteHost(formatInvite(inviteOf(a)), { ...joinerDeps(b), remoteHosts: failing });
+    expect(failed).toMatchObject({ ok: false, error: 'failed' });
+    expect(a.peers.list().filter((p) => p.revokedAt === undefined)).toHaveLength(0);
+  });
+
+  it('falls back to the invite’s alt addresses and saves the one that answered first', async () => {
+    const a = await makePc('PC A');
+    const b = await makePc('PC B');
+    const invite = inviteOf(a);
+    // A name that cannot resolve, then the real address.
+    const withAlt = formatInvite({ ...invite, host: 'no-such-host.invalid', alt: ['127.0.0.1'] });
+    const result = await joinRemoteHost(withAlt, joinerDeps(b));
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.host.addresses).toEqual(['127.0.0.1']);
   });
 
   it('joining this PC’s own invite is refused', async () => {
@@ -137,27 +223,53 @@ describe('cross-host pairing, end to end', () => {
     expect(await joinRemoteHost('not an invite', joinerDeps(b))).toMatchObject({ ok: false, error: 'invite-invalid' });
   });
 
+  function rpcFor(pc: Pc, cascade: (hostId: string) => void) {
+    const handlers = new Map<string, (p: Record<string, unknown>) => Promise<unknown>>();
+    registerA2aRemoteRpc((m, h) => handlers.set(m, h), {
+      controller: pc.controller,
+      server: pc.server,
+      peers: pc.peers,
+      remoteHosts: pc.remoteHosts,
+      cascade,
+      log: () => undefined,
+      joinOverrides: { timeouts: FAST },
+    });
+    return (method: string, params: Record<string, unknown> = {}) => handlers.get(method)!(params);
+  }
+
   it('peers.revoke cascades to the link and exposure stores', async () => {
     const a = await makePc('PC A');
     const b = await makePc('PC B');
     expect((await joinRemoteHost(formatInvite(inviteOf(a)), joinerDeps(b))).ok).toBe(true);
-    const handlers = new Map<string, (p: Record<string, unknown>) => Promise<unknown>>();
     const links = { forgetHost: vi.fn(() => 0) };
     const exposures = { forgetHost: vi.fn(() => true) };
-    registerA2aRemoteRpc((m, h) => handlers.set(m, h), {
-      controller: a.controller,
-      server: a.server,
-      peers: a.peers,
-      remoteHosts: a.remoteHosts,
-      links,
-      exposures,
-      log: () => undefined,
-    });
+    const call = rpcFor(a, forgetHostCascade({ links, exposures }, () => undefined));
     const [peer] = a.peers.list();
-    expect(await handlers.get('a2a.remote.peers.revoke')!({ peerId: peer.peerId })).toEqual({ ok: true });
+    expect(await call('a2a.remote.peers.revoke', { peerId: peer.peerId })).toEqual({ ok: true });
     expect(links.forgetHost).toHaveBeenCalledWith(b.server.status().hostId);
     expect(exposures.forgetHost).toHaveBeenCalledWith(b.server.status().hostId);
     expect(a.peers.list()[0].revokedAt).toBeDefined();
-    expect(await handlers.get('a2a.remote.peers.revoke')!({ peerId: 'unknown' })).toEqual({ ok: false });
+    expect(await call('a2a.remote.peers.revoke', { peerId: 'unknown' })).toEqual({ ok: false });
+  });
+
+  it('hosts.remove tells the other PC, cascades here, and still removes when the other PC is gone', async () => {
+    const a = await makePc('PC A');
+    const b = await makePc('PC B');
+    const cascaded: string[] = [];
+    const call = rpcFor(b, (h) => cascaded.push(h));
+    expect((await call('a2a.remote.join', { invite: a.server.beginPairing().invite }) as { ok: boolean }).ok).toBe(true);
+    const aId = a.server.status().hostId!;
+    expect(await call('a2a.remote.hosts.remove', { hostId: aId })).toEqual({ ok: true, remoteRevoked: true });
+    expect(b.remoteHosts.list()).toHaveLength(0);
+    expect(cascaded).toEqual([aId]);
+    expect(a.peers.list().filter((p) => p.revokedAt === undefined)).toHaveLength(0);
+    expect(a.cascaded).toEqual([b.server.status().hostId]);
+
+    // Pair again, then take A offline: the removal still happens here.
+    expect((await call('a2a.remote.join', { invite: a.server.beginPairing().invite }) as { ok: boolean }).ok).toBe(true);
+    a.controller.configure({ enabled: false });
+    await a.server.whenIdle();
+    expect(await call('a2a.remote.hosts.remove', { hostId: aId })).toEqual({ ok: true, remoteRevoked: false });
+    expect(b.remoteHosts.list()).toHaveLength(0);
   });
 });

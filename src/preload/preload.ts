@@ -60,6 +60,7 @@ import type {
 } from '../shared/lanlink';
 import type {
   A2aRemoteHostsListResult,
+  A2aRemoteHostsRemoveResult,
   A2aRemoteJoinResult,
   A2aRemotePairBeginResult,
   A2aRemotePairStatus,
@@ -1983,7 +1984,8 @@ document.addEventListener('DOMContentLoaded', () => {
   pairStatus: () => ipcRenderer.invoke(IPC.A2A_REMOTE_PAIR_STATUS) as Promise<A2aRemotePairStatus>,
   join: (invite: string) => ipcRenderer.invoke(IPC.A2A_REMOTE_JOIN, invite) as Promise<A2aRemoteJoinResult>,
   hostsList: () => ipcRenderer.invoke(IPC.A2A_REMOTE_HOSTS_LIST) as Promise<A2aRemoteHostsListResult>,
-  hostsRemove: (hostId: string) => ipcRenderer.invoke(IPC.A2A_REMOTE_HOSTS_REMOVE, hostId) as Promise<{ ok: boolean }>,
+  hostsRemove: (hostId: string) =>
+    ipcRenderer.invoke(IPC.A2A_REMOTE_HOSTS_REMOVE, hostId) as Promise<A2aRemoteHostsRemoveResult>,
   peersList: () => ipcRenderer.invoke(IPC.A2A_REMOTE_PEERS_LIST) as Promise<A2aRemotePeersListResult>,
   peersRevoke: (peerId: string) => ipcRenderer.invoke(IPC.A2A_REMOTE_PEERS_REVOKE, peerId) as Promise<{ ok: boolean }>,
 };

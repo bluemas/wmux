@@ -18,6 +18,8 @@ export interface Pc {
   peers: PeerStore;
   remoteHosts: RemoteHostStore;
   server: A2aServer;
+  /** hostIds the listener ran its revoke cascade for. */
+  cascaded: string[];
 }
 
 const made: Pc[] = [];
@@ -45,10 +47,12 @@ export async function makePc(
   const a2aDir = path.join(dir, 'a2a');
   const peers = new PeerStore({ dir: a2aDir, scheduleHarden: () => undefined });
   const remoteHosts = new RemoteHostStore({ dir: a2aDir });
+  const cascaded: string[] = [];
   const server = new A2aServer({
     controller,
     identityDir: a2aDir,
     peers,
+    onPeerRevoked: (hostId) => cascaded.push(hostId),
     hostname: () => name,
     ipv4s: () => ['127.0.0.1'],
     bindHost: '127.0.0.1',
@@ -56,7 +60,7 @@ export async function makePc(
     ...opts.deps,
   });
   await server.whenIdle();
-  const pc = { dir, config, controller, peers, remoteHosts, server };
+  const pc = { dir, config, controller, peers, remoteHosts, server, cascaded };
   made.push(pc);
   return pc;
 }
