@@ -3,6 +3,8 @@ import {
   A2A_REMOTE_INBOUND_EVENT,
   A2A_REMOTE_NOTIFY_METHOD,
   A2A_REMOTE_RPC,
+  isBrainRemoteTask,
+  localSideOf,
   type A2aRemoteDeliveryResult,
   type A2aRemoteHeldReason,
   type A2aRemoteInboxItem,
@@ -10,6 +12,7 @@ import {
 } from '../../shared/a2aRemoteDelivery';
 import { GATED_DELIVERY_DEADLINE_MARGIN_MS, GATED_NEW_TASK_SEND_MAIN_TIMEOUT_MS } from '../../shared/freshContext';
 import { TERMINAL_STATES, type Task } from '../../shared/types';
+import { eventBus, type EmitInput } from '../events/EventBus';
 
 /**
  * Cross-host A2A, receiving side in main: hand the remote work the daemon
@@ -32,6 +35,10 @@ import { TERMINAL_STATES, type Task } from '../../shared/types';
  * its own, never by re-delivering), and the renderer answers `duplicate` for a
  * task it already delivered.
  *
+ * A task on a brain link (this PC's Moa, which owns no pane) never reaches the
+ * renderer: its delivery is an event on main's bus that wakes Moa through the
+ * commander coalescer (`deliverToBrain`).
+ *
  * This is a main-internal call straight to the renderer, NOT through the pipe
  * router: no operator origin is stamped, so the renderer's approval gate
  * applies. LanLink's RemoteInboxBridge is deliberately not reused — it avoids
@@ -50,6 +57,8 @@ export interface RemoteA2aBridgeDeps {
   sendToRenderer: (method: string, params: Record<string, unknown>, opts?: { timeoutMs?: number }) => Promise<unknown>;
   /** Subscribe to daemon broadcasts; returns an unsubscribe. */
   onDaemonEvent: (listener: (event: { type?: unknown; [key: string]: unknown }) => void) => () => void;
+  /** Main's event bus emit, for brain-link work (default: the `eventBus` singleton). */
+  emitEvent?: (input: EmitInput) => void;
   backstopMs?: number;
   now?: () => number;
   log?: (level: 'info' | 'warn', msg: string) => void;
@@ -198,6 +207,7 @@ export class RemoteA2aBridge {
 
   /** Hand one unit to the renderer and record the outcome. */
   private async deliver(unit: Work, resnapshot: boolean): Promise<RetryHeldResult['results'][number]['outcome']> {
+    if (isBrainRemoteTask(unit.task)) return this.deliverToBrain(unit);
     const { task, item } = unit;
     const marker = task.metadata.remote as A2aRemoteTaskState;
     let res: unknown;
@@ -230,6 +240,37 @@ export class RemoteA2aBridge {
       this.deps.log?.('warn', `[a2a-remote] renderer refused ${unit.key}: ${result.error}`);
     }
     return 'not-delivered';
+  }
+
+  /**
+   * Brain-link work: announce it on main's bus, then mark it delivered. A new
+   * task, a reply, or a state change on a task the other PC's Moa sent is an
+   * `a2a.received` (a wake-worthy kind of its own); a state change on a task
+   * this Moa sent is the ordinary `a2a.task` receipt, so the existing
+   * completed / failed / input-required / canceled wakes apply unchanged.
+   * Pointer-only: Moa reads the body with a2a_task_query.
+   */
+  private async deliverToBrain(unit: Work): Promise<'delivered' | 'not-delivered'> {
+    const { task, item } = unit;
+    const side = localSideOf(task);
+    const hq = task.metadata[side].workspaceId;
+    const peer = task.metadata[side === 'from' ? 'to' : 'from'];
+    const state = task.status.state;
+    try {
+      const emit = this.deps.emitEvent ?? ((input: EmitInput): void => void eventBus.emit(input));
+      if (item?.kind === 'state' && side === 'from') {
+        emit({ type: 'a2a.task', workspaceId: hq, from: hq, to: peer.workspaceId, taskId: task.id, kind: state === 'canceled' ? 'cancelled' : 'updated', state });
+      } else {
+        emit({ type: 'a2a.received', workspaceId: hq, taskId: task.id, from: peer.name, to: hq, item: item?.kind ?? 'task', state, host: peer.name.split('/')[0] || peer.name });
+      }
+    } catch (err) {
+      this.backoff(unit.key);
+      this.deps.log?.('warn', `[a2a-remote] could not announce ${unit.key} to Moa: ${err instanceof Error ? err.message : String(err)}`);
+      return 'not-delivered';
+    }
+    this.retry.delete(unit.key);
+    await this.mark(unit.key, { taskId: task.id, ...(item ? { messageId: item.messageId } : {}), mark: { delivered: true } });
+    return 'delivered';
   }
 
   private taskParams(task: Task, marker: A2aRemoteTaskState, resnapshot: boolean): Record<string, unknown> {

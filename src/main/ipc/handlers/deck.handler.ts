@@ -2155,6 +2155,31 @@ export function registerDeckHandler(
       coalescer?.push(receipt);
       return;
     }
+    // Cross-host A2A: another PC's Moa sent this PC's Moa work (brain link).
+    // Only the current HQ is woken, through the same gates as any receipt.
+    if (ev.type === 'a2a.received') {
+      const hq = getHqWorkspaceId();
+      if (hq === null || ev.to !== hq || ev.workspaceId !== hq) return;
+      const receipt: CoalescerInput = {
+        workspaceId: hq,
+        // One subject per item kind: a reply buffered with its task keeps both.
+        ptyId: `a2a:${ev.taskId}#${ev.item}`,
+        kind: 'a2a.received',
+        source: 'a2a',
+        agent: null,
+        seq: ev.seq,
+        ts: ev.ts,
+        a2a: { taskId: ev.taskId, from: ev.from, to: hq, state: ev.state, remote: { host: ev.host, item: ev.item } },
+      };
+      if (hqPresence(hq) !== 'present') {
+        void getTaskLedger()
+          .recordOrphanedEvent({ ownerWorkspaceId: hq, seq: ev.seq, payload: receipt })
+          .catch((err) => console.warn(`[deck] could not park a remote Moa receipt for HQ ${hq}: ${String(err)}`));
+        return;
+      }
+      coalescer?.push(receipt);
+      return;
+    }
     // AO-style CI feedback (owner decision 2026-07-18): a pane's PR went red.
     // Route it into the SAME coalescer as lifecycle events so it inherits the
     // mode/budget/decision-gate policy — auto drives a fix, assist reports, off

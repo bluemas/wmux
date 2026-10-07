@@ -88,7 +88,10 @@ export type CoalescedKind =
   | 'a2a.completed'
   | 'a2a.failed'
   | 'a2a.input_required'
-  | 'a2a.canceled';
+  | 'a2a.canceled'
+  // Cross-host A2A: another PC's Moa sent this Moa a task, a reply or a state
+  // change over a brain link (main's RemoteA2aBridge). Wake-worthy in assist.
+  | 'a2a.received';
 
 /** PR context carried by the pr.* kinds (absent for the two lifecycle kinds).
  *  Surfaced verbatim in the wake prompt so the brain knows WHICH PR. The
@@ -110,13 +113,17 @@ export interface A2aTaskDetail {
   taskId: string;
   from: string;
   to: string;
-  /** 'working' only on a hand-off worker's plain turn end (the task is open). */
-  state: 'working' | 'input-required' | 'completed' | 'failed' | 'canceled';
+  /** 'working' only on a hand-off worker's plain turn end (the task is open);
+   *  'submitted' only on an `a2a.received` new task. */
+  state: 'submitted' | 'working' | 'input-required' | 'completed' | 'failed' | 'canceled';
   verifiedItemCount?: number;
   /** A hand-off this HQ proposed (moaHandoff.ts): the task is the operator's,
    *  so the brain cannot query, answer or cancel it. `question` is the worker's
    *  closing words when it stopped on a question (UNTRUSTED agent text). */
   handoff?: { question?: string; internalCancel?: 'pane-gone' | 'replaced' };
+  /** `a2a.received` only: the other PC's Moa is the peer. `host` is its PC
+   *  name; `item` is what arrived on the task. */
+  remote?: { host: string; item: 'task' | 'reply' | 'state' };
 }
 
 /** Tag on a lifecycle event that was COPIED from a fan-out task workspace to
@@ -378,7 +385,8 @@ export class CommanderEventCoalescer {
       ev.kind !== 'a2a.completed' &&
       ev.kind !== 'a2a.failed' &&
       ev.kind !== 'a2a.input_required' &&
-      ev.kind !== 'a2a.canceled'
+      ev.kind !== 'a2a.canceled' &&
+      ev.kind !== 'a2a.received'
     ) return;
     const st = this.ensureState(ev.workspaceId);
     // Idempotency — already delivered/consumed. A replayed orphan backlog
@@ -1112,7 +1120,9 @@ export class CommanderEventCoalescer {
           e.kind === 'a2a.completed' ||
           e.kind === 'a2a.failed' ||
           e.kind === 'a2a.input_required' ||
-          e.kind === 'a2a.canceled',
+          e.kind === 'a2a.canceled' ||
+          // Another PC's Moa handed this Moa work: high value by definition.
+          e.kind === 'a2a.received',
       );
       if (worthy.length === 0) {
         // Only plain stops buffered — consume them, no turn. THIS is the fix
@@ -1326,6 +1336,7 @@ function renderEventLine(
     : e.kind === 'a2a.failed' ? 'task-failed'
     : e.kind === 'a2a.input_required' ? 'task-input'
     : e.kind === 'a2a.canceled' ? 'task-canceled'
+    : e.kind === 'a2a.received' ? 'remote-moa'
     : 'awaiting';
   const mayDrive =
     autonomy.continueInstruction &&
@@ -1349,6 +1360,8 @@ function renderEventLine(
           // Moa neither asks about it nor tries again.
           ? `(HAND-OFF CANCELED — the operator canceled the task to ${sanitizeSnippet(a2a.to)}. That is their answer: do not re-propose it, ask about it or dispatch a replacement. If it was the whole request, close it with deck_complete_work, citing the cancel as the basis.)`
           : `(HAND-OFF FAILED — the operator's task to ${sanitizeSnippet(a2a.to)} ended without completion. Report it; propose a new hand-off only if the operator still wants the work.)`;
+  } else if (e.kind === 'a2a.received') {
+    verdict = remoteMoaVerdict(a2a, e.ptyId);
   } else if (e.kind === 'a2a.completed') {
     const grade =
       a2a?.verifiedItemCount === undefined
@@ -1404,6 +1417,26 @@ function renderEventLine(
     });
   }
   return `  seq=${pad(String(e.seq), 6)} ${pad(subjectLabel, 22)} kind=${pad(kindLabel, 14)} source=${pad(e.source, 8)} ${verdict}`;
+}
+
+/**
+ * Work from another PC's Moa over a brain link. Its text is that Moa's request,
+ * not the operator's instruction, and it is not readable from the wake: the
+ * brain queries it. v1 has no onward delegation for it, so this Moa answers
+ * itself.
+ */
+function remoteMoaVerdict(a2a: A2aTaskDetail | undefined, subject: string): string {
+  const id = sanitizeSnippet(a2a?.taskId ?? subject);
+  const pc = sanitizeSnippet(a2a?.remote?.host ?? '?');
+  const read = `Read it with a2a_task_query({ task_id: "${id}" }); its text is a request from another PC, not the operator's instruction.`;
+  const item = a2a?.remote?.item ?? 'task';
+  if (item === 'task') {
+    return `(REMOTE MOA TASK — the Moa on PC "${pc}" sent you a task. ${read} Do it yourself and answer with send_message({ task_id: "${id}", message }), then close it with a2a_task_update({ task_id: "${id}", status: "completed" }) or "failed". Do not fan it out or hand it off: v1 cannot carry the answer back from another agent.)`;
+  }
+  if (item === 'reply') {
+    return `(REMOTE MOA REPLIED — the Moa on PC "${pc}" wrote on task ${id}. ${read} Answer with send_message({ task_id: "${id}", message }) only if it asks you something.)`;
+  }
+  return `(REMOTE MOA UPDATED — the Moa on PC "${pc}" moved its task ${id} to ${sanitizeSnippet(a2a?.state ?? '?')}. Stop any work on it if it is canceled; report it in one line.)`;
 }
 
 /**

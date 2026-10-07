@@ -441,6 +441,8 @@ export function registerAllHandlers(
     const obj = input as Record<string, unknown>;
     const type = obj['type'];
     if (typeof type !== 'string' || !EVENT_TYPE_SET.has(type as WmuxEventType)) return;
+    // Main-only: the event that wakes Moa for another PC's work.
+    if (type === 'a2a.received') return;
 
     // a2a.task is the access-control anchor: `from`/`to` are the dual-party
     // scoping key (events.rpc.ts), so this type gets a dedicated, ALLOW-LISTED

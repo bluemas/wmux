@@ -271,3 +271,86 @@ describe('RemoteA2aBridge', () => {
     expect(renderer).not.toHaveBeenCalled();
   });
 });
+
+describe('RemoteA2aBridge — brain link (Moa to Moa)', () => {
+  const HQ = 'ws-hq';
+  let emitted: Array<Record<string, unknown>>;
+  let brainBridge: RemoteA2aBridge;
+
+  /** A task on a brain link: the local side is the HQ with no pane. */
+  function brainTask(n: number, direction: 'inbound' | 'outbound'): Task {
+    const t = remoteTask(n);
+    const marker = t.metadata.remote as A2aRemoteTaskState;
+    const moa = { workspaceId: HQ, name: 'Moa' };
+    const peer = { workspaceId: `remote:${LINK}`, name: 'DESKTOP-WIN2/Moa' };
+    if (direction === 'inbound') {
+      t.metadata.from = peer;
+      t.metadata.to = moa;
+    } else {
+      t.metadata.from = moa;
+      t.metadata.to = peer;
+      marker.direction = 'outbound';
+      delete marker.delivered;
+    }
+    return t;
+  }
+
+  beforeEach(() => {
+    emitted = [];
+    brainBridge = new RemoteA2aBridge({
+      daemonRpc: (m, p) => daemon.rpc(m, p),
+      sendToRenderer: (m, p) => renderer(m, p),
+      onDaemonEvent: () => () => undefined,
+      emitEvent: (input) => { emitted.push(input); },
+    });
+  });
+  afterEach(() => brainBridge.stop());
+
+  it('a new task never reaches the renderer: it is announced as a2a.received and marked delivered', async () => {
+    daemon.tasks.set(id(20), brainTask(20, 'inbound'));
+    await brainBridge.trigger();
+    await settle();
+    expect(renderer).not.toHaveBeenCalled();
+    expect(emitted).toEqual([{
+      type: 'a2a.received', workspaceId: HQ, taskId: id(20), from: 'DESKTOP-WIN2/Moa', to: HQ, item: 'task', state: 'submitted', host: 'DESKTOP-WIN2',
+    }]);
+    expect(daemon.marks).toEqual([{ taskId: id(20), delivered: true }]);
+    await brainBridge.trigger();
+    expect(emitted).toHaveLength(1);
+  });
+
+  it('a reply on the task Moa sent is a2a.received; its state change is the ordinary a2a.task receipt', async () => {
+    const t = brainTask(21, 'outbound');
+    t.status.state = 'completed';
+    (t.metadata.remote as A2aRemoteTaskState).inbox = [
+      { messageId: 'r1', kind: 'reply' },
+      { messageId: 's1', kind: 'state' },
+    ];
+    daemon.tasks.set(id(21), t);
+    await brainBridge.trigger();
+    await settle();
+    expect(renderer).not.toHaveBeenCalled();
+    expect(emitted).toEqual([
+      { type: 'a2a.received', workspaceId: HQ, taskId: id(21), from: 'DESKTOP-WIN2/Moa', to: HQ, item: 'reply', state: 'completed', host: 'DESKTOP-WIN2' },
+      { type: 'a2a.task', workspaceId: HQ, from: HQ, to: `remote:${LINK}`, taskId: id(21), kind: 'updated', state: 'completed' },
+    ]);
+    expect(daemon.marks).toEqual([
+      { taskId: id(21), messageId: 'r1', delivered: true },
+      { taskId: id(21), messageId: 's1', delivered: true },
+    ]);
+  });
+
+  it('a state change the other Moa made on its own task is a2a.received', async () => {
+    const t = brainTask(22, 'inbound');
+    t.status.state = 'canceled';
+    const marker = t.metadata.remote as A2aRemoteTaskState;
+    marker.delivered = true;
+    marker.inbox = [{ messageId: 's2', kind: 'state' }];
+    daemon.tasks.set(id(22), t);
+    await brainBridge.trigger();
+    await settle();
+    expect(emitted).toEqual([
+      { type: 'a2a.received', workspaceId: HQ, taskId: id(22), from: 'DESKTOP-WIN2/Moa', to: HQ, item: 'state', state: 'canceled', host: 'DESKTOP-WIN2' },
+    ]);
+  });
+});
