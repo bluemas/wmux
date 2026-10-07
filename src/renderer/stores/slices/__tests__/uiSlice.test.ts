@@ -948,3 +948,12 @@ describe('UISlice — rail route', () => {
     expect(store.getState().inspectModeActive).toBe(false);
   });
 });
+
+describe('UISlice — Claude resume on start (#1826)', () => {
+  it('is off by default and the setter flips it', () => {
+    const store = createTestStore();
+    expect(store.getState().claudeResumeOnStart).toBe(false);
+    store.getState().setClaudeResumeOnStart(true);
+    expect(store.getState().claudeResumeOnStart).toBe(true);
+  });
+});

@@ -153,6 +153,8 @@ function UsageCard({
   const usage = useStore((s) => s.anthropicUsage);
   const limitAutoResume = useStore((s) => s.usageLimitAutoResume);
   const setLimitAutoResume = useStore((s) => s.setUsageLimitAutoResume);
+  const resumeOnStart = useStore((s) => s.claudeResumeOnStart);
+  const setResumeOnStart = useStore((s) => s.setClaudeResumeOnStart);
   const [lastRefreshAtMs, setLastRefreshAtMs] = useState<number>(0);
   const now = useNowEverySec();
   const cooldownRemainingMs = Math.max(0, lastRefreshAtMs + REFRESH_COOLDOWN_MS - now);
@@ -206,6 +208,17 @@ function UsageCard({
           checked={limitAutoResume}
           onCheckedChange={setLimitAutoResume}
           aria-label={t('claudeIntegration.usageLimit.autoResume')}
+        />
+      </SettingRow>
+      <SettingRow
+        id="clauderesumeonstart"
+        label={t('claudeIntegration.resumeOnStart')}
+        description={t('claudeIntegration.resumeOnStartDesc')}
+      >
+        <Switch
+          checked={resumeOnStart}
+          onCheckedChange={setResumeOnStart}
+          aria-label={t('claudeIntegration.resumeOnStart')}
         />
       </SettingRow>
     </SettingsSection>

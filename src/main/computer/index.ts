@@ -11,7 +11,7 @@ import { ComputerService, computerUseShutDown, type ConsentRequester, type Helpe
 import { HelperProcess } from './HelperProcess';
 import { StopKey } from './stopKey';
 import { createHelperVerifier } from './verifyHelper';
-import { WINDOWS_HELPER_PIN, effectiveHelperStatus } from './helperPin';
+import { WINDOWS_HELPER_PIN, effectiveHelperStatus, helperUnsignedNotice } from './helperPin';
 import { isSelfElevated } from './selfElevation';
 import { resolveHelperPathFor, type HelperSpec } from './helperPath';
 
@@ -132,7 +132,7 @@ const verifyHelper = createHelperVerifier({
   windowsPin: WINDOWS_HELPER_PIN,
 });
 
-/** settings.ts's file check, plus the packaged-Windows signing gate (helperPin.ts). */
+/** settings.ts's file check, plus the packaged-Windows gates (helperPin.ts). */
 function helperStatus(helperPath: string | null): ComputerHelperStatus {
   return effectiveHelperStatus(rawHelperStatus(helperPath), {
     platform: process.platform,
@@ -248,6 +248,7 @@ export function registerComputerUseIpc(getExistingService: () => ComputerService
     return {
       enabled,
       helper,
+      ...(helper === 'ready' && helperUnsignedNotice({ platform: process.platform, isPackaged: app.isPackaged, pin: WINDOWS_HELPER_PIN }) && { helperUnsigned: true }),
       stopKey: COMPUTER_ABORT_ACCELERATOR,
       stopKeyStatus: key.status(),
       ...(error && { error }),

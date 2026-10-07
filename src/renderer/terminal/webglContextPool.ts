@@ -85,9 +85,9 @@ export class WebglContextPool {
   }
 
   /**
-   * A terminal became hidden (after the defer grace period) or unmounted.
-   * Disposes its context if held and forgets it entirely. Safe to call for an
-   * unknown token.
+   * A terminal unmounted. Disposes its context if held and forgets it
+   * entirely. Safe to call for an unknown token. (Hiding a terminal does not
+   * release: it keeps its context until evicted.)
    */
   release(token: string): void {
     const entry = this.entries.get(token);

@@ -100,6 +100,7 @@ export function TabComputerUse() {
               : state.helper === 'elevated' ? 'settings.computerUseElevatedNote' : 'settings.computerUseUnsupportedNote')}
         </SettingNote>
       )}
+      {state?.helper === 'ready' && state.helperUnsigned && <SettingNote>{t('settings.computerUseHelperUnsignedNote')}</SettingNote>}
       {stopKeyUnavailable && state && (
         <SettingNote tone="danger">
           {t('settings.computerUseStopKeyUnavailableNote', { key: formatStopKey(state.stopKey, isMac) })}
