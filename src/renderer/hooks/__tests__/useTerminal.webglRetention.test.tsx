@@ -111,3 +111,60 @@ describe('useTerminal WebGL retention', { timeout: 60_000 }, () => {
     expect(webgl.disposed).toBe(disposed + 1);
   });
 });
+
+// With more terminals than the budget, a pane shown without a context used to
+// take one at once: evict another terminal and rebuild a renderer before it
+// could paint, on every step of cycling workspaces by shortcut. Such a grant
+// now waits until the pane has stayed shown; a quick pass takes nothing.
+describe('useTerminal WebGL grant when the pool is full', { timeout: 60_000 }, () => {
+  const fillers: string[] = [];
+
+  afterEach(async () => {
+    const { webglContextPool } = await import('../../terminal/webglContextPool');
+    for (const token of fillers.splice(0)) webglContextPool.release(token);
+  });
+
+  async function setup() {
+    const { useTerminal, WEBGL_EVICTING_ACQUIRE_DWELL_MS } = await import('../useTerminal');
+    const { webglContextPool, MAX_WEBGL_CONTEXTS } = await import('../../terminal/webglContextPool');
+    for (let i = 0; i < MAX_WEBGL_CONTEXTS; i++) {
+      const token = `filler-${i}`;
+      fillers.push(token);
+      webglContextPool.acquire(token, () => undefined, () => undefined);
+    }
+    function Harness({ visible }: { visible: boolean }) {
+      const ref = useRef<HTMLDivElement>(null);
+      useTerminal(ref, { ptyId: 'p-full-pool', isVisible: visible });
+      return <div ref={ref} style={{ width: 800, height: 600 }} />;
+    }
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    return { Harness, webglContextPool, dwell: WEBGL_EVICTING_ACQUIRE_DWELL_MS };
+  }
+
+  it('paints without WebGL first and takes a context once the pane has stayed shown', async () => {
+    const { Harness, webglContextPool, dwell } = await setup();
+    const before = webgl.created;
+    await act(async () => { root!.render(<Harness visible />); });
+    await act(async () => { await new Promise((r) => setTimeout(r, 30)); });
+    expect(webgl.created).toBe(before);
+    expect(fillers.every((t) => webglContextPool.grantedTokens().includes(t))).toBe(true);
+
+    await act(async () => { await new Promise((r) => setTimeout(r, dwell + 100)); });
+    expect(webgl.created).toBe(before + 1);
+    // It took the least-recently-used terminal's slot.
+    expect(webglContextPool.grantedTokens()).not.toContain('filler-0');
+  });
+
+  it('a pane hidden again before the dwell never takes a context', async () => {
+    const { Harness, webglContextPool, dwell } = await setup();
+    const before = webgl.created;
+    await act(async () => { root!.render(<Harness visible />); });
+    await act(async () => { await new Promise((r) => setTimeout(r, dwell / 5)); });
+    await act(async () => { root!.render(<Harness visible={false} />); });
+    await act(async () => { await new Promise((r) => setTimeout(r, dwell + 100)); });
+    expect(webgl.created).toBe(before);
+    expect(fillers.every((t) => webglContextPool.grantedTokens().includes(t))).toBe(true);
+  });
+});
