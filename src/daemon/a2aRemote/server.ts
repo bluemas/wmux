@@ -594,7 +594,7 @@ function refuseTooLarge(req: http.IncomingMessage, res: http.ServerResponse): vo
   sendJson(res, 413, { ok: false, error: 'too-large' satisfies A2aRemoteErrorCode });
 }
 
-function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
+export function sendJson(res: http.ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',

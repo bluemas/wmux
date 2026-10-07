@@ -20,6 +20,7 @@ import {
   isSafeId,
   loadStore,
   sanitizeName,
+  sanitizeRepoKey,
   storeUnavailable,
   type StoreLog,
 } from './storeFile';
@@ -105,6 +106,8 @@ export function linkFromProposal(hostId: HostId, req: A2aLinkProposeRequest): Ne
       workspaceId: req.from.workspaceId,
       paneId: req.from.paneId,
       ...(req.from.label !== undefined ? { label: req.from.label } : {}),
+      ...(req.from.workspaceName !== undefined ? { workspaceName: req.from.workspaceName } : {}),
+      ...(req.from.gitRemote !== undefined ? { gitRemote: req.from.gitRemote } : {}),
     },
     allow: { outbound: req.allow.inbound, inbound: req.allow.outbound },
   };
@@ -192,6 +195,21 @@ export class LinkStore {
     if (typeof input.linkId !== 'string' || !UUID_RE.test(input.linkId)) throw new Error('link: invalid linkId');
     if (this.links.has(input.linkId)) throw new Error(`link ${input.linkId}: duplicate linkId`);
     return this.create(input.linkId, input, 'proposed-in');
+  }
+
+  /**
+   * Drop a `proposed-out` link the other side never acknowledged (its
+   * proposal POST failed). Not a transition: the link never existed there.
+   */
+  discard(linkId: string): void {
+    const rec = this.require(linkId, ['proposed-out'], 'discard');
+    this.links.delete(linkId);
+    try {
+      this.persist();
+    } catch (err) {
+      this.links.set(linkId, rec);
+      throw err;
+    }
   }
 
   /** Our human accepted a `proposed-in` link. */
@@ -447,7 +465,9 @@ function cleanNewLink(input: unknown): NewLinkInput | string {
     !isHostId(remote['hostId']) ||
     !isSafeId(remote['workspaceId']) ||
     !isSafeId(remote['paneId']) ||
-    (remote['label'] !== undefined && typeof remote['label'] !== 'string')
+    (remote['label'] !== undefined && typeof remote['label'] !== 'string') ||
+    (remote['workspaceName'] !== undefined && typeof remote['workspaceName'] !== 'string') ||
+    (remote['gitRemote'] !== undefined && typeof remote['gitRemote'] !== 'string')
   ) {
     return 'invalid remote pane';
   }
@@ -455,6 +475,8 @@ function cleanNewLink(input: unknown): NewLinkInput | string {
     return 'invalid allow flags';
   }
   const label = remote['label'] === undefined ? '' : sanitizeName(remote['label'], '');
+  const workspaceName = remote['workspaceName'] === undefined ? '' : sanitizeName(remote['workspaceName'], '');
+  const gitRemote = sanitizeRepoKey(remote['gitRemote']);
   return {
     local: { workspaceId: local['workspaceId'], paneId: local['paneId'] },
     remote: {
@@ -462,6 +484,8 @@ function cleanNewLink(input: unknown): NewLinkInput | string {
       workspaceId: remote['workspaceId'],
       paneId: remote['paneId'],
       ...(label ? { label } : {}),
+      ...(workspaceName ? { workspaceName } : {}),
+      ...(gitRemote ? { gitRemote } : {}),
     },
     allow: { outbound: allow['outbound'], inbound: allow['inbound'] },
   };

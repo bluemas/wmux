@@ -318,7 +318,16 @@ export interface A2aLinkRecordV1 {
   version: number;
   state: A2aLinkState;
   local: { workspaceId: string; paneId: string };
-  remote: { hostId: HostId; workspaceId: string; paneId: string; label?: string };
+  remote: {
+    hostId: HostId;
+    workspaceId: string;
+    paneId: string;
+    label?: string;
+    /** Display only, for the `<PC>/<workspace>/<pane>` alias. */
+    workspaceName?: string;
+    /** Display only: the pane's normalized `host/owner/repo` key, never a raw remote URL. */
+    gitRemote?: string;
+  };
   allow: {
     /** This side may start new tasks toward the remote pane. */
     outbound: boolean;
@@ -359,8 +368,11 @@ export interface A2aExposedResponse {
 export interface A2aLinkProposeRequest {
   /** Minted by the proposer; the receiver refuses a duplicate id. */
   linkId: string;
-  /** Proposer's pane (the receiver stores it as `remote`). */
-  from: { workspaceId: string; paneId: string; label?: string };
+  /**
+   * Proposer's pane (the receiver stores it as `remote`). The names and the
+   * repo key are display-only, sanitized and bounded by the receiver.
+   */
+  from: { workspaceId: string; paneId: string; label?: string; workspaceName?: string; gitRemote?: string };
   /** Receiver's pane (must be exposed to the proposer). */
   to: { workspaceId: string; paneId: string };
   /** Directions from the PROPOSER's point of view. */
@@ -370,6 +382,24 @@ export interface A2aLinkProposeRequest {
 export interface A2aLinkProposeResponse {
   linkId: string;
   state: 'proposed-in';
+}
+
+/** `GET /api/a2a/links/:linkId` — the link from the SERVER's perspective. */
+export interface A2aLinkStatusResponse {
+  linkId: string;
+  state: A2aLinkState;
+  version: number;
+  endedReason?: A2aLinkRecordV1['endedReason'];
+}
+
+/**
+ * `/api/a2a/links/:linkId` — the per-link path. GET answers the link's state as
+ * the SERVER sees it (A2aLinkStatusResponse): the joiner polls it ("refresh")
+ * until the server's stream carries the accept notice. `+ linkRevokeSuffix`
+ * is the joiner's revoke.
+ */
+export function a2aLinkPath(linkId: string): string {
+  return `${A2A_ROUTES.links}/${encodeURIComponent(linkId)}`;
 }
 
 // ─── Layer 4 wire ───────────────────────────────────────────────────────────

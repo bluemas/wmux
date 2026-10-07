@@ -466,3 +466,30 @@ describe('LinkStore persistence', () => {
     expect(log).toHaveBeenCalledWith('error', expect.stringContaining('could not be persisted'));
   });
 });
+
+describe('LinkStore display fields and discard (PR2b)', () => {
+  it('keeps the remote workspace name and repo key across a reload, sanitized', () => {
+    const s = make();
+    const id = s.proposeOut(input({
+      remote: { hostId: HOST, workspaceId: 'rws', paneId: 'rp', workspaceName: '  API\u0007 server ', gitRemote: 'github.com/acme/api' },
+    })).linkId;
+    expect(make().get(id)?.remote).toMatchObject({ workspaceName: 'API server', gitRemote: 'github.com/acme/api' });
+    // A repo key with whitespace is dropped, not stored.
+    const bad = s.proposeOut(input({ ...at(2), remote: { hostId: HOST, workspaceId: 'rws', paneId: 'rp', gitRemote: 'a b' } })).linkId;
+    expect(s.get(bad)?.remote.gitRemote).toBeUndefined();
+  });
+
+  it('discard drops only an unacknowledged proposal, and rolls back on a failed write', () => {
+    const s = make();
+    const out = linkIn(s, 'proposed-out');
+    const inn = linkIn(s, 'proposed-in', at(2));
+    expect(() => s.discard(inn)).toThrow(/not allowed/);
+    fail = true;
+    expect(() => s.discard(out)).toThrow('disk full');
+    expect(s.get(out)?.state).toBe('proposed-out');
+    fail = false;
+    s.discard(out);
+    expect(s.get(out)).toBeUndefined();
+    expect(make().get(out)).toBeUndefined();
+  });
+});
