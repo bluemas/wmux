@@ -82,12 +82,12 @@ function asPeer(joiner: Side, server: Side) {
 }
 
 const B_PANES = [
-  { workspaceId: 'ws-api', workspaceName: 'API', paneId: 'pane-1', label: 'w1-1(claude)', agent: 'claude', cwd: '/srv/api', gitRemote: 'github.com/acme/api', gitBranch: 'main' },
-  { workspaceId: 'ws-api', workspaceName: 'API', paneId: 'pane-2', label: 'w1-2' },
-  { workspaceId: 'ws-secret', workspaceName: 'Secret', paneId: 'pane-9', label: 'w2-1' },
+  { kind: 'pane', workspaceId: 'ws-api', workspaceName: 'API', paneId: 'pane-1', label: 'w1-1(claude)', agent: 'claude', cwd: '/srv/api', gitRemote: 'github.com/acme/api', gitBranch: 'main' },
+  { kind: 'pane', workspaceId: 'ws-api', workspaceName: 'API', paneId: 'pane-2', label: 'w1-2' },
+  { kind: 'pane', workspaceId: 'ws-secret', workspaceName: 'Secret', paneId: 'pane-9', label: 'w2-1' },
 ];
 
-const A_PANE = { workspaceId: 'ws-a', paneId: 'pane-a', label: 'w1-1(codex)', workspaceName: 'Web', gitRemote: 'github.com/acme/api' };
+const A_PANE = { kind: 'pane', workspaceId: 'ws-a', paneId: 'pane-a', label: 'w1-1(codex)', workspaceName: 'Web', gitRemote: 'github.com/acme/api' };
 
 /** B exposes only ws-api/pane-1 to A. */
 async function exposeOne(a: Side, b: Side): Promise<void> {
@@ -98,8 +98,8 @@ async function exposeOne(a: Side, b: Side): Promise<void> {
 async function propose(a: Side, b: Side, remotePane: Record<string, unknown>): Promise<{ ok: boolean; link?: A2aLinkRecordV1; error?: string }> {
   return (await a.rpc('a2a.remote.links.propose', {
     hostId: b.hostId,
-    localPane: A_PANE,
-    remotePane,
+    local: A_PANE,
+    remote: remotePane,
     allow: { outbound: true, inbound: true },
   })) as { ok: boolean; link?: A2aLinkRecordV1; error?: string };
 }
@@ -115,7 +115,7 @@ describe('cross-host exposure and pane links, end to end', () => {
     const listed = (await a.rpc('a2a.remote.hosts.exposed', { hostId: b.hostId })) as { ok: boolean; panes: unknown[] };
     expect(listed).toEqual({ ok: true, panes: [B_PANES[0]] });
 
-    const proposed = await propose(a, b, { workspaceId: 'ws-api', paneId: 'pane-1', label: 'w1-1(claude)', workspaceName: 'API', gitRemote: 'github.com/acme/api' });
+    const proposed = await propose(a, b, { kind: 'pane', workspaceId: 'ws-api', paneId: 'pane-1', label: 'w1-1(claude)', workspaceName: 'API', gitRemote: 'github.com/acme/api' });
     expect(proposed.ok).toBe(true);
     const linkId = proposed.link!.linkId;
     expect(a.links.get(linkId)).toMatchObject({ state: 'proposed-out', remote: { hostId: b.hostId, workspaceName: 'API', paneId: 'pane-1' } });
@@ -124,8 +124,8 @@ describe('cross-host exposure and pane links, end to end', () => {
     expect(b.links.get(linkId)).toMatchObject({
       state: 'proposed-in',
       version: 1,
-      local: { workspaceId: 'ws-api', paneId: 'pane-1' },
-      remote: { hostId: a.hostId, workspaceId: 'ws-a', paneId: 'pane-a', label: 'w1-1(codex)', workspaceName: 'Web', gitRemote: 'github.com/acme/api' },
+      local: { kind: 'pane', workspaceId: 'ws-api', paneId: 'pane-1' },
+      remote: { hostId: a.hostId, kind: 'pane', workspaceId: 'ws-a', paneId: 'pane-a', label: 'w1-1(codex)', workspaceName: 'Web', gitRemote: 'github.com/acme/api' },
       allow: { outbound: true, inbound: true },
     });
     expect(b.events).toContainEqual({ type: 'a2a.remote.link.proposed', linkId });
@@ -145,7 +145,7 @@ describe('cross-host exposure and pane links, end to end', () => {
     await exposeOne(a, b);
 
     // A sibling pane of an exposed workspace, and a pane of an unexposed one.
-    for (const pane of [{ workspaceId: 'ws-api', paneId: 'pane-2' }, { workspaceId: 'ws-secret', paneId: 'pane-9' }]) {
+    for (const pane of [{ kind: 'pane', workspaceId: 'ws-api', paneId: 'pane-2' }, { kind: 'pane', workspaceId: 'ws-secret', paneId: 'pane-9' }]) {
       expect(await propose(a, b, pane)).toMatchObject({ ok: false, error: 'forbidden' });
     }
     expect(a.links.list()).toHaveLength(0);
@@ -159,7 +159,7 @@ describe('cross-host exposure and pane links, end to end', () => {
     await pair(a, b, 'PC A');
     await pair(c, b, 'PC C');
     await exposeOne(a, b);
-    const { link } = await propose(a, b, { workspaceId: 'ws-api', paneId: 'pane-1' });
+    const { link } = await propose(a, b, { kind: 'pane', workspaceId: 'ws-api', paneId: 'pane-1' });
 
     const asC = asPeer(c, b);
     expect(await asC.requestJson('POST', a2aLinkPath(link!.linkId) + A2A_ROUTES.linkRevokeSuffix, {})).toMatchObject({ status: 403, json: { error: 'forbidden' } });
@@ -178,14 +178,14 @@ describe('cross-host exposure and pane links, end to end', () => {
     await exposeOne(a, b);
     const body = {
       linkId: crypto.randomUUID(),
-      from: { workspaceId: 'ws-a', paneId: 'pane-a' },
-      to: { workspaceId: 'ws-api', paneId: 'pane-1' },
+      from: { kind: 'pane', workspaceId: 'ws-a', paneId: 'pane-a' },
+      to: { kind: 'pane', workspaceId: 'ws-api', paneId: 'pane-1' },
       allow: { outbound: true, inbound: false },
     };
     const client = asPeer(a, b);
     expect((await client.requestJson('POST', A2A_ROUTES.links, body)).status).toBe(200);
     // Same id, even for another pane pair.
-    const again = await client.requestJson('POST', A2A_ROUTES.links, { ...body, from: { workspaceId: 'ws-a', paneId: 'pane-b' } });
+    const again = await client.requestJson('POST', A2A_ROUTES.links, { ...body, from: { kind: 'pane', workspaceId: 'ws-a', paneId: 'pane-b' } });
     expect(again).toMatchObject({ status: 409, json: { error: 'conflict' } });
     expect(b.links.list()).toHaveLength(1);
   });
@@ -195,11 +195,11 @@ describe('cross-host exposure and pane links, end to end', () => {
     const b = await makeSide('PC B');
     await pair(a, b, 'PC A');
     await exposeOne(a, b);
-    const { link } = await propose(a, b, { workspaceId: 'ws-api', paneId: 'pane-1' });
+    const { link } = await propose(a, b, { kind: 'pane', workspaceId: 'ws-api', paneId: 'pane-1' });
     await b.rpc('a2a.remote.links.accept', { linkId: link!.linkId });
     await a.rpc('a2a.remote.links.refresh', { linkId: link!.linkId });
 
-    expect(await b.rpc('a2a.remote.local.paneGone', { workspaceId: 'ws-api', paneId: 'pane-1', reason: 'pane-closed' })).toEqual({ ok: true, broken: 1 });
+    expect(await b.rpc('a2a.remote.local.paneGone', { kind: 'pane', workspaceId: 'ws-api', paneId: 'pane-1', reason: 'pane-closed' })).toEqual({ ok: true, broken: 1 });
     expect(b.links.get(link!.linkId)).toMatchObject({ state: 'broken', endedReason: 'pane-closed' });
     expect(b.events).toContainEqual({ type: 'a2a.remote.link.changed', linkId: link!.linkId, state: 'broken' });
     expect(await a.rpc('a2a.remote.hosts.exposed', { hostId: b.hostId })).toEqual({ ok: true, panes: [] });
@@ -213,7 +213,7 @@ describe('cross-host exposure and pane links, end to end', () => {
     const b = await makeSide('PC B');
     await pair(a, b, 'PC A');
     await exposeOne(a, b);
-    const { link } = await propose(a, b, { workspaceId: 'ws-api', paneId: 'pane-1' });
+    const { link } = await propose(a, b, { kind: 'pane', workspaceId: 'ws-api', paneId: 'pane-1' });
     expect(await a.rpc('a2a.remote.local.paneGone', { workspaceId: 'ws-a', reason: 'workspace-gone' })).toEqual({ ok: true, broken: 1 });
     expect(a.links.get(link!.linkId)).toMatchObject({ state: 'broken', endedReason: 'workspace-gone' });
   });
@@ -243,7 +243,7 @@ describe('cross-host exposure and pane links, end to end', () => {
     const b = await makeSide('PC B');
     await pair(a, b, 'PC A');
     await exposeOne(a, b);
-    const { link } = await propose(a, b, { workspaceId: 'ws-api', paneId: 'pane-1' });
+    const { link } = await propose(a, b, { kind: 'pane', workspaceId: 'ws-api', paneId: 'pane-1' });
     expect(await b.rpc('a2a.remote.links.reject', { linkId: link!.linkId })).toMatchObject({ ok: true, link: { state: 'revoked', endedReason: 'revoked-local' } });
     expect(await a.rpc('a2a.remote.links.refresh', { linkId: link!.linkId })).toMatchObject({ ok: true, link: { state: 'revoked', endedReason: 'revoked-remote' } });
   });
@@ -251,14 +251,87 @@ describe('cross-host exposure and pane links, end to end', () => {
   it('a proposal to an unpaired PC fails without a local record', async () => {
     const a = await makeSide('PC A');
     const b = await makeSide('PC B');
-    expect(await propose(a, b, { workspaceId: 'ws-api', paneId: 'pane-1' })).toMatchObject({ ok: false, error: 'not-paired' });
+    expect(await propose(a, b, { kind: 'pane', workspaceId: 'ws-api', paneId: 'pane-1' })).toMatchObject({ ok: false, error: 'not-paired' });
     expect(a.links.list()).toHaveLength(0);
+  });
+
+  describe('Moa (brain) ends', () => {
+    const MOA = { kind: 'brain', workspaceId: 'ws-hq-b', workspaceName: 'Moa' };
+    const A_MOA = { kind: 'brain', workspaceId: 'ws-hq-a', workspaceName: 'Moa' };
+
+    async function exposeMoa(a: Side, b: Side, brain: boolean): Promise<void> {
+      await b.rpc('a2a.remote.exposure.publish', { panes: [MOA, ...B_PANES] });
+      await b.rpc('a2a.remote.exposure.set', { hostId: a.hostId, workspaceIds: ['ws-api'], paneIds: { 'ws-api': ['pane-1'] }, brain });
+    }
+    const proposeMoa = async (a: Side, b: Side, local: Record<string, unknown>, remote: Record<string, unknown>) =>
+      (await a.rpc('a2a.remote.links.propose', { hostId: b.hostId, local, remote, allow: { outbound: true, inbound: true } })) as { ok: boolean; link?: A2aLinkRecordV1; error?: string };
+
+    it('an exposed Moa is listed, and Moa <-> Moa links and activates', async () => {
+      const a = await makeSide('PC A');
+      const b = await makeSide('PC B');
+      await pair(a, b, 'PC A');
+      await exposeMoa(a, b, true);
+      const listed = (await a.rpc('a2a.remote.hosts.exposed', { hostId: b.hostId })) as { panes: unknown[] };
+      expect(listed.panes).toEqual([MOA, B_PANES[0]]);
+
+      const r = await proposeMoa(a, b, A_MOA, { kind: 'brain', workspaceId: 'ws-hq-b' });
+      expect(r.ok).toBe(true);
+      const id = r.link!.linkId;
+      expect(b.links.get(id)).toMatchObject({ state: 'proposed-in', local: { kind: 'brain', workspaceId: 'ws-hq-b' }, remote: { kind: 'brain', workspaceId: 'ws-hq-a' } });
+      expect(b.links.get(id)!.local).not.toHaveProperty('paneId');
+      await b.rpc('a2a.remote.links.accept', { linkId: id });
+      expect(await a.rpc('a2a.remote.links.refresh', { linkId: id })).toMatchObject({ ok: true, link: { state: 'active' } });
+      expect(a.links.findActiveByLocalBrain('ws-hq-a').map((l) => l.linkId)).toEqual([id]);
+
+      // One link per remote host's Moa.
+      expect(await proposeMoa(a, b, A_MOA, { kind: 'brain', workspaceId: 'ws-hq-b' })).toMatchObject({ ok: false, error: 'conflict' });
+    });
+
+    it('Moa <-> pane is refused, here and by the server (403)', async () => {
+      const a = await makeSide('PC A');
+      const b = await makeSide('PC B');
+      await pair(a, b, 'PC A');
+      await exposeMoa(a, b, true);
+      expect(await proposeMoa(a, b, A_PANE, { kind: 'brain', workspaceId: 'ws-hq-b' })).toMatchObject({ ok: false, error: 'forbidden' });
+      expect(await proposeMoa(a, b, A_MOA, { kind: 'pane', workspaceId: 'ws-api', paneId: 'pane-1' })).toMatchObject({ ok: false, error: 'forbidden' });
+      const raw = await asPeer(a, b).requestJson('POST', A2A_ROUTES.links, {
+        linkId: crypto.randomUUID(),
+        from: { kind: 'pane', workspaceId: 'ws-a', paneId: 'pane-a' },
+        to: { kind: 'brain', workspaceId: 'ws-hq-b' },
+        allow: { outbound: true, inbound: true },
+      });
+      expect(raw).toMatchObject({ status: 403, json: { error: 'forbidden' } });
+      expect(a.links.list()).toHaveLength(0);
+      expect(b.links.list()).toHaveLength(0);
+    });
+
+    it('a Moa that is not exposed, or not the current HQ, is refused (403)', async () => {
+      const a = await makeSide('PC A');
+      const b = await makeSide('PC B');
+      await pair(a, b, 'PC A');
+      await exposeMoa(a, b, false);
+      expect(((await a.rpc('a2a.remote.hosts.exposed', { hostId: b.hostId })) as { panes: unknown[] }).panes).toEqual([B_PANES[0]]);
+      expect(await proposeMoa(a, b, A_MOA, { kind: 'brain', workspaceId: 'ws-hq-b' })).toMatchObject({ ok: false, error: 'forbidden' });
+      await exposeMoa(a, b, true);
+      expect(await proposeMoa(a, b, A_MOA, { kind: 'brain', workspaceId: 'ws-old-hq' })).toMatchObject({ ok: false, error: 'forbidden' });
+    });
+
+    it('Moa going away breaks its links and withdraws it from the list', async () => {
+      const a = await makeSide('PC A');
+      const b = await makeSide('PC B');
+      await pair(a, b, 'PC A');
+      await exposeMoa(a, b, true);
+      const { link } = await proposeMoa(a, b, A_MOA, { kind: 'brain', workspaceId: 'ws-hq-b' });
+      expect(await b.rpc('a2a.remote.local.paneGone', { workspaceId: 'ws-hq-b', reason: 'workspace-gone', endpoint: 'brain' })).toEqual({ ok: true, broken: 1 });
+      expect(b.links.get(link!.linkId)).toMatchObject({ state: 'broken', endedReason: 'workspace-gone' });
+      expect(((await a.rpc('a2a.remote.hosts.exposed', { hostId: b.hostId })) as { panes: unknown[] }).panes).toEqual([B_PANES[0]]);
+    });
   });
 
   it('the exposed snapshot drops malformed entries', () => {
     const cache = new ExposedPaneCache();
-    expect(cache.publish([B_PANES[0], { workspaceId: '', paneId: 'x' }, 'nope', { workspaceId: 'w', paneId: 'p', gitRemote: 'has space' }])).toBe(2);
-    expect(cache.all()[1]).toEqual({ workspaceId: 'w', workspaceName: 'w', paneId: 'p' });
+    expect(cache.publish([B_PANES[0], { kind: 'pane', workspaceId: '', paneId: 'x' }, 'nope', { kind: 'pane', workspaceId: 'w', paneId: 'p', gitRemote: 'has space' }])).toBe(2);
+    expect(cache.all()[1]).toEqual({ kind: 'pane', workspaceId: 'w', workspaceName: 'w', paneId: 'p' });
   });
 });
 

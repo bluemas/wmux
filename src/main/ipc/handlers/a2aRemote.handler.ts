@@ -1,7 +1,21 @@
-import { ipcMain } from 'electron';
+import { BrowserWindow, ipcMain } from 'electron';
 import { IPC } from '../../../shared/constants';
+import type { A2aRemoteLinkEvent, A2aRemoteLinkProposeParams } from '../../../shared/rpc';
 import { wrapHandler } from '../wrapHandler';
 import type { DaemonClient } from '../../DaemonClient';
+import { detectRemote } from '../../github/PrProvider';
+import { A2aExposurePublisher, coercePaneSnapshot } from '../../a2aRemote/exposurePublisher';
+
+// Module scope: the handlers are re-registered on every daemon (re)connect,
+// but the last pane snapshot (the gone-pane baseline) must outlive that.
+let liveClient: DaemonClient | null = null;
+const publisher = new A2aExposurePublisher({
+  client: () => liveClient,
+  repoKey: async (cwd) => (await detectRemote(cwd))?.key ?? null,
+  log: (msg) => console.warn(`[a2a-remote] ${msg}`),
+});
+
+const LINK_EVENTS: ReadonlySet<string> = new Set(['a2a.remote.link.proposed', 'a2a.remote.link.changed']);
 
 /**
  * Cross-host A2A — Settings ↔ daemon control-plane IPC. Thin pass-throughs
@@ -26,12 +40,56 @@ export function registerA2aRemoteHandlers(daemonClient: DaemonClient): () => voi
     [IPC.A2A_REMOTE_HOSTS_REMOVE, (hostId) => daemonClient.a2aRemoteHostsRemove(str(hostId))],
     [IPC.A2A_REMOTE_PEERS_LIST, () => daemonClient.a2aRemotePeersList()],
     [IPC.A2A_REMOTE_PEERS_REVOKE, (peerId) => daemonClient.a2aRemotePeersRevoke(str(peerId))],
+    [
+      IPC.A2A_REMOTE_SNAPSHOT,
+      async (snapshot) => {
+        const parsed = coercePaneSnapshot(snapshot);
+        if (parsed) await publisher.accept(parsed);
+        return { ok: parsed !== null };
+      },
+    ],
+    [IPC.A2A_REMOTE_EXPOSURE_GET, (hostId) => daemonClient.a2aRemoteExposureGet(str(hostId))],
+    [
+      IPC.A2A_REMOTE_EXPOSURE_SET,
+      async (hostId, workspaceIds, paneIds, brain) => {
+        const result = await daemonClient.a2aRemoteExposureSet(
+          str(hostId),
+          Array.isArray(workspaceIds) ? workspaceIds.filter((w): w is string => typeof w === 'string') : [],
+          (paneIds ?? {}) as Record<string, string[]>,
+          brain === true,
+        );
+        // A newly exposed workspace's panes must be listed before the other PC looks.
+        await publisher.republish();
+        return result;
+      },
+    ],
+    [IPC.A2A_REMOTE_HOSTS_EXPOSED, (hostId) => daemonClient.a2aRemoteHostsExposed(str(hostId))],
+    [IPC.A2A_REMOTE_LINKS_LIST, () => daemonClient.a2aRemoteLinksList()],
+    [IPC.A2A_REMOTE_LINKS_PROPOSE, (params) => daemonClient.a2aRemoteLinksPropose((params ?? {}) as A2aRemoteLinkProposeParams)],
+    [IPC.A2A_REMOTE_LINKS_ACCEPT, (linkId) => daemonClient.a2aRemoteLinkAction('accept', str(linkId))],
+    [IPC.A2A_REMOTE_LINKS_REJECT, (linkId) => daemonClient.a2aRemoteLinkAction('reject', str(linkId))],
+    [IPC.A2A_REMOTE_LINKS_REVOKE, (linkId) => daemonClient.a2aRemoteLinkAction('revoke', str(linkId))],
+    [IPC.A2A_REMOTE_LINKS_REFRESH, (linkId) => daemonClient.a2aRemoteLinkAction('refresh', str(linkId))],
   ];
   for (const [channel, fn] of handlers) {
     ipcMain.removeHandler(channel);
     ipcMain.handle(channel, wrapHandler(channel, (_event, ...args: unknown[]) => fn(...args)));
   }
+  // Daemon link nudges → every window (the renderer re-reads the link list).
+  const onEvent = (event: { type?: unknown; data?: unknown }): void => {
+    if (typeof event.type !== 'string' || !LINK_EVENTS.has(event.type)) return;
+    const payload = event.data as A2aRemoteLinkEvent;
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win.isDestroyed()) win.webContents.send(IPC.A2A_REMOTE_LINK_EVENT, payload);
+    }
+  };
+  daemonClient.on('event', onEvent);
+  liveClient = daemonClient;
+  // A restarted daemon starts with an empty exposure snapshot.
+  void publisher.republish();
   return () => {
     for (const [channel] of handlers) ipcMain.removeHandler(channel);
+    daemonClient.off('event', onEvent);
+    if (liveClient === daemonClient) liveClient = null;
   };
 }

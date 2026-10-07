@@ -2,6 +2,9 @@ import {
   A2A_ROUTES,
   a2aLinkPath,
   formatPeerCredential,
+  isAllowedEndpointPair,
+  isConsistentEndpoint,
+  type A2aEndpointKind,
   type A2aExposureV1,
   type A2aLinkProposeRequest,
   type A2aLinkRecordV1,
@@ -50,7 +53,7 @@ export interface A2aLinkRpcDeps {
   exposures: {
     get(hostId: HostId): A2aExposureV1 | undefined;
     list(): A2aExposureV1[];
-    set(hostId: HostId, input: { workspaceIds: string[]; paneIds?: Record<string, string[]> }): A2aExposureV1;
+    set(hostId: HostId, input: { workspaceIds: string[]; paneIds?: Record<string, string[]>; brain?: boolean }): A2aExposureV1;
     forgetPane(paneId: string): void;
     forgetWorkspace(workspaceId: string): void;
   };
@@ -154,7 +157,10 @@ export function registerA2aLinkRpc(onRpc: (method: string, handler: RpcHandler) 
       const list = rawPanes[ws];
       paneIds[ws] = Array.isArray(list) ? list.filter(isSafeId) : [];
     }
-    return { exposure: deps.exposures.set(hostId, { workspaceIds, paneIds }) };
+    if (params['brain'] !== undefined && typeof params['brain'] !== 'boolean') {
+      throw new Error('a2a.remote.exposure.set: brain must be boolean');
+    }
+    return { exposure: deps.exposures.set(hostId, { workspaceIds, paneIds, brain: params['brain'] === true }) };
   });
 
   onRpc('a2a.remote.hosts.exposed', async (params): Promise<A2aRemoteHostsExposedResult> => {
@@ -176,19 +182,22 @@ export function registerA2aLinkRpc(onRpc: (method: string, handler: RpcHandler) 
 
   onRpc('a2a.remote.links.propose', async (params): Promise<A2aRemoteLinkResult> => {
     const hostId = str(params, 'hostId');
-    const local = paneArg(params['localPane']);
-    const remote = paneArg(params['remotePane']);
+    const local = endArg(params['local']);
+    const remote = endArg(params['remote']);
     const allow = params['allow'];
     if (!local || !remote || !isPlainObject(allow) || typeof allow['outbound'] !== 'boolean' || typeof allow['inbound'] !== 'boolean') {
       return { ok: false, error: 'bad-request' };
     }
     if (!allow['outbound'] && !allow['inbound']) return { ok: false, error: 'bad-request', message: 'no direction allowed' };
+    if (!isAllowedEndpointPair(local.kind, remote.kind)) {
+      return { ok: false, error: 'forbidden', message: 'Moa links only to Moa, a pane only to a pane' };
+    }
     if (!deps.remoteHosts.get(hostId)) return { ok: false, error: 'not-paired' };
 
     let link: A2aLinkRecordV1;
     try {
       link = links.proposeOut({
-        local: { workspaceId: local.workspaceId, paneId: local.paneId },
+        local: local.kind === 'pane' ? { kind: 'pane', workspaceId: local.workspaceId, paneId: local.paneId } : { kind: 'brain', workspaceId: local.workspaceId },
         remote: { hostId, ...remote },
         allow: { outbound: allow['outbound'], inbound: allow['inbound'] },
       });
@@ -198,7 +207,7 @@ export function registerA2aLinkRpc(onRpc: (method: string, handler: RpcHandler) 
     const request: A2aLinkProposeRequest = {
       linkId: link.linkId,
       from: local,
-      to: { workspaceId: remote.workspaceId, paneId: remote.paneId },
+      to: remote.kind === 'pane' ? { kind: 'pane', workspaceId: remote.workspaceId, paneId: remote.paneId } : { kind: 'brain', workspaceId: remote.workspaceId },
       allow: link.allow,
     };
     try {
@@ -293,13 +302,15 @@ export function registerA2aLinkRpc(onRpc: (method: string, handler: RpcHandler) 
     const workspaceId = str(params, 'workspaceId');
     const paneId = str(params, 'paneId');
     const reason = str(params, 'reason') as A2aRemotePaneGoneParams['reason'];
-    if (!workspaceId || !GONE_REASONS.has(reason) || (reason !== 'workspace-gone' && !paneId)) {
+    const brainGone = params['endpoint'] === 'brain';
+    if (!workspaceId || !GONE_REASONS.has(reason) || (reason !== 'workspace-gone' && !paneId) || (brainGone && reason !== 'workspace-gone')) {
       throw new Error('a2a.remote.local.paneGone: workspaceId, paneId and a known reason are required');
     }
     let broken = 0;
     for (const rec of links.list()) {
       if (!NON_TERMINAL.has(rec.state) || rec.local.workspaceId !== workspaceId) continue;
-      if (reason !== 'workspace-gone' && rec.local.paneId !== paneId) continue;
+      if (brainGone && rec.local.kind !== 'brain') continue;
+      if (reason !== 'workspace-gone' && (rec.local.kind !== 'pane' || rec.local.paneId !== paneId)) continue;
       let link: A2aLinkRecordV1;
       try {
         link = links.markBroken(rec.linkId, reason as BrokenReason);
@@ -313,7 +324,9 @@ export function registerA2aLinkRpc(onRpc: (method: string, handler: RpcHandler) 
       changed(link);
     }
     try {
-      if (reason === 'workspace-gone') {
+      if (brainGone) {
+        deps.panes.forgetBrain();
+      } else if (reason === 'workspace-gone') {
         deps.exposures.forgetWorkspace(workspaceId);
         deps.panes.forgetWorkspace(workspaceId);
       } else {
@@ -365,13 +378,15 @@ export function registerA2aLinkRpc(onRpc: (method: string, handler: RpcHandler) 
   }
 }
 
-/** A pane argument from the app: ids required, display fields passed through for the store to sanitize. */
-function paneArg(raw: unknown): { workspaceId: string; paneId: string; label?: string; workspaceName?: string; gitRemote?: string } | null {
-  if (!isPlainObject(raw) || !isSafeId(raw['workspaceId']) || !isSafeId(raw['paneId'])) return null;
-  const out: { workspaceId: string; paneId: string; label?: string; workspaceName?: string; gitRemote?: string } = {
-    workspaceId: raw['workspaceId'],
-    paneId: raw['paneId'],
-  };
+type EndArg = { kind: A2aEndpointKind; workspaceId: string; paneId?: string; label?: string; workspaceName?: string; gitRemote?: string };
+
+/** An end argument from the app: kind and ids required, display fields passed through for the store to sanitize. */
+function endArg(raw: unknown): EndArg | null {
+  if (!isPlainObject(raw) || !isConsistentEndpoint(raw) || !isSafeId(raw['workspaceId'])) return null;
+  if (raw['kind'] === 'pane' && !isSafeId(raw['paneId'])) return null;
+  const out: EndArg = raw['kind'] === 'pane'
+    ? { kind: 'pane', workspaceId: raw['workspaceId'], paneId: raw['paneId'] as string }
+    : { kind: 'brain', workspaceId: raw['workspaceId'] };
   for (const key of ['label', 'workspaceName', 'gitRemote'] as const) {
     if (typeof raw[key] === 'string' && raw[key]) out[key] = raw[key];
   }

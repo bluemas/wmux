@@ -7,11 +7,12 @@ import {
   type A2aLinkRecordV1,
   type A2aLinkStatusResponse,
   type A2aRemoteErrorCode,
-  type HostId,
+  isAllowedEndpointPair,
+  isConsistentEndpoint,
 } from '../../shared/a2aRemote';
 import type { A2aRemoteLinkEvent } from '../../shared/rpc';
 import type { WebA2aPeer, WebA2aRoutes } from '../web/WebTerminalServer';
-import type { ExposedPaneCache } from './exposedPanes';
+import type { ExposedPaneCache, ExposureCheck } from './exposedPanes';
 import { linkFromProposal, type NewLinkInput } from './linkStore';
 import { A2A_REQUEST_BODY_MAX, readJsonBody, sendJson } from './server';
 import { errMsg, isPlainObject, isSafeId } from './storeFile';
@@ -45,8 +46,8 @@ export interface A2aRouteLinks {
 }
 
 export interface A2aRouteDeps {
-  exposures: { isPaneExposed(hostId: HostId, workspaceId: string, paneId: string): boolean };
-  panes: Pick<ExposedPaneCache, 'visibleTo'>;
+  exposures: ExposureCheck;
+  panes: Pick<ExposedPaneCache, 'visibleTo' | 'brain'>;
   links: A2aRouteLinks;
   /** Daemon -> app nudge (`pipeServer.broadcast`). */
   broadcast: (event: A2aRemoteLinkEvent) => void;
@@ -130,9 +131,11 @@ export function createA2aRoutes(deps: A2aRouteDeps): A2aRouteTable {
     }
     const proposal = parseProposal(body);
     if (!proposal) return refuse(res, 400, 'bad-request');
-    // The receiver's pane must be one this peer may see. Same answer whether
-    // the pane exists or not: nothing about unexposed panes leaks.
-    if (!deps.exposures.isPaneExposed(peer.hostId, proposal.to.workspaceId, proposal.to.paneId)) {
+    // Like with like only (no Moa <-> pane in v1), and the receiver's end
+    // must be one this peer may see: an exposed pane, or this PC's Moa while
+    // exposed and only under its current HQ. Same answer whether the end
+    // exists or not: nothing about unexposed panes leaks.
+    if (!isAllowedEndpointPair(proposal.from.kind, proposal.to.kind) || !mayLinkTo(peer, proposal.to)) {
       return refuse(res, 403, 'forbidden');
     }
     if (deps.links.get(proposal.linkId)) return refuse(res, 409, 'conflict', 'duplicate linkId');
@@ -180,6 +183,11 @@ export function createA2aRoutes(deps: A2aRouteDeps): A2aRouteTable {
     sendJson(res, 200, { ok: true, state: ended.state });
   });
 
+  function mayLinkTo(peer: WebA2aPeer, to: A2aLinkProposeRequest['to']): boolean {
+    if (to.kind === 'pane') return deps.exposures.isPaneExposed(peer.hostId, to.workspaceId, to.paneId ?? '');
+    return deps.exposures.isBrainExposed(peer.hostId) && deps.panes.brain()?.workspaceId === to.workspaceId;
+  }
+
   /** The link, when it exists AND belongs to the calling peer's host; otherwise answered here. */
   function ownedLink(linkId: string | undefined, peer: WebA2aPeer, res: http.ServerResponse): A2aLinkRecordV1 | null {
     const link = linkId && UUID_RE.test(linkId) ? deps.links.get(linkId) : undefined;
@@ -202,8 +210,8 @@ function parseProposal(raw: unknown): A2aLinkProposeRequest | null {
   if (!isPlainObject(raw)) return null;
   const { linkId, from, to, allow } = raw;
   if (typeof linkId !== 'string' || !UUID_RE.test(linkId)) return null;
-  if (!isPlainObject(from) || !isSafeId(from['workspaceId']) || !isSafeId(from['paneId'])) return null;
-  if (!isPlainObject(to) || !isSafeId(to['workspaceId']) || !isSafeId(to['paneId'])) return null;
+  if (!isPlainObject(from) || !isSafeEnd(from)) return null;
+  if (!isPlainObject(to) || !isSafeEnd(to)) return null;
   if (!isPlainObject(allow) || typeof allow['outbound'] !== 'boolean' || typeof allow['inbound'] !== 'boolean') return null;
   const optional = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
   const label = optional(from['label']);
@@ -212,13 +220,22 @@ function parseProposal(raw: unknown): A2aLinkProposeRequest | null {
   return {
     linkId,
     from: {
-      workspaceId: from['workspaceId'],
-      paneId: from['paneId'],
+      ...endOf(from),
       ...(label !== undefined ? { label } : {}),
       ...(workspaceName !== undefined ? { workspaceName } : {}),
       ...(gitRemote !== undefined ? { gitRemote } : {}),
     },
-    to: { workspaceId: to['workspaceId'], paneId: to['paneId'] },
+    to: endOf(to),
     allow: { outbound: allow['outbound'], inbound: allow['inbound'] },
   };
+}
+
+function isSafeEnd(e: Record<string, unknown>): boolean {
+  return isConsistentEndpoint(e) && isSafeId(e['workspaceId']) && (e['kind'] !== 'pane' || isSafeId(e['paneId']));
+}
+
+function endOf(e: Record<string, unknown>): A2aLinkProposeRequest['to'] {
+  return e['kind'] === 'pane'
+    ? { kind: 'pane', workspaceId: e['workspaceId'] as string, paneId: e['paneId'] as string }
+    : { kind: 'brain', workspaceId: e['workspaceId'] as string };
 }

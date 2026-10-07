@@ -803,6 +803,20 @@ export const IPC = {
   A2A_REMOTE_HOSTS_REMOVE: 'a2aRemote:hosts:remove',
   A2A_REMOTE_PEERS_LIST: 'a2aRemote:peers:list',
   A2A_REMOTE_PEERS_REVOKE: 'a2aRemote:peers:revoke',
+  // Exposure and pane links. SNAPSHOT is the renderer's whole pane tree (main
+  // diffs it for gone panes and publishes the exposed part); LINK_EVENT is the
+  // main → renderer push of daemon link nudges.
+  A2A_REMOTE_SNAPSHOT: 'a2aRemote:snapshot',
+  A2A_REMOTE_EXPOSURE_GET: 'a2aRemote:exposure:get',
+  A2A_REMOTE_EXPOSURE_SET: 'a2aRemote:exposure:set',
+  A2A_REMOTE_HOSTS_EXPOSED: 'a2aRemote:hosts:exposed',
+  A2A_REMOTE_LINKS_LIST: 'a2aRemote:links:list',
+  A2A_REMOTE_LINKS_PROPOSE: 'a2aRemote:links:propose',
+  A2A_REMOTE_LINKS_ACCEPT: 'a2aRemote:links:accept',
+  A2A_REMOTE_LINKS_REJECT: 'a2aRemote:links:reject',
+  A2A_REMOTE_LINKS_REVOKE: 'a2aRemote:links:revoke',
+  A2A_REMOTE_LINKS_REFRESH: 'a2aRemote:links:refresh',
+  A2A_REMOTE_LINK_EVENT: 'a2aRemote:link-event',
   // Scheduled runs (renderer → main → daemon `automation.*`). Invoke channels
   // resolve even with no daemon (empty lists / `{ ok:false }`). AUTOMATION_PUSH
   // carries daemon events and connect-time snapshots main → renderer;

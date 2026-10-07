@@ -1310,6 +1310,7 @@ export type McpDeclarePermissionsResult =
 // in the capability map: no plugin or MCP caller can declare them.
 
 import type {
+  A2aEndpointKind,
   A2aExposedPane,
   A2aExposureV1,
   A2aLinkRecordV1,
@@ -1459,10 +1460,12 @@ export type A2aRemoteLinkResult =
   | { ok: true; link: A2aLinkRecordV1; remoteNotified?: boolean }
   | { ok: false; error: A2aRemoteCallError; message?: string };
 
-/** The pane fields a joiner sends with its proposal (display only on the other PC). */
+/** One end of a joiner's proposal; names and repo are display only on the other PC. */
 export interface A2aRemoteProposePane {
+  kind: A2aEndpointKind;
   workspaceId: string;
-  paneId: string;
+  /** A pane end only; absent for Moa (`brain`). */
+  paneId?: string;
   label?: string;
   workspaceName?: string;
   gitRemote?: string;
@@ -1471,8 +1474,9 @@ export interface A2aRemoteProposePane {
 /** `a2a.remote.links.propose` params. */
 export interface A2aRemoteLinkProposeParams {
   hostId: string;
-  localPane: A2aRemoteProposePane;
-  remotePane: A2aRemoteProposePane;
+  /** Both ends must be the same kind (`isAllowedEndpointPair`). */
+  local: A2aRemoteProposePane;
+  remote: A2aRemoteProposePane;
   /** From THIS PC's point of view. */
   allow: { outbound: boolean; inbound: boolean };
 }
@@ -1480,7 +1484,28 @@ export interface A2aRemoteLinkProposeParams {
 /** `a2a.remote.local.paneGone` params: a bound pane or workspace went away here. */
 export interface A2aRemotePaneGoneParams {
   workspaceId: string;
-  /** Absent for `workspace-gone` (every pane of it). */
+  /** Absent for `workspace-gone` (every pane of it) and for `endpoint: 'brain'`. */
   paneId?: string;
   reason: 'pane-closed' | 'pane-moved' | 'workspace-gone';
+  /**
+   * 'brain': this PC's Moa went away (Moa turned off, or its HQ is gone):
+   * only the Moa links on HQ `workspaceId` break, as `workspace-gone`.
+   */
+  endpoint?: 'brain';
+}
+
+/**
+ * Renderer -> main (`IPC.A2A_REMOTE_SNAPSHOT`): every workspace and pane of
+ * this window, exposed or not. Main diffs consecutive snapshots for gone or
+ * moved panes (`a2a.remote.local.paneGone`) and publishes the panes of
+ * exposed workspaces, with their git remote, as `a2a.remote.exposure.publish`.
+ */
+export interface A2aRemotePaneSnapshot {
+  workspaces: Array<{
+    id: string;
+    name: string;
+    panes: Array<{ paneId: string; label?: string; agent?: string; cwd?: string; gitBranch?: string }>;
+  }>;
+  /** This PC's Moa: present while Moa is on and its HQ workspace exists. */
+  brain?: { workspaceId: string; name: string };
 }

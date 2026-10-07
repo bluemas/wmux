@@ -59,6 +59,13 @@ import type {
   LanLinkPeersListResult,
 } from '../shared/lanlink';
 import type {
+  A2aRemoteExposureGetResult,
+  A2aRemoteHostsExposedResult,
+  A2aRemoteLinkEvent,
+  A2aRemoteLinkProposeParams,
+  A2aRemoteLinkResult,
+  A2aRemoteLinksListResult,
+  A2aRemotePaneSnapshot,
   A2aRemoteHostsListResult,
   A2aRemoteHostsRemoveResult,
   A2aRemoteJoinResult,
@@ -1988,6 +1995,26 @@ document.addEventListener('DOMContentLoaded', () => {
     ipcRenderer.invoke(IPC.A2A_REMOTE_HOSTS_REMOVE, hostId) as Promise<A2aRemoteHostsRemoveResult>,
   peersList: () => ipcRenderer.invoke(IPC.A2A_REMOTE_PEERS_LIST) as Promise<A2aRemotePeersListResult>,
   peersRevoke: (peerId: string) => ipcRenderer.invoke(IPC.A2A_REMOTE_PEERS_REVOKE, peerId) as Promise<{ ok: boolean }>,
+  snapshot: (snapshot: A2aRemotePaneSnapshot) =>
+    ipcRenderer.invoke(IPC.A2A_REMOTE_SNAPSHOT, snapshot) as Promise<{ ok: boolean }>,
+  exposureGet: (hostId: string) =>
+    ipcRenderer.invoke(IPC.A2A_REMOTE_EXPOSURE_GET, hostId) as Promise<A2aRemoteExposureGetResult>,
+  exposureSet: (hostId: string, workspaceIds: string[], paneIds: Record<string, string[]>, brain: boolean) =>
+    ipcRenderer.invoke(IPC.A2A_REMOTE_EXPOSURE_SET, hostId, workspaceIds, paneIds, brain) as Promise<A2aRemoteExposureGetResult>,
+  hostsExposed: (hostId: string) =>
+    ipcRenderer.invoke(IPC.A2A_REMOTE_HOSTS_EXPOSED, hostId) as Promise<A2aRemoteHostsExposedResult>,
+  linksList: () => ipcRenderer.invoke(IPC.A2A_REMOTE_LINKS_LIST) as Promise<A2aRemoteLinksListResult>,
+  linksPropose: (params: A2aRemoteLinkProposeParams) =>
+    ipcRenderer.invoke(IPC.A2A_REMOTE_LINKS_PROPOSE, params) as Promise<A2aRemoteLinkResult>,
+  linksAccept: (linkId: string) => ipcRenderer.invoke(IPC.A2A_REMOTE_LINKS_ACCEPT, linkId) as Promise<A2aRemoteLinkResult>,
+  linksReject: (linkId: string) => ipcRenderer.invoke(IPC.A2A_REMOTE_LINKS_REJECT, linkId) as Promise<A2aRemoteLinkResult>,
+  linksRevoke: (linkId: string) => ipcRenderer.invoke(IPC.A2A_REMOTE_LINKS_REVOKE, linkId) as Promise<A2aRemoteLinkResult>,
+  linksRefresh: (linkId: string) => ipcRenderer.invoke(IPC.A2A_REMOTE_LINKS_REFRESH, linkId) as Promise<A2aRemoteLinkResult>,
+  onLinkEvent: (callback: (event: A2aRemoteLinkEvent) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: A2aRemoteLinkEvent) => callback(payload);
+    ipcRenderer.on(IPC.A2A_REMOTE_LINK_EVENT, listener);
+    return () => { ipcRenderer.removeListener(IPC.A2A_REMOTE_LINK_EVENT, listener); };
+  },
 };
 
 // wmux web — titlebar toggle bridge (renderer → main → daemon control pipe).

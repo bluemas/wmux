@@ -5,7 +5,11 @@ import { scheduleTokenFileReHarden } from '../../shared/security';
 import {
   A2A_REMOTE_RECORD_V,
   isA2aRemoteMessageKind,
+  isAllowedEndpointPair,
+  isConsistentEndpoint,
   isHostId,
+  type A2aEndpoint,
+  type A2aEndpointKind,
   type A2aLinkProposeRequest,
   type A2aLinkRecordV1,
   type A2aLinkState,
@@ -41,8 +45,9 @@ import {
  *                                                notice must name EXACTLY ours + 1)
  *   proposed-*|active --forgetHost---> revoked  (revoked-remote; peer revoked here)
  *
- * Limits: at most one non-terminal link per (local pane, remote host, remote
- * pane); at most `LINKS_PER_HOST_MAX` non-terminal links per remote host; the
+ * Ends are a pane or the host's Moa (`brain`); only like with like
+ * (`isAllowedEndpointPair`). Limits: at most one non-terminal link per (local
+ * end, remote host, remote end), and per remote host's Moa; at most `LINKS_PER_HOST_MAX` non-terminal links per remote host; the
  * newest `TERMINAL_KEEP` terminal links are kept, older ones are pruned.
  *
  * Corrupt file (bad JSON, bad record, two live links on one pane triple):
@@ -71,7 +76,8 @@ export type LinkNotice = NonNullable<A2aRemoteEnvelope['link']>;
 export type NewLinkInput = Pick<A2aLinkRecordV1, 'local' | 'remote' | 'allow'>;
 
 export type LinkCheckResult =
-  | { ok: true; link: A2aLinkRecordV1 }
+  /** `kind` is the link's end kind (both ends share it: isAllowedEndpointPair). */
+  | { ok: true; link: A2aLinkRecordV1; kind: A2aEndpointKind }
   | {
       ok: false;
       error: Extract<
@@ -100,11 +106,10 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 export function linkFromProposal(hostId: HostId, req: A2aLinkProposeRequest): NewLinkInput & { linkId: string } {
   return {
     linkId: req.linkId,
-    local: { workspaceId: req.to.workspaceId, paneId: req.to.paneId },
+    local: endpointOf(req.to),
     remote: {
       hostId,
-      workspaceId: req.from.workspaceId,
-      paneId: req.from.paneId,
+      ...endpointOf(req.from),
       ...(req.from.label !== undefined ? { label: req.from.label } : {}),
       ...(req.from.workspaceName !== undefined ? { workspaceName: req.from.workspaceName } : {}),
       ...(req.from.gitRemote !== undefined ? { gitRemote: req.from.gitRemote } : {}),
@@ -164,12 +169,17 @@ export class LinkStore {
   /** Every ACTIVE link on a local pane (a pane may link to several remote panes). */
   findActiveByLocalPane(workspaceId: string, paneId: string): A2aLinkRecordV1[] {
     return this.list().filter(
-      (r) => r.state === 'active' && r.local.workspaceId === workspaceId && r.local.paneId === paneId,
+      (r) => r.state === 'active' && r.local.kind === 'pane' && r.local.workspaceId === workspaceId && r.local.paneId === paneId,
     );
   }
 
+  /** Every ACTIVE link on this host's Moa (the brain of HQ `hqWorkspaceId`). */
+  findActiveByLocalBrain(hqWorkspaceId: string): A2aLinkRecordV1[] {
+    return this.list().filter((r) => r.state === 'active' && r.local.kind === 'brain' && r.local.workspaceId === hqWorkspaceId);
+  }
+
   /** Every ACTIVE link to one remote pane (it may link to several local panes). */
-  findActiveByRemote(hostId: HostId, workspaceId: string, paneId: string): A2aLinkRecordV1[] {
+  findActiveByRemote(hostId: HostId, workspaceId: string, paneId: string | undefined): A2aLinkRecordV1[] {
     return this.list().filter(
       (r) =>
         r.state === 'active' &&
@@ -334,14 +344,14 @@ export class LinkStore {
       if (TERMINAL.has(rec.state)) return { ok: false, error: 'link-not-active' };
       switch (notice.state) {
         case 'revoked':
-          return { ok: true, link: structuredClone(rec) };
+          return { ok: true, link: structuredClone(rec), kind: rec.local.kind };
         case 'active':
           if (rec.state !== 'proposed-out') return { ok: false, error: 'link-not-active' };
           if (notice.version !== rec.version + 1) return { ok: false, error: 'stale-link-version' };
-          return { ok: true, link: structuredClone(rec) };
+          return { ok: true, link: structuredClone(rec), kind: rec.local.kind };
         case 'broken':
           if (notice.version !== rec.version + 1) return { ok: false, error: 'stale-link-version' };
-          return { ok: true, link: structuredClone(rec) };
+          return { ok: true, link: structuredClone(rec), kind: rec.local.kind };
         default:
           return { ok: false, error: 'bad-request' };
       }
@@ -355,7 +365,7 @@ export class LinkStore {
     } else if (task?.onThisLink !== true) {
       return { ok: false, error: 'unknown-task' };
     }
-    return { ok: true, link: structuredClone(rec) };
+    return { ok: true, link: structuredClone(rec), kind: rec.local.kind };
   }
 
   // --- internals --------------------------------------------------------------
@@ -364,7 +374,7 @@ export class LinkStore {
     const clean = cleanNewLink(input);
     if (typeof clean === 'string') throw new Error(`link ${linkId}: ${clean}`);
     const live = [...this.links.values()].filter((r) => !TERMINAL.has(r.state));
-    const clash = live.find((r) => sameTriple(r, clean));
+    const clash = live.find((r) => sameEnds(r, clean));
     if (clash) throw new Error(`link ${linkId}: pane pair already linked by ${clash.linkId} (${clash.state})`);
     if (live.filter((r) => r.remote.hostId === clean.remote.hostId).length >= LINKS_PER_HOST_MAX) {
       throw new Error(`link ${linkId}: host ${clean.remote.hostId} already holds ${LINKS_PER_HOST_MAX} live links`);
@@ -441,14 +451,24 @@ export class LinkStore {
   }
 }
 
-function sameTriple(a: NewLinkInput, b: NewLinkInput): boolean {
-  return (
-    a.local.workspaceId === b.local.workspaceId &&
-    a.local.paneId === b.local.paneId &&
-    a.remote.hostId === b.remote.hostId &&
-    a.remote.workspaceId === b.remote.workspaceId &&
-    a.remote.paneId === b.remote.paneId
-  );
+/** A link end without the display fields (kind + workspaceId + paneId when a pane). */
+function endpointOf(e: { kind: A2aEndpointKind; workspaceId: string; paneId?: string }): A2aEndpoint {
+  return e.kind === 'pane' ? { kind: 'pane', workspaceId: e.workspaceId, paneId: e.paneId } : { kind: 'brain', workspaceId: e.workspaceId };
+}
+
+function sameEnd(a: A2aEndpoint, b: A2aEndpoint): boolean {
+  return a.kind === b.kind && a.workspaceId === b.workspaceId && a.paneId === b.paneId;
+}
+
+/**
+ * Would `b` duplicate live link `a`? The same (local end, remote host, remote
+ * end); and for Moa, any second link with the same remote host's Moa — an HQ
+ * that was recreated (new workspaceId) must not open a parallel link.
+ */
+function sameEnds(a: NewLinkInput, b: NewLinkInput): boolean {
+  if (a.remote.hostId !== b.remote.hostId) return false;
+  if (a.remote.kind === 'brain' && b.remote.kind === 'brain') return true;
+  return sameEnd(a.local, b.local) && sameEnd(a.remote, b.remote);
 }
 
 /**
@@ -456,21 +476,26 @@ function sameTriple(a: NewLinkInput, b: NewLinkInput): boolean {
  * control characters (they may come from a remote host); the label follows
  * the display-name rule and is dropped when empty.
  */
+/** A bounded end: known kind, safe workspaceId, and a safe paneId exactly when it is a pane. */
+function isSafeEnd(e: Record<string, unknown>): boolean {
+  return isConsistentEndpoint(e) && isSafeId(e['workspaceId']) && (e['kind'] !== 'pane' || isSafeId(e['paneId']));
+}
+
 function cleanNewLink(input: unknown): NewLinkInput | string {
   if (!isPlainObject(input)) return 'invalid link';
   const { local, remote, allow } = input;
-  if (!isPlainObject(local) || !isSafeId(local['workspaceId']) || !isSafeId(local['paneId'])) return 'invalid local pane';
+  if (!isPlainObject(local) || !isSafeEnd(local)) return 'invalid local end';
   if (
     !isPlainObject(remote) ||
     !isHostId(remote['hostId']) ||
-    !isSafeId(remote['workspaceId']) ||
-    !isSafeId(remote['paneId']) ||
+    !isSafeEnd(remote) ||
     (remote['label'] !== undefined && typeof remote['label'] !== 'string') ||
     (remote['workspaceName'] !== undefined && typeof remote['workspaceName'] !== 'string') ||
     (remote['gitRemote'] !== undefined && typeof remote['gitRemote'] !== 'string')
   ) {
-    return 'invalid remote pane';
+    return 'invalid remote end';
   }
+  if (!isAllowedEndpointPair(local['kind'] as A2aEndpointKind, remote['kind'] as A2aEndpointKind)) return 'endpoint pair not allowed';
   if (!isPlainObject(allow) || typeof allow['outbound'] !== 'boolean' || typeof allow['inbound'] !== 'boolean') {
     return 'invalid allow flags';
   }
@@ -478,11 +503,10 @@ function cleanNewLink(input: unknown): NewLinkInput | string {
   const workspaceName = remote['workspaceName'] === undefined ? '' : sanitizeName(remote['workspaceName'], '');
   const gitRemote = sanitizeRepoKey(remote['gitRemote']);
   return {
-    local: { workspaceId: local['workspaceId'], paneId: local['paneId'] },
+    local: endpointOf(local as unknown as A2aEndpoint),
     remote: {
       hostId: remote['hostId'],
-      workspaceId: remote['workspaceId'],
-      paneId: remote['paneId'],
+      ...endpointOf(remote as unknown as A2aEndpoint),
       ...(label ? { label } : {}),
       ...(workspaceName ? { workspaceName } : {}),
       ...(gitRemote ? { gitRemote } : {}),
@@ -512,7 +536,7 @@ function coerceFile(raw: unknown): A2aLinkRecordV1[] | null {
     }
     const clean = cleanNewLink(r);
     if (typeof clean === 'string') return null;
-    if (!TERMINAL.has(state as A2aLinkState) && out.some((o) => !TERMINAL.has(o.state) && sameTriple(o, clean))) return null;
+    if (!TERMINAL.has(state as A2aLinkState) && out.some((o) => !TERMINAL.has(o.state) && sameEnds(o, clean))) return null;
     seen.add(linkId);
     out.push({
       v: 1,
