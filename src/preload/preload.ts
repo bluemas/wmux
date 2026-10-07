@@ -704,6 +704,32 @@ const electronAPI = {
     set: (vendor: 'claude' | 'codex', on: boolean) =>
       ipcRenderer.invoke(IPC.ACCOUNT_ROTATION_SET, { vendor, on }) as Promise<{ ok: boolean }>,
   },
+  // agy (Antigravity CLI) accounts: one machine-wide sign-in, swapped by main.
+  // Snapshots carry emails, labels and quota fractions only — never a credential.
+  agyAccounts: {
+    list: () =>
+      ipcRenderer.invoke(IPC.AGY_ACCOUNT_LIST) as Promise<
+        import('../shared/agyAccounts').AgyAccountsSnapshot & {
+          login: import('../main/account/AgyAccountService').AgyLoginState;
+        }
+      >,
+    addCurrent: (label?: string) =>
+      ipcRenderer.invoke(IPC.AGY_ACCOUNT_ADD_CURRENT, { label }) as Promise<import('../shared/agyAccounts').AgyAccount>,
+    beginLogin: () =>
+      ipcRenderer.invoke(IPC.AGY_ACCOUNT_LOGIN_BEGIN) as Promise<import('../main/account/AgyAccountService').AgyLoginState>,
+    cancelLogin: () => ipcRenderer.invoke(IPC.AGY_ACCOUNT_LOGIN_CANCEL) as Promise<{ ok: boolean }>,
+    activate: (id: string) => ipcRenderer.invoke(IPC.AGY_ACCOUNT_ACTIVATE, { id }) as Promise<{ ok: boolean }>,
+    rename: (id: string, label: string) =>
+      ipcRenderer.invoke(IPC.AGY_ACCOUNT_RENAME, { id, label }) as Promise<{ ok: boolean }>,
+    remove: (id: string) => ipcRenderer.invoke(IPC.AGY_ACCOUNT_REMOVE, { id }) as Promise<{ ok: boolean }>,
+    setAutoRotate: (on: boolean) =>
+      ipcRenderer.invoke(IPC.AGY_ACCOUNT_SET_AUTO_ROTATE, { on }) as Promise<{ ok: boolean }>,
+    onChanged: (callback: () => void) => {
+      const listener = (): void => callback();
+      ipcRenderer.on(IPC.AGY_ACCOUNT_CHANGED, listener);
+      return () => { ipcRenderer.removeListener(IPC.AGY_ACCOUNT_CHANGED, listener); };
+    },
+  },
   // Scheduled runs. Invokes pass through to the daemon's automation.* RPCs and
   // never reject for a missing daemon (empty lists / `{ ok:false }`). onPush
   // carries daemon events + connect-time snapshots; onOpenRun is an OS toast
@@ -860,6 +886,26 @@ const electronAPI = {
         ipcRenderer.invoke(IPC.DECK_MOA_DELEGATED_APPROVALS) as Promise<{ approvals: import('../shared/moa').MoaDelegatedApproval[] }>,
       delegatedAnswer: (args: { approvalId: string; choiceKey: string; promptFingerprint: string }) =>
         ipcRenderer.invoke(IPC.DECK_MOA_DELEGATED_ANSWER, args) as Promise<import('../shared/moa').MoaApprovalAnswerResult>,
+      // Moa's delegate (moa_ask tickets): list, answer an escalated one, the
+      // per-rule auto toggle, and main's change events. Owner-only: no pipe
+      // route reaches these.
+      delegateList: () =>
+        ipcRenderer.invoke(IPC.DECK_MOA_DELEGATE_LIST) as Promise<import('../shared/moaDecision').MoaDelegateListResult>,
+      delegateResolve: (args: import('../shared/moaDecision').MoaResolveRequest) =>
+        ipcRenderer.invoke(IPC.DECK_MOA_DELEGATE_RESOLVE, args) as Promise<import('../shared/moaDecision').MoaResolveResult>,
+      delegateAutoSet: (args: import('../shared/moaDecision').MoaAutoRuleSetRequest) =>
+        ipcRenderer.invoke(IPC.DECK_MOA_DELEGATE_AUTO_SET, args) as Promise<import('../shared/moaDecision').MoaAutoRuleSetResult>,
+      // Decision events; the lane audit's MoaAuditEvent rides the same channel.
+      onDelegateDecision: (callback: (event: import('../shared/moaDecision').MoaDecisionEvent | import('../shared/moaDecision').MoaAuditEvent) => void) => {
+        const listener = (_e: Electron.IpcRendererEvent, data: import('../shared/moaDecision').MoaDecisionEvent | import('../shared/moaDecision').MoaAuditEvent): void => callback(data);
+        ipcRenderer.on(IPC.DECK_MOA_DELEGATE_DECISION_EVENT, listener);
+        return () => { ipcRenderer.removeListener(IPC.DECK_MOA_DELEGATE_DECISION_EVENT, listener); };
+      },
+      onDelegateEffect: (callback: (event: import('../shared/moaDecision').MoaEffectEvent) => void) => {
+        const listener = (_e: Electron.IpcRendererEvent, data: import('../shared/moaDecision').MoaEffectEvent): void => callback(data);
+        ipcRenderer.on(IPC.DECK_MOA_DELEGATE_EFFECT_EVENT, listener);
+        return () => { ipcRenderer.removeListener(IPC.DECK_MOA_DELEGATE_EFFECT_EVENT, listener); };
+      },
       // Moa's hand-offs: answer a hand-off card (a body only when the operator
       // edited it), the recent auto hand-offs, and stopping one of them.
       handoffResolve: (args: import('../shared/moaHandoff').MoaHandoffResolveRequest) =>
