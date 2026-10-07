@@ -37,8 +37,8 @@ function activeLink(allow = { outbound: true, inbound: true }, label = 'codex', 
   const linkId = crypto.randomUUID();
   links.receiveProposal({
     linkId,
-    local: { workspaceId: 'ws-a', paneId: 'pane-a' },
-    remote: { hostId: HOST, workspaceId: 'ws-b', paneId: remotePane, label },
+    local: { kind: 'pane', workspaceId: 'ws-a', paneId: 'pane-a' },
+    remote: { hostId: HOST, kind: 'pane', workspaceId: 'ws-b', paneId: remotePane, label },
     allow,
   });
   links.accept(linkId);
@@ -50,12 +50,13 @@ const FROM = { workspaceId: 'ws-a', name: 'Frontend', paneId: 'pane-a' };
 describe('listRemoteTargets', () => {
   it('lists active links only, with their alias and direction flag', () => {
     const linkId = activeLink({ outbound: false, inbound: true });
-    links.proposeOut({ local: { workspaceId: 'ws-a', paneId: 'p2' }, remote: { hostId: HOST, workspaceId: 'w', paneId: 'p' }, allow: { outbound: true, inbound: true } });
+    links.proposeOut({ local: { kind: 'pane', workspaceId: 'ws-a', paneId: 'p2' }, remote: { hostId: HOST, kind: 'pane', workspaceId: 'w', paneId: 'p' }, allow: { outbound: true, inbound: true } });
     expect(listRemoteTargets(deps)).toEqual([
       {
         alias: 'pc-b/ws-b/codex',
         linkId,
         hostId: HOST,
+        kind: 'pane',
         local: { workspaceId: 'ws-a', paneId: 'pane-a' },
         remote: { workspaceId: 'ws-b', paneId: 'pane-b', label: 'codex' },
         allowOutbound: false,
@@ -101,6 +102,48 @@ describe('sendRemoteTask', () => {
     const res = await sendRemoteTask(deps, { linkId, from: FROM, title: '', text: 'x' });
     expect(res).toMatchObject({ ok: false });
     expect(tasks.getTask(remoteTaskId(linkId, 'msg-1'))!.status.state).toBe('canceled');
+  });
+});
+
+describe('sendRemoteTask — brain link (Moa to Moa)', () => {
+  function brainLink(): string {
+    const linkId = crypto.randomUUID();
+    links.receiveProposal({
+      linkId,
+      local: { kind: 'brain', workspaceId: 'ws-hq' },
+      remote: { hostId: HOST, kind: 'brain', workspaceId: 'ws-rhq' },
+      allow: { outbound: true, inbound: true },
+    });
+    links.accept(linkId);
+    return linkId;
+  }
+  const MOA = { workspaceId: 'ws-hq', name: 'Moa' };
+
+  it('lists the link as a brain target without pane ids', () => {
+    const linkId = brainLink();
+    expect(listRemoteTargets(deps)).toEqual([
+      { alias: 'pc-b/Moa', linkId, hostId: HOST, kind: 'brain', local: { workspaceId: 'ws-hq' }, remote: { workspaceId: 'ws-rhq' }, allowOutbound: true },
+    ]);
+  });
+
+  it('Moa sends as its HQ workspace with no pane', async () => {
+    const linkId = brainLink();
+    const res = await sendRemoteTask(deps, { linkId, from: MOA, title: '', text: 'summarize the build' });
+    expect(res).toEqual({ ok: true, taskId: remoteTaskId(linkId, 'msg-1') });
+    expect(tasks.getTask(remoteTaskId(linkId, 'msg-1'))!.metadata.from).toEqual(MOA);
+    expect(outbox.pending(HOST)).toHaveLength(1);
+  });
+
+  it('refuses a pane sender or another workspace on a brain link', async () => {
+    const linkId = brainLink();
+    expect(await sendRemoteTask(deps, { linkId, from: { ...MOA, paneId: 'pane-a' }, title: '', text: 'x' })).toMatchObject({ ok: false });
+    expect(await sendRemoteTask(deps, { linkId, from: { ...MOA, workspaceId: 'ws-a' }, title: '', text: 'x' })).toMatchObject({ ok: false });
+    expect(outbox.pending(HOST)).toEqual([]);
+  });
+
+  it('a pane link refuses a sender without a pane', async () => {
+    const linkId = activeLink();
+    expect(await sendRemoteTask(deps, { linkId, from: { workspaceId: 'ws-a', name: 'Moa' }, title: '', text: 'x' })).toMatchObject({ ok: false });
   });
 });
 

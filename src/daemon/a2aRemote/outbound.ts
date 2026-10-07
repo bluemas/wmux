@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import {
+  A2A_BRAIN_ALIAS,
   A2A_REMOTE_BODY_MAX,
   A2A_REMOTE_PROTOCOL,
   type A2aLinkRecordV1,
@@ -47,7 +48,9 @@ export interface OutboundDeps {
  * part is the label, else the pane id.
  */
 export function linkAlias(link: A2aLinkRecordV1, hostName: string | undefined): string {
-  return remoteAlias(hostName || link.remote.hostId.slice(0, 8), link.remote.workspaceId, link.remote.label || link.remote.paneId);
+  const pc = hostName || link.remote.hostId.slice(0, 8);
+  if (link.remote.kind === 'brain') return `${pc.replace(/\//g, '-')}/${A2A_BRAIN_ALIAS}`;
+  return remoteAlias(pc, link.remote.workspaceId, link.remote.label || link.remote.paneId || '');
 }
 
 /** Every ACTIVE link as an addressable target. */
@@ -59,8 +62,13 @@ export function listRemoteTargets(deps: Pick<OutboundDeps, 'linkStore' | 'aliasF
       alias: deps.aliasFor(l),
       linkId: l.linkId,
       hostId: l.remote.hostId,
-      local: { ...l.local },
-      remote: { workspaceId: l.remote.workspaceId, paneId: l.remote.paneId, ...(l.remote.label ? { label: l.remote.label } : {}) },
+      kind: l.local.kind,
+      local: { workspaceId: l.local.workspaceId, ...(l.local.paneId ? { paneId: l.local.paneId } : {}) },
+      remote: {
+        workspaceId: l.remote.workspaceId,
+        ...(l.remote.paneId ? { paneId: l.remote.paneId } : {}),
+        ...(l.remote.label ? { label: l.remote.label } : {}),
+      },
       allowOutbound: l.allow.outbound,
     }));
 }
@@ -74,7 +82,12 @@ export function listRemoteTargets(deps: Pick<OutboundDeps, 'linkStore' | 'aliasF
 export async function sendRemoteTask(deps: OutboundDeps, input: A2aRemoteSendTaskInput): Promise<OutboundResult> {
   const link = deps.linkStore.get(input.linkId);
   if (!link) return { ok: false, error: 'unknown-link' };
-  if (link.local.workspaceId !== input.from.workspaceId || link.local.paneId !== input.from.paneId) {
+  if (link.local.kind === 'brain') {
+    // Moa sends as its HQ workspace; main proved it from the commander token.
+    if (link.local.workspaceId !== input.from.workspaceId || input.from.paneId !== undefined) {
+      return { ok: false, error: 'forbidden: only this PC\'s Moa may send on this link' };
+    }
+  } else if (!input.from.paneId || link.local.workspaceId !== input.from.workspaceId || link.local.paneId !== input.from.paneId) {
     return { ok: false, error: 'forbidden: only the linked local pane may send on this link' };
   }
   const check = deps.linkStore.checkMessage(link.linkId, link.version, link.remote.hostId, 'outbound', 'task');

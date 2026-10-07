@@ -24,6 +24,7 @@ const target: A2aRemoteTarget = {
   alias: ALIAS,
   linkId: LINK,
   hostId: HOST,
+  kind: 'pane',
   local: { workspaceId: 'ws-a', paneId: 'pane-a' },
   remote: { workspaceId: 'ws-b', paneId: 'pane-b', label: 'codex' },
   allowOutbound: true,

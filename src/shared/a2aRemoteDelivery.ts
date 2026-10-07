@@ -8,7 +8,7 @@
 //
 // Pure module: no node:* imports (the renderer imports it).
 
-import type { A2aRemoteTaskMarkerV1, HostId } from './a2aRemote';
+import type { A2aEndpointKind, A2aRemoteTaskMarkerV1, HostId } from './a2aRemote';
 import type { Task } from './types';
 
 /**
@@ -84,17 +84,25 @@ export interface A2aRemoteTarget {
   alias: string;
   linkId: string;
   hostId: HostId;
-  /** The local pane bound to the link: the only pane that may send on it. */
-  local: { workspaceId: string; paneId: string };
-  remote: { workspaceId: string; paneId: string; label?: string };
+  /** Both ends' kind (`isAllowedEndpointPair`: always the same on a link). */
+  kind: A2aEndpointKind;
+  /**
+   * The local end bound to the link: the only sender on it. A pane end has a
+   * `paneId`; a brain end (this PC's Moa) has none.
+   */
+  local: { workspaceId: string; paneId?: string };
+  remote: { workspaceId: string; paneId?: string; label?: string };
   /** `link.allow.outbound`: this side may start new tasks on the link. */
   allowOutbound: boolean;
 }
 
 export interface A2aRemoteSendTaskInput {
   linkId: string;
-  /** The verified sender pane (must be the link's local pane) and its pty now. */
-  from: { workspaceId: string; name: string; paneId: string; ptyId?: string };
+  /**
+   * The verified sender: the link's local pane and its pty now, or — on a
+   * brain link — this PC's Moa (its HQ workspace, no pane).
+   */
+  from: { workspaceId: string; name: string; paneId?: string; ptyId?: string };
   title: string;
   text: string;
 }
@@ -150,6 +158,15 @@ export const A2A_REMOTE_HOLD_TTL_MS = 24 * 60 * 60 * 1000;
 /** The local side of a remote task: the party whose workspace is not `remote:`. */
 export function localSideOf(task: Pick<Task, 'metadata'>): 'from' | 'to' {
   return isRemoteWorkspaceId(task.metadata.from.workspaceId) ? 'to' : 'from';
+}
+
+/**
+ * A remote task on a brain link: its local side is this PC's Moa, which owns
+ * no pane, so the local party carries no `paneId` (a pane link's always does).
+ * Delivered as an event that wakes Moa, never written to a terminal.
+ */
+export function isBrainRemoteTask(task: Pick<Task, 'metadata'>): boolean {
+  return !task.metadata[localSideOf(task)].paneId;
 }
 
 // ─── Renderer delivery result ───────────────────────────────────────────────

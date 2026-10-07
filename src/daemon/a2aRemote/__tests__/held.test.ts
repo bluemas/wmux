@@ -35,8 +35,8 @@ beforeEach(() => {
   linkId = crypto.randomUUID();
   links.receiveProposal({
     linkId,
-    local: { workspaceId: 'ws-b', paneId: 'pane-b' },
-    remote: { hostId: HOST, workspaceId: 'ws-a', paneId: 'pane-a' },
+    local: { kind: 'pane', workspaceId: 'ws-b', paneId: 'pane-b' },
+    remote: { hostId: HOST, kind: 'pane', workspaceId: 'ws-a', paneId: 'pane-a' },
     allow: { outbound: true, inbound: true },
   });
   links.accept(linkId);

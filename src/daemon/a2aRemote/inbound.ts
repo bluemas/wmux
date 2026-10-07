@@ -1,4 +1,5 @@
 import {
+  A2A_BRAIN_ALIAS,
   A2A_REMOTE_BODY_MAX,
   A2A_REMOTE_PROTOCOL,
   isA2aRemoteMessageKind,
@@ -73,11 +74,14 @@ export async function acceptInbound(
         id: taskId,
         title: text.split('\n', 1)[0].slice(0, 100),
         from: { workspaceId: remoteWs, name: deps.aliasFor(link) },
-        to: {
-          workspaceId: link.local.workspaceId,
-          name: deps.localWorkspaceName?.(link.local.workspaceId) ?? link.local.workspaceId,
-          paneId: link.local.paneId,
-        },
+        // A brain end is this PC's Moa: its HQ workspace, no pane.
+        to: link.local.kind === 'brain'
+          ? { workspaceId: link.local.workspaceId, name: A2A_BRAIN_ALIAS }
+          : {
+            workspaceId: link.local.workspaceId,
+            name: deps.localWorkspaceName?.(link.local.workspaceId) ?? link.local.workspaceId,
+            paneId: link.local.paneId,
+          },
         history: [textMessage(env.messageId, 'user', text)],
         remote: { v: 1, linkId: link.linkId, hostId: peer.hostId, messageId: env.messageId, direction: 'inbound', delivered: false },
       },

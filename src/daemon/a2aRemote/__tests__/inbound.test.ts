@@ -46,9 +46,9 @@ function activeLink(allow = { outbound: true, inbound: true }): string {
   const linkId = crypto.randomUUID();
   links.receiveProposal({
     linkId,
-    local: { workspaceId: 'ws-b', paneId: 'pane-b' },
+    local: { kind: 'pane', workspaceId: 'ws-b', paneId: 'pane-b' },
     // A distinct remote pane per link: one pane pair holds one live link.
-    remote: { hostId: HOST, workspaceId: 'ws-a', paneId: linkCount++ === 0 ? 'pane-a' : `pane-a${linkCount}`, label: 'claude' },
+    remote: { hostId: HOST, kind: 'pane', workspaceId: 'ws-a', paneId: linkCount++ === 0 ? 'pane-a' : `pane-a${linkCount}`, label: 'claude' },
     allow,
   });
   links.accept(linkId); // version 2
@@ -180,8 +180,8 @@ describe('acceptInbound — reply and state', () => {
 describe('acceptInbound — link notices', () => {
   it('applies a remote accept once; the redelivery is a duplicate', async () => {
     const out = links.proposeOut({
-      local: { workspaceId: 'ws-b', paneId: 'pane-b' },
-      remote: { hostId: HOST, workspaceId: 'ws-a', paneId: 'pane-a' },
+      local: { kind: 'pane', workspaceId: 'ws-b', paneId: 'pane-b' },
+      remote: { hostId: HOST, kind: 'pane', workspaceId: 'ws-a', paneId: 'pane-a' },
       allow: { outbound: true, inbound: true },
     });
     const notice = env(out.linkId, { kind: 'link', text: undefined, link: { state: 'active', version: 2 } });
@@ -207,5 +207,32 @@ describe('acceptInbound — link notices', () => {
       .toMatchObject({ ok: false, error: 'bad-request' });
     expect(await acceptInbound(env(linkId, { kind: 'link', text: undefined, link: { state: 'broken', version: 3, reason: 'pane-closed' } }), peer, deps))
       .toEqual({ ok: true, duplicate: false });
+  });
+});
+
+describe('acceptInbound — brain link (Moa to Moa)', () => {
+  function brainLink(): string {
+    const linkId = crypto.randomUUID();
+    links.receiveProposal({
+      linkId,
+      local: { kind: 'brain', workspaceId: 'ws-hq' },
+      remote: { hostId: HOST, kind: 'brain', workspaceId: 'ws-rhq' },
+      allow: { outbound: true, inbound: true },
+    });
+    links.accept(linkId);
+    return linkId;
+  }
+
+  it('lands the task on this PC\'s Moa: HQ workspace, no pane, same broadcast', async () => {
+    const linkId = brainLink();
+    deps.aliasFor = () => 'pc-a/Moa';
+    const e = env(linkId, {});
+    const res = await acceptInbound(e, peer, deps);
+    const id = remoteTaskId(linkId, e.messageId);
+    expect(res).toEqual({ ok: true, taskId: id, duplicate: false });
+    const t = tasks.getTask(id)!;
+    expect(t.metadata.from).toEqual({ workspaceId: `remote:${linkId}`, name: 'pc-a/Moa' });
+    expect(t.metadata.to).toEqual({ workspaceId: 'ws-hq', name: 'Moa' });
+    expect(broadcast).toHaveBeenCalledWith({ type: 'a2a.remote.inbound', taskId: id });
   });
 });
