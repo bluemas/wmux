@@ -119,11 +119,13 @@ export function shouldShowMemoryChip(
 }
 
 /**
- * Whether the CPU chip draws. Only while the memory chip is up, and never at a
- * reading that rounds to 0% — DESIGN.md: a chip at zero is not drawn.
+ * Whether the CPU chip draws (only ever while the memory chip is up). Never at
+ * a reading that rounds to 0% — DESIGN.md: a chip at zero is not drawn. It
+ * appears at 1% and stays down to 0.5%, so an idle session hovering around the
+ * rounding edge does not blink the chip on every poll.
  */
-export function shouldShowCpuChip(percent: number | null): percent is number {
-  return percent !== null && Math.round(percent) > 0;
+export function shouldShowCpuChip(percent: number | null, wasShown: boolean): boolean {
+  return percent !== null && percent >= (wasShown ? 0.5 : 1);
 }
 
 /** CPU chip text: wmux + all its child processes, percent of the whole machine. */
@@ -143,6 +145,7 @@ export function StatusClockTime() {
   const [memBytes, setMemBytes] = useState<number | null>(null);
   // CPU of wmux and its children, read with the memory figure and shown beside it.
   const [cpuPercent, setCpuPercent] = useState<number | null>(null);
+  const [cpuShown, setCpuShown] = useState(false);
   // Whether the chip is on screen. State, because it also picks the poll
   // cadence — there is no reason to ask main for a number every 5 s while
   // nothing is rendering it.
@@ -177,8 +180,12 @@ export function StatusClockTime() {
         setMemShown(shouldShowMemoryChip(bytes, memBaseline.current, memShownRef.current));
       }).catch(() => { /* main not ready / handler swapped — keep last value */ });
       void Promise.resolve(window.electronAPI.system.getCpuUsage?.()).then((percent) => {
-        if (cancelled || typeof percent !== 'number') return;
-        setCpuPercent(percent);
+        if (cancelled) return;
+        // No reading (sampling failed or not supported) clears the chip rather
+        // than leaving the last figure on screen.
+        const value = typeof percent === 'number' ? percent : null;
+        setCpuPercent(value);
+        setCpuShown((was) => shouldShowCpuChip(value, was));
       }).catch(() => { /* no reading this tick — keep last value */ });
     };
     update();
@@ -193,7 +200,7 @@ export function StatusClockTime() {
       {memShown && memBytes !== null && (
         <span data-statusbar-memory className="tabular-nums">{formatMemoryChip(memBytes)}</span>
       )}
-      {memShown && memBytes !== null && shouldShowCpuChip(cpuPercent) && (
+      {memShown && memBytes !== null && cpuShown && cpuPercent !== null && (
         <span data-statusbar-cpu className="tabular-nums">{formatCpuChip(cpuPercent)}</span>
       )}
       {clockVisible && <span data-statusbar-clock>{timeStr}</span>}

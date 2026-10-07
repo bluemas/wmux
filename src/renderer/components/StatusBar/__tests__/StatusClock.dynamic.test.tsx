@@ -16,6 +16,7 @@ import {
   StatusClockTime,
   formatMemoryChip,
   memoryChipLevel,
+  shouldShowCpuChip,
   shouldShowMemoryChip,
 } from '../StatusClock';
 import { useStore } from '../../../stores';
@@ -118,6 +119,14 @@ describe('StatusClockTime', () => {
     stubMemory(2 * 1024 * 1024 * 1024);
     await mount();
     expect(container.querySelector('[data-statusbar-memory]')?.textContent).toBe('2048MB');
+  });
+
+  it('holds the CPU chip across the rounding edge instead of blinking', () => {
+    expect(shouldShowCpuChip(0.7, false)).toBe(false);
+    expect(shouldShowCpuChip(1, false)).toBe(true);
+    expect(shouldShowCpuChip(0.7, true)).toBe(true);
+    expect(shouldShowCpuChip(0.4, true)).toBe(false);
+    expect(shouldShowCpuChip(null, true)).toBe(false);
   });
 
   it('draws the CPU chip beside the memory chip, but not at 0%', async () => {
