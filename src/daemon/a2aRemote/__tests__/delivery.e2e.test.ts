@@ -5,7 +5,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { A2A_ROUTES, formatPeerCredential, type A2aLinkRecordV1 } from '../../../shared/a2aRemote';
 import { A2A_REMOTE_NOTIFY_METHOD, A2A_REMOTE_RPC } from '../../../shared/a2aRemoteDelivery';
 import type { DaemonConfig } from '../../types';
@@ -27,8 +27,12 @@ import { A2aServer } from '../server';
 import type { SessionClient } from '../session';
 import { freePort } from './a2aServerRig';
 
-const FAST = { connectMs: 2_000, requestMs: 4_000 };
-const TIMING = { backoffMinMs: 30, backoffMaxMs: 150, livenessMs: 3_000, connectMs: 2_000, requestMs: 4_000 };
+// Two PCs each mint a certificate and every step is a TLS handshake: slow CI
+// runners (Windows) need far more than the default per-test budget.
+vi.setConfig({ testTimeout: 60_000, hookTimeout: 30_000 });
+
+const FAST = { connectMs: 5_000, requestMs: 10_000 };
+const TIMING = { backoffMinMs: 30, backoffMaxMs: 150, livenessMs: 10_000, connectMs: 5_000, requestMs: 10_000 };
 
 type Rpc = (method: string, params?: Record<string, unknown>) => Promise<unknown>;
 
@@ -216,7 +220,7 @@ async function linked(a: Pc, b: Pc): Promise<string> {
   return linkId;
 }
 
-async function until(cond: () => boolean, ms = 8_000): Promise<void> {
+async function until(cond: () => boolean, ms = 30_000): Promise<void> {
   const end = Date.now() + ms;
   while (!cond()) {
     if (Date.now() > end) throw new Error('timed out waiting');
@@ -302,7 +306,7 @@ describe('cross-host delivery, end to end', () => {
     await until(() => a.delivery.status()[0]?.state !== 'connected');
 
     b = await makePc('PC-B', { dir: bDir, port: bPort });
-    await until(() => taskSends(b).length === 1, 10_000);
+    await until(() => taskSends(b).length === 1);
     expect(taskSends(b)[0]).toMatchObject({ presetTaskId: taskId });
     // B -> A: still exactly the one task from before the restart.
     const more = (await b.rpc(A2A_REMOTE_RPC.sendTask, {
@@ -435,7 +439,7 @@ describe('cross-host delivery, end to end', () => {
         const res = (await b.rpc(A2A_REMOTE_RPC.held)) as { tasks: Array<{ id: string; metadata: { remote: { held?: string } } }> };
         return res.tasks.find((t) => t.id === taskId)?.metadata.remote.held;
       };
-      const end = Date.now() + 5_000;
+      const end = Date.now() + 30_000;
       while ((await held()) !== 'delivery-unconfirmed') {
         if (Date.now() > end) throw new Error('not held');
         await new Promise((r) => setTimeout(r, 50));
