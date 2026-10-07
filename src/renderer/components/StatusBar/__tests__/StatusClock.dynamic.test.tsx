@@ -76,9 +76,12 @@ describe('formatMemoryChip', () => {
 let container: HTMLDivElement;
 let root: Root;
 
-function stubMemory(bytes: number): void {
+function stubMemory(bytes: number, cpuPercent?: number): void {
   (window as unknown as { electronAPI: unknown }).electronAPI = {
-    system: { getMemoryUsage: vi.fn(async () => bytes) },
+    system: {
+      getMemoryUsage: vi.fn(async () => bytes),
+      ...(cpuPercent === undefined ? {} : { getCpuUsage: vi.fn(async () => cpuPercent) }),
+    },
   };
 }
 
@@ -115,6 +118,18 @@ describe('StatusClockTime', () => {
     stubMemory(2 * 1024 * 1024 * 1024);
     await mount();
     expect(container.querySelector('[data-statusbar-memory]')?.textContent).toBe('2048MB');
+  });
+
+  it('draws the CPU chip beside the memory chip, but not at 0%', async () => {
+    stubMemory(2 * 1024 * 1024 * 1024, 0.4);
+    await mount();
+    expect(container.querySelector('[data-statusbar-memory]')).not.toBeNull();
+    expect(container.querySelector('[data-statusbar-cpu]')).toBeNull();
+    act(() => root.unmount());
+    root = createRoot(container);
+    stubMemory(2 * 1024 * 1024 * 1024, 12.6);
+    await mount();
+    expect(container.querySelector('[data-statusbar-cpu]')?.textContent).toBe('CPU 13%');
   });
 
   it('shows the clock only when the setting asks for it', async () => {

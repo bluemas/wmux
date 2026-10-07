@@ -118,6 +118,14 @@ export function shouldShowMemoryChip(
   return bytes >= (wasShown ? level * MEMORY_CHIP_HYSTERESIS : level);
 }
 
+/**
+ * Whether the CPU chip draws. Only while the memory chip is up, and never at a
+ * reading that rounds to 0% — DESIGN.md: a chip at zero is not drawn.
+ */
+export function shouldShowCpuChip(percent: number | null): percent is number {
+  return percent !== null && Math.round(percent) > 0;
+}
+
 /** CPU chip text: wmux + all its child processes, percent of the whole machine. */
 export function formatCpuChip(percent: number): string {
   return `CPU ${Math.round(percent)}%`;
@@ -183,10 +191,10 @@ export function StatusClockTime() {
   return (
     <>
       {memShown && memBytes !== null && (
-        <span data-statusbar-memory>{formatMemoryChip(memBytes)}</span>
+        <span data-statusbar-memory className="tabular-nums">{formatMemoryChip(memBytes)}</span>
       )}
-      {memShown && memBytes !== null && cpuPercent !== null && (
-        <span data-statusbar-cpu>{formatCpuChip(cpuPercent)}</span>
+      {memShown && memBytes !== null && shouldShowCpuChip(cpuPercent) && (
+        <span data-statusbar-cpu className="tabular-nums">{formatCpuChip(cpuPercent)}</span>
       )}
       {clockVisible && <span data-statusbar-clock>{timeStr}</span>}
     </>
