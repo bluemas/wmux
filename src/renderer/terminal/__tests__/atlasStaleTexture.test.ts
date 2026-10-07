@@ -71,20 +71,26 @@ class FakeCanvas {
   height = 0;
   style = {};
   private readonly _ctx = new Proxy(new FakeCtx(), {
-    get: (t, p) => (p in t ? t[p as string] : () => {}),
+    get: (t, p) => (p in t ? t[p as string] : () => { /* every other 2D call is a no-op */ }),
     set: (t, p, v) => ((t[p as string] = v), true),
   });
   getContext(): unknown {
     return this._ctx;
   }
-  remove(): void {}
+  remove(): void { /* never attached to a document */ }
 }
 
 const col = (r: number, g: number, b: number) => ({
   css: `rgb(${r},${g},${b})`,
   rgba: ((r << 24) | (g << 16) | (b << 8) | 255) >>> 0,
 });
-const noCache = { setColor() {}, getColor() { return undefined; }, setCss() {}, getCss() { return undefined; }, clear() {} };
+const noCache = {
+  setColor() { /* no cache: nothing to store */ },
+  getColor() { return undefined; },
+  setCss() { /* no cache: nothing to store */ },
+  getCss() { return undefined; },
+  clear() { /* no cache: nothing to clear */ },
+};
 const CONFIG = {
   customGlyphs: true, devicePixelRatio: 2, deviceMaxTextureSize: 4096, letterSpacing: 0, lineHeight: 1,
   fontSize: 13, fontFamily: 'monospace', fontWeight: 'normal', fontWeightBold: 'bold',
@@ -185,7 +191,7 @@ function fakeGl(uploads: Map<number, unknown>): unknown {
     activeTexture: (unit: number) => { active = unit; },
     texImage2D: (...args: unknown[]) => { uploads.set(active, args[args.length - 1]); },
   };
-  return new Proxy(gl, { get: (t, p) => (p in t ? t[p as string] : typeof p === 'string' && /^[A-Z_0-9]+$/.test(p) ? 0 : () => {}) });
+  return new Proxy(gl, { get: (t, p) => (p in t ? t[p as string] : typeof p === 'string' && /^[A-Z_0-9]+$/.test(p) ? 0 : () => { /* every other GL call is a no-op */ }) });
 }
 
 describe('addon-webgl atlas texture upload (I6) — two cap merges in a row', () => {
