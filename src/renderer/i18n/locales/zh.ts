@@ -589,6 +589,7 @@ export const zh = {
   'settings.sc.toggleToolbarPin': '固定 / 取消固定智能体工具栏',
   'settings.sc.openWorktaskCleanup': '打开任务清理列表',
   'settings.sc.showGitDiff': '显示 Git 差异',
+  'settings.sc.renameTab': '重命名标签',
   'settings.sc.unset': '未设置',
   'mention.title': '提及智能体',
   'mention.placeholder': '提及智能体…',
@@ -993,6 +994,7 @@ export const zh = {
 
   // Pane stash (#977) — the pane leaves the layout, its session keeps running.
   'pane.rename': '重命名面板',
+  'pane.renameTab': '重命名标签',
   'pane.stash': '收起面板',
   'pane.stashHint': '从布局中移除 — 会话继续运行',
   'pane.unstash': '取回',
@@ -1013,6 +1015,7 @@ export const zh = {
   'palette.cmd.toggleToolbarPin': '固定 / 取消固定智能体工具栏',
   'palette.cmd.openWorktaskCleanup': '打开任务清理列表',
   'palette.cmd.showGitDiff': '显示 Git 差异',
+  'palette.cmd.renameTab': '重命名标签',
   'palette.cmd.showTaskDiff': '显示任务差异',
   'worktask.cleanup.title': '任务清理列表',
   'worktask.cleanup.rescan': '重新扫描',

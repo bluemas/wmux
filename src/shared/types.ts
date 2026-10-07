@@ -126,6 +126,11 @@ export interface Surface {
   scrollbackFile?: string;  // surfaceId used as filename for scrollback dump
   /** True once the user manually renamed this tab; blocks shell-set (OSC 0/2) titles. */
   titleLocked?: boolean;
+  /** While titleLocked: the title the first rename replaced. Clearing the
+   *  rename restores it, and the next shell-set title takes over from there.
+   *  Not refreshed from OSC titles while locked — an agent retitles its tab
+   *  many times a second, and each refresh would be a store write. */
+  autoTitle?: string;
 }
 
 // === Pane: either a leaf (has surfaces) or a branch (has children) ===

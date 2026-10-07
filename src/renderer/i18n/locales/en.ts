@@ -609,6 +609,7 @@ export const en = {
   // The wording carries the whole promise: "stash" removes, "close" destroys,
   // and every string here says which one is happening.
   'pane.rename': 'Rename pane',
+  'pane.renameTab': 'Rename tab',
   'pane.stash': 'Stash pane',
   'pane.stashHint': 'Remove from layout — the session keeps running',
   'pane.unstash': 'Bring back',
@@ -688,6 +689,7 @@ export const en = {
   'palette.cmd.toggleToolbarPin': 'Pin / unpin the agent toolbar',
   'palette.cmd.openWorktaskCleanup': 'Open Task Cleanup List',
   'palette.cmd.showGitDiff': 'Show Git Diff',
+  'palette.cmd.renameTab': 'Rename Tab',
   'palette.cmd.showTaskDiff': 'Show Task Diff',
   // J3 — task cleanup list (WorktaskCleanupView)
   'worktask.cleanup.title': 'Task Cleanup List',
@@ -2098,6 +2100,7 @@ export const en = {
   'settings.sc.toggleToolbarPin': 'Pin / unpin the agent toolbar',
   'settings.sc.openWorktaskCleanup': 'Open task cleanup list',
   'settings.sc.showGitDiff': 'Show git diff',
+  'settings.sc.renameTab': 'Rename tab',
   'settings.sc.unset': 'Not set',
   'mention.title': 'Mention an agent',
   'mention.placeholder': 'Mention an agent…',

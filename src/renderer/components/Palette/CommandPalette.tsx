@@ -23,6 +23,7 @@ import { clearShortcut, describeShortcut, rebindProblemText } from '../../utils/
 import {
   openMultiTask,
   openWorktaskCleanup,
+  renameActiveTab,
   showGitDiff,
   stashActivePane,
   toggleAgentToolbarPin,
@@ -372,6 +373,13 @@ export default function CommandPalette() {
         label: t('palette.cmd.showGitDiff'),
         shortcut: 'showGitDiff',
         action: () => { showGitDiff(); setVisible(false); },
+      },
+      {
+        // Close first: the rename field takes the keyboard, and the palette
+        // must not still hold it when the field mounts.
+        label: t('palette.cmd.renameTab'),
+        shortcut: 'renameTab',
+        action: () => { setVisible(false); renameActiveTab(); },
       },
     ];
 

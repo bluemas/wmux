@@ -314,6 +314,7 @@ export const ko = {
   'pane.maxLeavesReachedWithStash': '페인 한도 도달 ({count}개, 보관 {stashed}개 포함). 보관함에서 꺼내 닫거나, 보이는 페인을 닫으세요.',
 
   'pane.rename': '페인 이름 바꾸기',
+  'pane.renameTab': '탭 이름 바꾸기',
 
   'pane.stash': '페인 치우기',
   'pane.stashHint': '레이아웃에서 치웁니다 — 세션은 계속 실행됩니다',
@@ -385,6 +386,7 @@ export const ko = {
   'palette.cmd.toggleToolbarPin': '에이전트 툴바 고정 / 해제',
   'palette.cmd.openWorktaskCleanup': '태스크 정리 목록 열기',
   'palette.cmd.showGitDiff': 'Git Diff 보기',
+  'palette.cmd.renameTab': '탭 이름 바꾸기',
   'palette.cmd.showTaskDiff': '태스크 Diff 보기',
   // J3 — 태스크 정리 목록(WorktaskCleanupView)
   'worktask.cleanup.title': '태스크 정리 목록',
@@ -1546,6 +1548,7 @@ export const ko = {
   'settings.sc.toggleToolbarPin': '에이전트 툴바 고정 / 해제',
   'settings.sc.openWorktaskCleanup': '태스크 정리 목록 열기',
   'settings.sc.showGitDiff': 'Git Diff 보기',
+  'settings.sc.renameTab': '탭 이름 바꾸기',
   'settings.sc.unset': '없음',
   'mention.title': '에이전트 멘션',
   'mention.placeholder': '멘션할 에이전트…',
