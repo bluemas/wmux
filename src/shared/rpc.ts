@@ -1473,6 +1473,23 @@ export interface A2aRemoteHostsStatusResult {
   hosts: A2aRemoteHostStatus[];
 }
 
+/** Remote work held for a person (`a2a.remote.held`): the ledger tasks. */
+export interface A2aRemoteHeldListResult {
+  tasks: import('./types').Task[];
+}
+
+/** A person's "deliver to the pane as it is now" on a held remote task. */
+export interface A2aRemoteHeldRetryResult {
+  ok: boolean;
+  results: Array<{ messageId?: string; outcome: 'delivered' | 'not-delivered' | NonNullable<import('./a2aRemote').A2aRemoteTaskMarkerV1['held']> }>;
+  error?: string;
+}
+
+/** A person's reject of a held remote task (`a2a.remote.rejectHeld`). */
+export type A2aRemoteHeldRejectResult =
+  | { ok: true; taskId: string; state: 'failed' | 'canceled'; queued: boolean }
+  | { ok: false; error: string };
+
 /** One pane the app offers for exposure (`a2a.remote.exposure.publish`); main adds the git fields. */
 export type A2aExposureCandidate = A2aExposedPane;
 
