@@ -532,6 +532,15 @@ export type RpcMethod =
   | 'a2a.remote.links.revoke'
   | 'a2a.remote.links.refresh'
   | 'a2a.remote.local.paneGone'
+  | 'a2a.remote.pending'
+  | 'a2a.remote.mark'
+  | 'a2a.remote.targets'
+  | 'a2a.remote.sendTask'
+  | 'a2a.remote.reply'
+  | 'a2a.remote.state'
+  | 'a2a.remote.held'
+  | 'a2a.remote.rejectHeld'
+  | 'a2a.remote.hosts.status'
   | 'a2a.resolve.identity'
   | 'a2a.whoami'
   | 'a2a.discover'
@@ -797,6 +806,15 @@ export const ALL_RPC_METHODS = [
   'a2a.remote.links.revoke',
   'a2a.remote.links.refresh',
   'a2a.remote.local.paneGone',
+  'a2a.remote.pending',
+  'a2a.remote.mark',
+  'a2a.remote.targets',
+  'a2a.remote.sendTask',
+  'a2a.remote.reply',
+  'a2a.remote.state',
+  'a2a.remote.held',
+  'a2a.remote.rejectHeld',
+  'a2a.remote.hosts.status',
   'a2a.resolve.identity',
   'a2a.whoami',
   'a2a.discover',
@@ -965,6 +983,13 @@ export interface DaemonEvent {
     // proposal arrived or a link changed state. Re-read the link list.
     | 'a2a.remote.link.proposed'
     | 'a2a.remote.link.changed'
+    // Cross-host A2A delivery (`sessionId` ''). `a2a.remote.inbound`: a peer's
+    // task landed in the ledger, undelivered — main's RemoteA2aBridge re-pulls
+    // `a2a.remote.pending` (a nudge; the pull is the guarantee). `data` is
+    // A2aRemoteInboundEvent. `a2a.remote.hosts.status`: a paired PC's
+    // connection state changed. `data` is A2aRemoteHostStatus.
+    | 'a2a.remote.inbound'
+    | 'a2a.remote.hosts.status'
     // A2A channels (a2a-channels U4) — daemon broadcasts every successful
     // post as `channel.message`. `sessionId` is not meaningful here (no
     // session owns the event) so the field is set to '' (the rest of the
@@ -1422,6 +1447,31 @@ export type A2aRemoteLinkEvent =
   /** Another PC proposed a link to one of this PC's panes: our human decides. */
   | { type: 'a2a.remote.link.proposed'; linkId: string }
   | { type: 'a2a.remote.link.changed'; linkId: string; state: A2aLinkState };
+
+/**
+ * One paired PC's delivery connection (`a2a.remote.hosts.status`, and the
+ * daemon event of the same name). `joiner`: this PC dials that one (it is in
+ * the remote-host store); `server`: that PC dials this one. Connected means
+ * the stream is up — the joiner holds it open, the server is serving it.
+ * `identity-changed`: the other PC answered with another certificate; nothing
+ * was sent and the pairing must be redone.
+ */
+export interface A2aRemoteHostStatus {
+  hostId: string;
+  name: string;
+  role: 'joiner' | 'server';
+  state: 'connected' | 'connecting' | 'disconnected' | 'identity-changed';
+  /** Messages still owed to that PC (pending or outcome-unknown). */
+  pending: number;
+  /** ISO time the stream last came up. */
+  connectedAt?: string;
+  lastError?: string;
+}
+
+/** `a2a.remote.hosts.status` */
+export interface A2aRemoteHostsStatusResult {
+  hosts: A2aRemoteHostStatus[];
+}
 
 /** One pane the app offers for exposure (`a2a.remote.exposure.publish`); main adds the git fields. */
 export type A2aExposureCandidate = A2aExposedPane;

@@ -8,7 +8,7 @@ import { AppendOnlyLog } from '../../eventlog/AppendOnlyLog';
 import { remoteTaskId } from '../ids';
 import { LinkStore } from '../linkStore';
 import { OutboxStore } from '../outboxStore';
-import { linkAlias, listRemoteTargets, sendRemoteReply, sendRemoteState, sendRemoteTask, type OutboundDeps } from '../outbound';
+import { aliasTable, linkAlias, listRemoteTargets, sendRemoteReply, sendRemoteState, sendRemoteTask, type OutboundDeps } from '../outbound';
 
 const HOST = '11111111-1111-4111-8111-111111111111';
 
@@ -37,8 +37,8 @@ function activeLink(allow = { outbound: true, inbound: true }, label = 'codex', 
   const linkId = crypto.randomUUID();
   links.receiveProposal({
     linkId,
-    local: { workspaceId: 'ws-a', paneId: 'pane-a' },
-    remote: { hostId: HOST, workspaceId: 'ws-b', paneId: remotePane, label },
+    local: { kind: 'pane', workspaceId: 'ws-a', paneId: 'pane-a' },
+    remote: { hostId: HOST, kind: 'pane', workspaceId: 'ws-b', paneId: remotePane, label },
     allow,
   });
   links.accept(linkId);
@@ -50,13 +50,13 @@ const FROM = { workspaceId: 'ws-a', name: 'Frontend', paneId: 'pane-a' };
 describe('listRemoteTargets', () => {
   it('lists active links only, with their alias and direction flag', () => {
     const linkId = activeLink({ outbound: false, inbound: true });
-    links.proposeOut({ local: { workspaceId: 'ws-a', paneId: 'p2' }, remote: { hostId: HOST, workspaceId: 'w', paneId: 'p' }, allow: { outbound: true, inbound: true } });
+    links.proposeOut({ local: { kind: 'pane', workspaceId: 'ws-a', paneId: 'p2' }, remote: { hostId: HOST, kind: 'pane', workspaceId: 'w', paneId: 'p' }, allow: { outbound: true, inbound: true } });
     expect(listRemoteTargets(deps)).toEqual([
       {
         alias: 'pc-b/ws-b/codex',
         linkId,
         hostId: HOST,
-        local: { workspaceId: 'ws-a', paneId: 'pane-a' },
+        local: { kind: 'pane', workspaceId: 'ws-a', paneId: 'pane-a' },
         remote: { workspaceId: 'ws-b', paneId: 'pane-b', label: 'codex' },
         allowOutbound: false,
       },
@@ -66,6 +66,24 @@ describe('listRemoteTargets', () => {
   it('a "/" inside a part cannot fake an extra alias segment', () => {
     activeLink(undefined, 'a/b');
     expect(listRemoteTargets(deps)[0].alias).toBe('pc-b/ws-b/a-b');
+  });
+});
+
+describe('aliases', () => {
+  it('uses the remote workspace name, falls back to ids, and reads <PC>/Moa for a brain end', () => {
+    const base = links.get(activeLink())!;
+    expect(linkAlias({ ...base, remote: { ...base.remote, workspaceName: 'API' } }, 'DESK')).toBe('DESK/API/codex');
+    expect(linkAlias({ ...base, remote: { ...base.remote, label: undefined } }, 'DESK')).toBe('DESK/ws-b/pane-b');
+    expect(linkAlias({ ...base, remote: { hostId: HOST, kind: 'brain', workspaceId: 'hq' } }, 'DESK')).toBe('DESK/Moa');
+    expect(linkAlias({ ...base, remote: { ...base.remote, workspaceName: 'a/b' } }, 'DE/SK')).toBe('DE-SK/a-b/codex');
+  });
+
+  it('numbers a repeated alias by link age, so an exact alias names one link', () => {
+    const older = { ...links.get(activeLink(undefined, 'codex', 'pane-b'))!, createdAt: '2026-01-01T00:00:00.000Z' };
+    const newer = { ...links.get(activeLink(undefined, 'codex', 'pane-c'))!, createdAt: '2026-01-02T00:00:00.000Z' };
+    const table = aliasTable([newer, older], () => 'pc-b');
+    expect(table.get(older.linkId)).toBe('pc-b/ws-b/codex');
+    expect(table.get(newer.linkId)).toBe('pc-b/ws-b/codex#2');
   });
 });
 

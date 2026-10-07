@@ -85,8 +85,9 @@ export interface A2aRemoteTarget {
   linkId: string;
   hostId: HostId;
   /** The local pane bound to the link: the only pane that may send on it. */
-  local: { workspaceId: string; paneId: string };
-  remote: { workspaceId: string; paneId: string; label?: string };
+  local: { workspaceId: string; paneId?: string };
+  /** A brain (Moa) end has no `paneId`. */
+  remote: { workspaceId: string; paneId?: string; label?: string };
   /** `link.allow.outbound`: this side may start new tasks on the link. */
   allowOutbound: boolean;
 }

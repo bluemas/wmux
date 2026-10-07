@@ -34,7 +34,7 @@ import { isPlainObject, isSafeId } from './storeFile';
 
 export interface InboundDeps {
   linkStore: Pick<LinkStore, 'get' | 'checkMessage' | 'applyRemoteAccept' | 'revoke' | 'markBroken'>;
-  taskService: Pick<A2aTaskService, 'getTask' | 'createTask' | 'appendRemoteMessage' | 'applyRemoteState'>;
+  taskService: Pick<A2aTaskService, 'getTask' | 'createTask' | 'appendRemoteMessage' | 'applyRemoteState' | 'markRemote'>;
   broadcast: (event: A2aRemoteInboundEvent) => void;
   /** Display alias of a link's remote pane (`linkAlias`). */
   aliasFor: (link: A2aLinkRecordV1) => string;
@@ -64,6 +64,9 @@ export async function acceptInbound(
   if (!check.ok) return fail(check.error);
   const link = check.link;
   const remoteWs = remoteWorkspaceId(link.linkId);
+  // A brain (Moa) end has no pane to paste into; its delivery is PR4's. Until
+  // then every task / reply / state on such a link is held, never pasted.
+  const brain = check.kind === 'brain';
 
   if (env.kind === 'task') {
     const taskId = remoteTaskId(link.linkId, env.messageId);
@@ -85,6 +88,10 @@ export async function acceptInbound(
     );
     if (!created.ok) return fail('conflict' in created ? 'conflict' : 'unavailable', created.error);
     if (created.existed) return { ok: true, taskId, duplicate: true };
+    if (brain) {
+      await holdForBrain(deps, { taskId });
+      return { ok: true, taskId, duplicate: false };
+    }
     deps.broadcast({ type: A2A_REMOTE_INBOUND_EVENT, taskId });
     return { ok: true, taskId, duplicate: false };
   }
@@ -101,6 +108,7 @@ export async function acceptInbound(
       message: textMessage(env.messageId, role, env.text as string),
     });
     if (!res.ok) return fail('conflict' in res ? 'conflict' : 'unavailable', res.error);
+    if (brain && !res.duplicate) await holdForBrain(deps, { taskId, messageId: env.messageId });
     return { ok: true, taskId, duplicate: res.duplicate };
   }
 
@@ -112,7 +120,20 @@ export async function acceptInbound(
     ...(env.text ? { summary: env.text } : {}),
   });
   if (!res.ok) return fail(stateErrorCode(res), res.error);
+  if (brain && !res.duplicate) await holdForBrain(deps, { taskId, messageId: env.messageId });
   return { ok: true, taskId, duplicate: res.duplicate };
+}
+
+/**
+ * Hold a brain-end delivery (`brain-delivery-pending`). Best effort: the
+ * message is already durable, and a hold that did not land only means main
+ * may try a pane delivery that the renderer refuses (no pane on a brain link).
+ */
+async function holdForBrain(deps: InboundDeps, target: { taskId: string; messageId?: string }): Promise<void> {
+  // A state the ledger took without a delivery item (e.g. a no-op) has nothing to hold.
+  const marker = deps.taskService.getTask(target.taskId)?.metadata.remote as { inbox?: Array<{ messageId: string }> } | undefined;
+  if (target.messageId !== undefined && !marker?.inbox?.some((i) => i.messageId === target.messageId)) return;
+  await deps.taskService.markRemote({ ...target, held: 'brain-delivery-pending' }).catch(() => undefined);
 }
 
 /** Link lifecycle notice. A notice the link already reflects is a duplicate. */

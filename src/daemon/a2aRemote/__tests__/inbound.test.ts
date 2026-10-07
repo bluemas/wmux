@@ -46,9 +46,9 @@ function activeLink(allow = { outbound: true, inbound: true }): string {
   const linkId = crypto.randomUUID();
   links.receiveProposal({
     linkId,
-    local: { workspaceId: 'ws-b', paneId: 'pane-b' },
+    local: { kind: 'pane', workspaceId: 'ws-b', paneId: 'pane-b' },
     // A distinct remote pane per link: one pane pair holds one live link.
-    remote: { hostId: HOST, workspaceId: 'ws-a', paneId: linkCount++ === 0 ? 'pane-a' : `pane-a${linkCount}`, label: 'claude' },
+    remote: { hostId: HOST, kind: 'pane', workspaceId: 'ws-a', paneId: linkCount++ === 0 ? 'pane-a' : `pane-a${linkCount}`, label: 'claude' },
     allow,
   });
   links.accept(linkId); // version 2
@@ -83,6 +83,29 @@ describe('acceptInbound — task', () => {
     expect(t.metadata.remote).toMatchObject({ linkId, hostId: HOST, direction: 'inbound', delivered: false });
     expect(broadcast).toHaveBeenCalledWith({ type: 'a2a.remote.inbound', taskId: id });
     expect(tasks.listRemotePending().map((x) => x.id)).toEqual([id]);
+  });
+
+  it('a task to a brain (Moa) end is held as brain-delivery-pending, never broadcast for a pane paste', async () => {
+    const linkId = crypto.randomUUID();
+    links.receiveProposal({
+      linkId,
+      local: { kind: 'brain', workspaceId: 'ws-hq' },
+      remote: { hostId: HOST, kind: 'brain', workspaceId: 'ws-hq-a' },
+      allow: { outbound: true, inbound: true },
+    });
+    links.accept(linkId);
+    const e = env(linkId, {});
+    expect(await acceptInbound(e, peer, deps)).toMatchObject({ ok: true, duplicate: false });
+    const id = remoteTaskId(linkId, e.messageId);
+    expect(tasks.getTask(id)!.metadata.remote).toMatchObject({ held: 'brain-delivery-pending', delivered: false });
+    expect(tasks.listRemotePending()).toEqual([]);
+    expect(tasks.listRemoteHeld().map((t) => t.id)).toEqual([id]);
+    expect(broadcast).not.toHaveBeenCalled();
+    // A peer reply into it is held the same way.
+    const reply = env(linkId, { kind: 'reply', taskId: id, text: 'more' });
+    expect(await acceptInbound(reply, peer, deps)).toMatchObject({ ok: true, duplicate: false });
+    const inbox = (tasks.getTask(id)!.metadata.remote as { inbox?: Array<{ messageId: string; held?: string }> }).inbox;
+    expect(inbox?.find((i) => i.messageId === reply.messageId)?.held).toBe('brain-delivery-pending');
   });
 
   it('the same message again is a duplicate; same id with another body is a conflict', async () => {
@@ -180,8 +203,8 @@ describe('acceptInbound — reply and state', () => {
 describe('acceptInbound — link notices', () => {
   it('applies a remote accept once; the redelivery is a duplicate', async () => {
     const out = links.proposeOut({
-      local: { workspaceId: 'ws-b', paneId: 'pane-b' },
-      remote: { hostId: HOST, workspaceId: 'ws-a', paneId: 'pane-a' },
+      local: { kind: 'pane', workspaceId: 'ws-b', paneId: 'pane-b' },
+      remote: { hostId: HOST, kind: 'pane', workspaceId: 'ws-a', paneId: 'pane-a' },
       allow: { outbound: true, inbound: true },
     });
     const notice = env(out.linkId, { kind: 'link', text: undefined, link: { state: 'active', version: 2 } });
