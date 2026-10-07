@@ -1512,6 +1512,10 @@ function renderEventLine(
  * brain queries it. v1 has no onward delegation for it, so this Moa answers
  * itself.
  */
+/** A task this Moa sent to another PC's Moa: waiting on it is never the operator's decision. */
+const REMOTE_MOA_WAIT =
+  'If you are still waiting on a task you sent to another PC\'s Moa and it shows remoteReceipt delivered or read, do not raise a decision card to ask whether to keep waiting or to be woken: you are woken when it replies or completes, so end your turn.';
+
 function remoteMoaVerdict(a2a: A2aTaskDetail | undefined): string {
   // Canonical pointers only: the peer chose both its PC name and (through its
   // message id) the task id, so anything else is replaced, never quoted.
@@ -1523,7 +1527,7 @@ function remoteMoaVerdict(a2a: A2aTaskDetail | undefined): string {
     return `(REMOTE MOA TASK — the Moa on PC "${pc}" sent you a task. ${read} Do it yourself and answer with send_message({ task_id: "${id}", message }), then close it with a2a_task_update({ task_id: "${id}", status: "completed" }) or "failed". Do not fan it out or hand it off: v1 cannot carry the answer back from another agent.)`;
   }
   if (item === 'reply') {
-    return `(REMOTE MOA REPLIED — the Moa on PC "${pc}" wrote on task ${id}. ${read} Answer with send_message({ task_id: "${id}", message }) only if it asks you something.)`;
+    return `(REMOTE MOA REPLIED — the Moa on PC "${pc}" wrote on task ${id}. ${read} Answer with send_message({ task_id: "${id}", message }) only if it asks you something. ${REMOTE_MOA_WAIT})`;
   }
   const state = a2a?.state && /^[a-z-]{1,20}$/.test(a2a.state) ? a2a.state : 'another state';
   return `(REMOTE MOA UPDATED — the Moa on PC "${pc}" moved its task ${id} to ${state}. Stop any work on it if it is canceled; report it in one line.)`;

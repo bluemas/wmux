@@ -162,6 +162,7 @@ describe('a2a.task.send — Moa to another PC\'s Moa (brain link)', () => {
     const res = await brainCall(setup(), { workspaceId: 'ws-forged', commanderWorkspaceId: 'ws-forged', to: BRAIN_ALIAS, message: 'check the build', title: 'T' }, asBrain('ws-hq'));
     expect(res).toMatchObject({ ok: true, taskId: RT, remote: true });
     expect(remote.sendTask).toHaveBeenCalledWith({ linkId: LINK, from: { workspaceId: 'ws-hq', name: 'Moa' }, title: 'T', text: 'check the build' });
+    expect(String(res.next)).toContain('Do not raise a decision card about waiting');
     expect(rendererCalls('a2a.task.send')).toEqual([]);
   });
 

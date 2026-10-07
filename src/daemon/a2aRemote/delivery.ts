@@ -171,6 +171,8 @@ export class A2aRemoteDelivery {
     const sessions = [...this.sessions.values()];
     this.sessions.clear();
     await Promise.all(sessions.map((s) => s.session.stop()));
+    // Leave no handle on the outbox file (or its folder) once stopped.
+    await this.outbox.idle();
   }
 
   /** One session per joined server; restarted when its address, port or pin changes. */

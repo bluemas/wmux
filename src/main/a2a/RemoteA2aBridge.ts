@@ -110,6 +110,10 @@ export class RemoteA2aBridge {
   private unsubscribe: (() => void) | null = null;
   private unsubscribeBrain: (() => void) | null = null;
   private running: Promise<void> | null = null;
+  /** Set by stop(): no new pull or delivery starts. */
+  private stopped = false;
+  /** Deliveries started by a pull, still running. */
+  private readonly working = new Set<Promise<unknown>>();
   private rerun = false;
 
   constructor(deps: RemoteA2aBridgeDeps) {
@@ -119,6 +123,7 @@ export class RemoteA2aBridge {
 
   start(): void {
     if (this.timer) return;
+    this.stopped = false;
     this.unsubscribe = this.deps.onDaemonEvent((event) => {
       if (event?.type === A2A_REMOTE_INBOUND_EVENT) void this.trigger();
     });
@@ -132,12 +137,19 @@ export class RemoteA2aBridge {
   }
 
   stop(): void {
+    this.stopped = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
     this.unsubscribe?.();
     this.unsubscribe = null;
     this.unsubscribeBrain?.();
     this.unsubscribeBrain = null;
+  }
+
+  /** Resolves once the pull and the deliveries already started have finished (after stop()). */
+  async whenIdle(): Promise<void> {
+    await this.running?.catch(() => undefined);
+    await Promise.allSettled([...this.working]);
   }
 
   /** The daemon connection (re)opened: pull at once. */
@@ -203,6 +215,7 @@ export class RemoteA2aBridge {
   }
 
   private async pullOnce(): Promise<void> {
+    if (this.stopped) return;
     let res: unknown;
     try {
       res = await this.deps.daemonRpc(A2A_REMOTE_RPC.pending, {});
@@ -236,8 +249,13 @@ export class RemoteA2aBridge {
       }
       const wait = this.retry.get(unit.key);
       if (wait && wait.at > this.now()) continue;
+      if (this.stopped) break;
       this.inFlight.add(unit.key);
-      void this.deliver(unit, false).finally(() => this.inFlight.delete(unit.key));
+      const run = this.deliver(unit, false).finally(() => {
+        this.inFlight.delete(unit.key);
+        this.working.delete(run);
+      });
+      this.working.add(run);
     }
   }
 

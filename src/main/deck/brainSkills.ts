@@ -114,8 +114,9 @@ agent as the operator's own words. After the card is raised, end your turn.
 A task you sent to \`<PC>/Moa\` stays \`submitted\` until that Moa answers.
 \`remoteReceipt\` in \`a2a_task_query\` says how far it got: \`delivered\` (it
 arrived) or \`read\` (that Moa read it). Once either is there, the other Moa
-has it: do not raise a decision about it, end your turn and wait to be woken
-with the result.
+has it. Do not raise a decision card to ask whether to keep waiting or to be
+woken: you are woken automatically when it replies or completes. End your turn
+and wait.
 `;
 
 const FANOUT_SKILL = `---

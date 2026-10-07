@@ -193,6 +193,9 @@ async function makePc(
     received,
     stop: async () => {
       bridge.stop();
+      // Nothing may write to this PC's ledger after its log closes. Bounded:
+      // a test may leave a renderer call that never answers.
+      await Promise.race([bridge.whenIdle(), new Promise((r) => setTimeout(r, 2_000))]);
       await delivery!.stop();
       server.dispose();
       await server.whenIdle();
@@ -506,7 +509,7 @@ describe('Moa to Moa across PCs (brain links), end to end', () => {
    * the wake. The state goes out the way main's a2a.task.update does: the
    * ledger first, then the state RPC.
    */
-  function fakeBrain(pc: Pc, hq: string): () => void {
+  function fakeBrain(pc: Pc, hq: string): () => Promise<void> {
     let seen = 0;
     let stopped = false;
     const tick = async (): Promise<void> => {
@@ -530,8 +533,11 @@ describe('Moa to Moa across PCs (brain links), end to end', () => {
         await new Promise((r) => setTimeout(r, 20));
       }
     };
-    void tick();
-    return () => { stopped = true; };
+    const loop = tick();
+    return async () => {
+      stopped = true;
+      await loop.catch(() => undefined);
+    };
   }
 
   it('A\'s Moa asks B\'s Moa; B is woken (never a pane paste), answers; A is woken by the reply and the completion — both ways', async () => {
@@ -574,8 +580,8 @@ describe('Moa to Moa across PCs (brain links), end to end', () => {
       // Exactly one wake per new task.
       expect(b.emitted.filter((e) => e.taskId === taskId && e.item === 'task')).toHaveLength(1);
     } finally {
-      stopA();
-      stopB();
+      await stopA();
+      await stopB();
     }
   }, 20_000);
 

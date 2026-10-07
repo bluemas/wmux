@@ -307,7 +307,14 @@ export function registerA2aRpc(
         text: message,
       }).catch((err: unknown): RemoteOpResult => ({ ok: false, error: err instanceof Error ? err.message : String(err) }));
       if (!res.ok) return { error: `a2a.task.send: remote send refused (${res.error})` };
-      return { ok: true, taskId: res.taskId, remote: true, delivery: REMOTE_QUEUED };
+      return {
+        ok: true,
+        taskId: res.taskId,
+        remote: true,
+        delivery: REMOTE_QUEUED,
+        // What Moa reads right after sending: the wait is not the operator's decision.
+        next: 'You are woken when the other Moa replies or completes it; a2a_task_query shows remoteReceipt delivered/read once it arrives. Do not raise a decision card about waiting: end your turn.',
+      };
     }
     const workspaceId = typeof params.workspaceId === 'string' ? params.workspaceId : '';
     const caller = await resolveCallerPane(getWindow, workspaceId, params.senderPtyId);

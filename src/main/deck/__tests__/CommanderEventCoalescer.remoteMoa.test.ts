@@ -78,6 +78,8 @@ describe('CommanderEventCoalescer — a2a.received (remote Moa)', () => {
     vi.advanceTimersByTime(1_000);
     await settle();
     expect(prompts[0]).toContain('REMOTE MOA REPLIED');
+    // Waiting on another PC's Moa is never a decision card for the operator.
+    expect(prompts[0]).toContain('do not raise a decision card to ask whether to keep waiting or to be woken');
   });
 
   it('does not wake while a decision is pending', async () => {
