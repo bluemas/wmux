@@ -331,7 +331,9 @@ describe('#874 attachImeAnchor', () => {
     // xterm rounds the cell to whole device pixels; clientHeight/rows does not.
     // Using the layout number would leave a fractional correction on every
     // frame and put a transform on the element when nothing needs moving.
-    const dom = buildTerminalDom(10, 17.59, 39);
+    // Rounding can only ever account for a sub-pixel gap (see the next test
+    // for what a wider one means).
+    const dom = buildTerminalDom(10, 16.4, 39);
     const { terminal, onRender, state } = makeTerminal(dom);
     const handle = attachImeAnchor(terminal);
     Object.assign(state, { baseY: 6, viewportY: 4, cursorY: 10, cursorX: 0 });
@@ -339,8 +341,25 @@ describe('#874 attachImeAnchor', () => {
     dom.textarea.style.left = '0px';
     dom.textarea.style.height = '16px'; // what _syncTextArea writes
     onRender.fire(undefined);
-    // Exactly two cells of drift at xterm's 16px, not 2 * 17.59.
+    // Exactly two cells of drift at xterm's 16px, not 2 * 16.4.
     expect(translateOf(dom.textarea)?.dy).toBe(32);
+    handle.dispose();
+  });
+
+  it('ignores xterm\'s cell height once it disagrees with the box by more than rounding', () => {
+    // A font-size change resizes the grid before xterm re-syncs the textarea,
+    // so `style.height` keeps the OLD cell height for a while. A gap that
+    // wide is staleness, not rounding, and the measured box wins.
+    const dom = buildTerminalDom(10, 14, 39);
+    const { terminal, onRender, state } = makeTerminal(dom);
+    const handle = attachImeAnchor(terminal);
+    Object.assign(state, { baseY: 6, viewportY: 4, cursorY: 10, cursorX: 0 });
+    dom.textarea.style.top = `${10 * 14}px`;
+    dom.textarea.style.left = '0px';
+    dom.textarea.style.height = '17.6px'; // the previous font's cell
+    onRender.fire(undefined);
+    // Two cells of scrolled-viewport drift at the box's 14px.
+    expect(translateOf(dom.textarea)?.dy).toBeCloseTo(28, 6);
     handle.dispose();
   });
 
@@ -1896,5 +1915,94 @@ describe('#1040 follow-up — the deferred sync is disarmed at compositionstart'
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe('cell geometry is measured fresh, not trusted from a stale cache', () => {
+  beforeEach(() => { document.body.innerHTML = ''; });
+
+  /** Re-shape the fake grid the way a font-size change does: xterm's
+   *  rows/cols change, and (once the renderer has caught up) the screen box
+   *  takes the new cell size. */
+  function regrid(
+    t: ReturnType<typeof makeTerminal>,
+    dom: ReturnType<typeof buildTerminalDom>,
+    rows: number, cols: number, cellWidth: number | null, cellHeight: number | null,
+  ): void {
+    Object.assign(t.terminal as { rows: number; cols: number }, { rows, cols });
+    if (cellWidth !== null) Object.defineProperty(dom.screen, 'clientWidth', { value: cellWidth * cols, configurable: true });
+    if (cellHeight !== null) Object.defineProperty(dom.screen, 'clientHeight', { value: cellHeight * rows, configurable: true });
+  }
+
+  it('a font shrink does not leave the preedit painted with the old cell height', () => {
+    // Field report (Korean IME, Claude Code fullscreen, after a font-size
+    // change): the composing syllable painted far from the caret. Reproduced
+    // on a packaged build by zooming the font out and composing — the
+    // preedit landed rows below the caret. The resize event fires before the
+    // renderer has re-synced the textarea, so `style.height` still carries the
+    // OLD cell height, and the anchor trusted it for the new grid.
+    const dom = buildTerminalDom(10, 17.6, 39, 142);
+    const t = makeTerminal(dom, 39, 142);
+    dom.textarea.style.height = '17.6px';
+    Object.assign(t.state, { baseY: 0, viewportY: 0, cursorY: 30, cursorX: 15 });
+    dom.textarea.style.top = `${30 * 17.6}px`;
+    dom.textarea.style.left = '150px';
+    const handle = attachImeAnchor(t.terminal);
+    t.onRender.fire(undefined); // learns xterm's 17.6 cell height
+    expect(dom.textarea.style.transform).toBe('');
+
+    // Font shrinks: 10x17.6 -> 8x14 cells. Same container, so 177x49 cells.
+    regrid(t, dom, 49, 177, 8, 14);
+    t.onResize.fire(undefined);
+
+    // The caret is on the new grid's row 47, col 15; xterm positions both
+    // children there in the new cell size. The textarea height has not been
+    // re-synced (still the old 17.6).
+    Object.assign(t.state, { cursorY: 47, cursorX: 15 });
+    const place = (): void => {
+      dom.textarea.style.top = `${47 * 14}px`;
+      dom.textarea.style.left = `${15 * 8}px`;
+      dom.compView.style.top = `${47 * 14}px`;
+      dom.compView.style.left = `${15 * 8}px`;
+    };
+    place();
+    dom.textarea.dispatchEvent(new Event('compositionstart'));
+    place();
+    dom.textarea.dispatchEvent(new Event('compositionupdate'));
+
+    // xterm placed both on the caret; nothing may move them.
+    expect(translateOf(dom.textarea) ?? { dx: 0, dy: 0 }).toEqual({ dx: 0, dy: 0 });
+    expect(translateOf(dom.compView) ?? { dx: 0, dy: 0 }).toEqual({ dx: 0, dy: 0 });
+    handle.dispose();
+  });
+
+  it('a cell-width change with no resize event is picked up at compositionstart', () => {
+    // A font change that leaves rows/cols alone (fixed-geometry panes, or a
+    // fit that lands on the same grid) fires no resize at all, so the cached
+    // width per cell is never refreshed. compositionstart is user-paced, so
+    // it re-measures — the column the preedit is painted at depends on it.
+    const dom = buildTerminalDom(10, 17.6, 39, 142);
+    const t = makeTerminal(dom, 39, 142);
+    Object.assign(t.state, { baseY: 0, viewportY: 0, cursorY: 30, cursorX: 15 });
+    const handle = attachImeAnchor(t.terminal);
+
+    // The renderer now draws 8px cells on the same 142-column grid.
+    regrid(t, dom, 39, 142, 8, null);
+    const place = (): void => {
+      dom.textarea.style.top = `${30 * 17.6}px`;
+      dom.textarea.style.left = `${15 * 8}px`;
+      dom.compView.style.top = `${30 * 17.6}px`;
+      dom.compView.style.left = `${15 * 8}px`;
+    };
+    place();
+    dom.textarea.dispatchEvent(new Event('compositionstart'));
+    place();
+    dom.textarea.dispatchEvent(new Event('compositionupdate'));
+
+    expect(translateOf(dom.textarea) ?? { dx: 0, dy: 0 }).toEqual({ dx: 0, dy: 0 });
+    expect(translateOf(dom.compView) ?? { dx: 0, dy: 0 }).toEqual({ dx: 0, dy: 0 });
+    handle.dispose();
   });
 });
