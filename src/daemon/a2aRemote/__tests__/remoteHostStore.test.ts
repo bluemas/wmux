@@ -4,6 +4,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { atomicWriteJSONSync } from '../../util/atomicWrite';
 import {
+  ADDRESSES_MAX,
   REMOTE_HOSTS_FILE,
   RemoteHostStore,
   orderAddresses,
@@ -28,7 +29,7 @@ const flakyWrite = (p: string, d: unknown): void => {
   atomicWriteJSONSync(p, d);
 };
 const make = (o: Partial<RemoteHostStoreOptions> = {}): RemoteHostStore =>
-  new RemoteHostStore({ dir, now: () => clock, write: flakyWrite, reHarden: () => 'hardened', ...o });
+  new RemoteHostStore({ dir, now: () => clock, write: flakyWrite, reHarden: () => 'hardened', win32: false, ...o });
 
 const host = (o: Partial<NewRemoteHost> = {}): NewRemoteHost => ({
   hostId: HOST,
@@ -144,26 +145,77 @@ describe('RemoteHostStore', () => {
     expect(s.credentialFor(HOST)).toBeNull();
   });
 
-  it('hardens synchronously after every write; a failed harden on win32 unlinks and throws', () => {
-    const reHarden = vi.fn((): 'hardened' | 'failed' => 'hardened');
-    const s = make({ reHarden, win32: true });
-    s.add(host(), { peerId: PEER, secret: SECRET });
+  it('win32: a failed credential write removes the primary and .bak', () => {
     const file = path.join(dir, REMOTE_HOSTS_FILE);
-    expect(reHarden).toHaveBeenCalledWith(file);
-    reHarden.mockReturnValue('failed');
-    expect(() => s.add(host({ hostId: HOST2, peerId: PEER2 }), { peerId: PEER2, secret: SECRET2 })).toThrow(/owner-only/);
+    const s = make({ win32: true });
+    s.add(host(), { peerId: PEER, secret: SECRET });
+    fs.writeFileSync(`${file}.bak`, 'older generation');
+    fail = true;
+    expect(() => s.add(host({ hostId: HOST2, peerId: PEER2 }), { peerId: PEER2, secret: SECRET2 })).toThrow('disk full');
     expect(fs.existsSync(file)).toBe(false);
+    expect(fs.existsSync(`${file}.bak`)).toBe(false);
     expect(s.get(HOST2)).toBeUndefined();
+    // Removal worked, so the store stays usable and the next write restores the file.
+    fail = false;
+    s.updateAddresses(HOST, ['desk-pc']);
+    expect(make().credentialFor(HOST)).toEqual({ peerId: PEER, secret: SECRET });
   });
 
-  it('a failed harden off win32 is not fatal (0600 is already set by the write)', () => {
-    const s = make({ reHarden: () => 'failed', win32: false });
-    expect(() => s.add(host(), { peerId: PEER, secret: SECRET })).not.toThrow();
+  it('win32: if the scrub cannot remove a file, the store goes unavailable', () => {
+    const log = vi.fn();
+    const s = make({ win32: true, log, remove: () => { throw new Error('EPERM'); } });
+    s.add(host(), { peerId: PEER, secret: SECRET });
+    fail = true;
+    expect(() => s.add(host({ hostId: HOST2, peerId: PEER2 }), { peerId: PEER2, secret: SECRET2 })).toThrow('disk full');
+    fail = false;
+    expect(() => s.add(host({ hostId: HOST2, peerId: PEER2 }), { peerId: PEER2, secret: SECRET2 })).toThrow(/unavailable/);
+    expect(() => s.updateAddresses(HOST, ['x'])).toThrow(/unavailable/);
+    // A removal still takes effect in memory.
+    expect(() => s.remove(HOST)).toThrow(/unavailable/);
+    expect(s.credentialFor(HOST)).toBeNull();
+    expect(log).toHaveBeenCalledWith('error', expect.stringContaining('store is unavailable'));
   });
 
-  it('writes the file owner-only on POSIX', () => {
+  it('off win32 a failed write leaves the previous file in place', () => {
+    const file = path.join(dir, REMOTE_HOSTS_FILE);
+    const s = make({ win32: false });
+    s.add(host(), { peerId: PEER, secret: SECRET });
+    fail = true;
+    expect(() => s.add(host({ hostId: HOST2, peerId: PEER2 }), { peerId: PEER2, secret: SECRET2 })).toThrow();
+    expect(fs.existsSync(file)).toBe(true);
+    expect(make().credentialFor(HOST)).toEqual({ peerId: PEER, secret: SECRET });
+  });
+
+  it('load re-hardens the file; on win32 a failed harden means not loaded and unavailable', () => {
+    make().add(host(), { peerId: PEER, secret: SECRET });
+    const reHarden = vi.fn((): 'hardened' | 'failed' => 'hardened');
+    expect(make({ reHarden, win32: true }).credentialFor(HOST)).not.toBeNull();
+    expect(reHarden).toHaveBeenCalledWith(path.join(dir, REMOTE_HOSTS_FILE));
+    reHarden.mockReturnValue('failed');
+    const s = make({ reHarden, win32: true });
+    expect(s.credentialFor(HOST)).toBeNull();
+    expect(() => s.add(host({ hostId: HOST2, peerId: PEER2 }), { peerId: PEER2, secret: SECRET2 })).toThrow(/unavailable/);
+    expect(fs.existsSync(path.join(dir, REMOTE_HOSTS_FILE))).toBe(true);
+    // Off win32 the outcome is advisory (the file is already 0600).
+    expect(make({ reHarden, win32: false }).credentialFor(HOST)).not.toBeNull();
+  });
+
+  it('sanitizes the name and validates addresses against the hostname rule', () => {
+    const s = make();
+    const rec = s.add(host({ name: ' Desk\u0000PC ', addresses: ['999.1.1.1', 'bad host', '-x', 'ok-host', '10.0.0.1', `${'a'.repeat(64)}.corp`] }), {
+      peerId: PEER,
+      secret: SECRET,
+    });
+    expect(rec.name).toBe('Desk PC');
+    expect(rec.addresses).toEqual(['ok-host', '10.0.0.1']);
+    expect(() => s.updateAddresses(HOST, ['bad host', '300.0.0.1'])).toThrow(/no usable address/);
+    const many = Array.from({ length: 20 }, (_, i) => `h${i}`);
+    expect(s.updateAddresses(HOST, many).addresses).toHaveLength(ADDRESSES_MAX);
+  });
+
+  it('writes the file owner-only on POSIX (default writer)', () => {
     if (process.platform === 'win32') return;
-    const s = make({ reHarden: undefined });
+    const s = make({ write: undefined, reHarden: undefined, win32: undefined });
     s.add(host(), { peerId: PEER, secret: SECRET });
     expect(fs.statSync(path.join(dir, REMOTE_HOSTS_FILE)).mode & 0o777).toBe(0o600);
   });

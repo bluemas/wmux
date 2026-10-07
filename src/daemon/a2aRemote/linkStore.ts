@@ -9,11 +9,20 @@ import {
   type A2aLinkProposeRequest,
   type A2aLinkRecordV1,
   type A2aLinkState,
+  type A2aRemoteEnvelope,
   type A2aRemoteErrorCode,
   type A2aRemoteMessageKind,
   type HostId,
 } from '../../shared/a2aRemote';
-import { isIsoString, isNonEmptyString, isPlainObject, preserveCorrupt, readStoreFile, type StoreLog } from './storeFile';
+import {
+  isIsoString,
+  isPlainObject,
+  isSafeId,
+  loadStore,
+  sanitizeName,
+  storeUnavailable,
+  type StoreLog,
+} from './storeFile';
 
 /**
  * Layer 3 of cross-host A2A: one local pane <-> one remote pane (`links.json`),
@@ -23,26 +32,39 @@ import { isIsoString, isNonEmptyString, isPlainObject, preserveCorrupt, readStor
  *
  *   (none)        --proposeOut-------> proposed-out
  *   (none)        --receiveProposal--> proposed-in
- *   proposed-in   --accept-----------> active        (version + 1)
- *   proposed-out  --applyRemoteAccept> active        (version := the remote's, must be newer)
- *   proposed-*|active --revoke-------> revoked       (terminal, version + 1)
- *   proposed-*|active --markBroken---> broken        (terminal, version + 1)
+ *   proposed-in   --accept-----------> active   (version + 1)
+ *   proposed-out  --applyRemoteAccept> active   (remote version, EXACTLY ours + 1)
+ *   proposed-*|active --revoke-------> revoked  (terminal, version + 1; a remote
+ *                                                revoke is taken at ANY version)
+ *   proposed-*|active --markBroken---> broken   (terminal, version + 1; a remote
+ *                                                notice must name EXACTLY ours + 1)
+ *   proposed-*|active --forgetHost---> revoked  (revoked-remote; peer revoked here)
  *
- * At most one non-terminal link per (local pane, remote host, remote pane).
+ * Limits: at most one non-terminal link per (local pane, remote host, remote
+ * pane); at most `LINKS_PER_HOST_MAX` non-terminal links per remote host; the
+ * newest `TERMINAL_KEEP` terminal links are kept, older ones are pruned.
  *
- * Corrupt file: start empty (no link carries traffic) and keep the original as
- * `links.json.corrupt-<ts>`.
+ * Corrupt file (bad JSON, bad record, two live links on one pane triple):
+ * start empty and keep the original as `links.json.corrupt-<ts>`. An
+ * UNREADABLE file leaves the store unavailable (no link, every mutation throws)
+ * so the original is never overwritten.
  *
- * Write failure: every op rolls memory back and throws, EXCEPT `revoke` and
- * `markBroken`, which keep the in-memory terminal state (#658: a revocation
- * that silently un-happens on a disk error is worse than one that is only
- * lost on restart) and still throw so the caller can surface it.
+ * Write failure: every op rolls memory back and throws, EXCEPT `revoke`,
+ * `markBroken` and `forgetHost`, which keep the in-memory terminal state
+ * (#658: a revocation that silently un-happens on a disk error is worse than
+ * one that is only lost on restart) and still throw so the caller can surface it.
  */
 
 export const LINKS_FILE = 'links.json';
+/** Non-terminal links one remote host may hold here. */
+export const LINKS_PER_HOST_MAX = 64;
+/** Terminal (revoked/broken) links kept for display; older ones are pruned. */
+export const TERMINAL_KEEP = 256;
 
 type EndedReason = NonNullable<A2aLinkRecordV1['endedReason']>;
 export type BrokenReason = Extract<EndedReason, 'pane-closed' | 'pane-moved' | 'workspace-gone'>;
+/** The `link` field of a lifecycle envelope. */
+export type LinkNotice = NonNullable<A2aRemoteEnvelope['link']>;
 
 /** What a caller supplies for a new link; the store stamps v/state/version/timestamps. */
 export type NewLinkInput = Pick<A2aLinkRecordV1, 'local' | 'remote' | 'allow'>;
@@ -51,13 +73,17 @@ export type LinkCheckResult =
   | { ok: true; link: A2aLinkRecordV1 }
   | {
       ok: false;
-      error: Extract<A2aRemoteErrorCode, 'unknown-link' | 'link-not-active' | 'stale-link-version' | 'direction-not-allowed' | 'forbidden'>;
+      error: Extract<
+        A2aRemoteErrorCode,
+        'unknown-link' | 'link-not-active' | 'stale-link-version' | 'direction-not-allowed' | 'forbidden' | 'bad-request'
+      >;
     };
 
 const TERMINAL: ReadonlySet<A2aLinkState> = new Set(['revoked', 'broken']);
 const BROKEN_REASONS: ReadonlySet<string> = new Set(['pane-closed', 'pane-moved', 'workspace-gone']);
+const REVOKED_REASONS: ReadonlySet<string> = new Set(['revoked-local', 'revoked-remote']);
 const STATES: ReadonlySet<string> = new Set(['proposed-out', 'proposed-in', 'active', 'revoked', 'broken']);
-const ENDED_REASONS: ReadonlySet<string> = new Set(['revoked-local', 'revoked-remote', ...BROKEN_REASONS]);
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /**
  * Turn an incoming `A2aLinkProposeRequest` from `hostId` into THIS side's
@@ -87,7 +113,7 @@ export interface LinkStoreOptions {
   write?: (filePath: string, data: unknown) => void;
   /** Test seam; defaults to the deferred owner-only re-harden. */
   scheduleHarden?: (filePath: string) => void;
-  /** Test seam for `proposeOut` link ids. */
+  /** Test seam for `proposeOut` link ids (must return UUIDs). */
   mintId?: () => string;
 }
 
@@ -99,6 +125,7 @@ export class LinkStore {
   private readonly scheduleHarden: (filePath: string) => void;
   private readonly mintId: () => string;
   private readonly links = new Map<string, A2aLinkRecordV1>();
+  private writable = true;
 
   constructor(opts: LinkStoreOptions) {
     this.filePath = path.join(opts.dir, LINKS_FILE);
@@ -147,14 +174,16 @@ export class LinkStore {
 
   /** This side proposes; mints the linkId. */
   proposeOut(input: NewLinkInput): A2aLinkRecordV1 {
+    this.assertWritable();
     let linkId = this.mintId();
     while (this.links.has(linkId)) linkId = this.mintId();
     return this.create(linkId, input, 'proposed-out');
   }
 
-  /** The other side proposed. A duplicate linkId (in any state) is refused. */
+  /** The other side proposed (remote input). A duplicate linkId, in any state, is refused. */
   receiveProposal(input: NewLinkInput & { linkId: string }): A2aLinkRecordV1 {
-    if (!isNonEmptyString(input.linkId)) throw new Error('link: invalid linkId');
+    this.assertWritable();
+    if (typeof input.linkId !== 'string' || !UUID_RE.test(input.linkId)) throw new Error('link: invalid linkId');
     if (this.links.has(input.linkId)) throw new Error(`link ${input.linkId}: duplicate linkId`);
     return this.create(input.linkId, input, 'proposed-in');
   }
@@ -165,25 +194,73 @@ export class LinkStore {
     return this.commit(rec, { state: 'active', version: rec.version + 1 }, true);
   }
 
-  /** The other side's human accepted our `proposed-out` link at `version`. */
+  /**
+   * The other side's human accepted our `proposed-out` link. Their accept bumps
+   * the version once, so the notice must name EXACTLY ours + 1.
+   */
   applyRemoteAccept(linkId: string, version: number): A2aLinkRecordV1 {
     const rec = this.require(linkId, ['proposed-out'], 'applyRemoteAccept');
-    if (!Number.isInteger(version) || version <= rec.version) {
-      throw new Error(`link ${linkId}: remote accept version ${version} is not newer than ${rec.version}`);
+    if (version !== rec.version + 1) {
+      throw new Error(`link ${linkId}: remote accept version ${version}, expected ${rec.version + 1}`);
     }
     return this.commit(rec, { state: 'active', version }, true);
   }
 
+  /**
+   * End a link. `side: 'remote'` applies the owning host's revoke notice and is
+   * taken at ANY version: a revocation must never be blockable by a version
+   * race (the caller has already checked the sender owns the link — see
+   * `checkMessage`).
+   */
   revoke(linkId: string, side: 'local' | 'remote'): A2aLinkRecordV1 {
     const rec = this.require(linkId, ['proposed-out', 'proposed-in', 'active'], 'revoke');
     const endedReason: EndedReason = side === 'local' ? 'revoked-local' : 'revoked-remote';
     return this.commit(rec, { state: 'revoked', version: rec.version + 1, endedReason }, false);
   }
 
-  markBroken(linkId: string, reason: BrokenReason): A2aLinkRecordV1 {
+  /**
+   * Mark a link broken. Locally (no `remoteVersion`) whenever a bound pane or
+   * workspace goes away; from the other side's notice only when it names
+   * EXACTLY ours + 1 (their markBroken bumped once).
+   */
+  markBroken(linkId: string, reason: BrokenReason, remoteVersion?: number): A2aLinkRecordV1 {
     if (!BROKEN_REASONS.has(reason)) throw new Error(`link ${linkId}: invalid broken reason`);
     const rec = this.require(linkId, ['proposed-out', 'proposed-in', 'active'], 'markBroken');
+    if (remoteVersion !== undefined && remoteVersion !== rec.version + 1) {
+      throw new Error(`link ${linkId}: remote broken version ${remoteVersion}, expected ${rec.version + 1}`);
+    }
     return this.commit(rec, { state: 'broken', version: rec.version + 1, endedReason: reason }, false);
+  }
+
+  /**
+   * The peer for `hostId` was revoked here: end every non-terminal link to it
+   * as `revoked-remote`. Entry point of the revoke cascade. Keeps its
+   * in-memory effect on a failed write (like `revoke`). Returns how many
+   * links were ended.
+   */
+  forgetHost(hostId: HostId): number {
+    this.assertWritable();
+    const at = new Date(this.now()).toISOString();
+    let ended = 0;
+    for (const rec of [...this.links.values()]) {
+      if (rec.remote.hostId !== hostId || TERMINAL.has(rec.state)) continue;
+      this.links.set(rec.linkId, {
+        ...rec,
+        state: 'revoked',
+        version: rec.version + 1,
+        endedReason: 'revoked-remote',
+        updatedAt: at,
+      });
+      ended += 1;
+    }
+    if (ended === 0) return 0;
+    try {
+      this.persist();
+    } catch (err) {
+      this.log('error', `[a2a-remote] ${ended} link(s) to host ${hostId} are revoked in memory but could not be persisted`);
+      throw err;
+    }
+    return ended;
   }
 
   // --- delivery gate ----------------------------------------------------------
@@ -201,11 +278,16 @@ export class LinkStore {
    *   - `reply` / `state`: active link at this version, any direction. Whether
    *     the task they name exists is the caller's `unknown-task` check — this
    *     store does not track tasks.
-   *   - `link` (lifecycle notice): only unknown-link / forbidden / terminal are
-   *     checked. A remote ACCEPT arrives while we are still `proposed-out` and
-   *     names the NEW version, so the state and version gates would reject the
-   *     very notice that activates the link; `applyRemoteAccept` / `revoke`
-   *     validate it instead.
+   *   - `link` (lifecycle notice): pass the envelope's `link` as `notice`; the
+   *     envelope's `linkVersion` is not used, `notice.version` is. Missing
+   *     notice → `bad-request`.
+   *       - `active` (remote accept): link must be `proposed-out` and the
+   *         notice must name exactly our version + 1.
+   *       - `broken`: link must be non-terminal, notice exactly our version + 1.
+   *       - `revoked`: link must be non-terminal; ANY version. A revocation
+   *         from the authenticated owner of the link must never be blocked.
+   *     The matching transition (`applyRemoteAccept` / `markBroken(…, v)` /
+   *     `revoke(…, 'remote')`) enforces the same rule.
    */
   checkMessage(
     linkId: string,
@@ -213,14 +295,28 @@ export class LinkStore {
     hostId: HostId,
     direction: 'inbound' | 'outbound',
     kind: A2aRemoteMessageKind,
+    notice?: LinkNotice,
   ): LinkCheckResult {
     const rec = this.links.get(linkId);
     if (!rec) return { ok: false, error: 'unknown-link' };
     if (rec.remote.hostId !== hostId) return { ok: false, error: 'forbidden' };
-    if (!isA2aRemoteMessageKind(kind)) return { ok: false, error: 'forbidden' };
+    if (!isA2aRemoteMessageKind(kind)) return { ok: false, error: 'bad-request' };
     if (kind === 'link') {
+      if (!isPlainObject(notice)) return { ok: false, error: 'bad-request' };
       if (TERMINAL.has(rec.state)) return { ok: false, error: 'link-not-active' };
-      return { ok: true, link: structuredClone(rec) };
+      switch (notice.state) {
+        case 'revoked':
+          return { ok: true, link: structuredClone(rec) };
+        case 'active':
+          if (rec.state !== 'proposed-out') return { ok: false, error: 'link-not-active' };
+          if (notice.version !== rec.version + 1) return { ok: false, error: 'stale-link-version' };
+          return { ok: true, link: structuredClone(rec) };
+        case 'broken':
+          if (notice.version !== rec.version + 1) return { ok: false, error: 'stale-link-version' };
+          return { ok: true, link: structuredClone(rec) };
+        default:
+          return { ok: false, error: 'bad-request' };
+      }
     }
     if (rec.state !== 'active') return { ok: false, error: 'link-not-active' };
     if (version !== rec.version) return { ok: false, error: 'stale-link-version' };
@@ -233,36 +329,17 @@ export class LinkStore {
   // --- internals --------------------------------------------------------------
 
   private create(linkId: string, input: NewLinkInput, state: 'proposed-out' | 'proposed-in'): A2aLinkRecordV1 {
-    const shape = validateNewLink(input);
-    if (shape) throw new Error(`link ${linkId}: ${shape}`);
-    const clash = [...this.links.values()].find(
-      (r) =>
-        !TERMINAL.has(r.state) &&
-        r.local.workspaceId === input.local.workspaceId &&
-        r.local.paneId === input.local.paneId &&
-        r.remote.hostId === input.remote.hostId &&
-        r.remote.workspaceId === input.remote.workspaceId &&
-        r.remote.paneId === input.remote.paneId,
-    );
+    const clean = cleanNewLink(input);
+    if (typeof clean === 'string') throw new Error(`link ${linkId}: ${clean}`);
+    const live = [...this.links.values()].filter((r) => !TERMINAL.has(r.state));
+    const clash = live.find((r) => sameTriple(r, clean));
     if (clash) throw new Error(`link ${linkId}: pane pair already linked by ${clash.linkId} (${clash.state})`);
+    if (live.filter((r) => r.remote.hostId === clean.remote.hostId).length >= LINKS_PER_HOST_MAX) {
+      throw new Error(`link ${linkId}: host ${clean.remote.hostId} already holds ${LINKS_PER_HOST_MAX} live links`);
+    }
 
     const at = new Date(this.now()).toISOString();
-    const rec: A2aLinkRecordV1 = {
-      v: A2A_REMOTE_RECORD_V,
-      linkId,
-      version: 1,
-      state,
-      local: { workspaceId: input.local.workspaceId, paneId: input.local.paneId },
-      remote: {
-        hostId: input.remote.hostId,
-        workspaceId: input.remote.workspaceId,
-        paneId: input.remote.paneId,
-        ...(input.remote.label !== undefined ? { label: input.remote.label } : {}),
-      },
-      allow: { outbound: input.allow.outbound, inbound: input.allow.inbound },
-      createdAt: at,
-      updatedAt: at,
-    };
+    const rec: A2aLinkRecordV1 = { v: A2A_REMOTE_RECORD_V, linkId, version: 1, state, ...clean, createdAt: at, updatedAt: at };
     this.links.set(linkId, rec);
     try {
       this.persist();
@@ -274,6 +351,7 @@ export class LinkStore {
   }
 
   private require(linkId: string, from: A2aLinkState[], op: string): A2aLinkRecordV1 {
+    this.assertWritable();
     const rec = this.links.get(linkId);
     if (!rec) throw new Error(`link ${linkId}: unknown link`);
     if (!from.includes(rec.state)) throw new Error(`link ${linkId}: ${op} not allowed from ${rec.state}`);
@@ -298,81 +376,116 @@ export class LinkStore {
     return structuredClone(next);
   }
 
+  private assertWritable(): void {
+    if (!this.writable) throw storeUnavailable(LINKS_FILE);
+  }
+
   private persist(): void {
+    this.pruneTerminal();
     this.write(this.filePath, { v: A2A_REMOTE_RECORD_V, links: [...this.links.values()] });
     this.scheduleHarden(this.filePath);
   }
 
+  /** Keep only the newest `TERMINAL_KEEP` terminal links. */
+  private pruneTerminal(): void {
+    const terminal = [...this.links.values()]
+      .filter((r) => TERMINAL.has(r.state))
+      .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+    for (const stale of terminal.slice(TERMINAL_KEEP)) this.links.delete(stale.linkId);
+  }
+
   private load(): void {
-    const read = readStoreFile(this.filePath);
-    if (read.kind === 'missing') return;
-    const records = read.kind === 'parsed' ? coerceFile(read.value) : null;
-    if (!records) {
-      const detail = read.kind === 'corrupt' ? read.detail : 'invalid shape';
-      const kept = preserveCorrupt(this.filePath, this.now, this.log);
-      this.log('warn', `[a2a-remote] ${LINKS_FILE} is corrupt (${detail}); starting with no links. Original kept at ${kept ?? '(could not move)'}`);
-      return;
-    }
-    for (const rec of records) this.links.set(rec.linkId, rec);
+    const { value, writable } = loadStore({
+      filePath: this.filePath,
+      fileName: LINKS_FILE,
+      coerce: coerceFile,
+      now: this.now,
+      log: this.log,
+      level: 'warn',
+      emptyMeans: 'starting with no links',
+    });
+    this.writable = writable;
+    for (const rec of value ?? []) this.links.set(rec.linkId, rec);
   }
 }
 
-/** Null when well-formed, else what is wrong. */
-function validateNewLink(input: NewLinkInput): string | null {
-  if (!isPlainObject(input.local) || !isNonEmptyString(input.local.workspaceId) || !isNonEmptyString(input.local.paneId)) {
-    return 'invalid local pane';
-  }
-  const remote: unknown = input.remote;
+function sameTriple(a: NewLinkInput, b: NewLinkInput): boolean {
+  return (
+    a.local.workspaceId === b.local.workspaceId &&
+    a.local.paneId === b.local.paneId &&
+    a.remote.hostId === b.remote.hostId &&
+    a.remote.workspaceId === b.remote.workspaceId &&
+    a.remote.paneId === b.remote.paneId
+  );
+}
+
+/**
+ * Validate and copy a new link's pane pair. Ids are bounded and free of
+ * control characters (they may come from a remote host); the label follows
+ * the display-name rule and is dropped when empty.
+ */
+function cleanNewLink(input: unknown): NewLinkInput | string {
+  if (!isPlainObject(input)) return 'invalid link';
+  const { local, remote, allow } = input;
+  if (!isPlainObject(local) || !isSafeId(local['workspaceId']) || !isSafeId(local['paneId'])) return 'invalid local pane';
   if (
     !isPlainObject(remote) ||
     !isHostId(remote['hostId']) ||
-    !isNonEmptyString(remote['workspaceId']) ||
-    !isNonEmptyString(remote['paneId']) ||
+    !isSafeId(remote['workspaceId']) ||
+    !isSafeId(remote['paneId']) ||
     (remote['label'] !== undefined && typeof remote['label'] !== 'string')
   ) {
     return 'invalid remote pane';
   }
-  if (!isPlainObject(input.allow) || typeof input.allow.outbound !== 'boolean' || typeof input.allow.inbound !== 'boolean') {
+  if (!isPlainObject(allow) || typeof allow['outbound'] !== 'boolean' || typeof allow['inbound'] !== 'boolean') {
     return 'invalid allow flags';
   }
-  return null;
+  const label = remote['label'] === undefined ? '' : sanitizeName(remote['label'], '');
+  return {
+    local: { workspaceId: local['workspaceId'], paneId: local['paneId'] },
+    remote: {
+      hostId: remote['hostId'],
+      workspaceId: remote['workspaceId'],
+      paneId: remote['paneId'],
+      ...(label ? { label } : {}),
+    },
+    allow: { outbound: allow['outbound'], inbound: allow['inbound'] },
+  };
 }
 
-/** Whole-file validation: any bad record rejects the file. */
+/**
+ * Whole-file validation: any bad record rejects the file. `endedReason` must
+ * match the state (revoked → revoked-*, broken → a broken reason, absent on a
+ * live link), and no pane triple may carry two live links.
+ */
 function coerceFile(raw: unknown): A2aLinkRecordV1[] | null {
   if (!isPlainObject(raw) || raw['v'] !== 1 || !Array.isArray(raw['links'])) return null;
   const out: A2aLinkRecordV1[] = [];
   const seen = new Set<string>();
   for (const r of raw['links']) {
-    if (!isPlainObject(r) || r['v'] !== 1 || !isNonEmptyString(r['linkId']) || seen.has(r['linkId'])) return null;
-    const version = r['version'];
-    const state = r['state'];
+    if (!isPlainObject(r) || r['v'] !== 1) return null;
+    const { linkId, version, state, endedReason, createdAt, updatedAt } = r;
+    if (typeof linkId !== 'string' || !UUID_RE.test(linkId) || seen.has(linkId)) return null;
     if (typeof version !== 'number' || !Number.isInteger(version) || version < 1) return null;
     if (typeof state !== 'string' || !STATES.has(state)) return null;
-    if (!isIsoString(r['createdAt']) || !isIsoString(r['updatedAt'])) return null;
-    const endedReason = r['endedReason'];
-    if (endedReason !== undefined && (typeof endedReason !== 'string' || !ENDED_REASONS.has(endedReason))) return null;
-    const input = r as unknown as NewLinkInput;
-    if (validateNewLink(input)) return null;
-    const rec: A2aLinkRecordV1 = {
+    if (!isIsoString(createdAt) || !isIsoString(updatedAt)) return null;
+    if (state === 'revoked' ? !REVOKED_REASONS.has(endedReason as string) : state === 'broken' ? !BROKEN_REASONS.has(endedReason as string) : endedReason !== undefined) {
+      return null;
+    }
+    const clean = cleanNewLink(r);
+    if (typeof clean === 'string') return null;
+    if (!TERMINAL.has(state as A2aLinkState) && out.some((o) => !TERMINAL.has(o.state) && sameTriple(o, clean))) return null;
+    seen.add(linkId);
+    out.push({
       v: 1,
-      linkId: r['linkId'],
+      linkId,
       version,
       state: state as A2aLinkState,
-      local: { workspaceId: input.local.workspaceId, paneId: input.local.paneId },
-      remote: {
-        hostId: input.remote.hostId,
-        workspaceId: input.remote.workspaceId,
-        paneId: input.remote.paneId,
-        ...(input.remote.label !== undefined ? { label: input.remote.label } : {}),
-      },
-      allow: { outbound: input.allow.outbound, inbound: input.allow.inbound },
-      createdAt: r['createdAt'],
-      updatedAt: r['updatedAt'],
+      ...clean,
+      createdAt,
+      updatedAt,
       ...(endedReason !== undefined ? { endedReason: endedReason as EndedReason } : {}),
-    };
-    seen.add(rec.linkId);
-    out.push(rec);
+    });
   }
   return out;
 }

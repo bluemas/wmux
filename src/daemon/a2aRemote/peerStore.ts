@@ -4,7 +4,17 @@ import { atomicWriteJSONSync } from '../util/atomicWrite';
 import { scheduleTokenFileReHarden } from '../../shared/security';
 import { DEVICE_KDF, DEVICE_SALT_BYTES, DEVICE_SECRET_BYTES, LAST_SEEN_PERSIST_MS, type DeviceKdfParams } from '../web/DeviceStore';
 import { A2A_REMOTE_RECORD_V, isHostId, type A2aPeerRecordV1, type HostId } from '../../shared/a2aRemote';
-import { errMsg, isIsoString, isNonEmptyString, isPlainObject, preserveCorrupt, readStoreFile, type StoreLog } from './storeFile';
+import { promisify } from 'node:util';
+import {
+  errMsg,
+  isIsoString,
+  isNonEmptyString,
+  isPlainObject,
+  loadStore,
+  sanitizeName,
+  storeUnavailable,
+  type StoreLog,
+} from './storeFile';
 
 /**
  * Server side of cross-host A2A pairing: the joiners this host issued a PEER
@@ -12,15 +22,25 @@ import { errMsg, isIsoString, isNonEmptyString, isPlainObject, preserveCorrupt, 
  * class from `DeviceStore` — a peer is never a web device and never becomes a
  * `WebPrincipal`.
  *
- * Secrets are handled exactly like DeviceStore's: 32 CSPRNG bytes handed out
- * once, and only a per-peer salted scrypt output (same `DEVICE_KDF`
- * parameters, stored per record) on disk. Verification is length-independent
- * (scrypt output is fixed-length) and constant-time, with the same SHA-256
- * cache so legitimate traffic pays one derivation per daemon boot.
+ * Secrets are handled like DeviceStore's: 32 CSPRNG bytes handed out once,
+ * and only a per-peer salted scrypt output (same `DEVICE_KDF` parameters,
+ * stored per record) on disk. Verification is length-independent (scrypt
+ * output is fixed-length) and constant-time, with the same SHA-256 cache so
+ * legitimate traffic pays one derivation per daemon boot. Unlike DeviceStore,
+ * the derivation is the ASYNC `crypto.scrypt` (a wrong secret must not stall
+ * the event loop) and wrong secrets are rate-limited per peerId: past
+ * `FAILURES_PER_WINDOW` failures in `FAILURE_WINDOW_MS`, `resolve` answers
+ * `unknown` without deriving.
  *
- * Corrupt file: FAIL-CLOSED. Any invalid record rejects the whole file, the
- * store starts empty (nobody authenticates; joiners re-pair), and the original
- * is kept as `peers.json.corrupt-<ts>`.
+ * One live peer per hostId: `mint` refuses a hostId that already has an
+ * unrevoked peer, so a joiner cannot quietly re-pair as (or over) a host the
+ * operator already trusts — the operator revokes first.
+ *
+ * Corrupt file: FAIL-CLOSED. Any invalid record (including scrypt parameters
+ * scrypt itself would reject) rejects the whole file, the store starts empty
+ * (nobody authenticates; joiners re-pair), and the original is kept as
+ * `peers.json.corrupt-<ts>`. An UNREADABLE file leaves the store unavailable
+ * (nobody authenticates, `mint` throws) and the original untouched.
  *
  * Write failure: `mint` rolls back and throws (a secret nothing on disk knows
  * cannot be handed out). `revoke` keeps the in-memory revocation and throws
@@ -47,8 +67,10 @@ interface PeersFileV1 {
   peers: StoredPeer[];
 }
 
-const PEER_NAME_MAX = 64;
 const UNNAMED_PEER = 'Unnamed host';
+/** Wrong-secret budget per peerId. */
+export const FAILURE_WINDOW_MS = 1000;
+export const FAILURES_PER_WINDOW = 5;
 /** Same ceiling as DeviceStore: fail loudly at the call site on a parameter bump. */
 const SCRYPT_MAXMEM = 64 * 1024 * 1024;
 const VERIFIED_CACHE_CAP = 64;
@@ -77,6 +99,8 @@ export class PeerStore {
   private readonly peers = new Map<string, StoredPeer>();
   private readonly verified = new Map<string, { secretDigest: Buffer; hashHex: string }>();
   private readonly lastSeenPersistedAt = new Map<string, number>();
+  private readonly failures = new Map<string, { windowStart: number; count: number }>();
+  private writable = true;
 
   constructor(opts: PeerStoreOptions) {
     this.filePath = path.join(opts.dir, PEERS_FILE);
@@ -92,15 +116,28 @@ export class PeerStore {
     return [...this.peers.values()].map(project);
   }
 
+  /** Every peer (revoked included) issued to `hostId`. */
+  listByHost(hostId: HostId): A2aPeerRecordV1[] {
+    return [...this.peers.values()].filter((r) => r.hostId === hostId).map(project);
+  }
+
   /**
    * Issue a peer credential. Persists BEFORE returning; throws (after rolling
-   * back) when the roster cannot be written.
+   * back) when the roster cannot be written. Refuses a hostId that already has
+   * an unrevoked peer.
    */
   async mint(params: { hostId: HostId; name: string }): Promise<{ peerId: string; secret: string }> {
+    if (!this.writable) throw storeUnavailable(PEERS_FILE);
     if (!isHostId(params.hostId)) throw new Error('peer: invalid hostId');
+    this.assertHostFree(params.hostId);
     const secret = crypto.randomBytes(DEVICE_SECRET_BYTES).toString('base64url');
     const salt = crypto.randomBytes(DEVICE_SALT_BYTES);
     const kdf: DeviceKdfParams = { ...DEVICE_KDF };
+    const secretHash = (await derive(secret, salt, kdf)).toString('hex');
+    // Everything from here is synchronous; re-check after the await so two
+    // concurrent mints for one host cannot both land.
+    if (!this.writable) throw storeUnavailable(PEERS_FILE);
+    this.assertHostFree(params.hostId);
     let peerId = crypto.randomUUID();
     while (this.peers.has(peerId)) peerId = crypto.randomUUID();
     const at = this.now();
@@ -108,9 +145,9 @@ export class PeerStore {
       v: A2A_REMOTE_RECORD_V,
       peerId,
       hostId: params.hostId,
-      name: sanitizeName(params.name),
+      name: sanitizeName(params.name, UNNAMED_PEER),
       createdAt: new Date(at).toISOString(),
-      secretHash: derive(secret, salt, kdf).toString('hex'),
+      secretHash,
       salt: salt.toString('hex'),
       kdf,
     };
@@ -130,7 +167,12 @@ export class PeerStore {
    * Resolve a peer credential. Total; never throws.
    *   1. Unknown id → `unknown`, no derivation (a garbage id is no CPU lever).
    *   2. Revoked → `revoked` WITHOUT verifying the secret (DeviceStore rule).
-   *   3. Otherwise constant-time verify; a wrong secret is `unknown`, never
+   *      This does tell whoever holds a revoked peerId that it was revoked —
+   *      accepted, as in DeviceStore: verifying first would let a revoked
+   *      joiner's reconnect loop force a derivation per retry, and the id is a
+   *      128-bit random handle only that joiner ever held.
+   *   3. Over the wrong-secret budget → `unknown` without deriving.
+   *   4. Otherwise constant-time verify; a wrong secret is `unknown`, never
    *      revealing which half of the credential was right.
    */
   async resolve(
@@ -140,7 +182,13 @@ export class PeerStore {
     const rec = typeof peerId === 'string' ? this.peers.get(peerId) : undefined;
     if (!rec) return REJECT_UNKNOWN;
     if (rec.revokedAt !== undefined) return REJECT_REVOKED;
-    if (typeof secret !== 'string' || !this.verify(rec, secret)) return REJECT_UNKNOWN;
+    if (this.overBudget(rec.peerId)) return REJECT_UNKNOWN;
+    if (typeof secret !== 'string' || !(await this.verify(rec, secret))) {
+      this.noteFailure(rec.peerId);
+      return REJECT_UNKNOWN;
+    }
+    // Revoked while the derivation was in flight.
+    if (rec.revokedAt !== undefined || this.peers.get(rec.peerId) !== rec) return REJECT_REVOKED;
     return { ok: true, peerId: rec.peerId, hostId: rec.hostId, name: rec.name };
   }
 
@@ -150,10 +198,11 @@ export class PeerStore {
     if (!rec || rec.revokedAt !== undefined) return;
     const at = this.now();
     rec.lastSeenAt = new Date(at).toISOString();
-    if (at - (this.lastSeenPersistedAt.get(peerId) ?? 0) < LAST_SEEN_PERSIST_MS) return;
-    this.lastSeenPersistedAt.set(peerId, at);
+    if (!this.writable || at - (this.lastSeenPersistedAt.get(peerId) ?? 0) < LAST_SEEN_PERSIST_MS) return;
     try {
       this.persist();
+      // Only a write that landed resets the throttle, so a failed one is retried next time.
+      this.lastSeenPersistedAt.set(peerId, at);
     } catch (err) {
       // A lost timestamp costs a stale roster line, nothing more.
       this.log('warn', `[a2a-remote] could not persist lastSeenAt for peer ${peerId}: ${errMsg(err)}`);
@@ -166,6 +215,7 @@ export class PeerStore {
    * restart) and the error is rethrown.
    */
   revoke(peerId: string): boolean {
+    if (!this.writable) throw storeUnavailable(PEERS_FILE);
     const rec = this.peers.get(peerId);
     if (!rec || rec.revokedAt !== undefined) return false;
     rec.revokedAt = new Date(this.now()).toISOString();
@@ -181,8 +231,25 @@ export class PeerStore {
 
   // --- internals --------------------------------------------------------------
 
+  private assertHostFree(hostId: HostId): void {
+    const live = [...this.peers.values()].find((r) => r.hostId === hostId && r.revokedAt === undefined);
+    if (live) throw new Error(`peer: host ${hostId} is already paired as ${live.peerId}; revoke it first`);
+  }
+
+  private overBudget(peerId: string): boolean {
+    const f = this.failures.get(peerId);
+    return f !== undefined && this.now() - f.windowStart < FAILURE_WINDOW_MS && f.count >= FAILURES_PER_WINDOW;
+  }
+
+  private noteFailure(peerId: string): void {
+    const at = this.now();
+    const f = this.failures.get(peerId);
+    if (!f || at - f.windowStart >= FAILURE_WINDOW_MS) this.failures.set(peerId, { windowStart: at, count: 1 });
+    else f.count += 1;
+  }
+
   /** Constant-time; no branch on the presented secret's length (see DeviceStore.verify). */
-  private verify(rec: StoredPeer, secret: string): boolean {
+  private async verify(rec: StoredPeer, secret: string): Promise<boolean> {
     const secretBuf = Buffer.from(secret, 'utf8');
     const digest = sha256(secretBuf);
     const cached = this.verified.get(rec.peerId);
@@ -191,7 +258,7 @@ export class PeerStore {
     }
     let derived: Buffer;
     try {
-      derived = derive(secretBuf, Buffer.from(rec.salt, 'hex'), rec.kdf);
+      derived = await derive(secretBuf, Buffer.from(rec.salt, 'hex'), rec.kdf);
     } catch (err) {
       this.log('warn', `[a2a-remote] peer ${rec.peerId} hash could not be derived: ${errMsg(err)}`);
       return false;
@@ -220,19 +287,17 @@ export class PeerStore {
   }
 
   private load(): void {
-    const read = readStoreFile(this.filePath);
-    if (read.kind === 'missing') return;
-    const records = read.kind === 'parsed' ? coerceFile(read.value) : null;
-    if (!records) {
-      const detail = read.kind === 'corrupt' ? read.detail : 'invalid record';
-      const kept = preserveCorrupt(this.filePath, this.now, this.log);
-      this.log(
-        'error',
-        `[a2a-remote] ${PEERS_FILE} is corrupt (${detail}); no peer can authenticate until re-paired. Original kept at ${kept ?? '(could not move)'}`,
-      );
-      return;
-    }
-    for (const rec of records) this.peers.set(rec.peerId, rec);
+    const { value, writable } = loadStore({
+      filePath: this.filePath,
+      fileName: PEERS_FILE,
+      coerce: coerceFile,
+      now: this.now,
+      log: this.log,
+      level: 'error',
+      emptyMeans: 'no peer can authenticate until re-paired',
+    });
+    this.writable = writable;
+    for (const rec of value ?? []) this.peers.set(rec.peerId, rec);
   }
 }
 
@@ -248,23 +313,21 @@ function project(r: StoredPeer): A2aPeerRecordV1 {
   };
 }
 
-function derive(secret: string | Buffer, salt: Buffer, kdf: DeviceKdfParams): Buffer {
-  return crypto.scryptSync(secret, salt, kdf.keylen, { N: kdf.N, r: kdf.r, p: kdf.p, maxmem: SCRYPT_MAXMEM });
+const scryptAsync = promisify(crypto.scrypt) as (
+  password: crypto.BinaryLike,
+  salt: crypto.BinaryLike,
+  keylen: number,
+  options: crypto.ScryptOptions,
+) => Promise<Buffer>;
+
+function derive(secret: string | Buffer, salt: Buffer, kdf: DeviceKdfParams): Promise<Buffer> {
+  return scryptAsync(secret, salt, kdf.keylen, { N: kdf.N, r: kdf.r, p: kdf.p, maxmem: SCRYPT_MAXMEM });
 }
 
 function sha256(input: Buffer): Buffer {
   return crypto.createHash('sha256').update(input).digest();
 }
 
-function sanitizeName(name: unknown): string {
-  const cleaned = (typeof name === 'string' ? name : '')
-    // eslint-disable-next-line no-control-regex -- matching control characters is the point
-    .replace(/[\u0000-\u001f\u007f]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  if (!cleaned) return UNNAMED_PEER;
-  return cleaned.length > PEER_NAME_MAX ? cleaned.slice(0, PEER_NAME_MAX) : cleaned;
-}
 
 /** Whole-file validation (fail-closed): any record we cannot verify against rejects the file. */
 function coerceFile(raw: unknown): StoredPeer[] | null {
@@ -279,13 +342,13 @@ function coerceFile(raw: unknown): StoredPeer[] | null {
     if (!isHostId(hostId) || !isNonEmptyString(name) || !isIsoString(createdAt)) return null;
     if (lastSeenAt !== undefined && !isIsoString(lastSeenAt)) return null;
     if (revokedAt !== undefined && !isIsoString(revokedAt)) return null;
-    if (!isHex(secretHash) || !isHex(salt) || !kdf) return null;
+    if (!isHex(secretHash) || !isHex(salt) || !kdf || secretHash.length !== kdf.keylen * 2) return null;
     seen.add(peerId);
     out.push({
       v: 1,
       peerId,
       hostId,
-      name: sanitizeName(name),
+      name: sanitizeName(name, UNNAMED_PEER),
       createdAt,
       ...(lastSeenAt !== undefined ? { lastSeenAt } : {}),
       ...(revokedAt !== undefined ? { revokedAt } : {}),
@@ -297,7 +360,11 @@ function coerceFile(raw: unknown): StoredPeer[] | null {
   return out;
 }
 
-/** Same bounds as DeviceStore: a hand-edited record must not be a CPU/memory lever. */
+/**
+ * DeviceStore's bounds (a hand-edited record must not be a CPU/memory lever)
+ * plus what scrypt itself requires — N a power of two above 1 — and a key
+ * long enough to mean something. A violation rejects the whole file.
+ */
 function coerceKdf(raw: unknown): DeviceKdfParams | null {
   if (!isPlainObject(raw) || raw['algo'] !== 'scrypt') return null;
   const N = positiveInt(raw['N']);
@@ -305,7 +372,9 @@ function coerceKdf(raw: unknown): DeviceKdfParams | null {
   const p = positiveInt(raw['p']);
   const keylen = positiveInt(raw['keylen']);
   if (!N || !r || !p || !keylen) return null;
-  if (N > 1 << 20 || r > 32 || p > 16 || keylen > 128) return null;
+  if (N < 2 || (N & (N - 1)) !== 0 || N > 1 << 20) return null;
+  if (r > 32 || p > 16 || keylen < 16 || keylen > 128) return null;
+  if (128 * N * r > SCRYPT_MAXMEM) return null;
   return { algo: 'scrypt', N, r, p, keylen };
 }
 

@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { atomicWriteJSONSync } from '../util/atomicWrite';
-import { reHardenTokenFileAcl, type HardenOutcome } from '../../shared/security';
+import { reHardenTokenFileAcl, secureWriteTokenFile, type HardenOutcome } from '../../shared/security';
 import {
   A2A_REMOTE_RECORD_V,
   formatPeerCredential,
@@ -13,23 +13,38 @@ import {
   type HostId,
   type PeerCredential,
 } from '../../shared/a2aRemote';
-import { errMsg, isIsoString, isNonEmptyString, isPlainObject, preserveCorrupt, readStoreFile, type StoreLog } from './storeFile';
+import { errMsg, isIsoString, isPlainObject, loadStore, sanitizeName, storeUnavailable, type StoreLog } from './storeFile';
 
 /**
  * Joiner side of cross-host A2A pairing: the server hosts this machine paired
  * with, plus the peer credential each one issued (`remote-hosts.json`).
  *
  * The credential is a PLAINTEXT bearer, so it lives in a separate `secrets`
- * field of the same file — one atomic write, no two-file all-or-nothing — and
- * the file gets the LanLink peer store's fail-closed treatment: after every
- * write the owner-only ACL is applied SYNCHRONOUSLY, and on Windows a failed
- * harden unlinks the file and throws rather than leave a bearer
- * broad-readable. `get` / `list` never carry the secret; only `credentialFor`
- * does.
+ * field of the same file (one atomic write, no two-file all-or-nothing) and
+ * the file is only ever PUBLISHED owner-only:
+ *   - Windows: `secureWriteTokenFile`, which writes into a hardened staging
+ *     directory, applies the owner-only DACL, and only then swaps the file
+ *     into place (the `src/main/remote/RemoteHostsStore.ts` precedent). There
+ *     is no window where a broad-readable bearer sits at the real path.
+ *   - POSIX: `atomicWriteJSONSync`, whose temp file is created 0600 before the
+ *     rename; the rotated `.bak` is removed after every successful write.
+ * On a failed Windows write both the primary and `.bak` are removed
+ * best-effort; if either removal fails the store goes UNAVAILABLE (every
+ * later mutation throws) so nothing keeps writing next to a bearer of
+ * unknown protection. `get` / `list` never carry the secret; only
+ * `credentialFor` does.
+ *
+ * Load: the existing file is re-hardened first (`reHardenTokenFileAcl`:
+ * chmod 0600 on POSIX; on Windows it verifies the DACL and rewrites through a
+ * fresh owner-only inode when it is not). A Windows `failed` outcome means the
+ * DACL could be neither verified nor fixed, so the file is NOT read and the
+ * store is unavailable — the file is left in place, since the failure may be
+ * transient.
  *
  * Corrupt file: FAIL-CLOSED. Any invalid record rejects the whole file; the
  * store starts empty (no credential is presented anywhere; re-pair) and the
- * original is kept as `remote-hosts.json.corrupt-<ts>`.
+ * original is kept as `remote-hosts.json.corrupt-<ts>`. An unreadable file
+ * leaves the store unavailable and the original untouched.
  *
  * Write failure: `add` / `updateAddresses` / `updateFingerprint` roll memory
  * back and throw. `remove` keeps the in-memory removal and throws (#658: a
@@ -49,13 +64,19 @@ interface RemoteHostsFileV1 {
 /** What `add` takes; the store stamps `v` and `createdAt`. */
 export type NewRemoteHost = Omit<A2aRemoteHostRecordV1, 'v' | 'createdAt' | 'lastSeenAt'>;
 
-const IPV4_RE = /^\d{1,3}(?:\.\d{1,3}){3}$/;
+const UNNAMED_HOST = 'Unnamed host';
+/** Addresses kept per host. */
+export const ADDRESSES_MAX = 8;
+// Same rules as the contract's invite parser (module-private there).
+const IPV4_RE = /^(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
+const HOSTNAME_RE = /^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /**
  * Machine names first (company DNS survives DHCP), then IPv4s, each group in
- * the given order; trimmed, empty entries dropped, duplicates removed
- * case-insensitively.
+ * the given order; trimmed, duplicates removed case-insensitively, anything
+ * that is neither a valid IPv4 nor a valid hostname dropped, at most
+ * `ADDRESSES_MAX` kept.
  */
 export function orderAddresses(addresses: readonly string[]): string[] {
   const seen = new Set<string>();
@@ -66,10 +87,12 @@ export function orderAddresses(addresses: readonly string[]): string[] {
     const a = raw.trim();
     const key = a.toLowerCase();
     if (!a || seen.has(key)) continue;
+    const isIp = IPV4_RE.test(a);
+    if (!isIp && (/^[\d.]+$/.test(a) || !HOSTNAME_RE.test(a))) continue;
     seen.add(key);
-    (IPV4_RE.test(a) ? ips : names).push(a);
+    (isIp ? ips : names).push(a);
   }
-  return [...names, ...ips];
+  return [...names, ...ips].slice(0, ADDRESSES_MAX);
 }
 
 export interface RemoteHostStoreOptions {
@@ -77,10 +100,12 @@ export interface RemoteHostStoreOptions {
   dir: string;
   now?: () => number;
   log?: StoreLog;
-  /** Test seam; defaults to `atomicWriteJSONSync`. */
+  /** Test seam; defaults to `secureWriteTokenFile` on Windows, `atomicWriteJSONSync` elsewhere. */
   write?: (filePath: string, data: unknown) => void;
-  /** Test seam; defaults to the synchronous `reHardenTokenFileAcl`. */
+  /** Test seam; defaults to the synchronous `reHardenTokenFileAcl` (load-time). */
   reHarden?: (filePath: string) => HardenOutcome;
+  /** Test seam; defaults to `fs.rmSync(p, { force: true })`. */
+  remove?: (filePath: string) => void;
   /** Test seam; defaults to `process.platform === 'win32'`. */
   win32?: boolean;
 }
@@ -92,6 +117,8 @@ export class RemoteHostStore {
   private readonly write: (filePath: string, data: unknown) => void;
   private readonly reHarden: (filePath: string) => HardenOutcome;
   private readonly win32: boolean;
+  private readonly remove_: (filePath: string) => void;
+  private writable = true;
   private readonly hosts = new Map<HostId, A2aRemoteHostRecordV1>();
   private readonly secrets = new Map<HostId, string>();
 
@@ -99,9 +126,14 @@ export class RemoteHostStore {
     this.filePath = path.join(opts.dir, REMOTE_HOSTS_FILE);
     this.now = opts.now ?? Date.now;
     this.log = opts.log ?? ((): void => undefined);
-    this.write = opts.write ?? ((p, d): void => atomicWriteJSONSync(p, d));
-    this.reHarden = opts.reHarden ?? reHardenTokenFileAcl;
     this.win32 = opts.win32 ?? process.platform === 'win32';
+    this.write =
+      opts.write ??
+      (this.win32
+        ? (p, d): void => secureWriteTokenFile(p, JSON.stringify(d, null, 2))
+        : (p, d): void => atomicWriteJSONSync(p, d));
+    this.reHarden = opts.reHarden ?? reHardenTokenFileAcl;
+    this.remove_ = opts.remove ?? ((p): void => fs.rmSync(p, { force: true }));
     this.load();
   }
 
@@ -124,6 +156,7 @@ export class RemoteHostStore {
 
   /** Record a pairing. Re-pairing with a known hostId replaces it. */
   add(input: NewRemoteHost, credential: PeerCredential): A2aRemoteHostRecordV1 {
+    this.assertWritable();
     const rec = buildRecord(input, new Date(this.now()).toISOString());
     if (typeof rec === 'string') throw new Error(`remote host: ${rec}`);
     if (!credential || credential.peerId !== rec.peerId || !parsePeerCredential(formatPeerCredential(credential))) {
@@ -161,6 +194,7 @@ export class RemoteHostStore {
     this.hosts.delete(hostId);
     this.secrets.delete(hostId);
     try {
+      this.assertWritable();
       this.persist();
     } catch (err) {
       this.log('error', `[a2a-remote] remote host ${hostId} is removed in memory but could not be persisted`);
@@ -172,6 +206,7 @@ export class RemoteHostStore {
   // --- internals --------------------------------------------------------------
 
   private require(hostId: HostId): A2aRemoteHostRecordV1 {
+    this.assertWritable();
     const rec = this.hosts.get(hostId);
     if (!rec) throw new Error(`remote host ${hostId}: unknown host`);
     return rec;
@@ -193,49 +228,68 @@ export class RemoteHostStore {
     }
   }
 
+  private assertWritable(): void {
+    if (!this.writable) throw storeUnavailable(REMOTE_HOSTS_FILE);
+  }
+
   private persist(): void {
     const file: RemoteHostsFileV1 = {
       v: A2A_REMOTE_RECORD_V,
       hosts: [...this.hosts.values()],
       secrets: Object.fromEntries(this.secrets),
     };
-    this.write(this.filePath, file);
-    // Same discipline as the LanLink peer store: a bearer must never sit
-    // broad-readable, so harden synchronously and fail closed on Windows.
-    // ('unchanged' is a verified owner-only claim; only 'failed' is fatal.)
-    const outcome = this.reHarden(this.filePath);
-    if (this.win32 && outcome === 'failed') {
-      try {
-        fs.unlinkSync(this.filePath);
-      } catch (unlinkErr) {
-        this.log('error', `[a2a-remote] could not remove an un-hardened ${REMOTE_HOSTS_FILE}: ${errMsg(unlinkErr)}`);
-      }
-      throw new Error(`${REMOTE_HOSTS_FILE}: could not apply owner-only ACL — refusing to persist credentials`);
-    }
-    // The write rotated the previous generation to `.bak`. This store never
-    // reads it, and it may still hold a bearer the operator just removed.
     try {
-      fs.rmSync(`${this.filePath}.bak`, { force: true });
+      this.write(this.filePath, file);
+    } catch (err) {
+      if (this.win32) this.scrubAfterFailedWrite();
+      throw err;
+    }
+    // POSIX: the write rotated the previous generation to `.bak`. This store
+    // never reads it, and it may still hold a bearer the operator just removed.
+    try {
+      this.remove_(`${this.filePath}.bak`);
     } catch (err) {
       this.log('warn', `[a2a-remote] could not remove ${REMOTE_HOSTS_FILE}.bak: ${errMsg(err)}`);
     }
   }
 
-  private load(): void {
-    const read = readStoreFile(this.filePath);
-    if (read.kind === 'missing') return;
-    const parsed = read.kind === 'parsed' ? coerceFile(read.value) : null;
-    if (!parsed) {
-      const detail = read.kind === 'corrupt' ? read.detail : 'invalid record';
-      const kept = preserveCorrupt(this.filePath, this.now, this.log);
-      this.log(
-        'error',
-        `[a2a-remote] ${REMOTE_HOSTS_FILE} is corrupt (${detail}); no remote host is paired until re-paired. Original kept at ${kept ?? '(could not move)'}`,
-      );
-      return;
+  /**
+   * A Windows bearer write failed: whatever is left at the primary or `.bak`
+   * is of unknown protection. Remove both; if that fails, stop writing.
+   */
+  private scrubAfterFailedWrite(): void {
+    for (const p of [this.filePath, `${this.filePath}.bak`]) {
+      try {
+        this.remove_(p);
+      } catch (err) {
+        this.writable = false;
+        this.log('error', `[a2a-remote] could not remove ${p} after a failed credential write (${errMsg(err)}); store is unavailable`);
+      }
     }
-    for (const rec of parsed.hosts) this.hosts.set(rec.hostId, rec);
-    for (const [hostId, secret] of Object.entries(parsed.secrets)) this.secrets.set(hostId, secret);
+  }
+
+  private load(): void {
+    if (fs.existsSync(this.filePath)) {
+      const outcome = this.reHarden(this.filePath);
+      if (this.win32 && outcome === 'failed') {
+        this.writable = false;
+        this.log('error', `[a2a-remote] ${REMOTE_HOSTS_FILE} could not be verified owner-only; not loaded, store is unavailable`);
+        return;
+      }
+    }
+    const { value, writable } = loadStore({
+      filePath: this.filePath,
+      fileName: REMOTE_HOSTS_FILE,
+      coerce: coerceFile,
+      now: this.now,
+      log: this.log,
+      level: 'error',
+      emptyMeans: 'no remote host is paired until re-paired',
+    });
+    this.writable = writable;
+    if (!value) return;
+    for (const rec of value.hosts) this.hosts.set(rec.hostId, rec);
+    for (const [hostId, secret] of Object.entries(value.secrets)) this.secrets.set(hostId, secret);
   }
 }
 
@@ -243,7 +297,7 @@ export class RemoteHostStore {
 function buildRecord(input: NewRemoteHost, createdAt: string): A2aRemoteHostRecordV1 | string {
   if (!isPlainObject(input)) return 'invalid record';
   if (!isHostId(input.hostId)) return 'invalid hostId';
-  if (!isNonEmptyString(input.name)) return 'invalid name';
+  if (typeof input.name !== 'string') return 'invalid name';
   if (!Array.isArray(input.addresses)) return 'invalid addresses';
   const addresses = orderAddresses(input.addresses);
   if (addresses.length === 0) return 'no usable address';
@@ -254,7 +308,7 @@ function buildRecord(input: NewRemoteHost, createdAt: string): A2aRemoteHostReco
   return {
     v: A2A_REMOTE_RECORD_V,
     hostId: input.hostId,
-    name: input.name,
+    name: sanitizeName(input.name, UNNAMED_HOST),
     addresses,
     port: input.port,
     fingerprint256,

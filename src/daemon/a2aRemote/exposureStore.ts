@@ -2,7 +2,7 @@ import path from 'node:path';
 import { atomicWriteJSONSync } from '../util/atomicWrite';
 import { scheduleTokenFileReHarden } from '../../shared/security';
 import { A2A_REMOTE_RECORD_V, isHostId, type A2aExposureV1, type HostId } from '../../shared/a2aRemote';
-import { isIsoString, isPlainObject, preserveCorrupt, readStoreFile, type StoreLog } from './storeFile';
+import { isIsoString, isPlainObject, loadStore, storeUnavailable, type StoreLog } from './storeFile';
 
 /**
  * Layer 2 of cross-host A2A: per paired host, which workspaces/panes it may
@@ -11,7 +11,9 @@ import { isIsoString, isPlainObject, preserveCorrupt, readStoreFile, type StoreL
  * explicit allow-list all answer false.
  *
  * Corrupt file: start empty (nothing exposed) and keep the original as
- * `exposure.json.corrupt-<ts>` for the operator.
+ * `exposure.json.corrupt-<ts>` for the operator. An UNREADABLE file (or one
+ * that could not be moved aside) leaves the store unavailable: nothing is
+ * exposed and every mutation throws, so the original is never overwritten.
  *
  * Write failure: `set` rolls memory back and throws. `clear`, `forgetWorkspace`
  * and `forgetPane` only ever NARROW what is visible, so — like a revoke (#658)
@@ -44,6 +46,7 @@ export class ExposureStore {
   private readonly write: (filePath: string, data: unknown) => void;
   private readonly scheduleHarden: (filePath: string) => void;
   private readonly exposures = new Map<HostId, A2aExposureV1>();
+  private writable = true;
 
   constructor(opts: ExposureStoreOptions) {
     this.filePath = path.join(opts.dir, EXPOSURE_FILE);
@@ -69,6 +72,7 @@ export class ExposureStore {
    * means "no pane of that workspace", NOT "every pane".
    */
   set(hostId: HostId, input: { workspaceIds: string[]; paneIds?: Record<string, string[]> }): A2aExposureV1 {
+    this.assertWritable();
     if (!isHostId(hostId)) throw new Error('exposure: invalid hostId');
     const workspaceIds = uniqueStrings(input.workspaceIds);
     if (!workspaceIds) throw new Error('exposure: workspaceIds must be an array of non-empty strings');
@@ -103,12 +107,18 @@ export class ExposureStore {
 
   /** Expose nothing to `hostId`. Returns false when nothing was exposed. */
   clear(hostId: HostId): boolean {
+    this.assertWritable();
     if (!this.exposures.delete(hostId)) return false;
     this.persist();
     return true;
   }
 
-  /** Default false: absent record, absent workspace, or pane not in an explicit list. */
+  /**
+   * Default false: absent record, absent workspace, or pane not in an explicit
+   * list. An ABSENT `paneIds` key exposing every pane of that workspace is the
+   * contract's meaning (A2aExposureV1), not a store choice; the UI is meant to
+   * always write an explicit list (PR2b).
+   */
   isPaneExposed(hostId: HostId, workspaceId: string, paneId: string): boolean {
     const rec = this.exposures.get(hostId);
     if (!rec || !rec.workspaceIds.includes(workspaceId)) return false;
@@ -116,8 +126,14 @@ export class ExposureStore {
     return rec.paneIds[workspaceId].includes(paneId);
   }
 
+  /** The peer for `hostId` was revoked: drop everything exposed to it. Entry point of the revoke cascade. */
+  forgetHost(hostId: HostId): boolean {
+    return this.clear(hostId);
+  }
+
   /** Drop a closed workspace from every exposure. */
   forgetWorkspace(workspaceId: string): void {
+    this.assertWritable();
     let changed = false;
     for (const rec of this.exposures.values()) {
       if (rec.workspaceIds.includes(workspaceId)) {
@@ -138,6 +154,7 @@ export class ExposureStore {
    * widens to "every pane of the workspace".
    */
   forgetPane(paneId: string): void {
+    this.assertWritable();
     let changed = false;
     for (const rec of this.exposures.values()) {
       if (!rec.paneIds) continue;
@@ -151,6 +168,10 @@ export class ExposureStore {
     if (changed) this.persist();
   }
 
+  private assertWritable(): void {
+    if (!this.writable) throw storeUnavailable(EXPOSURE_FILE);
+  }
+
   private persist(): void {
     const file: ExposureFileV1 = { v: A2A_REMOTE_RECORD_V, exposures: [...this.exposures.values()] };
     this.write(this.filePath, file);
@@ -158,16 +179,17 @@ export class ExposureStore {
   }
 
   private load(): void {
-    const read = readStoreFile(this.filePath);
-    if (read.kind === 'missing') return;
-    const records = read.kind === 'parsed' ? coerceFile(read.value) : null;
-    if (!records) {
-      const detail = read.kind === 'corrupt' ? read.detail : 'invalid shape';
-      const kept = preserveCorrupt(this.filePath, this.now, this.log);
-      this.log('warn', `[a2a-remote] ${EXPOSURE_FILE} is corrupt (${detail}); nothing is exposed. Original kept at ${kept ?? '(could not move)'}`);
-      return;
-    }
-    for (const rec of records) this.exposures.set(rec.hostId, rec);
+    const { value, writable } = loadStore({
+      filePath: this.filePath,
+      fileName: EXPOSURE_FILE,
+      coerce: coerceFile,
+      now: this.now,
+      log: this.log,
+      level: 'warn',
+      emptyMeans: 'nothing is exposed',
+    });
+    this.writable = writable;
+    for (const rec of value ?? []) this.exposures.set(rec.hostId, rec);
   }
 }
 

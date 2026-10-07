@@ -123,6 +123,27 @@ describe('ExposureStore', () => {
     expect(s.isPaneExposed(HOST2, 'ws1', 'p1')).toBe(false);
   });
 
+  it('forgetHost drops everything exposed to that host', () => {
+    const s = make();
+    s.set(HOST, { workspaceIds: ['ws1'] });
+    s.set(HOST2, { workspaceIds: ['ws1'] });
+    expect(s.forgetHost(HOST)).toBe(true);
+    expect(s.isPaneExposed(HOST, 'ws1', 'p1')).toBe(false);
+    expect(s.isPaneExposed(HOST2, 'ws1', 'p1')).toBe(true);
+    expect(make().get(HOST)).toBeUndefined();
+  });
+
+  it('an unreadable file leaves the store unavailable and the file untouched', () => {
+    if (process.platform === 'win32') return;
+    const file = path.join(dir, EXPOSURE_FILE);
+    fs.mkdirSync(file); // EISDIR on read: neither missing nor corrupt
+    const s = make();
+    expect(s.isPaneExposed(HOST, 'ws1', 'p1')).toBe(false);
+    expect(() => s.set(HOST, { workspaceIds: ['ws1'] })).toThrow(/unavailable/);
+    expect(fs.statSync(file).isDirectory()).toBe(true);
+    expect(fs.readdirSync(dir)).toEqual([EXPOSURE_FILE]);
+  });
+
   it('rejects an invalid hostId', () => {
     expect(() => make().set('not-a-uuid', { workspaceIds: [] })).toThrow();
   });

@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { formatPeerCredential, parsePeerCredential } from '../../../shared/a2aRemote';
 import { atomicWriteJSONSync } from '../../util/atomicWrite';
 import { LAST_SEEN_PERSIST_MS } from '../../web/DeviceStore';
-import { PEERS_FILE, PeerStore, type PeerStoreOptions } from '../peerStore';
+import { FAILURES_PER_WINDOW, FAILURE_WINDOW_MS, PEERS_FILE, PeerStore, type PeerStoreOptions } from '../peerStore';
 
 const HOST = '11111111-1111-4111-8111-111111111111';
 const HOST2 = '22222222-2222-4222-8222-222222222222';
@@ -133,6 +133,48 @@ describe('PeerStore', () => {
     expect(await s.resolve(c.peerId, c.secret)).toEqual({ ok: false, reason: 'revoked' });
   });
 
+  it('refuses a second live peer for one hostId until the first is revoked', async () => {
+    const s = make();
+    const a = await s.mint({ hostId: HOST, name: 'a' });
+    await expect(s.mint({ hostId: HOST, name: 'impostor' })).rejects.toThrow(/revoke it first/);
+    // Concurrent mints for one host: exactly one lands.
+    const both = await Promise.allSettled([s.mint({ hostId: HOST2, name: 'x' }), s.mint({ hostId: HOST2, name: 'y' })]);
+    expect(both.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    s.revoke(a.peerId);
+    const b = await s.mint({ hostId: HOST, name: 're-paired' });
+    expect(s.listByHost(HOST).map((p) => [p.peerId, p.revokedAt !== undefined])).toEqual([
+      [a.peerId, true],
+      [b.peerId, false],
+    ]);
+    expect(s.listByHost(HOST2)).toHaveLength(1);
+  });
+
+  it('rate-limits wrong secrets per peerId without blocking other peers', async () => {
+    const s = make();
+    const a = await s.mint({ hostId: HOST, name: 'a' });
+    const b = await s.mint({ hostId: HOST2, name: 'b' });
+    for (let i = 0; i < FAILURES_PER_WINDOW; i++) await s.resolve(a.peerId, 'wrong-secret');
+    // Over budget: even the right secret is refused inside the window.
+    expect(await s.resolve(a.peerId, a.secret)).toEqual({ ok: false, reason: 'unknown' });
+    expect(await s.resolve(b.peerId, b.secret)).toMatchObject({ ok: true });
+    clock += FAILURE_WINDOW_MS;
+    expect(await s.resolve(a.peerId, a.secret)).toMatchObject({ ok: true });
+  });
+
+  it('a failed lastSeenAt write is retried on the next touch', async () => {
+    const s = make();
+    const c = await s.mint({ hostId: HOST, name: 'a' });
+    clock += LAST_SEEN_PERSIST_MS;
+    fail = true;
+    s.touch(c.peerId);
+    fail = false;
+    clock += 1;
+    const before = writes;
+    s.touch(c.peerId);
+    expect(writes).toBe(before + 1);
+    expect(make().list()[0].lastSeenAt).toBe(new Date(clock).toISOString());
+  });
+
   it('rejects an invalid hostId', async () => {
     await expect(make().mint({ hostId: 'nope', name: 'a' })).rejects.toThrow();
   });
@@ -160,6 +202,41 @@ describe('PeerStore', () => {
       fs.writeFileSync(file, JSON.stringify(parsed));
       const t = make();
       expect(await t.resolve(a.peerId, a.secret)).toEqual({ ok: false, reason: 'unknown' });
+    });
+
+    it.each([
+      ['N not a power of two', { N: 3000 }],
+      ['N of 1', { N: 1 }],
+      ['r out of range', { r: 64 }],
+      ['p out of range', { p: 32 }],
+      ['keylen too short', { keylen: 8 }],
+      ['algo not scrypt', { algo: 'pbkdf2' }],
+    ])('invalid scrypt parameters (%s) reject the whole file', async (_label, patch) => {
+      const s = make();
+      const a = await s.mint({ hostId: HOST, name: 'a' });
+      await s.mint({ hostId: HOST2, name: 'b' });
+      const file = path.join(dir, PEERS_FILE);
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf-8'));
+      Object.assign(parsed.peers[1].kdf, patch);
+      fs.writeFileSync(file, JSON.stringify(parsed));
+      expect(await make().resolve(a.peerId, a.secret)).toEqual({ ok: false, reason: 'unknown' });
+    });
+
+    it('a hash whose length does not match keylen rejects the file', async () => {
+      const a = await make().mint({ hostId: HOST, name: 'a' });
+      const file = path.join(dir, PEERS_FILE);
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf-8'));
+      parsed.peers[0].secretHash = parsed.peers[0].secretHash.slice(2);
+      fs.writeFileSync(file, JSON.stringify(parsed));
+      expect(await make().resolve(a.peerId, a.secret)).toEqual({ ok: false, reason: 'unknown' });
+    });
+
+    it('an unreadable file: nobody authenticates, mint refused, file untouched', async () => {
+      if (process.platform === 'win32') return;
+      fs.mkdirSync(path.join(dir, PEERS_FILE));
+      const s = make();
+      await expect(s.mint({ hostId: HOST, name: 'a' })).rejects.toThrow(/unavailable/);
+      expect(fs.readdirSync(dir)).toEqual([PEERS_FILE]);
     });
 
     it('a malformed revokedAt rejects the file rather than reviving the peer', async () => {
