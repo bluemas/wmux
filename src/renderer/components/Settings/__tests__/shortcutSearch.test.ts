@@ -30,6 +30,14 @@ describe('matchesShortcutQuery', () => {
     expect(matchesShortcutQuery('', 'Anything', 'Ctrl+N')).toBe(true);
   });
 
+  it('folds modifier names typed without a space or "+"', () => {
+    expect(matchesShortcutQuery('optionk', 'Some action', '⌥+K')).toBe(true);
+    expect(matchesShortcutQuery('commandk', 'Command palette', '⌘+K')).toBe(true);
+    expect(matchesShortcutQuery('controlk', 'Kill line', '⌃+K')).toBe(true);
+    expect(matchesShortcutQuery('cmdshiftd', 'Split down', '⌘+⇧+D')).toBe(true);
+    expect(matchesShortcutQuery('optk', 'Some action', '⌥+K')).toBe(true);
+  });
+
   it('does not match a different modifier', () => {
     expect(matchesShortcutQuery('alt k', 'Command palette', '⌘+K')).toBe(false);
     expect(matchesShortcutQuery('cmd k', 'Kill line', 'Ctrl+K')).toBe(false);

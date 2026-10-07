@@ -10,19 +10,20 @@
  */
 
 const MODIFIER_SYMBOLS: Record<string, string> = { '⌘': 'cmd', '⌥': 'alt', '⌃': 'ctrl', '⇧': 'shift' };
-const MODIFIER_WORDS: Record<string, string> = {
-  cmd: 'cmd', command: 'cmd',
-  alt: 'alt', option: 'alt', opt: 'alt',
-  ctrl: 'ctrl', control: 'ctrl',
-  shift: 'shift',
-};
+const MODIFIER_WORDS: Record<string, string> = { command: 'cmd', control: 'ctrl', option: 'alt', opt: 'alt' };
+// Longest names first, so "option" is not read as "opt" + "ion".
+const MODIFIER_WORD_RE = /command|control|option|opt/g;
 
 const squash = (text: string): string => text.toLowerCase().replace(/[\s+]/g, '');
 
-/** Modifier symbols and whole-word aliases folded to one spelling, then squashed. */
+/**
+ * Modifier symbols and names folded to one spelling, then squashed. Names are
+ * folded after squashing, so a joined query ("optionk", "commandk") folds the
+ * same as a spaced one ("option k").
+ */
 export function foldShortcutText(text: string): string {
-  const spelled = text.replace(/[⌘⌥⌃⇧]/g, (sym) => ` ${MODIFIER_SYMBOLS[sym]} `);
-  return squash(spelled.split(/[\s+]+/).map((word) => MODIFIER_WORDS[word.toLowerCase()] ?? word).join(' '));
+  const spelled = squash(text.replace(/[⌘⌥⌃⇧]/g, (sym) => MODIFIER_SYMBOLS[sym]));
+  return spelled.replace(MODIFIER_WORD_RE, (word) => MODIFIER_WORDS[word]);
 }
 
 /** Whether a shortcut row (its action name and displayed keys) matches the query. */
