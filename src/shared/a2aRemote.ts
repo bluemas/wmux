@@ -49,6 +49,11 @@ export const A2A_REMOTE_RECORD_V = 1;
 export const A2A_ROUTE_PREFIX = '/api/a2a/';
 
 export const A2A_ROUTES = Object.freeze({
+  /**
+   * POST — redeem a one-shot invite code for a peer credential (layer 1).
+   * Body: A2aPairRequest. The ONLY peer route that takes no credential.
+   */
+  pair: '/api/a2a/pair',
   /** GET  — the server's identity + protocol (lets a joiner re-verify after an address change). */
   hello: '/api/a2a/hello',
   /** GET  — what the server exposes to THIS peer (layer 2). */
@@ -64,6 +69,12 @@ export const A2A_ROUTES = Object.freeze({
   /** POST — joiner acknowledges stream events up to a cursor. Body: A2aStreamAck. */
   ack: '/api/a2a/ack',
 } as const);
+
+/**
+ * Default port of the dedicated A2A listener. Clear of the web server (7681)
+ * and LanLink (45651) defaults; the operator can change it in Settings.
+ */
+export const A2A_REMOTE_DEFAULT_PORT = 45660;
 
 /** True iff `pathname` is a peer route (prefix match on the canonical path). */
 export function isA2aRoute(pathname: string): boolean {
@@ -182,6 +193,41 @@ export function parseInvite(raw: unknown): { ok: true; invite: A2aInvite } | { o
   if (!fingerprint256) return { ok: false, error: 'fingerprint' };
   return { ok: true, invite: { host, port, code, fingerprint256 } };
 }
+
+/** `POST /api/a2a/pair` body. The joiner reports its own identity. */
+export interface A2aPairRequest {
+  code: string;
+  /** The joiner's own HostId. */
+  hostId: HostId;
+  /** The joiner's display name. */
+  name: string;
+  protocol: number;
+}
+
+/**
+ * `POST /api/a2a/pair` success. Carries a PEER credential and nothing else —
+ * never an operator token or a device credential.
+ */
+export interface A2aPairResponse {
+  /** `formatPeerCredential` form. */
+  credential: string;
+  /** The server's HostId. */
+  hostId: HostId;
+  name: string;
+  protocol: number;
+}
+
+/**
+ * Why a pairing was refused (`reason` on a non-200 `/api/a2a/pair` answer),
+ * so the joiner can tell the user what to do next.
+ */
+export type A2aPairRefusal =
+  /** No invite is open, or it ran out of time or attempts. */
+  | 'expired'
+  /** The code does not match the open invite. */
+  | 'invalid-code'
+  /** The joiner presented this server's own hostId. */
+  | 'self';
 
 // ─── Persisted records ──────────────────────────────────────────────────────
 
