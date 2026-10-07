@@ -98,25 +98,32 @@ describe('A2aTaskService — remote marker', () => {
 });
 
 describe('A2aTaskService — remote.mark and listRemotePending', () => {
-  it('lists undelivered inbound tasks only, and a mark survives replay', async () => {
+  it('lists undelivered, unheld inbound tasks; a hold moves to the held list; marks survive replay', async () => {
     const log = newLog();
     const svc = newService(log);
     await inbound(svc, 'rt-1');
     await inbound(svc, 'rt-2');
+    await inbound(svc, 'rt-3');
     await outbound(svc);
-    expect(svc.listRemotePending().map((t) => t.id).sort()).toEqual(['rt-1', 'rt-2']);
+    expect(svc.listRemotePending().map((t) => t.id).sort()).toEqual(['rt-1', 'rt-2', 'rt-3']);
 
     expect((await svc.markRemote({ taskId: 'rt-2', held: 'pane-missing' })).ok).toBe(true);
-    expect(svc.listRemotePending().map((t) => t.id).sort()).toEqual(['rt-1', 'rt-2']);
     expect(svc.getTask('rt-2')?.metadata.remote).toMatchObject({ delivered: false, held: 'pane-missing' });
+    expect(svc.listRemotePending().map((t) => t.id).sort()).toEqual(['rt-1', 'rt-3']);
+    expect(svc.listRemoteHeld().map((t) => t.id)).toEqual(['rt-2']);
 
-    expect((await svc.markRemote({ taskId: 'rt-1', delivered: true })).ok).toBe(true);
-    expect(svc.listRemotePending().map((t) => t.id)).toEqual(['rt-2']);
+    expect((await svc.markRemote({ taskId: 'rt-1', delivered: true, ptyId: 'pty-9' })).ok).toBe(true);
+    expect(svc.getTask('rt-1')?.metadata.to.ptyId).toBe('pty-9');
+    expect((await svc.markRemote({ taskId: 'rt-3', delivered: true, note: 'pasted-not-submitted' })).ok).toBe(true);
+    expect(svc.listRemotePending()).toEqual([]);
 
     const restored = newService(log);
     restored.restoreFromLog();
-    expect(restored.listRemotePending().map((t) => t.id)).toEqual(['rt-2']);
-    expect(restored.getTask('rt-2')?.metadata.remote).toMatchObject({ held: 'pane-missing' });
+    expect(restored.listRemotePending()).toEqual([]);
+    expect(restored.listRemoteHeld().map((t) => t.id)).toEqual(['rt-2']);
+    expect(restored.getTask('rt-2')?.metadata.remote).toMatchObject({ held: 'pane-missing', heldAt: expect.any(String) });
+    expect(restored.getTask('rt-1')?.metadata.to.ptyId).toBe('pty-9');
+    expect(restored.getTask('rt-3')?.metadata.remote).toMatchObject({ delivered: true, note: 'pasted-not-submitted' });
     expect(restored.getTask('rt-1')?.metadata.remote).toMatchObject({ delivered: true });
     expect(restored.getTask('rt-1')?.metadata.remote).not.toHaveProperty('held');
   });
@@ -141,11 +148,58 @@ describe('A2aTaskService — remote.mark and listRemotePending', () => {
     expect((await svc.markRemote({ taskId: 'nope', delivered: true })).ok).toBe(false);
   });
 
-  it('an ended inbound task is no longer pending', async () => {
+  it('an ended inbound task is no longer owed a delivery, only the notice of the peer cancel', async () => {
     const svc = newService(newLog());
     await inbound(svc);
     expect((await svc.applyRemoteState({ taskId: 'rt-in', linkId: LINK, messageId: 's1', to: 'canceled' })).ok).toBe(true);
+    expect(svc.getTask('rt-in')?.metadata.remote).toMatchObject({ inbox: [{ messageId: 's1', kind: 'state', delivered: false }] });
+    expect((await svc.markRemote({ taskId: 'rt-in', messageId: 's1', delivered: true })).ok).toBe(true);
     expect(svc.listRemotePending()).toEqual([]);
+  });
+
+  it('owes one delivery per peer reply/state, marked per message, replayed', async () => {
+    const log = newLog();
+    const svc = newService(log);
+    await outbound(svc);
+    await svc.appendRemoteMessage({ taskId: 'rt-out', linkId: LINK, actorWorkspaceId: REMOTE_WS, message: msg('r-1', 'hi', 'agent') });
+    // Our own reply owes nothing.
+    await svc.appendRemoteMessage({ taskId: 'rt-out', linkId: LINK, actorWorkspaceId: 'ws-local', message: msg('r-2', 'back') });
+    await svc.applyRemoteState({ taskId: 'rt-out', linkId: LINK, messageId: 's-1', to: 'working' });
+    const inbox = () => (svc.getTask('rt-out')?.metadata.remote as { inbox?: unknown[] }).inbox;
+    expect(inbox()).toEqual([
+      { messageId: 'r-1', kind: 'reply', delivered: false },
+      { messageId: 's-1', kind: 'state', delivered: false },
+    ]);
+    expect(svc.listRemotePending().map((t) => t.id)).toEqual(['rt-out']);
+
+    await svc.markRemote({ taskId: 'rt-out', messageId: 'r-1', held: 'occupant-changed' });
+    await svc.markRemote({ taskId: 'rt-out', messageId: 's-1', delivered: true });
+    expect(svc.listRemotePending()).toEqual([]);
+    expect(svc.listRemoteHeld().map((t) => t.id)).toEqual(['rt-out']);
+    expect((await svc.markRemote({ taskId: 'rt-out', messageId: 'nope', delivered: true })).ok).toBe(false);
+
+    const restored = newService(log);
+    restored.restoreFromLog();
+    expect((restored.getTask('rt-out')?.metadata.remote as { inbox?: unknown[] }).inbox).toEqual([
+      { messageId: 'r-1', kind: 'reply', delivered: false, held: 'occupant-changed', heldAt: expect.any(String) },
+      { messageId: 's-1', kind: 'state', delivered: true },
+    ]);
+    // Delivering it later (a person retried) records the new occupant on our side.
+    await restored.markRemote({ taskId: 'rt-out', messageId: 'r-1', delivered: true, ptyId: 'pty-new' });
+    expect(restored.getTask('rt-out')?.metadata.from.ptyId).toBe('pty-new');
+    expect(restored.listRemoteHeld()).toEqual([]);
+  });
+
+  it('forceFailRemote ends an open task from any state, once', async () => {
+    const log = newLog();
+    const svc = newService(log);
+    await inbound(svc);
+    const r = await svc.forceFailRemote({ taskId: 'rt-in', reason: 'link_revoked', forced: 'remote_link_ended' });
+    expect(r).toMatchObject({ ok: true, failed: true });
+    expect(svc.getTask('rt-in')?.status).toMatchObject({ state: 'failed', evidence: { summary: 'link_revoked', items: [] } });
+    expect(await svc.forceFailRemote({ taskId: 'rt-in', reason: 'x', forced: 'remote_link_ended' })).toMatchObject({ ok: true, failed: false });
+    expect(svc.listRemoteByLink(LINK)).toEqual([]);
+    expect(log.readAllRecords().filter((x) => x.domain === 'a2a').at(-1)?.payload).toMatchObject({ forced: 'remote_link_ended' });
   });
 });
 
@@ -202,6 +256,14 @@ describe('A2aTaskService — remote messages and states', () => {
     expect(svc.getTask('rt-in')?.status.state).toBe('submitted');
     expect((await svc.applyRemoteState({ taskId: 'rt-in', linkId: LINK, messageId: 's2', to: 'canceled' })).ok).toBe(true);
     expect(svc.getTask('rt-in')?.status.state).toBe('canceled');
+  });
+
+  it('a peer receiver failure is taken from submitted', async () => {
+    const svc = newService(newLog());
+    await outbound(svc);
+    expect((await svc.applyRemoteState({ taskId: 'rt-out', linkId: LINK, messageId: 's1', to: 'failed', summary: 'rejected' })).ok).toBe(true);
+    expect(svc.getTask('rt-out')?.status.state).toBe('failed');
+    expect((await svc.applyRemoteState({ taskId: 'rt-out', linkId: LINK, messageId: 's2', to: 'failed' })).ok).toBe(false);
   });
 
   it('refuses an invalid transition and a task on another link', async () => {

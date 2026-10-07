@@ -141,7 +141,12 @@ export async function sendRemoteReply(deps: OutboundDeps, input: A2aRemoteReplyI
  * The ledger is checked: a state the task is not in is refused, so this
  * cannot be used to tell the peer something that did not happen here.
  */
-export function sendRemoteState(deps: OutboundDeps, input: A2aRemoteStateInput): OutboundResult {
+/** What `sendRemoteState` needs: the ledger read, the link gate and the outbox. */
+export type StateDeps = Pick<OutboundDeps, 'linkStore' | 'outbox' | 'now' | 'mintId'> & {
+  taskService: Pick<A2aTaskService, 'getTask'>;
+};
+
+export function sendRemoteState(deps: StateDeps, input: A2aRemoteStateInput): OutboundResult {
   const found = remoteTaskAndLink(deps, input.taskId);
   if (!found.ok) return found;
   const { task, link } = found;
@@ -165,7 +170,7 @@ export function sendRemoteState(deps: OutboundDeps, input: A2aRemoteStateInput):
 // --- helpers --------------------------------------------------------------------
 
 function remoteTaskAndLink(
-  deps: OutboundDeps,
+  deps: StateDeps,
   taskId: string,
 ): { ok: true; task: Task; link: A2aLinkRecordV1 } | { ok: false; error: string } {
   const task = deps.taskService.getTask(taskId);
@@ -177,7 +182,7 @@ function remoteTaskAndLink(
 }
 
 function envelope(
-  deps: OutboundDeps,
+  deps: Pick<OutboundDeps, 'now'>,
   link: A2aLinkRecordV1,
   messageId: string,
   body: Pick<A2aRemoteEnvelope, 'kind' | 'taskId' | 'text' | 'state'>,
@@ -201,7 +206,7 @@ function bodyError(text: string): string | null {
   return Buffer.byteLength(text, 'utf8') > A2A_REMOTE_BODY_MAX ? 'too-large' : null;
 }
 
-function mint(deps: OutboundDeps): string {
+function mint(deps: Pick<OutboundDeps, 'mintId'>): string {
   return (deps.mintId ?? ((): string => crypto.randomUUID()))();
 }
 

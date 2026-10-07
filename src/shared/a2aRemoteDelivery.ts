@@ -9,6 +9,7 @@
 // Pure module: no node:* imports (the renderer imports it).
 
 import type { A2aRemoteTaskMarkerV1, HostId } from './a2aRemote';
+import type { Task } from './types';
 
 /**
  * Daemon RPC method names for the delivery layer. Registered in the daemon's
@@ -29,6 +30,10 @@ export const A2A_REMOTE_RPC = Object.freeze({
   reply: 'a2a.remote.reply',
   /** `A2aRemoteStateInput` → `{ ok: true } | { ok: false, error }`. */
   state: 'a2a.remote.state',
+  /** → `{ tasks: Task[] }` — `A2aTaskService.listRemoteHeld()` (for a person to decide). */
+  held: 'a2a.remote.held',
+  /** `{ taskId, reason }` → `{ ok: true } | { ok: false, error }` — `rejectHeld`. */
+  rejectHeld: 'a2a.remote.rejectHeld',
 } as const);
 
 /** Daemon broadcast when an inbound remote task was written to the ledger. */
@@ -81,8 +86,8 @@ export interface A2aRemoteTarget {
 
 export interface A2aRemoteSendTaskInput {
   linkId: string;
-  /** The verified sender pane (must be the link's local pane). */
-  from: { workspaceId: string; name: string; paneId: string };
+  /** The verified sender pane (must be the link's local pane) and its pty now. */
+  from: { workspaceId: string; name: string; paneId: string; ptyId?: string };
   title: string;
   text: string;
 }
@@ -101,9 +106,46 @@ export interface A2aRemoteStateInput {
   summary?: string;
 }
 
-// ─── Renderer delivery result ───────────────────────────────────────────────
+// ─── Delivery state on the ledger marker ─────────────────────────────────────
 
 export type A2aRemoteHeldReason = NonNullable<A2aRemoteTaskMarkerV1['held']>;
+
+/**
+ * One message the peer sent into an existing task (a reply, or a state
+ * change), owed a delivery to our local pane: replies are written to the
+ * pane, states are announced on the event bus. Exactly once per `messageId`.
+ */
+export interface A2aRemoteInboxItem {
+  messageId: string;
+  kind: 'reply' | 'state';
+  delivered?: boolean;
+  held?: A2aRemoteHeldReason;
+  /** When it was first held (the 24 h hold TTL counts from here). */
+  heldAt?: string;
+  note?: 'pasted-not-submitted';
+}
+
+/**
+ * What the daemon keeps under `Task.metadata.remote`: the v1 contract marker
+ * plus local delivery bookkeeping (never sent over the wire).
+ */
+export type A2aRemoteTaskState = A2aRemoteTaskMarkerV1 & {
+  /** Inbound task: its paste stayed in the composer; counted as delivered. */
+  note?: 'pasted-not-submitted';
+  /** Inbound task: when it was first held. */
+  heldAt?: string;
+  inbox?: A2aRemoteInboxItem[];
+};
+
+/** A hold older than this is rejected automatically (`held-expired`). */
+export const A2A_REMOTE_HOLD_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** The local side of a remote task: the party whose workspace is not `remote:`. */
+export function localSideOf(task: Pick<Task, 'metadata'>): 'from' | 'to' {
+  return isRemoteWorkspaceId(task.metadata.from.workspaceId) ? 'to' : 'from';
+}
+
+// ─── Renderer delivery result ───────────────────────────────────────────────
 
 /**
  * What the renderer answers main's bridge for one remote-task delivery.
@@ -114,6 +156,6 @@ export type A2aRemoteHeldReason = NonNullable<A2aRemoteTaskMarkerV1['held']>;
  *     agent in the pane); the bridge may try again later.
  */
 export type A2aRemoteDeliveryResult =
-  | { ok: true; delivered: true; duplicate?: boolean }
+  | { ok: true; delivered: true; duplicate?: boolean; ptyId?: string; note?: 'pasted-not-submitted' }
   | { ok: true; delivered: false; held?: A2aRemoteHeldReason; reason?: string }
   | { ok?: false; error: string };

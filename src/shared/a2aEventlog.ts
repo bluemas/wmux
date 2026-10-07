@@ -63,7 +63,7 @@ export interface A2aTaskTransitionPayload {
    * input-required→failed는 그래프상 불가한데 수신자 소멸로 어떤 non-terminal도
    * 전진 불가하므로 정당). 일반 transition API로는 이 값이 실리지 않는다.
    */
-  forced?: 'workspace_removed' | 'remote_state';
+  forced?: 'workspace_removed' | 'remote_state' | 'remote_held_rejected' | 'remote_link_ended';
   /**
    * Cross-host A2A: the peer's messageId when this transition came from the
    * other host (`forced: 'remote_state'` for a terminal one). Replay re-seeds the
@@ -98,6 +98,8 @@ export interface A2aTaskMessagePayload {
   taskId: string;
   message: Message;
   timestamp: string;
+  /** The peer host wrote it: it is owed a delivery to our local pane. */
+  remoteInbound?: true;
 }
 
 /**
@@ -107,8 +109,14 @@ export interface A2aTaskMessagePayload {
 export interface A2aRemoteMarkPayload {
   kind: 'remote.mark';
   taskId: string;
+  /** Set: the mark is for this inbound reply/state item, not the task itself. */
+  messageId?: string;
   delivered?: boolean;
   held?: NonNullable<A2aRemoteTaskMarkerV1['held']>;
+  /** With `delivered`: the paste stayed in the composer (Enter withheld). */
+  note?: 'pasted-not-submitted';
+  /** With `delivered`: the pty written to — the local pane's new occupant snapshot. */
+  ptyId?: string;
   timestamp: string;
 }
 
