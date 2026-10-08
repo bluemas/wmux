@@ -4,9 +4,11 @@
 
 # wmux
 
-### The workspace for AI agents.
+### The ADE for AI agents.
 
-Run Claude Code, Codex, Gemini, or any CLI agent side by side — native on **Windows and macOS** — and answer them from your **iPhone**.
+**Automate everything else. Do your true work.**
+
+Run fleets of AI agents — Claude Code, Codex, Gemini, or any CLI — side by side, native on **Windows and macOS**. Let them drive a real browser for the work beyond code, and answer them from your **iPhone**.
 
 [![Windows 10/11](https://img.shields.io/badge/Windows-10%2F11-0078D6?logo=windows&logoColor=white)](https://github.com/openwong2kim/wmux/releases/latest)
 [![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon-000000?logo=apple&logoColor=white)](https://github.com/openwong2kim/wmux/releases/latest)
@@ -23,7 +25,7 @@ Run Claude Code, Codex, Gemini, or any CLI agent side by side — native on **Wi
 
 </div>
 
-wmux is a desktop app where your coding agents work side by side, each in its own pane, while a background daemon on your own machine keeps every session alive. What sets it apart:
+wmux is a desktop app where your AI agents work side by side, each in its own pane, while a background daemon on your own machine keeps every session alive. What sets it apart:
 
 - **Any CLI agent, natively on Windows and macOS.** Claude Code, Codex, Gemini, agy (Antigravity), and any other CLI agent run side by side in real PTYs — no WSL needed on Windows.
 - **Sessions owned by your own daemon.** Closing the app, a crash, or a reboot does not end your agents' sessions.
@@ -191,7 +193,7 @@ Community shout-outs to [@snowyukitty](https://github.com/snowyukitty), [@matdac
 
 [MIT](LICENSE)
 
-<sub>**Keywords:** workspace multiplexer · AI coding agent workspace · agent fleet · multi-agent terminal · git worktree fan-out · Claude Code · Codex CLI · Gemini CLI · iOS approval app · MCP server · Chrome DevTools Protocol · browser automation · split terminal · Windows terminal multiplexer · macOS terminal multiplexer · ConPTY · xterm.js · Electron terminal · tmux for Windows</sub>
+<sub>**Keywords:** ADE · agent development environment · AI agent automation · workspace multiplexer · AI coding agent workspace · agent fleet · multi-agent terminal · git worktree fan-out · Claude Code · Codex CLI · Gemini CLI · iOS approval app · MCP server · Chrome DevTools Protocol · browser automation · split terminal · Windows terminal multiplexer · macOS terminal multiplexer · ConPTY · xterm.js · Electron terminal · tmux for Windows</sub>
 
 <div align="center"><sub>⭐ Star history</sub><br>
 
