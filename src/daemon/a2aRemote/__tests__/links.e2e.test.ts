@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { A2A_ROUTES, a2aLinkPath, formatPeerCredential, type A2aLinkRecordV1 } from '../../../shared/a2aRemote';
 import type { A2aRemoteLinkEvent } from '../../../shared/rpc';
 import { ExposedPaneCache } from '../exposedPanes';
@@ -16,6 +16,10 @@ import { LinkStore } from '../linkStore';
 import { PinnedClientError, PinnedTlsClient } from '../pinnedClient';
 import { createA2aRoutes } from '../routes';
 import { disposeAll, makePc, type Pc } from './a2aServerRig';
+
+// Two sides each mint a certificate and every step is a TLS handshake: slow CI
+// runners need far more than the default per-test budget.
+vi.setConfig({ testTimeout: 60_000, hookTimeout: 60_000 });
 
 const FAST = { connectMs: 2_000, requestMs: 5_000 };
 const dirs: string[] = [];
