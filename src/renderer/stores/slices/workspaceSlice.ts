@@ -1449,6 +1449,9 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       if (typeof data.claudeResumeOnStart === 'boolean') {
         state.claudeResumeOnStart = data.claudeResumeOnStart;
       }
+      if (data.fleetLayout === 'list' || data.fleetLayout === 'board') {
+        state.fleetLayout = data.fleetLayout;
+      }
       if (data.customKeybindings) {
         // Merge saved keybindings with current built-in defaults (mirrors the
         // layoutTemplates merge below). Built-in defaults (id 'kb-default-*')

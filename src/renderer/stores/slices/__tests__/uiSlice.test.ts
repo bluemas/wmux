@@ -957,3 +957,12 @@ describe('UISlice — Claude resume on start (#1826)', () => {
     expect(store.getState().claudeResumeOnStart).toBe(true);
   });
 });
+
+describe('UISlice — Fleet layout', () => {
+  it('is the list by default and the setter switches it', () => {
+    const store = createTestStore();
+    expect(store.getState().fleetLayout).toBe('list');
+    store.getState().setFleetLayout('board');
+    expect(store.getState().fleetLayout).toBe('board');
+  });
+});
