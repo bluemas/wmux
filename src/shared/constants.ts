@@ -804,6 +804,18 @@ export const IPC = {
   LANLINK_SEND: 'lanlink:send',
   LANLINK_PEERS_LIST: 'lanlink:peers:list',
   LANLINK_PEERS_REMOVE: 'lanlink:peers:remove',
+  // Cross-host A2A control plane (Settings → LAN → renderer → main → daemon
+  // control pipe `a2a.remote.*`).
+  A2A_REMOTE_STATUS: 'a2aRemote:status',
+  A2A_REMOTE_CONFIGURE: 'a2aRemote:configure',
+  A2A_REMOTE_PAIR_BEGIN: 'a2aRemote:pair:begin',
+  A2A_REMOTE_PAIR_CANCEL: 'a2aRemote:pair:cancel',
+  A2A_REMOTE_PAIR_STATUS: 'a2aRemote:pair:status',
+  A2A_REMOTE_JOIN: 'a2aRemote:join',
+  A2A_REMOTE_HOSTS_LIST: 'a2aRemote:hosts:list',
+  A2A_REMOTE_HOSTS_REMOVE: 'a2aRemote:hosts:remove',
+  A2A_REMOTE_PEERS_LIST: 'a2aRemote:peers:list',
+  A2A_REMOTE_PEERS_REVOKE: 'a2aRemote:peers:revoke',
   // Scheduled runs (renderer → main → daemon `automation.*`). Invoke channels
   // resolve even with no daemon (empty lists / `{ ok:false }`). AUTOMATION_PUSH
   // carries daemon events and connect-time snapshots main → renderer;

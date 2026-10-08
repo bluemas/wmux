@@ -39,6 +39,7 @@ import os from 'node:os';
 import {
   loadConfig,
   saveConfig,
+  saveConfigOrThrow,
   getWmuxDir,
   readNotifySinks,
   readPushPresenceSuppression,
@@ -80,6 +81,13 @@ import { LanLinkController } from './lanlink/controller';
 import { LanLinkServer } from './lanlink/server';
 import { PeerStore } from './lanlink/peers';
 import { coerceLanLinkPatch } from '../shared/lanlink';
+import { A2aRemoteController } from './a2aRemote/controller';
+import { A2aServer } from './a2aRemote/server';
+import { forgetHostCascade, registerA2aRemoteRpc } from './a2aRemote/rpc';
+import { PeerStore as A2aPeerStore } from './a2aRemote/peerStore';
+import { RemoteHostStore } from './a2aRemote/remoteHostStore';
+import { LinkStore } from './a2aRemote/linkStore';
+import { ExposureStore } from './a2aRemote/exposureStore';
 import { ChannelService, ChannelStateWriter, ChannelWakeWorker, wakeAgentSlug, wrapChannelMessageEnvelope, wrapChannelCatalogEnvelope, stampChannelCaller, type CallerFieldSpec, type ChannelServiceEventLog } from './channels';
 import { AppendOnlyLog } from './eventlog/AppendOnlyLog';
 import { SnapshotStore, SNAPSHOT_DIRNAME } from './eventlog/SnapshotStore';
@@ -6725,6 +6733,8 @@ let paneSupervisorRef: PaneSupervisor | null = null;
 // Module-level so the standalone shutdown() can dispose the LanLink listener
 // (close the net.Server, drop live connections, remove the firewall rules).
 let lanLinkServerRef: LanLinkServer | null = null;
+// Same for the cross-host A2A listener.
+let a2aServerRef: A2aServer | null = null;
 
 // Channels v2 — wake worker handle for shutdown + the emit fast path.
 let channelWakeWorkerRef: ChannelWakeWorker | null = null;
@@ -6900,6 +6910,7 @@ async function shutdown(
   // LanLink PR-4: close the listener, drop live AEAD connections, remove firewall
   // rules. Best-effort — must never block the shutdown path.
   try { lanLinkServerRef?.dispose(); } catch { /* best effort */ }
+  try { a2aServerRef?.dispose(); } catch { /* best effort */ }
   paneSupervisorRef = null;
 
   // Stop X1 context watchers (port poll timer + git fs.watch handles)
@@ -7912,6 +7923,39 @@ async function main(): Promise<void> {
       }),
   });
   lanLinkServerRef = lanLinkServer;
+
+  // Cross-host A2A — a DEDICATED HTTPS listener (not the phone web server),
+  // OFF until enabled in Settings. Its stores live under <wmux dir>/a2a. A
+  // failure here must not take the daemon down: the `a2a.remote.*` RPCs then
+  // stay unregistered and Settings shows the section as unavailable.
+  try {
+    const a2aDir = path.join(wmuxDir, 'a2a');
+    const a2aLog = (level: 'info' | 'warn' | 'error', msg: string): void => log(level, msg);
+    const a2aPeers = new A2aPeerStore({ dir: a2aDir, log: a2aLog });
+    const a2aCascade = forgetHostCascade(
+      { links: new LinkStore({ dir: a2aDir, log: a2aLog }), exposures: new ExposureStore({ dir: a2aDir, log: a2aLog }) },
+      a2aLog,
+    );
+    const a2aRemoteController = new A2aRemoteController({ config, persist: saveConfigOrThrow });
+    const a2aServer = new A2aServer({
+      controller: a2aRemoteController,
+      identityDir: a2aDir,
+      peers: a2aPeers,
+      onPeerRevoked: a2aCascade,
+      log: a2aLog,
+    });
+    a2aServerRef = a2aServer;
+    registerA2aRemoteRpc((method, handler) => pipeServer.onRpc(method, handler), {
+      controller: a2aRemoteController,
+      server: a2aServer,
+      peers: a2aPeers,
+      remoteHosts: new RemoteHostStore({ dir: a2aDir, log: a2aLog }),
+      cascade: a2aCascade,
+      log: a2aLog,
+    });
+  } catch (err) {
+    log('error', `[a2a-remote] disabled for this run: ${err instanceof Error ? err.message : String(err)}`);
+  }
 
   // Idle-shutdown config. Defaults: 5 min idle window + 60 s grace.
   // `WMUX_IDLE_SHUTDOWN_MS` and `WMUX_IDLE_GRACE_MS` env vars override

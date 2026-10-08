@@ -84,3 +84,30 @@ describe('a2aRemote helpers', () => {
     expect(isA2aRoute('/api/sessions')).toBe(false);
   });
 });
+
+describe('invite alt addresses', () => {
+  const FP2 = Array.from({ length: 32 }, () => 'AB').join(':');
+  const base = `wmux-a2a://desk:45660/K7PXM4QA#sha256=${FP2}`;
+
+  it('round-trips alt IPv4s and keeps the alt-less form unchanged', () => {
+    const parsed = parseInvite(`${base}&alt=10.0.0.5,192.168.1.9`);
+    expect(parsed).toEqual({
+      ok: true,
+      invite: { host: 'desk', port: 45660, code: 'K7PXM4QA', fingerprint256: FP2, alt: ['10.0.0.5', '192.168.1.9'] },
+    });
+    if (parsed.ok) expect(formatInvite(parsed.invite)).toBe(`${base}&alt=10.0.0.5,192.168.1.9`);
+    const plain = parseInvite(base);
+    expect(plain.ok && plain.invite.alt).toBeUndefined();
+    if (plain.ok) expect(formatInvite({ ...plain.invite, alt: [] })).toBe(base);
+  });
+
+  it.each([
+    ['&alt=', 'empty entry'],
+    ['&alt=10.0.0.01', 'leading zero'],
+    ['&alt=host.example', 'a name'],
+    ['&alt=1.1.1.1,2.2.2.2,3.3.3.3,4.4.4.4,5.5.5.5', 'more than four'],
+    ['&alt=::1', 'IPv6'],
+  ])('rejects alt %s (%s)', (suffix) => {
+    expect(parseInvite(`${base}${suffix}`)).toEqual({ ok: false, error: 'alt' });
+  });
+});

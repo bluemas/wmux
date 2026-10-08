@@ -35,6 +35,15 @@ import type {
   LanLinkPeersListResult,
 } from './lanlink';
 import type {
+  A2aRemoteHostsListResult,
+  A2aRemoteHostsRemoveResult,
+  A2aRemoteJoinResult,
+  A2aRemotePairBeginResult,
+  A2aRemotePairStatus,
+  A2aRemotePeersListResult,
+  A2aRemoteStatus,
+} from './rpc';
+import type {
   PairFlow,
   WebDeviceListError,
   WebDeviceRevokeResult,
@@ -183,6 +192,24 @@ declare global {
         peersList: () => Promise<LanLinkPeersListResult>;
         /** PR-5 — revoke a peer (live destroy of its AEAD connection). */
         peersRemove: (peerUuid: string) => Promise<{ ok: true }>;
+      };
+      /** Cross-host A2A control plane (Settings → LAN). Daemon mode only. */
+      a2aRemote?: {
+        status: () => Promise<A2aRemoteStatus>;
+        configure: (patch: { enabled?: boolean; port?: number }) => Promise<A2aRemoteStatus>;
+        /** Open a one-shot invite (10 minutes, 5 attempts). Fails while the listener is down. */
+        pairBegin: () => Promise<A2aRemotePairBeginResult>;
+        pairCancel: () => Promise<{ ok: true }>;
+        pairStatus: () => Promise<A2aRemotePairStatus>;
+        /** Pair with another PC from its pasted invite. Never rejects for a pairing failure. */
+        join: (invite: string) => Promise<A2aRemoteJoinResult>;
+        /** PCs this PC joined. */
+        hostsList: () => Promise<A2aRemoteHostsListResult>;
+        /** Removes here and tells that PC (best effort); `remoteRevoked` says whether it confirmed. */
+        hostsRemove: (hostId: string) => Promise<A2aRemoteHostsRemoveResult>;
+        /** PCs that joined this PC. */
+        peersList: () => Promise<A2aRemotePeersListResult>;
+        peersRevoke: (peerId: string) => Promise<{ ok: boolean }>;
       };
       /**
        * wmux web — titlebar toggle for the daemon-hosted browser/PWA terminal

@@ -14,6 +14,15 @@ import type {
   LanLinkSendArgs,
   LanLinkPeersListResult,
 } from '../shared/lanlink';
+import type {
+  A2aRemoteHostsListResult,
+  A2aRemoteHostsRemoveResult,
+  A2aRemoteJoinResult,
+  A2aRemotePairBeginResult,
+  A2aRemotePairStatus,
+  A2aRemotePeersListResult,
+  A2aRemoteStatus,
+} from '../shared/rpc';
 import { stripReplayQuerySequences } from '../shared/replayQuerySanitizer';
 import { createSessionPipeMarkers } from '../daemon/sessionPipeMarkers';
 import { SessionPipeStreamScanner } from './daemon/sessionPipeStreamScanner';
@@ -557,6 +566,53 @@ export class DaemonClient extends EventEmitter {
   async lanlinkPeersRemove(peerUuid: string): Promise<{ ok: true }> {
     const result = await this.rpc('lanlink.peers.remove', { peerUuid });
     return result as { ok: true };
+  }
+
+  // === Cross-host A2A control plane (`a2a.remote.*`) ===
+  //
+  // Thin pass-throughs; validation lives daemon-side. `join` does a pinned TLS
+  // pairing plus a hello round trip, so it gets 30s like lanlinkPairJoin; the
+  // daemon answers a structured `{ ok:false, error }` long before that.
+
+  async a2aRemoteStatus(): Promise<A2aRemoteStatus> {
+    return (await this.rpc('a2a.remote.status', {})) as A2aRemoteStatus;
+  }
+
+  async a2aRemoteConfigure(patch: { enabled?: boolean; port?: number }): Promise<A2aRemoteStatus> {
+    return (await this.rpc('a2a.remote.configure', patch as Record<string, unknown>)) as A2aRemoteStatus;
+  }
+
+  async a2aRemotePairBegin(): Promise<A2aRemotePairBeginResult> {
+    return (await this.rpc('a2a.remote.pair.begin', {})) as A2aRemotePairBeginResult;
+  }
+
+  async a2aRemotePairCancel(): Promise<{ ok: true }> {
+    return (await this.rpc('a2a.remote.pair.cancel', {})) as { ok: true };
+  }
+
+  async a2aRemotePairStatus(): Promise<A2aRemotePairStatus> {
+    return (await this.rpc('a2a.remote.pair.status', {})) as A2aRemotePairStatus;
+  }
+
+  async a2aRemoteJoin(invite: string): Promise<A2aRemoteJoinResult> {
+    return (await this.rpc('a2a.remote.join', { invite }, { timeoutMs: 30_000 })) as A2aRemoteJoinResult;
+  }
+
+  async a2aRemoteHostsList(): Promise<A2aRemoteHostsListResult> {
+    return (await this.rpc('a2a.remote.hosts.list', {})) as A2aRemoteHostsListResult;
+  }
+
+  /** Also tells the other PC (best effort, over the pinned connection), hence 30s. */
+  async a2aRemoteHostsRemove(hostId: string): Promise<A2aRemoteHostsRemoveResult> {
+    return (await this.rpc('a2a.remote.hosts.remove', { hostId }, { timeoutMs: 30_000 })) as A2aRemoteHostsRemoveResult;
+  }
+
+  async a2aRemotePeersList(): Promise<A2aRemotePeersListResult> {
+    return (await this.rpc('a2a.remote.peers.list', {})) as A2aRemotePeersListResult;
+  }
+
+  async a2aRemotePeersRevoke(peerId: string): Promise<{ ok: boolean }> {
+    return (await this.rpc('a2a.remote.peers.revoke', { peerId })) as { ok: boolean };
   }
 
   /**

@@ -510,6 +510,16 @@ export type RpcMethod =
   | 'lanlink.send'
   | 'lanlink.peers.list'
   | 'lanlink.peers.remove'
+  | 'a2a.remote.status'
+  | 'a2a.remote.configure'
+  | 'a2a.remote.pair.begin'
+  | 'a2a.remote.pair.cancel'
+  | 'a2a.remote.pair.status'
+  | 'a2a.remote.join'
+  | 'a2a.remote.hosts.list'
+  | 'a2a.remote.hosts.remove'
+  | 'a2a.remote.peers.list'
+  | 'a2a.remote.peers.revoke'
   | 'a2a.resolve.identity'
   | 'a2a.whoami'
   | 'a2a.discover'
@@ -753,6 +763,16 @@ export const ALL_RPC_METHODS = [
   'lanlink.send',
   'lanlink.peers.list',
   'lanlink.peers.remove',
+  'a2a.remote.status',
+  'a2a.remote.configure',
+  'a2a.remote.pair.begin',
+  'a2a.remote.pair.cancel',
+  'a2a.remote.pair.status',
+  'a2a.remote.join',
+  'a2a.remote.hosts.list',
+  'a2a.remote.hosts.remove',
+  'a2a.remote.peers.list',
+  'a2a.remote.peers.revoke',
   'a2a.resolve.identity',
   'a2a.whoami',
   'a2a.discover',
@@ -1255,3 +1275,101 @@ export type McpDeclarePermissionsResult =
       ok: false;
       errors: PermissionRejection[];
     };
+
+// ─── Cross-host A2A control plane (`a2a.remote.*`) ──────────────────────────
+//
+// Machine-local daemon control-pipe RPCs behind Settings → LAN. `wmux.internal`
+// in the capability map: no plugin or MCP caller can declare them.
+
+import type { A2aPeerRecordV1, A2aRemoteHostRecordV1 } from './a2aRemote';
+
+/** `a2a.remote.status` (and the echo of `a2a.remote.configure`). */
+export interface A2aRemoteStatus {
+  enabled: boolean;
+  /** The port the listener uses (configured, or the default). */
+  port: number;
+  listening: boolean;
+  /** This PC's identity; null until it has been loaded once. */
+  hostId: string | null;
+  name: string;
+  fingerprint256: string | null;
+  /** Why the listener is not running although enabled (bind or identity failure). */
+  lastError: string | null;
+}
+
+/** `a2a.remote.pair.begin` */
+export interface A2aRemotePairBeginResult {
+  invite: string;
+  /** Epoch ms. */
+  expiresAt: number;
+  /** The addresses the invite offers, in the order the other PC tries them. */
+  addresses: string[];
+}
+
+/** `a2a.remote.pair.status` */
+export interface A2aRemotePairStatus {
+  active: boolean;
+  expiresAt: number | null;
+  attemptsLeft: number;
+  /**
+   * Epoch ms until which some address is locked out after repeated failures
+   * (even the right code from it is refused until then); null when none is.
+   */
+  lockedUntil: number | null;
+}
+
+/** Why `a2a.remote.join` failed, worded for the person pasting the invite. */
+export type A2aRemoteJoinError =
+  /** The invite string does not parse. */
+  | 'invite-invalid'
+  /** The invite points at this PC. */
+  | 'self'
+  /** The PC answered with another certificate: a different PC, or its identity was renewed — get a new invite. */
+  | 'fingerprint-mismatch'
+  /** The PC refused the connection: A2A is off there or the port is wrong. */
+  | 'connect-refused'
+  /** No answer in time: likely a firewall, or the PC is offline. */
+  | 'timeout'
+  /** The host name in the invite does not resolve. */
+  | 'not-found'
+  /** The invite expired, was cancelled, or ran out of attempts. */
+  | 'code-expired'
+  /** The code does not match the PC's open invite. */
+  | 'code-invalid'
+  /** Two pairings for this PC raced on that PC; try again. */
+  | 'already-paired'
+  /** Too many failed attempts from this PC; wait a little and retry. */
+  | 'rate-limited'
+  /** The PC answered something this version does not understand. */
+  | 'protocol'
+  /** Anything else (network failure mid-request, local store failure). */
+  | 'failed';
+
+/** `a2a.remote.join` */
+export type A2aRemoteJoinResult =
+  | { ok: true; host: A2aRemoteHostRecordV1 }
+  | {
+      ok: false;
+      error: A2aRemoteJoinError;
+      detail?: string;
+      /** For `rate-limited`: how long until the other PC accepts another try. */
+      retryAfterMs?: number;
+    };
+
+/** `a2a.remote.hosts.list` — PCs this PC joined. Never carries a credential. */
+export interface A2aRemoteHostsListResult {
+  hosts: A2aRemoteHostRecordV1[];
+}
+
+/** `a2a.remote.hosts.remove` */
+export interface A2aRemoteHostsRemoveResult {
+  /** Removed here (false: it was not paired). */
+  ok: boolean;
+  /** The other PC confirmed it revoked this PC's pairing too. */
+  remoteRevoked: boolean;
+}
+
+/** `a2a.remote.peers.list` — PCs that joined this PC (revoked ones included). */
+export interface A2aRemotePeersListResult {
+  peers: A2aPeerRecordV1[];
+}

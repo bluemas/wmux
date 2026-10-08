@@ -452,6 +452,19 @@ export const METHOD_CAPABILITY: Record<RpcMethod, RequiredCapability> = {
   'lanlink.send':            { capability: 'wmux.internal' },
   'lanlink.peers.list':      { capability: 'wmux.internal' },
   'lanlink.peers.remove':    { capability: 'wmux.internal' },
+  // Cross-host A2A control plane (Settings → LAN). Same posture as lanlink.*:
+  // daemon control pipe only, never RpcRouter or the A2A listener. A plugin or
+  // MCP caller must not open an invite, join a PC, or revoke a pairing.
+  'a2a.remote.status':      { capability: 'wmux.internal' },
+  'a2a.remote.configure':   { capability: 'wmux.internal' },
+  'a2a.remote.pair.begin':  { capability: 'wmux.internal' },
+  'a2a.remote.pair.cancel': { capability: 'wmux.internal' },
+  'a2a.remote.pair.status': { capability: 'wmux.internal' },
+  'a2a.remote.join':        { capability: 'wmux.internal' },
+  'a2a.remote.hosts.list':  { capability: 'wmux.internal' },
+  'a2a.remote.hosts.remove': { capability: 'wmux.internal' },
+  'a2a.remote.peers.list':  { capability: 'wmux.internal' },
+  'a2a.remote.peers.revoke': { capability: 'wmux.internal' },
 
   // --- A2A (agent-to-agent) ---
   'a2a.resolve.identity': { capability: 'a2a.read',    riskClass: 'a2a' },
