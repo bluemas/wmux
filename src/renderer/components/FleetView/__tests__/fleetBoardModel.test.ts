@@ -75,18 +75,19 @@ describe('Fleet board keys', () => {
   });
 
   it('moves left and right to the nearest non-empty column at the nearest row', () => {
-    expect(moveOnBoard(grid, 'n3', 'right')).toBe('r1');
-    // Finished is empty, so Running → Idle.
-    expect(moveOnBoard(grid, 'r1', 'right')).toBe('i1');
-    expect(moveOnBoard(grid, 'i2', 'left')).toBe('r1');
-    expect(moveOnBoard(grid, 'n2', 'left')).toBe('n2');
+    // Columns run Running, Needs you, Finished, Idle.
+    expect(moveOnBoard(grid, 'r1', 'right')).toBe('n1');
+    // Finished is empty, so Needs you → Idle, at the nearest row.
+    expect(moveOnBoard(grid, 'n3', 'right')).toBe('i2');
+    expect(moveOnBoard(grid, 'i2', 'left')).toBe('n2');
+    expect(moveOnBoard(grid, 'n2', 'left')).toBe('r1');
+    expect(moveOnBoard(grid, 'r1', 'left')).toBe('r1');
     expect(moveOnBoard(grid, 'i2', 'right')).toBe('i2');
-    expect(moveOnBoard({ ...grid, running: ['r1', 'r2', 'r3'] }, 'i2', 'left')).toBe('r2');
   });
 
   it('lands on the first card when nothing is focused, and on nothing on an empty board', () => {
-    expect(moveOnBoard(grid, null, 'down')).toBe('n1');
-    expect(moveOnBoard(grid, 'gone', 'right')).toBe('n1');
+    expect(moveOnBoard(grid, null, 'down')).toBe('r1');
+    expect(moveOnBoard(grid, 'gone', 'right')).toBe('r1');
     expect(moveOnBoard({ needsYou: [], running: [], finished: [], idle: [] }, null, 'down')).toBeNull();
   });
 });
