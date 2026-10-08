@@ -830,6 +830,7 @@ primitives plus `Settings/SettingsLayout.tsx` (`SettingsSection`,
 | 2026-10-07 | Owner: blink rows that wait on you; per-user setting; default once + remind every 1 min; finished turns drop the needs-you border for a done dot; reduced motion forces off. Needs you = a question or an approval waits: an open dialog, or a turn that ended on a question (`pendingQuestion`); finished (done dot) = a turn that ended with no question. A plain turn-end `waiting` is never needs you, in the sidebar, the rail, Fleet, the titlebar, the deck briefing and the Tasks dot alike. The Continuous option is the documented exception to "perpetual motion only spinners/cursor" | "Done" and "you must act" looked the same, and a question the agent asks in its closing message is the most common thing waiting on the owner, so it stays flagged. A pulse catches the eye for the rows that wait; the setting lets each user choose how loud, and Continuous is allowed because the user opts in |
 | 2026-10-07 | Owner: the needs-you row border goes from dashed to a 1px solid hairline, as quiet as contrast allows: `--attention-hairline` = the look's `--attention` mixed toward transparent at the lowest percentage that keeps 3:1 against `--selection-subtle`, `--selection-hover` and the column behind, measured per look (54–98%; light looks need nearly the full colour). Box shape, radius, the reserved transparent border, the fill and the selected row's accent ring are unchanged; Moa's Waiting on you rows follow | The dash read as busy chrome. One shared percentage could not pass on both dark and light looks, so each look carries its own, pinned by a contrast test |
 | 2026-10-07 | Owner: the sidebar's default order is Manual (supersedes the 2026-09-25 Attention default); in Attention a new workspace lands last instead of holding the top; the Ctrl+N number is always shown, left of the name, in `--text-muted`, in every order | Rows that move on their own when an agent starts working cost the user the order they built. Ctrl+N already follows the stored order in every mode, so showing its number everywhere tells the truth about the key even when a sorted list makes the numbers read out of sequence. The number is a key label, not a state, so it stays neutral |
+| 2026-10-08 | Owner: Fleet can show its rows as a four-column board again (Needs you / Running / Finished / Idle), as an opt-in layout beside the default list; filters, search, tickets and the detail area are shared, and the old board's folding, dense mode, idle peek and 1–4 keys do not return | Some operators read a fleet by column at a glance; one setting gives them that without bringing back a second set of data, counts or verbs |
 | 2026-10-07 | The Ctrl+N number past eight workspaces: 1–8 on the first eight stored rows, 9 on the last, none between (amends the same-day "always shown" row) | Ctrl+9 jumps to the last workspace, not the ninth, so a 9 on the ninth row named a row the key never opens |
 
 ### Desktop conversation view
@@ -1093,6 +1094,18 @@ differently in the two places, and in the order `fleet_triage` returns.
   never on a permission prompt) and Jump to pane. An error row leads with
   its last error line. Check (an error, stopped or unconfirmed row's verb,
   click or Enter) opens this detail in place instead of jumping.
+- **Board layout (opt-in):** a List | Board switch in the header (and the
+  same choice in Settings › Appearance, saved with the session) draws the
+  same rows as cards in four columns — Needs you (with decision tickets),
+  Running, Finished (unread final reports, Ready to review tasks, finished
+  turns; a task shows once, as its review row) and Idle — each headed by its
+  chip's word, a dot and its count; an empty column is not drawn. Nothing
+  folds. A card is the row's content restacked (status and verb, then name,
+  workspace · agent, the now-doing line) on a `--selection-subtle` fill, no
+  border or stripe. ↑↓ / Home / End move in a column, ←→ to the nearest
+  non-empty column at the nearest row; Enter, Space, the row verbs, filters,
+  search and the detail area are the list's. The Tickets filter stays a list.
+  The list remains the default.
 - **Tickets:** Moa's delegated work, one row per job — a hand-off waiting for
   its click, or a WorkLink with its A2A task. A chat message is never a
   ticket. States: Queued, Working, Needs your decision (yellow), Done

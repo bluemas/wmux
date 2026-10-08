@@ -33,6 +33,7 @@ type TestState = WorkspaceSlice & {
   anthropicUsageEnabled: boolean;
   usageLimitAutoResume: boolean;
   claudeResumeOnStart: boolean;
+  fleetLayout: 'list' | 'board';
   customKeybindings: unknown[];
   autoUpdateEnabled: boolean;
   sidebarMode: 'workspaces' | 'company';
@@ -93,6 +94,7 @@ function createTestStore() {
       anthropicUsageEnabled: false,
       usageLimitAutoResume: false,
       claudeResumeOnStart: false,
+      fleetLayout: 'list',
       customKeybindings: [],
       autoUpdateEnabled: true,
       sidebarMode: 'workspaces',
@@ -1517,5 +1519,38 @@ describe('loadSession — Claude resume-on-start setting (#1826)', () => {
     expect(store.getState().claudeResumeOnStart).toBe(true);
     store.getState().loadSession(sessionWith(false));
     expect(store.getState().claudeResumeOnStart).toBe(false);
+  });
+});
+
+describe('loadSession — Fleet layout', () => {
+  function sessionWith(value: unknown): SessionData {
+    const ws: Workspace = {
+      id: 'ws-fleet-layout',
+      name: 'Fleet layout',
+      rootPane: makeBrowserSurfaceTree('https://example.com'),
+      activePaneId: 'pane-root',
+    };
+    return {
+      workspaces: [ws],
+      activeWorkspaceId: ws.id,
+      sidebarVisible: true,
+      ...(value !== undefined ? { fleetLayout: value } : {}),
+    } as unknown as SessionData;
+  }
+
+  it('stays the list for a session saved before the setting existed', () => {
+    const store = createTestStore();
+    store.getState().loadSession(sessionWith(undefined));
+    expect(store.getState().fleetLayout).toBe('list');
+  });
+
+  it('restores a saved layout and ignores an unknown one', () => {
+    const store = createTestStore();
+    store.getState().loadSession(sessionWith('board'));
+    expect(store.getState().fleetLayout).toBe('board');
+    store.getState().loadSession(sessionWith('grid'));
+    expect(store.getState().fleetLayout).toBe('board');
+    store.getState().loadSession(sessionWith('list'));
+    expect(store.getState().fleetLayout).toBe('list');
   });
 });

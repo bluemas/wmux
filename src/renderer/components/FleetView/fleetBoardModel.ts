@@ -1,8 +1,11 @@
-// The Fleet page's list, as pure helpers so they are testable without a DOM.
-// Sections come from selectFleetBoard (the classification the sidebar and the
-// fleet.triage RPC read); this file only counts, moves and picks.
+// The Fleet page's list and its board layout, as pure helpers so they are
+// testable without a DOM. Sections come from selectFleetBoard (the
+// classification the sidebar and the fleet.triage RPC read); this file only
+// counts, moves and picks.
 import type { FleetRow } from '../../stores/selectors/fleet';
 import type { InboxItem } from '../../stores/selectors/approvalInbox';
+import type { ReviewQueueEntry } from '../../stores/selectors/reviewQueue';
+import type { FleetTicket } from './fleetTickets';
 
 /**
  * How many agents Fleet holds: every row outside Idle, idle panes that run an
@@ -39,6 +42,84 @@ export function moveInList(keys: readonly string[], current: string | null, move
   if (at < 0) return keys[0];
   const next = move === 'down' ? Math.min(at + 1, keys.length - 1) : Math.max(at - 1, 0);
   return keys[next];
+}
+
+// ─── Board layout ───────────────────────────────────────────────────────────
+// The same rows as the list, in four columns. A column is a list section:
+// nothing is classified here, so a row sits in the column whose chip counts it.
+
+export type BoardColumn = 'needsYou' | 'running' | 'finished' | 'idle';
+export const BOARD_COLUMNS: readonly BoardColumn[] = ['needsYou', 'running', 'finished', 'idle'];
+
+export type BoardItem =
+  | { kind: 'pane'; key: string; row: FleetRow }
+  | { kind: 'review'; key: string; entry: ReviewQueueEntry }
+  | { kind: 'ticket'; key: string; ticket: FleetTicket };
+
+/** The board column of a Fleet row: its section. */
+export function boardColumnOf(row: FleetRow): BoardColumn {
+  return row.section;
+}
+
+/**
+ * Fill the four columns, each in the list's order. Needs you holds its rows
+ * and the tickets waiting on a decision; Finished holds the unread final
+ * reports, the Ready to review tasks and the finished turns, and shows a
+ * finished task once — as its review entry — rather than again as its pane.
+ */
+export function buildBoardColumns(
+  groups: { needsYou: readonly FleetRow[]; finished: readonly FleetRow[]; running: readonly FleetRow[]; idle: readonly FleetRow[] },
+  extra: { decisions: readonly FleetTicket[]; reports: readonly FleetTicket[]; review: readonly ReviewQueueEntry[] },
+  keys: { review: (workspaceId: string) => string; ticket: (ticketId: string) => string },
+): Record<BoardColumn, BoardItem[]> {
+  const pane = (row: FleetRow): BoardItem => ({ kind: 'pane', key: row.pane.paneId, row });
+  const ticket = (item: FleetTicket): BoardItem => ({ kind: 'ticket', key: keys.ticket(item.id), ticket: item });
+  const reviewWorkspaces = new Set(extra.review.map((entry) => entry.workspaceId));
+  const out: Record<BoardColumn, BoardItem[]> = { needsYou: [], running: [], finished: [], idle: [] };
+  for (const row of [...groups.needsYou, ...groups.running, ...groups.idle]) out[boardColumnOf(row)].push(pane(row));
+  out.needsYou.push(...extra.decisions.map(ticket));
+  out.finished.push(
+    ...extra.reports.map(ticket),
+    ...extra.review.map((entry): BoardItem => ({ kind: 'review', key: keys.review(entry.workspaceId), entry })),
+    ...groups.finished.filter((row) => !reviewWorkspaces.has(row.pane.workspaceId)).map(pane),
+  );
+  return out;
+}
+
+/** Keys of the focusable cards, column by column, in display order. */
+export type BoardGrid = Record<BoardColumn, string[]>;
+
+export function boardGrid(columns: Record<BoardColumn, readonly BoardItem[]>): BoardGrid {
+  return {
+    needsYou: columns.needsYou.map((item) => item.key),
+    running: columns.running.map((item) => item.key),
+    finished: columns.finished.map((item) => item.key),
+    idle: columns.idle.map((item) => item.key),
+  };
+}
+
+export type BoardMove = ListMove | 'left' | 'right';
+
+/**
+ * Where a key press moves focus on the board. ↑↓ stay in a column (clamped),
+ * Home/End go to its ends, ←→ go to the nearest non-empty neighbour column at
+ * the same row (clamped to its length). Nothing focused yet, or a key that
+ * left the board, lands on the first card.
+ */
+export function moveOnBoard(grid: BoardGrid, current: string | null, move: BoardMove): string | null {
+  const columns = BOARD_COLUMNS.filter((c) => grid[c].length > 0);
+  if (columns.length === 0) return null;
+  const col = columns.find((c) => current !== null && grid[c].includes(current));
+  if (!col) return grid[columns[0]][0];
+  const keys = grid[col];
+  const row = keys.indexOf(current as string);
+  if (move === 'up') return keys[Math.max(0, row - 1)];
+  if (move === 'down') return keys[Math.min(keys.length - 1, row + 1)];
+  if (move === 'home') return keys[0];
+  if (move === 'end') return keys[keys.length - 1];
+  const next = columns[columns.indexOf(col) + (move === 'right' ? 1 : -1)];
+  if (!next) return current;
+  return grid[next][Math.min(row, grid[next].length - 1)];
 }
 
 /**
