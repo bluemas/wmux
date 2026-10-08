@@ -56,6 +56,7 @@ import { useAgentActivityClock } from '../../hooks/useAgentActivityClock';
 import { useTerminalCopyShortcut } from '../../hooks/useTerminalCopyShortcut';
 import { useNotificationListener } from '../../hooks/useNotificationListener';
 import { useRpcBridge } from '../../hooks/useRpcBridge';
+import { useA2aLinkRequestToast, useA2aRemoteSnapshot } from '../../hooks/useA2aRemoteSnapshot';
 import { useCloseTabOnShellExit } from '../../hooks/useCloseTabOnShellExit';
 import AgentMentionPicker from '../Palette/AgentMentionPicker';
 import HandoffPopover from '../Git/HandoffPopover';
@@ -889,6 +890,9 @@ export default function AppLayout() {
   useTerminalCopyShortcut();
   useNotificationListener();
   useRpcBridge();
+  // Cross-host A2A: the pane tree for exposure and gone-pane link breaks.
+  useA2aRemoteSnapshot();
+  useA2aLinkRequestToast(t);
   // `exit` in a shell closes its tab (clean exit only).
   useCloseTabOnShellExit();
   // Keep the main-process WorkspaceMirror warm: push the workspace tree +

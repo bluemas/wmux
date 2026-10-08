@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import type { A2aPeerRecordV1, A2aRemoteHostRecordV1 } from '../../../shared/a2aRemote';
 import type { A2aRemoteJoinError, A2aRemoteStatus } from '../../../shared/rpc';
 import { useT } from '../../hooks/useT';
@@ -7,6 +7,7 @@ import UiButton from '../ui/Button';
 import Switch from '../ui/Switch';
 import Input from '../ui/Input';
 import { SettingsSection, SettingRow, SettingNote } from './SettingsLayout';
+import { A2aExposureChecklist } from './A2aExposureChecklist';
 
 // ─── Cross-PC A2A (experimental) ─────────────────────────────────────────────
 //
@@ -75,6 +76,11 @@ export interface A2aRemoteViewProps {
   onAsk: (c: Exclude<A2aRemoteConfirm, null>) => void;
   onConfirm: (c: Exclude<A2aRemoteConfirm, null>) => void;
   onCancelConfirm: () => void;
+  /** The PC whose "panes to show" checklist is open (by hostId). */
+  exposureOpen: string | null;
+  onToggleExposure: (hostId: string) => void;
+  /** Renders that checklist; a slot so this view stays pure. */
+  renderExposure?: (hostId: string, name: string) => ReactNode;
   error: string | null;
   t: T;
 }
@@ -90,7 +96,7 @@ export function A2aRemoteView(props: A2aRemoteViewProps) {
     status, platform, fingerprintCopied, onCopyFingerprint, lockedSec, busy, onToggleEnabled, portDraft, onPortDraft, onPortCommit,
     invite, inviteAddresses, remainingSec, copied, onCreateInvite, onCopyInvite, onCancelInvite,
     joinInput, onJoinInput, onJoin, joinBusy, joinOutcome,
-    hosts, peers, confirming, removed, onAsk, onConfirm, onCancelConfirm, error, t,
+    hosts, peers, confirming, removed, onAsk, onConfirm, onCancelConfirm, exposureOpen, onToggleExposure, renderExposure, error, t,
   } = props;
 
   const confirmRow = (kind: 'host' | 'peer', id: string, label: string) =>
@@ -247,10 +253,24 @@ export function A2aRemoteView(props: A2aRemoteViewProps) {
         ) : (
           <div className="contents" data-testid="a2a-remote-peers">
             {peers.map((p) => (
-              <div key={p.peerId} className="settings-row ui-row" style={{ flexDirection: 'row' }}>
-                <span className="ui-field-label truncate">{p.name}</span>
-                <div className="flex-1" />
-                {confirmRow('peer', p.peerId, t('settings.a2aRemotePeerRevoke'))}
+              <div key={p.peerId} className="contents">
+                <div className="settings-row ui-row" style={{ flexDirection: 'row' }}>
+                  <span className="ui-field-label truncate">{p.name}</span>
+                  <div className="flex-1" />
+                  <UiButton
+                    variant="ghost"
+                    size="md"
+                    className="shrink-0"
+                    aria-expanded={exposureOpen === p.hostId}
+                    onClick={() => onToggleExposure(p.hostId)}
+                  >
+                    {t('settings.a2aExposureButton')}
+                  </UiButton>
+                  {confirmRow('peer', p.peerId, t('settings.a2aRemotePeerRevoke'))}
+                </div>
+                {exposureOpen === p.hostId && renderExposure && (
+                  <div className="settings-row ui-row" data-testid="a2a-remote-exposure">{renderExposure(p.hostId, p.name)}</div>
+                )}
               </div>
             ))}
           </div>
@@ -285,6 +305,7 @@ export function A2aRemoteSection() {
   const [hosts, setHosts] = useState<A2aRemoteHostRecordV1[]>([]);
   const [peers, setPeers] = useState<A2aPeerRecordV1[]>([]);
   const [confirming, setConfirming] = useState<A2aRemoteConfirm>(null);
+  const [exposureOpen, setExposureOpen] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   // The port last shown, so a poll does not overwrite a port being typed.
@@ -493,6 +514,9 @@ export function A2aRemoteSection() {
       onAsk={setConfirming}
       onConfirm={(c) => void onConfirm(c)}
       onCancelConfirm={() => setConfirming(null)}
+      exposureOpen={exposureOpen}
+      onToggleExposure={(hostId) => setExposureOpen((cur) => (cur === hostId ? null : hostId))}
+      renderExposure={(hostId, name) => <A2aExposureChecklist hostId={hostId} pcName={name} t={t} />}
       error={error}
       t={t}
     />

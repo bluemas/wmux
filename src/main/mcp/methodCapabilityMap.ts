@@ -465,6 +465,20 @@ export const METHOD_CAPABILITY: Record<RpcMethod, RequiredCapability> = {
   'a2a.remote.hosts.remove': { capability: 'wmux.internal' },
   'a2a.remote.peers.list':  { capability: 'wmux.internal' },
   'a2a.remote.peers.revoke': { capability: 'wmux.internal' },
+  // Exposure and pane links: the same posture — only the app's own human
+  // exposes panes or accepts a link, never a plugin or an agent.
+  'a2a.remote.exposure.publish': { capability: 'wmux.internal' },
+  'a2a.remote.exposure.get': { capability: 'wmux.internal' },
+  'a2a.remote.exposure.list': { capability: 'wmux.internal' },
+  'a2a.remote.exposure.set': { capability: 'wmux.internal' },
+  'a2a.remote.hosts.exposed': { capability: 'wmux.internal' },
+  'a2a.remote.links.list': { capability: 'wmux.internal' },
+  'a2a.remote.links.propose': { capability: 'wmux.internal' },
+  'a2a.remote.links.accept': { capability: 'wmux.internal' },
+  'a2a.remote.links.reject': { capability: 'wmux.internal' },
+  'a2a.remote.links.revoke': { capability: 'wmux.internal' },
+  'a2a.remote.links.refresh': { capability: 'wmux.internal' },
+  'a2a.remote.local.paneGone': { capability: 'wmux.internal' },
 
   // --- A2A (agent-to-agent) ---
   'a2a.resolve.identity': { capability: 'a2a.read',    riskClass: 'a2a' },

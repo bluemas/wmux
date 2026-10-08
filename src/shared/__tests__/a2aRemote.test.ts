@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
+  a2aEndpointAlias,
+  isAllowedEndpointPair,
+  isConsistentEndpoint,
   formatInvite,
   formatPeerCredential,
   isA2aRoute,
@@ -109,5 +112,28 @@ describe('invite alt addresses', () => {
     ['&alt=::1', 'IPv6'],
   ])('rejects alt %s (%s)', (suffix) => {
     expect(parseInvite(`${base}${suffix}`)).toEqual({ ok: false, error: 'alt' });
+  });
+});
+
+describe('link end kinds (Moa)', () => {
+  it('a pane needs a paneId; a brain must not carry one', () => {
+    expect(isConsistentEndpoint({ kind: 'pane', paneId: 'p' })).toBe(true);
+    expect(isConsistentEndpoint({ kind: 'pane' })).toBe(false);
+    expect(isConsistentEndpoint({ kind: 'pane', paneId: '' })).toBe(false);
+    expect(isConsistentEndpoint({ kind: 'brain' })).toBe(true);
+    expect(isConsistentEndpoint({ kind: 'brain', paneId: '' })).toBe(false);
+    expect(isConsistentEndpoint({ kind: 'other', paneId: 'p' })).toBe(false);
+  });
+
+  it('links like with like only', () => {
+    expect(isAllowedEndpointPair('pane', 'pane')).toBe(true);
+    expect(isAllowedEndpointPair('brain', 'brain')).toBe(true);
+    expect(isAllowedEndpointPair('brain', 'pane')).toBe(false);
+    expect(isAllowedEndpointPair('pane', 'brain')).toBe(false);
+  });
+
+  it('aliases a Moa end as <PC>/Moa', () => {
+    expect(a2aEndpointAlias('DESK', { kind: 'brain', workspaceId: 'hq', workspaceName: 'HQ' })).toBe('DESK/Moa');
+    expect(a2aEndpointAlias('DESK', { kind: 'pane', workspaceId: 'w', paneId: 'p', workspaceName: 'API', label: 'w1-1' })).toBe('DESK/API/w1-1');
   });
 });

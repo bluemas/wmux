@@ -28,6 +28,7 @@ function props(over: Partial<A2aRemoteViewProps> = {}): A2aRemoteViewProps {
     joinInput: '', onJoinInput: () => undefined, onJoin: () => undefined, joinBusy: false, joinOutcome: null,
     hosts: [], peers: [], confirming: null, removed: null,
     onAsk: () => undefined, onConfirm: () => undefined, onCancelConfirm: () => undefined,
+    exposureOpen: null, onToggleExposure: () => undefined,
     error: null, t: tStub,
     ...over,
   };
@@ -93,6 +94,15 @@ describe('A2aRemoteView', () => {
     const asking = render(props({ peers: [peer], confirming: { kind: 'peer', id: 'p1' }, onConfirm }));
     expect(asking).toContain('settings.a2aRemoteKeep');
     expect(asking).toContain('ui-btn-danger');
+  });
+
+  it('opens a PC\'s "panes to show" checklist in place', () => {
+    const peer = { v: 1 as const, peerId: 'p1', hostId: '22222222-2222-4222-8222-222222222222', name: 'LAPTOP', createdAt: '2026-10-07T00:00:00.000Z' };
+    const closed = render(props({ peers: [peer], renderExposure: () => 'CHECKLIST' }));
+    expect(closed).toContain('settings.a2aExposureButton');
+    expect(closed).not.toContain('CHECKLIST');
+    const open = render(props({ peers: [peer], exposureOpen: peer.hostId, renderExposure: (id, name) => `CHECKLIST ${id} ${name}` }));
+    expect(open).toContain(`CHECKLIST ${peer.hostId} LAPTOP`);
   });
 
   it('lists joined hosts with their address', () => {

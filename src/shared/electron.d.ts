@@ -35,6 +35,13 @@ import type {
   LanLinkPeersListResult,
 } from './lanlink';
 import type {
+  A2aRemoteExposureGetResult,
+  A2aRemoteHostsExposedResult,
+  A2aRemoteLinkEvent,
+  A2aRemoteLinkProposeParams,
+  A2aRemoteLinkResult,
+  A2aRemoteLinksListResult,
+  A2aRemotePaneSnapshot,
   A2aRemoteHostsListResult,
   A2aRemoteHostsRemoveResult,
   A2aRemoteJoinResult,
@@ -210,6 +217,25 @@ declare global {
         /** PCs that joined this PC. */
         peersList: () => Promise<A2aRemotePeersListResult>;
         peersRevoke: (peerId: string) => Promise<{ ok: boolean }>;
+        /** This window's whole pane tree; main diffs it and publishes the exposed part. */
+        snapshot: (snapshot: A2aRemotePaneSnapshot) => Promise<{ ok: boolean }>;
+        exposureGet: (hostId: string) => Promise<A2aRemoteExposureGetResult>;
+        /**
+         * Always an explicit pane list per workspace; a workspace without one
+         * exposes no pane. `brain`: this PC's Moa is visible to that PC.
+         */
+        exposureSet: (hostId: string, workspaceIds: string[], paneIds: Record<string, string[]>, brain: boolean) => Promise<A2aRemoteExposureGetResult>;
+        /** The panes a PC this PC joined shows to it. */
+        hostsExposed: (hostId: string) => Promise<A2aRemoteHostsExposedResult>;
+        linksList: () => Promise<A2aRemoteLinksListResult>;
+        linksPropose: (params: A2aRemoteLinkProposeParams) => Promise<A2aRemoteLinkResult>;
+        linksAccept: (linkId: string) => Promise<A2aRemoteLinkResult>;
+        linksReject: (linkId: string) => Promise<A2aRemoteLinkResult>;
+        linksRevoke: (linkId: string) => Promise<A2aRemoteLinkResult>;
+        /** Re-read a link's state from the PC it was proposed to. */
+        linksRefresh: (linkId: string) => Promise<A2aRemoteLinkResult>;
+        /** Daemon link nudges (a proposal arrived, a link changed). Returns unsubscribe. */
+        onLinkEvent: (callback: (event: A2aRemoteLinkEvent) => void) => () => void;
       };
       /**
        * wmux web — titlebar toggle for the daemon-hosted browser/PWA terminal

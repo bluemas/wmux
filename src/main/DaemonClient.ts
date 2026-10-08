@@ -15,6 +15,14 @@ import type {
   LanLinkPeersListResult,
 } from '../shared/lanlink';
 import type {
+  A2aExposureCandidate,
+  A2aRemoteExposureGetResult,
+  A2aRemoteExposureListResult,
+  A2aRemoteHostsExposedResult,
+  A2aRemoteLinkProposeParams,
+  A2aRemoteLinkResult,
+  A2aRemoteLinksListResult,
+  A2aRemotePaneGoneParams,
   A2aRemoteHostsListResult,
   A2aRemoteHostsRemoveResult,
   A2aRemoteJoinResult,
@@ -613,6 +621,44 @@ export class DaemonClient extends EventEmitter {
 
   async a2aRemotePeersRevoke(peerId: string): Promise<{ ok: boolean }> {
     return (await this.rpc('a2a.remote.peers.revoke', { peerId })) as { ok: boolean };
+  }
+
+  async a2aRemoteExposurePublish(panes: A2aExposureCandidate[]): Promise<{ ok: true; count: number }> {
+    return (await this.rpc('a2a.remote.exposure.publish', { panes })) as { ok: true; count: number };
+  }
+
+  async a2aRemoteExposureList(): Promise<A2aRemoteExposureListResult> {
+    return (await this.rpc('a2a.remote.exposure.list', {})) as A2aRemoteExposureListResult;
+  }
+
+  async a2aRemoteExposureGet(hostId: string): Promise<A2aRemoteExposureGetResult> {
+    return (await this.rpc('a2a.remote.exposure.get', { hostId })) as A2aRemoteExposureGetResult;
+  }
+
+  async a2aRemoteExposureSet(hostId: string, workspaceIds: string[], paneIds: Record<string, string[]>, brain: boolean): Promise<A2aRemoteExposureGetResult> {
+    return (await this.rpc('a2a.remote.exposure.set', { hostId, workspaceIds, paneIds, brain })) as A2aRemoteExposureGetResult;
+  }
+
+  /** Reaches the other PC over the pinned connection, hence 30s. */
+  async a2aRemoteHostsExposed(hostId: string): Promise<A2aRemoteHostsExposedResult> {
+    return (await this.rpc('a2a.remote.hosts.exposed', { hostId }, { timeoutMs: 30_000 })) as A2aRemoteHostsExposedResult;
+  }
+
+  async a2aRemoteLinksList(): Promise<A2aRemoteLinksListResult> {
+    return (await this.rpc('a2a.remote.links.list', {})) as A2aRemoteLinksListResult;
+  }
+
+  /** propose / revoke / refresh may reach the other PC, hence 30s. */
+  async a2aRemoteLinksPropose(params: A2aRemoteLinkProposeParams): Promise<A2aRemoteLinkResult> {
+    return (await this.rpc('a2a.remote.links.propose', params as unknown as Record<string, unknown>, { timeoutMs: 30_000 })) as A2aRemoteLinkResult;
+  }
+
+  async a2aRemoteLinkAction(action: 'accept' | 'reject' | 'revoke' | 'refresh', linkId: string): Promise<A2aRemoteLinkResult> {
+    return (await this.rpc(`a2a.remote.links.${action}`, { linkId }, { timeoutMs: 30_000 })) as A2aRemoteLinkResult;
+  }
+
+  async a2aRemotePaneGone(params: A2aRemotePaneGoneParams): Promise<{ ok: true; broken: number }> {
+    return (await this.rpc('a2a.remote.local.paneGone', params as unknown as Record<string, unknown>)) as { ok: true; broken: number };
   }
 
   /**

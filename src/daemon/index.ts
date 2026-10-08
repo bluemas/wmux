@@ -88,6 +88,10 @@ import { PeerStore as A2aPeerStore } from './a2aRemote/peerStore';
 import { RemoteHostStore } from './a2aRemote/remoteHostStore';
 import { LinkStore } from './a2aRemote/linkStore';
 import { ExposureStore } from './a2aRemote/exposureStore';
+import { ExposedPaneCache } from './a2aRemote/exposedPanes';
+import { createA2aRoutes } from './a2aRemote/routes';
+import { registerA2aLinkRpc } from './a2aRemote/linkRpc';
+import type { A2aRemoteLinkEvent } from '../shared/rpc';
 import { ChannelService, ChannelStateWriter, ChannelWakeWorker, wakeAgentSlug, wrapChannelMessageEnvelope, wrapChannelCatalogEnvelope, stampChannelCaller, type CallerFieldSpec, type ChannelServiceEventLog } from './channels';
 import { AppendOnlyLog } from './eventlog/AppendOnlyLog';
 import { SnapshotStore, SNAPSHOT_DIRNAME } from './eventlog/SnapshotStore';
@@ -7932,25 +7936,51 @@ async function main(): Promise<void> {
     const a2aDir = path.join(wmuxDir, 'a2a');
     const a2aLog = (level: 'info' | 'warn' | 'error', msg: string): void => log(level, msg);
     const a2aPeers = new A2aPeerStore({ dir: a2aDir, log: a2aLog });
-    const a2aCascade = forgetHostCascade(
-      { links: new LinkStore({ dir: a2aDir, log: a2aLog }), exposures: new ExposureStore({ dir: a2aDir, log: a2aLog }) },
-      a2aLog,
-    );
+    const a2aLinks = new LinkStore({ dir: a2aDir, log: a2aLog });
+    const a2aExposures = new ExposureStore({ dir: a2aDir, log: a2aLog });
+    const a2aExposedPanes = new ExposedPaneCache();
+    const a2aRemoteHosts = new RemoteHostStore({ dir: a2aDir, log: a2aLog });
+    const a2aCascade = forgetHostCascade({ links: a2aLinks, exposures: a2aExposures }, a2aLog);
+    // Link nudges for the app (a proposal to accept, a state change to show).
+    const a2aBroadcast = (event: A2aRemoteLinkEvent): void =>
+      pipeServer.broadcast({ type: event.type, sessionId: '', data: event });
     const a2aRemoteController = new A2aRemoteController({ config, persist: saveConfigOrThrow });
     const a2aServer = new A2aServer({
       controller: a2aRemoteController,
       identityDir: a2aDir,
       peers: a2aPeers,
       onPeerRevoked: a2aCascade,
+      routes: createA2aRoutes({
+        exposures: a2aExposures,
+        panes: a2aExposedPanes,
+        links: a2aLinks,
+        broadcast: a2aBroadcast,
+        expireProposals: () => {
+          for (const l of a2aLinks.expireProposals()) a2aBroadcast({ type: 'a2a.remote.link.changed', linkId: l.linkId, state: l.state });
+        },
+        log: a2aLog,
+      }),
       log: a2aLog,
     });
     a2aServerRef = a2aServer;
-    registerA2aRemoteRpc((method, handler) => pipeServer.onRpc(method, handler), {
+    const onA2aRpc = (method: string, handler: (params: Record<string, unknown>) => Promise<unknown>): void =>
+      pipeServer.onRpc(method, handler);
+    registerA2aRemoteRpc(onA2aRpc, {
       controller: a2aRemoteController,
       server: a2aServer,
       peers: a2aPeers,
-      remoteHosts: new RemoteHostStore({ dir: a2aDir, log: a2aLog }),
+      remoteHosts: a2aRemoteHosts,
       cascade: a2aCascade,
+      log: a2aLog,
+    });
+    // notifyLinkChange stays the default no-op until the delivery layer's
+    // outbox is wired in; the joiner polls `a2a.remote.links.refresh` meanwhile.
+    registerA2aLinkRpc(onA2aRpc, {
+      links: a2aLinks,
+      exposures: a2aExposures,
+      panes: a2aExposedPanes,
+      remoteHosts: a2aRemoteHosts,
+      broadcast: a2aBroadcast,
       log: a2aLog,
     });
   } catch (err) {
