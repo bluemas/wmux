@@ -36,6 +36,11 @@ import type {
 } from './lanlink';
 import type {
   A2aRemoteExposureGetResult,
+  A2aRemoteHeldListResult,
+  A2aRemoteHeldRejectResult,
+  A2aRemoteHeldRetryResult,
+  A2aRemoteHostStatus,
+  A2aRemoteHostsStatusResult,
   A2aRemoteHostsExposedResult,
   A2aRemoteLinkEvent,
   A2aRemoteLinkProposeParams,
@@ -236,6 +241,16 @@ declare global {
         linksRefresh: (linkId: string) => Promise<A2aRemoteLinkResult>;
         /** Daemon link nudges (a proposal arrived, a link changed). Returns unsubscribe. */
         onLinkEvent: (callback: (event: A2aRemoteLinkEvent) => void) => () => void;
+        /** Connection state of every paired PC. */
+        hostsStatus: () => Promise<A2aRemoteHostsStatusResult>;
+        /** A paired PC's connection changed. Returns unsubscribe. */
+        onHostStatus: (callback: (status: A2aRemoteHostStatus) => void) => () => void;
+        /** Remote work held for a person (pane gone, another agent in it). */
+        heldList: () => Promise<A2aRemoteHeldListResult>;
+        /** Deliver a held task to its pane as the pane is now. */
+        heldRetry: (taskId: string) => Promise<A2aRemoteHeldRetryResult>;
+        /** Reject a held task; the other PC is told. */
+        heldReject: (taskId: string) => Promise<A2aRemoteHeldRejectResult>;
       };
       /**
        * wmux web — titlebar toggle for the daemon-hosted browser/PWA terminal

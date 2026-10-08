@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { A2aLinkRecordV1 } from '../../../shared/a2aRemote';
 import type { Workspace } from '../../../shared/types';
+import type { AgentSlug } from '../../../shared/events';
 import { useStore } from '../../stores';
 import { useT } from '../../hooks/useT';
 import UiButton from '../ui/Button';
@@ -26,6 +27,9 @@ export interface A2aLinksViewProps {
   /** hostId → that PC's name (paired either way). */
   pcNames: Record<string, string>;
   workspaces: Workspace[];
+  /** User pane labels and pane agents, for the header's pane names. */
+  paneLabel?: Record<string, string>;
+  surfaceAgent?: Record<string, { slug?: AgentSlug }>;
   /** `workspaceId/paneId` → this PC's repo key for that pane, when known. */
   localRepos: Record<string, string>;
   busy: string | null;
@@ -57,7 +61,7 @@ export function A2aLinksView(p: A2aLinksViewProps) {
   const pcName = (hostId: string): string => p.pcNames[hostId] ?? hostId.slice(0, 6);
   const localLine = (l: A2aLinkRecordV1): string => {
     if (l.local.kind === 'brain') return t('a2aLink.thisMoa');
-    const n = localPaneName(p.workspaces, l.local);
+    const n = localPaneName(p.workspaces, l.local, p.paneLabel, p.surfaceAgent);
     return `${n.workspace} / ${n.pane}`;
   };
   const localRepo = (l: A2aLinkRecordV1): string | undefined => p.localRepos[`${l.local.workspaceId}/${l.local.paneId}`];
@@ -160,6 +164,7 @@ export default function A2aLinksPanel() {
   const api = window.electronAPI?.a2aRemote;
   const workspaces = useStore((s) => s.workspaces);
   const surfaceAgent = useStore((s) => s.surfaceAgent);
+  const paneLabel = useStore((s) => s.paneLabel);
   const moa = useStore((s) => s.moa);
   const brain = useMemo(() => moaBrainEnd({ workspaces, surfaceAgent, moa }), [workspaces, surfaceAgent, moa]);
   const [moaDialog, setMoaDialog] = useState(false);
@@ -239,6 +244,8 @@ export default function A2aLinksPanel() {
       links={links}
       pcNames={pcNames}
       workspaces={workspaces}
+      paneLabel={paneLabel}
+      surfaceAgent={surfaceAgent}
       localRepos={localRepos}
       busy={busy}
       confirming={confirming}

@@ -600,7 +600,15 @@ export interface A2aRemoteTaskMarkerV1 {
   /** Inbound only: false until main confirms the gated delivery. */
   delivered?: boolean;
   /** Inbound only: why delivery is held. */
-  held?: 'occupant-changed' | 'pane-missing' | 'link-not-active';
+  held?:
+    | 'occupant-changed'
+    | 'pane-missing'
+    | 'link-not-active'
+    | 'brain-delivery-pending'
+    /** A paste was attempted but never confirmed (main restarted mid-delivery): a person decides. */
+    | 'delivery-unconfirmed'
+    /** The pane kept having no agent to deliver to. */
+    | 'no-agent';
 }
 
 export const A2A_REMOTE_TASK_ID_PREFIX = 'rt-';

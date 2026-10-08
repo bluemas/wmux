@@ -1545,6 +1545,9 @@ export default function AppLayout() {
         // Always flip the gate, even on error — never leave the user
         // staring at a permanent "Restoring panes…" placeholder.
         setPaneGate('ready');
+        // The load is over, whatever it found: from here the pane tree is
+        // the real one (a first run, an empty or a broken session included).
+        if (gen === startupGenRef.current) useStore.getState().markSessionLoadSettled();
       }
     })();
   // setPaneGate / clearAllPtyState are stable zustand action refs; reconcilePtys

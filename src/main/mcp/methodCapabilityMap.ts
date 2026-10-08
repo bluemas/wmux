@@ -479,6 +479,16 @@ export const METHOD_CAPABILITY: Record<RpcMethod, RequiredCapability> = {
   'a2a.remote.links.revoke': { capability: 'wmux.internal' },
   'a2a.remote.links.refresh': { capability: 'wmux.internal' },
   'a2a.remote.local.paneGone': { capability: 'wmux.internal' },
+  // Delivery: main's bridge and the a2a handlers only, never a plugin or MCP caller.
+  'a2a.remote.pending': { capability: 'wmux.internal' },
+  'a2a.remote.mark': { capability: 'wmux.internal' },
+  'a2a.remote.targets': { capability: 'wmux.internal' },
+  'a2a.remote.sendTask': { capability: 'wmux.internal' },
+  'a2a.remote.reply': { capability: 'wmux.internal' },
+  'a2a.remote.state': { capability: 'wmux.internal' },
+  'a2a.remote.held': { capability: 'wmux.internal' },
+  'a2a.remote.rejectHeld': { capability: 'wmux.internal' },
+  'a2a.remote.hosts.status': { capability: 'wmux.internal' },
 
   // --- A2A (agent-to-agent) ---
   'a2a.resolve.identity': { capability: 'a2a.read',    riskClass: 'a2a' },

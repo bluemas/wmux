@@ -91,6 +91,8 @@ import { ExposureStore } from './a2aRemote/exposureStore';
 import { ExposedPaneCache } from './a2aRemote/exposedPanes';
 import { createA2aRoutes } from './a2aRemote/routes';
 import { registerA2aLinkRpc } from './a2aRemote/linkRpc';
+import { A2aRemoteDelivery } from './a2aRemote/delivery';
+import { isRemoteTaskId } from '../shared/a2aRemote';
 import type { A2aRemoteLinkEvent } from '../shared/rpc';
 import { ChannelService, ChannelStateWriter, ChannelWakeWorker, wakeAgentSlug, wrapChannelMessageEnvelope, wrapChannelCatalogEnvelope, stampChannelCaller, type CallerFieldSpec, type ChannelServiceEventLog } from './channels';
 import { AppendOnlyLog } from './eventlog/AppendOnlyLog';
@@ -102,9 +104,10 @@ import { isPrincipalUpsertInput } from '../shared/principals';
 import { DEFAULT_COMPANY_ID, CHANNELS_EPOCH } from '../shared/channels';
 // envelope PR4 (§5 D11): A2A 태스크 정본을 렌더러 인메모리에서 데몬 이벤트 로그로.
 // (로그·machineId는 채널 부트 게이트 산출물 공유 — 별도 개방 금지.)
-import { A2aTaskService, type CreateTaskInput } from './a2a/A2aTaskService';
+import { A2aTaskService } from './a2a/A2aTaskService';
+import { parsePublicCreateTask } from './a2a/publicCreateParams';
 import { WorkTaskService } from './worktask/WorkTaskService';
-import { isTaskState, type AgentStatus, type Message, type Task } from '../shared/types';
+import { isTaskState, type AgentStatus, type Task } from '../shared/types';
 import { ProcessMonitor } from './ProcessMonitor';
 import { AgentProcessTracker } from './AgentProcessTracker';
 import { checkWslAgentRunning, reportedAgentForPane, WslPidWatcher } from './wslAgentProcess';
@@ -5586,21 +5589,12 @@ function registerRpcHandlers(
   // 30분 GC)라 로그 부재가 파국이 아니다.
   pipeServer.onRpc('a2a.task.create', async (rawParams) => {
     if (!a2aTaskService) return { ok: false, error: 'a2a.task.create: task log unavailable' };
-    const p = rawParams as Record<string, unknown>;
-    const from = p.from as CreateTaskInput['from'] | undefined;
-    const to = p.to as CreateTaskInput['to'] | undefined;
-    if (!from?.workspaceId || !to?.workspaceId || typeof p.title !== 'string') {
-      return { ok: false, error: 'a2a.task.create: from{workspaceId}, to{workspaceId}, and title are required' };
-    }
-    return a2aTaskService.createTask({
-      ...(typeof p.id === 'string' ? { id: p.id } : {}),
-      title: p.title,
-      from,
-      to,
-      // 초기 히스토리(첫 메시지)는 생성 envelope에 실려 내구화된다. 이후 증분
-      // 히스토리(reply) 내구화는 §6.F 몫 — 전이·생성·취소가 이 PR의 로그 정본.
-      ...(Array.isArray(p.history) ? { history: p.history as Message[] } : {}),
-    });
+    // 초기 히스토리(첫 메시지)는 생성 envelope에 실려 내구화된다. 이후 증분
+    // 히스토리(reply) 내구화는 §6.F 몫 — 전이·생성·취소가 이 PR의 로그 정본.
+    // A caller's `remote` marker never passes, and an rt- id is refused.
+    const parsed = parsePublicCreateTask(rawParams as Record<string, unknown>);
+    if (!parsed.ok) return parsed;
+    return a2aTaskService.createTask(parsed.input);
   });
 
   pipeServer.onRpc('a2a.task.update', async (rawParams, ctx) => {
@@ -5618,7 +5612,7 @@ function registerRpcHandlers(
     // Only the app's main process reads the pane tree; take the list from it
     // alone. Anything else leaves it unknown (no relaxation).
     const livePaneIds = pipeServer.isFirstParty(ctx.clientId) ? normalizeLivePaneIds(p.livePaneIds) : undefined;
-    return a2aTaskService.transition({
+    const moved = await a2aTaskService.transition({
       taskId,
       to: status,
       callerWorkspaceId: workspaceId,
@@ -5640,6 +5634,9 @@ function registerRpcHandlers(
       ...(p.evidence !== undefined ? { evidence: p.evidence } : {}),
       ...(typeof p.idempotencyKey === 'string' ? { idempotencyKey: p.idempotencyKey } : {}),
     });
+    // A cross-host task: the peer hears this state in the same call (ledger first, then outbox).
+    if (moved.ok && isRemoteTaskId(taskId)) await a2aDeliveryRef?.syncTask(taskId);
+    return moved;
   });
 
   pipeServer.onRpc('a2a.task.cancel', async (rawParams) => {
@@ -5648,11 +5645,13 @@ function registerRpcHandlers(
     const taskId = typeof p.taskId === 'string' ? p.taskId : '';
     const workspaceId = typeof p.workspaceId === 'string' ? p.workspaceId : '';
     if (!taskId || !workspaceId) return { ok: false, error: 'a2a.task.cancel: taskId and workspaceId are required' };
-    return a2aTaskService.cancelTask({
+    const canceled = await a2aTaskService.cancelTask({
       taskId,
       callerWorkspaceId: workspaceId,
       ...(typeof p.idempotencyKey === 'string' ? { idempotencyKey: p.idempotencyKey } : {}),
     });
+    if (canceled.ok && isRemoteTaskId(taskId)) await a2aDeliveryRef?.syncTask(taskId);
+    return canceled;
   });
 
   pipeServer.onRpc('a2a.task.reopen', async (rawParams) => {
@@ -6739,6 +6738,7 @@ let paneSupervisorRef: PaneSupervisor | null = null;
 let lanLinkServerRef: LanLinkServer | null = null;
 // Same for the cross-host A2A listener.
 let a2aServerRef: A2aServer | null = null;
+let a2aDeliveryRef: A2aRemoteDelivery | null = null;
 
 // Channels v2 — wake worker handle for shutdown + the emit fast path.
 let channelWakeWorkerRef: ChannelWakeWorker | null = null;
@@ -6914,6 +6914,7 @@ async function shutdown(
   // LanLink PR-4: close the listener, drop live AEAD connections, remove firewall
   // rules. Best-effort — must never block the shutdown path.
   try { lanLinkServerRef?.dispose(); } catch { /* best effort */ }
+  try { void a2aDeliveryRef?.stop(); } catch { /* best effort */ }
   try { a2aServerRef?.dispose(); } catch { /* best effort */ }
   paneSupervisorRef = null;
 
@@ -7936,21 +7937,22 @@ async function main(): Promise<void> {
     const a2aDir = path.join(wmuxDir, 'a2a');
     const a2aLog = (level: 'info' | 'warn' | 'error', msg: string): void => log(level, msg);
     const a2aPeers = new A2aPeerStore({ dir: a2aDir, log: a2aLog });
-    const a2aLinks = new LinkStore({ dir: a2aDir, log: a2aLog });
+    // The delivery layer (below) ends a link's tasks on every link transition.
+    let a2aDelivery: A2aRemoteDelivery | null = null;
+    const a2aLinks = new LinkStore({ dir: a2aDir, log: a2aLog, onTransition: (l) => a2aDelivery?.onLinkTransition(l) });
     const a2aExposures = new ExposureStore({ dir: a2aDir, log: a2aLog });
     const a2aExposedPanes = new ExposedPaneCache();
     const a2aRemoteHosts = new RemoteHostStore({ dir: a2aDir, log: a2aLog });
-    const a2aCascade = forgetHostCascade({ links: a2aLinks, exposures: a2aExposures }, a2aLog);
+    const a2aForgetHost = forgetHostCascade({ links: a2aLinks, exposures: a2aExposures }, a2aLog);
+    const a2aCascade = (hostId: string): void => {
+      a2aForgetHost(hostId);
+      a2aDelivery?.onPeerRevoked(hostId);
+    };
     // Link nudges for the app (a proposal to accept, a state change to show).
     const a2aBroadcast = (event: A2aRemoteLinkEvent): void =>
       pipeServer.broadcast({ type: event.type, sessionId: '', data: event });
     const a2aRemoteController = new A2aRemoteController({ config, persist: saveConfigOrThrow });
-    const a2aServer = new A2aServer({
-      controller: a2aRemoteController,
-      identityDir: a2aDir,
-      peers: a2aPeers,
-      onPeerRevoked: a2aCascade,
-      routes: createA2aRoutes({
+    const a2aRoutes = createA2aRoutes({
         exposures: a2aExposures,
         panes: a2aExposedPanes,
         links: a2aLinks,
@@ -7959,7 +7961,13 @@ async function main(): Promise<void> {
           for (const l of a2aLinks.expireProposals()) a2aBroadcast({ type: 'a2a.remote.link.changed', linkId: l.linkId, state: l.state });
         },
         log: a2aLog,
-      }),
+      });
+    const a2aServer = new A2aServer({
+      controller: a2aRemoteController,
+      identityDir: a2aDir,
+      peers: a2aPeers,
+      onPeerRevoked: a2aCascade,
+      routes: a2aRoutes,
       log: a2aLog,
     });
     a2aServerRef = a2aServer;
@@ -7973,16 +7981,46 @@ async function main(): Promise<void> {
       cascade: a2aCascade,
       log: a2aLog,
     });
-    // notifyLinkChange stays the default no-op until the delivery layer's
-    // outbox is wired in; the joiner polls `a2a.remote.links.refresh` meanwhile.
-    registerA2aLinkRpc(onA2aRpc, {
-      links: a2aLinks,
-      exposures: a2aExposures,
-      panes: a2aExposedPanes,
-      remoteHosts: a2aRemoteHosts,
-      broadcast: a2aBroadcast,
-      log: a2aLog,
-    });
+    // Link control RPCs. Their handlers are also kept here: the delivery
+    // layer's link reconcile reuses `a2a.remote.links.refresh` as is.
+    const a2aLinkHandlers = new Map<string, (params: Record<string, unknown>) => Promise<unknown>>();
+    registerA2aLinkRpc(
+      (method, handler) => {
+        a2aLinkHandlers.set(method, handler);
+        onA2aRpc(method, handler);
+      },
+      {
+        links: a2aLinks,
+        exposures: a2aExposures,
+        panes: a2aExposedPanes,
+        remoteHosts: a2aRemoteHosts,
+        broadcast: a2aBroadcast,
+        // Accept / reject / revoke / broken reach the other PC through the outbox.
+        notifyLinkChange: (...args) => a2aDelivery?.notifyLinkChange(...args),
+        log: a2aLog,
+      },
+    );
+    // Delivery (layer 4) needs the task ledger; without it links still work
+    // but nothing is carried, and the delivery RPCs stay unregistered.
+    if (a2aTaskService) {
+      const refresh = a2aLinkHandlers.get('a2a.remote.links.refresh');
+      a2aDelivery = new A2aRemoteDelivery({
+        dir: a2aDir,
+        links: a2aLinks,
+        taskService: a2aTaskService,
+        peers: a2aPeers,
+        remoteHosts: a2aRemoteHosts,
+        broadcast: (event) => pipeServer.broadcast(event),
+        refreshLink: (linkId) => (refresh ? refresh({ linkId }) : Promise.resolve(null)),
+        log: a2aLog,
+      });
+      a2aDelivery.registerRoutes(a2aRoutes);
+      a2aDelivery.registerRpc(onA2aRpc);
+      a2aDelivery.start();
+      a2aDeliveryRef = a2aDelivery;
+    } else {
+      log('warn', '[a2a-remote] task ledger unavailable: messages between PCs are not carried this run');
+    }
   } catch (err) {
     log('error', `[a2a-remote] disabled for this run: ${err instanceof Error ? err.message : String(err)}`);
   }

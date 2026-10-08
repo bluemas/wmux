@@ -1200,7 +1200,10 @@ export interface WmuxTaskMetadata {
   // sides optional — a ws-only side keeps active-pane delivery / ws-level role.
   // Always ws-scoped: the id must belong to its own `workspaceId` (validated at
   // delivery; cross-ws is refused).
-  from: { workspaceId: string; name: string; paneId?: string; surfaceId?: string };
+  // `from.ptyId` (optional): cross-host A2A only — the sender pane's pty when a
+  // remote task was sent, so a reply from the other host is held instead of
+  // landing on a different agent that took the pane since.
+  from: { workspaceId: string; name: string; paneId?: string; surfaceId?: string; ptyId?: string };
   // `to.ptyId` (optional) is a delivery-time pty SNAPSHOT — channel-mention
   // autoresponse stores it so a deferred flush can fail closed if the pane
   // restarted (successor agent now holds the paneId) before delivery.

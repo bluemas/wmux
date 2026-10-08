@@ -1,0 +1,457 @@
+// In-process end to end for layer 4: two "PCs" (server B, joiner A), each with
+// its own stores, task ledger, delivery layer and a real A2aServer on loopback
+// TLS. main is played by RemoteA2aBridge over the daemon RPCs; the renderer is
+// a fake that records what it was handed.
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { A2A_ROUTES, formatPeerCredential, type A2aLinkRecordV1 } from '../../../shared/a2aRemote';
+import { A2A_REMOTE_NOTIFY_METHOD, A2A_REMOTE_RPC } from '../../../shared/a2aRemoteDelivery';
+import type { DaemonConfig } from '../../types';
+import { RemoteA2aBridge } from '../../../main/a2a/RemoteA2aBridge';
+import { A2aTaskService } from '../../a2a/A2aTaskService';
+import { AppendOnlyLog } from '../../eventlog/AppendOnlyLog';
+import { A2aRemoteController } from '../controller';
+import { A2aRemoteDelivery } from '../delivery';
+import { ExposedPaneCache } from '../exposedPanes';
+import { ExposureStore } from '../exposureStore';
+import { joinRemoteHost } from '../joiner';
+import { registerA2aLinkRpc } from '../linkRpc';
+import { LinkStore } from '../linkStore';
+import { PeerStore } from '../peerStore';
+import { PinnedClientError, PinnedTlsClient, type PinnedClientOptions } from '../pinnedClient';
+import { RemoteHostStore } from '../remoteHostStore';
+import { createA2aRoutes } from '../routes';
+import { A2aServer } from '../server';
+import type { SessionClient } from '../session';
+import { freePort } from './a2aServerRig';
+
+// Two PCs each mint a certificate and every step is a TLS handshake: slow CI
+// runners (Windows) need far more than the default per-test budget.
+vi.setConfig({ testTimeout: 60_000, hookTimeout: 30_000 });
+
+const FAST = { connectMs: 5_000, requestMs: 10_000 };
+const TIMING = { backoffMinMs: 30, backoffMaxMs: 150, livenessMs: 10_000, connectMs: 5_000, requestMs: 10_000 };
+
+type Rpc = (method: string, params?: Record<string, unknown>) => Promise<unknown>;
+
+interface Pc {
+  name: string;
+  dir: string;
+  port: number;
+  hostId: string;
+  links: LinkStore;
+  remoteHosts: RemoteHostStore;
+  peers: PeerStore;
+  tasks: A2aTaskService;
+  server: A2aServer;
+  delivery: A2aRemoteDelivery;
+  bridge: RemoteA2aBridge;
+  rpc: Rpc;
+  /** What the fake renderer was handed. */
+  rendered: Array<{ method: string; params: Record<string, unknown> }>;
+  /** Envelopes this PC's routes accepted from a peer (any outcome). */
+  received: unknown[];
+  stop: () => Promise<void>;
+}
+
+const pcs: Pc[] = [];
+const dirs: string[] = [];
+
+afterEach(async () => {
+  for (const pc of pcs.splice(0)) await pc.stop();
+  for (const d of dirs.splice(0)) fs.rmSync(d, { recursive: true, force: true });
+});
+
+/** A client seam: lets a test break the first POST of a message after it was really sent. */
+type ClientHook = (opts: PinnedClientOptions) => SessionClient;
+
+async function makePc(
+  name: string,
+  opts: { dir?: string; port?: number; client?: ClientHook; render?: (method: string) => Promise<unknown> } = {},
+): Promise<Pc> {
+  const dir = opts.dir ?? fs.mkdtempSync(path.join(os.tmpdir(), 'a2a-deliv-'));
+  if (!opts.dir) dirs.push(dir);
+  const a2aDir = path.join(dir, 'a2a');
+  const port = opts.port ?? (await freePort());
+  const quiet = (): void => undefined;
+  const store = { dir: a2aDir, scheduleHarden: quiet };
+  const log = new AppendOnlyLog({ dir: path.join(dir, 'log'), fsync: () => undefined });
+  log.open();
+  const tasks = new A2aTaskService({ log, origin: { machineId: name, daemonEpoch: 1 } });
+  tasks.restoreFromLog();
+  let delivery: A2aRemoteDelivery | null = null;
+  const links = new LinkStore({ ...store, onTransition: (l) => delivery?.onLinkTransition(l) });
+  const exposures = new ExposureStore(store);
+  const panes = new ExposedPaneCache();
+  const peers = new PeerStore(store);
+  const remoteHosts = new RemoteHostStore({ dir: a2aDir });
+  const linkBroadcast = quiet;
+  const routes = createA2aRoutes({ exposures, panes, links, broadcast: linkBroadcast, log: quiet });
+  const config = { a2aRemote: { enabled: true, port } } as unknown as DaemonConfig;
+  const controller = new A2aRemoteController({ config, persist: quiet });
+  const server = new A2aServer({
+    controller,
+    identityDir: a2aDir,
+    peers,
+    onPeerRevoked: (hostId) => delivery?.onPeerRevoked(hostId),
+    routes,
+    hostname: () => name,
+    ipv4s: () => ['127.0.0.1'],
+    bindHost: '127.0.0.1',
+    log: quiet,
+  });
+  await server.whenIdle();
+
+  const handlers = new Map<string, (p: Record<string, unknown>) => Promise<unknown>>();
+  const onRpc = (m: string, h: (p: Record<string, unknown>) => Promise<unknown>): void => void handlers.set(m, h);
+  registerA2aLinkRpc(onRpc, {
+    links,
+    exposures,
+    panes,
+    remoteHosts,
+    broadcast: linkBroadcast,
+    notifyLinkChange: (...args) => delivery?.notifyLinkChange(...args),
+    log: quiet,
+    timeouts: FAST,
+  });
+  const received: unknown[] = [];
+  const listeners = new Set<(e: { type?: unknown }) => void>();
+  delivery = new A2aRemoteDelivery({
+    dir: a2aDir,
+    links,
+    taskService: tasks,
+    peers,
+    remoteHosts,
+    broadcast: (event) => {
+      for (const l of listeners) l(event);
+    },
+    refreshLink: (linkId) => handlers.get('a2a.remote.links.refresh')!({ linkId }),
+    log: quiet,
+    timing: TIMING,
+    heartbeatMs: 200,
+    syncMs: 50,
+    ...(opts.client ? { client: opts.client } : {}),
+  });
+  const realAccept = delivery.accept.bind(delivery);
+  delivery.accept = (env, peer) => {
+    received.push(env);
+    return realAccept(env, peer);
+  };
+  delivery.registerRoutes(routes);
+  delivery.registerRpc(onRpc);
+  const rpc: Rpc = (method, params = {}) => handlers.get(method)!(params);
+
+  const rendered: Pc['rendered'] = [];
+  const bridge = new RemoteA2aBridge({
+    daemonRpc: (method, params) => rpc(method, params),
+    sendToRenderer: async (method, params) => {
+      rendered.push({ method, params });
+      if (opts.render) return opts.render(method);
+      return { ok: true, delivered: true, ptyId: 'pty-1' };
+    },
+    onDaemonEvent: (l) => {
+      listeners.add(l as (e: { type?: unknown }) => void);
+      return () => listeners.delete(l as (e: { type?: unknown }) => void);
+    },
+    backstopMs: 100,
+  });
+  delivery.start();
+  bridge.start();
+
+  const pc: Pc = {
+    name,
+    dir,
+    port,
+    hostId: server.ensureIdentity().hostId,
+    links,
+    remoteHosts,
+    peers,
+    tasks,
+    server,
+    delivery,
+    bridge,
+    rpc,
+    rendered,
+    received,
+    stop: async () => {
+      bridge.stop();
+      await delivery!.stop();
+      server.dispose();
+      await server.whenIdle();
+      log.close();
+    },
+  };
+  pcs.push(pc);
+  return pc;
+}
+
+async function pair(joiner: Pc, server: Pc): Promise<void> {
+  const res = await joinRemoteHost(server.server.beginPairing().invite, {
+    self: () => joiner.server.ensureIdentity(),
+    selfName: joiner.name,
+    remoteHosts: joiner.remoteHosts,
+    timeouts: FAST,
+  });
+  expect(res.ok).toBe(true);
+  joiner.delivery.syncSessions();
+}
+
+const B_PANE = { kind: 'pane', workspaceId: 'ws-b', workspaceName: 'Backend', paneId: 'pane-b', label: 'codex' };
+const A_PANE = { kind: 'pane', workspaceId: 'ws-a', workspaceName: 'Web', paneId: 'pane-a', label: 'claude' };
+
+/** Pair A to B, B exposes its pane, A proposes, B's human accepts; the accept reaches A over the stream. */
+async function linked(a: Pc, b: Pc): Promise<string> {
+  await pair(a, b);
+  await b.rpc('a2a.remote.exposure.publish', { panes: [B_PANE] });
+  await b.rpc('a2a.remote.exposure.set', { hostId: a.hostId, workspaceIds: ['ws-b'], paneIds: { 'ws-b': ['pane-b'] } });
+  const proposed = (await a.rpc('a2a.remote.links.propose', {
+    hostId: b.hostId,
+    local: A_PANE,
+    remote: { kind: 'pane', workspaceId: 'ws-b', paneId: 'pane-b', label: 'codex', workspaceName: 'Backend' },
+    allow: { outbound: true, inbound: true },
+  })) as { ok: boolean; link: A2aLinkRecordV1 };
+  expect(proposed.ok).toBe(true);
+  const linkId = proposed.link.linkId;
+  expect(await b.rpc('a2a.remote.links.accept', { linkId })).toMatchObject({ ok: true });
+  // No refresh call: the accept notice travels B outbox -> stream -> A.
+  await until(() => a.links.get(linkId)?.state === 'active');
+  return linkId;
+}
+
+async function until(cond: () => boolean, ms = 30_000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > end) throw new Error('timed out waiting');
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
+async function sendTask(a: Pc, linkId: string, text: string): Promise<string> {
+  const res = (await a.rpc(A2A_REMOTE_RPC.sendTask, {
+    linkId,
+    from: { workspaceId: 'ws-a', name: 'Web', paneId: 'pane-a' },
+    title: text,
+    text,
+  })) as { ok: boolean; taskId: string };
+  expect(res.ok).toBe(true);
+  return res.taskId;
+}
+
+const taskSends = (pc: Pc): Array<Record<string, unknown>> => pc.rendered.filter((r) => r.method === 'a2a.task.send').map((r) => r.params);
+
+describe('cross-host delivery, end to end', () => {
+  it('A sends a task to B, B delivers it, B replies, the reply reaches A; and B -> A over the stream', async () => {
+    const b = await makePc('PC-B');
+    const a = await makePc('PC-A');
+    const linkId = await linked(a, b);
+
+    // Discover: A's target alias uses B's workspace name and pane label.
+    const targets = (await a.rpc(A2A_REMOTE_RPC.targets)) as { targets: Array<{ alias: string }> };
+    expect(targets.targets.map((t) => t.alias)).toEqual(['PC-B/Backend/codex']);
+
+    const taskId = await sendTask(a, linkId, 'review the API');
+    await until(() => taskSends(b).length === 1);
+    const delivered = taskSends(b)[0];
+    expect(delivered).toMatchObject({ presetTaskId: taskId, paneId: 'pane-b', gatedDelivery: true, execute: false, message: 'review the API' });
+    expect(delivered['remoteFrom']).toMatchObject({ workspaceId: `remote:${linkId}`, name: 'PC-A/Web/claude' });
+    await until(() => (b.tasks.getTask(taskId)?.metadata.remote as { delivered?: boolean })?.delivered === true);
+
+    // B's agent replies; A's sending pane gets it (bridge notify).
+    expect(await b.rpc(A2A_REMOTE_RPC.reply, { taskId, workspaceId: 'ws-b', text: 'looks good' })).toMatchObject({ ok: true });
+    await until(() => a.rendered.some((r) => r.method === A2A_REMOTE_NOTIFY_METHOD));
+    const aTask = a.tasks.getTask(taskId)!;
+    expect(aTask.history.map((m) => (m.parts[0] as { text: string }).text)).toEqual(['review the API', 'looks good']);
+
+    // a2a_task_query reads the rt- task with its history (the daemon copy).
+    expect(a.tasks.queryTasks('ws-a', {}).map((t) => t.id)).toContain(taskId);
+
+    // Reverse: B -> A is a stream event.
+    const back = (await b.rpc(A2A_REMOTE_RPC.sendTask, {
+      linkId,
+      from: { workspaceId: 'ws-b', name: 'Backend', paneId: 'pane-b' },
+      title: 'ping',
+      text: 'ping from B',
+    })) as { ok: boolean; taskId: string };
+    expect(back.ok).toBe(true);
+    await until(() => taskSends(a).length === 1);
+    expect(taskSends(a)[0]).toMatchObject({ presetTaskId: back.taskId, paneId: 'pane-a', message: 'ping from B' });
+
+    // Exactly once each way, and every message acked.
+    expect(taskSends(b)).toHaveLength(1);
+    await until(() => a.delivery.outbox.pending(b.hostId).length === 0 && b.delivery.outbox.pending(a.hostId).length === 0);
+    expect(a.delivery.status()).toMatchObject([{ hostId: b.hostId, role: 'joiner', state: 'connected', pending: 0 }]);
+    expect(b.delivery.status()).toMatchObject([{ hostId: a.hostId, role: 'server', state: 'connected' }]);
+  });
+
+  it('a send while B is down is delivered once B is back; B resumes its stream from the cursor without duplicates', async () => {
+    let b = await makePc('PC-B');
+    const a = await makePc('PC-A');
+    const linkId = await linked(a, b);
+    const bDir = b.dir;
+
+    // B owes A one reply-less task over the stream before going down.
+    const early = (await b.rpc(A2A_REMOTE_RPC.sendTask, {
+      linkId, from: { workspaceId: 'ws-b', name: 'Backend', paneId: 'pane-b' }, title: 'one', text: 'one',
+    })) as { taskId: string };
+    await until(() => taskSends(a).length === 1);
+
+    const bPort = b.port;
+    pcs.splice(pcs.indexOf(b), 1);
+    await b.stop();
+    const taskId = await sendTask(a, linkId, 'while you were away');
+    await new Promise((r) => setTimeout(r, 300));
+    expect(a.delivery.outbox.pending(b.hostId)).toHaveLength(1);
+    await until(() => a.delivery.status()[0]?.state !== 'connected');
+
+    b = await makePc('PC-B', { dir: bDir, port: bPort });
+    await until(() => taskSends(b).length === 1);
+    expect(taskSends(b)[0]).toMatchObject({ presetTaskId: taskId });
+    // B -> A: still exactly the one task from before the restart.
+    const more = (await b.rpc(A2A_REMOTE_RPC.sendTask, {
+      linkId, from: { workspaceId: 'ws-b', name: 'Backend', paneId: 'pane-b' }, title: 'two', text: 'two',
+    })) as { taskId: string };
+    await until(() => taskSends(a).length === 2);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(taskSends(a).map((p) => p['presetTaskId'])).toEqual([early.taskId, more.taskId]);
+    expect(taskSends(b)).toHaveLength(1);
+  });
+
+  it('a POST that got no answer is resent as is and delivered once', async () => {
+    let broke = false;
+    const flaky: ClientHook = (opts) => {
+      const real = new PinnedTlsClient(opts);
+      return {
+        openStream: (p, o) => real.openStream(p, o),
+        requestJson: async (method, p, body) => {
+          const res = await real.requestJson(method, p, body);
+          // The first task message really landed; its answer is "lost".
+          if (!broke && p === A2A_ROUTES.messages && (body as { kind?: string }).kind === 'task') {
+            broke = true;
+            throw new PinnedClientError('timeout', 'answer lost', { sent: true });
+          }
+          return res;
+        },
+      };
+    };
+    const b = await makePc('PC-B');
+    const a = await makePc('PC-A', { client: flaky });
+    const linkId = await linked(a, b);
+    const taskId = await sendTask(a, linkId, 'exactly once');
+    await until(() => a.delivery.outbox.pending(b.hostId).length === 0);
+    const posts = b.received.filter((e) => (e as { kind?: string }).kind === 'task');
+    expect(posts).toHaveLength(2); // the original and the resend
+    await until(() => taskSends(b).length === 1);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(taskSends(b)).toHaveLength(1);
+    expect(b.tasks.getTask(taskId)).toBeDefined();
+  });
+
+  it('revoking a link mid-task fails it on both sides and refuses later sends', async () => {
+    const b = await makePc('PC-B');
+    const a = await makePc('PC-A');
+    const linkId = await linked(a, b);
+    const taskId = await sendTask(a, linkId, 'long job');
+    await until(() => b.tasks.getTask(taskId) !== undefined);
+
+    expect(await b.rpc('a2a.remote.links.revoke', { linkId })).toMatchObject({ ok: true, link: { state: 'revoked' } });
+    await until(() => a.links.get(linkId)?.state === 'revoked');
+    await until(() => a.tasks.getTask(taskId)?.status.state === 'failed' && b.tasks.getTask(taskId)?.status.state === 'failed');
+
+    expect(await a.rpc(A2A_REMOTE_RPC.sendTask, {
+      linkId, from: { workspaceId: 'ws-a', name: 'Web', paneId: 'pane-a' }, title: 'x', text: 'x',
+    })).toMatchObject({ ok: false, error: 'link-not-active' });
+  });
+
+  it('a certificate that is not the pinned one stops A: identity-changed, nothing sent', async () => {
+    const b = await makePc('PC-B');
+    const a = await makePc('PC-A');
+    const linkId = await linked(a, b);
+    // B's certificate "changed": A's pin no longer matches what B serves.
+    a.remoteHosts.updateFingerprint(b.hostId, 'AB:'.repeat(31) + 'AB');
+    a.delivery.syncSessions();
+    await until(() => a.delivery.status()[0]?.state === 'identity-changed');
+    const before = b.received.length;
+    await sendTask(a, linkId, 'must not leave');
+    await new Promise((r) => setTimeout(r, 400));
+    expect(b.received.length).toBe(before);
+    expect(a.delivery.outbox.pending(b.hostId)).toHaveLength(1);
+  });
+
+  it('a second stream from the same peer closes the first', async () => {
+    const b = await makePc('PC-B');
+    const a = await makePc('PC-A');
+    await pair(a, b);
+    await a.delivery.stop(); // only the raw streams below
+    const cred = a.remoteHosts.credentialFor(b.hostId)!;
+    const client = new PinnedTlsClient({
+      addresses: ['127.0.0.1'],
+      port: b.server.boundPort()!,
+      fingerprint256: b.server.status().fingerprint256!,
+      credential: formatPeerCredential(cred),
+      connectTimeoutMs: FAST.connectMs,
+      requestTimeoutMs: FAST.requestMs,
+    });
+    const first = new AbortController();
+    const second = new AbortController();
+    let firstEnded = false;
+    const firstRun = (async () => {
+      for await (const ev of client.openStream(A2A_ROUTES.stream, { signal: first.signal })) void ev;
+      firstEnded = true;
+    })();
+    await until(() => b.delivery.hub.isConnected(a.hostId));
+    const secondEvents: string[] = [];
+    const secondRun = (async () => {
+      for await (const ev of client.openStream(A2A_ROUTES.stream, { signal: second.signal })) secondEvents.push(ev.event);
+    })();
+    await until(() => firstEnded && secondEvents.includes('hello'));
+    expect(b.delivery.hub.isConnected(a.hostId)).toBe(true);
+    second.abort();
+    first.abort();
+    await Promise.all([firstRun, secondRun]);
+  });
+
+  it('main restarting mid-paste: the task is not pasted again and shows as delivery-unconfirmed', async () => {
+    // B's renderer takes the paste and never answers (main dies right there).
+    const b = await makePc('PC-B', { render: () => new Promise(() => undefined) });
+    const a = await makePc('PC-A');
+    const linkId = await linked(a, b);
+    const taskId = await sendTask(a, linkId, 'paste me once');
+    await until(() => taskSends(b).length === 1);
+    await until(() => (b.tasks.getTask(taskId)?.metadata.remote as { attempted?: boolean })?.attempted === true);
+
+    // A new main: fresh bridge, same daemon.
+    b.bridge.stop();
+    const reRendered: string[] = [];
+    const fresh = new RemoteA2aBridge({
+      daemonRpc: (m, p) => b.rpc(m, p),
+      sendToRenderer: async (m) => {
+        reRendered.push(m);
+        return { ok: true, delivered: true };
+      },
+      onDaemonEvent: () => () => undefined,
+      backstopMs: 100,
+    });
+    fresh.start();
+    try {
+      const held = async (): Promise<string | undefined> => {
+        const res = (await b.rpc(A2A_REMOTE_RPC.held)) as { tasks: Array<{ id: string; metadata: { remote: { held?: string } } }> };
+        return res.tasks.find((t) => t.id === taskId)?.metadata.remote.held;
+      };
+      const end = Date.now() + 30_000;
+      while ((await held()) !== 'delivery-unconfirmed') {
+        if (Date.now() > end) throw new Error('not held');
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      await new Promise((r) => setTimeout(r, 400));
+      expect(reRendered).toEqual([]);
+      // A person's "send again" is the only way it is written once more.
+      expect(await fresh.retryHeld(taskId)).toMatchObject({ ok: true, results: [{ outcome: 'delivered' }] });
+      expect(reRendered).toEqual(['a2a.task.send']);
+    } finally {
+      fresh.stop();
+    }
+  });
+});
+

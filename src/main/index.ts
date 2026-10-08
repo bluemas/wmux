@@ -162,6 +162,10 @@ import { migrateScrollbackOnce } from './scrollback/legacyMigration';
 import { DaemonNotificationRouter } from './notification/DaemonNotificationRouter';
 import { markRendererNotificationListenerNotReady } from './notification/rendererNotificationReadiness';
 import { RemoteInboxBridge } from './lanlink/RemoteInboxBridge';
+import { RemoteA2aBridge } from './a2a/RemoteA2aBridge';
+import { daemonRemoteA2aRpcDeps } from './a2a/remoteA2aRpcDeps';
+import { setA2aRemoteBridge } from './ipc/handlers/a2aRemote.handler';
+import { sendToRenderer } from './pipe/handlers/_bridge';
 import { AutomationBridge } from './automation/AutomationBridge';
 import { AutomationClient } from './automation/AutomationClient';
 import { toastManager } from './notification/ToastManager';
@@ -645,6 +649,8 @@ async function refreshTraySessionCount(): Promise<void> {
 // the notification pipeline 100% inert (Codex 2nd review #1).
 let daemonNotificationRouter: DaemonNotificationRouter | null = null;
 let remoteInboxBridge: RemoteInboxBridge | null = null;
+// Cross-host A2A: hands remote tasks/replies the daemon holds to the renderer.
+let remoteA2aBridge: RemoteA2aBridge | null = null;
 // Scheduled runs: daemon automation events → renderer + OS toasts.
 const automationBridge = new AutomationBridge(
   () => mainWindow,
@@ -1038,7 +1044,11 @@ ipcMain.handle(
 
 /** Set once the ApprovalQueue exists (below). Read lazily by browser.rpc. */
 let liveBorrowRequester: BorrowApprovalRequester | null = null;
-registerA2aRpc(rpcRouter, () => mainWindow, claudeWorker, { getDaemonClient: () => daemonClient });
+registerA2aRpc(rpcRouter, () => mainWindow, claudeWorker, {
+  getDaemonClient: () => daemonClient,
+  // Cross-host A2A: a remote pane's alias and rt- tasks go through the daemon's outbox.
+  remote: daemonRemoteA2aRpcDeps(() => daemonClient),
+});
 registerA2aChannelRpc(rpcRouter, () => daemonClient, () => mainWindow);
 registerCompanyRpc(rpcRouter, () => mainWindow);
 registerEventsRpc(rpcRouter, () => mainWindow, (clientName) => getPluginTrustStore().get(clientName));
@@ -2006,6 +2016,21 @@ app.on('ready', async () => {
       remoteInboxBridge?.stop();
       remoteInboxBridge = new RemoteInboxBridge(() => mainWindow);
       remoteInboxBridge.start(client);
+      // Cross-host A2A — remote tasks/replies the daemon holds, pulled on the
+      // daemon's nudge, on every (re)connect (start pulls at once) and on a
+      // backstop; never through the router, so the approval gate applies.
+      remoteA2aBridge?.stop();
+      remoteA2aBridge = new RemoteA2aBridge({
+        daemonRpc: (method, params) => client.rpc(method, params),
+        sendToRenderer: (method, params, opts) => sendToRenderer(() => mainWindow, method, params, opts),
+        onDaemonEvent: (listener) => {
+          client.on('event', listener);
+          return () => { client.off('event', listener); };
+        },
+        log: (level, msg) => logLine(level, 'a2a-remote', msg),
+      });
+      remoteA2aBridge.start();
+      setA2aRemoteBridge(remoteA2aBridge);
       automationBridge.start(client);
       // X1 — context fold (git branch / worktree / ports / PR badge).
       workspaceContextRouter?.stop();
@@ -2042,6 +2067,9 @@ app.on('ready', async () => {
       daemonNotificationRouter = null;
       remoteInboxBridge?.stop();
       remoteInboxBridge = null;
+      remoteA2aBridge?.stop();
+      remoteA2aBridge = null;
+      setA2aRemoteBridge(null);
       automationBridge.stop();
       workspaceContextRouter?.stop();
       workspaceContextRouter = null;
