@@ -1685,7 +1685,7 @@ export const ko = {
   'settings.attentionBlinkFinished': '끝난 턴',
   'settings.attentionBlinkFinishedDesc': '아직 보지 않은 끝난 턴은 응답 필요 테두리 대신 작은 점으로 표시됩니다. 1회 깜빡임을 고르면 끝날 때 행도 한 번 깜빡입니다.',
   'settings.fleetLayout': 'Fleet 레이아웃',
-  'settings.fleetLayoutDesc': 'Fleet을 하나의 목록으로 볼지, 확인 필요·실행 중·완료·유휴 열로 나뉜 보드로 볼지 고릅니다. Fleet 상단에서도 바꿀 수 있습니다.',
+  'settings.fleetLayoutDesc': 'Fleet을 하나의 목록으로 볼지, 실행 중·확인 필요·완료·유휴 열로 나뉜 보드로 볼지 고릅니다. Fleet 상단에서도 바꿀 수 있습니다.',
   'settings.attentionBlinkFinishedDot': '점만',
   'settings.attentionBlinkFinishedPulse': '1회 깜빡임',
   'settings.sidebarLeft': '왼쪽',

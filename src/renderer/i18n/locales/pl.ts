@@ -2201,7 +2201,7 @@ export const pl = {
   'settings.attentionBlinkFinished': 'Zakończone tury',
   'settings.attentionBlinkFinishedDesc': 'Zakończona tura, której jeszcze nie oglądano, pokazuje małą kropkę zamiast ramki „potrzebuje cię”. Mrugnij raz sprawia też, że wiersz mignie po zakończeniu.',
   'settings.fleetLayout': 'Układ Floty',
-  'settings.fleetLayoutDesc': 'Pokazuj Flotę jako jedną listę wymagających uwagi albo jako tablicę z kolumnami Czeka na Ciebie, Pracuje, Zakończone i Bezczynny. Ten sam przełącznik jest w nagłówku Floty.',
+  'settings.fleetLayoutDesc': 'Pokazuj Flotę jako jedną listę wymagających uwagi albo jako tablicę z kolumnami Pracuje, Czeka na Ciebie, Zakończone i Bezczynny. Ten sam przełącznik jest w nagłówku Floty.',
   'settings.attentionBlinkFinishedDot': 'Tylko kropka',
   'settings.attentionBlinkFinishedPulse': 'Mrugnij raz',
   'settings.sidebarLeft': 'Lewo',
