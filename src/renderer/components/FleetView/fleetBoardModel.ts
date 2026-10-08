@@ -49,7 +49,7 @@ export function moveInList(keys: readonly string[], current: string | null, move
 // nothing is classified here, so a row sits in the column whose chip counts it.
 
 export type BoardColumn = 'needsYou' | 'running' | 'finished' | 'idle';
-export const BOARD_COLUMNS: readonly BoardColumn[] = ['needsYou', 'running', 'finished', 'idle'];
+export const BOARD_COLUMNS: readonly BoardColumn[] = ['running', 'needsYou', 'finished', 'idle'];
 
 export type BoardItem =
   | { kind: 'pane'; key: string; row: FleetRow }

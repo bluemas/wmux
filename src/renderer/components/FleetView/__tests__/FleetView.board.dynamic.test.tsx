@@ -93,8 +93,8 @@ describe('FleetView — Board layout', () => {
     await flushRaf();
     expect(container.querySelector('[data-fleet-view]')?.getAttribute('data-layout')).toBe('board');
     const columns = [...container.querySelectorAll<HTMLElement>('[data-board-column]')];
-    expect(columns.map((c) => c.dataset.boardColumn)).toEqual(['needsYou', 'running', 'finished', 'idle']);
-    expect(columns.map((c) => c.getAttribute('aria-label'))).toEqual(['Needs you', 'Running', 'Finished', 'Idle']);
+    expect(columns.map((c) => c.dataset.boardColumn)).toEqual(['running', 'needsYou', 'finished', 'idle']);
+    expect(columns.map((c) => c.getAttribute('aria-label'))).toEqual(['Running', 'Needs you', 'Finished', 'Idle']);
     const ptysIn = (column: string) => [...container.querySelectorAll<HTMLElement>(`[data-board-column="${column}"] [data-fleet-card]`)]
       .map((el) => el.dataset.ptyId);
     expect(ptysIn('needsYou')).toEqual(['pty-1']);
@@ -109,16 +109,18 @@ describe('FleetView — Board layout', () => {
     act(() => useStore.getState().setFleetLayout('board'));
     mount();
     await flushRaf();
-    expect(focusedPty()).toBe('pty-1');
     const running = [...container.querySelectorAll<HTMLElement>('[data-board-column="running"] [data-fleet-card]')]
       .map((el) => el.dataset.ptyId);
-    key('ArrowRight');
-    await flushRaf();
+    // Columns run Running, Needs you, Finished, Idle; focus starts on the
+    // board's first card.
     expect(focusedPty()).toBe(running[0]);
     key('ArrowDown');
     await flushRaf();
     expect(focusedPty()).toBe(running[1]);
-    // From the second Running card, → lands on Finished's only card.
+    // From the second Running card, → lands on Needs you's only card.
+    key('ArrowRight');
+    await flushRaf();
+    expect(focusedPty()).toBe('pty-1');
     key('ArrowRight');
     await flushRaf();
     expect(focusedPty()).toBe('pty-3');
@@ -128,6 +130,9 @@ describe('FleetView — Board layout', () => {
     key('ArrowLeft');
     await flushRaf();
     expect(focusedPty()).toBe('pty-3');
+    key('ArrowLeft');
+    await flushRaf();
+    expect(focusedPty()).toBe('pty-1');
     key('ArrowLeft');
     await flushRaf();
     expect(focusedPty()).toBe(running[0]);

@@ -2233,7 +2233,7 @@ export const en = {
   'settings.attentionBlinkFinished': 'Finished turns',
   'settings.attentionBlinkFinishedDesc': 'A finished turn you have not looked at shows a small dot instead of the needs-you border. Pulse once also flashes the row when it finishes.',
   'settings.fleetLayout': 'Fleet layout',
-  'settings.fleetLayoutDesc': 'Show Fleet as one attention list, or as a board with Needs you, Running, Finished and Idle columns. The same switch sits in the Fleet header.',
+  'settings.fleetLayoutDesc': 'Show Fleet as one attention list, or as a board with Running, Needs you, Finished and Idle columns. The same switch sits in the Fleet header.',
   'settings.attentionBlinkFinishedDot': 'Dot only',
   'settings.attentionBlinkFinishedPulse': 'Pulse once',
   'settings.sidebarLeft': 'Left',

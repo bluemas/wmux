@@ -575,7 +575,7 @@ export const zh = {
   'settings.attentionBlinkFinished': '已完成的轮次',
   'settings.attentionBlinkFinishedDesc': '尚未查看的已完成轮次显示为小圆点，而不是“需要你”的边框。选择闪烁一次时，完成时该行也会闪烁。',
   'settings.fleetLayout': '舰队布局',
-  'settings.fleetLayoutDesc': '将舰队显示为一个关注列表，或显示为按“需要你处理”“运行中”“已完成”“空闲”分列的看板。舰队页顶部也有同样的切换。',
+  'settings.fleetLayoutDesc': '将舰队显示为一个关注列表，或显示为按“运行中”“需要你处理”“已完成”“空闲”分列的看板。舰队页顶部也有同样的切换。',
   'settings.attentionBlinkFinishedDot': '仅圆点',
   'settings.attentionBlinkFinishedPulse': '闪烁一次',
   'settings.sidebarLeft': '左',
