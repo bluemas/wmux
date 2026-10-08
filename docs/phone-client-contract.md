@@ -692,8 +692,34 @@ unavailable), and today it is:
 | `stale-session` | An agent IS running but no binding was captured yet: the pane started before the hooks were armed, or its first turn has not ended. Retry later; do not send the operator to `setup-hooks` |
 | `no-transcript-path` | The session is bound but the first turn has not ended, so the file does not exist yet. Transient — this becomes available on its own |
 | `not-claude` | The agent publishes no transcript. A permanent no for this pane; hide the tab rather than showing an empty one |
-| `unsafe-transcript-path` | The recorded path fell outside the directories the daemon will read. Not retryable, and not something a client can fix |
+| `unsupported-agent` | The bound agent has no transcript reader in this daemon. Permanent for this pane, like `not-claude` |
+| `unsafe-transcript-path` | The recorded path failed containment: it resolves outside the agent account's own transcript directory, names another session, or is not a regular file. Not retryable, and not something a client can fix |
 | `unreadable` | The file is bound and in bounds but could not be read right now |
+
+A Codex session file that **does not exist yet** is not a refusal. Codex names
+the file when its thread starts but writes it on the first turn, so a
+phone-created Codex pane is bound before there is anything to read. As long as
+the path's containment holds (its nearest existing directory resolves inside
+the account's `sessions` directory and the name is this thread's), `/turns`
+answers `available: true` with an empty conversation (`events: []`,
+`hasMore: false`), so a client can send the first message; the rows appear on
+the next read after Codex writes them. Daemons before this answered
+`unsafe-transcript-path` there.
+
+**Rows that are not the human.** Claude Code writes its own machinery into
+`role:"user"` entries. Those come as `meta` rows, never `user_text`: slash
+commands (`slash_command`), their output (`command_output`), caveats
+(`caveat`), subagent results (`subagent`), reminders (`system_reminder`),
+and `!` shell mode: the command (`bash_input`, labelled with the command line)
+and what it printed (`bash_output`, a fixed label; the output itself is not
+sent). The subtype set is additive: render an unknown one as a neutral meta row.
+
+**A snapshot reads past an oversized entry.** A first page whose tail window
+starts inside one very large entry (Claude Code's session-start attachments
+can exceed the window) keeps reading backward until it holds the recent rows,
+within the page budget. Daemons before this could answer the newest row alone
+with `hasMore: true` (most visibly right after `/clear`); paging back with
+`dir=back` recovered the rest.
 
 `503` is different from all of these: the daemon has no projector wired at all
 (nothing to read from, on any pane). `404` is the same contract as the other
@@ -1095,6 +1121,22 @@ push and `approvals.json`); fetch the whole command from `/detail`.
 A dialog found only on the screen, with no pending call to bind to or a call
 whose command differs, is **informational for everyone**. `summary` and `risk`
 come from the call's own input.
+
+**The dialog shapes read** (measured on Claude Code 2.1.292). Each binds as
+above and gives the same record; only what the rows must spell differs:
+
+| title | `toolName` | `summary` | the rows must spell | `question` | `choices` (when answerable) |
+| --- | --- | --- | --- | --- | --- |
+| `<Tool> command` (`Bash command`) | the tool | the command | the command (and its description) | `Do you want to proceed?` | `Yes`, a plain `No` |
+| `Fetch` | `WebFetch` | the URL | `url: <url>` and `prompt: <prompt>` in the dashed box; the URL as Claude parses it (`https://example.com` → `https://example.com/`) | `Do you want to allow Claude to fetch this content?` | `1. Yes`, `3. No, and tell Claude what to do differently (esc)` |
+| `Read file` | `Read` | the path | `Read(<path>)` in the dashed box | `Do you want to proceed?` | `1. Yes`, `3. No` |
+
+The Fetch dialog draws no `Esc to cancel` footer: it is active when nothing but
+blank rows follows its options, and a narrow pane wraps its question over two
+rows (read as one). Fetch and Read dialogs bind only with their title on screen,
+never with the top scrolled off. Their option 2 (`Yes, and don't ask again for
+<host>`, `Yes, allow reading from <dir> during this session`) is never a
+choice. Other titles (`Edit file`, `Create file`) stay informational.
 
 `choices` then holds only the plain `Yes` and a plain `No` (`No`, or `No, …`
 such as "No, and tell Claude what to do differently"). An option that writes a
