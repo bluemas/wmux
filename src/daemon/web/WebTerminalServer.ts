@@ -152,11 +152,13 @@ import {
   chatV2Page,
   chatV2SendResponse,
   dequeueResponse,
+  steerResponse,
   hasConversation,
   launchResponse,
   parseCancelBody,
   parseLaunchBody,
   parseSendBody,
+  parseSteerBody,
   resolutionAgentSessionId,
   resolutionEpoch,
   sendResponse,
@@ -2693,7 +2695,10 @@ export class WebTerminalServer {
               ...(this.chatWritable(principal) && this.deps.chat?.()?.cancelOutcomeEnabled?.() === true ? { chatCancelOutcome: true } : {}),
               // Whether this caller's `chat-queue` sends are held by the daemon,
               // and DELETE …/chat/queue/:id (which needs `dequeue`) answers.
-              chatQueue: this.chatWritable(principal) && this.deps.chat?.()?.queueEnabled?.() === true && typeof this.deps.chat?.()?.dequeue === 'function',
+              chatQueue: this.chatQueueWorks(principal),
+              // `deliver:"steer"` on a queued send, and PATCH …/chat/queue/:id (which needs `steer`):
+              // only beside a working queue.
+              ...(this.chatQueueWorks(principal) && typeof this.deps.chat?.()?.steer === 'function' ? { chatSteer: true } : {}),
             }
           : {}),
         protocolVersion: PHONE_PROTOCOL_VERSION,
@@ -2733,6 +2738,7 @@ export class WebTerminalServer {
         const [, rawId, kind, rawReceipt] = chatRoute;
         if (kind === 'queue') {
           if (req.method === 'DELETE' && rawReceipt !== undefined) return this.handleChatDequeue(res, rawId, rawReceipt, principal);
+          if (req.method === 'PATCH' && rawReceipt !== undefined) return this.handleChatSteer(req, res, rawId, rawReceipt, principal);
         } else if (kind === 'cancel') {
           if (req.method === 'POST' && rawReceipt === undefined) return this.handleChatCancel(req, res, rawId, url, principal);
           if (req.method === 'GET' && rawReceipt !== undefined) return this.handleChatCancelReceipt(res, rawId, rawReceipt, principal);
@@ -5007,6 +5013,27 @@ export class WebTerminalServer {
   }
 
   /**
+   * `PATCH /api/sessions/:id/chat/queue/:clientMessageId {deliver:"steer"}`:
+   * "send now" for a waiting item. Same gates and owner binding as DELETE.
+   */
+  private handleChatSteer(req: http.IncomingMessage, res: http.ServerResponse, rawId: string, rawMessageId: string, principal: WebPrincipal): void {
+    res.setHeader('Cache-Control', 'no-store');
+    const refusal = this.chatWriteRefusal(principal);
+    if (refusal === 'transcript') return this.refuseTranscript(res);
+    if (refusal === 'input') return this.refuseInput(res, principal, 'Sending a queued message now types into this pane');
+    const id = decodePathSegment(rawId);
+    if (id === null || !this.conversableSession(id)) return this.json(res, 404, { error: 'pane-not-found' });
+    const chat = this.deps.chat?.() ?? null;
+    if (!chat?.steer || chat.queueEnabled?.() !== true) return this.json(res, 503, { error: 'chat-unavailable' });
+    const clientMessageId = decodePathSegment(rawMessageId) ?? '';
+    this.readJsonBody(req, res, (body) => {
+      if (!parseSteerBody(body)) return this.json(res, 400, { error: 'invalid-chat-request', detail: 'body must be {"deliver":"steer"}', clientMessageId });
+      const wire = steerResponse(chat.steer!(chatOwner(principal), id, clientMessageId), clientMessageId);
+      return this.json(res, wire.status, wire.body);
+    }, CHAT_CANCEL_MAX_BODY_BYTES);
+  }
+
+  /**
    * `POST /api/sessions/:id/chat/messages` (N4). The route adds the principal
    * gates and the wire mapping; binding, identity, receipts and the guarded
    * write are the daemon's shared send path, the same one the desktop uses.
@@ -5058,12 +5085,13 @@ export class WebTerminalServer {
         let outcome;
         try {
           // The cap on THIS request opts it into the daemon queue.
+          const { deliver, ...send } = parsed.value;
           const queue = clientCaps(req).chatQueue === true && chat.queueEnabled?.() === true
-            ? { authorized: this.queuedChatAuthorizer(fresh, id, pane, incarnation) } : undefined;
+            ? { authorized: this.queuedChatAuthorizer(fresh, id, pane, incarnation), ...(deliver ? { deliver } : {}) } : undefined;
           outcome = await chat.send({
             owner: chatOwner(fresh),
             id,
-            ...parsed.value,
+            ...send,
             managedReadOnly: true,
             authorized: this.chatWriteAuthorizer(req, res, url, principal, id, pane, incarnation),
             ...(queue ? { queue } : {}),
@@ -5153,6 +5181,12 @@ export class WebTerminalServer {
     if (this.opts?.allowTranscript !== true) return 'transcript';
     if (!this.mayInput(principal)) return 'input';
     return null;
+  }
+
+  /** `/api/config` `chatQueue`: chat writes pass, the queue loaded, and DELETE …/chat/queue/:id answers. */
+  private chatQueueWorks(principal: WebPrincipal): boolean {
+    const chat = this.deps.chat?.();
+    return this.chatWritable(principal) && chat?.queueEnabled?.() === true && typeof chat?.dequeue === 'function';
   }
 
   /** Whether a chat write gets past every gate that does not depend on the pane (the caller's, and a bridge). */
@@ -8403,7 +8437,7 @@ export class WebTerminalServer {
   emitChatQueue(event: ChatQueueEvent): void {
     if (!this.server || this.opts?.allowTranscript !== true) return;
     const body = JSON.stringify({ sessionId: event.sessionId, clientMessageId: event.clientMessageId, state: event.state,
-      ...(event.reason ? { reason: event.reason } : {}), at: event.at });
+      ...(event.reason ? { reason: event.reason } : {}), ...(event.deliver ? { deliver: event.deliver } : {}), at: event.at });
     this.deliverChatEvent(event.sessionId, () => ({ event: 'chat.queue', body }), (principal) => chatOwner(principal) === event.owner);
   }
 
