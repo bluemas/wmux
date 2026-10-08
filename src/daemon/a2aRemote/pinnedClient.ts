@@ -19,9 +19,10 @@ import { normalizeFingerprint256 } from '../../shared/a2aRemote';
  *      unreachable address.
  *   3. Only then is an HTTP/1.1 request built on that socket.
  *
- * Addresses are tried in order (machine name first, then known IPv4s); only
- * connect-level failures (refused, unreachable, DNS, handshake timeout) advance
- * to the next one. Proxy environment variables are ignored by construction: the
+ * Addresses are tried in order (the one that last answered first, both in the
+ * saved record and within one client instance); only connect-level failures
+ * (refused, unreachable, DNS, handshake timeout) advance to the next one, each
+ * after at most `connectTimeoutMs`. Proxy environment variables are ignored by construction: the
  * socket is dialled here and handed to `http.request` via `createConnection`,
  * so no agent — proxy-aware or not — is ever consulted.
  */
@@ -43,6 +44,13 @@ export interface PinnedClientOptions {
   connectTimeoutMs: number;
   /** Budget from request start to a complete JSON answer (requestJson) or to response headers (openStream). */
   requestTimeoutMs: number;
+  /**
+   * Called with the address that completed a handshake, only AFTER its
+   * certificate matched the pin, before any request is written. Lets the
+   * caller put that address first for the next connect. Must not throw;
+   * an error from it is ignored.
+   */
+  onConnected?: (address: string) => void;
 }
 
 export type PinnedClientErrorCode =
@@ -133,9 +141,16 @@ function watchSocket(socket: tls.TLSSocket, onFail: (err: Error) => void): () =>
 
 export class PinnedTlsClient {
   private readonly opts: PinnedClientOptions;
+  /**
+   * Dial order for this instance: the address that last got through moves
+   * to the front, so a long-lived client (a stream's acks, a pump run) does
+   * not wait out a dead address on every request.
+   */
+  private readonly addresses: string[];
 
   constructor(opts: PinnedClientOptions) {
     this.opts = opts;
+    this.addresses = [...opts.addresses];
   }
 
   /** One JSON request. Resolves with any HTTP status; `json` is null when the body is empty or not JSON. */
@@ -320,9 +335,9 @@ export class PinnedTlsClient {
   private async connect(signal?: AbortSignal): Promise<{ socket: tls.TLSSocket; address: string }> {
     const pin = normalizeFingerprint256(this.opts.fingerprint256);
     if (!pin) throw new PinnedClientError('bad-options', 'pinned fingerprint is malformed', { sent: false });
-    if (this.opts.addresses.length === 0) throw new PinnedClientError('bad-options', 'no address to try', { sent: false });
+    if (this.addresses.length === 0) throw new PinnedClientError('bad-options', 'no address to try', { sent: false });
     const failures: string[] = [];
-    for (const address of this.opts.addresses) {
+    for (const address of [...this.addresses]) {
       let socket: tls.TLSSocket;
       try {
         socket = await this.handshake(address, signal);
@@ -339,6 +354,13 @@ export class PinnedTlsClient {
           `${address} presented certificate ${presented ?? '(none)'}, expected the pinned ${pin}`,
           { sent: false },
         );
+      }
+      const at = this.addresses.indexOf(address);
+      if (at > 0) this.addresses.unshift(...this.addresses.splice(at, 1));
+      try {
+        this.opts.onConnected?.(address);
+      } catch {
+        // Bookkeeping only: it never decides a connection.
       }
       return { socket, address };
     }

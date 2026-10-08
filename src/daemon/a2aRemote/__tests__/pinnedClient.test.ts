@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import https from 'node:https';
@@ -228,6 +228,42 @@ describe('PinnedTlsClient — addresses and proxies', () => {
     // so the first address fails at connect — refused, or unavailable without IPv6.
     const out = await client({ port, addresses: ['::1', '127.0.0.1'] }).requestJson('GET', '/api/a2a/hello');
     expect(out.status).toBe(200);
+  }, 15_000);
+
+  it('reports the address that got through, and only after its certificate matched the pin', async () => {
+    const { port } = await httpsServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{"ok":true}');
+    });
+    const reached: string[] = [];
+    await client({ port, addresses: ['::1', '127.0.0.1'], onConnected: (a) => reached.push(a) }).requestJson('GET', '/x');
+    expect(reached).toEqual(['127.0.0.1']);
+    // A wrong certificate is never reported as reached (an impostor must not be promoted).
+    const wrong: string[] = [];
+    const err = await client({ port, fingerprint256: FP_B, addresses: ['127.0.0.1'], onConnected: (a) => wrong.push(a) })
+      .requestJson('GET', '/x')
+      .catch((e: unknown) => e);
+    expect((err as PinnedClientError).code).toBe('fingerprint-mismatch');
+    expect(wrong).toEqual([]);
+    // A throwing callback does not break the connection.
+    const out = await client({ port, addresses: ['127.0.0.1'], onConnected: () => { throw new Error('boom'); } }).requestJson('GET', '/x');
+    expect(out.status).toBe(200);
+  }, 15_000);
+
+  it('one client instance dials the address that last got through first (a stream\'s acks never re-wait a dead one)', async () => {
+    const { port } = await httpsServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{"ok":true}');
+    });
+    const dial = vi.spyOn(tls, 'connect');
+    try {
+      const c = client({ port, addresses: ['::1', '127.0.0.1'] });
+      for (let i = 0; i < 3; i++) expect((await c.requestJson('GET', '/x')).status).toBe(200);
+      const hosts = dial.mock.calls.map((args) => (args[0] as tls.ConnectionOptions).host);
+      expect(hosts).toEqual(['::1', '127.0.0.1', '127.0.0.1', '127.0.0.1']);
+    } finally {
+      dial.mockRestore();
+    }
   }, 15_000);
 
   it('reports connect-failed, with nothing sent, when no address answers', async () => {

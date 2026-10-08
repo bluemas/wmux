@@ -48,7 +48,9 @@ import { errMsg, isIsoString, isPlainObject, loadStore, sanitizeName, storeUnava
  * leaves the store unavailable and the original untouched.
  *
  * Write failure: `add` / `updateAddresses` / `updateFingerprint` roll memory
- * back and throw. `remove` keeps the in-memory removal and throws (#658: a
+ * back and throw. `promoteAddress` (automatic, on reconnect) also rolls back
+ * and throws, but never scrubs the store: a transient lock on the file must
+ * not wipe every pairing over a dial-order optimisation. `remove` keeps the in-memory removal and throws (#658: a
  * removal that un-happens on a disk error would keep presenting a credential
  * the operator meant to drop).
  */
@@ -74,15 +76,17 @@ const HOSTNAME_RE = /^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /**
- * Machine names first (company DNS survives DHCP), then IPv4s, each group in
- * the given order; trimmed, duplicates removed case-insensitively, anything
- * that is neither a valid IPv4 nor a valid hostname dropped, at most
- * `ADDRESSES_MAX` kept.
+ * The addresses in the given order — the order is the dial order, best
+ * first: the joiner saves the one that answered first and moves the ones
+ * that failed to the end, and `promoteAddress` puts the one that last
+ * answered first (a PC that roams between the office LAN and a tailnet must
+ * not wait out an unreachable address on every reconnect). Trimmed,
+ * duplicates removed case-insensitively, anything that is neither a valid
+ * IPv4 nor a valid hostname dropped, at most `ADDRESSES_MAX` kept.
  */
 export function orderAddresses(addresses: readonly string[]): string[] {
   const seen = new Set<string>();
-  const names: string[] = [];
-  const ips: string[] = [];
+  const out: string[] = [];
   for (const raw of addresses) {
     if (typeof raw !== 'string') continue;
     const a = raw.trim();
@@ -91,9 +95,28 @@ export function orderAddresses(addresses: readonly string[]): string[] {
     const isIp = IPV4_RE.test(a);
     if (!isIp && (/^[\d.]+$/.test(a) || !HOSTNAME_RE.test(a))) continue;
     seen.add(key);
-    (isIp ? ips : names).push(a);
+    out.push(a);
   }
-  return [...names, ...ips].slice(0, ADDRESSES_MAX);
+  return out.slice(0, ADDRESSES_MAX);
+}
+
+/**
+ * A pinned client's `onConnected` for `hostId`: put the address that answered
+ * first in the saved record (best effort — a failed write is logged and the
+ * connect goes on).
+ */
+export function addressPromoter(
+  store: { promoteAddress?(hostId: HostId, address: string): boolean },
+  hostId: HostId,
+  log: StoreLog,
+): (address: string) => void {
+  return (address) => {
+    try {
+      if (store.promoteAddress?.(hostId, address)) log('info', `[a2a-remote] ${hostId}: reached at ${address}; dialling it first from now on`);
+    } catch (err) {
+      log('warn', `[a2a-remote] ${hostId}: could not move ${address} to the front of its addresses: ${errMsg(err)}`);
+    }
+  };
 }
 
 export interface RemoteHostStoreOptions {
@@ -179,6 +202,33 @@ export class RemoteHostStore {
     return structuredClone(next);
   }
 
+  /**
+   * A connect to `hostId` got through at `address` (its pin already checked):
+   * dial it first next time. Writes only when the order changes; false when
+   * nothing changed (already first, or not one of the host's addresses — a
+   * connect never adds an address).
+   *
+   * Runs on its own during a background reconnect and is only an
+   * optimisation, so a failed write does NOT take the fail-closed path of the
+   * other mutations (scrubbing every pairing on Windows): the previous order
+   * is restored in memory, the store stays usable, and the error is thrown
+   * for the caller to log.
+   */
+  promoteAddress(hostId: HostId, address: string): boolean {
+    const rec = this.hosts.get(hostId);
+    if (!rec || !this.writable) return false;
+    const i = rec.addresses.findIndex((a) => a.toLowerCase() === address.toLowerCase());
+    if (i <= 0) return false;
+    this.hosts.set(hostId, { ...rec, addresses: [rec.addresses[i], ...rec.addresses.filter((_, j) => j !== i)] });
+    try {
+      this.persist({ scrubOnFailure: false });
+    } catch (err) {
+      this.hosts.set(hostId, rec);
+      throw err;
+    }
+    return true;
+  }
+
   /** Re-pin after a certificate rotation. hostId (and so every link) is unchanged. */
   updateFingerprint(hostId: HostId, fingerprint: string): A2aRemoteHostRecordV1 {
     const rec = this.require(hostId);
@@ -235,7 +285,7 @@ export class RemoteHostStore {
     if (!this.writable) throw storeUnavailable(REMOTE_HOSTS_FILE);
   }
 
-  private persist(): void {
+  private persist({ scrubOnFailure = true }: { scrubOnFailure?: boolean } = {}): void {
     const file: RemoteHostsFileV1 = {
       v: A2A_REMOTE_RECORD_V,
       hosts: [...this.hosts.values()],
@@ -244,7 +294,7 @@ export class RemoteHostStore {
     try {
       this.write(this.filePath, file);
     } catch (err) {
-      if (this.win32) this.scrubAfterFailedWrite();
+      if (this.win32 && scrubOnFailure) this.scrubAfterFailedWrite();
       throw err;
     }
     // POSIX: the write rotated the previous generation to `.bak`. This store
