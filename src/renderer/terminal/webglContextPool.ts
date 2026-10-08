@@ -19,15 +19,18 @@
 // force-evicted by Chromium (uncontrolled, unreliable fallback, blank panes).
 //
 // Net effect: we never exceed the cap, so Chromium never force-evicts, so no
-// terminal ever loses its renderer. The 12 most-recently-shown terminals get
-// GPU acceleration; any extras render via DOM (visually identical, only slower
-// on high-throughput output — invisible for the background panes you are not
-// actively reading). Persistence can now restore an arbitrary session count
-// and every restored terminal renders.
+// terminal ever loses its renderer. The first MAX_WEBGL_CONTEXTS terminals
+// shown get GPU acceleration; any extras render via DOM (slower on
+// high-throughput output, and glyphs sit up to a pixel off the WebGL layout,
+// so a shown terminal never swaps one for the other — see useTerminal).
+// Persistence can now restore an arbitrary session count and every restored
+// terminal renders.
 
-/** Safe ceiling below Chromium's ~16-context cap. Leaves headroom for any
- *  incidental contexts the renderer process may hold. */
-export const MAX_WEBGL_CONTEXTS = 12;
+/** Ceiling one below Chromium's 16-context cap. The renderer creates no other
+ *  WebGL contexts (browser panes run in their own processes); the spare slot
+ *  is the headroom. Raised from 12 (2026-10-08): every terminal over the
+ *  budget renders via DOM, and fleets of 15+ agent panes are common. */
+export const MAX_WEBGL_CONTEXTS = 15;
 
 interface PoolEntry {
   /** Load the WebGL addon for this terminal (idempotent — no-ops if loaded). */
@@ -115,6 +118,16 @@ export class WebglContextPool {
     const entry = this.entries.get(token);
     if (!entry || !entry.granted) return;
     entry.granted = false;
+  }
+
+  /**
+   * Whether granting `token` now would take another terminal's context: it
+   * holds none and the budget is full. Such a grant rebuilds a renderer
+   * (~0.5 s of synchronous GPU setup) on top of tearing one down.
+   */
+  acquireWouldEvict(token: string): boolean {
+    if (this.entries.get(token)?.granted) return false;
+    return this.grantedCount() >= this.max;
   }
 
   /** Number of terminals currently holding a live context. */

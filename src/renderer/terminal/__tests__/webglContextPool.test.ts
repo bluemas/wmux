@@ -129,7 +129,7 @@ describe('WebglContextPool', () => {
     terms.forEach((t) => request(pool, t));
 
     expect(pool.grantedCount()).toBe(MAX_WEBGL_CONTEXTS);
-    // The 12 most-recently-requested keep GPU; the first 8 fell back to DOM.
+    // The MAX_WEBGL_CONTEXTS most-recently-requested keep GPU; the rest fell back to DOM.
     const granted = pool.grantedTokens().sort((x, y) => Number(x.slice(1)) - Number(y.slice(1)));
     expect(granted).toEqual(
       Array.from({ length: MAX_WEBGL_CONTEXTS }, (_, i) => `s${i + (20 - MAX_WEBGL_CONTEXTS)}`),
@@ -148,5 +148,18 @@ describe('WebglContextPool', () => {
     request(pool, b);
     expect(pool.grantedCount()).toBe(1);
     expect(pool.grantedTokens()).toEqual(['b']); // most recent wins
+  });
+
+  it('acquireWouldEvict is true only for a terminal without a context when the budget is full', () => {
+    const pool = new WebglContextPool(2);
+    const [a, b, c] = ['a', 'b', 'c'].map(makeTerm);
+    expect(pool.acquireWouldEvict('a')).toBe(false); // free slot
+    request(pool, a);
+    request(pool, b);
+    expect(pool.acquireWouldEvict('a')).toBe(false); // already holds one
+    expect(pool.acquireWouldEvict('c')).toBe(true);  // full, would take one
+    request(pool, c);                                  // evicts a
+    expect(pool.acquireWouldEvict('a')).toBe(true);
+    expect(pool.acquireWouldEvict('c')).toBe(false);
   });
 });

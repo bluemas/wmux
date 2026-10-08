@@ -3382,12 +3382,23 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
           }
         }
       }
-      // Ask the shared pool for a context. Under budget → granted immediately;
-      // at budget → the pool evicts the least-recently-shown terminal (it drops
-      // to the DOM renderer) and grants us. This hard-bounds the live context
-      // count below Chromium's cap, so no terminal is ever force-evicted into a
-      // blank pane. Idempotent if we already hold one (just bumps our LRU rank).
-      if (loadWebglRef.current && disposeWebglRef.current) {
+      // Ask the shared pool for a context: idempotent if we already hold one
+      // (just bumps our LRU rank), granted at once when a slot is free. The
+      // pool bounds the live context count below Chromium's cap, so no
+      // terminal is ever force-evicted into a blank pane.
+      //
+      // A grant that would take another terminal's context is not asked for:
+      // the pane keeps the DOM renderer it was left with. Evicting on reveal
+      // rebuilt a renderer (~0.5 s, synchronous) before the pane could paint,
+      // on every step of cycling workspaces once terminals outnumber the
+      // budget; doing it a moment after the paint instead swapped renderers
+      // under the reader's eyes, and the two lay glyphs out up to a pixel
+      // apart. Such a pane takes a context on a later reveal once one is free.
+      if (
+        loadWebglRef.current &&
+        disposeWebglRef.current &&
+        !webglContextPool.acquireWouldEvict(token)
+      ) {
         webglContextPool.acquire(token, loadWebglRef.current, disposeWebglRef.current);
       }
       // Defer fit to allow CSS display change to take effect before measuring.

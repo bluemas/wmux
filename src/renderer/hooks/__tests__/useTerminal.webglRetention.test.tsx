@@ -111,3 +111,63 @@ describe('useTerminal WebGL retention', { timeout: 60_000 }, () => {
     expect(webgl.disposed).toBe(disposed + 1);
   });
 });
+
+// With more terminals than the budget, a pane shown without a context used to
+// take one at once: evict another terminal and rebuild a renderer before it
+// could paint, on every step of cycling workspaces by shortcut. Taking it a
+// moment later instead swapped renderers on screen, and DOM and WebGL lay
+// glyphs out up to a pixel apart. A shown pane now keeps the renderer it has;
+// it takes a context on a later reveal once one is free.
+describe('useTerminal WebGL grant when the pool is full', { timeout: 60_000 }, () => {
+  const fillers: string[] = [];
+
+  afterEach(async () => {
+    const { webglContextPool } = await import('../../terminal/webglContextPool');
+    for (const token of fillers.splice(0)) webglContextPool.release(token);
+  });
+
+  async function setup() {
+    const { useTerminal } = await import('../useTerminal');
+    const { webglContextPool, MAX_WEBGL_CONTEXTS } = await import('../../terminal/webglContextPool');
+    for (let i = 0; i < MAX_WEBGL_CONTEXTS; i++) {
+      const token = `filler-${i}`;
+      fillers.push(token);
+      webglContextPool.acquire(token, () => undefined, () => undefined);
+    }
+    function Harness({ visible }: { visible: boolean }) {
+      const ref = useRef<HTMLDivElement>(null);
+      useTerminal(ref, { ptyId: 'p-full-pool', isVisible: visible });
+      return <div ref={ref} style={{ width: 800, height: 600 }} />;
+    }
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    root = createRoot(host);
+    return { Harness, webglContextPool };
+  }
+
+  it('a pane shown while the pool is full keeps the DOM renderer and takes nothing', async () => {
+    const { Harness, webglContextPool } = await setup();
+    const before = webgl.created;
+    await act(async () => { root!.render(<Harness visible />); });
+    // Longer than any delay a deferred grant could use.
+    await act(async () => { await new Promise((r) => setTimeout(r, 1_000)); });
+    expect(webgl.created).toBe(before);
+    expect(fillers.every((t) => webglContextPool.grantedTokens().includes(t))).toBe(true);
+  });
+
+  it('takes a freed slot on its next reveal, not while it is shown', async () => {
+    const { Harness, webglContextPool } = await setup();
+    const before = webgl.created;
+    await act(async () => { root!.render(<Harness visible />); });
+    await act(async () => { await new Promise((r) => setTimeout(r, 30)); });
+
+    // A slot frees while the pane is on screen: no swap under the reader.
+    webglContextPool.release(fillers.shift()!);
+    await act(async () => { await new Promise((r) => setTimeout(r, 300)); });
+    expect(webgl.created).toBe(before);
+
+    await act(async () => { root!.render(<Harness visible={false} />); });
+    await act(async () => { root!.render(<Harness visible />); });
+    expect(webgl.created).toBe(before + 1);
+  });
+});
