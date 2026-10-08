@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
-import { agentDisplayToSlug } from '../../shared/agentIdentity';
+import { agentDisplayToSlug, agentRow } from '../../shared/agentIdentity';
 import { isBrainPty } from '../../shared/constants';
 import type { AgentStatus } from '../../shared/types';
 import type { ChatSkillCatalog } from '../../shared/transcript/chatSkills';
@@ -455,12 +455,14 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
     const live = deps.chatAgentState(id);
     const slug = slugOf(live);
     const agentAlive = !!slug && slug === status.terminal?.agent && live.agentVerified;
+    // Per-agent capabilities are `terminalChat` on the registry row (agentIdentity.ts).
+    const chat = agentAlive ? agentRow(slug)?.terminalChat : undefined;
     return { ...status, agentStatus: live.agentStatus, agentAlive,
       ...(status.terminal ? { terminal: { ...status.terminal, capabilities: { ...status.terminal.capabilities,
-        send: agentAlive && ['claude', 'codex'].includes(slug!),
-        cancel: agentAlive && ['claude', 'codex'].includes(slug!),
-        images: agentAlive && slug === 'claude',
-        queue: agentAlive && slug === 'claude',
+        send: agentAlive && chat?.send === true,
+        cancel: agentAlive && chat?.cancel === true,
+        images: agentAlive && chat?.images === true,
+        queue: agentAlive && chat?.queue === true,
       } } } : {}) };
   };
 
@@ -996,8 +998,9 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
     if (inserted === 'exists') return heldReplay(queueStore!.get(owner, clientMessageId)!, id, fingerprint, undefined);
     if (inserted === 'full') return refuse(clientMessageId, 'queue-full');
     if (inserted === 'persist-failed') return refuse(clientMessageId, 'chat-persist-failed');
-    // Only Claude's composer queues a prompt typed mid-turn; elsewhere `steer` is `next-turn`.
-    const steerable = source === 'file' && slugOf(deps.chatAgentState(id)) === 'claude';
+    // Only a composer that queues a prompt typed mid-turn (`terminalChat.queue` on
+    // the registry row: Claude Code) can be steered; elsewhere `steer` is `next-turn`.
+    const steerable = source === 'file' && agentRow(slugOf(deps.chatAgentState(id)))?.terminalChat?.queue === true;
     queueMemo.set(memoKey(owner, clientMessageId), {
       fingerprint, preview: Array.from(req.text).slice(0, QUEUE_PREVIEW_CHARS).join(''), text: req.text,
       agentSessionId: req.agentSessionId, ...(req.historyEpoch !== undefined ? { historyEpoch: req.historyEpoch } : {}),
