@@ -453,6 +453,11 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
     sidebarPinnedIds: state.sidebarPinnedIds,
     sidebarWidth: state.sidebarWidth,
     sidebarTaskGroupExpanded: state.sidebarTaskGroupExpanded,
+    // A dismissed question must stay dismissed across a restart: the PTY
+    // lives on in the daemon and its next Stop re-reads the same question.
+    ...(Object.keys(state.surfaceDismissedQuestion).length > 0
+      ? { surfaceDismissedQuestion: state.surfaceDismissedQuestion }
+      : {}),
     multiviewArrangement: state.multiviewArrangement,
     notificationSoundEnabled: state.notificationSoundEnabled,
     toastEnabled: state.toastEnabled,
