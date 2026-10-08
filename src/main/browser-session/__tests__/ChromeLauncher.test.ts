@@ -233,7 +233,11 @@ import { ChromeLauncherRegistry } from '../ChromeLauncher';
 
 describe('ChromeLauncherRegistry', () => {
   function makeStore(bindings: Record<string, string>) {
-    return { profileFor: (ws?: string) => (ws && bindings[ws]) || 'default' };
+    return {
+      profileFor: (ws?: string) => (ws && bindings[ws]) || 'default',
+      hasPaneBindings: () => false,
+      isPaneBound: () => false,
+    };
   }
 
   it('bound workspaces get distinct launchers with distinct dirs; unbound share default', () => {
@@ -279,8 +283,8 @@ describe('ChromeLauncherRegistry', () => {
 
     // Ownership resolves by the stable surfaceId, and reports the owning
     // workspace so browser.close can refuse a cross-workspace close.
-    expect(registry.ownerOfSurface(openedA.surfaceId)).toEqual({ workspaceId: 'ws-a', client: a });
-    expect(registry.ownerOfSurface(openedB.surfaceId)).toEqual({ workspaceId: 'ws-b', client: b });
+    expect(registry.ownerOfSurface(openedA.surfaceId)).toEqual({ workspaceId: 'ws-a', profile: 'pa', client: a });
+    expect(registry.ownerOfSurface(openedB.surfaceId)).toEqual({ workspaceId: 'ws-b', profile: 'pb', client: b });
     expect(registry.ownerOfSurface('chrome-nope')).toBeNull();
     // A raw CDP target id is not a surface handle.
     expect(registry.ownerOfSurface('tgt-a')).toBeNull();
@@ -288,6 +292,45 @@ describe('ChromeLauncherRegistry', () => {
     registry.disposeAll();
     expect(childA.kill).toHaveBeenCalled();
     expect(childB.kill).toHaveBeenCalled();
+  });
+
+  it('revealNewest activates the newest tab of a running pane profile and never launches one', async () => {
+    const child = makeChild();
+    spawnWritesPortFile(child);
+    let n = 0;
+    fetchMock.mockImplementation(async (url: string, init?: { method?: string }) => {
+      if (init?.method === 'PUT') return fetchOk({ id: `tgt-${++n}`, url: 'https://x.test/' });
+      if (String(url).endsWith('/json/list')) {
+        return fetchOk([
+          { id: 'tgt-1', url: 'https://x.test/', title: 'one', type: 'page' },
+          { id: 'tgt-2', url: 'https://x.test/', title: 'two', type: 'page' },
+          { id: 'tgt-3', url: 'https://x.test/', title: 'unattributed', type: 'page' },
+        ]);
+      }
+      return fetchOk({});
+    });
+    const registry = new ChromeLauncherRegistry({
+      defaultDir: '/tmp/default-prof',
+      profilesDir: '/tmp/profiles',
+      store: makeStore({}),
+    });
+
+    // Nothing was ever launched for this profile: refuse, spawn nothing.
+    expect(await registry.revealNewest('pane-prof', 'ws-a')).toMatchObject({ ok: false });
+    expect(registry.peekLauncher('pane-prof')).toBeUndefined();
+    expect(spawnMock).not.toHaveBeenCalled();
+
+    const launcher = registry.forProfile('pane-prof');
+    await launcher.openTab('https://x.test/', 'ws-a');
+    await launcher.openTab('https://x.test/', 'ws-a');
+    // Newest of all, but no workspace on record: never what a pane's reveal raises.
+    await launcher.openTab('https://x.test/');
+    expect(await registry.revealNewest('pane-prof', 'ws-a')).toEqual({ ok: true });
+    const activated = fetchMock.mock.calls.map(([u]) => String(u)).filter((u) => u.includes('/json/activate/'));
+    expect(activated).toEqual([expect.stringMatching(/\/json\/activate\/tgt-2$/)]);
+    // Another workspace's view of the same profile has nothing to show.
+    expect(await registry.revealNewest('pane-prof', 'ws-b')).toMatchObject({ ok: false });
+    expect(await registry.revealNewest('live', 'ws-a')).toMatchObject({ ok: false, error: expect.stringContaining('Live Chrome') });
   });
 
   it('statusForWorkspace on the live profile probes actual listening, not just a parseable file', async () => {

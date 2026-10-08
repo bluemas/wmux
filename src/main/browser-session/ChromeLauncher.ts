@@ -968,6 +968,48 @@ export class ChromeLauncher implements ChromeBackendClient {
     return out;
   }
 
+  /**
+   * Bring a wmux-opened tab, and its window, to the front. `/json/activate` is
+   * the HTTP form of CDP `Target.activateTarget`: it needs no socket (the
+   * watcher can be off), and Chrome raises the tab's window along with it.
+   */
+  async selectSurface(surfaceId: string): Promise<boolean> {
+    const record = this.surfaces.get(surfaceId);
+    if (!record?.targetId || !this.isRunning()) return false;
+    try {
+      await this.fetchJson(`/json/activate/${record.targetId}`);
+    } catch {
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Best effort: un-minimize the window holding a surface, over the watcher
+   * socket when one is open. Only for a person's explicit "Show in Chrome" —
+   * an agent selecting a tab must not undo a window the user minimized.
+   */
+  async restoreWindow(surfaceId: string): Promise<void> {
+    const targetId = this.surfaces.get(surfaceId)?.targetId;
+    if (!targetId) return;
+    // An adopted Chrome (app restart) has no watcher until something opens a
+    // tab; start it here. Never throws — no socket just means no restore.
+    await this.ensureTargetWatcher();
+    const socket = this.watcher;
+    if (!socket?.isOpen()) return;
+    try {
+      const reply = (await socket.send('Browser.getWindowForTarget', { targetId })) as {
+        windowId?: number;
+        bounds?: { windowState?: string };
+      };
+      if (typeof reply?.windowId === 'number' && reply.bounds?.windowState === 'minimized') {
+        await socket.send('Browser.setWindowBounds', { windowId: reply.windowId, bounds: { windowState: 'normal' } });
+      }
+    } catch {
+      /* the tab is already active; a window we could not restore is cosmetic */
+    }
+  }
+
   async closeSurface(surfaceId: string): Promise<boolean> {
     const record = this.surfaces.get(surfaceId);
     if (!record) return false;
@@ -1037,7 +1079,7 @@ export class ChromeLauncherRegistry {
       defaultDir: string;
       /** Named profiles live under <profilesDir>/<name>. */
       profilesDir: string;
-      store: Pick<ChromeProfileStore, 'profileFor'>;
+      store: Pick<ChromeProfileStore, 'profileFor' | 'hasPaneBindings' | 'isPaneBound'>;
       /** Persistence for stable surface ids. Optional — omitted keeps the
        *  pre-store in-memory behavior (older wirings, unit tests). */
       surfaceStore?: ChromeSurfaceStore;
@@ -1074,6 +1116,28 @@ export class ChromeLauncherRegistry {
     return this.forProfile(this.opts.store.profileFor(workspaceId));
   }
 
+  /** The profile a call runs in: the pane's own binding (same workspace only),
+   *  else the workspace's, else 'default'. Pure read — creates nothing. */
+  profileFor(workspaceId: string | undefined, paneId?: string): string {
+    return this.opts.store.profileFor(workspaceId, paneId);
+  }
+
+  /** Whether resolving the profile needs to know the calling pane at all. */
+  hasPaneBindings(workspaceId: string | undefined): boolean {
+    return this.opts.store.hasPaneBindings(workspaceId);
+  }
+
+  /** Whether `profile` is some pane's exclusive profile. */
+  isPaneBound(profile: string): boolean {
+    return this.opts.store.isPaneBound(profile);
+  }
+
+  /** The launcher for `profile` if one was ever created, without creating it —
+   *  for paths that must never spawn Chrome (reveal, status). */
+  peekLauncher(profile: string): ChromeBackendClient | undefined {
+    return profile === LIVE_CHROME_PROFILE ? (this.live ?? undefined) : this.launchers.get(profile);
+  }
+
   /**
    * Read-only status for browser.session.status: which profile the workspace is
    * bound to and whether its instance is up. It must NEVER create a launcher or
@@ -1085,7 +1149,13 @@ export class ChromeLauncherRegistry {
   async statusForWorkspace(
     workspaceId: string | undefined,
   ): Promise<{ profile: string; running: boolean; cdpPort: number | null; liveAttach?: boolean }> {
-    const profile = this.opts.store.profileFor(workspaceId);
+    return this.statusForProfile(this.opts.store.profileFor(workspaceId));
+  }
+
+  /** `statusForWorkspace` for an already resolved profile (a pane's own). */
+  async statusForProfile(
+    profile: string,
+  ): Promise<{ profile: string; running: boolean; cdpPort: number | null; liveAttach?: boolean }> {
     if (profile === LIVE_CHROME_PROFILE) {
       // `running` here means the user's remote-debugging endpoint is LISTENING —
       // not the old "did we lazily new-up a LiveChromeClient" (an object the
@@ -1117,14 +1187,45 @@ export class ChromeLauncherRegistry {
    * browser.close checks the returned workspaceId against the caller's scope
    * before acting, so this lookup discloses ownership, it does not grant it.
    */
-  ownerOfSurface(surfaceId: string): { workspaceId?: string; client: ChromeBackendClient } | null {
-    for (const launcher of this.launchers.values()) {
+  ownerOfSurface(
+    surfaceId: string,
+  ): { workspaceId?: string; profile: string; client: ChromeBackendClient } | null {
+    for (const [profile, launcher] of this.launchers) {
       if (!launcher.hasSurface(surfaceId)) continue;
       const workspaceId =
         launcher instanceof ChromeLauncher ? launcher.recordFor(surfaceId)?.workspaceId : undefined;
-      return { ...(workspaceId !== undefined && { workspaceId }), client: launcher };
+      // The profile lets browser.close refuse a pane's exclusive Chrome to a
+      // caller in any other pane, even one in the same workspace.
+      return { ...(workspaceId !== undefined && { workspaceId }), profile, client: launcher };
     }
     return null;
+  }
+
+  /**
+   * "Show in Chrome" for a pane: bring the newest tab of `profile` that belongs
+   * to `workspaceId` to the front. Never launches — a profile whose Chrome is
+   * not up has nothing to show, and spawning a browser to answer a click would
+   * be a surprise. Dedicated profiles only: on Live Chrome the newest tab may
+   * be the user's own.
+   */
+  async revealNewest(profile: string, workspaceId: string): Promise<{ ok: boolean; error?: string }> {
+    if (profile === LIVE_CHROME_PROFILE) {
+      return { ok: false, error: 'Show in Chrome applies to a wmux Chrome profile, not Live Chrome' };
+    }
+    const launcher = this.peekLauncher(profile);
+    if (!(launcher instanceof ChromeLauncher) || !launcher.isRunning()) {
+      return { ok: false, error: `the Chrome for profile "${profile}" is not running` };
+    }
+    // listTargets lets an unattributed record through; "Show in Chrome" for a
+    // pane must only ever raise a tab this workspace provably opened.
+    const tabs = (await launcher.listTargets(workspaceId)).filter((t) => t.workspaceId === workspaceId);
+    const newest = tabs[tabs.length - 1];
+    if (!newest) return { ok: false, error: `no open wmux tab in the Chrome for profile "${profile}"` };
+    if (!(await launcher.selectSurface(newest.surfaceId))) {
+      return { ok: false, error: 'Chrome did not bring the tab to the front' };
+    }
+    await launcher.restoreWindow(newest.surfaceId);
+    return { ok: true };
   }
 
   /**

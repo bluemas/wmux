@@ -191,3 +191,21 @@ describe('parseWorkspaceMirrorPayload — viewed (HQ brain context line)', () =>
     expect(parsed?.viewed).toBeUndefined();
   });
 });
+
+describe('parseWorkspaceMirrorPayload — panePtys passthrough', () => {
+  it('forwards plausible ptyId → paneId pairs and keeps an absent field absent', () => {
+    const parsed = parseWorkspaceMirrorPayload({
+      entries: [],
+      fleets: [],
+      panePtys: { 'daemon-1': 'pane-1', 'daemon-2': 42, 'bad id!': 'pane-3', 'daemon-4': 'bad pane!' },
+    });
+    expect(parsed?.panePtys).toEqual({ 'daemon-1': 'pane-1' });
+    expect(parseWorkspaceMirrorPayload({ entries: [], fleets: [] })).not.toHaveProperty('panePtys');
+  });
+
+  it('forwards paneIds (plausible ids only) and keeps an absent list absent', () => {
+    expect(parseWorkspaceMirrorPayload({ entries: [], fleets: [], paneIds: ['pane-1', 7, 'bad id!'] })?.paneIds)
+      .toEqual(['pane-1']);
+    expect(parseWorkspaceMirrorPayload({ entries: [], fleets: [] })).not.toHaveProperty('paneIds');
+  });
+});

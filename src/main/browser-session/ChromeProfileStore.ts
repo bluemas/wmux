@@ -3,6 +3,8 @@ import { getWmuxDir } from '../../daemon/config';
 import { atomicReadJSONSync, atomicWriteJSON } from '../../daemon/util/atomicWrite';
 import { isUnsafeKey } from '../account/accountStore';
 import { validateBrowserProfileName } from './ProfileManager';
+import type { ChromePaneBindings } from '../../shared/chromePaneBinding';
+import type { WorkspaceMirror } from '../workspace/WorkspaceMirror';
 
 // ---------------------------------------------------------------------------
 // Chrome-backend profile registry + workspace bindings (Phase 2.5).
@@ -17,6 +19,14 @@ import { validateBrowserProfileName } from './ProfileManager';
 // Modeled on account/accountStore.ts: main-owned JSON in the wmux data dir
 // (WMUX_DATA_SUFFIX-isolated), sync cache-backed reads, mutations serialized
 // through a write chain so overlapping read-modify-writes never race.
+//
+// Schema v2 adds PANE bindings (paneId → { workspaceId, profile }): one pane's
+// agent drives a Chrome of its own, so two panes in one workspace can be signed
+// into two different accounts. A pane-bound profile is EXCLUSIVE — bound to no
+// other pane and no workspace — which is what lets "every tab in this profile
+// belongs to that pane" hold without tracking panes per tab. A v1 file loads
+// unchanged (no paneBindings = none); an older build reading a v2 file simply
+// drops the field.
 // ---------------------------------------------------------------------------
 
 export const DEFAULT_CHROME_PROFILE = 'default';
@@ -26,7 +36,7 @@ export const DEFAULT_CHROME_PROFILE = 'default';
  * menu offers it as a static row and binding it is the explicit grant.
  */
 export const LIVE_CHROME_PROFILE = 'live';
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const MAX_PROFILES = 20;
 
 /** workspaceId → profileName */
@@ -36,6 +46,7 @@ interface ChromeProfilesFile {
   version: number;
   profiles: string[];
   bindings: ChromeProfileBindings;
+  paneBindings: ChromePaneBindings;
 }
 
 export function getChromeProfilesPath(dir: string = getWmuxDir()): string {
@@ -43,7 +54,16 @@ export function getChromeProfilesPath(dir: string = getWmuxDir()): string {
 }
 
 function emptyFile(): ChromeProfilesFile {
-  return { version: SCHEMA_VERSION, profiles: [DEFAULT_CHROME_PROFILE], bindings: {} };
+  return { version: SCHEMA_VERSION, profiles: [DEFAULT_CHROME_PROFILE], bindings: {}, paneBindings: {} };
+}
+
+/**
+ * Profile identity is case-INSENSITIVE: on macOS and Windows "Foo" and "foo"
+ * are one user-data-dir, so they are one Chrome and one set of logins. Every
+ * uniqueness and exclusivity check goes through this.
+ */
+function sameProfile(a: string, b: string): boolean {
+  return a.toLowerCase() === b.toLowerCase();
 }
 
 function isValidProfileName(name: unknown): name is string {
@@ -64,7 +84,12 @@ function sanitizeFile(raw: unknown, knownWorkspaceIds?: ReadonlySet<string>): Ch
   const r = raw as Record<string, unknown>;
   if (Array.isArray(r.profiles)) {
     for (const p of r.profiles) {
-      if (isValidProfileName(p) && !file.profiles.includes(p) && file.profiles.length < MAX_PROFILES) {
+      if (
+        isValidProfileName(p)
+        && !sameProfile(p, LIVE_CHROME_PROFILE)
+        && !file.profiles.some((q) => sameProfile(q, p))
+        && file.profiles.length < MAX_PROFILES
+      ) {
         file.profiles.push(p);
       }
     }
@@ -80,11 +105,46 @@ function sanitizeFile(raw: unknown, knownWorkspaceIds?: ReadonlySet<string>): Ch
       file.bindings[wsId] = profile;
     }
   }
+  // After the workspace bindings, so a hand-edited conflict resolves the same
+  // way every load: the workspace binding wins, then the first pane listed.
+  if (r.paneBindings && typeof r.paneBindings === 'object') {
+    for (const [paneId, raw] of Object.entries(r.paneBindings as Record<string, unknown>)) {
+      if (!paneId || isUnsafeKey(paneId)) continue;
+      if (!raw || typeof raw !== 'object') continue;
+      const { workspaceId, profile } = raw as Record<string, unknown>;
+      if (typeof workspaceId !== 'string' || !workspaceId || isUnsafeKey(workspaceId)) continue;
+      if (!isValidProfileName(profile) || !file.profiles.includes(profile)) continue;
+      if (paneBindRefusal(file, paneId, profile) !== null) continue;
+      if (knownWorkspaceIds && !knownWorkspaceIds.has(workspaceId)) continue;
+      file.paneBindings[paneId] = { workspaceId, profile };
+    }
+  }
   return file;
 }
 
+/**
+ * Why `profile` cannot be bound to `paneId`, or null when it can. A pane
+ * profile is exclusive: never 'default' (every unbound workspace shares it),
+ * never 'live' (the user's own browser is one account by definition), and
+ * not bound to any workspace or to another pane. Registry membership is the
+ * caller's check — the message for it differs by path.
+ */
+function paneBindRefusal(file: ChromeProfilesFile, paneId: string, profile: string): string | null {
+  if (sameProfile(profile, DEFAULT_CHROME_PROFILE) || sameProfile(profile, LIVE_CHROME_PROFILE)) {
+    return `the "${profile}" Chrome profile cannot be bound to a single pane; create a new profile for this pane`;
+  }
+  if (Object.values(file.bindings).some((p) => sameProfile(p, profile))) {
+    return `Chrome profile "${profile}" is bound to a workspace; create a new profile for this pane`;
+  }
+  const holder = Object.entries(file.paneBindings).find(([id, b]) => id !== paneId && sameProfile(b.profile, profile));
+  if (holder) {
+    return `Chrome profile "${profile}" is bound to another pane; create a new profile for this pane`;
+  }
+  return null;
+}
+
 export class ChromeProfileError extends Error {
-  readonly code: 'invalid' | 'limit' | 'not-found';
+  readonly code: 'invalid' | 'limit' | 'not-found' | 'conflict';
   constructor(code: ChromeProfileError['code'], message: string) {
     super(message);
     this.name = 'ChromeProfileError';
@@ -129,10 +189,38 @@ export class ChromeProfileStore {
     return { ...this.ensureCache().bindings };
   }
 
-  /** The profile a workspace's automation runs in ('default' when unbound). */
-  profileFor(workspaceId: string | undefined): string {
+  getPaneBindings(): ChromePaneBindings {
+    const out: ChromePaneBindings = {};
+    for (const [paneId, b] of Object.entries(this.ensureCache().paneBindings)) out[paneId] = { ...b };
+    return out;
+  }
+
+  /**
+   * The profile an automation call runs in: the calling pane's binding when it
+   * was made in this same workspace, else the workspace's binding, else
+   * 'default'. A pane binding from another workspace is ignored rather than
+   * followed — the pane moved, and its account does not travel with it.
+   */
+  profileFor(workspaceId: string | undefined, paneId?: string): string {
     if (!workspaceId || isUnsafeKey(workspaceId)) return DEFAULT_CHROME_PROFILE;
-    return this.ensureCache().bindings[workspaceId] ?? DEFAULT_CHROME_PROFILE;
+    const file = this.ensureCache();
+    if (paneId && !isUnsafeKey(paneId)) {
+      const pane = file.paneBindings[paneId];
+      if (pane && pane.workspaceId === workspaceId) return pane.profile;
+    }
+    return file.bindings[workspaceId] ?? DEFAULT_CHROME_PROFILE;
+  }
+
+  /** Whether any pane of this workspace has its own profile — the cheap test
+   *  that decides whether a call has to find out which pane is calling. */
+  hasPaneBindings(workspaceId: string | undefined): boolean {
+    if (!workspaceId || isUnsafeKey(workspaceId)) return false;
+    return Object.values(this.ensureCache().paneBindings).some((b) => b.workspaceId === workspaceId);
+  }
+
+  /** Whether `profile` is some pane's exclusive profile. */
+  isPaneBound(profile: string): boolean {
+    return Object.values(this.ensureCache().paneBindings).some((b) => sameProfile(b.profile, profile));
   }
 
   // ── Mutations (serialized) ────────────────────────────────────────────────
@@ -155,11 +243,17 @@ export class ChromeProfileStore {
 
   async create(name: string): Promise<string> {
     validateBrowserProfileName(name); // throws its user-facing message
-    if (name === LIVE_CHROME_PROFILE) {
+    if (sameProfile(name, LIVE_CHROME_PROFILE)) {
       throw new ChromeProfileError('invalid', `"${LIVE_CHROME_PROFILE}" is reserved for live-Chrome attach`);
     }
     return this.mutate((file) => {
       if (file.profiles.includes(name)) return name; // idempotent
+      // Same directory on a case-insensitive filesystem: a second name for one
+      // Chrome would let one account sit under two bindings.
+      const twin = file.profiles.find((p) => sameProfile(p, name));
+      if (twin) {
+        throw new ChromeProfileError('conflict', `Chrome profile "${twin}" already exists (names ignore case)`);
+      }
       if (file.profiles.length >= MAX_PROFILES) {
         throw new ChromeProfileError('limit', `at most ${MAX_PROFILES} Chrome profiles`);
       }
@@ -184,7 +278,96 @@ export class ChromeProfileStore {
       if (profileName !== LIVE_CHROME_PROFILE && !file.profiles.includes(profileName)) {
         throw new ChromeProfileError('not-found', `unknown Chrome profile "${profileName}"`);
       }
+      // A pane's profile is that pane's alone; sharing it with a whole
+      // workspace would put every other pane on the same account.
+      if (Object.values(file.paneBindings).some((b) => sameProfile(b.profile, profileName))) {
+        throw new ChromeProfileError(
+          'conflict',
+          `Chrome profile "${profileName}" is bound to a pane; unbind it there first`,
+        );
+      }
       file.bindings[workspaceId] = profileName;
     });
   }
+
+  /** Bind one pane to its own profile; null unbinds (the pane falls back to
+   *  its workspace's profile). User action only, like `setBinding`. */
+  async setPaneBinding(paneId: string, workspaceId: string, profileName: string | null): Promise<void> {
+    if (!paneId || isUnsafeKey(paneId)) {
+      throw new ChromeProfileError('invalid', 'invalid paneId');
+    }
+    if (!workspaceId || isUnsafeKey(workspaceId)) {
+      throw new ChromeProfileError('invalid', 'invalid workspaceId');
+    }
+    await this.mutate((file) => {
+      if (profileName === null) {
+        delete file.paneBindings[paneId];
+        return;
+      }
+      validateBrowserProfileName(profileName);
+      if (profileName !== LIVE_CHROME_PROFILE && profileName !== DEFAULT_CHROME_PROFILE
+        && !file.profiles.includes(profileName)) {
+        throw new ChromeProfileError('not-found', `unknown Chrome profile "${profileName}"`);
+      }
+      const refusal = paneBindRefusal(file, paneId, profileName);
+      if (refusal) throw new ChromeProfileError('conflict', refusal);
+      file.paneBindings[paneId] = { workspaceId, profile: profileName };
+    });
+  }
+
+  /**
+   * Bring pane bindings in line with the layout. A binding whose pane no
+   * longer exists is dropped; a bound pane that now lives in another workspace
+   * is RE-HOMED there — the account follows the pane, and the old workspace
+   * stops reporting pane bindings. `knownPaneIds` must be the COMPLETE set
+   * (stashed and PTY-less panes included) from a restored session: a partial
+   * or freshly generated tree would erase bindings the next healthy boot
+   * needs. `paneWorkspaces` may be partial — a pane missing from it keeps its
+   * workspace. Writes only when something changes: this runs on every push.
+   */
+  async reconcilePanes(
+    knownPaneIds: ReadonlySet<string>,
+    paneWorkspaces: ReadonlyMap<string, string>,
+  ): Promise<{ pruned: number; rehomed: number }> {
+    const plan = (file: ChromeProfilesFile) => {
+      const gone: string[] = [];
+      const moved: Array<[string, string]> = [];
+      for (const [paneId, binding] of Object.entries(file.paneBindings)) {
+        if (!knownPaneIds.has(paneId)) {
+          gone.push(paneId);
+          continue;
+        }
+        const now = paneWorkspaces.get(paneId);
+        if (now && now !== binding.workspaceId && !isUnsafeKey(now)) moved.push([paneId, now]);
+      }
+      return { gone, moved };
+    };
+    const preview = plan(this.ensureCache());
+    if (preview.gone.length === 0 && preview.moved.length === 0) return { pruned: 0, rehomed: 0 };
+    return this.mutate((file) => {
+      const { gone, moved } = plan(file);
+      for (const paneId of gone) delete file.paneBindings[paneId];
+      // Exclusivity is per profile, not per workspace, so a move never conflicts.
+      for (const [paneId, workspaceId] of moved) file.paneBindings[paneId].workspaceId = workspaceId;
+      return { pruned: gone.length, rehomed: moved.length };
+    });
+  }
+}
+
+/**
+ * Reconcile pane bindings against a renderer push — only a push from a
+ * renderer that RESTORED the saved session, and only when it sent the
+ * complete pane list. A failed or empty session load pushes a freshly
+ * generated tree, against which every real pane would look orphaned and lose
+ * its account for good (the same rule the Deck's startup reconcile follows).
+ */
+export function reconcilePaneBindingsFromMirror(
+  store: Pick<ChromeProfileStore, 'reconcilePanes'>,
+  mirror: Pick<WorkspaceMirror, 'isSessionRestored' | 'getKnownPaneIds' | 'getPaneWorkspaces'>,
+): Promise<{ pruned: number; rehomed: number }> {
+  const none = Promise.resolve({ pruned: 0, rehomed: 0 });
+  if (!mirror.isSessionRestored()) return none;
+  const known = mirror.getKnownPaneIds();
+  if (known === null || known.size === 0) return none;
+  return store.reconcilePanes(known, mirror.getPaneWorkspaces() ?? new Map());
 }
