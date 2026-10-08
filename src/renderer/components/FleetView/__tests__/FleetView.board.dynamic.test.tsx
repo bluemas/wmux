@@ -177,6 +177,19 @@ describe('FleetView — Board layout', () => {
     expect(container.querySelector('.wmux-fleet-list')).not.toBeNull();
   });
 
+  it('the List | Board switch shows on an empty Fleet too', async () => {
+    act(() => useStore.setState({ workspaces: [], surfaceAgent: {}, surfaceAgentStatus: {}, surfacePendingQuestion: {} }));
+    mount();
+    await flushRaf();
+    expect(container.querySelector('[data-fleet-view]')?.getAttribute('data-layout')).toBe('empty');
+    expect(container.querySelector('[data-fleet-empty]')).not.toBeNull();
+    const toggle = container.querySelector('[data-testid="fleet-layout"]');
+    expect(toggle).not.toBeNull();
+    const board = [...toggle!.querySelectorAll<HTMLButtonElement>('[role="radio"]')].find((b) => b.textContent === 'Board')!;
+    act(() => board.click());
+    expect(useStore.getState().fleetLayout).toBe('board');
+  });
+
   it('a status filter keeps only its column', async () => {
     act(() => useStore.getState().setFleetLayout('board'));
     mount();
