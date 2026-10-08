@@ -9,7 +9,8 @@ import { AppendOnlyLog } from '../../eventlog/AppendOnlyLog';
 import { remoteTaskId } from '../ids';
 import { acceptInbound, type InboundDeps } from '../inbound';
 import { LinkStore } from '../linkStore';
-import { linkAlias } from '../outbound';
+import { linkAlias, syncRemoteTask } from '../outbound';
+import { OutboxStore } from '../outboxStore';
 
 const HOST = '11111111-1111-4111-8111-111111111111';
 const OTHER_HOST = '22222222-2222-4222-8222-222222222222';
@@ -85,7 +86,7 @@ describe('acceptInbound — task', () => {
     expect(tasks.listRemotePending().map((x) => x.id)).toEqual([id]);
   });
 
-  it('a task to a brain (Moa) end is held as brain-delivery-pending, never broadcast for a pane paste', async () => {
+  it('a task to a brain (Moa) end is pending for main to wake Moa, never held; its reply is owed the same way', async () => {
     const linkId = crypto.randomUUID();
     links.receiveProposal({
       linkId,
@@ -97,15 +98,15 @@ describe('acceptInbound — task', () => {
     const e = env(linkId, {});
     expect(await acceptInbound(e, peer, deps)).toMatchObject({ ok: true, duplicate: false });
     const id = remoteTaskId(linkId, e.messageId);
-    expect(tasks.getTask(id)!.metadata.remote).toMatchObject({ held: 'brain-delivery-pending', delivered: false });
-    expect(tasks.listRemotePending()).toEqual([]);
-    expect(tasks.listRemoteHeld().map((t) => t.id)).toEqual([id]);
-    expect(broadcast).not.toHaveBeenCalled();
-    // A peer reply into it is held the same way.
+    expect(tasks.getTask(id)!.metadata.remote).toMatchObject({ delivered: false, kind: 'brain' });
+    expect(tasks.getTask(id)!.metadata.remote).not.toHaveProperty('held');
+    expect(tasks.listRemotePending().map((t) => t.id)).toEqual([id]);
+    expect(broadcast).toHaveBeenCalledWith({ type: 'a2a.remote.inbound', taskId: id });
     const reply = env(linkId, { kind: 'reply', taskId: id, text: 'more' });
     expect(await acceptInbound(reply, peer, deps)).toMatchObject({ ok: true, duplicate: false });
     const inbox = (tasks.getTask(id)!.metadata.remote as { inbox?: Array<{ messageId: string; held?: string }> }).inbox;
-    expect(inbox?.find((i) => i.messageId === reply.messageId)?.held).toBe('brain-delivery-pending');
+    expect(inbox?.find((i) => i.messageId === reply.messageId)).toMatchObject({ messageId: reply.messageId });
+    expect(inbox?.find((i) => i.messageId === reply.messageId)?.held).toBeUndefined();
   });
 
   it('the same message again is a duplicate; same id with another body is a conflict', async () => {
@@ -233,6 +234,50 @@ describe('acceptInbound — link notices', () => {
   });
 });
 
+describe('acceptInbound — brain link (Moa to Moa)', () => {
+  function brainLink(): string {
+    const linkId = crypto.randomUUID();
+    links.receiveProposal({
+      linkId,
+      local: { kind: 'brain', workspaceId: 'ws-hq' },
+      remote: { hostId: HOST, kind: 'brain', workspaceId: 'ws-rhq' },
+      allow: { outbound: true, inbound: true },
+    });
+    links.accept(linkId);
+    return linkId;
+  }
+
+  it('lands the task on this PC\'s Moa: HQ workspace, no pane, same broadcast', async () => {
+    const linkId = brainLink();
+    deps.aliasFor = () => 'pc-a/Moa';
+    const e = env(linkId, {});
+    const res = await acceptInbound(e, peer, deps);
+    const id = remoteTaskId(linkId, e.messageId);
+    expect(res).toEqual({ ok: true, taskId: id, duplicate: false });
+    const t = tasks.getTask(id)!;
+    expect(t.metadata.from).toEqual({ workspaceId: `remote:${linkId}`, name: 'pc-a/Moa' });
+    expect(t.metadata.to).toEqual({ workspaceId: 'ws-hq', name: 'Moa' });
+    expect(broadcast).toHaveBeenCalledWith({ type: 'a2a.remote.inbound', taskId: id });
+  });
+});
+
+describe('acceptInbound — message id', () => {
+  it('accepts only a plain token as the peer\'s message id', async () => {
+    const linkId = activeLink();
+    for (const messageId of ['a b', 'x"y', 'é', 'a'.repeat(129), 'a/b']) {
+      expect(await acceptInbound(env(linkId, { messageId }), peer, deps)).toMatchObject({ ok: false, error: 'bad-request' });
+    }
+    expect(await acceptInbound(env(linkId, { messageId: 'Abc_123-xyz' }), peer, deps)).toMatchObject({ ok: true });
+  });
+
+  it('records the link endpoint kind on the marker', async () => {
+    const linkId = activeLink();
+    const e = env(linkId, {});
+    await acceptInbound(e, peer, deps);
+    expect(tasks.getTask(remoteTaskId(linkId, e.messageId))!.metadata.remote).toMatchObject({ kind: 'pane' });
+  });
+});
+
 describe('acceptInbound — peer text is made safe before it is stored', () => {
   it('drops escapes (CSI, OSC 52, bracketed-paste end), controls and CR line forgery, keeps newlines and tabs', async () => {
     const linkId = activeLink();
@@ -249,3 +294,52 @@ describe('acceptInbound — peer text is made safe before it is stored', () => {
     expect(await acceptInbound(env(linkId, { text: '\x1b[201~\x1b]0;x\x07' }), peer, deps)).toMatchObject({ ok: false, error: 'bad-request' });
   });
 });
+
+describe('receipts', () => {
+  it('the receiver queues delivered, then read, once each; never a state change', async () => {
+    const linkId = activeLink();
+    const e = env(linkId, {});
+    await acceptInbound(e, peer, deps);
+    const id = remoteTaskId(linkId, e.messageId);
+    const outbox = new OutboxStore({ dir, scheduleHarden: () => undefined });
+    const sync = { linkStore: links, taskService: tasks, outbox };
+    const receipts = (): unknown[] => outbox.pending(HOST).map((r) => r.envelope).filter((x) => x.kind === 'receipt').map((x) => x.receipt);
+    expect(await syncRemoteTask(sync, id)).toEqual({ ok: true, queued: 0 }); // not handed over yet
+    await tasks.markRemote({ taskId: id, delivered: true });
+    await syncRemoteTask(sync, id);
+    await syncRemoteTask(sync, id);
+    expect(receipts()).toEqual(['delivered']);
+    await tasks.markRemote({ taskId: id, read: true });
+    await syncRemoteTask(sync, id);
+    await syncRemoteTask(sync, id);
+    expect(receipts()).toEqual(['delivered', 'read']);
+    expect(tasks.getTask(id)!.status.state).toBe('submitted');
+  });
+
+  it('the sender records the peer\'s receipts on its own task; a receipt for a task it did not send is refused', async () => {
+    const linkId = activeLink();
+    const out = remoteTaskId(linkId, 'mine-1');
+    await tasks.createTask({
+      id: out,
+      title: 'mine',
+      from: { workspaceId: 'ws-b', name: 'Backend', paneId: 'pane-b' },
+      to: { workspaceId: `remote:${linkId}`, name: 'pc-a/ws-a/claude' },
+      history: [{ kind: 'message', messageId: 'mine-1', role: 'user', parts: [{ kind: 'text', text: 'hi' }] }],
+      remote: { v: 1, linkId, hostId: HOST, messageId: 'mine-1', direction: 'outbound', kind: 'pane' },
+    });
+    expect(await acceptInbound(env(linkId, { kind: 'receipt', taskId: out, receipt: 'delivered', text: undefined }), peer, deps)).toMatchObject({ ok: true });
+    expect(tasks.getTask(out)!.metadata.remote).toMatchObject({ remoteDeliveredAt: expect.any(String) });
+    expect(tasks.getTask(out)!.metadata.remote).not.toHaveProperty('remoteReadAt');
+    expect(await acceptInbound(env(linkId, { kind: 'receipt', taskId: out, receipt: 'read', text: undefined }), peer, deps)).toMatchObject({ ok: true });
+    expect(tasks.getTask(out)!.metadata.remote).toMatchObject({ remoteReadAt: expect.any(String) });
+    expect(tasks.getTask(out)!.status.state).toBe('submitted');
+
+    const e = env(linkId, {});
+    await acceptInbound(e, peer, deps);
+    expect(await acceptInbound(env(linkId, { kind: 'receipt', taskId: remoteTaskId(linkId, e.messageId), receipt: 'read', text: undefined }), peer, deps))
+      .toMatchObject({ ok: false, error: 'forbidden' });
+    expect(await acceptInbound(env(linkId, { kind: 'receipt', taskId: out, receipt: 'opened' as never, text: undefined }), peer, deps))
+      .toMatchObject({ ok: false, error: 'bad-request' });
+  });
+});
+

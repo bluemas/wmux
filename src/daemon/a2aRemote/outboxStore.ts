@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { atomicWriteJSONSync } from '../util/atomicWrite';
-import { scheduleTokenFileReHarden } from '../../shared/security';
+import { reHardenTokenFile } from '../../shared/security';
 import {
   A2A_REMOTE_RECORD_V,
   isA2aRemoteMessageKind,
@@ -81,15 +81,44 @@ export class OutboxStore {
   /** Keyed `${hostId}:${seq}`. */
   private records = new Map<string, A2aOutboxRecordV1>();
   private writable = true;
+  /** The re-harden of the file running now (Windows rewrites the file), and whether another write wants one. */
+  private hardening: Promise<void> | null = null;
+  private hardenAgain = false;
 
   constructor(opts: OutboxStoreOptions) {
     this.filePath = path.join(opts.dir, OUTBOX_FILE);
     this.now = opts.now ?? Date.now;
     this.log = opts.log ?? ((): void => undefined);
     this.write = opts.write ?? ((p, d): void => atomicWriteJSONSync(p, d));
-    this.scheduleHarden = opts.scheduleHarden ?? scheduleTokenFileReHarden;
+    this.scheduleHarden = opts.scheduleHarden ?? ((): void => this.harden());
     this.onEnqueue = opts.onEnqueue ?? ((): void => undefined);
     this.load(opts.mintEpoch ?? ((): string => crypto.randomUUID()));
+  }
+
+  /**
+   * Re-harden the file after a write, tracked so `idle()` can wait for it: on
+   * Windows it rewrites the file and holds it (and the directory) meanwhile.
+   * Writes during a run ask for one more run, never a parallel one.
+   */
+  private harden(): void {
+    if (this.hardening) {
+      this.hardenAgain = true;
+      return;
+    }
+    this.hardening = (async (): Promise<void> => {
+      do {
+        this.hardenAgain = false;
+        await new Promise((r) => setImmediate(r));
+        await reHardenTokenFile(this.filePath);
+      } while (this.hardenAgain);
+    })().finally(() => {
+      this.hardening = null;
+    });
+  }
+
+  /** Resolves once no re-harden of the file is running (call on shutdown). */
+  async idle(): Promise<void> {
+    while (this.hardening) await this.hardening;
   }
 
   /** The store's epoch: the first half of every stream cursor. */

@@ -1,10 +1,13 @@
 import {
+  A2A_BRAIN_ALIAS,
   A2A_REMOTE_BODY_MAX,
+  A2A_REMOTE_MESSAGE_ID_RE,
   A2A_REMOTE_PROTOCOL,
   isA2aRemoteMessageKind,
   type A2aLinkRecordV1,
   type A2aRemoteDeliverResponse,
   type A2aRemoteEnvelope,
+  type A2aRemoteReceipt,
   type A2aRemoteErrorCode,
   type A2aRemoteTaskMarkerV1,
   type HostId,
@@ -60,7 +63,7 @@ export async function acceptInbound(
   if (env.kind === 'link') return applyLinkNotice(env, peer.hostId, deps);
 
   let onThisLink = false;
-  if (env.kind === 'reply' || env.kind === 'state') {
+  if (env.kind === 'reply' || env.kind === 'state' || env.kind === 'receipt') {
     const marker = deps.taskService.getTask(env.taskId as string)?.metadata.remote as A2aRemoteTaskMarkerV1 | undefined;
     onThisLink = marker?.v === 1 && marker.linkId === env.linkId;
   }
@@ -68,9 +71,6 @@ export async function acceptInbound(
   if (!check.ok) return fail(check.error);
   const link = check.link;
   const remoteWs = remoteWorkspaceId(link.linkId);
-  // A brain (Moa) end has no pane to paste into; its delivery is PR4's. Until
-  // then every task / reply / state on such a link is held, never pasted.
-  const brain = check.kind === 'brain';
 
   if (env.kind === 'task') {
     const taskId = remoteTaskId(link.linkId, env.messageId);
@@ -80,27 +80,34 @@ export async function acceptInbound(
         id: taskId,
         title: text.split('\n', 1)[0].slice(0, 100),
         from: { workspaceId: remoteWs, name: deps.aliasFor(link) },
-        to: {
-          workspaceId: link.local.workspaceId,
-          name: deps.localWorkspaceName?.(link.local.workspaceId) ?? link.local.workspaceId,
-          paneId: link.local.paneId,
-        },
+        // A brain end is this PC's Moa: its HQ workspace, no pane.
+        to: link.local.kind === 'brain'
+          ? { workspaceId: link.local.workspaceId, name: A2A_BRAIN_ALIAS }
+          : {
+            workspaceId: link.local.workspaceId,
+            name: deps.localWorkspaceName?.(link.local.workspaceId) ?? link.local.workspaceId,
+            paneId: link.local.paneId,
+          },
         history: [textMessage(env.messageId, 'user', text)],
-        remote: { v: 1, linkId: link.linkId, hostId: peer.hostId, messageId: env.messageId, direction: 'inbound', delivered: false },
+        remote: { v: 1, linkId: link.linkId, hostId: peer.hostId, messageId: env.messageId, direction: 'inbound', delivered: false, kind: link.local.kind },
       },
       { conflictOnBodyMismatch: true },
     );
     if (!created.ok) return fail('conflict' in created ? 'conflict' : 'unavailable', created.error);
     if (created.existed) return { ok: true, taskId, duplicate: true };
-    if (brain) {
-      await holdForBrain(deps, { taskId });
-      return { ok: true, taskId, duplicate: false };
-    }
     deps.broadcast({ type: A2A_REMOTE_INBOUND_EVENT, taskId });
     return { ok: true, taskId, duplicate: false };
   }
 
   const taskId = env.taskId as string;
+  if (env.kind === 'receipt') {
+    // The peer got (or read) a task WE sent it: bookkeeping only, never a state.
+    const marker = deps.taskService.getTask(taskId)?.metadata.remote as A2aRemoteTaskMarkerV1 | undefined;
+    if (marker?.direction !== 'outbound') return fail('forbidden', 'a receipt is only for a task this host sent');
+    const res = await deps.taskService.markRemote({ taskId, remoteReceipt: env.receipt as A2aRemoteReceipt });
+    if (!res.ok) return fail('unavailable', res.error);
+    return { ok: true, taskId, duplicate: false };
+  }
   if (env.kind === 'reply') {
     const task = deps.taskService.getTask(taskId);
     // The peer is the sender of an inbound task and the receiver of an outbound one.
@@ -112,7 +119,6 @@ export async function acceptInbound(
       message: textMessage(env.messageId, role, env.text as string),
     });
     if (!res.ok) return fail('conflict' in res ? 'conflict' : 'unavailable', res.error);
-    if (brain && !res.duplicate) await holdForBrain(deps, { taskId, messageId: env.messageId });
     return { ok: true, taskId, duplicate: res.duplicate };
   }
 
@@ -124,20 +130,7 @@ export async function acceptInbound(
     ...(env.text ? { summary: env.text } : {}),
   });
   if (!res.ok) return fail(stateErrorCode(res), res.error);
-  if (brain && !res.duplicate) await holdForBrain(deps, { taskId, messageId: env.messageId });
   return { ok: true, taskId, duplicate: res.duplicate };
-}
-
-/**
- * Hold a brain-end delivery (`brain-delivery-pending`). Best effort: the
- * message is already durable, and a hold that did not land only means main
- * may try a pane delivery that the renderer refuses (no pane on a brain link).
- */
-async function holdForBrain(deps: InboundDeps, target: { taskId: string; messageId?: string }): Promise<void> {
-  // A state the ledger took without a delivery item (e.g. a no-op) has nothing to hold.
-  const marker = deps.taskService.getTask(target.taskId)?.metadata.remote as { inbox?: Array<{ messageId: string }> } | undefined;
-  if (target.messageId !== undefined && !marker?.inbox?.some((i) => i.messageId === target.messageId)) return;
-  await deps.taskService.markRemote({ ...target, held: 'brain-delivery-pending' }).catch(() => undefined);
 }
 
 /** Link lifecycle notice. A notice the link already reflects is a duplicate. */
@@ -183,7 +176,7 @@ function parseEnvelope(raw: unknown): Parsed {
   if (!isPlainObject(raw)) return { error: 'bad-request' };
   if (raw['protocol'] !== A2A_REMOTE_PROTOCOL) return { error: 'protocol' };
   const { linkId, linkVersion, messageId, kind, taskId, text, state, link, sentAt } = raw;
-  if (!isSafeId(linkId) || !isSafeId(messageId) || typeof sentAt !== 'string') return { error: 'bad-request' };
+  if (!isSafeId(linkId) || typeof messageId !== 'string' || !A2A_REMOTE_MESSAGE_ID_RE.test(messageId) || typeof sentAt !== 'string') return { error: 'bad-request' };
   if (typeof linkVersion !== 'number' || !Number.isInteger(linkVersion)) return { error: 'bad-request' };
   if (!isA2aRemoteMessageKind(kind)) return { error: 'bad-request' };
   if (text !== undefined && typeof text !== 'string') return { error: 'bad-request' };
@@ -200,6 +193,9 @@ function parseEnvelope(raw: unknown): Parsed {
       break;
     case 'link':
       if (!isPlainObject(link) || typeof link['state'] !== 'string' || typeof link['version'] !== 'number') return { error: 'bad-request' };
+      break;
+    case 'receipt':
+      if (!isSafeId(taskId) || (raw['receipt'] !== 'delivered' && raw['receipt'] !== 'read')) return { error: 'bad-request' };
       break;
   }
   return { envelope: raw as unknown as A2aRemoteEnvelope };

@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { BrowserWindow } from 'electron';
+import { mintCommanderToken } from '../../../deck/commanderTrust';
 import { RpcRouter } from '../../RpcRouter';
 import { registerA2aRpc, type RemoteA2aRpcDeps } from '../a2a.rpc';
 import type { ClaudeWorker } from '../../../a2a/ClaudeWorker';
@@ -24,12 +25,13 @@ const target: A2aRemoteTarget = {
   alias: ALIAS,
   linkId: LINK,
   hostId: HOST,
+  kind: 'pane',
   local: { workspaceId: 'ws-a', paneId: 'pane-a' },
   remote: { workspaceId: 'ws-b', paneId: 'pane-b', label: 'codex' },
   allowOutbound: true,
 };
 
-let remote: { [K in keyof RemoteA2aRpcDeps]: ReturnType<typeof vi.fn> };
+let remote: { [K in keyof RemoteA2aRpcDeps]-?: ReturnType<typeof vi.fn> };
 let daemonCalls: Array<{ method: string; params: Record<string, unknown> }>;
 
 function setup(): RpcRouter {
@@ -69,6 +71,7 @@ beforeEach(() => {
     sendTask: vi.fn(async () => ({ ok: true, taskId: RT })),
     reply: vi.fn(async (i: { taskId: string }) => ({ ok: true, taskId: i.taskId })),
     state: vi.fn(async (i: { taskId: string }) => ({ ok: true, taskId: i.taskId })),
+    read: vi.fn(async () => ({ ok: true })),
   };
   sendToRendererMock.mockImplementation(async (_w: unknown, method: string) => {
     if (method === 'pane.list') return [{ id: 'pane-a', surfacePtyIds: ['pty-a'] }, { id: 'pane-a2', surfacePtyIds: ['pty-a2'] }];
@@ -138,6 +141,82 @@ describe('a2a.task.send — remote alias', () => {
     // The operator lane still carries an ordinary preset id.
     await router.dispatch({ id: 'z', method: 'a2a.task.send', params: { ...params, presetTaskId: `task-${'0'.repeat(36)}` } }, { operator: true });
     expect(rendererCalls('a2a.task.send')[2].presetTaskId).toBe(`task-${'0'.repeat(36)}`);
+  });
+});
+
+describe('a2a.task.send — Moa to another PC\'s Moa (brain link)', () => {
+  const BRAIN_ALIAS = 'pc-b/Moa';
+  const brainTarget: A2aRemoteTarget = {
+    alias: BRAIN_ALIAS, linkId: LINK, hostId: HOST, kind: 'brain',
+    local: { workspaceId: 'ws-hq' }, remote: { workspaceId: 'ws-rhq' }, allowOutbound: true,
+  };
+  /** A brain's request carries its spawn token; the router derives the workspace from it. */
+  const asBrain = (ws: string): string => mintCommanderToken(ws);
+  async function brainCall(router: RpcRouter, params: Record<string, unknown>, token?: string): Promise<Record<string, unknown>> {
+    const res = await router.dispatch({ id: 'b', method: 'a2a.task.send', params, ...(token ? { commanderToken: token } : {}) });
+    return (res as { result: Record<string, unknown> }).result;
+  }
+
+  it('the HQ commander sends as Moa of its verified workspace, never a wire value', async () => {
+    remote.listTargets.mockResolvedValue([brainTarget]);
+    const res = await brainCall(setup(), { workspaceId: 'ws-forged', commanderWorkspaceId: 'ws-forged', to: BRAIN_ALIAS, message: 'check the build', title: 'T' }, asBrain('ws-hq'));
+    expect(res).toMatchObject({ ok: true, taskId: RT, remote: true });
+    expect(remote.sendTask).toHaveBeenCalledWith({ linkId: LINK, from: { workspaceId: 'ws-hq', name: 'Moa' }, title: 'T', text: 'check the build' });
+    expect(String(res.next)).toContain('Do not raise a decision card about waiting');
+    expect(rendererCalls('a2a.task.send')).toEqual([]);
+  });
+
+  it('another workspace\'s brain, or a pane caller, cannot send on the brain link', async () => {
+    remote.listTargets.mockResolvedValue([brainTarget]);
+    const router = setup();
+    expect((await brainCall(router, { workspaceId: 'ws-hq', to: BRAIN_ALIAS, message: 'x' }, asBrain('ws-other'))).error).toMatch(/another workspace's Moa/);
+    expect((await brainCall(router, { workspaceId: 'ws-hq', senderPtyId: 'pty-a', to: BRAIN_ALIAS, message: 'x' })).error).toMatch(/not linked/);
+    expect(remote.sendTask).not.toHaveBeenCalled();
+  });
+
+  it('an alias that names two links is refused, never sent on the first one', async () => {
+    const other = '33333333-3333-4333-8333-333333333333';
+    remote.listTargets.mockResolvedValue([brainTarget, { ...brainTarget, linkId: other, hostId: other }]);
+    const res = await brainCall(setup(), { workspaceId: 'ws-hq', to: BRAIN_ALIAS, message: 'x' }, asBrain('ws-hq'));
+    expect(res.error).toMatch(/names 2 links/);
+    expect(remote.sendTask).not.toHaveBeenCalled();
+  });
+
+  it('Moa addressing a remote pane alias is refused toward the handoff card', async () => {
+    const res = await brainCall(setup(), { workspaceId: 'ws-a', to: ALIAS, message: 'x' }, asBrain('ws-a'));
+    expect(res.error).toMatch(/moa_propose_handoff/);
+    expect(remote.sendTask).not.toHaveBeenCalled();
+  });
+
+  it('a brain reply is sent as its verified workspace', async () => {
+    await brainCall(setup(), { workspaceId: 'ws-forged', taskId: RT, message: 'done: green' }, asBrain('ws-hq'));
+    expect(remote.reply).toHaveBeenCalledWith({ taskId: RT, workspaceId: 'ws-hq', text: 'done: green' });
+  });
+
+  it('a brain\'s status on a remote task uses its verified workspace and is queued for the peer', async () => {
+    const res = await setup().dispatch({ id: 'u', method: 'a2a.task.update', params: { workspaceId: 'ws-forged', taskId: RT, status: 'completed' }, commanderToken: asBrain('ws-hq') });
+    expect(res.ok).toBe(true);
+    expect(daemonCalls.find((c) => c.method === 'a2a.task.update')?.params).toMatchObject({ taskId: RT, workspaceId: 'ws-hq', status: 'completed' });
+    expect(remote.state).toHaveBeenCalledWith({ taskId: RT, state: 'completed' });
+  });
+
+  it('reading a remote task by id sends the read receipt as the verified reader; a list read does not', async () => {
+    const router = setup();
+    await router.dispatch({ id: 'q', method: 'a2a.task.query', params: { workspaceId: 'ws-forged', taskId: RT }, commanderToken: asBrain('ws-hq') });
+    expect(remote.read).toHaveBeenCalledWith({ taskId: RT, workspaceId: 'ws-hq' });
+    remote.read.mockClear();
+    await router.dispatch({ id: 'q2', method: 'a2a.task.query', params: { workspaceId: 'ws-hq' } });
+    expect(remote.read).not.toHaveBeenCalled();
+  });
+
+  it('discover lists the brain link as <PC>/Moa', async () => {
+    remote.listTargets.mockResolvedValue([brainTarget]);
+    const res = await call(setup(), 'a2a.discover', { workspaceId: 'ws-hq' });
+    const agents = res.agents as Array<{ name: string; description: string; metadata: Record<string, unknown> }>;
+    const moa = agents.find((a) => a.name === BRAIN_ALIAS)!;
+    expect(moa.description).toContain('Moa of PC pc-b');
+    expect(moa.metadata).toMatchObject({ endpoint: 'brain', remote: true });
+    expect(moa.metadata).not.toHaveProperty('localPaneId');
   });
 });
 

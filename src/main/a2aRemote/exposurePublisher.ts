@@ -90,6 +90,9 @@ export function goneForLinks(links: A2aLinkRecordV1[], tree: A2aRemotePaneSnapsh
   for (const l of links) {
     if (l.state === 'revoked' || l.state === 'broken') continue;
     if (l.local.kind === 'brain') {
+      // Moa not known yet (a cold start reads its state after the first
+      // snapshot) breaks nothing: only a Moa that is off or replaced does.
+      if (tree.brainState === 'unknown' && !tree.brain) continue;
       if (tree.brain?.workspaceId !== l.local.workspaceId) {
         out.push({ workspaceId: l.local.workspaceId, reason: 'workspace-gone', endpoint: 'brain' });
       }
@@ -164,7 +167,8 @@ export class A2aExposurePublisher {
       return rest;
     }
     const kept = this.last?.brain;
-    if (!kept) return rest;
+    // Nothing known to keep (a cold start): say so, so reconciliation waits.
+    if (!kept) return { ...rest, brainState: 'unknown' };
     if (this.brainUnknownSince === null) this.brainUnknownSince = this.now();
     const waited = this.now() - this.brainUnknownSince;
     if (waited >= A2A_BRAIN_GRACE_MS) return rest;

@@ -54,7 +54,7 @@ import type {
   A2aTaskMessagePayload,
   A2aTaskTransitionPayload,
 } from '../../shared/a2aEventlog';
-import type { A2aRemoteTaskMarkerV1 } from '../../shared/a2aRemote';
+import type { A2aRemoteReceipt, A2aRemoteTaskMarkerV1 } from '../../shared/a2aRemote';
 import { localSideOf, type A2aRemoteHeldReason, type A2aRemoteInboxItem, type A2aRemoteTaskState } from '../../shared/a2aRemoteDelivery';
 
 /** a2aSlice 현행 값 준수(캐시와 동일 시멘틱). */
@@ -343,9 +343,14 @@ export class A2aTaskService {
         ? marker.inbox?.find((i) => i.messageId === r.messageId)
         : marker;
       if (!target) return;
-      if (r.stateSync !== undefined || r.sent !== undefined) {
+      if (r.stateSync !== undefined || r.sent !== undefined || r.read || r.receiptSync !== undefined || r.remoteReceipt !== undefined) {
         if (r.stateSync !== undefined) marker.stateSync = r.stateSync;
         if (r.sent !== undefined && !(marker.sent ?? []).includes(r.sent)) (marker.sent ??= []).push(r.sent);
+        if (r.read && !marker.readAt) marker.readAt = r.timestamp;
+        if (r.receiptSync !== undefined) marker.receiptSync = r.receiptSync;
+        // A read implies the hand-over, even when the peer's 'delivered' never came.
+        if (r.remoteReceipt !== undefined && !marker.remoteDeliveredAt) marker.remoteDeliveredAt = r.timestamp;
+        if (r.remoteReceipt === 'read' && !marker.remoteReadAt) marker.remoteReadAt = r.timestamp;
         return;
       }
       if (r.attempted !== undefined) {
@@ -712,6 +717,12 @@ export class A2aTaskService {
     attempted?: boolean;
     stateSync?: TaskState;
     sent?: string;
+    /** Inbound: our side read it (first time only). */
+    read?: true;
+    /** Inbound: this receipt was queued for the peer. */
+    receiptSync?: A2aRemoteReceipt;
+    /** Outbound: the peer's receipt arrived. */
+    remoteReceipt?: A2aRemoteReceipt;
   }): Promise<{ ok: true; task: Task } | OpErr> {
     return this.withTaskLock(input.taskId, async () => {
       const task = this.tasks.get(input.taskId);
@@ -721,11 +732,18 @@ export class A2aTaskService {
       if (input.messageId !== undefined) {
         target = marker.inbox?.find((i) => i.messageId === input.messageId);
         if (!target) return { ok: false, error: `a2a.remote.mark: no inbound item ${input.messageId} on ${input.taskId}` };
-      } else if (marker.direction !== 'inbound' && input.stateSync === undefined && input.sent === undefined) {
+      } else if (marker.direction !== 'inbound' && input.stateSync === undefined && input.sent === undefined && input.remoteReceipt === undefined) {
         return { ok: false, error: 'a2a.remote.mark: only an inbound remote task has a delivery state' };
       }
-      const bookkeeping = input.stateSync !== undefined || input.sent !== undefined;
-      if (bookkeeping && input.messageId !== undefined) return { ok: false, error: 'a2a.remote.mark: stateSync/sent are task-level' };
+      if ((input.read || input.receiptSync !== undefined) && marker.direction !== 'inbound') {
+        return { ok: false, error: 'a2a.remote.mark: only an inbound remote task is read or acknowledged' };
+      }
+      if (input.remoteReceipt !== undefined && marker.direction !== 'outbound') {
+        return { ok: false, error: 'a2a.remote.mark: only an outbound remote task takes the peer\'s receipt' };
+      }
+      const receipts = input.read === true || input.receiptSync !== undefined || input.remoteReceipt !== undefined;
+      const bookkeeping = input.stateSync !== undefined || input.sent !== undefined || receipts;
+      if (bookkeeping && input.messageId !== undefined) return { ok: false, error: 'a2a.remote.mark: stateSync/sent/receipts are task-level' };
       if (input.delivered !== true && !input.held && input.attempted === undefined && !bookkeeping) {
         return { ok: false, error: 'a2a.remote.mark: nothing to mark' };
       }
@@ -734,8 +752,17 @@ export class A2aTaskService {
       let body: Partial<A2aRemoteMarkPayload>;
       if (bookkeeping) {
         unchanged = (input.stateSync === undefined || marker.stateSync === input.stateSync)
-          && (input.sent === undefined || (marker.sent ?? []).includes(input.sent));
-        body = { ...(input.stateSync !== undefined ? { stateSync: input.stateSync } : {}), ...(input.sent !== undefined ? { sent: input.sent } : {}) };
+          && (input.sent === undefined || (marker.sent ?? []).includes(input.sent))
+          && (input.read !== true || !!marker.readAt)
+          && (input.receiptSync === undefined || receiptRank(marker.receiptSync) >= receiptRank(input.receiptSync))
+          && (input.remoteReceipt === undefined || (input.remoteReceipt === 'read' ? !!marker.remoteReadAt : !!marker.remoteDeliveredAt));
+        body = {
+          ...(input.stateSync !== undefined ? { stateSync: input.stateSync } : {}),
+          ...(input.sent !== undefined ? { sent: input.sent } : {}),
+          ...(input.read ? { read: true as const } : {}),
+          ...(input.receiptSync !== undefined ? { receiptSync: input.receiptSync } : {}),
+          ...(input.remoteReceipt !== undefined ? { remoteReceipt: input.remoteReceipt } : {}),
+        };
       } else if (input.delivered === true) {
         unchanged = target.delivered === true && (!input.note || target.note === input.note) && (!input.ptyId || side.ptyId === input.ptyId);
         body = { delivered: true, ...(input.note ? { note: input.note } : {}), ...(input.ptyId ? { ptyId: input.ptyId } : {}) };
@@ -768,7 +795,8 @@ export class A2aTaskService {
    * Remote tasks with delivery work main can do now: an inbound task neither
    * delivered nor held (and not ended), or any reply/state item the peer sent
    * that is neither delivered nor held. Held work is NOT here: it waits for a
-   * person (`listRemoteHeld`) or the hold TTL, never for the backstop.
+   * person (`listRemoteHeld`) or the hold TTL, never for the backstop — except
+   * a `brain-unavailable` hold, which waits only for Moa.
    */
   listRemotePending(): Task[] {
     const out: Task[] = [];
@@ -776,8 +804,11 @@ export class A2aTaskService {
       const marker = remoteMarkerOf(task);
       if (!marker) continue;
       const ended = (TERMINAL_STATES as readonly string[]).includes(task.status.state);
-      const taskWork = marker.direction === 'inbound' && marker.delivered !== true && !marker.held && !ended;
-      const itemWork = (marker.inbox ?? []).some((i) => i.delivered !== true && !i.held);
+      // `brain-unavailable` waits for Moa, not for a person: main retries it
+      // as soon as Moa can take it, so it stays listed here.
+      const open = (held: string | undefined): boolean => !held || held === 'brain-unavailable';
+      const taskWork = marker.direction === 'inbound' && marker.delivered !== true && open(marker.held) && !ended;
+      const itemWork = (marker.inbox ?? []).some((i) => i.delivered !== true && open(i.held));
       if (taskWork || itemWork) out.push(task);
     }
     return out;
@@ -1183,4 +1214,9 @@ function firstMessageText(history: Message[]): string {
   return first.parts
     .map((p) => (p && p.kind === 'text' && typeof p.text === 'string' ? p.text : ''))
     .join('');
+}
+
+/** delivered < read: a receipt only ever moves forward. */
+function receiptRank(r: A2aRemoteReceipt | undefined): number {
+  return r === 'read' ? 2 : r === 'delivered' ? 1 : 0;
 }

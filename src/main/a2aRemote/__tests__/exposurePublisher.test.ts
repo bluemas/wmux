@@ -200,6 +200,23 @@ describe('A2aExposurePublisher Moa blips', () => {
     expect(gone).toEqual([]);
   });
 
+  it('a cold start (Moa not read yet) keeps a live Moa link, and breaks it only once Moa is off', async () => {
+    const { pub, gone } = rig();
+    const live: A2aLinkRecordV1 = {
+      v: 1, linkId: 'l1', version: 2, state: 'active', local: { kind: 'brain', workspaceId: 'hq' },
+      remote: { hostId: 'h', kind: 'brain', workspaceId: 'r' },
+      allow: { outbound: true, inbound: true }, proposer: 'local', createdAt: '', updatedAt: '',
+    };
+    // A fresh main process: no earlier snapshot, the daemon still holds the link.
+    (pub as unknown as { deps: { client: () => { a2aRemoteLinksList: () => Promise<unknown> } } }).deps.client().a2aRemoteLinksList = async () => ({ links: [live] });
+    await pub.accept(tree('unknown'));
+    expect(gone).toEqual([]);
+    await pub.accept(tree('present'));
+    expect(gone).toEqual([]);
+    await pub.accept(tree('off'));
+    expect(gone).toEqual([{ workspaceId: 'hq', reason: 'workspace-gone', endpoint: 'brain' }]);
+  });
+
   it('gives Moa up after the grace, and at once when it is turned off', async () => {
     const a = rig();
     await a.pub.accept(tree('present'));

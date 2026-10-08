@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { moaRemoteTasks } from '../a2aRemoteDelivery';
+import { summarizeTask } from '../a2aTaskQueryView';
 import {
   a2aEndpointAlias,
   isAllowedEndpointPair,
@@ -137,3 +139,36 @@ describe('link end kinds (Moa)', () => {
     expect(a2aEndpointAlias('DESK', { kind: 'pane', workspaceId: 'w', paneId: 'p', workspaceName: 'API', label: 'w1-1' })).toBe('DESK/API/w1-1');
   });
 });
+
+describe('moaRemoteTasks', () => {
+  const id = (n: number): string => `rt-${String(n).padStart(32, '0')}`;
+  it('keeps Moa-to-Moa tasks only, with direction and PC, newest first', () => {
+    const rows = moaRemoteTasks([
+      { id: id(1), state: 'working', title: 'a', from: 'Moa', to: 'PC2/Moa', updatedAt: '2026-10-08T01:00:00.000Z' },
+      { id: id(2), state: 'submitted', title: 'b', from: 'PC3/Moa', to: 'Moa', updatedAt: '2026-10-08T02:00:00.000Z' },
+      // A remote pane task, even into a workspace named Moa, is not one.
+      { id: id(3), state: 'working', title: 'c', from: 'PC2/ws/Moa', to: 'Moa' },
+      { id: 'task-local', state: 'working', title: 'd', from: 'Moa', to: 'PC2/Moa' },
+    ]);
+    expect(rows).toEqual([
+      { taskId: id(2), title: 'b', state: 'submitted', direction: 'received', host: 'PC3', updatedAt: '2026-10-08T02:00:00.000Z' },
+      { taskId: id(1), title: 'a', state: 'working', direction: 'sent', host: 'PC2', updatedAt: '2026-10-08T01:00:00.000Z' },
+    ]);
+  });
+});
+
+describe('receipts in summaries', () => {
+  const id = `rt-${'a'.repeat(32)}`;
+  const task = (remote: Record<string, unknown>) => ({
+    id, status: { state: 'submitted' }, history: [],
+    metadata: { title: 't', from: { name: 'Moa' }, to: { name: 'PC2/Moa' }, remote },
+  });
+  it('a2a_task_query summaries carry how far the peer got; the Moa panel shows it for sent tasks', () => {
+    expect(summarizeTask(task({ direction: 'outbound' }))).not.toHaveProperty('remoteReceipt');
+    expect(summarizeTask(task({ remoteDeliveredAt: 'x' }))).toMatchObject({ remoteReceipt: 'delivered' });
+    const read = summarizeTask(task({ remoteDeliveredAt: 'x', remoteReadAt: 'y' }));
+    expect(read).toMatchObject({ remoteReceipt: 'read' });
+    expect(moaRemoteTasks([read])).toMatchObject([{ direction: 'sent', receipt: 'read' }]);
+  });
+});
+

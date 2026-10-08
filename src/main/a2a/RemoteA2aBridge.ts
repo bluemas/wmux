@@ -3,6 +3,10 @@ import {
   A2A_REMOTE_INBOUND_EVENT,
   A2A_REMOTE_NOTIFY_METHOD,
   A2A_REMOTE_RPC,
+  BRAIN_UNAVAILABLE,
+  canonicalPcName,
+  isBrainRemoteTask,
+  localSideOf,
   type A2aRemoteDeliveryResult,
   type A2aRemoteHeldReason,
   type A2aRemoteInboxItem,
@@ -10,6 +14,8 @@ import {
 } from '../../shared/a2aRemoteDelivery';
 import { GATED_DELIVERY_DEADLINE_MARGIN_MS, GATED_NEW_TASK_SEND_MAIN_TIMEOUT_MS } from '../../shared/freshContext';
 import { TERMINAL_STATES, type Task } from '../../shared/types';
+import { eventBus, type EmitInput } from '../events/EventBus';
+import { brainCanReceive, onBrainReceiverChanged } from './brainReceiver';
 
 /**
  * Cross-host A2A, receiving side in main: hand the remote work the daemon
@@ -32,6 +38,12 @@ import { TERMINAL_STATES, type Task } from '../../shared/types';
  * its own, never by re-delivering), and the renderer answers `duplicate` for a
  * task it already delivered.
  *
+ * A task on a brain link (this PC's Moa, which owns no pane) never reaches the
+ * renderer: its delivery is an event on main's bus that wakes Moa through the
+ * commander coalescer (`deliverToBrain`). Only while Moa can take it: until
+ * then it is held as `brain-unavailable` (still listed as pending) and goes
+ * out when the deck says Moa's state changed, or on the next pull.
+ *
  * This is a main-internal call straight to the renderer, NOT through the pipe
  * router: no operator origin is stamped, so the renderer's approval gate
  * applies. LanLink's RemoteInboxBridge is deliberately not reused — it avoids
@@ -53,6 +65,12 @@ export interface RemoteA2aBridgeDeps {
   sendToRenderer: (method: string, params: Record<string, unknown>, opts?: { timeoutMs?: number }) => Promise<unknown>;
   /** Subscribe to daemon broadcasts; returns an unsubscribe. */
   onDaemonEvent: (listener: (event: { type?: unknown; [key: string]: unknown }) => void) => () => void;
+  /** Main's event bus emit, for brain-link work (default: the `eventBus` singleton). */
+  emitEvent?: (input: EmitInput) => void;
+  /** Can this PC's Moa (HQ `workspaceId`) take work now? Default: the deck's answer (brainReceiver.ts). */
+  brainReady?: (hqWorkspaceId: string) => boolean;
+  /** Subscribe to changes of that answer. Default: brainReceiver.ts. */
+  onBrainReadyChanged?: (listener: () => void) => () => void;
   backstopMs?: number;
   now?: () => number;
   log?: (level: 'info' | 'warn', msg: string) => void;
@@ -84,11 +102,18 @@ export class RemoteA2aBridge {
   /** A mark the daemon did not take yet: retried before anything else, never re-delivered. */
   private readonly pendingMarks = new Map<string, { taskId: string; messageId?: string; mark: Mark }>();
   private readonly retry = new Map<string, { at: number; delayMs: number }>();
+  /** Brain-link work held because Moa could not take it. */
+  private readonly brainWaiting = new Set<string>();
   /** Consecutive "written nowhere" answers per unit (no agent in the pane). */
   private readonly misses = new Map<string, { count: number; since: number }>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private unsubscribe: (() => void) | null = null;
+  private unsubscribeBrain: (() => void) | null = null;
   private running: Promise<void> | null = null;
+  /** Set by stop(): no new pull or delivery starts. */
+  private stopped = false;
+  /** Deliveries started by a pull, still running. */
+  private readonly working = new Set<Promise<unknown>>();
   private rerun = false;
 
   constructor(deps: RemoteA2aBridgeDeps) {
@@ -98,18 +123,33 @@ export class RemoteA2aBridge {
 
   start(): void {
     if (this.timer) return;
+    this.stopped = false;
     this.unsubscribe = this.deps.onDaemonEvent((event) => {
       if (event?.type === A2A_REMOTE_INBOUND_EVENT) void this.trigger();
+    });
+    // Moa came up (or its HQ did): what was held for it goes now.
+    this.unsubscribeBrain = (this.deps.onBrainReadyChanged ?? onBrainReceiverChanged)(() => {
+      for (const key of [...this.retry.keys()]) if (this.brainWaiting.has(key)) this.retry.delete(key);
+      void this.trigger();
     });
     this.timer = setInterval(() => void this.trigger(), this.deps.backstopMs ?? REMOTE_BRIDGE_BACKSTOP_MS);
     void this.trigger();
   }
 
   stop(): void {
+    this.stopped = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
     this.unsubscribe?.();
     this.unsubscribe = null;
+    this.unsubscribeBrain?.();
+    this.unsubscribeBrain = null;
+  }
+
+  /** Resolves once the pull and the deliveries already started have finished (after stop()). */
+  async whenIdle(): Promise<void> {
+    await this.running?.catch(() => undefined);
+    await Promise.allSettled([...this.working]);
   }
 
   /** The daemon connection (re)opened: pull at once. */
@@ -175,6 +215,7 @@ export class RemoteA2aBridge {
   }
 
   private async pullOnce(): Promise<void> {
+    if (this.stopped) return;
     let res: unknown;
     try {
       res = await this.deps.daemonRpc(A2A_REMOTE_RPC.pending, {});
@@ -188,6 +229,7 @@ export class RemoteA2aBridge {
     const listed = new Set(work.map((w) => w.key));
     for (const key of this.retry.keys()) if (!listed.has(key)) this.retry.delete(key);
     for (const key of this.pendingMarks.keys()) if (!listed.has(key)) this.pendingMarks.delete(key);
+    for (const key of this.brainWaiting) if (!listed.has(key)) this.brainWaiting.delete(key);
     for (const key of this.misses.keys()) if (!listed.has(key)) this.misses.delete(key);
     for (const unit of work) {
       if (this.inFlight.has(unit.key)) continue;
@@ -207,15 +249,29 @@ export class RemoteA2aBridge {
       }
       const wait = this.retry.get(unit.key);
       if (wait && wait.at > this.now()) continue;
+      if (this.stopped) break;
       this.inFlight.add(unit.key);
-      void this.deliver(unit, false).finally(() => this.inFlight.delete(unit.key));
+      const run = this.deliver(unit, false).finally(() => {
+        this.inFlight.delete(unit.key);
+        this.working.delete(run);
+      });
+      this.working.add(run);
     }
   }
 
   /** Hand one unit to the renderer and record the outcome. */
   private async deliver(unit: Work, resnapshot: boolean): Promise<RetryHeldResult['results'][number]['outcome']> {
+    if (isBrainRemoteTask(unit.task)) return this.deliverToBrain(unit);
     const { task, item } = unit;
     const marker = task.metadata.remote as A2aRemoteTaskState;
+    // A pane task always names its local pane; one that does not is held, never guessed.
+    if (!task.metadata[localSideOf(task)].paneId) {
+      this.backoff(unit.key);
+      if ((item ? item.held : marker.held) !== 'pane-missing') {
+        await this.mark(unit.key, { taskId: task.id, ...(item ? { messageId: item.messageId } : {}), mark: { held: 'pane-missing' } });
+      }
+      return 'pane-missing';
+    }
     const ref = { taskId: task.id, ...(item ? { messageId: item.messageId } : {}) };
     // Durable BEFORE the write: if main dies after the paste, the daemon knows
     // a paste may have happened and the unit is not pasted again on its own.
@@ -275,6 +331,50 @@ export class RemoteA2aBridge {
     return 'not-delivered';
   }
 
+  /**
+   * Brain-link work: announce it on main's bus, then mark it delivered. A new
+   * task, a reply, or a state change on a task the other PC's Moa sent is an
+   * `a2a.received` (a wake-worthy kind of its own); a state change on a task
+   * this Moa sent is the ordinary `a2a.task` receipt, so the existing
+   * completed / failed / input-required / canceled wakes apply unchanged.
+   * Pointer-only: Moa reads the body with a2a_task_query.
+   */
+  private async deliverToBrain(unit: Work): Promise<'delivered' | 'not-delivered' | typeof BRAIN_UNAVAILABLE> {
+    const { task, item } = unit;
+    const side = localSideOf(task);
+    const hq = task.metadata[side].workspaceId;
+    const peer = task.metadata[side === 'from' ? 'to' : 'from'];
+    const state = task.status.state;
+    const ref = { taskId: task.id, ...(item ? { messageId: item.messageId } : {}) };
+    // Moa off, no HQ, another HQ, or the wake runtime not up: nobody would
+    // see the event. Hold it (once) instead of marking it delivered.
+    if (!(this.deps.brainReady ?? brainCanReceive)(hq)) {
+      this.brainWaiting.add(unit.key);
+      this.backoff(unit.key);
+      const current = item ? item.held : (task.metadata.remote as A2aRemoteTaskState).held;
+      if (current !== BRAIN_UNAVAILABLE) await this.mark(unit.key, { ...ref, mark: { held: BRAIN_UNAVAILABLE } });
+      return BRAIN_UNAVAILABLE;
+    }
+    this.brainWaiting.delete(unit.key);
+    try {
+      const emit = this.deps.emitEvent ?? ((input: EmitInput): void => void eventBus.emit(input));
+      if (item?.kind === 'state' && side === 'from') {
+        emit({ type: 'a2a.task', workspaceId: hq, from: hq, to: peer.workspaceId, taskId: task.id, kind: state === 'canceled' ? 'cancelled' : 'updated', state });
+      } else {
+        // The peer names itself: only a host-name token of it travels on.
+        const host = canonicalPcName(peer.name.split('/')[0]);
+        emit({ type: 'a2a.received', workspaceId: hq, taskId: task.id, from: `${host}/Moa`, to: hq, item: item?.kind ?? 'task', state, host });
+      }
+    } catch (err) {
+      this.backoff(unit.key);
+      this.deps.log?.('warn', `[a2a-remote] could not announce ${unit.key} to Moa: ${err instanceof Error ? err.message : String(err)}`);
+      return 'not-delivered';
+    }
+    this.retry.delete(unit.key);
+    await this.mark(unit.key, { ...ref, mark: { delivered: true } });
+    return 'delivered';
+  }
+
   private taskParams(task: Task, marker: A2aRemoteTaskState, resnapshot: boolean): Record<string, unknown> {
     const first = task.history[0]?.parts.find((p) => p.kind === 'text');
     return {
@@ -330,9 +430,11 @@ function workOf(task: Task): Work[] {
   const ended = (TERMINAL_STATES as readonly string[]).includes(task.status.state);
   const out: Work[] = [];
   const taskOwed = marker.direction === 'inbound' && marker.delivered !== true;
-  if (taskOwed && !marker.held && !ended) out.push({ key: task.id, task });
+  // `brain-unavailable` waits only for Moa: retried on every pull.
+  const open = (held: string | undefined): boolean => !held || held === BRAIN_UNAVAILABLE;
+  if (taskOwed && open(marker.held) && !ended) out.push({ key: task.id, task });
   for (const item of marker.inbox ?? []) {
-    if (item.delivered === true || item.held) continue;
+    if (item.delivered === true || !open(item.held)) continue;
     // A reply into an inbound task waits until the task itself is in the pane.
     if (item.kind === 'reply' && taskOwed) continue;
     out.push({ key: itemKey(task.id, item.messageId), task, item });

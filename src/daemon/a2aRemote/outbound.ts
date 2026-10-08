@@ -4,6 +4,7 @@ import {
   A2A_REMOTE_BODY_MAX,
   A2A_REMOTE_PROTOCOL,
   type A2aLinkRecordV1,
+  type A2aRemoteReceipt,
   type A2aRemoteEnvelope,
   type A2aRemoteTaskMarkerV1,
 } from '../../shared/a2aRemote';
@@ -85,7 +86,8 @@ export function listRemoteTargets(deps: Pick<OutboundDeps, 'linkStore' | 'aliasF
       alias: deps.aliasFor(l),
       linkId: l.linkId,
       hostId: l.remote.hostId,
-      local: { ...l.local },
+      kind: l.local.kind,
+      local: { workspaceId: l.local.workspaceId, ...(l.local.paneId ? { paneId: l.local.paneId } : {}) },
       remote: {
         workspaceId: l.remote.workspaceId,
         ...(l.remote.paneId ? { paneId: l.remote.paneId } : {}),
@@ -104,7 +106,12 @@ export function listRemoteTargets(deps: Pick<OutboundDeps, 'linkStore' | 'aliasF
 export async function sendRemoteTask(deps: OutboundDeps, input: A2aRemoteSendTaskInput): Promise<OutboundResult> {
   const link = deps.linkStore.get(input.linkId);
   if (!link) return { ok: false, error: 'unknown-link' };
-  if (link.local.workspaceId !== input.from.workspaceId || link.local.paneId !== input.from.paneId) {
+  if (link.local.kind === 'brain') {
+    // Moa sends as its HQ workspace; main proved it from the commander token.
+    if (link.local.workspaceId !== input.from.workspaceId || input.from.paneId !== undefined) {
+      return { ok: false, error: 'forbidden: only this PC\'s Moa may send on this link' };
+    }
+  } else if (!input.from.paneId || link.local.workspaceId !== input.from.workspaceId || link.local.paneId !== input.from.paneId) {
     return { ok: false, error: 'forbidden: only the linked local pane may send on this link' };
   }
   const check = deps.linkStore.checkMessage(link.linkId, link.version, link.remote.hostId, 'outbound', 'task');
@@ -114,7 +121,7 @@ export async function sendRemoteTask(deps: OutboundDeps, input: A2aRemoteSendTas
 
   const messageId = mint(deps);
   const taskId = remoteTaskId(link.linkId, messageId);
-  const marker: A2aRemoteTaskMarkerV1 = { v: 1, linkId: link.linkId, hostId: link.remote.hostId, messageId, direction: 'outbound' };
+  const marker: A2aRemoteTaskMarkerV1 = { v: 1, linkId: link.linkId, hostId: link.remote.hostId, messageId, direction: 'outbound', kind: link.local.kind };
   const created = await deps.taskService.createTask({
     id: taskId,
     title: input.title || input.text.slice(0, 100),
@@ -193,6 +200,11 @@ const SYNCED_STATES: ReadonlySet<string> = new Set(['working', 'input-required',
  * The state message id is derived from the ledger transition (task, state,
  * time), so queueing the same committed state twice is one message to the peer.
  */
+/** One receipt per (task, kind): a resend after a crash is the same message. */
+export function receiptMessageId(taskId: string, receipt: A2aRemoteReceipt): string {
+  return `rc-${crypto.createHash('sha256').update(`${taskId}\0${receipt}`).digest('hex').slice(0, 32)}`;
+}
+
 export function stateMessageId(task: Pick<Task, 'id' | 'status'>): string {
   const h = crypto.createHash('sha256').update(`${task.id}\0${task.status.state}\0${task.status.timestamp}`).digest('hex');
   return `st-${h.slice(0, 32)}`;
@@ -227,6 +239,13 @@ export async function syncRemoteTask(
       deps.outbox.enqueue(link.remote.hostId, envelope(deps, link, m.messageId, { kind: 'reply', taskId: task.id, text }));
       // eslint-disable-next-line no-await-in-loop -- recorded in order
       await deps.taskService.markRemote({ taskId: task.id, sent: m.messageId });
+      queued += 1;
+    }
+    // Inbound: tell the sender how far we got (handed over, then read).
+    const receipt = marker.direction === 'inbound' ? (marker.readAt ? 'read' : marker.delivered === true ? 'delivered' : undefined) : undefined;
+    if (receipt && marker.receiptSync !== receipt && marker.receiptSync !== 'read') {
+      deps.outbox.enqueue(link.remote.hostId, envelope(deps, link, receiptMessageId(task.id, receipt), { kind: 'receipt', taskId: task.id, receipt }));
+      await deps.taskService.markRemote({ taskId: task.id, receiptSync: receipt });
       queued += 1;
     }
     const state = task.status.state;
@@ -270,7 +289,7 @@ function envelope(
   deps: Pick<OutboundDeps, 'now'>,
   link: A2aLinkRecordV1,
   messageId: string,
-  body: Pick<A2aRemoteEnvelope, 'kind' | 'taskId' | 'text' | 'state'>,
+  body: Pick<A2aRemoteEnvelope, 'kind' | 'taskId' | 'text' | 'state' | 'receipt'>,
 ): A2aRemoteEnvelope {
   return {
     protocol: A2A_REMOTE_PROTOCOL,

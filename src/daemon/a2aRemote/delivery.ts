@@ -67,7 +67,7 @@ export interface A2aRemoteDeliveryDeps {
 const SYNC_MS = 5_000;
 const MAINTENANCE_MS = 60_000;
 const HELD_REASONS: ReadonlySet<string> = new Set<A2aRemoteHeldReason>([
-  'occupant-changed', 'pane-missing', 'link-not-active', 'brain-delivery-pending', 'delivery-unconfirmed', 'no-agent',
+  'occupant-changed', 'pane-missing', 'link-not-active', 'brain-delivery-pending', 'brain-unavailable', 'delivery-unconfirmed', 'no-agent',
 ]);
 /** What the sender's ledger shows while our pane has no agent to take its task. */
 export const NO_AGENT_SUMMARY = 'The linked pane on the receiving PC has no agent running; the task is held until someone there acts.';
@@ -171,6 +171,8 @@ export class A2aRemoteDelivery {
     const sessions = [...this.sessions.values()];
     this.sessions.clear();
     await Promise.all(sessions.map((s) => s.session.stop()));
+    // Leave no handle on the outbox file (or its folder) once stopped.
+    await this.outbox.idle();
   }
 
   /** One session per joined server; restarted when its address, port or pin changes. */
@@ -260,22 +262,40 @@ export class A2aRemoteDelivery {
         ...(typeof p['ptyId'] === 'string' && isSafeId(p['ptyId']) ? { ptyId: p['ptyId'] } : {}),
       });
       if (res.ok && held === 'no-agent' && messageId === undefined) await this.noAgent(taskId);
+      // Handed over: the sender gets a `delivered` receipt.
+      if (res.ok && p['delivered'] === true && messageId === undefined) await this.syncTask(taskId);
       return res.ok ? { ok: true } : res;
+    });
+
+    onRpc(A2A_REMOTE_RPC.read, async (p) => {
+      const taskId = str(p, 'taskId');
+      const task = taskId ? svc.getTask(taskId) : undefined;
+      const marker = task?.metadata.remote as { direction?: string } | undefined;
+      // Only the receiving side of an inbound task reads it.
+      if (!task || marker?.direction !== 'inbound' || task.metadata.to.workspaceId !== str(p, 'workspaceId')) {
+        return { ok: false, error: 'forbidden: not an inbound remote task of this workspace' };
+      }
+      const res = await svc.markRemote({ taskId, read: true });
+      if (!res.ok) return res;
+      await this.syncTask(taskId);
+      return { ok: true };
     });
 
     onRpc(A2A_REMOTE_RPC.targets, async () => ({ targets: listRemoteTargets({ linkStore: this.deps.links, aliasFor: (l) => this.aliasFor(l) }) }));
 
     onRpc(A2A_REMOTE_RPC.sendTask, async (p) => {
       const from = isPlainObject(p['from']) ? p['from'] : null;
-      if (!from || typeof from['workspaceId'] !== 'string' || typeof from['paneId'] !== 'string' || typeof p['text'] !== 'string') {
-        return { ok: false, error: 'bad-request: linkId, from{workspaceId, paneId} and text are required' };
+      // A pane sender names its pane; Moa (a brain link) has none. sendRemoteTask
+      // checks it against the link's local end.
+      if (!from || typeof from['workspaceId'] !== 'string' || (from['paneId'] !== undefined && typeof from['paneId'] !== 'string') || typeof p['text'] !== 'string') {
+        return { ok: false, error: 'bad-request: linkId, from{workspaceId, paneId?} and text are required' };
       }
       return sendRemoteTask(this.outboundDeps(), {
         linkId: str(p, 'linkId'),
         from: {
           workspaceId: from['workspaceId'],
           name: typeof from['name'] === 'string' ? from['name'] : from['workspaceId'],
-          paneId: from['paneId'],
+          ...(typeof from['paneId'] === 'string' ? { paneId: from['paneId'] } : {}),
           ...(typeof from['ptyId'] === 'string' ? { ptyId: from['ptyId'] } : {}),
         },
         title: str(p, 'title'),

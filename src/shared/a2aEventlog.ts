@@ -14,7 +14,7 @@
  */
 
 import type { Task, TaskState, Message, CompletionEvidence } from './types';
-import type { A2aRemoteTaskMarkerV1 } from './a2aRemote';
+import type { A2aRemoteReceipt, A2aRemoteTaskMarkerV1 } from './a2aRemote';
 
 /**
  * A2A 로그 payload 판별 union. kind가 닫힌 enum이라 projection이 미지 kind를
@@ -123,6 +123,12 @@ export interface A2aRemoteMarkPayload {
   stateSync?: TaskState;
   /** Task-level: this reply of ours was queued for the peer. */
   sent?: string;
+  /** Task-level, inbound: our side read the task now. */
+  read?: true;
+  /** Task-level, inbound: this receipt was queued for the peer. */
+  receiptSync?: A2aRemoteReceipt;
+  /** Task-level, outbound: the peer sent this receipt. */
+  remoteReceipt?: A2aRemoteReceipt;
   timestamp: string;
 }
 
