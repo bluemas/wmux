@@ -117,6 +117,7 @@ import { GateFlagFile } from './gateFlagFile';
 import { WSL_GATE_FLAG_FILE } from '../shared/wslIntegration';
 import { CommandStartAgentProbe } from './commandStartAgentProbe';
 import { resolveCanonicalAgentIdentity, detectorSuppressedBy, reportedAgentName, provesLiveAgent, type CanonicalAgentIdentity } from './canonicalAgent';
+import { decideLaunchPresence, launchPresenceNeedsProcessRead, type IdleShellRead } from './launchPresence';
 import { Watchdog } from './Watchdog';
 import { selectRecoverableSessions } from './recoverySelector';
 import { isShutdownKillExit, SHUTDOWN_KILL_RECLASSIFY_MS } from './shutdownKill';
@@ -4647,6 +4648,35 @@ function registerRpcHandlers(
     const id = typeof params['id'] === 'string' ? params['id'] : '';
     return readDaemonAgentState(id);
   });
+  // #1919 / #1933 — the fan-out launch check: did the agent start in this
+  // pane? `absent` only on positive evidence (see launchPresence.ts). The
+  // process table is read only when `probeProcess` is set — the check polls
+  // cheaply and asks for the read once, after its bound — and only when no
+  // cheaper signal already decided.
+  pipeServer.onRpc('daemon.getLaunchPresence', async (params) => {
+    const id = typeof params['id'] === 'string' ? params['id'] : '';
+    const session = id ? sessionManager.getSession(id) : undefined;
+    const inputs = {
+      sessionExists: !!session,
+      agentName: readDaemonAgentState(id).agentName ?? null,
+      trackerAlive: agentProcessTracker.statusFor(id),
+      commandRunning: session?.promptLog.commandRunningIfKnown(),
+      isExec: !!session?.meta.exec,
+      isWsl: !!session?.meta.wslTarget,
+    };
+    let idleShell: IdleShellRead | undefined;
+    if (session && params['probeProcess'] === true && launchPresenceNeedsProcessRead(inputs)) {
+      try {
+        idleShell = await agentProcessTracker.idleShellState(session.meta.pid, session.meta.env, true);
+      } catch {
+        idleShell = 'error';
+      }
+    }
+    return {
+      ...decideLaunchPresence({ ...inputs, idleShell }),
+      incarnationId: session?.meta.incarnationId ?? null,
+    };
+  });
   pipeServer.onRpc('daemon.getAgentState', async (params) => {
     const id = typeof params['id'] === 'string' ? params['id'] : '';
     const state = readDaemonAgentState(id);
@@ -7602,6 +7632,11 @@ async function main(): Promise<void> {
     // this service, so the closure reads the binding at sweep time and treats
     // "not built yet / log unavailable" as "nothing anchored".
     isChannelRetained: (channelId) => workTaskService?.hasOpenTaskForChannel(channelId) === true,
+    // #1920 — a fan-out worker may join its own mission channel. Late-bound
+    // for the same reason as the anchor above; before WorkTaskService is up
+    // (or on a legacy boot) nobody holds such a seat.
+    isMissionTaskSeat: (channelId, workspaceId) =>
+      workTaskService?.isMissionTaskSeat(channelId, workspaceId) === true,
     emit: (event) => {
       // Wrap the ChannelMessageEvent in the canonical DaemonEvent envelope
       // before broadcasting on the control pipe. The helper lives in
