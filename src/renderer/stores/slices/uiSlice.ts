@@ -117,6 +117,7 @@ import {
   type PrefixConfig,
   type NotificationCategory,
   type AgentStatus,
+  type FleetLayout,
   BUILTIN_TEMPLATES,
   DEFAULT_PREFIX_CONFIG,
   buildDefaultCustomKeybindings,
@@ -253,6 +254,10 @@ export interface UISlice {
   // app restart (cross-session persistence is a deliberate follow-up).
   fleetSortMode: FleetSortMode;
   setFleetSortMode: (mode: FleetSortMode) => void;
+  // The Fleet page's layout: the attention list (default) or the same rows as
+  // a four-column board. Saved with the session (buildSessionData).
+  fleetLayout: FleetLayout;
+  setFleetLayout: (layout: FleetLayout) => void;
 
 
   // Fleet attention board — whether the Idle section shows its rows or stays
@@ -1221,6 +1226,12 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
 
   setFleetSortMode: (mode) => set((state) => {
     state.fleetSortMode = mode;
+  }),
+
+  fleetLayout: 'list',
+
+  setFleetLayout: (layout) => set((state) => {
+    state.fleetLayout = layout;
   }),
 
   fleetIdleExpanded: false,
