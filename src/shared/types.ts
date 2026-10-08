@@ -786,6 +786,9 @@ export interface ArchivedWorkspace {
   archivedAt: number;        // epoch ms, for the "3d ago" trailer
 }
 
+/** The Fleet page's layout: the attention list, or the same rows as a four-column board. */
+export type FleetLayout = 'list' | 'board';
+
 export interface SessionData {
   workspaces: Workspace[];
   activeWorkspaceId: string;
@@ -980,6 +983,8 @@ export interface SessionData {
   usageLimitAutoResume?: boolean;
   /** #1826 — type the resume line into Claude Code panes recovered at app start. Opt-in. */
   claudeResumeOnStart?: boolean;
+  /** How the Fleet page lays out its agents: one list (default) or a four-column board. */
+  fleetLayout?: FleetLayout;
   /** Categories whose surface actions are suppressed (#516). */
   mutedNotificationCategories?: NotificationCategory[];
   customKeybindings?: CustomKeybinding[];

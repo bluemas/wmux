@@ -117,6 +117,7 @@ export const SETTINGS_CATALOG: SettingsCatalogEntry[] = [
   { id: 'sidebarpanecoordinates', tab: 'appearance', labelKey: 'settings.sidebarShowPaneCoordinates', descKey: 'settings.sidebarShowPaneCoordinatesDesc', synonyms: 'roster coordinate w1-2 pane name label unnamed clutter agent' },
   { id: 'attentionblink', tab: 'appearance', labelKey: 'settings.attentionBlink', descKey: 'settings.attentionBlinkDesc', synonyms: 'blink pulse flash animate needs you waiting question approval remind 깜빡임 알림' },
   { id: 'attentionblinkfinished', tab: 'appearance', labelKey: 'settings.attentionBlinkFinished', descKey: 'settings.attentionBlinkFinishedDesc', synonyms: 'finished done dot turn complete pulse 완료 점' },
+  { id: 'fleetlayout', tab: 'appearance', labelKey: 'settings.fleetLayout', descKey: 'settings.fleetLayoutDesc', synonyms: 'fleet board kanban columns list layout view 보드 칸반 목록 레이아웃' },
   { id: 'workspacesettleidle', tab: 'appearance', labelKey: 'settings.workspaceSettleIdleDays', descKey: 'settings.workspaceSettleIdleDaysDesc', synonyms: 'settle settled idle days finished snooze hide quiet sidebar 마무리 미뤄두기 유휴' },
   { id: 'multiview', tab: 'appearance', labelKey: 'settings.multiviewArrangement', descKey: 'settings.multiviewArrangementDesc', synonyms: 'grid split stack columns rows' },
   { id: 'uiscale', tab: 'appearance', labelKey: 'settings.uiScale', descKey: 'settings.uiScaleDesc', synonyms: 'zoom dpi accessibility scale 배율' },

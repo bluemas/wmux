@@ -1015,6 +1015,33 @@ details[open] > .wmux-chatv2-tool-line .wmux-chatv2-chevron { transform: rotate(
 /* The dot carries the state; the label stays neutral. */
 .wmux-board .wmux-fleet-filters button[data-filter] { color: var(--text-sub); }
 .wmux-board .wmux-fleet-filters button[data-filter]:hover, .wmux-board .wmux-fleet-filters button[data-filter][aria-pressed="true"] { color: var(--text-main); }
+/* The Board layout: the list's rows as cards in four columns. A card is a
+ * fill (--selection-subtle at rest), never a box or a stripe; colour stays on
+ * the status dot. Status and verb share the first line, the side buttons sit
+ * at its right end, and the name and now-doing line take the full width. */
+.wmux-board .wmux-fleet-board { flex: 1; min-height: 0; display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); grid-auto-rows: minmax(0, 1fr); gap: 12px; padding: 0 20px 12px; }
+.wmux-fleet-board-col { display: flex; flex-direction: column; gap: 6px; min-width: 0; min-height: 0; }
+.wmux-fleet-board-head { display: flex; align-items: center; gap: 7px; min-height: 26px; padding: 0 2px; font-size: 12px; font-weight: 500; color: var(--text-sub); }
+.wmux-fleet-board-cards { display: flex; flex-direction: column; gap: 6px; min-height: 0; overflow-y: auto; }
+.wmux-board .wmux-fleet-board .wmux-fleet-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 4px 8px; min-height: 0; padding: 10px 12px; border-radius: 10px; background: var(--selection-subtle); }
+.wmux-board .wmux-fleet-board .wmux-fleet-card:hover { background: var(--selection); }
+.wmux-board .wmux-fleet-board .wmux-fleet-card[aria-selected="true"] { background: var(--selection-hover); }
+.wmux-fleet-board .wmux-fleet-status { grid-column: 1; grid-row: 1; min-width: 0; overflow: hidden; }
+.wmux-fleet-board .wmux-fleet-status > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wmux-fleet-board .wmux-fleet-action { grid-column: 2; grid-row: 1; margin-right: 52px; }
+/* grid-row: auto keeps the list's narrow-panel placement (max-width: 580px)
+ * from pulling the name onto the status line. */
+.wmux-fleet-board .wmux-fleet-identity, .wmux-fleet-board .wmux-fleet-progress { grid-column: 1 / -1; grid-row: auto; }
+.wmux-fleet-board .wmux-fleet-row > .wmux-fleet-row-trigger, .wmux-fleet-board .wmux-fleet-row > .wmux-fleet-row-detail { top: 6px; transform: none; }
+@container (max-width: 760px) {
+  /* Stacked columns grow to their cards and the board scrolls; an auto row
+   * would shrink to the board's height and let the columns overlap. */
+  .wmux-board .wmux-fleet-board { grid-auto-flow: row; grid-template-columns: repeat(2, minmax(0, 1fr)); grid-auto-rows: max-content; overflow-y: auto; }
+  .wmux-fleet-board-cards { overflow: visible; }
+}
+@container (max-width: 420px) {
+  .wmux-board .wmux-fleet-board { grid-template-columns: minmax(0, 1fr); }
+}
 /* A ticket's detail: the request, decisions waiting, the result. */
 .wmux-fleet-ticket-detail { min-width: 0; max-height: 320px; overflow-y: auto; padding: 10px 14px; border-radius: 10px; background: var(--bg-mantle); font-size: 13px; color: var(--text-main); }
 .wmux-fleet-ticket-head { display: flex; align-items: center; gap: 12px; min-width: 0; font-size: 12px; color: var(--text-sub); }

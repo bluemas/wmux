@@ -3582,6 +3582,8 @@ function TabAppearance() {
   const attentionBlinkFinished = useStore((s) => s.attentionBlinkFinished);
   const setAttentionBlinkFinished = useStore((s) => s.setAttentionBlinkFinished);
   const workspaceSettleIdleDays = useStore((s) => s.workspaceSettle.idleDays);
+  const fleetLayout = useStore((s) => s.fleetLayout);
+  const setFleetLayout = useStore((s) => s.setFleetLayout);
   const setSidebarPosition = useStore((s) => s.setSidebarPosition);
   const multiviewArrangement = useStore((s) => s.multiviewArrangement);
   const setMultiviewArrangement = useStore((s) => s.setMultiviewArrangement);
@@ -3774,6 +3776,17 @@ function TabAppearance() {
             options={[
               { value: 'dot', label: t('settings.attentionBlinkFinishedDot') },
               { value: 'pulse', label: t('settings.attentionBlinkFinishedPulse') },
+            ]}
+          />
+        </SettingRow>
+        {/* The same choice as the List | Board switch in the Fleet header. */}
+        <SettingRow id="fleetlayout" label={t('settings.fleetLayout')} description={t('settings.fleetLayoutDesc')}>
+          <SegmentedControl
+            value={fleetLayout}
+            onValueChange={setFleetLayout}
+            options={[
+              { value: 'list', label: t('fleet.layout.list') },
+              { value: 'board', label: t('fleet.layout.board') },
             ]}
           />
         </SettingRow>

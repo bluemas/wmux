@@ -450,6 +450,7 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
     anthropicUsageEnabled: state.anthropicUsageEnabled,
     usageLimitAutoResume: state.usageLimitAutoResume,
     claudeResumeOnStart: state.claudeResumeOnStart,
+    fleetLayout: state.fleetLayout,
     mutedNotificationCategories: state.mutedNotificationCategories,
     customKeybindings: state.customKeybindings,
     shortcutOverrides: state.shortcutOverrides,
