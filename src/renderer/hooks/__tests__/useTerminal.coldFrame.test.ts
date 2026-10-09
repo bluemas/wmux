@@ -7,7 +7,9 @@ import path from 'node:path';
 // effect that unit tests cannot mount. The cache and the swap state machine
 // are tested for real in terminal/__tests__/coldFrame.test.ts.
 describe('cold-park reveal — cold frame wiring (source-level)', () => {
-  const src = fs.readFileSync(path.join(__dirname, '..', 'useTerminal.ts'), 'utf-8');
+  // LF only: with core.autocrlf (the Windows default) the checkout is CRLF,
+  // and a `.` in the patterns below does not match the `\r`.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'useTerminal.ts'), 'utf-8').replace(/\r\n/g, '\n');
   const mainStart = src.indexOf('if (!container || !ptyId) return;');
   const mainEnd = src.indexOf('}, [ptyId, containerRef]);', mainStart);
   const mainEffect = src.slice(mainStart, mainEnd);
