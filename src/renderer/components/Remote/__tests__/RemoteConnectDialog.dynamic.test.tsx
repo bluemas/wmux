@@ -9,11 +9,12 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useStore } from '../../../stores';
-import RemoteConnectDialog, { CONNECT_PAIR_POLL_MS, CONNECT_REDEEM_GRACE_TICKS, maskPasted, pastedKind } from '../RemoteConnectDialog';
+import RemoteConnectDialog, { CONNECT_PAIR_POLL_MS, CONNECT_REDEEM_GRACE_TICKS, maskPasted, pastedKind, pastedParts } from '../RemoteConnectDialog';
 import { COPIED_MS } from '../../../hooks/useA2aInvite';
 
 const INVITE = 'wmux-a2a://desk.tail1.ts.net:45660/K7M2QX9P#A7:0D:5E:91';
 const HOST = '11111111-1111-4111-8111-111111111111';
+const LINK = 'https://office.ts.net/pair#wmux-desktop-code=ABCD2345';
 let container: HTMLDivElement;
 let root: Root;
 let a2a: Record<string, ReturnType<typeof vi.fn>>;
@@ -75,6 +76,29 @@ describe('pasted text', () => {
     expect(pastedKind('hello')).toBeNull();
     expect(maskPasted(INVITE)).toBe('wmux-a2a://desk.tail1.ts.net:45660/••••••••#A7:0D:5E:91');
     expect(maskPasted('https://office.ts.net/pair#wmux-desktop-code=ABCD2345')).not.toContain('ABCD2345');
+  });
+
+  it('splits a bundled invite into its lines, but keeps an address and a code on two lines as one', () => {
+    const bundle = `${INVITE}\r\n${LINK}\n`;
+    expect(pastedParts(bundle)).toEqual([INVITE, LINK]);
+    expect(pastedKind(bundle)).toBe('bundle');
+    expect(maskPasted(bundle)).not.toMatch(/K7M2QX9P|ABCD2345/);
+    expect(maskPasted(bundle).split('\n')).toHaveLength(2);
+    expect(pastedParts('https://office.ts.net:7681\nABCD2345')).toEqual(['https://office.ts.net:7681\nABCD2345']);
+    expect(pastedParts(`${INVITE}\nhello`)).toEqual([`${INVITE}\nhello`]);
+    // A stray line drops the bundle back to one piece; every line is still dotted out.
+    expect(maskPasted(`${INVITE}\n${LINK}\nhello`)).not.toMatch(/K7M2QX9P|ABCD2345/);
+    expect(maskPasted('https://office.ts.net:7681\nABCD2345')).toBe('https://office.ts.net:7681 ••••••••');
+  });
+
+  it('splits a bundle that Ctrl+V into the one-line field joined with a space, but not an address and a code', () => {
+    // Chromium's <input type=text> turns a pasted newline into a space (measured on Windows 11).
+    expect(pastedParts(`${INVITE} ${LINK}`)).toEqual([INVITE, LINK]);
+    expect(pastedKind(`${INVITE} ${LINK}`)).toBe('bundle');
+    expect(maskPasted(`${INVITE} ${LINK}`)).not.toMatch(/K7M2QX9P|ABCD2345/);
+    expect(pastedParts('https://office.ts.net:7681 ABCD2345')).toEqual(['https://office.ts.net:7681 ABCD2345']);
+    expect(pastedKind('https://office.ts.net:7681 ABCD2345')).toBe('link');
+    expect(pastedParts(`${INVITE} hello`)).toEqual([`${INVITE} hello`]);
   });
 });
 
@@ -221,5 +245,152 @@ describe('Connect a PC dialog', () => {
     await tick();
     expect(q('remote-connect-code')).toBeNull();
     expect(q('remote-connect-new-code')).not.toBeNull();
+  });
+});
+
+describe('one invite for A2A and the workspaces', () => {
+  const MINE = 'https://mac.tail1.ts.net/pair#wmux-desktop-code=WXYZ6789';
+  let web: Record<string, ReturnType<typeof vi.fn>>;
+  let writeEphemeral: ReturnType<typeof vi.fn>;
+  const pending = () => ({
+    running: true, urls: ['https://mac.tail1.ts.net'], pairCode: 'WXYZ6789', pendingDeviceName: 'Computer',
+    pendingPairFlow: 'computer', pairExpiresAt: Date.now() + 600_000,
+  });
+  const idle = () => ({ running: true, urls: ['https://mac.tail1.ts.net'] });
+  // The daemon's one pairing slot: pairStart fills it, pairCancel empties it.
+  let slot: Record<string, unknown> | null;
+  function stubWeb(running = true) {
+    slot = null;
+    web = {
+      status: vi.fn(async () => (running ? { ...idle(), ...slot } : { running: false })),
+      deviceList: vi.fn(async () => ({ devices: [] })),
+      pairStart: vi.fn(async () => { slot = pending(); return { ...idle(), ...slot }; }),
+      pairCancel: vi.fn(async () => { slot = null; return idle(); }),
+    };
+    writeEphemeral = vi.fn(async () => undefined);
+    vi.stubGlobal('electronAPI', { a2aRemote: a2a, remote, web });
+    vi.stubGlobal('clipboardAPI', { ...clipboard, writeEphemeral });
+  }
+  const share = () => q<HTMLButtonElement>('remote-connect-share')!;
+  const settle = async () => { for (let i = 0; i < 8; i++) await act(async () => { await Promise.resolve(); }); };
+
+  it('is off by default; ticking mints a view-only computer link and copies both lines as an expiring credential; unticking cancels it', async () => {
+    stub('');
+    stubWeb();
+    await render({ initialTab: 'invite' });
+    await settle();
+    expect(share().getAttribute('aria-checked')).toBe('false');
+    expect(web.pairStart).not.toHaveBeenCalled();
+    expect(clipboard.writeText).toHaveBeenCalledWith(INVITE);
+
+    await act(async () => { share().click(); });
+    await settle();
+    expect(web.pairStart).toHaveBeenCalledWith('Computer', false, 'computer');
+    expect(writeEphemeral).toHaveBeenCalledWith(`${INVITE}\n${MINE}`, expect.any(Number));
+    expect(writeEphemeral.mock.calls[0][1]).toBeGreaterThan(0);
+    expect(q('remote-connect-code')?.textContent).toBe(`${INVITE}\n${MINE}`);
+
+    clipboard.writeText.mockClear();
+    await act(async () => { share().click(); });
+    await settle();
+    expect(web.pairCancel).toHaveBeenCalledTimes(1);
+    expect(clipboard.writeText).toHaveBeenCalledWith(INVITE);
+    expect(q('remote-connect-code')?.textContent).toBe(INVITE);
+  });
+
+  it('does not cancel a code Share & pair minted since', async () => {
+    stub('');
+    stubWeb();
+    await render({ initialTab: 'invite' });
+    await settle();
+    await act(async () => { share().click(); });
+    await settle();
+    slot = { ...pending(), pairCode: 'NEWCODE2' };
+    await act(async () => { share().click(); });
+    await settle();
+    expect(web.pairCancel).not.toHaveBeenCalled();
+  });
+
+  it('never replaces a pairing code Share & pair already has open', async () => {
+    stub('');
+    stubWeb();
+    slot = { ...pending(), pendingDeviceName: 'Phone', pendingPairFlow: 'phone' };
+    await render({ initialTab: 'invite' });
+    await settle();
+    await act(async () => { share().click(); });
+    await settle();
+    expect(web.pairStart).not.toHaveBeenCalled();
+    expect(q('remote-connect-share-error')?.textContent).toContain('Share & pair has a pairing code open');
+    expect(share().getAttribute('aria-checked')).toBe('false');
+    expect(writeEphemeral).not.toHaveBeenCalled();
+  });
+
+  it('a link that arrives after Discard is cancelled, not copied', async () => {
+    stub('');
+    stubWeb();
+    let release!: () => void;
+    web.pairStart.mockImplementation(() => new Promise((resolve) => {
+      release = () => { slot = pending(); resolve({ ...idle(), ...slot }); };
+    }));
+    await render({ initialTab: 'invite' });
+    await settle();
+    await act(async () => { share().click(); });
+    await settle();
+    await act(async () => { q<HTMLButtonElement>('remote-connect-discard')!.click(); });
+    await settle();
+    await act(async () => { release(); });
+    await settle();
+    expect(writeEphemeral).not.toHaveBeenCalled();
+    expect(web.pairCancel).toHaveBeenCalledTimes(1);
+    expect(slot).toBeNull();
+  });
+
+  it('is offered only while Share & pair answers over HTTPS', async () => {
+    stub('');
+    stubWeb(false);
+    await render({ initialTab: 'invite' });
+    await settle();
+    expect(share().getAttribute('aria-disabled') === 'true' || share().hasAttribute('disabled')).toBe(true);
+    expect(q('remote-connect-invite')?.textContent).toContain('Turn on Share & pair over Tailscale or HTTPS first.');
+  });
+
+  it('a pasted bundle connects both; what failed stays for another try', async () => {
+    stub(`${INVITE}\n${LINK}`, false);
+    await render();
+    await act(async () => { q<HTMLButtonElement>('remote-connect-paste-button')!.click(); });
+    await act(async () => { q<HTMLButtonElement>('remote-connect-submit')!.click(); });
+    await settle();
+    expect(a2a.join).toHaveBeenCalledWith(INVITE);
+    expect(remote.hostsPair).toHaveBeenCalledWith('https://office.ts.net', 'ABCD2345');
+    expect(q('remote-connect-message')?.textContent).toBe('Paired with DESK.\nConnected to office. Its workspaces are listed under Other PCs.');
+    expect(q('remote-connect-link-pane')).not.toBeNull();
+
+    act(() => root.unmount());
+    root = createRoot(container);
+    stub(`${INVITE}\n${LINK}`, false);
+    remote.hostsPair.mockResolvedValue({ ok: false, error: 'nope' });
+    await render();
+    await act(async () => { q<HTMLButtonElement>('remote-connect-paste-button')!.click(); });
+    await act(async () => { q<HTMLButtonElement>('remote-connect-submit')!.click(); });
+    await settle();
+    expect(q('remote-connect-message')?.getAttribute('role')).toBe('alert');
+    expect(q('remote-connect-pasted')?.textContent).not.toContain('wmux-a2a://');
+    expect(q('remote-connect-pasted')?.textContent).toContain('office.ts.net');
+  });
+
+  it('a bundle pasted into the field itself (newline turned into a space) connects both', async () => {
+    stub('', false);
+    await render();
+    const input = q<HTMLInputElement>('remote-connect-input')!;
+    const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!;
+    await act(async () => {
+      setValue.call(input, `${INVITE} ${LINK}`);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await act(async () => { q<HTMLButtonElement>('remote-connect-submit')!.click(); });
+    await settle();
+    expect(a2a.join).toHaveBeenCalledWith(INVITE);
+    expect(remote.hostsPair).toHaveBeenCalledWith('https://office.ts.net', 'ABCD2345');
+    expect(q('remote-connect-message')?.getAttribute('role')).toBe('status');
   });
 });
