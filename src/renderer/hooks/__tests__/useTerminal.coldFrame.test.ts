@@ -54,6 +54,25 @@ describe('cold-park reveal — cold frame wiring (source-level)', () => {
     expect(route).not.toMatch(/warmSwap/);
   });
 
+  it('defers a cached frame the first fit did not match to the first resize at its width', () => {
+    // The first fit runs with the DOM renderer's measured cell; WebGL then
+    // rounds it to whole device pixels and refits (125 %: 115 -> 118 cols).
+    expect(mainEffect).toMatch(/deferredColdFrame = coldFrame !== null && !paintColdFrame && initialFitRan \? coldFrame : null;/);
+    const resize = mainEffect.slice(mainEffect.indexOf('const deferredColdFrameResize'), mainEffect.indexOf('if (isVisibleRef.current) {', mainEffect.indexOf('const deferredColdFrameResize')));
+    expect(resize).toMatch(/terminal\.onResize\(/);
+    // Painted only at the cached width, once, and never after PTY output was
+    // routed to this mount (routePtyData sets revealFirstDataLogged for every
+    // payload, before the resync hold-out and the scheduler).
+    expect(resize).toMatch(/if \(!frame \|\| revealFirstDataLogged \|\| !coldFrameFits\(frame, cols\)\) return;\s*\n\s*deferredColdFrame = null;\s*\n\s*terminal\.write\(frame\.frame\);\s*\n\s*warmSwap\.painted\(\);/);
+    expect(mainEffect).toMatch(/const routePtyData = \(payload: PtyDataPayload\) => \{\s*\n\s*logRevealFirstData\(payload\);/);
+    expect(mainEffect).toMatch(/if \(revealFirstDataLogged\) return;\s*\n\s*revealFirstDataLogged = true;/);
+    // Nor after the attach settled (a flush with nothing replayed must not
+    // leave a cosmetic frame on screen for good), at both flush listeners.
+    expect((mainEffect.match(/revealTimingT0\.delete\(ptyId\);\s*\n\s*deferredColdFrame = null;[^\n]*\n\s*if \(completeResyncFromFlush\(recoveredBytes\)\) return;/g) ?? []).length).toBe(2);
+    // The resize subscription goes with the mount.
+    expect(mainEffect).toMatch(/warmSwap\.cancel\(\);\s*\n\s*deferredColdFrameResize\?\.dispose\(\);\s*\n\s*deferredColdFrame = null;/);
+  });
+
   it('closes the swap at both flush-complete listeners, after resync settlement', () => {
     const closes = mainEffect.match(/if \(completeResyncFromFlush\(recoveredBytes\)\) return;\s*\n(?:\s*\/\/.*\n)*\s*writeSwapBytes\(warmSwap\.onFlush\(recoveredBytes\)\);/g) ?? [];
     expect(closes).toHaveLength(2);

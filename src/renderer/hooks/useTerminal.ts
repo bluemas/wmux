@@ -81,7 +81,7 @@ import {
 } from '../terminal/terminalOutputScheduler';
 import { reconnectPtyWithRetry as reconnectPtyWithRetryImpl } from './reconnectPtyWithRetry';
 import { adoptTerminal, parkTerminal, restoreParkedViewport, type ParkedTerminal } from '../terminal/terminalPark';
-import { captureColdFrame, coldFrameFits, dropColdFrame, takeColdFrame, WarmFrameSwap, REPAINT_BEGIN, REPAINT_END } from '../terminal/coldFrame';
+import { captureColdFrame, coldFrameFits, dropColdFrame, takeColdFrame, WarmFrameSwap, REPAINT_BEGIN, REPAINT_END, type ColdFrame } from '../terminal/coldFrame';
 
 // One detector for every pane in this renderer: the ESC-pair state is keyed by
 // ptyId, and a per-mount instance would lose a double-tap split across a remount.
@@ -2685,6 +2685,9 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // Cold-park reveal: the swap from a painted cold frame to the daemon
     // replay (coldFrame.ts). Idle unless this mount painted one.
     const warmSwap = new WarmFrameSwap();
+    // A cold frame taken at mount whose width the first fit did not match yet
+    // (see the paint below); null once painted, given up, or overtaken by output.
+    let deferredColdFrame: ColdFrame | null = null;
     // Phase 3: settle an in-flight resync when its replay flush completes.
     // The reset goes FIRST, in the stream: the replay bytes were held in the
     // resync buffer (never handed to xterm), so nothing can parse between the
@@ -2889,10 +2892,28 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // scrollbackFile pane raises until first data (same as an adoption).
       fireFirstData();
     }
+    // The first fit runs before the WebGL renderer is in, with the DOM
+    // renderer's measured cell; WebGL then rounds the cell to whole device
+    // pixels and refits. At 125 % scaling an 8.2 px cell becomes 8 px, so a
+    // pane captured at 118 columns mounts at 115 and reaches 118 a frame or
+    // two later, long before the replay. Keep a frame the first fit did not
+    // match and paint it at the first resize to its width, unless PTY output
+    // was routed to this mount first (revealFirstDataLogged) or the attach
+    // settled (the flush listeners drop it).
+    deferredColdFrame = coldFrame !== null && !paintColdFrame && initialFitRan ? coldFrame : null;
+    const deferredColdFrameResize = deferredColdFrame ? terminal.onResize(({ cols }) => {
+      const frame = deferredColdFrame;
+      if (!frame || revealFirstDataLogged || !coldFrameFits(frame, cols)) return;
+      deferredColdFrame = null;
+      terminal.write(frame.frame);
+      warmSwap.painted();
+      fireFirstData();
+      revealTiming(ptyId, 'cold-frame-painted', `${cols}x${terminal.rows}`);
+    }) : null;
     if (isVisibleRef.current) {
       if (!adopted) revealTimingT0.set(ptyId, performance.now());
       else revealTimingT0.delete(ptyId);
-      console.log(`[wmux:reveal-timing] ptyId=${ptyId} stage=mount +0.0ms mode=${adopted ? 'adopted' : 'fresh'} cachedFrame=${paintColdFrame ? 'yes' : coldFrame ? `skipped(${coldFrame.cols}x${coldFrame.rows}->${initialFitRan ? `${terminal.cols}x${terminal.rows}` : 'unfitted'})` : 'no'}`);
+      console.log(`[wmux:reveal-timing] ptyId=${ptyId} stage=mount +0.0ms mode=${adopted ? 'adopted' : 'fresh'} cachedFrame=${paintColdFrame ? 'yes' : coldFrame ? `${deferredColdFrame ? 'deferred' : 'skipped'}(${coldFrame.cols}x${coldFrame.rows}->${initialFitRan ? `${terminal.cols}x${terminal.rows}` : 'unfitted'})` : 'no'}`);
     }
 
     // #1002: an adopted terminal carries its own buffer across the restructure,
@@ -2934,6 +2955,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         if (terminalRef.current !== terminal) return;
         revealTiming(ptyId, 'flush-complete', `recoveredBytes=${recoveredBytes} swap=${warmSwap.phase}`);
         revealTimingT0.delete(ptyId);
+        deferredColdFrame = null; // the attach is settled: too late for a cosmetic frame
         if (completeResyncFromFlush(recoveredBytes)) return;
         // Cold-park reveal: close the swap opened in front of the replay
         // (or drop the cached frame when nothing was replayed).
@@ -3108,6 +3130,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         if (terminalRef.current !== terminal) return;
         revealTiming(ptyId, 'flush-complete', `recoveredBytes=${recoveredBytes} swap=${warmSwap.phase}`);
         revealTimingT0.delete(ptyId);
+        deferredColdFrame = null; // the attach is settled: too late for a cosmetic frame
         if (completeResyncFromFlush(recoveredBytes)) return;
         // Cold-park reveal: close the swap opened in front of the replay
         // (or drop the cached frame when nothing was replayed).
@@ -3343,6 +3366,8 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // idle swap) holding a DEC 2026 frame until xterm's timeout; close it.
       if (warmSwap.phase === 'open') writeSwapBytes(REPAINT_END);
       warmSwap.cancel();
+      deferredColdFrameResize?.dispose();
+      deferredColdFrame = null;
       revealTimingT0.delete(ptyId);
       // Drop any output still queued in the shared scheduler — the terminal
       // is being disposed, parsing the backlog would be wasted work and a
