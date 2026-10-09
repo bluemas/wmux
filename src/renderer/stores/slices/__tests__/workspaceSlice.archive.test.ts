@@ -161,4 +161,37 @@ describe('workspace archive (#1011)', () => {
     expect(store.getState().workspaces).toHaveLength(2);
     expect(store.getState().archivedWorkspaces).toHaveLength(0);
   });
+
+  it('restore reopens each pane in the directory it had, not the startup one', () => {
+    // A terminal in each leaf; the right one's active tab is a browser, so its
+    // terminal tab supplies the directory.
+    const [left, right] = getLeafPanes(wsA.rootPane) as Array<Extract<Pane, { type: 'leaf' }>>;
+    left.surfaces = [{ id: 's-l', ptyId: 'p-l', title: 'pwsh', shell: 'pwsh', cwd: 'C:/git/Alpha' }];
+    left.activeSurfaceId = 's-l';
+    right.surfaces = [
+      { id: 's-r1', ptyId: 'p-r', title: 'pwsh', shell: 'pwsh', cwd: 'C:/git/Alpha/web' },
+      { id: 's-r2', ptyId: '', title: 'Browser', shell: '', cwd: '', surfaceType: 'browser' },
+    ];
+    right.activeSurfaceId = 's-r2';
+    store.setState({ projectPaneSeed: {} } as never);
+
+    store.getState().archiveWorkspace(wsA.id);
+    const archived = store.getState().archivedWorkspaces[0]!;
+    expect(archived.leafCwds).toEqual(['C:/git/Alpha', 'C:/git/Alpha/web']);
+
+    store.getState().restoreArchivedWorkspace(archived.id);
+    const restored = store.getState().workspaces.find((w) => w.name === 'Alpha')!;
+    const leaves = getLeafPanes(restored.rootPane);
+    const seeds = (store.getState() as unknown as { projectPaneSeed: Record<string, { cwd?: string }> }).projectPaneSeed;
+    expect(leaves.map((l) => seeds[l.id]?.cwd)).toEqual(['C:/git/Alpha', 'C:/git/Alpha/web']);
+  });
+
+  it('restore of an entry archived without directories seeds nothing', () => {
+    store.setState({ projectPaneSeed: {} } as never);
+    store.getState().archiveWorkspace(wsA.id);
+    const archived = store.getState().archivedWorkspaces[0]!;
+    store.setState({ archivedWorkspaces: [{ ...archived, leafCwds: undefined }] } as never);
+    store.getState().restoreArchivedWorkspace(archived.id);
+    expect((store.getState() as unknown as { projectPaneSeed: object }).projectPaneSeed).toEqual({});
+  });
 });

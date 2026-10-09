@@ -783,6 +783,11 @@ export interface ArchivedWorkspace {
   color?: string;            // WorkspaceColorId — string-typed like the persisted tag
   profile?: WorkspaceProfile;
   tree: LayoutNode;
+  /** Each leaf's working directory when it was archived, in `tree`'s leaf
+   *  order ('' for a leaf without a terminal cwd). Restore opens each
+   *  terminal there instead of the startup directory. Absent on entries
+   *  archived before this field existed. */
+  leafCwds?: string[];
   archivedAt: number;        // epoch ms, for the "3d ago" trailer
 }
 
