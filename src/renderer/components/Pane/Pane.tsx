@@ -299,8 +299,16 @@ export function planAutoResume(args: {
   binding: { agent?: string; cwd: string; sessionId?: string; permissionMode?: Parameters<typeof permissionFlagFor>[0] } | undefined;
   paneCwds: ReadonlyArray<string | undefined>;
   roleBinding: RoleBinding | undefined;
+  /** OSC 133: the shell is running a command, not sitting at its prompt. */
+  commandRunning?: boolean;
+  /** Process truth: the pane's agent process is alive. */
+  agentAlive?: boolean;
 }): string | null {
   if (!args.enabled || args.agent !== 'claude') return null;
+  // The daemon outlives an app quit, so a pane it recovered once keeps its
+  // resume hint across app restarts while the resumed agent runs in it. Typing
+  // then would land in the agent's own input box. Unknown signals do not block.
+  if (args.commandRunning === true || args.agentAlive === true) return null;
   const { binding } = args;
   // Validate the session id before typing it: only a well-formed Claude session
   // id is ever put on the line; anything else falls back to `--continue`.
@@ -683,6 +691,14 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
     const timer = setTimeout(() => {
       if (!useStore.getState().claudeResumeOnStart) return; // turned off meanwhile
       if (useStore.getState().resumeHintByPtyId[ptyId] !== 'claude') return; // typed into / dismissed meanwhile
+      // Re-checked here, not only when planning: the liveness snapshot lands
+      // with the session list, which can arrive after the pane is ready.
+      const { commandRunningByPtyId, agentAliveByPtyId } = useStore.getState();
+      if (commandRunningByPtyId[ptyId] === true || agentAliveByPtyId[ptyId] === true) {
+        // The agent is already running in this pane: the hint is stale.
+        useStore.getState().clearResumeHint(ptyId);
+        return;
+      }
       if (!claimAutoResume(ptyId)) return; // resumed already, or the pill was clicked meanwhile
       window.electronAPI.pty.write(ptyId, `${line}\r`);
       useStore.getState().clearResumeHint(ptyId);
