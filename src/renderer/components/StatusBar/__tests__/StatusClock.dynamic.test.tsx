@@ -90,7 +90,7 @@ beforeEach(() => {
   container = document.createElement('div');
   document.body.appendChild(container);
   root = createRoot(container);
-  useStore.setState({ titlebarClockVisible: false });
+  useStore.setState({ titlebarClockVisible: false, titlebarVitalsAlwaysVisible: false });
 });
 afterEach(() => {
   act(() => root.unmount());
@@ -139,6 +139,15 @@ describe('StatusClockTime', () => {
     stubMemory(2 * 1024 * 1024 * 1024, 12.6);
     await mount();
     expect(container.querySelector('[data-statusbar-cpu]')?.textContent).toBe('CPU 13%');
+  });
+
+  it('shows memory and CPU at any reading when the setting asks for it', async () => {
+    stubMemory(553 * 1024 * 1024, 0.4);
+    useStore.setState({ titlebarVitalsAlwaysVisible: true });
+    await mount();
+    expect(container.querySelector('[data-statusbar-memory]')?.textContent).toBe('553MB');
+    // A reading that rounds to 0% still draws: the user asked for the gauge.
+    expect(container.querySelector('[data-statusbar-cpu]')?.textContent).toBe('CPU 0%');
   });
 
   it('shows the clock only when the setting asks for it', async () => {

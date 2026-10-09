@@ -2259,6 +2259,9 @@ export const en = {
   'settings.titlebarClock': 'Clock in the titlebar',
   'settings.titlebarClockDesc':
     'Off by default — your OS already shows the time. Turn it on if you run wmux full-screen with the taskbar hidden.',
+  'settings.titlebarVitals': 'Always show memory and CPU',
+  'settings.titlebarVitalsDesc':
+    'Off by default — the memory and CPU chips then appear only when memory use grows large. Turn it on to keep both in the titlebar all the time.',
   'settings.currentVersion': 'Current',
   'settings.latestVersion': 'Latest',
   'settings.updateReady': 'Update ready',
