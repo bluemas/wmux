@@ -10,7 +10,7 @@
 // Settled is not drawn: the lists read open items only, so it would always
 // be empty. A row the classifier calls settled (or drops) waits with others
 // rather than vanishing.
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { useT } from '../../hooks/useT';
 import { useStore } from '../../stores';
@@ -124,25 +124,31 @@ function useGitViewer(groups: RepoGroup[] | null, refreshKey: number): number {
   const remotes = (groups ?? []).filter((g) => !g.key.startsWith('path:'));
   const sig = remotes.map((g) => `${g.key}\0${g.prPath}`).join('\n');
   const lastRefresh = useRef(refreshKey);
-  useEffect(() => {
+  // A layout effect, so a replaced read is marked stale at commit, before
+  // any of its answers can land after the new render.
+  useLayoutEffect(() => {
     const api = (window as unknown as { electronAPI?: { github?: ViewerBridge } }).electronAPI?.github;
     if (!api) return undefined;
     const force = lastRefresh.current !== refreshKey;
     lastRefresh.current = refreshKey;
+    // An answer to an effect that has been replaced (a refresh, other repos)
+    // is dropped: it may be older than the answer the newer read gets.
     let alive = true;
-    const bump = () => { if (alive) setVersion((v) => v + 1); };
+    const bump = () => setVersion((v) => v + 1);
     const askedHosts = new Set<string>();
     for (const g of remotes) {
       const host = hostOf(g.key);
       if ((force || !loginByHost.has(host)) && !askedHosts.has(host) && api.viewerLogin) {
         askedHosts.add(host);
         void api.viewerLogin(g.prPath, force).then((r) => {
-          if (r.login) { loginByHost.set(host, r.login); bump(); }
+          if (alive && r.login) { loginByHost.set(host, r.login); bump(); }
         }, () => undefined);
       }
-      if ((force || !permissionByKey.has(g.key)) && api.repoPermission) {
+      // Asked again whenever the kept role is not usable (none, or read under
+      // another login than the host's current one).
+      if ((force || groupPermission(g.key) === null) && api.repoPermission) {
         void api.repoPermission(g.prPath, force).then((r) => {
-          if (r.permission) {
+          if (alive && r.permission) {
             // main read the role under its current login for the host, if any.
             permissionByKey.set(g.key, { permission: r.permission, login: r.login });
             if (r.login) loginByHost.set(host, r.login);
