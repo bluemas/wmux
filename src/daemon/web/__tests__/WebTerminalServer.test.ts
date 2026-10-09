@@ -8996,7 +8996,7 @@ describe('WebTerminalServer', () => {
       fs.writeFileSync(sent, PNG_1X1);
       fs.writeFileSync(other, PNG_1X1);
       sendUserFile(transcript, [sent]);
-      // Named only in a different tool's input: not a sent file.
+      // Named only in a Read that has no result: neither sent nor read.
       fs.appendFileSync(transcript, `${JSON.stringify({
         type: 'assistant', timestamp: new Date().toISOString(),
         message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_read', name: 'Read', input: { file_path: other } }] },
@@ -9102,7 +9102,9 @@ describe('WebTerminalServer', () => {
         ({ transcriptPath: transcript, agentSessionId: 'session', generation: reads++ === 0 ? 0 : 1 }));
       const info = await startWithTranscript();
       const res = await fetch(routeUrl('image', 's1', file), { headers: bearer(info.token as string) });
-      expect(reads).toBe(2);
+      // Two for the SendUserFile lookup (before and after the scan), one for
+      // the Read lookup that follows it and finds nothing.
+      expect(reads).toBe(3);
       expect(res.status).toBe(404);
     });
 
@@ -9222,6 +9224,263 @@ describe('WebTerminalServer', () => {
       const on = await startWithTranscript();
       const onBody = await (await fetch(`${base()}/api/config`, { headers: bearer(on.token as string) })).json();
       expect(onBody).toHaveProperty('turnSentFiles', true);
+    });
+  });
+
+  describe('images the agent opened with Read, on /turns/image', () => {
+    const PNG_1X1 = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+      'base64',
+    );
+    let dirs: string[];
+    let cwd: string;
+    let scratch: string;
+    let transcript: string;
+    const imageUrl = (id: string, p: string): string =>
+      `${base()}/api/sessions/${id}/turns/image?path=${encodeURIComponent(p)}`;
+    let seq = 0;
+    /**
+     * One Read call and its result, appended to `file`, in the shape Claude
+     * Code writes: an image block on success, a text block with is_error on
+     * failure.
+     */
+    const readFile = (
+      file: string,
+      filePath: string,
+      opts: { at?: number; isError?: boolean; answered?: boolean; textOnly?: boolean } = {},
+    ): void => {
+      const id = `toolu_read_${++seq}`;
+      const timestamp = new Date(opts.at ?? Date.now()).toISOString();
+      const lines = [JSON.stringify({
+        type: 'assistant', timestamp,
+        message: { role: 'assistant', content: [{ type: 'tool_use', id, name: 'Read', input: { file_path: filePath } }] },
+      })];
+      if (opts.answered !== false) {
+        lines.push(JSON.stringify({
+          type: 'user', timestamp,
+          message: { role: 'user', content: [{
+            type: 'tool_result', tool_use_id: id,
+            content: opts.isError || opts.textOnly
+              ? [{ type: 'text', text: opts.isError ? 'File does not exist.' : 'binary file' }]
+              : [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: PNG_1X1.toString('base64') } }],
+            ...(opts.isError ? { is_error: true } : {}),
+          }] },
+        }));
+      }
+      fs.appendFileSync(file, `${lines.join('\n')}\n`);
+    };
+
+    beforeEach(() => {
+      dirs = [];
+      const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-read-image-')));
+      dirs.push(root);
+      cwd = path.join(root, 'cwd');
+      scratch = path.join(root, 'scratchpad');
+      fs.mkdirSync(cwd);
+      fs.mkdirSync(scratch);
+      transcript = path.join(root, 'session.jsonl');
+      fs.writeFileSync(transcript, '');
+      managed.meta.spawnCwd = cwd;
+      projectorMock.sentFileBinding.mockImplementation((id: string) =>
+        (id === 's1' ? { transcriptPath: transcript, agentSessionId: 'session', generation: 0 } : null));
+    });
+    afterEach(() => {
+      vi.restoreAllMocks();
+      for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('serves an image a successful Read opened outside the spawn cwd, without a sent-file audit line', async () => {
+      const file = path.join(scratch, 'shot.png');
+      fs.writeFileSync(file, PNG_1X1);
+      readFile(transcript, file);
+      const info = await startWithTranscript();
+      const res = await fetch(imageUrl('s1', file), { headers: bearer(info.token as string) });
+      expect(res.status).toBe(200);
+      expect(res.headers.get('content-type')).toBe('image/png');
+      expect(res.headers.get('cache-control')).toBe('no-store');
+      expect(Buffer.from(await res.arrayBuffer()).equals(PNG_1X1)).toBe(true);
+      expect(sentFileAudits).toEqual([]);
+    });
+
+    it('is not served on /turns/file, which keeps the SendUserFile addition only', async () => {
+      const file = path.join(scratch, 'shot.png');
+      fs.writeFileSync(file, PNG_1X1);
+      readFile(transcript, file);
+      const info = await startWithTranscript();
+      const res = await fetch(`${base()}/api/sessions/s1/turns/file?path=${encodeURIComponent(file)}`, {
+        headers: bearer(info.token as string),
+      });
+      expect(res.status).toBe(404);
+      expect(await res.json()).toEqual({ error: 'file not found' });
+    });
+
+    it('refuses a Read whose result is an error, or that has no result yet', async () => {
+      const failed = path.join(scratch, 'failed.png');
+      const pending = path.join(scratch, 'pending.png');
+      fs.writeFileSync(failed, PNG_1X1);
+      fs.writeFileSync(pending, PNG_1X1);
+      readFile(transcript, failed, { isError: true });
+      readFile(transcript, pending, { answered: false });
+      const info = await startWithTranscript();
+      for (const file of [failed, pending]) {
+        const res = await fetch(imageUrl('s1', file), { headers: bearer(info.token as string) });
+        expect(res.status).toBe(404);
+        expect(await res.json()).toEqual({ error: 'image not found' });
+      }
+    });
+
+    it("refuses an image read in another pane's transcript", async () => {
+      const file = path.join(scratch, 'theirs.png');
+      fs.writeFileSync(file, PNG_1X1);
+      const otherTranscript = path.join(path.dirname(transcript), 'other.jsonl');
+      readFile(otherTranscript, file);
+      projectorMock.sentFileBinding.mockImplementation((id: string) =>
+        id === 's1' ? { transcriptPath: transcript, agentSessionId: 'session', generation: 0 }
+          : id === 's2' ? { transcriptPath: otherTranscript, agentSessionId: 'other', generation: 0 } : null);
+      const info = await startWithTranscript();
+      const h = bearer(info.token as string);
+      expect((await fetch(imageUrl('s2', file), { headers: h })).status).toBe(200);
+      for (const id of ['s1', 's3']) {
+        expect((await fetch(imageUrl(id, file), { headers: h })).status).toBe(404);
+      }
+    });
+
+    it('refuses a Read of a non-image path, even when its bytes are an image', async () => {
+      const file = path.join(scratch, 'notes.txt');
+      fs.writeFileSync(file, PNG_1X1);
+      readFile(transcript, file);
+      const info = await startWithTranscript();
+      const res = await fetch(imageUrl('s1', file), { headers: bearer(info.token as string) });
+      expect(res.status).toBe(404);
+      expect(await res.json()).toEqual({ error: 'image not found' });
+    });
+
+    it('refuses a Read older than 24 hours, and an image modified after the Read', async () => {
+      const old = path.join(scratch, 'old.png');
+      const later = path.join(scratch, 'later.png');
+      fs.writeFileSync(old, PNG_1X1);
+      fs.writeFileSync(later, PNG_1X1);
+      readFile(transcript, old, { at: Date.now() - 25 * 60 * 60 * 1000 });
+      readFile(transcript, later);
+      const future = new Date(Date.now() + 10 * 60 * 1000);
+      fs.utimesSync(later, future, future);
+      const info = await startWithTranscript();
+      for (const file of [old, later]) {
+        expect((await fetch(imageUrl('s1', file), { headers: bearer(info.token as string) })).status).toBe(404);
+      }
+    });
+
+    it('refuses a Read whose successful result carries no image block', async () => {
+      const file = path.join(scratch, 'text.png');
+      fs.writeFileSync(file, PNG_1X1);
+      readFile(transcript, file, { textOnly: true });
+      const info = await startWithTranscript();
+      const res = await fetch(imageUrl('s1', file), { headers: bearer(info.token as string) });
+      expect(res.status).toBe(404);
+      expect(await res.json()).toEqual({ error: 'image not found' });
+    });
+
+    it('refuses an image rewritten after the Read, once past the clock tolerance', async () => {
+      const file = path.join(scratch, 'rewritten.png');
+      readFile(transcript, file, { at: Date.now() - 10 * 60 * 1000 });
+      // Written now: ten minutes after the call, past the five-minute tolerance.
+      fs.writeFileSync(file, PNG_1X1);
+      const info = await startWithTranscript();
+      const res = await fetch(imageUrl('s1', file), { headers: bearer(info.token as string) });
+      expect(res.status).toBe(404);
+    });
+
+    it('refuses a spelling through a linked parent folder, even when it reaches the read image', async () => {
+      const file = path.join(scratch, 'shot.png');
+      fs.writeFileSync(file, PNG_1X1);
+      const alias = path.join(path.dirname(scratch), 'alias');
+      fs.symlinkSync(scratch, alias, 'dir');
+      readFile(transcript, file);
+      const info = await startWithTranscript();
+      const res = await fetch(imageUrl('s1', path.join(alias, 'shot.png')), { headers: bearer(info.token as string) });
+      expect(res.status).toBe(404);
+      expect(await res.json()).toEqual({ error: 'image not found' });
+    });
+
+    // A junction needs no symlink privilege, so this runs on any Windows box,
+    // where the symlink cases above fail with EPERM unless Developer Mode is on.
+    it.runIf(process.platform === 'win32')('on Windows, serves only the spelling the Read used, whichever separators it has', async () => {
+      const file = path.join(scratch, 'shot.png');
+      const slashed = path.join(scratch, 'slashed.png').replace(/\\/g, '/');
+      fs.writeFileSync(file, PNG_1X1);
+      fs.writeFileSync(slashed, PNG_1X1);
+      const alias = path.join(path.dirname(scratch), 'alias');
+      fs.symlinkSync(scratch, alias, 'junction');
+      readFile(transcript, file);
+      readFile(transcript, slashed);
+      const info = await startWithTranscript();
+      const h = bearer(info.token as string);
+      expect((await fetch(imageUrl('s1', file), { headers: h })).status).toBe(200);
+      expect((await fetch(imageUrl('s1', slashed), { headers: h })).status).toBe(200);
+      const swapCase = (s: string): string => s.replace(/[a-z]/gi, (c) => (c === c.toLowerCase() ? c.toUpperCase() : c.toLowerCase()));
+      for (const p of [
+        file.replace(/\\/g, '/'),
+        slashed.replace(/\//g, '\\'),
+        `${file[0] === file[0].toLowerCase() ? file[0].toUpperCase() : file[0].toLowerCase()}${file.slice(1)}`,
+        path.join(scratch, 'SHOT.PNG'),
+        swapCase(file),
+        `\\\\?\\${file}`,
+        `\\\\.\\${file}`,
+        `${file}.`,
+        `${file} `,
+        `${file}::$DATA`,
+        path.join(alias, 'shot.png'),
+      ]) {
+        const res = await fetch(imageUrl('s1', p), { headers: h });
+        expect(res.status, p).toBe(404);
+        expect(await res.json()).toEqual({ error: 'image not found' });
+      }
+    });
+
+    it.runIf(process.platform === 'darwin')('serves the /tmp spelling of a Read recorded under /private/tmp, and the reverse', async () => {
+      const root = fs.realpathSync(fs.mkdtempSync('/tmp/wmux-read-alias-'));
+      dirs.push(root);
+      expect(root.startsWith('/private/tmp/')).toBe(true);
+      const a = path.join(root, 'a.png');
+      const b = path.join(root, 'b.png');
+      fs.writeFileSync(a, PNG_1X1);
+      fs.writeFileSync(b, PNG_1X1);
+      readFile(transcript, a);
+      readFile(transcript, b.slice('/private'.length));
+      const info = await startWithTranscript();
+      const h = bearer(info.token as string);
+      expect((await fetch(imageUrl('s1', a.slice('/private'.length)), { headers: h })).status).toBe(200);
+      expect((await fetch(imageUrl('s1', b), { headers: h })).status).toBe(200);
+    });
+
+    it('refuses a different name that links to a read image, and a read path whose last component is a link', async () => {
+      const real = path.join(scratch, 'real.png');
+      const elsewhere = path.join(path.dirname(scratch), 'elsewhere.png');
+      const readLink = path.join(scratch, 'read-link.png');
+      const requestLink = path.join(scratch, 'request-link.png');
+      fs.writeFileSync(real, PNG_1X1);
+      fs.writeFileSync(elsewhere, PNG_1X1);
+      fs.symlinkSync(elsewhere, readLink);
+      fs.symlinkSync(real, requestLink);
+      readFile(transcript, real);
+      readFile(transcript, readLink);
+      const info = await startWithTranscript();
+      const h = bearer(info.token as string);
+      for (const p of [requestLink, readLink, `${scratch}/./real.png`]) {
+        const res = await fetch(imageUrl('s1', p), { headers: h });
+        expect(res.status).toBe(404);
+        expect(await res.json()).toEqual({ error: 'image not found' });
+      }
+    });
+
+    it('/api/config advertises turnReadImages only alongside the transcript grant', async () => {
+      const off = await startRO();
+      const offBody = await (await fetch(`${base()}/api/config`, { headers: bearer(off.token as string) })).json();
+      expect(offBody).not.toHaveProperty('turnReadImages');
+      await server.stop();
+      const on = await startWithTranscript();
+      const onBody = await (await fetch(`${base()}/api/config`, { headers: bearer(on.token as string) })).json();
+      expect(onBody).toHaveProperty('turnReadImages', true);
     });
   });
 
