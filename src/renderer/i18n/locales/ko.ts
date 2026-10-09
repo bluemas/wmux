@@ -1500,6 +1500,9 @@ export const ko = {
   'settings.titlebarClock': '타이틀바 시계',
   'settings.titlebarClockDesc':
     '기본값 꺼짐 — 운영체제가 이미 시각을 표시합니다. 작업 표시줄을 숨긴 전체 화면에서 쓸 때 켜세요.',
+  'settings.titlebarVitals': '메모리·CPU 항상 표시',
+  'settings.titlebarVitalsDesc':
+    '기본값 꺼짐 — 꺼 두면 메모리 사용량이 커졌을 때만 메모리·CPU 칩이 나타납니다. 켜면 둘 다 타이틀바에 항상 표시됩니다.',
   'settings.currentVersion': '현재 버전',
   'settings.latestVersion': '최신 버전',
   'settings.updateReady': '업데이트 준비 완료',

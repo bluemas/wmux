@@ -3590,6 +3590,8 @@ function TabAppearance() {
   const setChatViewEnabled = useStore((s) => s.setChatViewEnabled);
   const titlebarClockVisible = useStore((s) => s.titlebarClockVisible);
   const setTitlebarClockVisible = useStore((s) => s.setTitlebarClockVisible);
+  const titlebarVitalsAlwaysVisible = useStore((s) => s.titlebarVitalsAlwaysVisible);
+  const setTitlebarVitalsAlwaysVisible = useStore((s) => s.setTitlebarVitalsAlwaysVisible);
   const paneNewTerminalButton = useStore((s) => s.paneNewTerminalButton);
   const setPaneNewTerminalButton = useStore((s) => s.setPaneNewTerminalButton);
   const applyChromePreset = useStore((s) => s.applyChromePreset);
@@ -3688,6 +3690,15 @@ function TabAppearance() {
             checked={titlebarClockVisible}
             onChange={setTitlebarClockVisible}
             label={t('settings.titlebarClock')}
+          />
+        </SettingRow>
+        {/* Off by default for the same reason: memory and CPU otherwise appear
+            only when memory is worth interrupting for. */}
+        <SettingRow label={t('settings.titlebarVitals')} description={t('settings.titlebarVitalsDesc')}>
+          <Toggle
+            checked={titlebarVitalsAlwaysVisible}
+            onChange={setTitlebarVitalsAlwaysVisible}
+            label={t('settings.titlebarVitals')}
           />
         </SettingRow>
       </SettingsSection>

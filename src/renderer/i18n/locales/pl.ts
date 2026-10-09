@@ -2026,6 +2026,9 @@ export const pl = {
   'settings.titlebarClock': 'Zegar na pasku tytułu',
   'settings.titlebarClockDesc':
     'Domyślnie wyłączony — system i tak pokazuje godzinę. Włącz, jeśli używasz wmux na pełnym ekranie z ukrytym paskiem zadań.',
+  'settings.titlebarVitals': 'Zawsze pokazuj pamięć i CPU',
+  'settings.titlebarVitalsDesc':
+    'Domyślnie wyłączone — wskaźniki pamięci i CPU pojawiają się wtedy tylko przy dużym zużyciu pamięci. Włącz, aby oba były stale widoczne na pasku tytułu.',
   'settings.currentVersion': 'Bieżąca',
   'settings.latestVersion': 'Najnowsza',
   'settings.updateReady': 'Aktualizacja gotowa',

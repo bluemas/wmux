@@ -141,6 +141,8 @@ export function formatMemoryChip(bytes: number): string {
 /** 메모리(5초 폴) + 시각(1초). 우측 클러스터 뒷부분(채널/벨 뒤). */
 export function StatusClockTime() {
   const clockVisible = useStore((s) => s.titlebarClockVisible);
+  // Opt-in: memory and CPU at every reading, not only past the memory rule.
+  const vitalsAlways = useStore((s) => s.titlebarVitalsAlwaysVisible);
   const [time, setTime] = useState(() => new Date());
   const [memBytes, setMemBytes] = useState<number | null>(null);
   // CPU of wmux and its children, read with the memory figure and shown beside it.
@@ -189,18 +191,18 @@ export function StatusClockTime() {
       }).catch(() => { /* no reading this tick — keep last value */ });
     };
     update();
-    const timer = setInterval(update, memShown ? MEMORY_POLL_SHOWN_MS : MEMORY_POLL_HIDDEN_MS);
+    const timer = setInterval(update, memShown || vitalsAlways ? MEMORY_POLL_SHOWN_MS : MEMORY_POLL_HIDDEN_MS);
     return () => { cancelled = true; clearInterval(timer); };
-  }, [memShown]);
+  }, [memShown, vitalsAlways]);
 
   const timeStr = time.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
 
   return (
     <>
-      {memShown && memBytes !== null && (
+      {(memShown || vitalsAlways) && memBytes !== null && (
         <span data-statusbar-memory className="tabular-nums">{formatMemoryChip(memBytes)}</span>
       )}
-      {memShown && memBytes !== null && cpuShown && cpuPercent !== null && (
+      {(memShown || vitalsAlways) && memBytes !== null && (cpuShown || vitalsAlways) && cpuPercent !== null && (
         <span data-statusbar-cpu className="tabular-nums">{formatCpuChip(cpuPercent)}</span>
       )}
       {clockVisible && <span data-statusbar-clock>{timeStr}</span>}

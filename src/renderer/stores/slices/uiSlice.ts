@@ -405,6 +405,15 @@ export interface UISlice {
   setTitlebarClockVisible: (visible: boolean) => void;
 
   /**
+   * Keep the memory and CPU chips in the titlebar at every reading. Off by
+   * default: they then appear only when memory is worth interrupting for
+   * (StatusClock's shouldShowMemoryChip). An explicit opt-in for people who
+   * want the gauges on screen all the time.
+   */
+  titlebarVitalsAlwaysVisible: boolean;
+  setTitlebarVitalsAlwaysVisible: (visible: boolean) => void;
+
+  /**
    * EXPERIMENTAL, default OFF: a `+` on the pane's tab strip that adds a
    * SECOND terminal to that pane.
    *
@@ -1464,6 +1473,13 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
 
   setTitlebarClockVisible: (visible) => set((state) => {
     state.titlebarClockVisible = visible;
+  }),
+
+  // Off unless asked for — see the interface note.
+  titlebarVitalsAlwaysVisible: false,
+
+  setTitlebarVitalsAlwaysVisible: (visible) => set((state) => {
+    state.titlebarVitalsAlwaysVisible = visible;
   }),
 
   // Off unless asked for — see the interface note.
