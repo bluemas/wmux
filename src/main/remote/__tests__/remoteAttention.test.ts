@@ -52,6 +52,16 @@ describe('formatRemoteAttention', () => {
     expect(formatRemoteAttention('approval', { tier: 'info', phase: 'resolved' })).toBeNull();
     expect(formatRemoteAttention('approval', { tier: 'act', toolName: 'Bash' })?.body).toBe('Bash');
   });
+
+  it('replaces C1 controls and bidi overrides in toast text, not only C0', () => {
+    const ch = (...codes: number[]) => String.fromCharCode(...codes);
+    const out = formatRemoteAttention('notify', {
+      title: `Build ${ch(0x202e)}gnp.exe${ch(0x202c)} done`,
+      body: `line one${ch(0x85)}line two${ch(0x2028)}three${ch(0x1b)}[31m`,
+    });
+    expect(out?.title).toBe('Build  gnp.exe  done');
+    expect(out?.body).toBe('line one line two three [31m');
+  });
 });
 
 describe('RemoteAttentionGate', () => {
@@ -215,6 +225,28 @@ describe('RemoteAttentionSubscriber', () => {
 
     sub.start();
     await vi.waitFor(() => expect(h.reconnectDelays()).toEqual([60_000]));
+    sub.stop();
+  });
+
+  it('backs off to the slowest step after an oversized frame, even though the reset frame reset the counter', async () => {
+    const h = timerHarness();
+    const fetchImpl = vi.fn(async () => fakeStream([
+      frame('reset', { epoch: 'e1', headId: 0 }),
+      'event: notify\ndata: ' + 'A'.repeat(300 * 1024),
+    ]));
+    const sub = new RemoteAttentionSubscriber({
+      host: HOST,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      jitter: () => 0.5,
+      setTimeoutImpl: h.setTimeoutImpl,
+      clearTimeoutImpl: h.clearTimeoutImpl,
+      onNotification: () => { throw new Error('must not notify'); },
+    });
+    sub.start();
+    await vi.waitFor(() => expect(h.reconnectDelays()).toEqual([60_000]));
+    h.fireReconnect();
+    await vi.waitFor(() => expect(h.reconnectDelays()).toEqual([60_000, 60_000]));
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
     sub.stop();
   });
 
