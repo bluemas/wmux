@@ -453,6 +453,7 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
     sidebarSortMode: state.sidebarSortMode,
     sidebarSortModeChosen: state.sidebarSortModeChosen,
     sidebarPinnedIds: state.sidebarPinnedIds,
+    sidebarBookmarkedIds: state.sidebarBookmarkedIds,
     sidebarWidth: state.sidebarWidth,
     sidebarTaskGroupExpanded: state.sidebarTaskGroupExpanded,
     multiviewArrangement: state.multiviewArrangement,

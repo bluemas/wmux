@@ -134,6 +134,7 @@ import {
   type TokenRole,
 } from '../../themes';
 import { sanitizeFontFamily } from '../../utils/terminalFont';
+import { isMoaHqWorkspace } from './moaSlice';
 import {
   DEFAULT_TERMINAL_CURSOR_STYLE,
   sanitizeTerminalCursorStyle,
@@ -615,6 +616,10 @@ export interface UISlice {
    *  `workspaces` (sidebarLayout.pinnedFirst), so the stored order is pinned-first. */
   sidebarPinnedIds: string[];
   toggleSidebarPin: (workspaceId: string) => void;
+  /** Bookmarked workspaces, in the order they were bookmarked. A bookmark is a
+   *  mark for the sidebar filter (Bookmarked only); it never moves a row. */
+  sidebarBookmarkedIds: string[];
+  toggleSidebarBookmark: (workspaceId: string) => void;
   /** Session-only: when a workspace was created, for the new-workspace hold. */
   sidebarNewAt: Record<string, number>;
   /**
@@ -1757,6 +1762,16 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
     if (!r) return;
     state.workspaces = r.items;
     state.sidebarPinnedIds = r.pinnedIds;
+  }),
+  sidebarBookmarkedIds: [],
+  toggleSidebarBookmark: (workspaceId) => set((state) => {
+    if (state.sidebarBookmarkedIds.includes(workspaceId)) {
+      state.sidebarBookmarkedIds = state.sidebarBookmarkedIds.filter((id) => id !== workspaceId);
+      return;
+    }
+    // Only a live workspace can be bookmarked; Moa's HQ is never in the list.
+    if (!state.workspaces.some((w) => w.id === workspaceId) || isMoaHqWorkspace(state, workspaceId)) return;
+    state.sidebarBookmarkedIds = [...state.sidebarBookmarkedIds, workspaceId];
   }),
   sidebarNewAt: {},
   sidebarSeen: {},

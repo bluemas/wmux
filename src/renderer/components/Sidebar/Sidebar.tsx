@@ -330,6 +330,10 @@ export default function Sidebar({ chrome = 'full' }: { chrome?: 'full' | 'sheet'
   const shownCount = filteredWorkspaces.length + remoteByRowId.size;
   const hqActive = !!moaHqId && !activeRemoteKey && activeWorkspaceId === moaHqId
     && workspaces.some((w) => w.id === moaHqId);
+  // Bookmarked only, with nothing bookmarked: the empty list says how to
+  // bookmark instead of "No workspaces match".
+  const noBookmarks = useStore((s) => wsFilter.bookmarked
+    && !listed.some((w) => s.sidebarBookmarkedIds.includes(w.id)));
   const activeHidden = !activeRemoteKey && !hqActive && !filteredWorkspaces.some((w) => w.id === activeWorkspaceId);
   const clearFilters = useCallback(() => {
     setWsSearch('');
@@ -576,7 +580,7 @@ export default function Sidebar({ chrome = 'full' }: { chrome?: 'full' | 'sheet'
       )}
       {narrowed && shownCount === 0 && (
         <div className="wmux-ws-filter-empty" data-ws-filter-empty>
-          <p>{t('sidebar.filter.noMatch')}</p>
+          <p>{t(noBookmarks ? 'sidebar.filter.noBookmarks' : 'sidebar.filter.noMatch')}</p>
           <button type="button" className="wmux-ws-filter-clear" onClick={clearFilters}>{t('sidebar.filter.clearAll')}</button>
         </div>
       )}

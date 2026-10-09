@@ -203,6 +203,9 @@ export const ko = {
   'sidebar.pinned': '상단 고정됨',
   'sidebar.pin': '상단에 고정',
   'sidebar.unpin': '고정 해제',
+  'sidebar.bookmarked': "북마크됨",
+  'sidebar.bookmark': "북마크",
+  'sidebar.unbookmark': "북마크 해제",
   // Workspace settle / snooze (shared/workspaceSettle).
   'workspaceSettle.settle': "마무리",
   'workspaceSettle.settleBlocked': "실행 중이거나 입력을 기다리거나 고정된 워크스페이스는 마무리할 수 없습니다",
@@ -399,6 +402,7 @@ export const ko = {
   'palette.cmd.openWorktaskCleanup': '태스크 정리 목록 열기',
   'palette.cmd.showGitDiff': 'Git Diff 보기',
   'palette.cmd.renameTab': '탭 이름 바꾸기',
+  'palette.cmd.toggleBookmark': "이 워크스페이스 북마크 켜기/끄기",
   'palette.cmd.showTaskDiff': '태스크 Diff 보기',
   // J3 — 태스크 정리 목록(WorktaskCleanupView)
   'worktask.cleanup.title': '태스크 정리 목록',
@@ -3694,6 +3698,9 @@ export const ko = {
   'sidebar.filter.noMatch': "일치하는 워크스페이스가 없습니다",
   'sidebar.filter.activeHidden': "선택한 워크스페이스가 필터로 숨겨져 있습니다",
   'sidebar.filter.remove': "{name} 해제",
+  'sidebar.filter.bookmarks': "북마크",
+  'sidebar.filter.bookmarked': "북마크만",
+  'sidebar.filter.noBookmarks': "아직 북마크한 워크스페이스가 없습니다. 워크스페이스를 우클릭하고 북마크를 선택하세요.",
 
   // PC rail (computer column)
   'settings.sc.prevPc': "이전 컴퓨터",
