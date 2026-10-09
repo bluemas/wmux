@@ -5,6 +5,7 @@ import { IconCheck } from '../icons';
 import type { FilterChip, WorkspaceFilter } from './workspaceFilter';
 
 const GROUPS: { titleKey: string; options: FilterChip[] }[] = [
+  { titleKey: 'sidebar.filter.bookmarks', options: [{ group: 'bookmarked', value: true }] },
   { titleKey: 'sidebar.filter.status', options: [
     { group: 'status', value: 'needsYou' }, { group: 'status', value: 'running' },
     { group: 'status', value: 'usageWaiting' }, { group: 'status', value: 'idle' },
@@ -21,11 +22,15 @@ const GROUPS: { titleKey: string; options: FilterChip[] }[] = [
 
 /** The i18n key naming one check (also the chip's label). */
 export function filterChipKey(chip: FilterChip): string {
-  return chip.group === 'hideTasks' ? 'sidebar.filter.hideTasks' : `sidebar.filter.${chip.group}.${chip.value}`;
+  if (chip.group === 'hideTasks') return 'sidebar.filter.hideTasks';
+  if (chip.group === 'bookmarked') return 'sidebar.filter.bookmarked';
+  return `sidebar.filter.${chip.group}.${chip.value}`;
 }
 
 export function chipOn(filter: WorkspaceFilter, chip: FilterChip): boolean {
-  return chip.group === 'hideTasks' ? filter.hideTasks : (filter[chip.group] as string[]).includes(chip.value);
+  if (chip.group === 'hideTasks') return filter.hideTasks;
+  if (chip.group === 'bookmarked') return filter.bookmarked;
+  return (filter[chip.group] as string[]).includes(chip.value);
 }
 
 /**

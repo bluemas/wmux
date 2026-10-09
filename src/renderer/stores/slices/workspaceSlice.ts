@@ -744,10 +744,13 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
         if (foldKeys.some((k) => k === id || k.endsWith(`:${id}`) || k.includes(`:${id}:`))) {
           set((s: StoreState) => { dropOwnerFoldKeys(s.sidebarTaskGroupExpanded, id); });
         }
-        // Glance board: a removed workspace keeps no pin or new-workspace hold.
-        if (get().sidebarPinnedIds?.includes(id) || get().sidebarNewAt?.[id] !== undefined) {
+        // Glance board: a removed workspace keeps no pin, bookmark or
+        // new-workspace hold.
+        if (get().sidebarPinnedIds?.includes(id) || get().sidebarBookmarkedIds?.includes(id)
+          || get().sidebarNewAt?.[id] !== undefined) {
           set((s: StoreState) => {
             s.sidebarPinnedIds = s.sidebarPinnedIds.filter((p) => p !== id);
+            s.sidebarBookmarkedIds = (s.sidebarBookmarkedIds ?? []).filter((b) => b !== id);
             delete s.sidebarNewAt[id];
           });
         }
@@ -1411,6 +1414,10 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
         const liveIds = new Set((data.workspaces ?? []).map((w) => w.id));
         state.sidebarPinnedIds = Array.isArray(data.sidebarPinnedIds)
           ? [...new Set(data.sidebarPinnedIds.filter((id): id is string => typeof id === 'string' && liveIds.has(id)))]
+          : [];
+        // Bookmarks: only ids of workspaces this session restores, once each.
+        state.sidebarBookmarkedIds = Array.isArray(data.sidebarBookmarkedIds)
+          ? [...new Set(data.sidebarBookmarkedIds.filter((id): id is string => typeof id === 'string' && liveIds.has(id)))]
           : [];
         // Pinned to top (2026-09-26): a pin used to hold a row's manual slot
         // in the Attention order. Sessions saved then keep their pins, and the

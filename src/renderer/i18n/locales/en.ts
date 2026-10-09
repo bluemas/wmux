@@ -207,6 +207,9 @@ export const en = {
   'sidebar.pinned': 'Pinned to top',
   'sidebar.pin': 'Pin to top',
   'sidebar.unpin': 'Unpin',
+  'sidebar.bookmarked': "Bookmarked",
+  'sidebar.bookmark': "Bookmark",
+  'sidebar.unbookmark': "Remove bookmark",
   // Workspace settle / snooze (shared/workspaceSettle).
   'workspaceSettle.settle': "Settle",
   'workspaceSettle.settleBlocked': "A running, waiting or pinned workspace cannot settle",
@@ -696,6 +699,7 @@ export const en = {
   'palette.cmd.openWorktaskCleanup': 'Open Task Cleanup List',
   'palette.cmd.showGitDiff': 'Show Git Diff',
   'palette.cmd.renameTab': 'Rename Tab',
+  'palette.cmd.toggleBookmark': "Toggle bookmark for this workspace",
   'palette.cmd.showTaskDiff': 'Show Task Diff',
   // J3 — task cleanup list (WorktaskCleanupView)
   'worktask.cleanup.title': 'Task Cleanup List',
@@ -4252,6 +4256,9 @@ export const en = {
   'sidebar.filter.noMatch': "No workspaces match",
   'sidebar.filter.activeHidden': "The selected workspace is hidden by the filter",
   'sidebar.filter.remove': "Remove {name}",
+  'sidebar.filter.bookmarks': "Bookmarks",
+  'sidebar.filter.bookmarked': "Bookmarked only",
+  'sidebar.filter.noBookmarks': "No bookmarked workspaces yet. Right-click a workspace and choose Bookmark.",
 
   // PC rail (computer column)
   'settings.sc.prevPc': "Previous computer",

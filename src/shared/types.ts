@@ -975,6 +975,9 @@ export interface SessionData {
   /** Workspaces pinned to the top of the sidebar (2026-09-26; before that a pin
    *  held a manual slot in the Attention order — same shape, loaded as pinned-to-top). */
   sidebarPinnedIds?: string[];
+  /** Bookmarked workspaces: a mark the sidebar filter can narrow to. Unlike a
+   *  pin it never changes the order. */
+  sidebarBookmarkedIds?: string[];
   /** #1481 — expanded sidebar width in px. Clamped on load. */
   sidebarWidth?: number;
   /** #1481 — owner workspace id → user-chosen expansion of its fan-out task group. */

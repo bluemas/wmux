@@ -26,12 +26,14 @@ export interface WorkspaceFilter {
   other: OtherFacet[];
   /** Hide fan-out task workspaces (applies on its own, like a group). */
   hideTasks: boolean;
+  /** Show only bookmarked workspaces (applies on its own, like a group). */
+  bookmarked: boolean;
 }
 
-export const EMPTY_FILTER: WorkspaceFilter = { status: [], kind: [], agent: [], other: [], hideTasks: false };
+export const EMPTY_FILTER: WorkspaceFilter = { status: [], kind: [], agent: [], other: [], hideTasks: false, bookmarked: false };
 
 export function isFilterActive(f: WorkspaceFilter): boolean {
-  return f.status.length + f.kind.length + f.agent.length + f.other.length > 0 || f.hideTasks;
+  return f.status.length + f.kind.length + f.agent.length + f.other.length > 0 || f.hideTasks || f.bookmarked;
 }
 
 /** What a workspace is, for the filter. */
@@ -42,6 +44,9 @@ export interface WorkspaceFacts {
   hasPr: boolean;
   hasChanges: boolean;
   isTask: boolean;
+  /** Bookmarked itself, or a nested fan-out task of a bookmarked owner (the
+   *  tasks travel with the row they nest under). */
+  isBookmarked: boolean;
 }
 
 /**
@@ -70,6 +75,7 @@ export function matchesFilter(f: WorkspaceFilter, facts: WorkspaceFacts): boolea
   if (f.other.length > 0 && !f.other.some((o) =>
     (o === 'pr' && facts.hasPr) || (o === 'changes' && facts.hasChanges) || (o === 'tasks' && facts.isTask))) return false;
   if (f.hideTasks && facts.isTask) return false;
+  if (f.bookmarked && !facts.isBookmarked) return false;
   return true;
 }
 
@@ -79,10 +85,12 @@ export type FilterChip =
   | { group: 'kind'; value: KindFacet }
   | { group: 'agent'; value: AgentFacet }
   | { group: 'other'; value: OtherFacet }
-  | { group: 'hideTasks'; value: true };
+  | { group: 'hideTasks'; value: true }
+  | { group: 'bookmarked'; value: true };
 
 export function filterChips(f: WorkspaceFilter): FilterChip[] {
   return [
+    ...(f.bookmarked ? [{ group: 'bookmarked' as const, value: true as const }] : []),
     ...f.status.map((value) => ({ group: 'status' as const, value })),
     ...f.kind.map((value) => ({ group: 'kind' as const, value })),
     ...f.agent.map((value) => ({ group: 'agent' as const, value })),
@@ -93,6 +101,7 @@ export function filterChips(f: WorkspaceFilter): FilterChip[] {
 
 /** The filter with one check turned on or off. */
 export function toggleFacet(f: WorkspaceFilter, chip: FilterChip): WorkspaceFilter {
+  if (chip.group === 'bookmarked') return { ...f, bookmarked: !f.bookmarked };
   if (chip.group === 'hideTasks') {
     // Hiding tasks and showing only tasks cannot both hold.
     return { ...f, hideTasks: !f.hideTasks, other: f.hideTasks ? f.other : f.other.filter((o) => o !== 'tasks') };
@@ -110,6 +119,7 @@ export function toggleFacet(f: WorkspaceFilter, chip: FilterChip): WorkspaceFilt
 export function selectWorkspaceFactKeys(state: StoreState): Record<string, string> {
   const status = selectAllWorkspaceAgentStatus(state);
   const silent = selectAllWorkspaceUnverifiableMinutes(state);
+  const bookmarked = new Set(state.sidebarBookmarkedIds ?? []);
   const out: Record<string, string> = {};
   for (const ws of state.workspaces) {
     const agents = [...new Set(getWorkspacePtyIds(ws)
@@ -117,20 +127,24 @@ export function selectWorkspaceFactKeys(state: StoreState): Record<string, strin
       .filter((a): a is NonNullable<typeof a> => Boolean(a?.name))
       .map((a) => agentFacet(a.slug)))].sort();
     const sync = ws.metadata?.gitSync;
-    const isTask = resolveTaskLink(state.missionByPaneGroup[ws.id], state.fanoutLineage[ws.id], state.fanoutSpawnOwner[ws.id]) !== null;
+    const link = resolveTaskLink(state.missionByPaneGroup[ws.id], state.fanoutLineage[ws.id], state.fanoutSpawnOwner[ws.id]);
+    const isTask = link !== null;
+    const nestedOwner = link && !link.detached ? link.ownerId : undefined;
+    const isBookmarked = bookmarked.has(ws.id) || (!!nestedOwner && bookmarked.has(nestedOwner));
     out[ws.id] = [
       statusFacet(status[ws.id] ?? 'idle', (silent[ws.id] ?? 0) > 0, workspaceHasUsageLimitWaiting(state, ws.id)),
       agents.join(','),
       ws.metadata?.pr ? 1 : 0,
       sync && (sync.dirty > 0 || sync.ahead > 0) ? 1 : 0,
       isTask ? 1 : 0,
+      isBookmarked ? 1 : 0,
     ].join('|');
   }
   return out;
 }
 
 export function factsFromKey(key: string): WorkspaceFacts {
-  const [status, agents, pr, changes, task] = key.split('|');
+  const [status, agents, pr, changes, task, bookmarked] = key.split('|');
   const list = agents ? (agents.split(',') as AgentFacet[]) : [];
   return {
     status: status as StatusFacet,
@@ -139,5 +153,6 @@ export function factsFromKey(key: string): WorkspaceFacts {
     hasPr: pr === '1',
     hasChanges: changes === '1',
     isTask: task === '1',
+    isBookmarked: bookmarked === '1',
   };
 }

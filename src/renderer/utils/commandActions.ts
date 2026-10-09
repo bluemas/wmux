@@ -46,6 +46,17 @@ export function toggleAgentToolbarPin(): void {
   state.setAgentToolbarPinned(!state.agentToolbarPinned);
 }
 
+/**
+ * Bookmark or un-bookmark the active local workspace (the row menu's
+ * Bookmark, for the keyboard). Nothing while a remote mirror is on screen:
+ * the local selection is only remembered then, not shown.
+ */
+export function toggleActiveWorkspaceBookmark(): void {
+  const state = useStore.getState();
+  if (isRemoteMirrorVisible(state) || !state.activeWorkspaceId) return;
+  state.toggleSidebarBookmark(state.activeWorkspaceId);
+}
+
 /** J3 §1 — the task cleanup list (a disk scan of the dedicated root). */
 export function openWorktaskCleanup(): void {
   useStore.getState().setWorktaskCleanupVisible(true);
