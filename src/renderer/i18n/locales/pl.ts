@@ -215,6 +215,9 @@ export const pl = {
   'sidebar.pinned': 'Przypięte na górze',
   'sidebar.pin': 'Przypnij na górze',
   'sidebar.unpin': 'Odepnij',
+  'sidebar.bookmarked': "Dodano do zakładek",
+  'sidebar.bookmark': "Dodaj do zakładek",
+  'sidebar.unbookmark': "Usuń z zakładek",
   // Workspace settle / snooze (shared/workspaceSettle).
   'workspaceSettle.settle': "Oznacz jako zakończony",
   'workspaceSettle.settleBlocked': "Działającego, oczekującego lub przypiętego obszaru roboczego nie można oznaczyć jako zakończony",
@@ -685,6 +688,7 @@ export const pl = {
   'palette.cmd.openWorktaskCleanup': 'Otwórz listę porządkowania zadań',
   'palette.cmd.showGitDiff': 'Pokaż diff Git',
   'palette.cmd.renameTab': 'Zmień nazwę karty',
+  'palette.cmd.toggleBookmark': "Przełącz zakładkę dla tego obszaru roboczego",
   'palette.cmd.showTaskDiff': 'Pokaż diff zadania',
   // J3 — task cleanup list (WorktaskCleanupView)
   'worktask.cleanup.title': 'Lista porządkowania zadań',
@@ -3900,4 +3904,7 @@ export const pl = {
   'sidebar.filter.noMatch': "Brak pasujących obszarów roboczych",
   'sidebar.filter.activeHidden': "Wybrany obszar roboczy jest ukryty przez filtr",
   'sidebar.filter.remove': "Usuń {name}",
+  'sidebar.filter.bookmarks': "Zakładki",
+  'sidebar.filter.bookmarked': "Tylko z zakładek",
+  'sidebar.filter.noBookmarks': "Brak obszarów roboczych w zakładkach. Kliknij obszar roboczy prawym przyciskiem i wybierz Dodaj do zakładek.",
 } as const;

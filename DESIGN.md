@@ -443,7 +443,8 @@ leaves the page.
   buttons (new workspace, filter). 264px by default, resizable 220–400px from
   the inner edge.
 - **Workspace filter:** the filter button (or Ctrl/Cmd+F) opens a popover —
-  the text search on top, then checks for **status** (Needs you, Running,
+  the text search on top, then checks for **bookmarks** (Bookmarked only),
+  **status** (Needs you, Running,
   Waiting (usage limit), Idle — the sidebar's own classification; Waiting
   applies where the row would otherwise be idle, like its clock mark),
   **kind** (has an agent, terminal only), **agent** (Claude Code, Codex,
@@ -985,6 +986,17 @@ no empty reply row or reserved gap under the latest prompt.
   takes the target row's pin state, so dropping beside a pinned row pins and
   beside an unpinned row unpins. Pinning lands the row at the end of the
   group; unpinning at the top of the rest.
+- **Bookmarked:** row menu › Bookmark / Remove bookmark (or the palette's
+  "Toggle bookmark for this workspace"), on any row but Moa's HQ. A bookmark
+  never moves a row — order is the pin's job — and only feeds the filter's
+  Bookmarked only check, where a bookmarked owner keeps its nested fan-out
+  tasks. A bookmarked row carries a muted ribbon glyph after the pin's place
+  (`--text-muted`, never a colour: a bookmark is the user's mark, not a
+  state). Ctrl+N and drag keep the stored order while the check is on, as
+  under every filter; a selected row it hides is called out like any filter.
+  With nothing bookmarked the empty list says how to bookmark. Bookmarks
+  persist with the session; the check, like every filter check, lasts for
+  the session.
 - **Changed since you last looked:** a 6px `--text-main` dot (never amber —
   Fleet's rule) after the name, on the workspace row and on the agent row,
   when an agent tab's status or pending question changed (any number of

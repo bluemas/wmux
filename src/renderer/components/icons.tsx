@@ -489,6 +489,11 @@ export function IconMoreVertical({ size = 14 }: { size?: number }) {
 }
 
 /** Pin — a row that keeps its place in the sidebar's Attention order. */
+/** Bookmark ribbon — a bookmarked workspace (sidebar row mark, filter). */
+export function IconBookmark({ size = 14 }: { size?: number }) {
+  return <Icon size={size}><path d="M4.2 1.8 H9.8 V12.2 L7 9.8 L4.2 12.2 Z" /></Icon>;
+}
+
 export function IconPin({ size = 14 }: { size?: number }) {
   return (
     <Icon size={size}>

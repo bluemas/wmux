@@ -44,6 +44,9 @@ export const zh = {
   'sidebar.pinned': '已置顶',
   'sidebar.pin': '置顶',
   'sidebar.unpin': '取消置顶',
+  'sidebar.bookmarked': "已加书签",
+  'sidebar.bookmark': "添加书签",
+  'sidebar.unbookmark': "移除书签",
   // Workspace settle / snooze (shared/workspaceSettle).
   'workspaceSettle.settle': "收尾",
   'workspaceSettle.settleBlocked': "运行中、等待输入或已置顶的工作区无法收尾",
@@ -1063,6 +1066,7 @@ export const zh = {
   'palette.cmd.openWorktaskCleanup': '打开任务清理列表',
   'palette.cmd.showGitDiff': '显示 Git 差异',
   'palette.cmd.renameTab': '重命名标签',
+  'palette.cmd.toggleBookmark': "切换此工作区的书签",
   'palette.cmd.showTaskDiff': '显示任务差异',
   'worktask.cleanup.title': '任务清理列表',
   'worktask.cleanup.rescan': '重新扫描',
@@ -3075,4 +3079,7 @@ export const zh = {
   'sidebar.filter.noMatch': "没有匹配的工作区",
   'sidebar.filter.activeHidden': "所选工作区被筛选隐藏",
   'sidebar.filter.remove': "移除 {name}",
+  'sidebar.filter.bookmarks': "书签",
+  'sidebar.filter.bookmarked': "仅显示书签",
+  'sidebar.filter.noBookmarks': "还没有加书签的工作区。右键点击工作区并选择“添加书签”。",
 } as const;

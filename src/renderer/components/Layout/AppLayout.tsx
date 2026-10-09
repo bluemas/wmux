@@ -441,6 +441,7 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
     sidebarSortMode: state.sidebarSortMode,
     sidebarSortModeChosen: state.sidebarSortModeChosen,
     sidebarPinnedIds: state.sidebarPinnedIds,
+    sidebarBookmarkedIds: state.sidebarBookmarkedIds,
     sidebarWidth: state.sidebarWidth,
     sidebarTaskGroupExpanded: state.sidebarTaskGroupExpanded,
     // A dismissed question must stay dismissed across a restart: the PTY

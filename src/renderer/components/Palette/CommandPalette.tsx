@@ -27,6 +27,7 @@ import {
   showGitDiff,
   stashActivePane,
   toggleAgentToolbarPin,
+  toggleActiveWorkspaceBookmark,
 } from '../../utils/commandActions';
 
 // ---------------------------------------------------------------------------
@@ -381,6 +382,11 @@ export default function CommandPalette() {
         label: t('palette.cmd.renameTab'),
         shortcut: 'renameTab',
         action: () => { setVisible(false); renameActiveTab(); },
+      },
+      {
+        // No default key: bookmarking is occasional, and the row menu has it.
+        label: t('palette.cmd.toggleBookmark'),
+        action: () => { toggleActiveWorkspaceBookmark(); setVisible(false); },
       },
     ];
 

@@ -14,7 +14,7 @@ import { attentionPulseClass } from './attentionBlink';
 import { usePrefersReducedMotion } from '../ui/MediaPreview';
 import { workspaceHasUsageLimitWaiting } from '../../stores/slices/usageLimitSlice';
 import { selectWorkspaceAttentionClasses } from '../../stores/selectors/fleet';
-import { IconCopy, IconX, IconGear, IconChevron, IconBell, IconFolder, IconTerminal, IconExternalLink, IconCheck, IconGitBranch, IconWorktree, IconWarning, IconFanOut, IconPin } from '../icons';
+import { IconCopy, IconX, IconGear, IconChevron, IconBell, IconFolder, IconTerminal, IconExternalLink, IconCheck, IconGitBranch, IconWorktree, IconWarning, IconFanOut, IconPin, IconBookmark } from '../icons';
 import { tokenAttrs } from '../../themes';
 import { HIT_TARGET_24_CLUSTER, HIT_TARGET_24_IN_CLUSTER } from '../hitArea';
 import { buildWorkspaceMarkdown } from '../../utils/sessionInfoMarkdown';
@@ -495,6 +495,9 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumb
   const sortMode = useStore((s) => s.sidebarSortMode);
   const sortPaused = sortMode !== 'manual';
   const pinned = useStore((s) => s.sidebarPinnedIds.includes(workspaceId));
+  // A bookmark is a mark for the sidebar filter, never an order: no reorder
+  // or settle rule reads it.
+  const bookmarked = useStore((s) => s.sidebarBookmarkedIds.includes(workspaceId));
   const reorderOff = taskRow || moaHq || (sortPaused && !pinned);
   const setTerminalTextDropDragActive = useStore((s) => s.setTerminalTextDropDragActive);
 
@@ -585,6 +588,7 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumb
     mode: blinkMode, remindMs: blinkRemindMs, finished: blinkFinished,
   });
   const toggleSidebarPin = useStore((s) => s.toggleSidebarPin);
+  const toggleSidebarBookmark = useStore((s) => s.toggleSidebarBookmark);
   // Settle / snooze (main owns both; the menu only sends the verbs). Scalars,
   // so a push about another workspace does not re-render this row.
   const workspaceSettled = useStore((s) => !!s.workspaceSettle.states[workspaceId]?.settled);
@@ -1365,6 +1369,12 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumb
                     <IconPin size={10} />
                   </span>
                 )}
+                {/* Neutral like the pin: a bookmark is the user's own mark, not a state. */}
+                {bookmarked && !moaHq && (
+                  <span className="flex-none text-[var(--text-muted)]" role="img" aria-label={t('sidebar.bookmarked')} title={t('sidebar.bookmarked')} data-sidebar-bookmarked>
+                    <IconBookmark size={10} />
+                  </span>
+                )}
                 {hasProfile && (
                   <span
                     className="text-[10px] leading-none flex-shrink-0 text-[var(--accent-blue)]"
@@ -1599,6 +1609,18 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumb
               data-workspace-action="pin"
             >
               {pinned ? t('sidebar.unpin') : t('sidebar.pin')}
+            </button>
+          )}
+          {/* Bookmark: a mark the filter's "Bookmarked only" narrows to. Unlike
+              a pin it never moves the row, so a task row can carry one too. */}
+          {!moaHq && (
+            <button
+              className="w-full text-left px-3 py-1.5 text-xs transition-colors hover:bg-[var(--bg-overlay)]"
+              style={{ color: 'var(--text-main)' }}
+              onClick={() => { setMenuPos(null); toggleSidebarBookmark(workspaceId); }}
+              data-workspace-action="bookmark"
+            >
+              {bookmarked ? t('sidebar.unbookmark') : t('sidebar.bookmark')}
             </button>
           )}
           {/* Settle / snooze: visibility only — the workspace moves to the
