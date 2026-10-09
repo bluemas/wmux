@@ -33,6 +33,15 @@ import {
 /** Collect all leaf panes from a pane tree (canonical walk, aliased locally). */
 const collectLeafPanes = getLeafPanes;
 
+/** A leaf's working directory: its active terminal's cwd, else the first
+ *  terminal's that has one, else ''. */
+function leafCwd(leaf: PaneLeaf): string {
+  const isTerminal = (s: PaneLeaf['surfaces'][number]) => (s.surfaceType ?? 'terminal') === 'terminal' && !!s.cwd;
+  const active = leaf.surfaces.find((s) => s.id === leaf.activeSurfaceId);
+  if (active && isTerminal(active)) return active.cwd;
+  return leaf.surfaces.find(isTerminal)?.cwd ?? '';
+}
+
 /**
  * Cold-park (TASK-9) is safe ONLY for terminal-only workspaces. Unmounting a
  * pane tree that holds a browser (live webview session), editor (unsaved local
@@ -455,6 +464,9 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
         ...(color ? { color } : {}),
         ...(ws.profile ? { profile: ws.profile } : {}),
         tree: extractLayout(ws.rootPane),
+        // extractLayout keeps only the shape (it also saves layout templates,
+        // which must not carry paths), so each leaf's directory travels here.
+        leafCwds: collectLeafPanes(ws.rootPane).map(leafCwd),
         archivedAt: Date.now(),
       };
       get().removeWorkspace(id);
@@ -488,6 +500,13 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
         ws.nextPaneOrdinal = assignPaneOrdinals(rootPane, 1);
         ws.rootPane = rootPane;
         ws.activePaneId = leaves[0]?.id ?? rootPane.id;
+        // Reopen each terminal where it was: the restored leaves are empty, and
+        // without a seed the funnel opens them in the startup directory (~).
+        // Same leaf order as the archive (both walk the tree depth-first).
+        leaves.forEach((leaf, i) => {
+          const cwd = archived.leafCwds?.[i];
+          if (typeof cwd === 'string' && cwd) state.projectPaneSeed[leaf.id] = { cwd };
+        });
         const color = normalizeWorkspaceColor(archived.color);
         if (color) ws.color = color;
         // Same sanitize policy every other profile-entry path runs
