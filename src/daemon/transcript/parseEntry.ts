@@ -13,7 +13,7 @@
 // Entry classes observed in a real transcript (Claude Code 2.1.206) and what
 // they map to here:
 //   user / assistant                → the conversation (see below)
-//   pr-link                         → meta
+//   pr-link                         → meta (`pr_link`)
 //   system, last-prompt, mode, permission-mode, attachment,
 //   file-history-snapshot, ai-title, queue-operation, anything unknown → []
 //
@@ -103,7 +103,11 @@ export function parseTranscriptLineDetailed(
   // because it is a real, user-visible outcome of the turn; the rest carry no
   // conversation content at all.
   if (type === 'pr-link') {
-    return single(metaEvent(baseId, ts, 'unknown', prLinkLabel(entry)), empty);
+    const pr = prLinkFields(entry);
+    // Without a usable http(s) url the row stays a neutral chip, and whatever
+    // string the entry held is not echoed into its label.
+    if (!pr) return single(metaEvent(baseId, ts, 'unknown', 'pull request'), empty);
+    return single({ ...metaEvent(baseId, ts, 'pr_link', pr.url), ...pr }, empty);
   }
   // A prompt the human queued while tools ran reaches the model as an
   // attachment, never as a `user` entry (Claude Code 2.1.282, probed 2026-09-25).
@@ -638,12 +642,63 @@ function metaEvent(
   return { id, kind: 'meta', subtype, label: label.slice(0, 200), ...tsOf(ts) };
 }
 
-function prLinkLabel(entry: Record<string, unknown>): string {
-  for (const key of ['url', 'prUrl', 'link']) {
-    const value = entry[key];
-    if (typeof value === 'string' && value) return value;
+/** Longest url a `pr_link` row carries; anything longer is not a PR link. */
+const MAX_PR_URL_CHARS = 2048;
+
+/** `owner/name`, each part a GitHub-style name. */
+const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+
+/** `/owner/name/pull/123` at the start of a url path. */
+const PULL_PATH_RE = /^\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)(?:\/|$)/i;
+
+/**
+ * `value` as a `pr_link` url: an http(s) url of bounded length, with any
+ * user name or password removed — or null.
+ */
+function prUrlOf(value: unknown): { url: string; parsed: URL } | null {
+  if (typeof value !== 'string' || !value || value.length > MAX_PR_URL_CHARS) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return null;
   }
-  return 'pull request';
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return null;
+  if (!parsed.username && !parsed.password) return { url: value, parsed };
+  parsed.username = '';
+  parsed.password = '';
+  return { url: parsed.href, parsed };
+}
+
+/**
+ * The structured fields of a `pr-link` entry, or null when it names no http(s)
+ * url. Claude Code writes `prUrl`, `prNumber` and `prRepository` (2.1.x,
+ * observed 2026-10-08), so `prUrl` is tried first and the first key holding a
+ * usable url wins. The explicit fields win over the url, and a
+ * `/owner/name/pull/N` url path fills in whichever is missing.
+ */
+function prLinkFields(entry: Record<string, unknown>): { url: string; number?: number; repo?: string } | null {
+  let found: { url: string; parsed: URL } | null = null;
+  for (const key of ['prUrl', 'url', 'link']) {
+    found = prUrlOf(entry[key]);
+    if (found) break;
+  }
+  if (!found) return null;
+  const { url, parsed } = found;
+  const fromPath = PULL_PATH_RE.exec(parsed.pathname);
+  const rawNumber = entry['prNumber'];
+  const number = typeof rawNumber === 'number' && Number.isSafeInteger(rawNumber) && rawNumber > 0
+    ? rawNumber
+    : fromPath ? Number(fromPath[3]) : undefined;
+  const rawRepo = entry['prRepository'];
+  const repo = typeof rawRepo === 'string' && REPO_RE.test(rawRepo)
+    ? rawRepo
+    : fromPath ? `${fromPath[1]}/${fromPath[2]}` : undefined;
+  return {
+    url,
+    ...(number !== undefined && Number.isSafeInteger(number) && number > 0 ? { number } : {}),
+    ...(repo !== undefined ? { repo } : {}),
+  };
 }
 
 function single(event: TurnEvent, empty: ParsedTranscriptLine): ParsedTranscriptLine {
