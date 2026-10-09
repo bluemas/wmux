@@ -3714,7 +3714,7 @@ function TabAppearance() {
         </SettingRow>
         {/* Off by default for the same reason: memory and CPU otherwise appear
             only when memory is worth interrupting for. */}
-        <SettingRow label={t('settings.titlebarVitals')} description={t('settings.titlebarVitalsDesc')}>
+        <SettingRow id="titlebarvitals" label={t('settings.titlebarVitals')} description={t('settings.titlebarVitalsDesc')}>
           <Toggle
             checked={titlebarVitalsAlwaysVisible}
             onChange={setTitlebarVitalsAlwaysVisible}

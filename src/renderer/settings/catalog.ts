@@ -122,6 +122,7 @@ export const SETTINGS_CATALOG: SettingsCatalogEntry[] = [
   { id: 'workspacesettleidle', tab: 'appearance', labelKey: 'settings.workspaceSettleIdleDays', descKey: 'settings.workspaceSettleIdleDaysDesc', synonyms: 'settle settled idle days finished snooze hide quiet sidebar 마무리 미뤄두기 유휴' },
   { id: 'multiview', tab: 'appearance', labelKey: 'settings.multiviewArrangement', descKey: 'settings.multiviewArrangementDesc', synonyms: 'grid split stack columns rows' },
   { id: 'uiscale', tab: 'appearance', labelKey: 'settings.uiScale', descKey: 'settings.uiScaleDesc', synonyms: 'zoom dpi accessibility scale 배율' },
+  { id: 'titlebarvitals', tab: 'appearance', labelKey: 'settings.titlebarVitals', descKey: 'settings.titlebarVitalsDesc', synonyms: 'memory ram cpu usage gauge chip titlebar status vitals 메모리 사용량 타이틀바' },
   { id: 'toolbar', tab: 'appearance', labelKey: 'settings.agentToolbarShow', descKey: 'settings.agentToolbarShowDesc', synonyms: 'toolbar compose new chat' },
 
   { id: 'sound', tab: 'notifications', labelKey: 'settings.sound', descKey: 'settings.soundDesc', synonyms: 'sound audio beep alarm 소리' },
