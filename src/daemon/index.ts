@@ -71,7 +71,7 @@ import type { WebTlsConfig } from '../shared/web';
 import { generateSnapshotUnqueued, enqueueSnapshotJob, generateTextSnapshot, generateTextSnapshotUnqueued, capTextRowsToFrameBudget, MAX_SCROLLBACK, type TextSnapshotOutcome } from './HeadlessSnapshot';
 import { readSessionTextReplay } from './sessionTextReplay';
 import { serializeSession } from './sessionSerialize';
-import { AwaitingScreenVerifier, renderPaneScreen } from './AwaitingScreenVerifier';
+import { AwaitingScreenVerifier, questionInFlight, renderPaneScreen } from './AwaitingScreenVerifier';
 import { screenShowsAgentDialog } from './transcript/chatScreenGate';
 import { ApprovalPushRouter } from './push/approvalPushRouter';
 import { readPendingToolUse } from './transcript/pendingToolUse';
@@ -348,6 +348,8 @@ let noteCodexServerLost: ((id:string)=>void) | undefined;
 let noteCodexTurnFailed: ((id:string, threadId:string, turn:unknown)=>void) | undefined;
 /** The `turn_failed` push (contract §7), set at boot once the push sender exists. */
 let pushTurnFailed: ((sessionId:string, failure:TurnFailure)=>void) | undefined;
+/** Re-run a pane's awaiting verification (#1901), set by wireEvents. */
+let reverifyAwaiting: ((sessionId: string) => void) | undefined;
 // Late-bound: the pipe server that carries notices exists only after boot.
 let notifyCodexIdentityRefused: ((id:string,reason:string)=>void) | undefined;
 const codexRefusalNoticedAt = new Map<string,number>();
@@ -6037,8 +6039,26 @@ function wireEvents(
     holdsPrompt: (id) => approvalRegistry?.list().pending
       // An agent-held (native) decision is not a dialog on this screen.
       .some((request) => request.sessionId === id && request.kind === 'terminal_prompt' && !isNativeDecision(request)) === true,
+    // #1901 — an AskUserQuestion still in flight, consulted on a narrow grid only.
+    holdsQuestion: (id) => {
+      const managed = sessionManager.getSession(id);
+      return !!managed && questionInFlight({
+        sessionId: id,
+        pending: approvalRegistry?.list().pending ?? [],
+        agentAlive: agentProcessTracker.identityFor(id)?.alive,
+        commandRunning: managed.promptLog.commandRunningIfKnown(),
+      });
+    },
     log: (level, message) => log(level, message),
   });
+  // A question record that ends (answered, expired, superseded) or an agent
+  // that exits changes the verdict without drawing anything: judge again now.
+  approvalRegistry?.onEvent((event) => {
+    if (event.type !== 'create' && event.type !== 'press' && event.request.kind === 'awaiting_input') {
+      awaitingVerifier.trigger(event.request.sessionId, 'signal');
+    }
+  });
+  reverifyAwaiting = (sessionId) => awaitingVerifier.trigger(sessionId, 'signal');
   const forgetAwaiting = (payload: { id: string }): void => awaitingVerifier.forget(payload.id);
   sessionManager.on('session:died', forgetAwaiting);
   sessionManager.on('session:destroyed', forgetAwaiting);
@@ -7936,6 +7956,8 @@ async function main(): Promise<void> {
     if (!state.alive) automationEngine?.onAgentProcessExit(sessionId);
     // The agent that hit the limit is gone; a relaunch is a new agent.
     if (!state.alive) usageLimits?.drop(sessionId);
+    // A question its agent can no longer be waiting on stops holding the pane.
+    if (!state.alive) reverifyAwaiting?.(sessionId);
     // A Codex launch edge opens a fresh cwd-bind window; a death edge closes it.
     codexCwdBinder?.reset(sessionId);
     codexProcessStart.delete(sessionId);
