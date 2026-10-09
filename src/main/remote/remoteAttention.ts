@@ -16,6 +16,7 @@
 // turn view, which is a per-pane phone affordance rather than a fleet signal.
 
 import type { NotificationCategory, NotificationType } from '../../shared/types';
+import { REMOTE_LIMITS, remoteId } from '../../shared/remoteLimits';
 
 /** The recorded attention kinds the daemon publishes (WebTerminalServer). */
 export type RemoteAttentionKind = 'critical' | 'notify' | 'approval';
@@ -41,8 +42,8 @@ const SEEN_CAP = 200;
  * this from" prefix. Same reflex as RemoteHostClient, which already truncates
  * every remote-supplied string it surfaces.
  */
-const MAX_TITLE_CHARS = 120;
-const MAX_BODY_CHARS = 240;
+const MAX_TITLE_CHARS = REMOTE_LIMITS.attentionTitle;
+const MAX_BODY_CHARS = REMOTE_LIMITS.attentionBody;
 
 function str(v: unknown): string {
   return typeof v === 'string' ? v : '';
@@ -79,7 +80,7 @@ export function formatRemoteAttention(
     if (data.tier !== 'act') return null;
     const tool = clean(data.toolName, MAX_TITLE_CHARS);
     const summary = clean(data.toolInputSummary, MAX_BODY_CHARS);
-    const detail = tool && summary ? `${tool}: ${summary}` : tool || summary;
+    const detail = (tool && summary ? `${tool}: ${summary}` : tool || summary).slice(0, MAX_BODY_CHARS);
     return {
       title: 'Approval needed',
       body: detail || 'An agent is waiting for your decision.',
@@ -160,14 +161,16 @@ export class RemoteAttentionGate {
     if (event !== 'critical' && event !== 'notify' && event !== 'approval') return null;
     const parsed = safeParse(data);
     if (!parsed) return null;
-    const sessionId = str(parsed.sessionId);
+    // Bounded like every other id from a remote host: the epoch and session
+    // id are kept in the dedup set below, so their length is what it costs.
+    const sessionId = remoteId(parsed.sessionId);
     if (!sessionId) return null;
 
     // An event with no numeric id and no epoch can be neither placed against
     // the replay boundary nor deduped against the pane-stream tee of itself.
     // Firing it would defeat both gates at once, so it is dropped.
     const id = typeof parsed.id === 'number' ? parsed.id : null;
-    const epoch = str(parsed.epoch);
+    const epoch = remoteId(parsed.epoch);
     if (id === null || !epoch) return null;
     if (id <= this.replayUntilId) return null; // replayed backlog
     const key = `${epoch}:${id}`;
