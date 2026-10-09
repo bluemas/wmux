@@ -427,6 +427,7 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
     paneActionsVisible: state.paneActionsVisible,
     chatViewEnabled: state.chatViewEnabled,
     titlebarClockVisible: state.titlebarClockVisible,
+    titlebarVitalsAlwaysVisible: state.titlebarVitalsAlwaysVisible,
     paneNewTerminalButton: state.paneNewTerminalButton,
     splitInheritsCwd: state.splitInheritsCwd,
     closeTabOnShellExit: state.closeTabOnShellExit,

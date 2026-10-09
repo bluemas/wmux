@@ -583,6 +583,9 @@ export const zh = {
   'settings.attentionBlinkFinishedPulse': '闪烁一次',
   'settings.sidebarLeft': '左',
   'settings.sidebarRight': '右',
+  'settings.titlebarVitals': '始终显示内存和 CPU',
+  'settings.titlebarVitalsDesc':
+    '默认关闭——关闭时，仅在内存占用变大时才显示内存和 CPU 指示。开启后两者始终显示在标题栏中。',
   'settings.currentVersion': '当前版本',
   'settings.latestVersion': '最新版本',
   'settings.updateReady': '更新已准备就绪',

@@ -873,6 +873,8 @@ export interface SessionData {
   // Titlebar wall-clock (2026-09-05). Default off; persisted so the people who
   // turn it on keep it across restarts.
   titlebarClockVisible?: boolean;
+  /** Memory/CPU chips at every reading. Default off; persisted like the clock. */
+  titlebarVitalsAlwaysVisible?: boolean;
   /** Experimental opt-in; absent means off. See uiSlice.paneNewTerminalButton. */
   paneNewTerminalButton?: boolean;
   scrollbackLines?: number;

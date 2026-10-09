@@ -35,6 +35,12 @@ describe('matchSettings', () => {
     expect(hits.map((h) => h.entry.id)).toEqual(['language']);
   });
 
+  it('finds the always-on memory and CPU chips by memory, CPU and a Korean synonym', () => {
+    for (const q of ['memory', 'cpu', '메모리']) {
+      expect(matchSettings(q, t).map((h) => h.entry.id)).toContain('titlebarvitals');
+    }
+  });
+
   it('counts hits per tab so the nav can show a badge', () => {
     const hits = matchSettings('cursor', t);
     expect(tabHitCount('appearance', hits)).toBeGreaterThan(0);

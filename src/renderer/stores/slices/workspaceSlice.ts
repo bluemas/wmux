@@ -1302,6 +1302,10 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       if (typeof data.titlebarClockVisible === 'boolean') {
         state.titlebarClockVisible = data.titlebarClockVisible;
       }
+      // Always-on memory/CPU chips — default OFF, same rule as the clock.
+      if (typeof data.titlebarVitalsAlwaysVisible === 'boolean') {
+        state.titlebarVitalsAlwaysVisible = data.titlebarVitalsAlwaysVisible;
+      }
       // Pane action cluster — default ON; only an explicit false hides it.
       if (typeof data.paneActionsVisible === 'boolean') {
         state.paneActionsVisible = data.paneActionsVisible;
