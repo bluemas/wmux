@@ -112,6 +112,7 @@ import { registerAutomationRpc } from './pipe/handlers/automation.rpc';
 import { registerWorktaskHandlers, type WorktaskServices } from './ipc/handlers/worktask.handler';
 import { registerWorktaskRpc } from './pipe/handlers/worktask.rpc';
 import { TaskAdoptService } from './worktask/TaskAdoptService';
+import { installE2EHooks } from './e2eHooks';
 import { TaskGateRunner, setSharedTaskGateRunner } from './worktask/TaskGateRunner';
 import { createHostedLedgerPort } from './worktask/ledgerPort';
 import { getProjectConfigStore } from './project/ProjectConfigStore';
@@ -534,6 +535,8 @@ const autoUpdater = new AutoUpdater(() => mainWindow, {
 // install waiter's post-exit verification (installTeardown.ts) covers it on
 // the update path.
 void app.whenReady().then(() => { try { warnOnInstallIntegrityGap(); } catch { /* best-effort */ } });
+// Dev-build-only e2e seam (e2e/): inert unless WMUX_E2E_HOOKS=1 on an unpackaged build.
+void app.whenReady().then(() => installE2EHooks());
 
 // ── Promoted browser flows: the idle sweep ─────────────────────────────────
 //
