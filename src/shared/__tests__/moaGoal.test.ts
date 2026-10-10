@@ -136,9 +136,21 @@ describe('buildMoaGoalCard', () => {
       contract({ doneCriteria: ['npm test passes'], evidence: ['vitest output'], constraints: ['no new dependencies'] }),
       () => undefined,
     );
-    expect(card.context).toContain('Done when: (1) npm test passes');
-    expect(card.context).toContain('Evidence: vitest output');
-    expect(card.context).toContain('Constraints: no new dependencies');
+    expect(card.context).toContain('Done when:\n  (1) npm test passes');
+    expect(card.context).toContain('Evidence:\n  • vitest output');
+    expect(card.context).toContain('Constraints:\n  • no new dependencies');
+    // The criteria come right after the goal, before the boilerplate.
+    expect(card.context.indexOf('Done when:')).toBeLessThan(card.context.indexOf('Moa may'));
+  });
+
+  it('a full contract (8 criteria, 8 evidence, 8 constraints of 200 chars) fits the goal card cap, one line each', () => {
+    const long = (k: string) => Array.from({ length: 8 }, (_, i) => `${k}${i}`.padEnd(200, 'x'));
+    const card = buildMoaGoalCard(
+      contract({ goal: 'g'.repeat(500), doneCriteria: long('c'), evidence: long('e'), constraints: long('k') }),
+      () => undefined,
+    );
+    expect(card.context.length).toBeLessThanOrEqual(8000);
+    expect(card.context.split('\n').filter((l) => /^ {2}\(\d\) /.test(l))).toHaveLength(8);
   });
 
   it('a card without criteria says none were stated', () => {
