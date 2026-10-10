@@ -26,7 +26,8 @@ import { execFile } from 'child_process';
  *   process would still be our child and subordinate.
  * - Not SMAppService: requires a signed app with an embedded agent plist.
  * - The plist lives in the wmux data dir, NOT ~/Library/LaunchAgents, so the
- *   daemon never auto-starts at login.
+ *   daemon never auto-starts at login, and only until bootstrap returns: the
+ *   loaded job does not need it, and it carries the whole spawn env.
  *
  * Labels are unique per start (`<base>.<id>`): a fixed label could only be
  * re-used after `bootout`, and booting out a job whose daemon is still alive
@@ -236,7 +237,11 @@ export async function startDaemonViaLaunchd(
     try { fs.unlinkSync(plistPath); } catch { /* ignore */ }
     throw new LaunchdUnavailableError(e instanceof Error ? e.message : String(e));
   }
-  rt.log(`[launcher] launchd job ${label} bootstrapped (${plistPath})`);
+  // launchctl hands launchd the parsed plist, so the loaded job no longer
+  // needs the file (list, bootout and prune all go by label). Removing it
+  // keeps the spawn env, which may carry credentials, off disk.
+  try { fs.unlinkSync(plistPath); } catch { /* prune sweeps it */ }
+  rt.log(`[launcher] launchd job ${label} bootstrapped`);
 
   // RunAtLoad starts the process asynchronously; wait for its pid.
   let pid: number | null = null;

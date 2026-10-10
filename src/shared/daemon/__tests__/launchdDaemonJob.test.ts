@@ -148,10 +148,14 @@ describe('startDaemonViaLaunchd / pruneStaleDaemonJobs', () => {
 
   it('bootstraps a plist in the gui domain and returns the job pid', async () => {
     let label = '';
+    let plist = '';
     const rt = fakeRuntime({});
     rt.runLaunchctl = async (args) => {
       rt.calls.push(args);
-      if (args[0] === 'bootstrap') label = path.basename(args[2], '.plist');
+      if (args[0] === 'bootstrap') {
+        label = path.basename(args[2], '.plist');
+        plist = fs.readFileSync(args[2], 'utf-8');
+      }
       if (args[0] === 'list') return label ? `4321\t0\t${label}\n` : '';
       return '';
     };
@@ -162,7 +166,9 @@ describe('startDaemonViaLaunchd / pruneStaleDaemonJobs', () => {
     expect(boot[1]).toBe('gui/501');
     expect(job.label.startsWith(`${base}.`)).toBe(true);
     expect(job.pid).toBe(4321);
-    const plist = fs.readFileSync(boot[2], 'utf-8');
+    // The loaded job does not need the file; the env it carries is not left on disk.
+    expect(fs.existsSync(boot[2])).toBe(false);
+    expect(fs.readdirSync(dir)).toEqual([]);
     expect(plist).toContain(`<string>${job.label}</string>`);
     expect(plist).toContain('<string>/x/index.js</string>');
     expect(plist).toContain('<key>A</key>');
