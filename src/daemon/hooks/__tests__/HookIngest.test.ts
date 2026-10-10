@@ -631,6 +631,27 @@ describe('HookIngest', () => {
       });
     });
 
+    it('a stop held for a background shell, then its task-notification turn, ends at complete', () => {
+      // Live hook sequence (DocuCompare pane, 2026-10-11): the turn ends with
+      // one background shell still running, the shell finishes, and Claude
+      // Code runs a task-notification turn that fires UserPromptSubmit and
+      // Stop like any other. That last Stop is the one that must close the
+      // pane; its leftover count comes from the bridge's transcript miner.
+      ingest.handle(makeSignal({ ptyId: 'pty-a', kind: 'agent.user_prompt_submit' }));
+      ingest.handle(makeSignal({ ptyId: 'pty-a', kind: 'agent.activity', payload: { tool_name: 'Bash' } }));
+      ingest.handle(makeSignal({ ptyId: 'pty-a', payload: { wmux_leftover_work: 1 } }));
+      expect(fixture.emitted.at(-1)?.data).toMatchObject({ hookKind: 'agent.stop', status: 'running' });
+
+      ingest.handle(makeSignal({ ptyId: 'pty-a', kind: 'agent.user_prompt_submit' }));
+      ingest.handle(makeSignal({ ptyId: 'pty-a' }));
+      vi.advanceTimersByTime(DEFAULT_ALARM_WINDOW_MS);
+      expect(fixture.emitted.at(-1)?.data).toMatchObject({
+        hookKind: 'agent.stop',
+        decision: 'emit',
+        status: 'complete',
+      });
+    });
+
     it('an answered cue cancels a pending attention window before its broadcast', () => {
       ingest.handle(makeSignal({ ptyId: 'pty-a', kind: 'agent.activity', payload: { tool_name: 'Bash' } }));
       ingest.handle(makeSignal({ ptyId: 'pty-a', kind: 'agent.awaiting_input' }));
