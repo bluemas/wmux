@@ -1243,7 +1243,7 @@ export const en = {
   // Settings — Accounts — quota-driven account choice for Claude/Codex launches
   'accounts.rotateClaude': "Switch Claude accounts by quota",
   'accounts.rotateCodex': "Switch Codex accounts by quota",
-  'accounts.rotateDesc': "When the account a workspace is bound to is out of quota, a new Claude or Codex pane in it starts on the registered account with the most quota left; the binding itself stays. When every account is out, the agent is not started until one resets. Panes already running are not touched. Claude quota is read from its usage endpoint (no model request); Codex quota from the limits it records in each account's session files.",
+  'accounts.rotateDesc': "When the account a workspace is bound to is out of quota, a new Claude or Codex pane in it starts on the registered account with the most quota left; the binding itself stays. When every account is out, the agent is not started until one resets. Panes already running are not touched. The Command Deck orchestrator and background (A2A) tasks follow the same rule when they start a new conversation; a conversation already under way stays on its account. Claude quota is read from its usage endpoint (no model request); Codex quota from the limits it records in each account's session files.",
   'accounts.quotaOut': "Out of quota",
   'accounts.quotaOutUntil': "Usable again at {time}",
   'accounts.quotaUnknown': "quota not measured yet",
@@ -1443,6 +1443,8 @@ export const en = {
   'moa.settings.shadowFull': "The shadow log is full (20 MB), so nothing more is judged. Move moa-shadow/decisions.jsonl aside to start a new one.",
   'moa.settings.retro': "Weekly retro",
   'moa.settings.retroDesc': "Once a week, while Moa is on, a short summary on Moa's briefing: how often you were asked, work that sat waiting, repeated questions and the slowest work.",
+  'moa.settings.fleetFastPath': "Answer Fleet questions locally",
+  'moa.settings.fleetFastPathDesc': "Short status questions typed here, like \"Who needs me?\" or \"Fleet status\", are answered from the Fleet board on this computer without a Moa turn. Anything else still goes to Moa.",
   'moa.settings.retroWhenDesc': "Local time. It reviews the last full week, Monday to Sunday.",
   'moa.settings.retroDay': "Retro day",
   'moa.settings.retroHour': "Retro time",
@@ -4330,6 +4332,16 @@ export const en = {
   'remote.scope.viewOnly': "View only blocks typing, but it can still answer on-screen prompts that take a single key.",
   'remote.scope.input': "Can type also lets it open and close sessions and answer approvals.",
   'remotePage.connect.pasteScope': "If the invite shares workspaces, this computer can read and search every workspace on that PC, including later ones. While paired, wmux checks it every few seconds, keeps a connection open for its alerts and shows its notifications; mute them from its icon in the computer column.",
+  // Quit and Stop Sessions (main-process native confirm)
+  'quitAndStop.message': "Quit wmux and stop all sessions?",
+  'quitAndStop.detail': "Agent sessions running: {agents}. Terminals in all: {sessions}. All of them will be stopped. Plain Quit leaves them running in the background.",
+  'quitAndStop.detailUnknown': "wmux could not count the running sessions. Every terminal and agent session will be stopped. Plain Quit leaves them running in the background.",
+  'quitAndStop.confirm': "Quit and Stop Sessions",
+  'quitAndStop.cancel': "Cancel",
+  'quitAndStop.stopFailedMessage': "wmux could not stop the sessions.",
+  'quitAndStop.stopFailedDetail': "The wmux daemon did not stop, so wmux stays open and your sessions are still running. Run wmux daemon stop in a terminal, then quit again.",
+  'quitAndStop.alreadyQuittingMessage': "wmux is already quitting.",
+  'quitAndStop.alreadyQuittingDetail': "This quit leaves your sessions running in the background. To stop them, run wmux daemon stop in a terminal.",
 } as const;
 
 export type TranslationKey = keyof typeof en;

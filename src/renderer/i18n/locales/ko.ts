@@ -937,6 +937,8 @@ export const ko = {
   'moa.settings.shadowFull': "그림자 판정 기록이 가득 찼습니다(20 MB). 더 이상 판정하지 않습니다. 새로 시작하려면 moa-shadow/decisions.jsonl을 다른 곳으로 옮기세요.",
   'moa.settings.retro': "주간 회고",
   'moa.settings.retroDesc': "Moa가 켜져 있으면 일주일에 한 번 Moa 브리핑에 짧은 요약을 보여 줍니다: 얼마나 자주 물어봤는지, 오래 기다린 일, 반복된 질문, 가장 느린 일.",
+  'moa.settings.fleetFastPath': "Fleet 질문은 이 컴퓨터에서 답하기",
+  'moa.settings.fleetFastPathDesc': "여기에 입력한 \"작업 상태\", \"내가 봐야 할 작업\" 같은 짧은 상태 질문은 Moa 턴 없이 이 컴퓨터의 Fleet 보드로 답합니다. 그 밖의 메시지는 그대로 Moa에게 갑니다.",
   'moa.settings.retroWhenDesc': "현지 시각 기준. 지난 한 주(월요일~일요일)를 돌아봅니다.",
   'moa.settings.retroDay': "회고 요일",
   'moa.settings.retroHour': "회고 시각",
@@ -3482,7 +3484,7 @@ export const ko = {
   // Settings — Accounts — quota-driven account choice for Claude/Codex launches
   'accounts.rotateClaude': "할당량에 따라 Claude 계정 전환",
   'accounts.rotateCodex': "할당량에 따라 Codex 계정 전환",
-  'accounts.rotateDesc': "워크스페이스에 연결된 계정의 할당량이 소진되면, 그 워크스페이스의 새 Claude 또는 Codex 패널은 남은 할당량이 가장 많은 등록 계정으로 시작합니다. 연결 자체는 바뀌지 않습니다. 모든 계정이 소진되면 하나가 초기화될 때까지 에이전트를 시작하지 않습니다. 이미 실행 중인 패널은 건드리지 않습니다. Claude 할당량은 사용량 엔드포인트에서(모델 요청 없음), Codex 할당량은 각 계정의 세션 파일에 기록된 한도에서 읽습니다.",
+  'accounts.rotateDesc': "워크스페이스에 연결된 계정의 할당량이 소진되면, 그 워크스페이스의 새 Claude 또는 Codex 패널은 남은 할당량이 가장 많은 등록 계정으로 시작합니다. 연결 자체는 바뀌지 않습니다. 모든 계정이 소진되면 하나가 초기화될 때까지 에이전트를 시작하지 않습니다. 이미 실행 중인 패널은 건드리지 않습니다. 커맨드 덱 오케스트레이터와 백그라운드(A2A) 작업도 새 대화를 시작할 때 같은 규칙을 따르며, 이미 진행 중인 대화는 원래 계정에 남습니다. Claude 할당량은 사용량 엔드포인트에서(모델 요청 없음), Codex 할당량은 각 계정의 세션 파일에 기록된 한도에서 읽습니다.",
   'accounts.quotaOut': "할당량 소진",
   'accounts.quotaOutUntil': "{time}에 다시 사용 가능",
   'accounts.quotaUnknown': "할당량 미측정",
@@ -3772,4 +3774,14 @@ export const ko = {
   'remote.scope.viewOnly': "보기 전용은 입력을 막지만, 키 하나로 답하는 화면 프롬프트에는 응답할 수 있습니다.",
   'remote.scope.input': "입력 가능은 세션 열기·닫기와 승인 응답도 허용합니다.",
   'remotePage.connect.pasteScope': "초대에 워크스페이스 공유가 포함되면 이 컴퓨터는 그 PC의 모든 워크스페이스(나중에 여는 것 포함)를 읽고 검색할 수 있습니다. 페어링된 동안 wmux는 몇 초마다 상태를 확인하고, 알림용 연결을 열어 두며, 그 알림을 표시합니다. 알림은 컴퓨터 열의 해당 아이콘에서 끌 수 있습니다.",
+  // Quit and Stop Sessions (main-process native confirm)
+  'quitAndStop.message': "wmux를 종료하고 모든 세션을 멈출까요?",
+  'quitAndStop.detail': "지금 실행 중: 에이전트 세션 {agents}개, 터미널 전체 {sessions}개. 모두 멈춥니다. 일반 종료는 세션을 백그라운드에서 계속 실행합니다.",
+  'quitAndStop.detailUnknown': "실행 중인 세션 수를 확인하지 못했습니다. 모든 터미널과 에이전트 세션이 멈춥니다. 일반 종료는 세션을 백그라운드에서 계속 실행합니다.",
+  'quitAndStop.confirm': "종료하고 세션 멈추기",
+  'quitAndStop.cancel': "취소",
+  'quitAndStop.stopFailedMessage': "세션을 멈추지 못했습니다.",
+  'quitAndStop.stopFailedDetail': "wmux 데몬이 멈추지 않아 wmux를 열어 둡니다. 세션은 아직 실행 중입니다. 터미널에서 wmux daemon stop를 실행한 뒤 다시 종료하세요.",
+  'quitAndStop.alreadyQuittingMessage': "wmux가 이미 종료하는 중입니다.",
+  'quitAndStop.alreadyQuittingDetail': "이번 종료는 세션을 백그라운드에서 계속 실행해 둡니다. 멈추려면 터미널에서 wmux daemon stop를 실행하세요.",
 } as const;

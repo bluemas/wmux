@@ -531,4 +531,14 @@ export const es = {
   'remote.scope.viewOnly': "Solo ver impide escribir, pero aún puede responder a avisos en pantalla que piden una sola tecla.",
   'remote.scope.input': "Puede escribir también le permite abrir y cerrar sesiones y responder aprobaciones.",
   'remotePage.connect.pasteScope': "Si la invitación comparte espacios de trabajo, este equipo puede leer y buscar todos los espacios de trabajo de ese PC, incluidos los que se abran después. Mientras estén emparejados, wmux lo comprueba cada pocos segundos, mantiene una conexión abierta para sus alertas y muestra sus notificaciones; puedes silenciarlas desde su icono en la columna de equipos.",
+  // Quit and Stop Sessions (main-process native confirm)
+  'quitAndStop.message': "¿Salir de wmux y detener todas las sesiones?",
+  'quitAndStop.detail': "Sesiones de agentes en ejecución: {agents}. Terminales en total: {sessions}. Se detendrán todas. Salir normalmente las deja en ejecución en segundo plano.",
+  'quitAndStop.detailUnknown': "wmux no pudo contar las sesiones en ejecución. Se detendrán todas las terminales y sesiones de agentes. Salir normalmente las deja en ejecución en segundo plano.",
+  'quitAndStop.confirm': "Salir y detener sesiones",
+  'quitAndStop.cancel': "Cancelar",
+  'quitAndStop.stopFailedMessage': "wmux no pudo detener las sesiones.",
+  'quitAndStop.stopFailedDetail': "El daemon de wmux no se detuvo, así que wmux sigue abierto y tus sesiones siguen en ejecución. Ejecuta wmux daemon stop en una terminal y vuelve a salir.",
+  'quitAndStop.alreadyQuittingMessage': "wmux ya se está cerrando.",
+  'quitAndStop.alreadyQuittingDetail': "Este cierre deja tus sesiones en ejecución en segundo plano. Para detenerlas, ejecuta wmux daemon stop en una terminal.",
 } as const;

@@ -1226,7 +1226,7 @@ export const pl = {
   // Settings — Accounts — quota-driven account choice for Claude/Codex launches
   'accounts.rotateClaude': "Przełączaj konta Claude według limitu",
   'accounts.rotateCodex': "Przełączaj konta Codex według limitu",
-  'accounts.rotateDesc': "Gdy konto przypisane do obszaru roboczego wyczerpie limit, nowy panel Claude lub Codex w tym obszarze startuje na zarejestrowanym koncie z największym pozostałym limitem; samo przypisanie się nie zmienia. Gdy wszystkie konta są wyczerpane, agent nie startuje, dopóki któreś się nie zresetuje. Działające panele pozostają bez zmian. Limit Claude jest odczytywany z punktu końcowego użycia (bez zapytania do modelu), limit Codex z limitów zapisanych w plikach sesji każdego konta.",
+  'accounts.rotateDesc': "Gdy konto przypisane do obszaru roboczego wyczerpie limit, nowy panel Claude lub Codex w tym obszarze startuje na zarejestrowanym koncie z największym pozostałym limitem; samo przypisanie się nie zmienia. Gdy wszystkie konta są wyczerpane, agent nie startuje, dopóki któreś się nie zresetuje. Działające panele pozostają bez zmian. Orkiestrator Command Deck i zadania w tle (A2A) stosują tę samą zasadę, gdy zaczynają nową rozmowę; trwająca rozmowa zostaje na swoim koncie. Limit Claude jest odczytywany z punktu końcowego użycia (bez zapytania do modelu), limit Codex z limitów zapisanych w plikach sesji każdego konta.",
   'accounts.quotaOut': "Brak limitu",
   'accounts.quotaOutUntil': "Ponownie dostępne o {time}",
   'accounts.quotaUnknown': "limit jeszcze niezmierzony",
@@ -1424,6 +1424,8 @@ export const pl = {
   'moa.settings.shadowFull': "Dziennik sędziego w cieniu jest pełny (20 MB), więc nic więcej nie jest oceniane. Przenieś moa-shadow/decisions.jsonl, aby zacząć nowy.",
   'moa.settings.retro': "Cotygodniowe podsumowanie",
   'moa.settings.retroDesc': "Raz w tygodniu, gdy Moa jest włączona, krótkie podsumowanie w briefingu Moa: jak często Cię pytano, praca, która długo czekała, powtarzające się pytania i najwolniejsza praca.",
+  'moa.settings.fleetFastPath': "Odpowiadaj lokalnie na pytania o Fleet",
+  'moa.settings.fleetFastPathDesc': "Krótkie pytania o stan wpisane tutaj, np. „Who needs me?” lub „Fleet status”, dostają odpowiedź z tablicy Fleet na tym komputerze, bez tury Moa. Wszystko inne nadal trafia do Moa.",
   'moa.settings.retroWhenDesc': "Czas lokalny. Obejmuje ostatni pełny tydzień, od poniedziałku do niedzieli.",
   'moa.settings.retroDay': "Dzień podsumowania",
   'moa.settings.retroHour': "Godzina podsumowania",
@@ -4290,4 +4292,14 @@ export const pl = {
   'remote.scope.viewOnly': "Tylko podgląd blokuje pisanie, ale urządzenie nadal może odpowiadać na monity ekranowe wymagające jednego klawisza.",
   'remote.scope.input': "Może pisać pozwala też otwierać i zamykać sesje oraz odpowiadać na zatwierdzenia.",
   'remotePage.connect.pasteScope': "Jeśli zaproszenie udostępnia obszary robocze, ten komputer może czytać i przeszukiwać każdy obszar roboczy na tamtym komputerze, także otwarte później. Po sparowaniu wmux sprawdza go co kilka sekund, utrzymuje połączenie dla alertów i pokazuje jego powiadomienia; wycisz je z jego ikony w kolumnie komputerów.",
+  // Quit and Stop Sessions (main-process native confirm)
+  'quitAndStop.message': "Zamknąć wmux i zatrzymać wszystkie sesje?",
+  'quitAndStop.detail': "Teraz działa: sesje agentów: {agents}, terminale łącznie: {sessions}. Wszystkie zostaną zatrzymane. Zwykłe zamknięcie zostawia je działające w tle.",
+  'quitAndStop.detailUnknown': "wmux nie mógł policzyć działających sesji. Wszystkie terminale i sesje agentów zostaną zatrzymane. Zwykłe zamknięcie zostawia je działające w tle.",
+  'quitAndStop.confirm': "Zamknij i zatrzymaj sesje",
+  'quitAndStop.cancel': "Anuluj",
+  'quitAndStop.stopFailedMessage': "wmux nie mógł zatrzymać sesji.",
+  'quitAndStop.stopFailedDetail': "Demon wmux się nie zatrzymał, więc wmux pozostaje otwarty, a sesje nadal działają. Uruchom wmux daemon stop w terminalu, a potem zamknij aplikację ponownie.",
+  'quitAndStop.alreadyQuittingMessage': "wmux już się zamyka.",
+  'quitAndStop.alreadyQuittingDetail': "To zamknięcie pozostawia sesje działające w tle. Aby je zatrzymać, uruchom wmux daemon stop w terminalu.",
 } as const;
