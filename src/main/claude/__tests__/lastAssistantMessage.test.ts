@@ -65,6 +65,17 @@ describe('endsWithQuestion', () => {
     expect(endsWithQuestion('어느 쪽으로 할까요?\n- A로 진행할까요?')).toBe(true);
   });
 
+  it('still reads a list item that ends in a question ending as a question', () => {
+    expect(endsWithQuestion('남은 선택:\n- 이대로 배포할까요')).toBe(true);
+    expect(endsWithQuestion('남은 선택:\n1. A로 진행할까요.')).toBe(true);
+    expect(endsWithQuestion('남은 선택:\n- 지금 머지해도 되나요')).toBe(true);
+  });
+
+  it('treats a checklist item with no space after the bullet the same way', () => {
+    expect(endsWithQuestion('확인할 것:\n-화면이 뜨는지')).toBe(false);
+    expect(endsWithQuestion('확인할 것:\n•합계가 맞는지.')).toBe(false);
+  });
+
   it('catches the polite proposal form that plain 까 misses', () => {
     // `진행할까요` ends in 요, not 까 — the most common way an agent asks
     // permission in Korean, and the exact bug class this function exists for.

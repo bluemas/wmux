@@ -6,24 +6,26 @@
 // process.platform at import time and would throw a ReferenceError in the
 // renderer bundle. Everything here takes platform/build as parameters.
 
-/** The first Windows 11 build (21H2). */
-export const WINDOWS_11_FIRST_BUILD = 22000;
-
 /**
  * Whether PTYs on this machine should spawn against node-pty's bundled
- * conpty.dll (OpenConsole) instead of the OS in-box ConPTY (#910).
+ * conpty.dll (OpenConsole) instead of the OS in-box ConPTY.
  *
- * Windows 10's in-box ConPTY never forwards mouse-mode DECSETs (`?1000`
- * `?1002` `?1006`) to the output pipe, so TUIs that enable mouse tracking
- * (vim `set mouse=a`, tmux, ...) never see clicks or wheel events. The
- * OpenConsole build shipped inside node-pty's prebuilds has the fix
- * (microsoft/terminal#15977), so below the cut we ask node-pty for the DLL
- * backend (`useConptyDll: true`).
+ * Every Windows build with a readable version takes the bundled DLL
+ * (`useConptyDll: true`):
  *
- * 22000 is a PRODUCT cut, not the upstream fix build: it covers Server 2022
- * (20348) and misses early/unpatched Win11 22000 — acceptable, because those
- * machines get mouse relay from their own in-box ConPTY. Do not present this
- * number as "the build where inbox ConPTY gained mouse".
+ * - #910 (Windows 10): the in-box ConPTY never forwards mouse-mode DECSETs
+ *   (`?1000` `?1002` `?1006`) to the output pipe, so TUIs that enable mouse
+ *   tracking (vim `set mouse=a`, tmux, ...) never see clicks or wheel events.
+ *   The OpenConsole build in node-pty's prebuilds has the fix.
+ * - #1932 (Windows 11): the in-box ConPTY answers DA1 itself without sixel
+ *   and swallows sixel DCS sequences, while the renderer still answers
+ *   XTSMGRAPHICS — so inline sixel images never render in a local pane. The
+ *   bundled OpenConsole passes the DCS through, and DA1/DA2 are answered by
+ *   xterm.js (DA1 then advertises sixel). Measured on Windows 11 26200.
+ *
+ * Until #1932 this predicate cut at build 22000 (Windows 11 kept in-box).
+ * That cut is gone: one backend on every Windows build, so a pane behaves
+ * the same on Windows 10 and 11.
  *
  * A null build means "could not read it" — keep the in-box backend rather
  * than acting on a number that was never really read.
@@ -34,11 +36,43 @@ export const WINDOWS_11_FIRST_BUILD = 22000;
  * exception is the damaged-install fallback: if the bundled DLL cannot load,
  * the spawn retries in-box while the renderer still reports a modern build —
  * a known, accepted trade-off (no session meta by design; see #910 review).
+ *
+ * `override` (from `WMUX_CONPTY_BACKEND`, see `parseConptyBackendOverride`)
+ * replaces the build-number decision on Windows. It is a test and diagnosis
+ * seam for the spawn sites only; the renderer keeps the build-number value.
  */
-export function shouldUseBundledConpty(platform: string, buildNumber: number | null): boolean {
+export function shouldUseBundledConpty(
+  platform: string,
+  buildNumber: number | null,
+  override: boolean | null = null,
+): boolean {
   if (platform !== 'win32') return false;
-  if (buildNumber === null) return false;
-  return buildNumber < WINDOWS_11_FIRST_BUILD;
+  if (override !== null) return override;
+  return buildNumber !== null;
+}
+
+/** Which ConPTY backend a PTY actually started on. */
+export type ConptyBackend = 'bundled' | 'inbox';
+
+/**
+ * Env var that forces the PTY backend on Windows: `bundled` or `inbox`. The
+ * spawn sites read it from their own process env and pass the parsed value to
+ * `shouldUseBundledConpty` as its override. It is a test and diagnosis seam
+ * (#1965): the runtime tests pin the bundled backend with it, whatever the
+ * runner's build, and `inbox` puts a machine back on the OS ConPTY to tell a
+ * backend-specific problem from anything else.
+ */
+export const CONPTY_BACKEND_ENV = 'WMUX_CONPTY_BACKEND';
+
+/**
+ * Parse a `WMUX_CONPTY_BACKEND` value: true forces bundled, false forces
+ * in-box, null (unset or unrecognised) keeps the build-number default.
+ */
+export function parseConptyBackendOverride(value: string | null | undefined): boolean | null {
+  const v = value?.trim().toLowerCase();
+  if (v === 'bundled') return true;
+  if (v === 'inbox' || v === 'in-box') return false;
+  return null;
 }
 
 /**
@@ -125,21 +159,28 @@ export function classifyConptySpawnError(
  *
  * `onNotice` reports which backend actually started, and every demotion, so
  * "the mouse stopped working on this pane" is answerable from the log.
+ * `onBackend` reports the same thing as a value, for callers whose behaviour
+ * depends on it (#1965: bundled OpenConsole does not repaint on resize and
+ * waits for an answer to its startup DA1).
  */
 export function spawnWithConptyPolicy<T>(
   spawn: (useBundled: boolean) => T,
   useBundled: boolean,
   onNotice: (level: 'info' | 'warn', message: string) => void,
+  onBackend?: (backend: ConptyBackend) => void,
 ): T {
   if (!useBundled) {
     onNotice('info', 'ConPTY backend = in-box');
-    return spawn(false);
+    const result = spawn(false);
+    onBackend?.('inbox');
+    return result;
   }
   let retried = false;
   for (;;) {
     try {
       const result = spawn(true);
       onNotice('info', `ConPTY backend = bundled conpty.dll${retried ? ' (after one retry)' : ''}`);
+      onBackend?.('bundled');
       return result;
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
@@ -153,6 +194,7 @@ export function spawnWithConptyPolicy<T>(
         onNotice('warn', `bundled ConPTY unusable (${detail}); falling back to in-box ConPTY — this pane has no mouse reporting`);
         const result = spawn(false);
         onNotice('info', 'ConPTY backend = in-box (after bundled demotion)');
+        onBackend?.('inbox');
         return result;
       }
       throw err;

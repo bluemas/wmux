@@ -47,12 +47,14 @@ import {
   type MoaRuleView,
   type MoaUnreceiptedMerge,
 } from '../../shared/moaDecision';
+import type { PrMergeFacts } from '../../shared/phoneGitWrite';
 import type { PrLaneFacts } from '../../shared/prReview';
 import type { MoaDelegateEvents, MoaDelegateServicePort } from './moaDelegatePorts';
 import type { MoaDecisionStore, MoaSettlement } from './moaDecisionStore';
 import type { MoaEffectStore } from './moaEffectStore';
 import type { MoaMergeExecutor } from './moaMergeExecutor';
 import { evaluateMergeLane, type MergeLaneFactsReader, type LaneVerdict } from './moaMergeLane';
+import { buildMergeFacts, type MergeFactsExtras } from './moaMergeFacts';
 import { moaAutoEligibility, type PolicyBook } from './deckPolicy';
 import {
   SHADOW_DAILY_CAP_DEFAULT,
@@ -98,6 +100,12 @@ export interface MoaAskServicePorts {
   askerBranches: (asker: MoaAsker, repoPath: string) => Promise<string[]>;
   /** A verdict the shadow judge already recorded for this question hash. */
   priorJudgment?: (questionHash: string) => MoaJudgeResult | null;
+  /** What the decision's PrMergeFacts need beside the lane read: squash
+   *  permission and the gh login. Null or absent: no facts. */
+  mergeFactsExtras?: (repo: { key: string; path: string }) => Promise<MergeFactsExtras | null>;
+  /** The gh login a merge in `repo` goes out as, read now (uncached); null
+   *  when it cannot be read. */
+  currentLogin?: (repo: { key: string; path: string }) => Promise<string | null>;
   /** PRs merged since `sinceIso` in a repo (the audit). */
   mergedSince?: (repo: { key: string; path: string }, sinceIso: string) => Promise<Array<Omit<MoaUnreceiptedMerge, 'repoKey'>> | null>;
   judgeDailyCap?: number;
@@ -333,9 +341,12 @@ export class MoaAskService implements MoaDelegateServicePort {
     if (facts.number !== body.prNumber) return { settlement: refuse('pr-mismatch', 'GitHub answered for another pull request'), auto: false };
     if (facts.state !== 'OPEN') return { settlement: refuse('not-open', `the pull request is ${facts.state.toLowerCase() || 'not open'}`), auto: false };
     if (facts.headRefOid !== body.expectHead) return { settlement: refuse('head-moved', 'the pull request has another head than expectHead'), auto: false };
-    const lane = await this.evaluateLane(d, facts);
+    const [lane, mergeFacts] = await Promise.all([this.evaluateLane(d, facts), this.mergeFacts(d.repo, facts)]);
     const laneFacts = { passed: lane.ok, failed: lane.failures.map((f) => f.reason) };
-    const withLane = (r: { settlement: MoaSettlement; auto: boolean }) => ({ ...r, settlement: { ...r.settlement, lane: { ok: lane.ok, reasons: laneFacts.failed } } });
+    const withLane = (r: { settlement: MoaSettlement; auto: boolean }) => ({
+      ...r,
+      settlement: { ...r.settlement, lane: { ok: lane.ok, reasons: laneFacts.failed }, ...(mergeFacts ? { facts: mergeFacts } : {}) },
+    });
     const book = this.ports.loadBook();
     if (!book || book.rules.size === 0) return withLane({ settlement: esc('no-policy-book', 'the policy book has no rules; the owner answers it in the Moa panel'), auto: false });
     const question = `Merge pull request #${body.prNumber} (head ${body.expectHead.slice(0, 12)}) into ${facts.baseRefName || 'its base'}?`;
@@ -372,6 +383,12 @@ export class MoaAskService implements MoaDelegateServicePort {
       settlement: { status: 'answered', judge: j, ruleId: j.ruleId, reasonCode: 'auto-merge', why: j.why || `rule ${j.ruleId}`, answer: { actionVerdict: 'go' } },
       auto: true,
     });
+  }
+
+  /** The card's PrMergeFacts on the lane read; null when the extras are unknown. */
+  private async mergeFacts(repo: { key: string; path: string }, lane: PrLaneFacts): Promise<PrMergeFacts | null> {
+    const extras = await this.ports.mergeFactsExtras?.(repo).catch(() => null);
+    return extras ? buildMergeFacts(lane, extras) : null;
   }
 
   private async evaluateLane(d: MoaDecision, facts: PrLaneFacts): Promise<LaneVerdict> {
@@ -429,6 +446,20 @@ export class MoaAskService implements MoaDelegateServicePort {
       if (!e.eligible) return `auto-${e.reason}`;
     }
     return null;
+  }
+
+  /**
+   * The executor's identity gate: a decision whose card showed a gh login
+   * merges only as that login. `identity-changed` when gh now signs in as
+   * another account, `identity-unknown` when the login cannot be read.
+   * Decisions without facts (stored before them) showed no login: null.
+   */
+  async identity(effect: MergeEffect): Promise<string | null> {
+    const shown = this.ports.decisions.get(effect.decisionId)?.facts?.identity.login;
+    if (!shown) return null;
+    const now = await this.ports.currentLogin?.({ key: effect.repoKey, path: effect.repoPath }).catch(() => null) ?? null;
+    if (!now) return 'identity-unknown';
+    return now.toLowerCase() === shown.toLowerCase() ? null : 'identity-changed';
   }
 
   /** The lane context for an effect's asker, read now. */

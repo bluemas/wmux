@@ -20,6 +20,7 @@ import { submitBracketedPasteToPty } from '../../utils/ptyMessageDelivery';
 import { disposePanePtys } from '../../utils/paneTeardown';
 import { findParent, findPane } from '../../../shared/paneUtils';
 import { findStashedEntry } from '../../../shared/paneStash';
+import { paneLabelRejectionKey } from '../../utils/paneNaming';
 import type { TranslationKey } from '../../i18n/locales/en';
 
 export type FleetEditorKind = 'message' | 'label' | 'role' | 'close';
@@ -56,6 +57,9 @@ export interface FleetRowVerbContext {
   hasAgent?: boolean;
   /** The pane is its workspace's root (single-pane workspace). */
   isRootPane?: boolean;
+  /** The agent itself reports a live prompt (raw surfaceAgent status
+   *  awaiting_input), which waits for an answer and cannot be dismissed. */
+  livePrompt?: boolean;
 }
 
 export function fleetRowVerbs(pane: FleetPane, ctx: FleetRowVerbContext = {}): FleetRowVerbs {
@@ -72,7 +76,7 @@ export function fleetRowVerbs(pane: FleetPane, ctx: FleetRowVerbContext = {}): F
     stashed: !!pane.stashed,
     closeEnabled,
     ...(closeEnabled ? {} : { closeReason: 'fleet.verb.closeRoot' as const }),
-    dismissQuestion: !pane.remote && !!fleetTargetPtyId(pane) && !!ctx.pendingQuestion?.trim(),
+    dismissQuestion: !pane.remote && !!fleetTargetPtyId(pane) && !!ctx.pendingQuestion?.trim() && !ctx.livePrompt,
   };
 }
 
@@ -89,6 +93,7 @@ export function fleetRowVerbsFromState(pane: FleetPane, state: VerbStoreState): 
     commandRunning: state.commandRunningByPtyId[target] === true,
     hasAgent: !!state.surfaceAgent[target]?.name,
     isRootPane: !!ws && ws.rootPane.id === pane.paneId && findParent(ws.rootPane, pane.paneId) === null,
+    livePrompt: state.surfaceAgent[target]?.status === 'awaiting_input',
   });
 }
 
@@ -275,7 +280,10 @@ export function FleetRowEditor({ pane, kind, onDone }: FleetRowEditorProps) {
       }
       submitBracketedPasteToPty(fleetTargetPtyId(fresh), text, { agent: agentName ?? pane.agentName });
     } else {
-      window.electronAPI.metadata.setLabel(pane.paneId, pane.workspaceId, value.trim()).catch((err: unknown) => {
+      window.electronAPI.metadata.setLabel(pane.paneId, pane.workspaceId, value.trim()).then((res) => {
+        // The pane label policy refused it: say why, not just that it failed.
+        if (!res.ok) useStore.getState().pushToast({ level: 'error', message: t(paneLabelRejectionKey(res.code)) });
+      }, (err: unknown) => {
         console.error('[fleet] setLabel failed', err);
         useStore.getState().pushToast({ level: 'error', message: t('fleet.label.failed') });
       });

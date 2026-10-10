@@ -14,6 +14,7 @@ import {
   REPAINT_BEGIN,
   type ColdFrame,
   REPAINT_END,
+  splitTrailingEscape,
   __coldFrameKeys,
   __resetColdFrames,
 } from '../coldFrame';
@@ -195,6 +196,28 @@ describe('WarmFrameSwap', () => {
     expect(swap.onFlush(4)).toBe(REPAINT_END);
   });
 
+  it('holds back an escape sequence a payload ends inside and sends it after END', () => {
+    const swap = new WarmFrameSwap();
+    swap.painted();
+    expect(swap.onData('hello\x1b[12;')).toBe(`${REPAINT_BEGIN}hello`);
+    // A later payload picks the held bytes up in front of it…
+    expect(swap.onData('6Hx\x1b]0;ti')).toBe('\x1b[12;6Hx');
+    // …and the flush closes the frame before what is still unfinished.
+    expect(swap.onFlush(20)).toBe(`${REPAINT_END}\x1b]0;ti`);
+    expect(swap.onData('tle\x07')).toBe('tle\x07');
+  });
+
+  it('close ends an open frame with the held-back bytes, and is a no-op otherwise', () => {
+    const swap = new WarmFrameSwap();
+    expect(swap.close()).toBeNull();
+    swap.painted();
+    expect(swap.close()).toBeNull();
+    swap.onData('a\x1b[');
+    expect(swap.close()).toBe(`${REPAINT_END}\x1b[`);
+    expect(swap.phase).toBe('idle');
+    expect(swap.close()).toBeNull();
+  });
+
   it('cancel forgets the swap (a resync repainted from scratch)', () => {
     const swap = new WarmFrameSwap();
     swap.painted();
@@ -226,6 +249,67 @@ describe('the swap sequence on a real parser', () => {
     expect(term.buffer.active.length).toBe(fresh.buffer.active.length);
     expect(term.buffer.active.cursorX).toBe(fresh.buffer.active.cursorX);
     expect(term.buffer.active.cursorY).toBe(fresh.buffer.active.cursorY);
+  });
+
+  // A snapshot ends with the escape sequence the daemon's ring was still
+  // inside (HeadlessSnapshot's partial tail); the live bytes after the flush
+  // marker finish it. END must not land in between.
+  async function swapAcrossFlush(replay: string, live: string): Promise<{ term: HeadlessTerminal; titles: string[] }> {
+    const term = headless(30, 14);
+    const titles: string[] = [];
+    term.onTitleChange((title) => titles.push(title));
+    await write(term, 'cached frame');
+    const swap = new WarmFrameSwap();
+    swap.painted();
+    await write(term, swap.onData(replay));
+    await write(term, swap.onFlush(replay.length) ?? '');
+    await write(term, swap.onData(live));
+    return { term, titles };
+  }
+
+  it('a flush boundary inside a CSI still positions the cursor', async () => {
+    const { term } = await swapAcrossFlush('hello\x1b[12;', '6HX');
+    expect(term.modes.synchronizedOutputMode).toBe(false);
+    expect(screen(term)[0]).toBe('hello');
+    expect(screen(term)[11]).toBe('     X');
+    expect(term.buffer.active.cursorX).toBe(6);
+    expect(term.buffer.active.cursorY).toBe(11);
+  });
+
+  it('a flush boundary inside an OSC still sets the title', async () => {
+    const { term, titles } = await swapAcrossFlush('hello\x1b]0;my ti', 'tle\x07 world');
+    expect(term.modes.synchronizedOutputMode).toBe(false);
+    expect(titles).toEqual(['my title']);
+    expect(screen(term)[0]).toBe('hello world');
+  });
+
+  it('a flush boundary inside a long OSC (a raw replay has no tail cap) still sets the title', async () => {
+    const long = 'x'.repeat(6000);
+    const { term, titles } = await swapAcrossFlush(`hello\x1b]0;${long}`, 'y\x07 world');
+    expect(titles).toEqual([`${long}y`]);
+    expect(screen(term)[0]).toBe('hello world');
+  });
+
+  it('splitTrailingEscape lets a resync write END before the replay tail, across chunks', async () => {
+    const held = [
+      { data: 'hello\x1b', replay: true },
+      { data: '[12;', replay: true },
+    ];
+    const { complete, pending } = splitTrailingEscape(held);
+    expect(complete).toEqual([{ data: 'hello', replay: true }]);
+    expect(pending).toEqual({ data: '\x1b[12;', replay: true });
+    const term = headless(30, 14);
+    await write(term, `cached${REPAINT_BEGIN}`);
+    for (const chunk of complete) await write(term, chunk.data);
+    await write(term, REPAINT_END);
+    await write(term, pending?.data ?? '');
+    await write(term, '6HX');
+    expect(screen(term)[0]).toBe('hello');
+    expect(term.buffer.active.cursorX).toBe(6);
+    expect(term.buffer.active.cursorY).toBe(11);
+    // A replay that ends at ground passes through untouched.
+    const whole = [{ data: 'a\x1b[1m', replay: true }, { data: 'b', replay: false }];
+    expect(splitTrailingEscape(whole)).toEqual({ complete: whole, pending: null });
   });
 
   it('RIS leaves no mode the cached frame or an old screen had set', async () => {

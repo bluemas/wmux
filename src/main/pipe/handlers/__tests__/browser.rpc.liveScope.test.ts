@@ -8,6 +8,7 @@ import type {
   LiveTabOwner,
   LiveWriteScope,
 } from '../../../../shared/liveWriteScope';
+import { dispatchAsClaimedCaller } from './claimedCaller';
 
 /**
  * Live Chrome, agent window: the main-lane half of the write gate.
@@ -144,7 +145,7 @@ function register(options: {
 }) {
   const live = options.live ?? makeFakeLive();
   const hasTarget = options.hasTarget ?? true;
-  const router = new RpcRouter();
+  const router = dispatchAsClaimedCaller(new RpcRouter());
   const cdp = {
     // Answers any lookup with the ONE builtin surface it has (surface-1), the
     // way the real manager answers a default-target lookup. None of the live
@@ -170,7 +171,9 @@ function register(options: {
     liveWriteScope: () => options.writeScopeSetting ?? ('agent' as LiveWriteScope),
   };
   const registry = {
-    forWorkspace: vi.fn(() => live),
+    profileFor: vi.fn(() => 'live'),
+    hasPaneBindings: vi.fn(() => false),
+    isPaneBound: vi.fn(() => false),
     forProfile: vi.fn(() => live),
     ownerOfSurface: vi.fn(() => null),
     disposeAll: vi.fn(),
@@ -636,7 +639,7 @@ describe('browser_tabs borrow / return', () => {
   });
 
   it('with no way to ask the human, borrow refuses rather than granting', async () => {
-    const router = new RpcRouter();
+    const router = dispatchAsClaimedCaller(new RpcRouter());
     const live = makeFakeLive();
     const cdp = {
       getTarget: vi.fn(() => TARGET),
@@ -659,7 +662,9 @@ describe('browser_tabs borrow / return', () => {
       undefined,
       undefined,
       {
-        forWorkspace: () => live,
+        profileFor: () => 'live',
+        hasPaneBindings: () => false,
+        isPaneBound: () => false,
         forProfile: () => live,
         ownerOfSurface: () => null,
         disposeAll: vi.fn(),

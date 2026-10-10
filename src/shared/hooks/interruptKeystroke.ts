@@ -14,15 +14,19 @@
  *  a human's double-tap, not a machine's. */
 export const DOUBLE_ESC_WINDOW_MS = 500;
 
+import { ESCAPE_WIN32 } from '../win32InputKeys';
+import { kittyChunkAsLegacy } from '../kittyKeyEvents';
+
 const CTRL_C = '\x03';
 const ESC = '\x1b';
 // Keep in lockstep with src/renderer/terminal/escapeKeys.ts. A pane that
 // negotiated kitty / win32-input-mode writes these instead of a bare ESC,
-// and they must still settle the turn latch (#1152).
+// and they must still settle the turn latch (#1152). The win32 record is the
+// one the daemon's approval answers write on Windows (#1915).
 const ESCAPE_CSI_U = '\x1b[27u';
-const ESCAPE_WIN32 = '\x1b[27;1;27;1;0;1_\x1b[27;1;0;0;0;1_';
 
-function isEscapeChunk(data: string): boolean {
+/** Whether a written chunk is one Escape key, in any encoding wmux writes. */
+export function isEscapeChunk(data: string): boolean {
   return data === ESC || data === ESCAPE_CSI_U || data === ESCAPE_WIN32;
 }
 
@@ -44,8 +48,13 @@ export class InterruptKeystrokeDetector {
   constructor(private readonly now: () => number = Date.now) {}
 
   /** Feed one written chunk. True when it completes an interrupt. */
-  observe(ptyId: string, data: string): boolean {
-    if (!ptyId || typeof data !== 'string' || data.length === 0) return false;
+  observe(ptyId: string, raw: string): boolean {
+    if (!ptyId || typeof raw !== 'string' || raw.length === 0) return false;
+    // A pane that pushed kitty flags types Ctrl+C as `CSI 99;5u` and, with
+    // flag 2, follows every key with a release event. A release is not a
+    // keystroke: it must neither count nor break an ESC double-tap.
+    const data = kittyChunkAsLegacy(raw);
+    if (data.length === 0) return false;
     if (data.includes(CTRL_C)) {
       this.pendingEscAt.delete(ptyId);
       return true;

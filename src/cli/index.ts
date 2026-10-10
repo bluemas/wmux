@@ -4,6 +4,8 @@ process.on('SIGINT', () => {
   process.exit(130);
 });
 
+// Must stay the first import: turns off working-directory executable lookup (Windows) before any module runs.
+import '../shared/exeSearchGuard';
 import { hasFlag } from './utils';
 import { handleWorkspace } from './commands/workspace';
 import { handleSurface } from './commands/surface';
@@ -91,7 +93,8 @@ WEB ACCESS (browser / PWA)
                                     --allow-host on a re-run: loopback only
         [--allow-input]             Enable keyboard input (off by default)
         [--no-allow-<x>]            Turn a grant off on a re-run: input,
-                                    upload, transcript, dangerous-launch
+                                    upload, transcript, dangerous-launch,
+                                    git-write
         [--allow-upload]            Enable photo upload from a paired phone
                                     (JPEG/PNG, 10 MB cap, files kept 24h in
                                     ~/.wmux/uploads/phone). Off by default
@@ -102,6 +105,10 @@ WEB ACCESS (browser / PWA)
         [--allow-dangerous-launch]  Let a phone start Claude/Codex from chat
                                     with approvals off (bypass/yolo), after
                                     per-launch confirmation. Off by default
+        [--allow-git-write]         Let a phone with an explicit input grant
+                                    push, open PRs and squash-merge, after a
+                                    preview and confirmation. Off by default
+        [--git-write-login <login>] GitHub login those writes run as
         [--no-inline-images]        Stop the browser terminal drawing sixel and
                                     iTerm2 images (on by default; kept across
                                     re-runs, restarts and --stop;

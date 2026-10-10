@@ -17,12 +17,34 @@ import { EXECUTE_SEND_MAIN_TIMEOUT_MS } from '../../../shared/executeApprovalBou
 import { GATED_DELIVERY_DEADLINE_MARGIN_MS, GATED_NEW_TASK_SEND_MAIN_TIMEOUT_MS, NEW_TASK_SEND_MAIN_TIMEOUT_MS } from '../../../shared/freshContext';
 import { flagOrphanedTask, isPagedTaskQuery, pagedTaskId, shapeTaskQueryResult, summarizeTask } from '../../../shared/a2aTaskQueryView';
 import { defaultSnapshot } from '../../pty/portWatch';
+import { claimTokenForPane } from '../../workspace/workspaceClaimTrust';
 import type { PortSnapshot, SnapshotFn } from '../../pty/portWatch';
 import { walkToOwningAnchor } from '../../pty/serverSidePidWalk';
 import { tryProcessCreatedAt } from '../../pty/winSnapshotNative';
+import { readWindowsAncestry } from './callerAncestry';
+import { getAccountStore } from '../../account/accountStore';
+import {
+  CODEX_THREAD_ID_RE,
+  classifyMcpParent,
+  codexHome,
+  matchOwnerToLiveAnchor,
+  readCodexThreadOwner,
+  readParentChain,
+  type McpParentClass,
+} from '../../../mcp/codexThreadIdentity';
 import type { OwningAnchor } from '../../pty/serverSidePidWalk';
 import { recordSentTask, recordTaskState, reopenedState, stateOfTask, workLinkFromSentTask } from '../../workLink/a2aProducer';
 import { noteTrackReply } from '../../deck/trackRecordFeed';
+import { moaGoalSendScope } from '../../deck/moaLevelGate';
+import { A2A_BRAIN_ALIAS, isRemoteTaskId } from '../../../shared/a2aRemote';
+import {
+  isRemoteWorkspaceId,
+  remoteWorkspaceId,
+  type A2aRemoteReplyInput,
+  type A2aRemoteSendTaskInput,
+  type A2aRemoteStateInput,
+  type A2aRemoteTarget,
+} from '../../../shared/a2aRemoteDelivery';
 
 type GetWindow = () => BrowserWindow | null;
 
@@ -58,6 +80,10 @@ const INTERNAL_RENDERER_FIELDS = [
   'deliveryGuardKey',
   'presetTaskId',
   'hqHandoffOnly',
+  // Cross-host A2A: only main's RemoteA2aBridge sets these, calling the
+  // renderer directly (never through this router).
+  'remoteFrom',
+  'remoteMarker',
 ] as const;
 
 /**
@@ -179,6 +205,48 @@ async function readWorkspacePanes(
 
 /** Validate an RPC-supplied caller pid. Anything non-positive / non-integer is
  *  ignored (older MCP build, or junk) → the handler keeps its legacy behavior. */
+/**
+ * Every Codex home the owner record can live in: main's own CODEX_HOME (or
+ * the default) and each registered account's config dir, since a thread
+ * started under another account's app-server keeps its owner index there. A
+ * dir with no owner index (another agent's account) simply misses.
+ */
+function codexHomes(): string[] {
+  const homes = new Set<string>([codexHome(process.env), codexHome({ ...process.env, CODEX_HOME: '' })]);
+  try {
+    for (const account of getAccountStore().listAccounts()) {
+      if (account.configDir) homes.add(account.configDir);
+    }
+  } catch {
+    /* an unreadable account store leaves the default homes */
+  }
+  return [...homes];
+}
+
+/**
+ * The pane a Codex thread's owner record names, with a claim on it, or null.
+ * Only for a caller main has seen to run under a shared Codex app-server
+ * (`callerIsSharedServerChild`): a thread id is a routing input, and only that
+ * parent hands one to an MCP server.
+ */
+function resolveCodexThreadClaim(
+  threadId: unknown,
+  entries: ReadonlyArray<{ ptyId: string; workspaceId: string }>,
+  callerIsSharedServerChild: boolean,
+): { workspaceId: string; ptyId: string; workspaceToken: string } | null {
+  if (!callerIsSharedServerChild) return null;
+  if (typeof threadId !== 'string' || !CODEX_THREAD_ID_RE.test(threadId)) return null;
+  let owner: ReturnType<typeof readCodexThreadOwner>;
+  for (const home of codexHomes()) {
+    owner = readCodexThreadOwner(threadId, home);
+    if (owner) break;
+  }
+  const match = matchOwnerToLiveAnchor(threadId, owner, entries, process.env.WMUX_DATA_SUFFIX || '');
+  if (match.status !== 'hit') return null;
+  const workspaceToken = claimTokenForPane(match.wsId, match.ptyId);
+  return workspaceToken ? { workspaceId: match.wsId, ptyId: match.ptyId, workspaceToken } : null;
+}
+
 function normalizeCallerPid(raw: unknown): number | null {
   return typeof raw === 'number' && Number.isInteger(raw) && raw > 0 ? raw : null;
 }
@@ -201,6 +269,28 @@ function withDeadline<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
  *  scan so a hung Win32_Process query can't sink the legacy fallback response. */
 const RPC_SNAPSHOT_DEADLINE_MS = 8000;
 
+type RemoteOpResult = { ok: true; taskId: string } | { ok: false; error: string };
+
+/**
+ * Cross-host A2A hooks into this handler set. Each is a daemon RPC in the
+ * wiring step (`A2A_REMOTE_RPC`); absent = no remote addressing at all.
+ */
+export interface RemoteA2aRpcDeps {
+  /** Every ACTIVE link as an alias target. */
+  listTargets: () => Promise<A2aRemoteTarget[]>;
+  /** Create the outbound ledger task and queue its envelope. */
+  sendTask: (input: A2aRemoteSendTaskInput) => Promise<RemoteOpResult>;
+  /** Append a reply to a remote task and queue it. */
+  reply: (input: A2aRemoteReplyInput) => Promise<RemoteOpResult>;
+  /** Queue a state the ledger already committed on a remote task. */
+  state: (input: A2aRemoteStateInput) => Promise<RemoteOpResult>;
+  /** The receiver of an inbound remote task read it: the sender gets a `read` receipt. */
+  read?: (input: { taskId: string; workspaceId: string }) => Promise<unknown>;
+}
+
+const REMOTE_QUEUED = { stored: true, notified: false, queued: true, reason: 'queued_for_remote_host' } as const;
+const REMOTE_STATES: ReadonlySet<string> = new Set(['working', 'input-required', 'completed', 'failed', 'canceled']);
+
 export function registerA2aRpc(
   router: RpcRouter,
   getWindow: GetWindow,
@@ -210,9 +300,128 @@ export function registerA2aRpc(
     getDaemonClient?: () => DaemonClient | null;
     /** Process creation time for the walk's pid-reuse guard; tests inject one. */
     createdAt?: (pid: number) => bigint | null;
+    /** One caller's ancestry when the snapshot is unavailable; tests inject one. */
+    readAncestry?: (pid: number, timeoutMs: number) => Promise<Map<number, number> | null>;
+    /** Who spawned a Codex-thread caller, from its ancestors' argv; tests inject one. */
+    classifyCodexCaller?: (pid: number) => Promise<McpParentClass>;
+    remote?: RemoteA2aRpcDeps;
   } = {},
 ): void {
   const getDaemonClient = opts.getDaemonClient;
+  const remote = opts.remote;
+
+  /**
+   * Active links `to` names EXACTLY (no trimming, no partial match): by alias,
+   * or by the `remote:<linkId>` id a2a.discover lists for the remote end.
+   */
+  async function remoteTargetsFor(to: unknown): Promise<A2aRemoteTarget[]> {
+    if (!remote || typeof to !== 'string' || (!to.includes('/') && !isRemoteWorkspaceId(to))) return [];
+    try {
+      return (await remote.listTargets()).filter((t) => t.alias === to || remoteWorkspaceId(t.linkId) === to);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * A new task addressed to a remote pane's alias. Only the link's own local
+   * pane may send on it, so the caller's pane must be proven; the task is
+   * message-only (no worker is ever spawned for a remote pane).
+   */
+  async function sendRemoteTask(
+    params: Record<string, unknown>,
+    matches: A2aRemoteTarget[],
+    ctx: RpcContext | undefined,
+  ): Promise<unknown> {
+    const alias = params.to as string;
+    if (params.execute === true) return { error: 'a2a.task.send: execute is not available for a remote pane (message only)' };
+    // An alias must name exactly one link: never pick one of several silently.
+    if (matches.length > 1) {
+      return { error: `a2a.task.send: "${alias}" names ${matches.length} links; send to the exact alias a2a_discover lists for the one you mean (a repeated name gets a #2, #3 suffix)` };
+    }
+    let message: string;
+    try { message = validateMessage(typeof params.message === 'string' ? params.message : ''); } catch (e) {
+      return { error: `a2a.task.send: ${e instanceof Error ? e.message : 'invalid'}` };
+    }
+    if (ctx?.commanderWorkspace) {
+      // A brain sends only on a brain link of its own workspace: Moa to
+      // another PC's Moa. The sender is the token-verified commander binding,
+      // never a wire value.
+      const hq = ctx.commanderWorkspace;
+      const brainLink = matches.find((t) => t.kind === 'brain' && t.local.workspaceId === hq);
+      if (!brainLink) {
+        return matches.some((t) => t.kind === 'brain')
+          ? { error: `a2a.task.send: "${alias}" is linked to another workspace's Moa, not to this one` }
+          : {
+            error:
+              `a2a.task.send: Moa does not send work straight to an agent ("${alias}" is a remote pane). ` +
+              'Ask its PC\'s Moa instead (its <PC>/Moa alias from a2a_discover), or propose the work to the operator with moa_propose_handoff.',
+          };
+      }
+      if (!brainLink.allowOutbound) return { error: `a2a.task.send: the link to "${alias}" does not allow sending from this side` };
+      const res = await remote!.sendTask({
+        linkId: brainLink.linkId,
+        from: { workspaceId: hq, name: A2A_BRAIN_ALIAS },
+        title: typeof params.title === 'string' ? params.title : '',
+        text: message,
+      }).catch((err: unknown): RemoteOpResult => ({ ok: false, error: err instanceof Error ? err.message : String(err) }));
+      if (!res.ok) return { error: `a2a.task.send: remote send refused (${res.error})` };
+      return {
+        ok: true,
+        taskId: res.taskId,
+        remote: true,
+        delivery: REMOTE_QUEUED,
+        // What Moa reads right after sending: the wait is not the operator's decision.
+        next: 'You are woken when the other Moa replies or completes it; a2a_task_query shows remoteReceipt delivered/read once it arrives. Do not raise a decision card about waiting: end your turn.',
+      };
+    }
+    const workspaceId = typeof params.workspaceId === 'string' ? params.workspaceId : '';
+    const caller = await resolveCallerPane(getWindow, workspaceId, params.senderPtyId);
+    if (caller.kind !== 'resolved') {
+      return { error: `a2a.task.send: "${alias}" is a remote pane; sending to it needs the caller's verified pane` };
+    }
+    const link = matches.find((t) => t.kind !== 'brain' && t.local.workspaceId === workspaceId && t.local.paneId === caller.paneId);
+    if (!link) return { error: `a2a.task.send: this pane is not linked to "${alias}"` };
+    if (!link.allowOutbound) return { error: `a2a.task.send: the link to "${alias}" does not allow sending from this side` };
+    const res = await remote!.sendTask({
+      linkId: link.linkId,
+      // The verified sender pty: a reply from the peer is held if another
+      // agent holds this pane by then.
+      from: { workspaceId, name: workspaceId, paneId: caller.paneId, ptyId: params.senderPtyId as string },
+      title: typeof params.title === 'string' ? params.title : '',
+      text: message,
+    }).catch((err: unknown): RemoteOpResult => ({ ok: false, error: err instanceof Error ? err.message : String(err) }));
+    if (!res.ok) return { error: `a2a.task.send: remote send refused (${res.error})` };
+    return { ok: true, taskId: res.taskId, remote: true, delivery: REMOTE_QUEUED };
+  }
+
+  /** A reply on a remote task: stored in the ledger and queued for the peer. */
+  async function replyRemote(method: string, taskId: string, params: Record<string, unknown>, ctx: RpcContext | undefined): Promise<unknown> {
+    let message: string;
+    try { message = validateMessage(typeof params.message === 'string' ? params.message : ''); } catch (e) {
+      return { error: `${method}: ${e instanceof Error ? e.message : 'invalid'}` };
+    }
+    const res = await remote!.reply({
+      taskId,
+      // A brain answers as its token-verified workspace (Moa: the HQ).
+      workspaceId: ctx?.commanderWorkspace ?? (typeof params.workspaceId === 'string' ? params.workspaceId : ''),
+      text: message,
+    }).catch((err: unknown): RemoteOpResult => ({ ok: false, error: err instanceof Error ? err.message : String(err) }));
+    if (!res.ok) return { error: `${method}: remote reply refused (${res.error})` };
+    return { ok: true, taskId, remote: true, delivery: REMOTE_QUEUED };
+  }
+
+  /** After the ledger committed a state on a remote task, tell the peer. Best effort. */
+  async function queueRemoteState(taskId: string, state: unknown, evidence: unknown): Promise<void> {
+    if (!remote || !isRemoteTaskId(taskId) || typeof state !== 'string' || !REMOTE_STATES.has(state)) return;
+    const summary = isRecord(evidence) && typeof evidence.summary === 'string' ? evidence.summary : undefined;
+    try {
+      const res = await remote.state({ taskId, state: state as A2aRemoteStateInput['state'], ...(summary ? { summary } : {}) });
+      if (!res.ok) console.warn(`[a2a.rpc] state ${state} of remote task ${taskId} was not queued: ${res.error}`);
+    } catch (err) {
+      console.warn(`[a2a.rpc] state ${state} of remote task ${taskId} was not queued:`, err);
+    }
+  }
   // Server-side process-tree snapshot for handshake identity resolution. Shared
   // across CONCURRENT handshakes (in-flight coalescing) so the multi-agent launch
   // burst triggers ONE Win32_Process spawn, not one per agent. The MCP side
@@ -220,6 +429,28 @@ export function registerA2aRpc(
   // the miss/fallback path re-snaps.
   const snapshotFn: SnapshotFn = opts.snapshot ?? defaultSnapshot;
   const createdAt = opts.createdAt ?? tryProcessCreatedAt;
+  const readAncestry = opts.readAncestry ?? readWindowsAncestry;
+  const classifyCodexCaller = opts.classifyCodexCaller ?? (async (pid: number) => classifyMcpParent(await readParentChain(pid)));
+  // A shared app-server's MCP child lives as long as the server, so a
+  // confirmed answer is kept a minute rather than re-reading argv every call.
+  // 'unknown' is never kept.
+  const codexCallerClass = new Map<number, { cls: McpParentClass; at: number }>();
+  async function isSharedServerChild(pid: number | null): Promise<boolean> {
+    if (pid === null) return false;
+    const hit = codexCallerClass.get(pid);
+    if (hit && Date.now() - hit.at < 60_000) return hit.cls === 'shared-server';
+    let cls: McpParentClass = 'unknown';
+    try {
+      cls = await classifyCodexCaller(pid);
+    } catch {
+      cls = 'unknown';
+    }
+    if (cls !== 'unknown') {
+      if (codexCallerClass.size > 256) codexCallerClass.clear();
+      codexCallerClass.set(pid, { cls, at: Date.now() });
+    }
+    return cls === 'shared-server';
+  }
   let snapInflight: Promise<PortSnapshot> | null = null;
   async function getCoalescedSnapshot(): Promise<PortSnapshot | null> {
     if (!snapInflight) {
@@ -253,6 +484,26 @@ export function registerA2aRpc(
     // instead of one PowerShell spawn per caller. A callerPid still absent after
     // that is a genuine miss the walk handles (parent undefined → null).
     return getCoalescedSnapshot();
+  }
+
+  /** See the `hintedPane` field of `a2a.resolve.identity`. */
+  async function resolveHintedPane(
+    hintedPtyId: unknown,
+    entries: ReadonlyArray<{ ptyId: string; workspaceId: string }>,
+  ): Promise<{ live: boolean; workspaceId?: string; workspaceToken?: string } | null> {
+    if (typeof hintedPtyId !== 'string' || hintedPtyId.length === 0 || hintedPtyId.length > 128) return null;
+    const pane = entries.find((e) => e.ptyId === hintedPtyId);
+    if (!pane) return { live: false };
+    let wslLive = false;
+    try {
+      const res = await getDaemonClient?.()?.rpc('session.wslAgentLive', { sessionId: hintedPtyId }, { timeoutMs: 2000 });
+      wslLive = (res as { live?: unknown } | null)?.live === true;
+    } catch {
+      wslLive = false; // daemon unreachable or older: unattested
+    }
+    if (!wslLive) return { live: true };
+    const workspaceToken = claimTokenForPane(pane.workspaceId, pane.ptyId);
+    return workspaceToken ? { live: true, workspaceId: pane.workspaceId, workspaceToken } : { live: true };
   }
 
   // a2a.resolve.identity — handled in main process (not renderer).
@@ -390,7 +641,15 @@ export function registerA2aRpc(
         RPC_SNAPSHOT_DEADLINE_MS - (Date.now() - startedAt),
         null,
       );
-      if (snapshot) {
+      // No usable snapshot (on Windows: the Win32_Process query failed or ran
+      // out of time, or it predates the caller): read just this caller's chain
+      // instead, so a pane agent still gets its claim. The chain script checks
+      // creation times itself, so the walk needs no separate reuse guard.
+      const ppidByPid =
+        snapshot && snapshot.ppidByPid.has(callerPid)
+          ? snapshot.ppidByPid
+          : await readAncestry(callerPid, RPC_SNAPSHOT_DEADLINE_MS - (Date.now() - startedAt));
+      if (ppidByPid) {
         const anchorByPid = new Map<number, OwningAnchor>();
         for (const e of entries) {
           const pid = Number(e.pid);
@@ -398,18 +657,49 @@ export function registerA2aRpc(
             anchorByPid.set(pid, { ptyId: e.ptyId, workspaceId: e.workspaceId });
           }
         }
-        const parentPid = snapshot.ppidByPid.get(callerPid);
+        const parentPid = ppidByPid.get(callerPid);
         // Creation times reject a reused parent pid: a Codex app-server that
         // updated itself is orphaned, and its dead parent's pid may now be a
         // new pane's shell (Windows only; elsewhere the reader returns null).
         const hit = parentPid !== undefined
-          ? walkToOwningAnchor(parentPid, snapshot.ppidByPid, anchorByPid, { createdAt, child: callerPid })
+          ? walkToOwningAnchor(parentPid, ppidByPid, anchorByPid, { createdAt, child: callerPid })
           : null;
         if (hit) resolved = { workspaceId: hit.anchor.workspaceId, ptyId: hit.anchor.ptyId };
       }
     }
 
-    return { mappings, entries, resolved };
+    // A pane claim from main's own walk: the token binds the walked workspace
+    // and pane, so browser calls carrying it are scoped from what main found
+    // rather than from a workspace the caller names. Additive — a caller that
+    // ignores the field is unaffected. Only for a hit main resolved itself,
+    // never for the client-side walk over `entries`.
+    const workspaceToken = resolved ? claimTokenForPane(resolved.workspaceId, resolved.ptyId) : null;
+    // A call from a shared Codex app-server names its thread instead: the pane
+    // comes from the thread's owner record (written by wmux's Codex hooks from
+    // inside that pane), joined with the LIVE anchors above. The claim goes
+    // back on its own field because the caller stamps it on that call only.
+    const codexThreadId = (params as { codexThreadId?: unknown }).codexThreadId;
+    const threadClaim = codexThreadId === undefined
+      ? null
+      : resolveCodexThreadClaim(
+          codexThreadId,
+          entries,
+          await isSharedServerChild(normalizeCallerPid((params as { codexCallerPid?: unknown }).codexCallerPid)),
+        );
+    // The walk missed but the caller's env names a pane. Main says whether
+    // that pane is live, and attests it only when the daemon follows a live
+    // agent inside it from WSL — the one pane kind whose processes main cannot
+    // walk. A name that is not a live pane (a scheduled run's `auto-` session,
+    // which belongs to no workspace) is reported as such, never as a pane.
+    const hintedPane = resolved ? null : await resolveHintedPane((params as { hintedPtyId?: unknown }).hintedPtyId, entries);
+    return {
+      mappings,
+      entries,
+      resolved,
+      ...(workspaceToken && { workspaceToken }),
+      ...(threadClaim && { threadClaim }),
+      ...(hintedPane && { hintedPane }),
+    };
   });
 
   /**
@@ -459,7 +749,44 @@ export function registerA2aRpc(
 
   // A2A protocol — whoami/discover/broadcast/skills는 렌더러 소유 그대로.
   router.register('a2a.whoami', (params) => sendToRenderer(getWindow, 'a2a.whoami', params));
-  router.register('a2a.discover', (params) => sendToRenderer(getWindow, 'a2a.discover', params));
+  router.register('a2a.discover', async (params) => {
+    const res = await sendToRenderer(getWindow, 'a2a.discover', params);
+    if (!remote || !isRecord(res) || !Array.isArray(res.agents)) return res;
+    let targets: A2aRemoteTarget[] = [];
+    try { targets = await remote.listTargets(); } catch { return res; }
+    // A remote pane is addressable only from its linked local pane: list the
+    // links of the caller's workspace (every link when no workspace is named).
+    const ws = typeof params.workspaceId === 'string' && params.workspaceId ? params.workspaceId : '';
+    const entries = targets
+      .filter((t) => !ws || t.local.workspaceId === ws)
+      .map((t) => ({
+        name: t.alias,
+        description: t.kind === 'brain'
+          ? `Moa of PC ${t.alias.split('/')[0]} (linked to this PC's Moa; send_message to: "${t.alias}"; message only)`
+          : `Remote pane ${t.alias} (linked to local pane ${t.local.paneId}; message only)`,
+        url: remoteWorkspaceId(t.linkId),
+        version: '1.0',
+        capabilities: { stateTransitionHistory: true },
+        skills: [],
+        skillsRegistered: false,
+        live: false,
+        remote: true,
+        panes: [],
+        metadata: {
+          workspaceId: remoteWorkspaceId(t.linkId),
+          status: 'remote',
+          agentName: null,
+          live: false,
+          remote: true,
+          linkId: t.linkId,
+          hostId: t.hostId,
+          ...(t.local.paneId ? { localPaneId: t.local.paneId } : {}),
+          endpoint: t.kind,
+          allowOutbound: t.allowOutbound,
+        },
+      }));
+    return entries.length ? { ...res, agents: [...res.agents, ...entries] } : res;
+  });
   router.register('a2a.broadcast', async (params, ctx) =>
     refuseHandoffMarker('a2a.broadcast', params.message, ctx)
     ?? sendToRenderer(getWindow, 'a2a.broadcast', withOperatorOrigin(params, ctx)));
@@ -474,7 +801,14 @@ export function registerA2aRpc(
   // 더 최신이면 status/updatedAt만 데몬 값으로 덮고, 렌더러 전용 증분(history·
   // artifacts)은 보존한다(§6.F — 증분 히스토리는 아직 데몬 비내구). 데몬-only
   // id(재시작 생존분)는 추가. 데몬 미가용이면 현행 렌더러-only와 동일.
-  router.register('a2a.task.query', async (rawParams) => {
+  router.register('a2a.task.query', async (rawParams, ctx) => {
+    // Reading one remote task by id is what the sender's `read` receipt means.
+    // The daemon checks the caller is the task's receiving workspace.
+    const readId = typeof rawParams.taskId === 'string' ? rawParams.taskId : '';
+    const reader = ctx?.commanderWorkspace ?? (typeof rawParams.workspaceId === 'string' ? rawParams.workspaceId : '');
+    if (remote?.read && isRemoteTaskId(readId) && reader) {
+      void remote.read({ taskId: readId, workspaceId: reader }).catch(() => undefined);
+    }
     // view: 'page' (a2a_task_query): each source returns summaries (or the one
     // named task), and the merged result is paged here — see a2aTaskQueryView.
     const paged = isPagedTaskQuery(rawParams);
@@ -560,6 +894,9 @@ export function registerA2aRpc(
     const merged = rendererTasks.map((rt) => {
       const dt = daemonById.get(rt.id);
       if (!dt) return rt;
+      // A remote task's history grows in the daemon (the peer's replies), so
+      // the daemon copy is the whole truth for it.
+      if (isRemoteTaskId(rt.id)) return dt;
       // 데몬 정본이 렌더러 캐시보다 최신이면(렌더러가 daemonCommitted 미적용) status/
       // updatedAt을 데몬 값으로 덮되 렌더러 전용 증분(history·artifacts)은 보존.
       if (updatedAtOf(dt) > updatedAtOf(rt)) {
@@ -587,6 +924,9 @@ export function registerA2aRpc(
     const marked = refuseHandoffMarker('a2a.task.update', rawParams.message, ctx);
     if (marked) return marked;
     const params = withOperatorOrigin(rawParams, ctx);
+    // A brain moves a remote task as its token-verified workspace (Moa: the
+    // HQ), never a wire value: the state also goes to the other PC.
+    if (ctx?.commanderWorkspace && remote && isRemoteTaskId(params.taskId)) params.workspaceId = ctx.commanderWorkspace;
     // 메시지 선검증(shared validateMessage — 렌더러와 동일 계약): 데몬 커밋 후
     // 렌더러가 메시지를 거부해 캐시-데몬이 갈라지는 창을 닫는다.
     if (typeof params.message === 'string') {
@@ -650,11 +990,13 @@ export function registerA2aRpc(
         if (cancelWorker) claudeWorker.cancel(cancelWorker);
         // Work link (best-effort): the daemon's committed state is the truth.
         void recordTaskState(params.taskId, stateOfTask(gate.result.task), undefined, gate.result.task);
-        return sendToRenderer(getWindow, 'a2a.task.update', {
+        const applied = await sendToRenderer(getWindow, 'a2a.task.update', {
           ...params,
           daemonCommitted: true,
           committedTask: gate.result.task,
         });
+        if (typeof params.taskId === 'string') await queueRemoteState(params.taskId, params.status, params.evidence);
+        return applied;
       }
       // unavailable → the renderer's own checked writer (fallback). Only an
       // explicit ok from it counts as a committed cancel.
@@ -666,6 +1008,10 @@ export function registerA2aRpc(
           { status: { state: params.status, message: params.message, evidence: params.evidence } });
       }
       return res;
+    }
+    // A message on a remote task is a reply for the peer host.
+    if (typeof params.message === 'string' && remote && typeof params.taskId === 'string' && isRemoteTaskId(params.taskId)) {
+      return replyRemote('a2a.task.update', params.taskId, params, ctx);
     }
     // Message-only update: may reopen an ended task (daemon first).
     if (typeof params.message === 'string') {
@@ -689,6 +1035,18 @@ export function registerA2aRpc(
   router.register('a2a.task.send', async (params, ctx) => {
     const marked = refuseHandoffMarker('a2a.task.send', [params.message, params.title], ctx);
     if (marked) return marked;
+    // Cross-host A2A: a reply on a remote task, or a new task to a remote
+    // pane's exact alias, goes to the peer host instead of a local pane.
+    if (remote && typeof params.taskId === 'string' && isRemoteTaskId(params.taskId)) {
+      if (params.execute === true) return { error: 'a2a.task.send: execute is only supported for new tasks' };
+      return replyRemote('a2a.task.send', params.taskId, params, ctx);
+    }
+    if (!params.taskId) {
+      const matches = await remoteTargetsFor(params.to);
+      if (matches.length > 0) return sendRemoteTask(params, matches, ctx);
+      // A remote end's id never names a local workspace: no active link, no send.
+      if (isRemoteWorkspaceId(params.to)) return { error: `a2a.task.send: "${params.to}" is not an active link to another PC` };
+    }
     // Forward the VALIDATED commander binding (RpcRouter set it from the
     // per-spawn token; never read from the wire, so any caller-supplied value
     // is dropped first). The renderer's reply-delivery guards need it: an
@@ -707,7 +1065,7 @@ export function registerA2aRpc(
       sendParams.deliveryGuardKey = params.deliveryGuardKey;
     }
     // A task id main minted for a new operator send (moaHandoff.ts).
-    if (ctx?.operator === true && typeof params.presetTaskId === 'string' && !params.taskId) {
+    if (ctx?.operator === true && typeof params.presetTaskId === 'string' && !params.taskId && !isRemoteTaskId(params.presetTaskId)) {
       sendParams.presetTaskId = params.presetTaskId;
     }
     // A trusted in-process caller (Git page, fanout, Moa) that created the work
@@ -730,7 +1088,14 @@ export function registerA2aRpc(
         } catch {
           // a ledger we cannot read grants nothing extra
         }
-        sendParams.hqHandoffOnly = { allowedTargets: [ctx.commanderWorkspace, ...own] };
+        // While a goal is active, only the goal's own workspaces (owner
+        // decision 2, moaLevelGate.ts): an older fan-out task outside the
+        // contract is not reachable directly either.
+        const goalScope = moaGoalSendScope(ctx.commanderWorkspace);
+        const allowed = [ctx.commanderWorkspace, ...own];
+        sendParams.hqHandoffOnly = {
+          allowedTargets: goalScope ? allowed.filter((w) => goalScope.includes(w)) : allowed,
+        };
       }
     }
     // A NEW execute send's reply is held until the user answers the approval
@@ -845,11 +1210,13 @@ export function registerA2aRpc(
         committed && isRecord(committed.status) ? committed.status.state : undefined;
       if (committedState === 'canceled') {
         void recordTaskState(taskId, 'canceled');
-        return sendToRenderer(getWindow, 'a2a.task.cancel', {
+        const applied = await sendToRenderer(getWindow, 'a2a.task.cancel', {
           ...params,
           daemonCommitted: true,
           committedTask: gate.result.task,
         });
+        await queueRemoteState(taskId, 'canceled', undefined);
+        return applied;
       }
       return { ok: true, taskId };
     }

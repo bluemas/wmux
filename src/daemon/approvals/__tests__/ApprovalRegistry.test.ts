@@ -17,6 +17,7 @@ import {
 } from '../approvalStore';
 import {
   decideApprovalPress,
+  encodeAnswerKey,
   keystrokesForAgent,
   looksLikeApprovalPrompt,
   looksLikeChoiceOnScreen,
@@ -225,6 +226,30 @@ describe('ApprovalRegistry — lifecycle', () => {
     await h.registry.resolve({ id: 'req-1', decision: 'deny', resolvedBy: 'phone' });
 
     expect(h.writes).toEqual([{ sessionId: 'pty-a', data: '\x1b' }]);
+  });
+
+  it('#1915: on a win32-input-mode pane deny sends the Esc key record, and approve still sends the digit', async () => {
+    const panes: string[] = [];
+    const h = makeRegistry({ win32Input: (sessionId) => { panes.push(sessionId); return true; } });
+    await awaitingInput(h.registry);
+    await settle();
+
+    await h.registry.resolve({ id: 'req-1', decision: 'deny', resolvedBy: 'phone' });
+
+    // Measured on Windows: a bare ESC left the picker up, the record closed it.
+    expect(h.writes).toEqual([{ sessionId: 'pty-a', data: '\x1b[27;1;27;1;0;1_\x1b[27;1;0;0;0;1_' }]);
+    expect(panes).toEqual(['pty-a']);
+  });
+
+  it('#1915: on a win32-input-mode pane approve still sends the plain digit', async () => {
+    const h = makeRegistry({ win32Input: () => true });
+    await awaitingInput(h.registry);
+    await settle();
+
+    await h.registry.resolve({ id: 'req-1', decision: 'approve', resolvedBy: 'phone' });
+
+    // Measured: a digit presses its option through conhost as a plain byte.
+    expect(h.writes).toEqual([{ sessionId: 'pty-a', data: '1' }]);
   });
 
   it('an unknown id is not-found and writes nothing', async () => {
@@ -587,6 +612,55 @@ describe('ApprovalRegistry — supersede and expire', () => {
     await h.registry.expireForSession('pty-a', 'turn-ended');
     await settle();
     expect(h.registry.list().recentlyResolved[0]?.localAnswer).toBeUndefined();
+  });
+
+  // #1918: Copilot fires no hook when its permission prompt is cancelled with
+  // Esc. The pane's answered path is the only thing that knows it is over.
+  it('the pane answered at the terminal expires its question-less card', async () => {
+    const h = makeRegistry();
+    await h.registry.noteHookAwaitingInput({ sessionId: 'pty-cop', agent: 'copilot', workspaceId: 'ws-1', attribution: 'exact' });
+    await settle();
+    expect(h.registry.list().pending).toHaveLength(1);
+
+    expect(await h.registry.expireAnsweredInformational('pty-cop', 'answered-locally')).toBe(1);
+    expect(h.registry.list().pending).toHaveLength(0);
+    expect(h.registry.list().recentlyResolved[0]).toMatchObject({ sessionId: 'pty-cop', kind: 'awaiting_input', state: 'expired' });
+    expect(h.events.map((e) => e.type)).toEqual(['create', 'expire']);
+  });
+
+  it('the screen check finding the dialog gone expires a question-less card too', async () => {
+    const h = makeRegistry();
+    await h.registry.noteHookAwaitingInput({ sessionId: 'pty-cop', agent: 'copilot' });
+    await settle();
+    expect(await h.registry.expireAnsweredInformational('pty-cop', 'screen-cleared')).toBe(1);
+    expect(h.registry.list().pending).toHaveLength(0);
+  });
+
+  it('the answered sweep leaves a question card, a keyed card and other panes alone', async () => {
+    const h = makeRegistry();
+    // An AskUserQuestion picker: one key can release the pane while the
+    // picker is still up, and Claude reports the answer itself.
+    await awaitingInput(h.registry, 'pty-q');
+    // A card the agent settles by its own request id (OpenCode).
+    await h.registry.noteHookAwaitingInput({ sessionId: 'pty-oc', agent: 'opencode', requestId: 'per_1' });
+    // Options with no question text are still something to answer.
+    await h.registry.noteHookAwaitingInput({ sessionId: 'pty-opt', agent: 'claude', options: ['Yes', 'No'] });
+    // Another pane's informational card.
+    await h.registry.noteHookAwaitingInput({ sessionId: 'pty-other', agent: 'copilot' });
+    await settle();
+
+    for (const id of ['pty-q', 'pty-oc', 'pty-opt']) {
+      expect(await h.registry.expireAnsweredInformational(id, 'answered-locally'), id).toBe(0);
+    }
+    expect(h.registry.list().pending.map((r) => r.sessionId).sort()).toEqual(['pty-oc', 'pty-opt', 'pty-other', 'pty-q']);
+  });
+
+  it('the answered sweep never touches a permission gate', async () => {
+    const h = makeRegistry();
+    h.registry.noteGateAwaiting({ sessionId: 'pty-g', agent: 'claude', toolName: 'Bash', toolInputSummary: 'npm test' });
+    await settle();
+    expect(await h.registry.expireAnsweredInformational('pty-g', 'answered-locally')).toBe(0);
+    expect(h.registry.list().pending).toHaveLength(1);
   });
 
   it('expiring a pane with nothing pending emits nothing', async () => {
@@ -963,6 +1037,20 @@ describe('risk hint — a UI step-up signal, never a gate', () => {
 
     const third = makeRegistry();
     expect(third.registry.list().recentlyResolved[0].risk).toBeUndefined();
+  });
+});
+
+describe('encodeAnswerKey (#1915)', () => {
+  it('writes Esc as its win32-input-mode key record pair only on a win32-input pane', () => {
+    expect(encodeAnswerKey('\x1b', true)).toBe('\x1b[27;1;27;1;0;1_\x1b[27;1;0;0;0;1_');
+    expect(encodeAnswerKey('\x1b', false)).toBe('\x1b');
+  });
+
+  it('leaves every other answer key as it is (measured: digits, a lone CR and a VT arrow press as bytes)', () => {
+    for (const key of ['1', '4', '\r', '\x1b[B', '\x1b[200~text\x1b[201~']) {
+      expect(encodeAnswerKey(key, true)).toBe(key);
+      expect(encodeAnswerKey(key, false)).toBe(key);
+    }
   });
 });
 

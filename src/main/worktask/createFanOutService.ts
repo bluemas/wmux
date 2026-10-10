@@ -20,6 +20,7 @@ import type { RpcMethod } from '../../shared/rpc';
 import { sendToRenderer } from '../pipe/handlers/_bridge';
 import { getProjectConfigStore } from '../project/ProjectConfigStore';
 import { FanOutService } from './FanOutService';
+import { createDaemonLaunchProbe } from './fanoutLaunchProbe';
 import { createWorkerTempDir, getWorkerTempDirSweeper, removeWorkerTempDir } from './fanoutTempDir';
 
 type GetWindow = () => BrowserWindow | null;
@@ -93,6 +94,9 @@ export function createFanOutService(
         dc.writeToSession(ptyId, sequence);
       },
     },
+    // #1919 — did the worker's agent actually start? `false` only on the
+    // daemon's positive evidence of absence (see fanoutLaunchProbe.ts).
+    launchProbe: createDaemonLaunchProbe(getDaemonClient),
     // Private TMPDIR per worker, removed once its task workspace is gone
     // (see fanoutTempDir.ts for the reconcile).
     workerTempDirs: {

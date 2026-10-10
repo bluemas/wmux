@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { createElement } from 'react';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import ResumeInfoChip, { buildPaneResumeCommand } from '../ResumeInfoChip';
 import type { ResumeBinding } from '../../../../shared/agentResume';
 
@@ -26,9 +28,40 @@ describe('buildPaneResumeCommand', () => {
     });
   });
 
-  it('skip-permissions ON also rides the cwd-relative fallback (a launch pref, not conversation-scoped)', () => {
-    const out = buildPaneResumeCommand(claude(), ['/Users/me/OTHER'], true);
-    expect(out).toMatchObject({ command: 'claude --dangerously-skip-permissions --continue', exact: false });
+  it('skip-permissions ON never rides the cwd-relative fallback (#1916)', () => {
+    const out = buildPaneResumeCommand(claude({ permissionMode: 'bypassPermissions' }), ['/Users/me/OTHER'], true);
+    expect(out).toMatchObject({ command: 'claude --resume', exact: false });
+  });
+
+  it('skip-permissions OFF drops a captured bypassPermissions on an EXACT resume (#1916)', () => {
+    const out = buildPaneResumeCommand(claude({ permissionMode: 'bypassPermissions' }), ['/Users/me/proj'], false);
+    expect(out).toMatchObject({
+      command: 'claude --resume a1b2c3d4-0000-0000-0000-9f8e7d6c5b4a',
+      exact: true,
+    });
+  });
+
+  it('the cwd-relative fallback withholds the permission choices in the role args (#1916)', () => {
+    const out = buildPaneResumeCommand(claude(), ['/Users/me/OTHER'], false, {
+      agent: 'claude', args: '--permission-mode bypassPermissions --verbose',
+    });
+    expect(out?.command).toBe('claude --resume --verbose');
+    const exactOut = buildPaneResumeCommand(claude(), ['/Users/me/proj'], false, {
+      agent: 'claude', args: '--permission-mode acceptEdits',
+    });
+    expect(exactOut?.command).toBe('claude --resume a1b2c3d4-0000-0000-0000-9f8e7d6c5b4a --permission-mode acceptEdits');
+  });
+
+  it('the cwd-relative fallback withholds a role skip flag for every agent (#1916)', () => {
+    const claudeOut = buildPaneResumeCommand(claude(), ['/Users/me/OTHER'], true, { agent: 'claude', skipPermissions: true });
+    expect(claudeOut?.command).toBe('claude --resume');
+    const codexOut = buildPaneResumeCommand(
+      claude({ agent: 'codex', sessionId: 'sess-77' }),
+      ['/Users/me/OTHER'],
+      false,
+      { agent: 'codex', skipPermissions: true },
+    );
+    expect(codexOut?.command).toBe('codex resume');
   });
 
   it('skip-permissions OFF + default mode → plain exact resume, no permission flag', () => {
@@ -53,12 +86,12 @@ describe('buildPaneResumeCommand', () => {
       ['/Users/me/OTHER'],
       false,
     );
-    expect(out).toMatchObject({ command: 'claude --continue', exact: false });
+    expect(out).toMatchObject({ command: 'claude --resume', exact: false });
   });
 
   it('missing live cwd → fallback (cannot confirm the cwd-scoped resume)', () => {
     const out = buildPaneResumeCommand(claude(), [undefined], false);
-    expect(out).toMatchObject({ command: 'claude --continue', exact: false });
+    expect(out).toMatchObject({ command: 'claude --resume', exact: false });
   });
 
   it('codex takes no permission flag even with skip-permissions ON', () => {
@@ -95,12 +128,12 @@ describe('buildPaneResumeCommand', () => {
 
   it('no candidate matches → fallback', () => {
     const out = buildPaneResumeCommand(claude(), ['C:\\Users\\me', 'D:\\other'], false);
-    expect(out).toMatchObject({ command: 'claude --continue', exact: false });
+    expect(out).toMatchObject({ command: 'claude --resume', exact: false });
   });
 
   it('empty candidate list → fallback', () => {
     const out = buildPaneResumeCommand(claude(), [], false);
-    expect(out).toMatchObject({ command: 'claude --continue', exact: false });
+    expect(out).toMatchObject({ command: 'claude --resume', exact: false });
   });
 
   it('non-resumable agent → null (no affordance)', () => {
@@ -116,7 +149,7 @@ describe('buildPaneResumeCommand', () => {
 
   it('re-asserts the bound model on the cwd-relative fallback too', () => {
     const out = buildPaneResumeCommand(claude(), ['/Users/me/OTHER'], false, { agent: 'claude', model: 'haiku' });
-    expect(out?.command).toBe('claude --model haiku --continue');
+    expect(out?.command).toBe('claude --model haiku --resume');
   });
 
   it('reports roleRewritten so the caller can log the change once', () => {
@@ -155,9 +188,10 @@ describe('buildPaneResumeCommand', () => {
     expect(buildPaneResumeCommand(binding, [], true, undefined, true)?.command)
       .toBe('claude --dangerously-skip-permissions --resume conv-1');
     // Host says it no longer matches → the cwd-relative fallback, even though
-    // a naive local compare of two empty strings would have said "exact".
+    // a naive local compare of two empty strings would have said "exact". The
+    // fallback carries no bypass flag (#1916).
     expect(buildPaneResumeCommand(binding, [''], true, undefined, false)?.command)
-      .toBe('claude --dangerously-skip-permissions --continue');
+      .toBe('claude --resume');
   });
 });
 
@@ -178,7 +212,7 @@ describe('buildPaneResumeCommand — role skipPermissions vs the toggle', () => 
 
   it('toggle OFF on the cwd-relative fallback still withholds it', () => {
     const out = buildPaneResumeCommand(claude(), ['/Users/me/OTHER'], false, skipRole);
-    expect(out?.command).toBe('claude --model haiku --effort low --continue');
+    expect(out?.command).toBe('claude --model haiku --effort low --resume');
   });
 
   it('toggle ON carries exactly one skip flag', () => {
@@ -205,7 +239,7 @@ describe('buildPaneResumeCommand — role skipPermissions vs the toggle', () => 
     const exact = buildPaneResumeCommand(claude({ permissionMode: 'plan' }), ['/Users/me/proj'], false, argsRole);
     expect(exact?.command).toBe(`claude --model haiku --permission-mode plan --resume ${SID} --verbose`);
     const fallback = buildPaneResumeCommand(claude(), ['/Users/me/OTHER'], false, argsRole);
-    expect(fallback?.command).toBe('claude --model haiku --continue --verbose');
+    expect(fallback?.command).toBe('claude --model haiku --resume --verbose');
     expect(countSkip(fallback?.command)).toBe(0);
   });
 
@@ -244,5 +278,36 @@ describe('ResumeInfoChip render smoke', () => {
       }),
     );
     expect(html).toBe('');
+  });
+});
+
+// #1946 — a Codex binding that no longer matches the pane's folder opens the
+// `codex resume` picker instead of reopening the folder's newest thread.
+describe('buildPaneResumeCommand — no exact session opens the picker (#1946)', () => {
+  const THREAD = '0199a1b2-0000-7000-8000-9f8e7d6c5b4a';
+  const codex = (over: Partial<ResumeBinding> = {}): ResumeBinding =>
+    ({ agent: 'codex', sessionId: THREAD, cwd: 'D:/repo', ts: 1, ...over });
+
+  it('bound and in its folder: the exact thread', () => {
+    expect(buildPaneResumeCommand(codex(), ['d:\\repo\\'], false))
+      .toMatchObject({ command: `codex resume ${THREAD}`, exact: true });
+  });
+
+  it('bound to another folder: the picker, never --last', () => {
+    const out = buildPaneResumeCommand(codex({ cwd: 'D:/other' }), ['D:/repo'], true);
+    expect(out).toMatchObject({ command: 'codex resume', exact: false });
+    expect(out?.command).not.toContain('--last');
+  });
+
+  it('a role model rides the picker line without adding a positional after `resume`', () => {
+    const out = buildPaneResumeCommand(codex({ cwd: 'D:/other' }), ['D:/repo'], false, { agent: 'codex', model: 'gpt-5' });
+    expect(out?.command).toBe('codex --model gpt-5 resume');
+  });
+
+  it("the chip's action button names the picker when the session is not exact", () => {
+    const src = readFileSync(resolve(__dirname, '../ResumeInfoChip.tsx'), 'utf8');
+    expect(src).toMatch(/built\.exact\s*\?\s*t\('resume\.label', \{ agent: agentName \}\)\s*:\s*t\('resume\.pickLabel', \{ agent: agentName \}\)/);
+    expect(src).toContain("t('resume.pickerNote')");
+    expect(src).toContain("title={built.exact ? t('resume.tooltip') : t('resume.pickTooltip')}");
   });
 });

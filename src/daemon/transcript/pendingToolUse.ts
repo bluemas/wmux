@@ -117,11 +117,23 @@ export function readPendingToolUse(
 }
 
 /**
- * The text a tool's permission dialog shows as "the command": Bash's
- * `command`, otherwise the path / url / pattern the call acts on.
+ * Claude Code's shell tools. Their input is `{ command, description }` and
+ * their permission dialog is titled "<Tool> command". On Windows Claude often
+ * picks its PowerShell tool over Bash (#1936). Listed by name: another tool's
+ * `command` field is not what its dialog shows.
+ */
+const SHELL_TOOLS: ReadonlySet<string> = new Set(['Bash', 'PowerShell']);
+
+/**
+ * The text a tool's permission dialog shows as "the command": a shell tool's
+ * `command`, WebSearch's `query` (by name: another tool's `query`, such as
+ * ToolSearch's, is not a dialog's), otherwise the path / url / pattern the
+ * call acts on.
  */
 export function commandOfToolInput(name: string, input: Record<string, unknown>): string | undefined {
-  const fields = name === 'Bash' ? ['command'] : ['file_path', 'notebook_path', 'path', 'url', 'pattern'];
+  const fields = SHELL_TOOLS.has(name)
+    ? ['command']
+    : name === 'WebSearch' ? ['query'] : ['file_path', 'notebook_path', 'path', 'url', 'pattern'];
   for (const field of fields) {
     const value = input[field];
     if (typeof value === 'string' && value.trim()) return value;

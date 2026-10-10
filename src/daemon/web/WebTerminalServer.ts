@@ -11,10 +11,13 @@ import { sessionPullRequests } from './sessionPullRequests';
 import { SessionGitController, SessionGitError } from './sessionGit';
 import { PhoneGitReads, type PhoneGitSessionRef } from './phoneGitRead';
 import type { PhoneWorktreeService } from './phoneWorktree';
+import type { PhoneGitWriteGate } from './phoneGitWriteGate';
+import { matchPhoneGitWriteRoute, PhoneGitWriteRoutes } from './phoneGitWriteRoutes';
 import { PHONE_WORKTREE_REQUEST_ID } from '../../shared/phoneGitV1';
 import { sessionFiles, searchSessionFiles, SessionFileError } from './sessionFiles';
 import { openResolvedFile } from './openResolvedFile';
-import { SENT_FILE_CLOCK_SKEW_MS, SentFileIndex, sentFileParts } from '../transcript/sentFiles';
+import { SENT_FILE_CLOCK_SKEW_MS, SentFileIndex, sentFileParts, type GrantTool } from '../transcript/sentFiles';
+import { isLocalClientPath } from './clientPath';
 import { listFolders, FolderBrowseError, homeIsBrowsable } from './phoneFolders';
 import {
   createSearchCursorCodec,
@@ -37,6 +40,7 @@ import {
 import http from 'node:http';
 import type { AgentStatus } from '../../shared/types';
 import { isRemoteAgentStatus } from '../../shared/remoteHosts';
+import { isA2aRoute, looksLikePeerCredential, parsePeerCredential, type A2aRemoteErrorCode } from '../../shared/a2aRemote';
 import { createSidebarDropLog, parsePhoneSidebarSnapshot, phoneTaskNesting, phoneWorkspaceLayout, type PhoneSidebarSnapshot, type PhoneSidebarTaskSummary, type PhoneSidebarWorkspace, type PhoneTaskNestedUnder } from '../../shared/phoneFleetSidebar';
 import https from 'node:https';
 import crypto from 'node:crypto';
@@ -93,7 +97,7 @@ import {
   scanSkillCatalog,
   type SkillCatalogEntry,
 } from '../../main/deck/skillCatalogScan';
-import { ENV_KEYS, isBrainPty } from '../../shared/constants';
+import { ENV_KEYS, isBrainPty, isBrainPtyId } from '../../shared/constants';
 import { resolveMoaPane, type MoaPaneFact } from './moaPane';
 import {
   DEVICE_KIND_HEADER,
@@ -125,10 +129,13 @@ import { startSseHeartbeat } from './sseHeartbeat';
 import { StreamResponseLimits } from './StreamResponseLimits';
 import {
   CHAT_LAUNCH_RETENTION_MS,
+  CHAT_MESSAGE_RETENTION_MS,
+  CHAT_SEND_MAX_UNITS,
   checkChatId,
   projectChatBlocked,
   type ChatBlocked,
   type ChatBridge,
+  type ChatDeliveredMessage,
   type ChatOwner,
   type ChatQueueEvent,
   type ChatResolution,
@@ -151,17 +158,23 @@ import {
   chatV2Page,
   chatV2SendResponse,
   dequeueResponse,
+  steerResponse,
   hasConversation,
   launchResponse,
   parseCancelBody,
   parseLaunchBody,
   parseSendBody,
+  parseSteerBody,
   resolutionAgentSessionId,
   resolutionEpoch,
   sendResponse,
   type ChatV2PhoneHost,
+  type SendBody,
   type WireResponse,
 } from './chatWire';
+import { MOA_WAKE_RETRY_AFTER, type MoaWakeService, type MoaWakeWire } from '../phone/MoaWakeService';
+import { MOA_WAKE_COMMAND } from '../../shared/moaWake';
+import { FLEET_TICKET_ROUTE_PREFIX, fleetTicketDetailResponse, fleetTicketsFields } from './fleetTickets';
 import type { ChatV2Binding } from '../../shared/chatv2/ipc';
 import { buildWebCsp, WEB_APP_FONT_FILE } from './webCsp';
 // Type only — the channel service implementation stays out of this module.
@@ -339,6 +352,15 @@ export interface WebTerminalStartOptions {
    */
   allowDangerousLaunch?: boolean;
   /**
+   * Whether the phone may push, open PRs and squash-merge
+   * (`--allow-git-write`). A server CEILING on top of an explicit per-device
+   * input grant; a device record that predates grants does not pass. Absent →
+   * false. See phoneGitWriteRoutes.ts.
+   */
+  allowGitWrite?: boolean;
+  /** The GitHub login every phone push and merge runs as (`--git-write-login`). Absent: none run. */
+  gitWriteLogin?: string;
+  /**
    * Whether the web client draws inline images (sixel, iTerm2) (#1641).
    * Absent → on; `wmux web --no-inline-images` turns it off. Advertised on
    * `/api/config` as `inlineImages`.
@@ -390,6 +412,10 @@ export interface WebTerminalInfo {
   allowTranscript?: boolean;
   /** Whether chat launch may use `bypass`/`yolo`. Its own opt-in (contract §3.4). */
   allowDangerousLaunch?: boolean;
+  /** Whether phone push / PR create / merge are armed (`--allow-git-write`). */
+  allowGitWrite?: boolean;
+  /** The GitHub login those writes run as. */
+  gitWriteLogin?: string;
   /** Whether the web client draws inline images (#1641). */
   inlineImages?: boolean;
   /** True when this listener terminates HTTPS inside the daemon. */
@@ -519,12 +545,54 @@ export interface WebDeviceResolver {
    * daemon injects here.
    */
   list?(): WebDeviceSummary[];
+  /**
+   * Whether the device's input grant was set explicitly (a record that
+   * predates grants answers false). Absent: no device passes the git write gate.
+   */
+  hasExplicitInputGrant?(deviceId: string): boolean;
   revoke?(deviceId: string, actor: DeviceActor): { ok: boolean; reason?: 'not-found' | 'persist-failed' };
   setInput?(
     deviceId: string,
     allowInput: boolean,
     actor: DeviceActor,
   ): WebDeviceSetInputResult;
+}
+
+/** A paired A2A peer, as authenticated by `WebPeerResolver`. Never a `WebPrincipal`. */
+export interface WebA2aPeer {
+  peerId: string;
+  hostId: string;
+  name: string;
+}
+
+/**
+ * Cross-host A2A peer credential store (`wmuxpeer~<peerId>~<secret>`). A
+ * DIFFERENT credential type from a device: it authenticates `/api/a2a/*` and
+ * nothing else, and is resolved by the peer gate in `handleApi` before the
+ * operator/device `authenticate()` ever runs.
+ */
+export interface WebPeerResolver {
+  resolve(
+    peerId: string,
+    secret: string,
+  ):
+    | Promise<{ ok: true; peerId: string; hostId: string; name: string } | { ok: false; reason: 'unknown' | 'revoked' }>
+    | { ok: true; peerId: string; hostId: string; name: string }
+    | { ok: false; reason: 'unknown' | 'revoked' };
+  /** Bookkeeping after a successful resolve, like `WebDeviceResolver.touch`. Never fatal. */
+  touch?(peerId: string): void;
+}
+
+/**
+ * The `/api/a2a/*` route table, reached only with an authenticated peer.
+ *
+ * Match on `pathname` exactly as given — the same raw (not percent-decoded)
+ * pathname the gate judged. Never decode it and dispatch again, and never
+ * hand the request on to another route table: the gate's decision covers this
+ * pathname and nothing else.
+ */
+export interface WebA2aRoutes {
+  handle(req: http.IncomingMessage, res: http.ServerResponse, url: URL, pathname: string, peer: WebA2aPeer): Promise<void>;
 }
 
 /**
@@ -663,6 +731,13 @@ interface WebTerminalServerDeps {
    */
   devices?: WebDeviceResolver;
   /**
+   * Cross-host A2A peers. Absent: every `/api/a2a/*` request answers 503 —
+   * and a peer credential is still refused (403) on every other route.
+   */
+  peers?: WebPeerResolver;
+  /** The `/api/a2a/*` handlers. Absent: an authenticated peer gets 503. */
+  a2a?: WebA2aRoutes;
+  /**
    * The daemon's approval registry. Optional: a daemon that has not wired one
    * (or a unit test that does not care) still serves every other route, and the
    * approval routes answer 503 rather than pretending the surface exists.
@@ -689,6 +764,8 @@ interface WebTerminalServerDeps {
   git?: GitRunner;
   /** Phone worktree creation (contract item 5). Absent: the routes 503 and `gitWorktrees` is omitted. */
   phoneWorktrees?: () => PhoneWorktreeService;
+  /** Phone git write actions: tokens, receipts, identity. Absent: the routes 503 and no config key is set. */
+  phoneGitWrite?: () => PhoneGitWriteGate;
   /**
    * Where `POST /api/upload` writes photos. Optional like `approvals`: a daemon
    * that did not wire one still serves every other route, and the upload route
@@ -713,7 +790,9 @@ interface WebTerminalServerDeps {
    */
   moaPane?: () => MoaPaneFact | null;
   /** Records one phone send to the Moa pane (the device audit log). */
-  auditMoaSend?: (entry: { deviceId: string; sessionId: string; route: 'chat' | 'input' }) => void;
+  auditMoaSend?: (entry: { deviceId: string; sessionId: string; route: 'chat' | 'input' | 'wake' }) => void;
+  /** `POST /api/moa/messages` before the Moa pane exists (`moa.wake`). Absent: the route answers 503. */
+  moaWake?: () => MoaWakeService;
   /**
    * #1772 — an answer or decline to the Moa pane's `terminal_prompt` was
    * refused as `prompt-changed`: the daemon looks at the screen once, so a
@@ -1338,6 +1417,8 @@ export class WebTerminalServer {
   private readonly clients = new Set<SseClient>();
   /** Live `/api/events` subscribers — fleet attention, no pane stream attached. */
   private readonly eventClients = new Set<EventClient>();
+  /** The Moa pane id the last `moa` event carried. */
+  private lastMoaEventId: string | null = null;
   /**
    * #782 — devices that opened a pane's turn view, keyed by pane. The
    * non-recording transcript nudge is delivered ONLY to these, so a busy pane's
@@ -1696,6 +1777,8 @@ export class WebTerminalServer {
     allowUpload: boolean;
     allowTranscript: boolean;
     allowDangerousLaunch: boolean;
+    allowGitWrite: boolean;
+    gitWriteLogin?: string;
     inlineImages: boolean;
   } | undefined {
     if (!this.server || !this.opts) return undefined;
@@ -1709,6 +1792,8 @@ export class WebTerminalServer {
       allowUpload: this.opts.allowUpload === true,
       allowTranscript: this.opts.allowTranscript === true,
       allowDangerousLaunch: this.opts.allowDangerousLaunch === true,
+      allowGitWrite: this.opts.allowGitWrite === true,
+      ...(this.opts.gitWriteLogin ? { gitWriteLogin: this.opts.gitWriteLogin } : {}),
       inlineImages: this.opts.inlineImages !== false,
     };
   }
@@ -1841,7 +1926,7 @@ export class WebTerminalServer {
 
     this.deps.log(
       'info',
-      `[web] ${options.tls ? 'HTTPS' : 'HTTP'} listening on ${this.opts.host}:${this.opts.port} (input ${options.allowInput ? 'ENABLED' : 'read-only'}, uploads ${options.allowUpload ? 'ENABLED' : 'off'}${options.allowDangerousLaunch ? ', dangerous chat launch ENABLED' : ''})`,
+      `[web] ${options.tls ? 'HTTPS' : 'HTTP'} listening on ${this.opts.host}:${this.opts.port} (input ${options.allowInput ? 'ENABLED' : 'read-only'}, uploads ${options.allowUpload ? 'ENABLED' : 'off'}${options.allowDangerousLaunch ? ', dangerous chat launch ENABLED' : ''}${options.allowGitWrite ? ', git write ENABLED' : ''})`,
     );
     // N7 — the bridge's OpenCode watches poll the plugin once a second, so a
     // watch nobody reads any more has to end on its own. Unref'd: this timer
@@ -2036,6 +2121,22 @@ export class WebTerminalServer {
       if (client.principal.kind === 'device') ids.add(client.principal.deviceId);
     }
     return ids;
+  }
+
+  /**
+   * Which panes each device is watching right now, by pty session id.
+   * Device principals only (the operator's own streams are not a "phone"),
+   * deduplicated per device. A device with no pane stream is absent.
+   */
+  liveSessionsByDevice(): Map<string, string[]> {
+    const byDevice = new Map<string, Set<string>>();
+    for (const client of this.clients) {
+      if (client.principal.kind !== 'device') continue;
+      const ids = byDevice.get(client.principal.deviceId) ?? new Set<string>();
+      ids.add(client.sessionId);
+      byDevice.set(client.principal.deviceId, ids);
+    }
+    return new Map([...byDevice].map(([deviceId, ids]) => [deviceId, [...ids]]));
   }
 
   /**
@@ -2244,6 +2345,8 @@ export class WebTerminalServer {
         allowUpload: this.opts.allowUpload,
         allowTranscript: this.opts?.allowTranscript === true,
         allowDangerousLaunch: this.opts.allowDangerousLaunch === true,
+        allowGitWrite: this.opts.allowGitWrite === true,
+        ...(this.opts.gitWriteLogin ? { gitWriteLogin: this.opts.gitWriteLogin } : {}),
         inlineImages: this.opts.inlineImages !== false,
         tls: this.opts.tls !== undefined,
         token: this.token,
@@ -2264,6 +2367,8 @@ export class WebTerminalServer {
       allowUpload: this.opts.allowUpload,
       allowTranscript: this.opts.allowTranscript === true,
       allowDangerousLaunch: this.opts.allowDangerousLaunch === true,
+      allowGitWrite: this.opts.allowGitWrite === true,
+      ...(this.opts.gitWriteLogin ? { gitWriteLogin: this.opts.gitWriteLogin } : {}),
       inlineImages: this.opts.inlineImages !== false,
       tls: this.opts.tls !== undefined,
       token: this.token,
@@ -2334,6 +2439,18 @@ export class WebTerminalServer {
       : hostHeader.split(':')[0].toLowerCase();
     if (!this.allowedHosts.has(hostname)) {
       return this.json(res, 403, { error: 'host not allowed' });
+    }
+
+    // Cross-host A2A peer gate. Judged right after the Host guard and before
+    // EVERY other branch (static pages, `/api/pair`, `authenticate()`, the route
+    // table), so a peer credential reaches nothing but `/api/a2a/*`, and
+    // `/api/a2a/*` never reaches the operator/device routes.
+    if (isA2aRoute(p)) {
+      this.handleA2a(req, res, url, p).catch((err: unknown) => this.failRequest(res, err));
+      return;
+    }
+    if (looksLikePeerCredential(bearerOf(req))) {
+      return this.json(res, 403, { ok: false, error: 'forbidden' satisfies A2aRemoteErrorCode });
     }
 
     // Static, unauthenticated pages (no secrets live in these). `/` is the
@@ -2524,6 +2641,10 @@ export class WebTerminalServer {
         // `SendUserFile` (outside the spawn cwd and uploads). Same grant, same
         // omit-when-off shape; the phone shows chips for those files only on true.
         ...(this.opts?.allowTranscript === true ? { turnSentFiles: true } : {}),
+        // Whether `/turns/image` also serves an image the pane's agent opened
+        // with `Read` outside the spawn cwd (its session scratch folder, a temp
+        // directory). Same grant, same omit-when-off shape.
+        ...(this.opts?.allowTranscript === true ? { turnReadImages: true } : {}),
         // Advertised only when BOTH grants the route needs are held, the same
         // way `agentSettings` is: a phone that reads this as "browsable" and
         // then meets a 403 on every listing is worse off than one that never
@@ -2556,6 +2677,9 @@ export class WebTerminalServer {
         // Phone Git v1 (contract item 5): OMITTED, not false, without the grant.
         ...(this.mayInput(principal) ? { gitProjects: true, gitChecks: true } : {}),
         ...(this.mayInput(principal) && this.phoneWorktreeService()?.available ? { gitWorktrees: true } : {}),
+        // Phone git write actions: OMITTED, not false, unless that action can
+        // run for this caller (see PhoneGitWriteRoutes.configKeys).
+        ...this.gitWriteRoutes.configKeys(principal),
         runHistory: this.opts?.allowTranscript === true && this.deps.runHistory !== undefined,
         // `GET /api/search`, and which of its scopes can answer. OMITTED, not
         // false, when none can — the shape a daemon predating the route serves.
@@ -2601,6 +2725,10 @@ export class WebTerminalServer {
         // Same meaning as `fleetSidebar`: supported here, present only while
         // a desktop new enough to compute it answers.
         ...(this.deps.desktop ? { moaDelegations: true } : {}),
+        // `/api/workspaces` can carry `fleetTickets` and `nextScheduleAt`,
+        // and `GET /api/fleet/tickets/<id>` answers (see fleetTickets.ts).
+        // Same meaning as `moaDelegations`.
+        ...(this.deps.desktop ? { fleetTickets: true } : {}),
         // Moa (the desktop's HQ main bot) is on and its HQ workspace exists.
         // OMITTED, not false, otherwise — Moa off, no HQ, no desktop attached,
         // or an older desktop or daemon: the phone reads all of them as "no Moa".
@@ -2610,6 +2738,19 @@ export class WebTerminalServer {
         // TUI (see moaSession): omitted with Moa off, the HQ missing or
         // changed, or before the brain's first turn has started its TUI.
         ...(sidebar?.moa === true ? this.moaSessionIdField() : {}),
+        // `POST /api/moa/messages` can start Moa's brain: Moa on, no Moa pane
+        // yet, an attached desktop that announced `moa.wake`, and a caller
+        // the chat write gates admit. Omitted otherwise.
+        //
+        // Where every one of those holds but the desktop says the HQ's agent
+        // mode is off, the wake would only end 409 `moa-mode-off`: serve
+        // `moaWakeBlocked` with that reason INSTEAD of `moaWake`, so the phone
+        // can say why rather than offer a send that fails. Never both.
+        ...(sidebar?.moa === true && this.moaSessionIdField().moaSessionId === undefined &&
+          this.deps.moaWake && this.availableDesktop()?.supports(MOA_WAKE_COMMAND) &&
+          this.chatWriteRefusal(principal) === null
+          ? (sidebar.moaWakeBlocked === 'moa-mode-off' ? { moaWakeBlocked: 'moa-mode-off' } : { moaWake: true })
+          : {}),
         // Phone channel Inbox (§9): the four `/api/channels*` routes answer
         // here. OMITTED, not false, exactly when they would answer 503
         // `channels-unavailable` — the shape a pre-channels daemon serves.
@@ -2636,7 +2777,10 @@ export class WebTerminalServer {
               ...(this.chatWritable(principal) && this.deps.chat?.()?.cancelOutcomeEnabled?.() === true ? { chatCancelOutcome: true } : {}),
               // Whether this caller's `chat-queue` sends are held by the daemon,
               // and DELETE …/chat/queue/:id (which needs `dequeue`) answers.
-              chatQueue: this.chatWritable(principal) && this.deps.chat?.()?.queueEnabled?.() === true && typeof this.deps.chat?.()?.dequeue === 'function',
+              chatQueue: this.chatQueueWorks(principal),
+              // `deliver:"steer"` on a queued send, and PATCH …/chat/queue/:id (which needs `steer`):
+              // only beside a working queue.
+              ...(this.chatQueueWorks(principal) && typeof this.deps.chat?.()?.steer === 'function' ? { chatSteer: true } : {}),
             }
           : {}),
         protocolVersion: PHONE_PROTOCOL_VERSION,
@@ -2667,6 +2811,12 @@ export class WebTerminalServer {
     if (req.method === 'POST' && p === '/api/sessions') {
       return this.handleSessionCreate(req, res, principal, url);
     }
+    if (p === '/api/moa/messages' && req.method === 'POST') {
+      return this.handleMoaSend(req, res, url, principal);
+    }
+    if (req.method === 'GET' && p.startsWith('/api/moa/messages/')) {
+      return this.handleMoaSendReceipt(res, p.slice('/api/moa/messages/'.length), principal);
+    }
     if (p.startsWith('/api/sessions/')) {
       const rest = p.slice('/api/sessions/'.length);
       // Native chat writes and their receipts nest under the pane (contract
@@ -2676,6 +2826,7 @@ export class WebTerminalServer {
         const [, rawId, kind, rawReceipt] = chatRoute;
         if (kind === 'queue') {
           if (req.method === 'DELETE' && rawReceipt !== undefined) return this.handleChatDequeue(res, rawId, rawReceipt, principal);
+          if (req.method === 'PATCH' && rawReceipt !== undefined) return this.handleChatSteer(req, res, rawId, rawReceipt, principal);
         } else if (kind === 'cancel') {
           if (req.method === 'POST' && rawReceipt === undefined) return this.handleChatCancel(req, res, rawId, url, principal);
           if (req.method === 'GET' && rawReceipt !== undefined) return this.handleChatCancelReceipt(res, rawId, rawReceipt, principal);
@@ -2697,6 +2848,12 @@ export class WebTerminalServer {
       }
       if ((req.method === 'GET' || req.method === 'POST') && rest.endsWith('/accounts')) {
         return this.handleSessionAccounts(req,res,rest.slice(0,-'/accounts'.length),url,principal);
+      }
+      // Before the `/git/pr` list and `/git` matches below: POST `…/git/pr` is pr.create.
+      const gitWrite = matchPhoneGitWriteRoute(req.method, rest);
+      if (gitWrite) {
+        void this.gitWriteRoutes.handle(req, res, gitWrite, url, principal).catch((err: unknown) => this.failRequest(res, err));
+        return;
       }
       const phoneGitRead = req.method === 'GET' ? /^([^/]+)\/git\/(branches|checks)$/.exec(rest) : null;
       if (phoneGitRead) return this.handlePhoneGitRead(res, phoneGitRead[1], principal, phoneGitRead[2] as 'branches' | 'checks');
@@ -2785,6 +2942,11 @@ export class WebTerminalServer {
     }
     if ((req.method === 'GET' || req.method === 'POST') && p.startsWith('/api/desktop-workspaces/') && p.endsWith('/browser')) {
       void this.handleWorkspaceBrowser(req,res,p.slice('/api/desktop-workspaces/'.length,-'/browser'.length),url,principal);
+      return;
+    }
+    if (req.method === 'GET' && p.startsWith(FLEET_TICKET_ROUTE_PREFIX)) {
+      void fleetTicketDetailResponse(p.slice(FLEET_TICKET_ROUTE_PREFIX.length), { allowTranscript: this.opts?.allowTranscript === true, desktop: this.availableDesktop() })
+        .then(r => this.json(res,r.status,r.body,{'Cache-Control':'no-store'}));
       return;
     }
     if ((req.method === 'GET' && p === '/api/desktop-workspaces') || (req.method === 'POST' && p === '/api/workspaces')) return this.handlePhoneWorkspaces(req,res,url,principal);
@@ -3197,11 +3359,17 @@ export class WebTerminalServer {
    */
   private async handleWorkspacesList(res: http.ServerResponse): Promise<void> {
     const sidebar = await this.desktopSidebar();
-    const byId = new Map<string, { id: string; name: string; panes: RemotePaneSummary[] }>();
+    const byId = new Map<string, { id: string; name: string; panes: (RemotePaneSummary & { lastActivity?: string })[] }>();
+    // Workspaces holding a brain pane, so the empty rows below never list one.
+    const brainWorkspaces = new Set<string>();
     for (const s of this.deps.sessionManager.listLiveSessions()) {
       // Same exclusion as /api/sessions: the orchestrator brain pane must be
       // neither listed nor allowed to synthesize a phantom workspace row.
-      if (isBrainPty({ id: s.id, env: s.env })) continue;
+      if (isBrainPty({ id: s.id, env: s.env })) {
+        const brainWs = s.env?.[ENV_KEYS.WORKSPACE_ID];
+        if (typeof brainWs === 'string' && brainWs) brainWorkspaces.add(brainWs);
+        continue;
+      }
       const id = s.env?.[ENV_KEYS.WORKSPACE_ID];
       if (typeof id !== 'string' || !id) continue; // no workspace id → unaddressable, omitted
       const entry = byId.get(id) ?? { id, name: '', panes: [] };
@@ -3213,6 +3381,9 @@ export class WebTerminalServer {
         sessionId: s.id,
         ...shellLabelOf(s.cmd),
         ...(s.cwd ? { cwd: s.cwd } : {}),
+        // The session's last output stamp (ISO), so a viewer can draw the
+        // host sidebar's idle label. Additive-optional.
+        ...(typeof s.lastActivity === 'string' && s.lastActivity ? { lastActivity: s.lastActivity } : {}),
         // #1163 — per-session agent metadata, so the attaching desktop's
         // roster can count remote agents. The name is creation-time role
         // metadata, then the daemon's CANONICAL answer (the one
@@ -3283,7 +3454,16 @@ export class WebTerminalServer {
       const extra = fields.get(w.id);
       const panes = w.panes.map((pane) => {
         const label = sidebarPanes.get(pane.sessionId);
-        return label?.paneId !== undefined && label.workspaceId === w.id ? { ...pane, paneId: label.paneId } : pane;
+        // The desktop's own pane name ("w1-1" or its label) and tab title,
+        // as its sidebar draws them. Additive-optional, like paneId.
+        return label?.paneId !== undefined && label.workspaceId === w.id
+          ? {
+              ...pane,
+              paneId: label.paneId,
+              ...(label.paneName ? { paneName: label.paneName } : {}),
+              ...(label.surfaceTitle ? { surfaceTitle: label.surfaceTitle } : {}),
+            }
+          : pane;
       });
       return extra
         ? {
@@ -3296,15 +3476,29 @@ export class WebTerminalServer {
           }
         : { ...w, panes, ...hqRole(sidebar, w.id) };
     });
+    // Workspaces the desktop shows that have no live terminal: listed as
+    // `empty: true` rows with no panes (and no name or layout — the snapshot
+    // carries neither, and a name only arrives with a session's env), after
+    // the live ones. Moa's HQ is never one: its only pane is the brain, which
+    // must not synthesize a row, and neither does a fan-out task workspace
+    // (it nests under its owner), nor one the desktop still lists a pane for
+    // (a hidden brain pane, or one whose session is gone). No desktop
+    // (locked, occluded, headless), no empty rows: this list cannot know
+    // about them.
+    const paneWorkspaces = new Set(sidebar.panes.map((p) => p.workspaceId));
+    const empty = sidebar.workspaces
+      .filter((w) => !byId.has(w.id) && !brainWorkspaces.has(w.id) && !paneWorkspaces.has(w.id) && w.id !== sidebar.hqWorkspaceId && w.task === undefined)
+      .map((w) => ({ id: w.id, name: '', panes: [], empty: true as const, ...sidebarWorkspaceFields(w, undefined, undefined, undefined) }));
     // Only an id this reply lists, so the active workspace cannot name one the
     // phone is not allowed to see (a brain-only workspace, for one).
     const active = sidebar.activeWorkspaceId;
     return this.json(res, 200, {
-      workspaces: merged,
+      workspaces: [...merged, ...empty],
       ...(active && byId.has(active) ? { activeWorkspaceId: active } : {}),
       // Not limited to the listed rows: a finished job's workspace is often
       // closed by then, and its id names nothing the phone may not see.
       ...(sidebar.moaDelegations !== undefined ? { moaDelegations: sidebar.moaDelegations } : {}),
+      ...fleetTicketsFields(sidebar, this.opts?.allowTranscript === true),
     });
   }
 
@@ -3991,6 +4185,38 @@ export class WebTerminalServer {
     }).finally(() => { this.phoneGitRequests -= 1; });
   }
 
+  private gitWriteRoutesInstance: PhoneGitWriteRoutes | undefined;
+
+  /** Push, PR create and merge (phoneGitWriteRoutes.ts), reading this server's state at request time. */
+  private get gitWriteRoutes(): PhoneGitWriteRoutes {
+    return this.gitWriteRoutesInstance ??= new PhoneGitWriteRoutes({
+      ceiling: () => ({
+        allowGitWrite: this.server !== null && this.opts?.allowGitWrite === true,
+        ...(this.opts?.gitWriteLogin ? { login: this.opts.gitWriteLogin } : {}),
+      }),
+      mayInput: (p) => this.mayInput(p as WebPrincipal),
+      explicitInputGrant: (deviceId) => {
+        try { return this.deps.devices?.hasExplicitInputGrant?.(deviceId) === true; } catch { return false; }
+      },
+      refuseInput: (res, p, detail) => this.refuseInput(res, p as WebPrincipal, detail),
+      session: (p, id) => this.attachableSession(p as WebPrincipal, id)?.meta,
+      stillAuthorized: async (req, url, p, id) => {
+        const principal = p as WebPrincipal;
+        const fresh = await this.authenticate(req, url, false).catch(() => ({ ok: false as const }));
+        if (!fresh.ok || fresh.principal.kind !== principal.kind) return false;
+        if (principal.kind === 'device' && (fresh.principal.kind !== 'device' || fresh.principal.deviceId !== principal.deviceId)) return false;
+        if (!this.mayInput(fresh.principal)) return false;
+        if (fresh.principal.kind === 'device' && this.deps.devices?.hasExplicitInputGrant?.(fresh.principal.deviceId) !== true) return false;
+        return this.attachableSession(fresh.principal, id) !== undefined;
+      },
+      readJsonBody: (req, res, onBody, maxBytes) => this.readJsonBody(req, res, onBody, maxBytes),
+      json: (res, status, body) => this.json(res, status, body, { 'Cache-Control': 'no-store' }),
+      gate: () => this.deps.phoneGitWrite?.(),
+      git: () => (this.git ??= this.deps.git ?? createGitRunner()),
+      log: (level, msg) => this.deps.log(level, msg),
+    });
+  }
+
   /** The worktree service, or undefined when it is not wired or could not be built. */
   private phoneWorktreeService(): PhoneWorktreeService | undefined {
     try { return this.deps.phoneWorktrees?.(); } catch { return undefined; }
@@ -4350,7 +4576,10 @@ export class WebTerminalServer {
       : resolution.source === 'tui' ? resolution.turn : undefined;
     const owner = chatOwner(principal);
     const queue = caps.chatQueue === true && chat.queueEnabled?.() === true ? chat.queue?.(owner, sessionId) ?? [] : undefined;
-    const events = queue !== undefined ? this.tagDeliveredRows(chat, sessionId, owner, body.events) : body.events;
+    // A Moa wake's row is tagged for any caller: it never went through chat.send.
+    const wakeRows = this.moaWakeRows(sessionId, owner);
+    const events = queue !== undefined || wakeRows.length > 0
+      ? this.tagDeliveredRows(chat, sessionId, owner, body.events, queue !== undefined) : body.events;
     // Only a terminal binding whose agent is not alive can be resumable; skip the lookup otherwise.
     const resumable = resolution.source === 'file' && resolution.status.agentAlive !== true
       ? await chat.resumable?.(sessionId).catch(() => false) ?? false : false;
@@ -4457,8 +4686,12 @@ export class WebTerminalServer {
    * the first matching one at or after it was typed. Rows are copied, never
    * mutated (the projector may hand out shared objects).
    */
-  private tagDeliveredRows(chat: ChatBridge, sessionId: string, owner: ChatOwner, events: unknown): unknown {
-    const delivered = chat.delivered?.(owner, sessionId) ?? [];
+  private tagDeliveredRows(chat: ChatBridge, sessionId: string, owner: ChatOwner, events: unknown, queued = true): unknown {
+    const delivered = [
+      ...(queued ? chat.delivered?.(owner, sessionId) ?? [] : []),
+      // The phone's first message to Moa went through main, not chat.send.
+      ...this.moaWakeRows(sessionId, owner),
+    ];
     if (!Array.isArray(events) || delivered.length === 0) return events;
     const unused = [...delivered];
     return events.map((event: Record<string, unknown>) => {
@@ -4470,6 +4703,11 @@ export class WebTerminalServer {
       const [match] = unused.splice(index, 1);
       return { ...event, clientMessageId: match.clientMessageId };
     });
+  }
+
+  /** The owner's accepted Moa wake texts, when `sessionId` is the Moa pane. */
+  private moaWakeRows(sessionId: string, owner: ChatOwner): ChatDeliveredMessage[] {
+    return this.moaSession(sessionId) ? this.deps.moaWake?.().deliveredFor(owner) ?? [] : [];
   }
 
   /** The `/turns` page for a resolved binding, read synchronously; undefined once answered (503). */
@@ -4950,6 +5188,27 @@ export class WebTerminalServer {
   }
 
   /**
+   * `PATCH /api/sessions/:id/chat/queue/:clientMessageId {deliver:"steer"}`:
+   * "send now" for a waiting item. Same gates and owner binding as DELETE.
+   */
+  private handleChatSteer(req: http.IncomingMessage, res: http.ServerResponse, rawId: string, rawMessageId: string, principal: WebPrincipal): void {
+    res.setHeader('Cache-Control', 'no-store');
+    const refusal = this.chatWriteRefusal(principal);
+    if (refusal === 'transcript') return this.refuseTranscript(res);
+    if (refusal === 'input') return this.refuseInput(res, principal, 'Sending a queued message now types into this pane');
+    const id = decodePathSegment(rawId);
+    if (id === null || !this.conversableSession(id)) return this.json(res, 404, { error: 'pane-not-found' });
+    const chat = this.deps.chat?.() ?? null;
+    if (!chat?.steer || chat.queueEnabled?.() !== true) return this.json(res, 503, { error: 'chat-unavailable' });
+    const clientMessageId = decodePathSegment(rawMessageId) ?? '';
+    this.readJsonBody(req, res, (body) => {
+      if (!parseSteerBody(body)) return this.json(res, 400, { error: 'invalid-chat-request', detail: 'body must be {"deliver":"steer"}', clientMessageId });
+      const wire = steerResponse(chat.steer!(chatOwner(principal), id, clientMessageId), clientMessageId);
+      return this.json(res, wire.status, wire.body);
+    }, CHAT_CANCEL_MAX_BODY_BYTES);
+  }
+
+  /**
    * `POST /api/sessions/:id/chat/messages` (N4). The route adds the principal
    * gates and the wire mapping; binding, identity, receipts and the guarded
    * write are the daemon's shared send path, the same one the desktop uses.
@@ -4985,42 +5244,241 @@ export class WebTerminalServer {
             ...(parsed.clientMessageId !== undefined ? { clientMessageId: parsed.clientMessageId } : {}),
           });
         }
-        const { clientMessageId } = parsed.value;
-        // A chat-v2 record is read + approve only on the phone, like a managed one.
-        if (this.chatV2For(id)) {
-          const refused = chatV2SendResponse(clientMessageId);
-          return this.json(res, refused.status, refused.body);
-        }
-        if (!chat) return this.json(res, 503, { error: 'chat-unavailable' });
-        // Moa's own permission dialog is up: Enter would answer it, and its only
-        // answer path is the desktop. Same refusal as a dialog the screen shows.
-        if (this.moaDialogUp(id)) {
-          const blocked = sendResponse({ clientMessageId, replayed: false, result: 'blocked', effect: 'none', error: 'chat-blocked', blockedBy: 'terminal' }, clientMessageId);
-          return this.json(res, blocked.status, blocked.body);
-        }
-        let outcome;
-        try {
-          // The cap on THIS request opts it into the daemon queue.
-          const queue = clientCaps(req).chatQueue === true && chat.queueEnabled?.() === true
-            ? { authorized: this.queuedChatAuthorizer(fresh, id, pane, incarnation) } : undefined;
-          outcome = await chat.send({
-            owner: chatOwner(fresh),
-            id,
-            ...parsed.value,
-            managedReadOnly: true,
-            authorized: this.chatWriteAuthorizer(req, res, url, principal, id, pane, incarnation),
-            ...(queue ? { queue } : {}),
-          });
-        } catch (err) {
-          // No `effect`: the write stage is unknown, and the client's rule for a
-          // 5xx without one is "unknown — ask the receipt", never "nothing sent".
-          this.deps.log('warn', `[web] chat send threw for ${id}: ${errMsg(err)}`);
-          return this.json(res, 500, { error: 'chat-send-failed', clientMessageId });
-        }
-        const wire = sendResponse(outcome, clientMessageId);
-        this.json(res, wire.status, wire.body);
+        return this.dispatchChatSend(req, res, url, principal, fresh, id, pane, incarnation, parsed.value);
       })().catch((err: unknown) => this.failRequest(res, err));
     }, CHAT_SEND_MAX_BODY_BYTES);
+  }
+
+  /**
+   * The chat send after the body parsed and the caller was re-authorized: the
+   * pane's refusals, the daemon queue opt-in, the shared send path and the
+   * wire mapping. `POST /api/moa/messages` delegates here once the Moa pane exists.
+   */
+  private async dispatchChatSend(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    url: URL,
+    principal: WebPrincipal,
+    fresh: WebPrincipal,
+    id: string,
+    pane: ManagedSession,
+    incarnation: string | undefined,
+    value: Omit<SendBody, 'historyEpoch'> & { historyEpoch?: string },
+  ): Promise<void> {
+    const chat = this.deps.chat?.() ?? null;
+    const { clientMessageId } = value;
+    // A chat-v2 record is read + approve only on the phone, like a managed one.
+    if (this.chatV2For(id)) {
+      const refused = chatV2SendResponse(clientMessageId);
+      return this.json(res, refused.status, refused.body);
+    }
+    if (!chat) return this.json(res, 503, { error: 'chat-unavailable' });
+    // Moa's own permission dialog is up: Enter would answer it, and its only
+    // answer path is the desktop. Same refusal as a dialog the screen shows.
+    if (this.moaDialogUp(id)) {
+      const blocked = sendResponse({ clientMessageId, replayed: false, result: 'blocked', effect: 'none', error: 'chat-blocked', blockedBy: 'terminal' }, clientMessageId);
+      return this.json(res, blocked.status, blocked.body);
+    }
+    let outcome;
+    try {
+      // The cap on THIS request opts it into the daemon queue.
+      const { deliver, ...send } = value;
+      const queue = clientCaps(req).chatQueue === true && chat.queueEnabled?.() === true
+        ? { authorized: this.queuedChatAuthorizer(fresh, id, pane, incarnation), ...(deliver ? { deliver } : {}) } : undefined;
+      outcome = await chat.send({
+        owner: chatOwner(fresh),
+        id,
+        ...send,
+        managedReadOnly: true,
+        authorized: this.chatWriteAuthorizer(req, res, url, principal, id, pane, incarnation),
+        ...(queue ? { queue } : {}),
+      });
+    } catch (err) {
+      // No `effect`: the write stage is unknown, and the client's rule for a
+      // 5xx without one is "unknown — ask the receipt", never "nothing sent".
+      this.deps.log('warn', `[web] chat send threw for ${id}: ${errMsg(err)}`);
+      return this.json(res, 500, { error: 'chat-send-failed', clientMessageId });
+    }
+    const wire = sendResponse(outcome, clientMessageId);
+    this.json(res, wire.status, wire.body);
+  }
+
+  private moaWire(res: http.ServerResponse, wire: MoaWakeWire): void {
+    return this.json(res, wire.status, wire.body, wire.headers);
+  }
+
+  /**
+   * `POST /api/moa/messages` `{clientMessageId, text}`: a message to Moa
+   * whether or not its brain runs yet. Same gates as a chat send. A wake
+   * receipt for the id answers first, so a retry after the pane appeared is
+   * never a second turn; with the Moa pane up the message takes the chat send
+   * path (same id, recorded in the chat receipt); without it, main starts the
+   * brain with it (`moa.wake`, MoaWakeService).
+   */
+  private handleMoaSend(req: http.IncomingMessage, res: http.ServerResponse, url: URL, principal: WebPrincipal): void {
+    res.setHeader('Cache-Control', 'no-store');
+    const refusal = this.chatWriteRefusal(principal);
+    if (refusal === 'transcript') return this.refuseTranscript(res);
+    if (refusal === 'input') return this.refuseInput(res, principal, 'Sending to Moa types into its pane');
+    this.readJsonBody(req, res, (body) => {
+      void (async () => {
+        const fresh = await this.authenticate(req, url, false).catch(() => ({ ok: false as const }));
+        if (!fresh.ok || !sameCaller(principal, fresh.principal)) return this.json(res, 401, { error: 'authorization-expired' });
+        if (this.chatWriteRefusal(fresh.principal) !== null) return this.refuseInput(res, fresh.principal, 'Input permission changed');
+        const caller = fresh.principal;
+        const o = body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : null;
+        const cmid = typeof o?.clientMessageId === 'string' ? o.clientMessageId : undefined;
+        const invalid = (detail: string) => this.json(res, 400, {
+          error: 'invalid-chat-request', detail, effect: 'none', ...(cmid !== undefined ? { clientMessageId: cmid } : {}),
+        });
+        if (!o) return invalid('body must be a JSON object');
+        const extra = Object.keys(o).find((k) => k !== 'clientMessageId' && k !== 'text');
+        if (extra !== undefined) return invalid(`unknown field: ${extra.slice(0, 64)}`);
+        if (cmid === undefined) return invalid('clientMessageId must be a string');
+        if (typeof o.text !== 'string') return invalid('text must be a string');
+        const text = o.text;
+        const idCheck = checkChatId(cmid, this.now(), CHAT_MESSAGE_RETENTION_MS);
+        if (idCheck === 'invalid') return invalid('clientMessageId');
+        if (idCheck === 'expired') return this.json(res, 400, { error: 'message-id-expired', effect: 'none', clientMessageId: cmid });
+        if (!text.trim()) return invalid('text');
+        // The chat send limit and its refusal, so a client has one rule.
+        if (text.length > CHAT_SEND_MAX_UNITS) {
+          return this.json(res, 400, { error: 'text-too-long', result: 'error', limit: 'units', effect: 'none', clientMessageId: cmid });
+        }
+        const owner = chatOwner(caller);
+        const wake = this.deps.moaWake?.() ?? null;
+        const seen = wake?.peek(owner, cmid, text);
+        if (seen) return this.moaWire(res, seen);
+        // A send the chat path already carried — maybe to a Moa pane that has
+        // since gone away — replays; it never becomes a wake or a second send.
+        const prior = this.moaPriorSend(owner, cmid, text);
+        if (prior) return this.json(res, prior.status, prior.body);
+        const sessionId = this.moaSessionIdField().moaSessionId;
+        if (sessionId !== undefined) return this.moaDelegateSend(req, res, url, principal, caller, sessionId, cmid, text);
+        if (!wake) return this.json(res, 503, { error: 'desktop-unavailable', clientMessageId: cmid });
+        // An accepted wake is starting the brain and its pane is not up yet:
+        // a second message cannot reach it either way, so it waits.
+        if (wake.isStarting()) {
+          return this.json(res, 409, { error: 'moa-starting', clientMessageId: cmid }, { 'Retry-After': MOA_WAKE_RETRY_AFTER.starting });
+        }
+        // The audit line is written before the request leaves, like a chat send's.
+        if (caller.kind === 'device') {
+          try { this.deps.auditMoaSend?.({ deviceId: caller.deviceId, sessionId: 'moa-wake', route: 'wake' }); } catch { /* best-effort */ }
+        } else {
+          this.deps.log('info', '[web] Moa wake requested by the operator');
+        }
+        return this.moaWire(res, await wake.wake({
+          owner, clientMessageId: cmid, text, ...(caller.kind === 'device' ? { deviceId: caller.deviceId } : {}),
+        }));
+      })().catch((err: unknown) => this.failRequest(res, err));
+    }, CHAT_SEND_MAX_BODY_BYTES);
+  }
+
+  /**
+   * A chat send this caller already made under `clientMessageId`, on any pane,
+   * as the chat route's replay would answer it; null when there is none. Moa
+   * panes come and go, so the pane it went to need not be the current one —
+   * but it must be a brain pane: an id spent on an ordinary pane, or on other
+   * text, is reused.
+   */
+  private moaPriorSend(owner: ChatOwner, clientMessageId: string, text: string): WireResponse | null {
+    const prior = this.deps.chat?.()?.priorSend?.(owner, clientMessageId, text);
+    if (!prior || prior.view.state === 'unknown') return null;
+    if (!isBrainPtyId(prior.paneId) || prior.sameText === false) {
+      return { status: 409, body: { error: 'message-id-reused', clientMessageId } };
+    }
+    const view = prior.view;
+    if (view.queue) {
+      return sendResponse({ clientMessageId, replayed: true, queueState: view.queue.state, ...(view.queue.reason ? { queueReason: view.queue.reason } : {}) }, clientMessageId);
+    }
+    if (view.state === 'pending' || view.state === 'queued') return sendResponse({ clientMessageId, replayed: true, pending: true }, clientMessageId);
+    const effect = view.state === 'submitted' ? 'submitted' : view.state === 'refused' ? 'none' : 'uncertain';
+    return sendResponse({
+      clientMessageId, replayed: true, effect,
+      ...(view.result ? { result: view.result } : {}),
+      ...(view.error ? { error: view.error } : {}),
+      ...(view.queued ? { queued: true as const } : {}),
+    }, clientMessageId);
+  }
+
+  /** The Moa pane exists: the chat send path, with the conversation the daemon resolves itself. */
+  private async moaDelegateSend(
+    req: http.IncomingMessage, res: http.ServerResponse, url: URL, principal: WebPrincipal,
+    fresh: WebPrincipal, sessionId: string, clientMessageId: string, text: string,
+  ): Promise<void> {
+    const pane = this.moaSession(sessionId);
+    const chat = this.deps.chat?.() ?? null;
+    if (!pane) return this.json(res, 409, { error: 'moa-starting', clientMessageId }, { 'Retry-After': MOA_WAKE_RETRY_AFTER.starting });
+    if (!chat) return this.json(res, 503, { error: 'chat-unavailable', clientMessageId });
+    // Stopped on its own dialog or a startup screen: say so, not "starting" —
+    // only the desktop can answer it, and the brain has no conversation yet.
+    if (this.moaDialogUp(sessionId)) {
+      const blocked = sendResponse({ clientMessageId, replayed: false, result: 'blocked', effect: 'none', error: 'chat-blocked', blockedBy: 'terminal' }, clientMessageId);
+      return this.json(res, blocked.status, blocked.body);
+    }
+    const resolution = await chat.resolve(sessionId);
+    const agentSessionId = hasConversation(resolution) ? resolutionAgentSessionId(resolution) : undefined;
+    const historyEpoch = resolutionEpoch(resolution);
+    // The pane is up but the brain has not reported its conversation yet.
+    if (!agentSessionId) {
+      return this.json(res, 409, { error: 'moa-starting', clientMessageId }, { 'Retry-After': MOA_WAKE_RETRY_AFTER.starting });
+    }
+    return this.dispatchChatSend(req, res, url, principal, fresh, sessionId, pane, pane.meta.incarnationId, {
+      agentSessionId, ...(historyEpoch !== undefined ? { historyEpoch } : {}), clientMessageId, text,
+    });
+  }
+
+  /**
+   * `GET /api/moa/messages/:clientMessageId`: the caller's own message to
+   * Moa, a wake or one the chat path carried. Transcript, not input, like
+   * the chat receipt. `moaSessionId` rides along whenever the pane is up.
+   */
+  private handleMoaSendReceipt(res: http.ServerResponse, rawMessageId: string, principal: WebPrincipal): void {
+    res.setHeader('Cache-Control', 'no-store');
+    if (this.opts?.allowTranscript !== true) return this.refuseTranscript(res);
+    const clientMessageId = decodePathSegment(rawMessageId) ?? '';
+    const owner = chatOwner(principal);
+    const sessionId = this.moaSessionIdField().moaSessionId;
+    const withPane = sessionId !== undefined ? { moaSessionId: sessionId } : {};
+    const view = this.deps.moaWake?.().view(owner, clientMessageId) ?? null;
+    if (view) {
+      return this.json(res, 200, {
+        clientMessageId, state: view.state, ...(view.code ? { code: view.code } : {}),
+        ...withPane,
+      });
+    }
+    const prior = this.deps.chat?.()?.priorSend?.(owner, clientMessageId);
+    // Only a send to a Moa (brain) pane is a message to Moa; the pane may be gone.
+    const sent = prior && isBrainPtyId(prior.paneId) ? prior.view : null;
+    if (!sent || sent.state === 'unknown') return this.json(res, 404, { error: 'unknown-message', clientMessageId });
+    const state = sent.state === 'submitted' ? 'accepted'
+      : sent.state === 'refused' ? 'failed'
+        : sent.state === 'uncertain' ? 'uncertain' : 'pending';
+    return this.json(res, 200, {
+      clientMessageId, state,
+      ...(state === 'failed' && sent.error ? { code: sent.error } : {}),
+      ...withPane,
+    });
+  }
+
+  /**
+   * The global `moa` event: `{moaSessionId}` when the Moa pane appears or
+   * changes, `{moaSessionId:null}` when it goes away. Index calls this on
+   * every Moa pane push; it fires only when the resolved id changed.
+   */
+  emitMoaChanged(): void {
+    const sessionId = this.moaSessionIdField().moaSessionId ?? null;
+    if (sessionId === this.lastMoaEventId) return;
+    this.lastMoaEventId = sessionId;
+    if (sessionId !== null) this.deps.moaWake?.().paneAppeared();
+    const body = JSON.stringify({ moaSessionId: sessionId });
+    for (const client of this.eventClients) {
+      try {
+        writeSse(client.res, 'moa', body);
+      } catch {
+        /* client stream broken — its own 'close' handler cleans up */
+      }
+    }
   }
 
   /**
@@ -5096,6 +5554,12 @@ export class WebTerminalServer {
     if (this.opts?.allowTranscript !== true) return 'transcript';
     if (!this.mayInput(principal)) return 'input';
     return null;
+  }
+
+  /** `/api/config` `chatQueue`: chat writes pass, the queue loaded, and DELETE …/chat/queue/:id answers. */
+  private chatQueueWorks(principal: WebPrincipal): boolean {
+    const chat = this.deps.chat?.();
+    return this.chatWritable(principal) && chat?.queueEnabled?.() === true && typeof chat?.dequeue === 'function';
   }
 
   /** Whether a chat write gets past every gate that does not depend on the pane (the caller's, and a bridge). */
@@ -5376,9 +5840,10 @@ export class WebTerminalServer {
     return sessionId !== undefined && this.moaSession(sessionId) ? { moaSessionId: sessionId } : {};
   }
 
-  /** The Moa pane's own permission dialog is on screen (main's flag, see moaPane.ts). */
+  /** The Moa pane's own permission dialog, or a startup screen, is on screen (main's flags, see moaPane.ts). */
   private moaDialogUp(sessionId: string): boolean {
-    return this.deps.moaPane?.()?.dialog !== undefined && !!this.moaSession(sessionId);
+    const fact = this.deps.moaPane?.();
+    return (fact?.dialog !== undefined || fact?.blockedOnTui === true) && !!this.moaSession(sessionId);
   }
 
   /** `readableSession`, plus the Moa pane: the turn and chat routes only. */
@@ -5508,8 +5973,8 @@ export class WebTerminalServer {
    * can move it with three bytes of terminal output and aim this route at the
    * whole home directory. A record with no `spawnCwd` leaves the uploads
    * directory as the only root; with neither there is nothing to serve.
-   * Outside the roots, the one path served is a file the pane's agent sent
-   * with `SendUserFile` — see `sentFileTarget`.
+   * Outside the roots, the paths served are a file the pane's agent sent with
+   * `SendUserFile`, or an image it opened with `Read` — see `sentFileTarget`.
    *
    * Everything a caller could use to map the disk answers 404 `image not
    * found` — outside the boundary, missing, a directory, unreadable. A 403 for
@@ -5546,6 +6011,12 @@ export class WebTerminalServer {
       });
       return;
     }
+    // Before ANY filesystem call: on Windows a lookup on a UNC or device path
+    // reaches the host it names (#1976). Same 404 as a missing file.
+    if (!isLocalClientPath(raw)) {
+      this.json(res, 404, { error: 'image not found' });
+      return;
+    }
 
     const roots = [managed.meta.spawnCwd, this.deps.uploadsDir].filter(
       (dir): dir is string => typeof dir === 'string' && dir.length > 0,
@@ -5579,9 +6050,12 @@ export class WebTerminalServer {
         break;
       }
     }
-    // Outside the roots, a file the pane's agent sent with SendUserFile is the
-    // one other path served. Unlisted, expired and missing all get the same 404.
-    const sent = real === null ? await this.sentFileTarget(sessionId, raw) : null;
+    // Outside the roots, a file the pane's agent sent with SendUserFile, or an
+    // image it opened with Read, is the other path served. Unlisted, expired
+    // and missing all get the same 404. Only a sent file is audited: an image
+    // the agent read is what the transcript grant already covers.
+    const sentByAgent = real === null ? await this.sentFileTarget(sessionId, raw, 'SendUserFile') : null;
+    const sent = sentByAgent ?? (real === null ? await this.sentFileTarget(sessionId, raw, 'Read') : null);
     if (sent) real = sent.real;
     if (real === null) {
       this.json(res, 404, { error: 'image not found' });
@@ -5655,7 +6129,7 @@ export class WebTerminalServer {
         this.json(res, 404, { error: 'image not found' });
         return;
       }
-      if (sent) this.auditSentFile(principal, sessionId, sent.name, stat.size);
+      if (sentByAgent) this.auditSentFile(principal, sessionId, sentByAgent.name, stat.size);
       res.writeHead(200, {
         'Content-Type': contentType,
         ...this.securityHeaders(),
@@ -5692,9 +6166,11 @@ export class WebTerminalServer {
    * it was rewired to call. Shipped phone builds depend on that route, and the
    * contract this one was written to (wmux-ios, 2026-09-20) asks in as many
    * words that it not be touched; refactoring it to reach a new abstraction is
-   * a change to it, whatever the diff says about behaviour. The one shared
-   * piece is the open itself, `openResolvedFile`: #1434 asked for both routes
-   * to change together, and two copies of that check could drift apart.
+   * a change to it, whatever the diff says about behaviour. The shared pieces
+   * are the open itself, `openResolvedFile`: #1434 asked for both routes to
+   * change together, and two copies of that check could drift apart; and the
+   * `isLocalClientPath` gate that runs before any filesystem call, for the same
+   * reason (#1976).
    *
    * Every piece of the boundary is load-bearing here for the reasons spelled
    * out on that handler: the roots are `meta.spawnCwd` ∪ `deps.uploadsDir` and
@@ -5741,6 +6217,10 @@ export class WebTerminalServer {
       });
       return;
     }
+    if (!isLocalClientPath(raw)) {
+      this.json(res, 404, { error: 'file not found' });
+      return;
+    }
 
     const roots = [managed.meta.spawnCwd, this.deps.uploadsDir].filter(
       (dir): dir is string => typeof dir === 'string' && dir.length > 0,
@@ -5767,8 +6247,9 @@ export class WebTerminalServer {
         break;
       }
     }
-    // The SendUserFile addition, exactly as on the image route.
-    const sent = real === null ? await this.sentFileTarget(sessionId, raw) : null;
+    // The SendUserFile addition, exactly as on the image route. (The Read
+    // addition is image-route only.)
+    const sent = real === null ? await this.sentFileTarget(sessionId, raw, 'SendUserFile') : null;
     if (sent) real = sent.real;
     if (real === null) {
       this.json(res, 404, { error: 'file not found' });
@@ -5896,12 +6377,15 @@ export class WebTerminalServer {
 
   /**
    * Where to open `raw` when the transcript bound to this pane says its agent
-   * sent that exact path to the user with `SendUserFile` (successfully, under
-   * 24 hours ago), with the call's time — or null.
+   * sent that exact path to the user with `SendUserFile` — or, for `tool:
+   * 'Read'`, opened that image with `Read` — successfully, under 24 hours ago,
+   * with the call's time; or null.
    *
    * The match is on `raw` as the request spelled it, byte for byte against the
-   * transcript's `input.files[]`; `sentFileParts` separately refuses `.`/`..`
-   * segments and doubled separators. Only the PARENT is resolved: the last
+   * transcript's `input.files[]` (or `input.file_path`); `sentFileParts`
+   * separately refuses `.`/`..` segments and doubled separators. A `Read`
+   * grant also matches macOS's `/tmp/` ↔ `/private/tmp/` respelling, as a
+   * string. Only the PARENT is resolved: the last
    * component is opened as named, so `openResolvedFile` refuses it when it is a
    * symlink and checks the handle is the regular file it looked up.
    *
@@ -5912,13 +6396,15 @@ export class WebTerminalServer {
   private async sentFileTarget(
     sessionId: string,
     raw: string,
+    tool: GrantTool,
   ): Promise<{ real: string; name: string; sentAt: number } | null> {
+    if (!isLocalClientPath(raw)) return null;
     const parts = sentFileParts(raw);
     if (!parts) return null;
     const projector = this.deps.projector?.() ?? null;
     const before = projector?.sentFileBinding(sessionId) ?? null;
     if (!projector || !before) return null;
-    const sentAt = await this.sentFiles.sentAt(before.transcriptPath, raw, this.now());
+    const sentAt = await this.sentFiles.grantedAt(before.transcriptPath, raw, this.now(), tool);
     if (sentAt === null) return null;
     const after = projector.sentFileBinding(sessionId);
     if (
@@ -8346,7 +8832,7 @@ export class WebTerminalServer {
   emitChatQueue(event: ChatQueueEvent): void {
     if (!this.server || this.opts?.allowTranscript !== true) return;
     const body = JSON.stringify({ sessionId: event.sessionId, clientMessageId: event.clientMessageId, state: event.state,
-      ...(event.reason ? { reason: event.reason } : {}), at: event.at });
+      ...(event.reason ? { reason: event.reason } : {}), ...(event.deliver ? { deliver: event.deliver } : {}), at: event.at });
     this.deliverChatEvent(event.sessionId, () => ({ event: 'chat.queue', body }), (principal) => chatOwner(principal) === event.owner);
   }
 
@@ -8973,6 +9459,65 @@ export class WebTerminalServer {
   }
 
   // --- helpers ------------------------------------------------------------
+
+  /**
+   * `/api/a2a/*` — accepts a PEER credential and nothing else: no browser
+   * (`Origin` present — server-to-server calls carry none), no operator token,
+   * no device credential, no `?token=` and no stream ticket. (Every OTHER route
+   * refuses a peer credential in `handle` before reaching here.)
+   *
+   * Fail closed: no resolver or no handler is 503, never a fallthrough.
+   */
+  private async handleA2a(req: http.IncomingMessage, res: http.ServerResponse, url: URL, p: string): Promise<void> {
+    const bearer = bearerOf(req);
+    const refuse = (status: number, error: A2aRemoteErrorCode, extra?: Record<string, unknown>): void =>
+      this.json(res, status, { ok: false, error, ...extra });
+
+    if (req.headers['origin'] !== undefined) return refuse(403, 'forbidden');
+    const cred = parsePeerCredential(bearer);
+    if (!cred) {
+      // A malformed peer credential is a failed peer login (401). Any OTHER
+      // credential is a principal that is never allowed here (403). The operator
+      // check is a constant-time compare, not an authentication.
+      if (looksLikePeerCredential(bearer)) return refuse(401, 'unauthorized');
+      const otherCredential =
+        (bearer !== null && !!this.token && timingSafeEquals(bearer, this.token)) ||
+        (bearer !== null && bearer.indexOf(DEVICE_CREDENTIAL_SEP) > 0) ||
+        url.searchParams.has('token') ||
+        url.searchParams.has('ticket');
+      return otherCredential ? refuse(403, 'forbidden') : refuse(401, 'unauthorized');
+    }
+
+    const peers = this.deps.peers;
+    if (!peers) return refuse(503, 'unavailable');
+    let result: Awaited<ReturnType<WebPeerResolver['resolve']>>;
+    try {
+      result = await peers.resolve(cred.peerId, cred.secret);
+    } catch (err) {
+      // A store that cannot answer is not an authorization.
+      this.deps.log('warn', `[web] peer auth failed: ${errMsg(err)}`);
+      return refuse(401, 'unauthorized', { reason: 'unknown' });
+    }
+    if (!result.ok) return refuse(401, 'unauthorized', { reason: result.reason });
+    // Bookkeeping, never fatal — whether it throws or returns a rejecting promise.
+    const touchFailed = (err: unknown): void => this.deps.log('warn', `[web] peer touch failed: ${errMsg(err)}`);
+    try {
+      Promise.resolve(peers.touch?.(result.peerId)).catch(touchFailed);
+    } catch (err) {
+      touchFailed(err);
+    }
+
+    const routes = this.deps.a2a;
+    if (!routes) return refuse(503, 'unavailable');
+    try {
+      await routes.handle(req, res, url, p, { peerId: result.peerId, hostId: result.hostId, name: result.name });
+    } catch (err) {
+      this.deps.log('warn', `[web] a2a handler threw: ${errMsg(err)}`);
+      if (!res.headersSent) return refuse(500, 'unavailable');
+      // Mid-response: the body is already partial, so end the exchange.
+      res.destroy();
+    }
+  }
 
   /**
    * Authenticate an `/api/*` request. Two credential forms, one gate:
@@ -9774,6 +10319,12 @@ function readTlsPem(kind: 'certificate' | 'private key', filePath: string): Buff
  * remains observable — as it was before M3, and as it is for every bearer
  * scheme that does not pad.
  */
+/** The `Authorization: Bearer` value, or null when there is none. */
+function bearerOf(req: http.IncomingMessage): string | null {
+  const header = req.headers['authorization'];
+  return typeof header === 'string' && header.startsWith('Bearer ') ? header.slice('Bearer '.length) : null;
+}
+
 function timingSafeEquals(supplied: string, expected: string): boolean {
   const a = Buffer.from(supplied);
   const b = Buffer.from(expected);

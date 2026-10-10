@@ -51,8 +51,16 @@ import {
   type ShortcutActionId,
 } from '../../../shared/keymap';
 import { shortcutPressGuard } from '../../utils/shortcutBindings';
-import { describeShortcut, rebindProblemText } from '../../utils/shortcutRebind';
+import {
+  builtinKeyConflict,
+  customKeyConflict,
+  describeShortcut,
+  rebindProblemText,
+  type KeyConflict,
+} from '../../utils/shortcutRebind';
+import KeyConflictConfirm from '../shared/KeyConflictConfirm';
 import { CLAUDE_EFFORT_LEVELS } from '../../../shared/claudeModels';
+import type { AgentSlug } from '../../../shared/agentIdentity';
 import {
   agyEffortOf,
   agyFamilyOf,
@@ -73,6 +81,7 @@ import { McpStatusSection } from './McpStatusSection';
 import { AccountsSection } from './AccountsSection';
 import { AgyAccountsSection } from './AgyAccountsSection';
 import { FanoutPresetsSection } from './FanoutPresetsSection';
+import { A2aRemoteSection } from './A2aRemoteSection';
 import { terminalFontFamilyCss } from '../../utils/terminalFont';
 import { hasBareFunctionKeyBinding } from '../../utils/functionKeyBinding';
 import { Icon, IconX, IconCheck, IconChevron, IconExternalLink, IconBrowser, IconComputer, IconUsers, IconRobot, IconRemoteDevices, IconPlus, IconWarning } from '../icons';
@@ -658,8 +667,10 @@ function disposeWorkspacePtys(ws: Workspace) {
 // no-op'ing silently. Model entry is a datalist combobox, not a <select>: only
 // claude's aliases are known to us, and a codex model id (`gpt-5.5`) must be
 // typeable. agy takes its fan-out prompt through `-i` (applyRoleAgent) and its
-// task folder is pre-trusted by main (main/agents/agyTrust).
-const ROLE_BINDING_AGENTS = ['claude', 'codex', 'opencode', 'gemini', 'agy'] as const;
+// task folder is pre-trusted by main (main/agents/agyTrust). A curated, ORDERED
+// picker subset, so it is a literal list rather than derived from the registry;
+// `satisfies` rejects any entry that is not a registry slug.
+const ROLE_BINDING_AGENTS = ['claude', 'codex', 'opencode', 'gemini', 'agy'] as const satisfies readonly AgentSlug[];
 
 // Model ids and CLI args are machine evidence, so the free-text fields are mono.
 const ROLE_BINDING_FIELD_CLASS = 'settings-input font-mono';
@@ -1902,6 +1913,8 @@ function TabTerminal() {
   const setSplitInheritsCwd = useStore((s) => s.setSplitInheritsCwd);
   const closeTabOnShellExit = useStore((s) => s.closeTabOnShellExit);
   const setCloseTabOnShellExit = useStore((s) => s.setCloseTabOnShellExit);
+  const plainDragSelectEnabled = useStore((s) => s.plainDragSelectEnabled);
+  const setPlainDragSelectEnabled = useStore((s) => s.setPlainDragSelectEnabled);
   const imeResidueGuardEnabled = useStore((s) => s.imeResidueGuardEnabled);
   const setImeResidueGuardEnabled = useStore((s) => s.setImeResidueGuardEnabled);
   const hiddenPaneRetentionEnabled = useStore((s) => s.hiddenPaneRetentionEnabled);
@@ -2015,6 +2028,13 @@ function TabTerminal() {
         </SettingRow>
       </SettingsSection>
       <SettingsSection title={t('settings.sectionInput')}>
+        <SettingRow id="plaindragselect" label={t('settings.plainDragSelect')} description={t('settings.plainDragSelectDesc')}>
+          <Toggle
+            checked={plainDragSelectEnabled}
+            onChange={setPlainDragSelectEnabled}
+            label={t('settings.plainDragSelect')}
+          />
+        </SettingRow>
         <SettingRow id="ime" label={t('settings.imeResidueGuard')} description={t('settings.imeResidueGuardDesc')}>
           <Toggle
             checked={imeResidueGuardEnabled}
@@ -3694,7 +3714,7 @@ function TabAppearance() {
         </SettingRow>
         {/* Off by default for the same reason: memory and CPU otherwise appear
             only when memory is worth interrupting for. */}
-        <SettingRow label={t('settings.titlebarVitals')} description={t('settings.titlebarVitalsDesc')}>
+        <SettingRow id="titlebarvitals" label={t('settings.titlebarVitals')} description={t('settings.titlebarVitalsDesc')}>
           <Toggle
             checked={titlebarVitalsAlwaysVisible}
             onChange={setTitlebarVitalsAlwaysVisible}
@@ -4466,6 +4486,10 @@ export function TabShortcuts() {
   // Filter for the shortcut list: matches the action's name or its key combo.
   const [shortcutQuery, setShortcutQuery] = useState('');
   const [shortcutNote, setShortcutNote] = useState<{ action: ShortcutActionId; text: string } | null>(null);
+  // #1885 — a save that would leave a custom keybinding dead on its key waits
+  // here for Use anyway / Cancel.
+  const [keyConflict, setKeyConflict] = useState<{ conflict: KeyConflict; save: () => void } | null>(null);
+  useOwnedDialog(keyConflict !== null);
 
   const platform: NodeJS.Platform = window.electronAPI?.platform === 'darwin'
     ? 'darwin'
@@ -4488,7 +4512,22 @@ export function TabShortcuts() {
   const moveShortcut = (action: ShortcutActionId, combo: string) => {
     const text = problemText(action, combo);
     setShortcutNote(text ? { action, text } : null);
-    if (!text) setShortcutOverride(action, combo);
+    if (text) return;
+    const save = () => setShortcutOverride(action, combo);
+    const conflict = customKeyConflict(action, combo);
+    if (conflict) setKeyConflict({ conflict, save });
+    else save();
+  };
+  // A custom keybinding put on a key a built-in owns would never fire (#1885).
+  const recordCustomKey = (target: string, key: string) => {
+    const save = () => {
+      if (target === 'new') addKeybinding({ key, label: '', command: '', sendEnter: true });
+      else updateKeybinding(target, { key });
+    };
+    const unchanged = target !== 'new' && customKeybindings.some((kb) => kb.id === target && kb.key === key);
+    const conflict = unchanged ? null : builtinKeyConflict(key);
+    if (conflict) setKeyConflict({ conflict, save });
+    else save();
   };
   // Back to the default combo(s) — unless something else took one of them
   // meanwhile, which would leave two actions on one key.
@@ -4824,14 +4863,21 @@ export function TabShortcuts() {
         <KeyCaptureOverlay
           label={t('settings.kb.pressKey')}
           onCapture={(key, _code) => {
-            if (capturingFor === 'new') {
-              addKeybinding({ key, label: '', command: '', sendEnter: true });
-            } else {
-              updateKeybinding(capturingFor, { key });
-            }
+            recordCustomKey(capturingFor, key);
             setCapturingFor(null);
           }}
           onCancel={() => setCapturingFor(null)}
+        />
+      )}
+
+      {keyConflict && (
+        <KeyConflictConfirm
+          conflict={keyConflict.conflict}
+          onConfirm={() => {
+            keyConflict.save();
+            setKeyConflict(null);
+          }}
+          onCancel={() => setKeyConflict(null)}
         />
       )}
     </div>
@@ -5444,7 +5490,7 @@ export default function SettingsPanel({ initialTab }: { initialTab?: string }) {
                     {activeTab === 'browser'            && <TabBrowser />}
                     {activeTab === 'computer-use'       && <TabComputerUse />}
                     {activeTab === 'remote'             && <TabRemote />}
-                    {activeTab === 'lanlink'            && <><LanLinkSection /><LanLinkPairingSection /></>}
+                    {activeTab === 'lanlink'            && <><LanLinkSection /><LanLinkPairingSection /><A2aRemoteSection /></>}
                     {activeTab === 'about'              && <TabAbout />}
                   </div>
                 </>

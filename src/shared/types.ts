@@ -24,6 +24,7 @@ import type { WorkspaceColorId } from './workspaceColors';
 // cycle, which TypeScript resolves without any runtime import.
 import type { AgentSlug } from './events';
 import type { OrchestratorRoleBindings } from './orchestratorRole';
+import type { PcRailPersisted } from './pcRail';
 import type { AgentSignalKind } from './hooks/signal-types';
 
 // Re-export for backward compatibility
@@ -32,7 +33,9 @@ import type { AgentSignalKind } from './hooks/signal-types';
  *  adapter with the Hermes Agent spawn spec; 'claude-pty' = the user's own
  *  Claude Code binary driven as an interactive TUI inside a deck-embedded pty
  *  (the subscription-safe hedge — see ClaudePtyBrainAdapter). New ACP vendors
- *  extend this union + a spawn spec — no new adapter code. */
+ *  extend this union + a spawn spec — no new adapter code.
+ *  TODO(#1904): brain runtime ids, not agent slugs (`hermes` and `claude-pty`
+ *  have no registry row), so this union is not derived from agentIdentity.ts. */
 export type BrainVendor = 'claude' | 'hermes' | 'claude-pty';
 
 export type AgentPreset = _AgentPreset;
@@ -903,6 +906,8 @@ export interface SessionData {
   coldParkEnabled?: boolean;
   /** #1641: draw sixel / iTerm2 inline images (default true). */
   inlineImagesEnabled?: boolean;
+  /** #1947: plain left-drag selects text under app mouse tracking (default true). */
+  plainDragSelectEnabled?: boolean;
   /**
    * #517 browser lightweight mode: CPU-throttle effectively-invisible embedded
    * browser guests (automation-leased guests stay full-speed). Default false.
@@ -1009,6 +1014,8 @@ export interface SessionData {
   shortcutOverrides?: Partial<Record<string, string | null>>;
   autoUpdateEnabled?: boolean;
   customThemeColors?: CustomThemeColors;
+  /** PC rail: the selected computer, the last workspace per computer, muted hosts. Never a shadow id. */
+  pcRail?: PcRailPersisted;
   sidebarMode?: 'workspaces' | 'company';
   company?: Company | null;
   memberCosts?: Record<string, number>;
@@ -1219,7 +1226,10 @@ export interface WmuxTaskMetadata {
   // sides optional — a ws-only side keeps active-pane delivery / ws-level role.
   // Always ws-scoped: the id must belong to its own `workspaceId` (validated at
   // delivery; cross-ws is refused).
-  from: { workspaceId: string; name: string; paneId?: string; surfaceId?: string };
+  // `from.ptyId` (optional): cross-host A2A only — the sender pane's pty when a
+  // remote task was sent, so a reply from the other host is held instead of
+  // landing on a different agent that took the pane since.
+  from: { workspaceId: string; name: string; paneId?: string; surfaceId?: string; ptyId?: string };
   // `to.ptyId` (optional) is a delivery-time pty SNAPSHOT — channel-mention
   // autoresponse stores it so a deferred flush can fail closed if the pane
   // restarted (successor agent now holds the paneId) before delivery.

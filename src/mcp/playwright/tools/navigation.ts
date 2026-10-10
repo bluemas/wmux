@@ -203,6 +203,8 @@ function publicTab(tab: BrowserTabDescriptor) {
     // Live Chrome only: whether this workspace may WRITE to the tab. Absent on
     // the other backends, where every addressable tab is one wmux opened.
     ...(tab.owner !== undefined && { owner: tab.owner }),
+    // A private tab (browser_open private:true): in-memory session, never restored.
+    ...(tab.private === true && { private: true }),
     // Every rendered tab URL passes through here (list / new / select / close),
     // so this is the single place a credential in a query string or in
     // `scheme://user:pass@host` gets masked before the agent reads it.
@@ -599,11 +601,12 @@ export function registerNavigationTools(server: McpServer, deps: BrowserToolDeps
         let workspaceId: string;
         try {
           workspaceId = await deps.resolveWorkspaceId();
-        } catch {
+        } catch (err) {
+          // The resolver's own message says why and what to do; keep it.
           return tabsToolError(
             browserTabsError(
               'BROWSER_TABS_WORKSPACE_UNRESOLVED',
-              'The calling workspace is unavailable.',
+              err instanceof Error && err.message ? err.message : 'The calling workspace is unavailable.',
             ),
           );
         }

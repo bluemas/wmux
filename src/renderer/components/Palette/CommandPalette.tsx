@@ -8,6 +8,8 @@ import { useIpc } from '../../hooks/useIpc';
 import { resolveStartupCwd, withDefaultShell, withWorkspaceProfile } from '../../utils/ptyCreateOptions';
 import { pastePtyChunked } from '../../utils/clipboardChunk';
 import { openUrlInBrowserPane } from '../../utils/browserPaneActions';
+import { PRIVATE_BROWSER_PARTITION } from '../../../shared/privateBrowser';
+import { isShadowWorkspaceId } from '../../../shared/pcRail';
 import { hasAdoptableTaskDiff, openTaskDiff } from '../../utils/openTaskDiff';
 import { tokenAttrs } from '../../themes';
 import { usePlugins } from '../../plugins/usePlugins';
@@ -19,7 +21,14 @@ import { isChatV2Covering } from '../ChatV2/coverage';
 import { showWorkspaces } from '../../utils/showWorkspaces';
 import { comboFromEvent, displayCombo, effectiveBindings, type ShortcutActionId } from '../../../shared/keymap';
 import { shortcutPlatform, shortcutPressGuard } from '../../utils/shortcutBindings';
-import { clearShortcut, describeShortcut, rebindProblemText } from '../../utils/shortcutRebind';
+import {
+  clearShortcut,
+  customKeyConflict,
+  describeShortcut,
+  rebindProblemText,
+  type KeyConflict,
+} from '../../utils/shortcutRebind';
+import KeyConflictConfirm from '../shared/KeyConflictConfirm';
 import {
   openMultiTask,
   openWorktaskCleanup,
@@ -172,6 +181,13 @@ export default function CommandPalette() {
   // the same rules Settings → Shortcuts applies (shortcutRebind).
   const [recording, setRecording] = useState<ShortcutActionId | null>(null);
   const [recordNote, setRecordNote] = useState<string | null>(null);
+  // #1885 — the recorded key also runs a custom keybinding: ask before the
+  // built-in takes it. The ref lets the recorder's teardown leave focus in
+  // the dialog instead of pulling it back to the search input underneath.
+  const [keyConflict, setKeyConflict] = useState<
+    { conflict: KeyConflict; action: ShortcutActionId; combo: string } | null
+  >(null);
+  const keyConflictOpenRef = useRef(false);
   const shortcutOverrides = useStore((s) => s.shortcutOverrides);
   const setShortcutOverride = useStore((s) => s.setShortcutOverride);
   const setKeyCaptureActive = useStore((s) => s.setKeyCaptureActive);
@@ -316,7 +332,8 @@ export default function CommandPalette() {
             return;
           }
           const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
-          if (ws) {
+          // Another computer's (shadow) workspace never gets a local shell.
+          if (ws && !isShadowWorkspaceId(ws.id)) {
             // Issue #175: new tabs honor profile.startupCwd > global startupDirectory.
             const cwd = resolveStartupCwd({ splitInheritsCwd: false, profile: ws.profile, startupDirectory: state.startupDirectory });
             void ipcInvoke<{ id: string; cwd?: string }>(() =>
@@ -367,6 +384,15 @@ export default function CommandPalette() {
           // forceNew: the explicit "Open Browser" command always creates a
           // fresh split — reuse is for link/port clicks (browserPaneActions).
           openUrlInBrowserPane(undefined, { forceNew: true });
+          showWorkspaces(useStore.getState());
+          setVisible(false);
+        },
+      },
+      {
+        label: t('palette.cmd.openPrivateBrowser'),
+        shortcut: 'openPrivateBrowser',
+        action: () => {
+          openUrlInBrowserPane(undefined, { forceNew: true, partition: PRIVATE_BROWSER_PARTITION });
           showWorkspaces(useStore.getState());
           setVisible(false);
         },
@@ -731,6 +757,8 @@ export default function CommandPalette() {
     // listening behind a palette that is gone.
     setRecording(null);
     setRecordNote(null);
+    keyConflictOpenRef.current = false;
+    setKeyConflict(null);
     if (visible) {
       setQuery('');
       setActiveIdx(0);
@@ -778,6 +806,13 @@ export default function CommandPalette() {
       shortcutPressGuard.noteActed(e);
       const problem = rebindProblemText(recording, combo);
       if (problem) { setRecordNote(problem); return; }
+      const conflict = customKeyConflict(recording, combo);
+      if (conflict) {
+        keyConflictOpenRef.current = true;
+        setKeyConflict({ conflict, action: recording, combo });
+        finish();
+        return;
+      }
       setShortcutOverride(recording, combo);
       finish();
     };
@@ -785,10 +820,18 @@ export default function CommandPalette() {
     return () => {
       window.removeEventListener('keydown', handler, true);
       setKeyCaptureActive(false);
-      // The search input was swapped out for the prompt; give it focus back.
-      requestAnimationFrame(() => inputRef.current?.focus());
+      // The search input was swapped out for the prompt; give it focus back
+      // (unless a key conflict dialog took over, which hands it back itself).
+      requestAnimationFrame(() => { if (!keyConflictOpenRef.current) inputRef.current?.focus(); });
     };
   }, [recording, setKeyCaptureActive, setShortcutOverride]);
+
+  const closeKeyConflict = (useAnyway: boolean) => {
+    if (useAnyway && keyConflict) setShortcutOverride(keyConflict.action, keyConflict.combo);
+    keyConflictOpenRef.current = false;
+    setKeyConflict(null);
+    requestAnimationFrame(() => inputRef.current?.focus());
+  };
 
   // -------------------------------------------------------------------------
   // Keep activeIdx in bounds when results change
@@ -984,6 +1027,13 @@ export default function CommandPalette() {
           )}
         </div>
       </div>
+      {keyConflict && (
+        <KeyConflictConfirm
+          conflict={keyConflict.conflict}
+          onConfirm={() => closeKeyConflict(true)}
+          onCancel={() => closeKeyConflict(false)}
+        />
+      )}
     </div>
   );
 }

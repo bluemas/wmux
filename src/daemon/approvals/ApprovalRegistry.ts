@@ -70,7 +70,8 @@ import {
   parsePlanPrompt,
   parseTerminalPrompt,
   terminalPromptAnswerability,
-  toolFromDialogTitle,
+  toolOfDialog,
+  webSearchDetail,
   type ParsedTerminalPrompt,
 } from './terminalPromptParse';
 import { commandOfToolInput, type PendingToolUse } from '../transcript/pendingToolUse';
@@ -78,6 +79,7 @@ import { screenShowsActiveDialog, screenShowsPermissionDialog } from '../transcr
 import { terminalPromptTextRisk } from '../push/approvalRisk';
 import {
   decideApprovalPress,
+  encodeAnswerKey,
   keystrokesForAgent,
   looksLikeApprovalPrompt,
   questionOnScreen,
@@ -425,6 +427,13 @@ export interface ApprovalRegistryDeps {
    * delivery it did not make.
    */
   writeToSession: (sessionId: string, data: string) => boolean;
+  /**
+   * The pane's input is parsed as win32-input-mode key records (a ConPTY pane
+   * on Windows), so a key with no byte of its own — Esc — is written as a key
+   * record instead (see `encodeAnswerKey`). Absent or false: the bytes go out
+   * as they are.
+   */
+  win32Input?: (sessionId: string) => boolean;
   /**
    * The workspace-shaped half of the press scope (see `decideApprovalPress`):
    * is this workspace a WorkTask task workspace, and what is its deck autonomy
@@ -1077,6 +1086,40 @@ export class ApprovalRegistry implements ApprovalRegistryApi, ApprovalHookSink {
     });
   }
 
+  /**
+   * The pane left `awaiting_input` at the terminal (a recognised answer key,
+   * Esc included, or the screen check found the dialog gone). Expire its
+   * question-less `awaiting_input` cards: a card that only said "this pane is
+   * waiting on you" is false once the pane is not waiting.
+   *
+   * #1918: GitHub Copilot CLI fires no hook when its permission prompt is
+   * cancelled with Esc, so its card stayed pending until the next prompt and
+   * refused every automated key into the pane meanwhile.
+   *
+   * Only cards with nothing to answer. A card carrying a question, choices or
+   * a form is an AskUserQuestion picker: one key can release the pane while
+   * the picker is still up, and the agent reports what was answered
+   * (`agent.input_answered`), which a screen-inferred expiry here would beat
+   * to the record. A card keyed to the agent's own request id (OpenCode) is
+   * settled by that agent's report, and a native record by its server.
+   */
+  expireAnsweredInformational(sessionId: string, reason: 'answered-locally' | 'screen-cleared'): Promise<number> {
+    return this.mutate<number>(() => {
+      const events = this.expirePendingWhere(
+        (r) => r.sessionId === sessionId
+          && r.kind === 'awaiting_input'
+          && !isNative(r)
+          && r.hookRequestId === undefined
+          && !r.question
+          && !r.form
+          && !(r.choices && r.choices.length > 0)
+          && !(r.options && r.options.length > 0),
+        reason,
+      );
+      return { events, result: events.length };
+    });
+  }
+
   private decisionChannels(): PhoneDecisionsConfig {
     try {
       return this.deps.phoneDecisions?.() ?? { native: true, stepwise: true };
@@ -1470,6 +1513,11 @@ export class ApprovalRegistry implements ApprovalRegistryApi, ApprovalHookSink {
     return !screenShowsActiveDialog(screen.rows) && !screenShowsPermissionDialog(screen.rows);
   }
 
+  /** The bytes that press `key` in this pane (a win32 Esc record on Windows, #1915). */
+  private answerBytes(sessionId: string, key: string): string {
+    return encodeAnswerKey(key, this.deps.win32Input?.(sessionId) === true);
+  }
+
   private async readPromptScreenSafely(
     sessionId: string,
   ): Promise<{ rows: readonly string[]; mark: PromptScreenMark; cols?: number } | null> {
@@ -1500,17 +1548,20 @@ export class ApprovalRegistry implements ApprovalRegistryApi, ApprovalHookSink {
     if (read?.parsed.plan) return this.buildPlanPrompt(note, read, binding);
     const parsed = read?.parsed ?? null;
     const command = binding ? commandOfToolInput(binding.name, binding.input) : undefined;
-    // The dialog's second field: a Bash call's description, a WebFetch call's prompt.
-    const detail = binding?.input[binding.name === 'WebFetch' ? 'prompt' : 'description'];
-    const description = typeof detail === 'string' ? detail : undefined;
-    const toolName = binding?.name ?? note.toolName ?? toolFromDialogTitle(parsed?.title);
+    // The dialog's second field: a shell call's (Bash, PowerShell) description,
+    // a WebFetch call's prompt, a WebSearch call's domain filter as its box
+    // draws it (null: a shape not measured, which binds nothing).
+    const webSearch = binding?.name === 'WebSearch' ? webSearchDetail(binding.input) : undefined;
+    const detail = binding?.name === 'WebSearch' ? webSearch : binding?.input[binding.name === 'WebFetch' ? 'prompt' : 'description'];
+    const description = typeof detail === 'string' && detail ? detail : undefined;
+    const toolName = binding?.name ?? note.toolName ?? (parsed ? toolOfDialog(parsed) : undefined);
     // The call's own input is the source of the summary; the screen only when
-    // there is no call to read it from.
-    const summary = boundRecordText(command, TERMINAL_PROMPT_SUMMARY_MAX)
+    // there is no call to read it from. A WebSearch domain filter shows next to its query.
+    const summary = boundRecordText(command && webSearch ? `${command} (${webSearch})` : command, TERMINAL_PROMPT_SUMMARY_MAX)
       ?? (parsed ? boundRecordText(parsed.commandText, TERMINAL_PROMPT_SUMMARY_MAX) : undefined)
       ?? note.summary;
     // The summary is capped for display; the binding takes the WHOLE command.
-    const call = binding && command && !binding.unbindable
+    const call = binding && command && !binding.unbindable && webSearch !== null
       ? { name: binding.name, command, ...(description ? { description } : {}) }
       : null;
     const topCut = !!parsed && !parsed.topRuleFound;
@@ -1534,7 +1585,7 @@ export class ApprovalRegistry implements ApprovalRegistryApi, ApprovalHookSink {
         && !!mark && !!this.soleEvidence(note.sessionId)?.mark
         && this.soleEvidence(note.sessionId)!.mark!.keyInputRevision === mark.keyInputRevision
         && this.soleEvidence(note.sessionId)!.mark!.incarnation === mark.incarnation
-        && toolFromDialogTitle(parsed.title) === binding.name
+        && toolOfDialog(parsed) === binding.name
         && dialogMatchesToolCall(parsed, call, { topCut })
     );
     const answer = bound ? terminalPromptAnswerability(parsed) : null;
@@ -2071,7 +2122,7 @@ export class ApprovalRegistry implements ApprovalRegistryApi, ApprovalHookSink {
         : (choiceDigit ?? keys.approve);
       let delivered = false;
       try {
-        delivered = this.deps.writeToSession(record.sessionId, data);
+        delivered = this.deps.writeToSession(record.sessionId, this.answerBytes(record.sessionId, data));
       } catch (err) {
         this.deps.log?.(
           'warn',
@@ -2446,7 +2497,7 @@ export class ApprovalRegistry implements ApprovalRegistryApi, ApprovalHookSink {
         record.pressedAt = this.now();
         let delivered = false;
         try {
-          delivered = this.deps.writeToSession(record.sessionId, '\x1b');
+          delivered = this.deps.writeToSession(record.sessionId, this.answerBytes(record.sessionId, '\x1b'));
         } catch (err) {
           this.deps.log?.('warn', `[approvals] write failed for ${record.sessionId}: ${String(err)}`);
         }

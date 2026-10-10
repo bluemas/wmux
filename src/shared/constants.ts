@@ -299,6 +299,12 @@ export const IPC = {
   //   renderer-only trust boundary.
   DECK_LEDGER_GATE_GET: 'deck:ledger-gate:get',
   DECK_LEDGER_GATE_SET: 'deck:ledger-gate:set',
+  //   DECK_FLEET_FAST_PATH_* — the `deck.fleetFastPath` switch (Settings
+  //   toggle). ON answers short read-only Fleet questions from the desktop
+  //   composer with the local Fleet board instead of a Moa turn. Backed by
+  //   deck-fleet-fast-path.json (main/deck/deckFleetFastPathStore.ts).
+  DECK_FLEET_FAST_PATH_GET: 'deck:fleet-fast-path:get',
+  DECK_FLEET_FAST_PATH_SET: 'deck:fleet-fast-path:set',
   //   DECK_LEDGER_SUMMARY — the Deck status panel's read: the open task
   //   ledger rows one workspace's brain owns, joined with the workspace
   //   mirror's per-worker agent status. Read-only projection.
@@ -343,6 +349,15 @@ export const IPC = {
   DECK_MOA_ARCHIVE_LIST: 'deck:moa:archive:list',
   DECK_MOA_ARCHIVE_ACK: 'deck:moa:archive:ack',
   DECK_MOA_STORE_RESET: 'deck:moa:store:reset',
+  //   DECK_MOA_GOAL_END: the operator ends Moa's open goal contract
+  //   (moaGoalContract.ts) from Settings › Moa. Ending only takes powers away.
+  DECK_MOA_GOAL_END: 'deck:moa:goal:end',
+  //   DECK_MOA_GOAL_REVERT: "Revert this goal" — close the PRs Moa opened
+  //   for a completed goal (moaGoalDelivery.ts). Branches and history stay.
+  DECK_MOA_GOAL_REVERT: 'deck:moa:goal:revert',
+  //   DECK_MOA_DRAFT_ANSWER: approve or dismiss a learning-loop goal draft
+  //   (moaGoalLearning.ts). Approve proposes and approves it as a goal.
+  DECK_MOA_DRAFT_ANSWER: 'deck:moa:draft:answer',
   //   DECK_MOA_SHADOW_STATS — the shadow judge's readout (MoaShadowStats).
   DECK_MOA_SHADOW_STATS: 'deck:moa:shadow:stats',
   //   DECK_MOA_MEMORY_LIST / _DELETE: what Moa remembers (saved precedents,
@@ -375,6 +390,9 @@ export const IPC = {
   // A delegated task's result from its A2A completion evidence ({ workspaceId,
   // taskId } → { result: MoaTaskResult | null }), for Moa's result card.
   DECK_MOA_TASK_RESULT: 'deck:moa:task-result',
+  // Tasks between this PC's Moa and other PCs' Moa (brain links), newest
+  // first (invoke → { tasks: MoaRemoteTask[] }). Re-read on DECK_MOA_CHANGED.
+  DECK_MOA_REMOTE_TASKS: 'deck:moa:remote-tasks',
   //   DECK_MOA_HANDOFF_RESOLVE (invoke MoaHandoffResolveRequest): answer a
   //   hand-off card by id (main reads the body from its own store; an edited
   //   body is the operator's own input). DECK_MOA_HANDOFF_RECEIPTS (invoke):
@@ -615,6 +633,9 @@ export const IPC = {
   // Fleet Ready to review — a task's change counts only (numstat + untracked),
   // no patch text; answers `unchanged` when the worktree state key matches.
   DIFF_SUMMARY: 'diff:summary',
+  // Git page Worktrees — how many paths have uncommitted changes, from
+  // `git status` alone (no file is read).
+  DIFF_STATUS: 'diff:status',
   // Deck Git 탭 — 워크트리 GUI (list/add/remove; remove는 --force 미제공)
   WORKTREE_LIST: 'worktree:list',
   WORKTREE_ADD: 'worktree:add',
@@ -631,6 +652,9 @@ export const IPC = {
   // Git page Issues view (gh CLI, 30s TTL, rate-limit breaker)
   GITHUB_ISSUE_LIST: 'github:issueList',
   GITHUB_ISSUE_DETAIL: 'github:issueDetail',
+  // The signed-in gh login and the viewer's role on a repo (read on Git page show, cached in main)
+  GITHUB_VIEWER_LOGIN: 'github:viewerLogin',
+  GITHUB_REPO_PERMISSION: 'github:repoPermission',
   // PR review and CI on the Git page's detail pane (src/main/github/GhPrReviewService.ts).
   PR_REVIEW_CHECKS: 'prReview:checks',
   PR_REVIEW_FILES: 'prReview:files',
@@ -730,6 +754,8 @@ export const IPC = {
   // anything in flight.
   COMPUTER_USE_GET: 'computer-use:get',
   COMPUTER_USE_SET: 'computer-use:set',
+  // macOS permission buttons: { op: 'request' | 'reset' | 'reveal' }, returns GET's shape.
+  COMPUTER_USE_PERMISSIONS: 'computer-use:permissions',
   // Global quick launch (Settings › Shortcuts, and the floating composer).
   // SETTINGS_GET/SET return QuickLaunchSettingsPayload; the rest are the
   // composer window's own calls, refused from any other sender. The strings
@@ -804,6 +830,38 @@ export const IPC = {
   LANLINK_SEND: 'lanlink:send',
   LANLINK_PEERS_LIST: 'lanlink:peers:list',
   LANLINK_PEERS_REMOVE: 'lanlink:peers:remove',
+  // Cross-host A2A control plane (Settings → LAN → renderer → main → daemon
+  // control pipe `a2a.remote.*`).
+  A2A_REMOTE_STATUS: 'a2aRemote:status',
+  A2A_REMOTE_CONFIGURE: 'a2aRemote:configure',
+  A2A_REMOTE_PAIR_BEGIN: 'a2aRemote:pair:begin',
+  A2A_REMOTE_PAIR_CANCEL: 'a2aRemote:pair:cancel',
+  A2A_REMOTE_PAIR_STATUS: 'a2aRemote:pair:status',
+  A2A_REMOTE_JOIN: 'a2aRemote:join',
+  A2A_REMOTE_HOSTS_LIST: 'a2aRemote:hosts:list',
+  A2A_REMOTE_HOSTS_REMOVE: 'a2aRemote:hosts:remove',
+  A2A_REMOTE_PEERS_LIST: 'a2aRemote:peers:list',
+  A2A_REMOTE_PEERS_REVOKE: 'a2aRemote:peers:revoke',
+  // Exposure and pane links. SNAPSHOT is the renderer's whole pane tree (main
+  // diffs it for gone panes and publishes the exposed part); LINK_EVENT is the
+  // main → renderer push of daemon link nudges.
+  A2A_REMOTE_SNAPSHOT: 'a2aRemote:snapshot',
+  A2A_REMOTE_EXPOSURE_GET: 'a2aRemote:exposure:get',
+  A2A_REMOTE_EXPOSURE_SET: 'a2aRemote:exposure:set',
+  A2A_REMOTE_HOSTS_EXPOSED: 'a2aRemote:hosts:exposed',
+  A2A_REMOTE_LINKS_LIST: 'a2aRemote:links:list',
+  A2A_REMOTE_LINKS_PROPOSE: 'a2aRemote:links:propose',
+  A2A_REMOTE_LINKS_ACCEPT: 'a2aRemote:links:accept',
+  A2A_REMOTE_LINKS_REJECT: 'a2aRemote:links:reject',
+  A2A_REMOTE_LINKS_REVOKE: 'a2aRemote:links:revoke',
+  A2A_REMOTE_LINKS_REFRESH: 'a2aRemote:links:refresh',
+  A2A_REMOTE_LINK_EVENT: 'a2aRemote:link-event',
+  // Delivery: per-PC connection state, and remote work held for a person.
+  A2A_REMOTE_HOSTS_STATUS: 'a2aRemote:hosts:status',
+  A2A_REMOTE_HOST_STATUS_EVENT: 'a2aRemote:host-status-event',
+  A2A_REMOTE_HELD_LIST: 'a2aRemote:held:list',
+  A2A_REMOTE_HELD_RETRY: 'a2aRemote:held:retry',
+  A2A_REMOTE_HELD_REJECT: 'a2aRemote:held:reject',
   // Scheduled runs (renderer → main → daemon `automation.*`). Invoke channels
   // resolve even with no daemon (empty lists / `{ ok:false }`). AUTOMATION_PUSH
   // carries daemon events and connect-time snapshots main → renderer;

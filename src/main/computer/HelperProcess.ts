@@ -66,6 +66,12 @@ export interface HelperProcessOptions {
    * (verifyHelper.ts: the packaged macOS helper's code signature).
    */
   verify?: (command: string) => Promise<void>;
+  /**
+   * Runtime switches for the optional `configure` method (protocol.ts), read
+   * when a helper says hello and on reconfigure(). Sent only to a helper whose
+   * hello lists `configure`; others are skipped silently.
+   */
+  configure?: () => HelperMethods['configure']['params'];
   /** Per-method timeout override, mainly for tests. */
   timeoutFor?: (method: HelperMethod) => number;
   log?: (message: string) => void;
@@ -134,7 +140,11 @@ function mergeRelease(a: ReleaseInputParams | null, b: ReleaseInputParams): Rele
   return { ...(keys && { keys }), ...(modifiers && { modifiers }), ...(buttons && { buttons }) };
 }
 
+/** A cold launch (a large IDE) plus waiting for its first window. */
+const OPEN_APP_TIMEOUT_MS = 30_000;
+
 function defaultTimeout(method: HelperMethod): number {
+  if (method === 'openApp') return OPEN_APP_TIMEOUT_MS;
   return method === 'getAppState' ? HELPER_TIMEOUT_MS.getAppState : HELPER_TIMEOUT_MS.default;
 }
 
@@ -165,6 +175,27 @@ export class HelperProcess {
     return this.running?.hello ?? null;
   }
 
+  /** Whether the running helper's hello listed `method`; undefined while none runs. */
+  supports(method: HelperMethod): boolean | undefined {
+    return this.running ? this.running.hello.capabilities.actions.includes(method) : undefined;
+  }
+
+  /**
+   * Pushes the current `configure` params to the running helper (a Settings
+   * change). Never starts a helper: one that starts later is configured on
+   * its hello. A failure is logged, never thrown.
+   */
+  reconfigure(): Promise<void> {
+    const run = async (): Promise<void> => {
+      const running = this.running;
+      if (this.disposed || !running) return;
+      await this.sendConfigure(running);
+    };
+    const result = this.queue.then(run, run);
+    this.queue = result.catch(() => undefined);
+    return result;
+  }
+
   get lastStderr(): string {
     return this.stderrTail;
   }
@@ -175,7 +206,7 @@ export class HelperProcess {
       if (generation !== this.abortGeneration) throw new ComputerError('aborted', 'stopped by the user');
     };
     const run = async (): Promise<HelperMethods[M]['result']> => {
-      if (this.disposed) throw new ComputerError('helper_unavailable', 'computer use is shutting down');
+      if (this.disposed) throw new ComputerError('shutting_down', 'computer use is shutting down');
       assertCurrent();
       if (this.heldInput && method !== 'releaseInput') {
         let released = false;
@@ -223,7 +254,7 @@ export class HelperProcess {
   dispose(): void {
     this.disposed = true;
     this.clearIdle();
-    const error = new ComputerError('helper_unavailable', 'computer use is shutting down');
+    const error = new ComputerError('shutting_down', 'computer use is shutting down');
     if (this.running) {
       // Mid-input, stdin EOF first: the helper releases what it holds on EOF,
       // and no fresh helper may be started for it any more.
@@ -320,7 +351,7 @@ export class HelperProcess {
   }
 
   private ensureRunning(): Promise<Running> {
-    if (this.disposed) return Promise.reject(new ComputerError('helper_unavailable', 'computer use is shutting down'));
+    if (this.disposed) return Promise.reject(new ComputerError('shutting_down', 'computer use is shutting down'));
     if (this.running) return Promise.resolve(this.running);
     if (!this.starting) {
       this.starting = this.start()
@@ -342,9 +373,31 @@ export class HelperProcess {
   private async start(): Promise<Running> {
     if (this.opts.verify) {
       await this.opts.verify(this.opts.command);
-      if (this.disposed) throw new ComputerError('helper_unavailable', 'computer use is shutting down');
+      if (this.disposed) throw new ComputerError('shutting_down', 'computer use is shutting down');
     }
-    return this.spawnHelper();
+    // A helper killed by dispose() while starting reports its exit; the
+    // caller should hear that wmux is shutting down instead.
+    const running = await this.spawnHelper().catch((err: unknown) => {
+      if (this.disposed) throw new ComputerError('shutting_down', 'computer use is shutting down');
+      throw err;
+    });
+    // Before the request that started it, so its first action already runs
+    // with the person's settings (the overlay).
+    await this.sendConfigure(running);
+    if (this.disposed) throw new ComputerError('shutting_down', 'computer use is shutting down');
+    if (this.running !== running) {
+      throw new ComputerError('helper_unavailable', 'the computer-use helper stopped while starting');
+    }
+    return running;
+  }
+
+  private async sendConfigure(running: Running): Promise<void> {
+    if (!this.opts.configure || !running.hello.capabilities.actions.includes('configure')) return;
+    try {
+      await this.send(running, 'configure', this.opts.configure());
+    } catch (err) {
+      this.log(`configure failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   private spawnHelper(): Promise<Running> {
@@ -387,6 +440,9 @@ export class HelperProcess {
       });
 
       child.stderr.on('data', (chunk: string) => {
+        // A replaced helper's late stderr must not end up in its successor's
+        // exit message.
+        if (!this.isCurrent(child)) return;
         this.stderrTail = (this.stderrTail + chunk).slice(-STDERR_TAIL_BYTES);
       });
 
@@ -414,7 +470,7 @@ export class HelperProcess {
               return;
             }
             if (this.disposed) {
-              fail(new ComputerError('helper_unavailable', 'computer use is shutting down'));
+              fail(new ComputerError('shutting_down', 'computer use is shutting down'));
               return;
             }
             settled = true;
@@ -433,8 +489,11 @@ export class HelperProcess {
       });
       child.on('exit', (code, signal) => {
         this.log(`helper exited (code ${code ?? 'null'}, signal ${signal ?? 'null'})`);
+        // Before fail(): a helper that dies before its hello stops being
+        // current there, and its stderr is the only clue to why.
+        this.logStderrTail(child);
         fail(new ComputerError('helper_unavailable', `the computer-use helper exited during start-up (exit code ${code ?? 'none'})`));
-        this.onExit(child);
+        this.onExit(child, code);
       });
     });
   }
@@ -446,7 +505,7 @@ export class HelperProcess {
       return;
     }
     // A helper that is no longer the running one has nothing to answer.
-    if (this.running?.child !== child && this.startingChild !== child) return;
+    if (!this.isCurrent(child)) return;
     if (parsed.kind === 'invalid') {
       this.log(`invalid helper line (${parsed.reason}); killing it`);
       this.terminate(child, new ComputerError('internal', `the computer-use helper sent an invalid reply (${parsed.reason})`));
@@ -465,6 +524,11 @@ export class HelperProcess {
     } else {
       pending.reject(new ComputerError(parsed.response.error.code, parsed.response.error.message));
     }
+  }
+
+  /** The running helper, or the one still starting. */
+  private isCurrent(child: ChildProcessWithoutNullStreams): boolean {
+    return this.running?.child === child || this.startingChild === child;
   }
 
   private send(running: Running, method: HelperMethod, params: unknown): Promise<unknown> {
@@ -495,9 +559,18 @@ export class HelperProcess {
     });
   }
 
-  private onExit(child: ChildProcessWithoutNullStreams): void {
-    const tail = this.stderrTail.trim().split('\n').slice(-1)[0] ?? '';
-    this.terminate(child, new ComputerError('helper_unavailable', `the computer-use helper exited${tail ? `: ${tail}` : ''}`));
+  /**
+   * The helper's stderr goes to the log, never to the agent: it is the
+   * helper's own diagnostics (paths, OS error text), not something an agent
+   * can act on.
+   */
+  private logStderrTail(child: ChildProcessWithoutNullStreams): void {
+    const tail = this.isCurrent(child) ? this.stderrTail.trim().split('\n').slice(-1)[0] ?? '' : '';
+    if (tail) this.log(`helper stderr before exit: ${tail}`);
+  }
+
+  private onExit(child: ChildProcessWithoutNullStreams, code: number | null = null): void {
+    this.terminate(child, new ComputerError('helper_unavailable', `the computer-use helper exited${code !== null ? ` (exit code ${code})` : ''}`));
   }
 
   private failPending(error: Error): void {

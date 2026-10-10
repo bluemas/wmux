@@ -174,6 +174,8 @@ export const FIRST_PARTY_METHODS: ReadonlySet<RpcMethod> = new Set<RpcMethod>([
   'surface.close',
   // panes + metadata
   'pane.list',
+  // pane-name targeting (#w1-2) on the terminal, pane and A2A tools
+  'pane.resolveName',
   'fleet.triage',
   'pane.search',
   'pane.getMetadata',
@@ -213,6 +215,10 @@ export const FIRST_PARTY_METHODS: ReadonlySet<RpcMethod> = new Set<RpcMethod>([
   // per-spawn-token auth; the handler refuses any caller that is not the HQ
   // brain, and delivery waits for the operator's card answer.
   'deck.proposeHandoff',
+  // Moa's goal contract (moa_propose_goal / moa_goal). Same per-spawn-token
+  // auth, HQ only; the proposal only raises an operator card.
+  'deck.proposeGoal',
+  'deck.goal',
   // events
   'events.poll',
   // browser (Playwright + packaged CDP/RPC fallbacks)

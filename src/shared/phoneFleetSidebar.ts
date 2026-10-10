@@ -30,6 +30,14 @@ export const PHONE_SIDEBAR_LIMITS = {
   moaDelegations: 20,
   moaDelegationTitle: 80,
   moaDelegationAgentName: 64,
+  /** Fleet's tickets (`PhoneSidebarSnapshot.fleetTickets`). */
+  fleetTickets: 30,
+  fleetTicketTitle: 80,
+  fleetTicketAgentName: 64,
+  fleetTicketWorkspaceName: 100,
+  /** One line of the request, and of the final report: agent-authored text. */
+  fleetTicketRequestLine: 160,
+  fleetTicketResultSummary: 240,
   /** Upper bound for counts and ahead/behind; anything larger is not a real value. */
   count: 1_000_000,
   /**
@@ -161,6 +169,51 @@ export interface PhoneMoaDelegation {
   since: number;
 }
 
+/** A ticket's state: the desktop Fleet's own five words. */
+export const PHONE_FLEET_TICKET_STATES = ['queued', 'working', 'needs-you', 'done', 'failed'] as const;
+export type PhoneFleetTicketState = (typeof PHONE_FLEET_TICKET_STATES)[number];
+
+/** Where a ticket's job started: a WorkLink origin, or a Moa hand-off not yet delivered. */
+export const PHONE_FLEET_TICKET_ORIGINS = ['issue', 'pr', 'moa', 'moa-auto', 'manual', 'handoff'] as const;
+export type PhoneFleetTicketOrigin = (typeof PHONE_FLEET_TICKET_ORIGINS)[number];
+
+/** How long a finished (done / failed) ticket stays listed: the desktop's TICKET_RECENT_MS. */
+export const PHONE_FLEET_TICKET_RECENT_MS = 24 * 60 * 60 * 1000;
+
+/** Verified items over all items, e.g. "3/4". */
+const VERIFICATION_RE = /^\d{1,5}\/\d{1,5}$/;
+
+/**
+ * One desktop Fleet ticket: a delegated job of any origin (Moa, an A2A send,
+ * a Git page issue, a hand-off card still waiting on the operator). The
+ * shared shape is re-exported by phoneFleetTickets.ts, which holds the detail
+ * contract.
+ *
+ * `requestLine`, `resultSummary` and `verification` are agent-authored text:
+ * the daemon serves them only with `--allow-transcript` (fleetTickets.ts).
+ */
+export interface PhoneFleetTicket {
+  /** The desktop ticket id: a WorkLink id, or `handoff:<decision id>`. */
+  id: string;
+  /** The A2A task carrying the job, when there is one. */
+  taskId?: string;
+  origin: PhoneFleetTicketOrigin;
+  workspaceId: string;
+  /** The workspace's name, kept by the desktop after the workspace closes. */
+  workspaceName?: string;
+  agentName?: string;
+  title: string;
+  state: PhoneFleetTicketState;
+  /** Epoch ms the job last changed on the desktop's record. */
+  updatedAt: number;
+  /** The request's first line, single-line and bounded. */
+  requestLine?: string;
+  /** The final report's first line, single-line and bounded; only on done / failed. */
+  resultSummary?: string;
+  /** Verified evidence items over all items, e.g. "3/4"; only on done / failed. */
+  verification?: string;
+}
+
 /**
  * Surface kinds the phone may see: the desktop's surface types, plus 'other'
  * for anything newer. A parser maps an unknown kind to 'other' rather than
@@ -234,12 +287,30 @@ export interface PhoneSidebarSnapshot {
   /** Moa is on and its HQ workspace exists. Absent otherwise. */
   moa?: true;
   /**
+   * Why a wake of Moa from the phone would be refused right now, though Moa is
+   * on: `'moa-mode-off'` while the HQ workspace's agent mode is off (main
+   * refuses every brain turn there). Only beside `moa`. Absent when nothing
+   * blocks a wake, when the mode could not be read, and from an older desktop
+   * — all of which leave the daemon advertising `moaWake` as before.
+   */
+  moaWakeBlocked?: 'moa-mode-off';
+  /**
    * Moa's delegated jobs, newest first: every open one plus those that ended
    * within PHONE_MOA_DELEGATION_RECENT_MS, at most `moaDelegations`. Present
    * (possibly empty) whenever the desktop computed it; absent from an older
    * desktop, on a failed read, or when cut for size.
    */
   moaDelegations?: PhoneMoaDelegation[];
+  /**
+   * Every Fleet ticket, needs-you first then newest first (the desktop's own
+   * order): every open one plus those that ended within
+   * PHONE_FLEET_TICKET_RECENT_MS, at most `fleetTickets`. Present (possibly
+   * empty) whenever the desktop computed it; absent from an older desktop, on
+   * a failed read, or when cut for size.
+   */
+  fleetTickets?: PhoneFleetTicket[];
+  /** Epoch ms of the earliest enabled schedule's next run. Absent when none is scheduled. */
+  nextScheduleAt?: number;
 }
 
 /**
@@ -395,6 +466,54 @@ function parseMoaDelegations(value: unknown[], drop: SidebarDropReporter): Phone
   return out.sort((a, b) => b.since - a.since);
 }
 
+function parseFleetTicket(value: unknown): PhoneFleetTicket | undefined {
+  if (!isRecord(value)) return undefined;
+  const L = PHONE_SIDEBAR_LIMITS;
+  const id = idString(value.id);
+  const workspaceId = idString(value.workspaceId);
+  const title = boundedString(value.title, L.fleetTicketTitle);
+  const updatedAt = timestamp(value.updatedAt);
+  // A word this build does not know (a newer desktop) reads as the contract
+  // tells the phone to read it — a state as `working`, an origin as `manual`
+  // — rather than costing the row.
+  const state = (PHONE_FLEET_TICKET_STATES as readonly unknown[]).includes(value.state)
+    ? value.state as PhoneFleetTicketState
+    : boundedString(value.state, 32) !== undefined ? 'working' : undefined;
+  const origin = (PHONE_FLEET_TICKET_ORIGINS as readonly unknown[]).includes(value.origin)
+    ? value.origin as PhoneFleetTicketOrigin
+    : boundedString(value.origin, 32) !== undefined ? 'manual' : undefined;
+  if (id === undefined || workspaceId === undefined || title === undefined || updatedAt === undefined || state === undefined || origin === undefined) return undefined;
+  const ticket: PhoneFleetTicket = { id, origin, workspaceId, title, state, updatedAt };
+  // Optional fields are dropped one by one: a bad name never costs the row.
+  const taskId = idString(value.taskId);
+  if (taskId !== undefined) ticket.taskId = taskId;
+  const workspaceName = boundedString(value.workspaceName, L.fleetTicketWorkspaceName);
+  if (workspaceName !== undefined) ticket.workspaceName = workspaceName;
+  const agentName = boundedString(value.agentName, L.fleetTicketAgentName);
+  if (agentName !== undefined) ticket.agentName = agentName;
+  const requestLine = boundedString(value.requestLine, L.fleetTicketRequestLine);
+  if (requestLine !== undefined) ticket.requestLine = requestLine;
+  const resultSummary = boundedString(value.resultSummary, L.fleetTicketResultSummary);
+  if (resultSummary !== undefined) ticket.resultSummary = resultSummary;
+  if (typeof value.verification === 'string' && VERIFICATION_RE.test(value.verification)) ticket.verification = value.verification;
+  return ticket;
+}
+
+function parseFleetTickets(value: unknown[], drop: SidebarDropReporter): PhoneFleetTicket[] {
+  const out: PhoneFleetTicket[] = [];
+  const seen = new Set<string>();
+  for (const raw of value) {
+    if (out.length >= PHONE_SIDEBAR_LIMITS.fleetTickets) { drop('fleetTickets.overLimit'); break; }
+    const row = parseFleetTicket(raw);
+    if (!row) { drop('fleetTickets.row'); continue; }
+    if (seen.has(row.id)) { drop('fleetTickets.duplicate'); continue; }
+    seen.add(row.id);
+    out.push(row);
+  }
+  // The producer's order stands: needs-you first is the desktop's own rule.
+  return out;
+}
+
 function parseWorkspace(value: unknown, drop: SidebarDropReporter): PhoneSidebarWorkspace | null {
   if (!isRecord(value)) return null;
   const id = idString(value.id);
@@ -417,7 +536,7 @@ function parseWorkspace(value: unknown, drop: SidebarDropReporter): PhoneSidebar
   if (task) row.task = task;
   else if (value.task !== undefined) drop('workspace.task');
   if (value.layout !== undefined) {
-    const layout = parseLayout(value.layout, drop);
+    const layout = parsePhoneSidebarLayout(value.layout, drop);
     if (layout) row.layout = layout;
   }
   const moaHandoff = parseMoaHandoff(value.moaHandoff);
@@ -483,7 +602,7 @@ class LayoutRefusal extends Error {
  * have. Two things degrade instead: an unknown surface kind reads as 'other',
  * and an `activePaneId` that is not a leaf of the tree is dropped alone.
  */
-function parseLayout(value: unknown, drop: SidebarDropReporter): PhoneSidebarLayout | undefined {
+export function parsePhoneSidebarLayout(value: unknown, drop: SidebarDropReporter): PhoneSidebarLayout | undefined {
   const bounds = PHONE_SIDEBAR_LIMITS.layout;
   let nodes = 0;
   let leaves = 0;
@@ -625,8 +744,15 @@ export function parsePhoneSidebarSnapshot(value: unknown, onDrop?: SidebarDropRe
   else if (value.hqWorkspaceId !== undefined) drop('hqWorkspaceId');
   if (value.moa === true) snapshot.moa = true;
   else if (value.moa !== undefined) drop('moa');
+  if (value.moaWakeBlocked === 'moa-mode-off') snapshot.moaWakeBlocked = 'moa-mode-off';
+  else if (value.moaWakeBlocked !== undefined) drop('moaWakeBlocked');
   if (Array.isArray(value.moaDelegations)) snapshot.moaDelegations = parseMoaDelegations(value.moaDelegations, drop);
   else if (value.moaDelegations !== undefined) drop('moaDelegations');
+  if (Array.isArray(value.fleetTickets)) snapshot.fleetTickets = parseFleetTickets(value.fleetTickets, drop);
+  else if (value.fleetTickets !== undefined) drop('fleetTickets');
+  const nextScheduleAt = timestamp(value.nextScheduleAt);
+  if (nextScheduleAt !== undefined) snapshot.nextScheduleAt = nextScheduleAt;
+  else if (value.nextScheduleAt !== undefined) drop('nextScheduleAt');
   return snapshot;
 }
 

@@ -156,6 +156,43 @@ describe('computer.rpc', () => {
     );
   });
 
+  it('checks the shape of control params at the pipe: unknown fields and wrong types never reach the service', async () => {
+    const control = vi.fn(async () => ({ method: 'accessibility', verification: 'verified' }));
+    const { call } = setup({ control } as never);
+    const act = (params: Record<string, unknown>) =>
+      errorOf(call('computer.act', { action: 'click', snapshotId: 's1', senderPtyId: 'pty-a1', ...params }, { clientName: 'c' }));
+    for (const bad of [
+      { index: 1, workspaceId: 'ws-forged' },
+      { index: '3' },
+      { index: -1 },
+      { index: 1, button: 'back' },
+      { index: 1, modifiers: 'ctrl' },
+      { x: 'NaN', y: 2 },
+      { index: 1, clickCount: Infinity },
+      { snapshotId: 7, index: 1 },
+      { index: 1, constructor: 'x' },
+      { index: 1, toString: 'x' },
+    ]) {
+      expect((await act(bad))?.code, JSON.stringify(bad)).toBe('invalid_argument');
+    }
+    expect(control).not.toHaveBeenCalled();
+    expect(await act({ index: 1, button: 'right', clickCount: 2, modifiers: ['ctrl'] })).toBeNull();
+    expect(control).toHaveBeenCalledWith(expect.anything(), {
+      action: 'click', snapshotId: 's1', index: 1, button: 'right', clickCount: 2, modifiers: ['ctrl'],
+    });
+  });
+
+  it('routes openApp on computer.act to the service by selector, with the caller identity', async () => {
+    const control = vi.fn();
+    const openApp = vi.fn(async () => ({ app: { id: 'com.apple.TextEdit' }, window: null }));
+    const { call } = setup({ control, openApp } as never);
+    await call('computer.act', { action: 'openApp', app: 'TextEdit', senderPtyId: 'pty-a1' }, { clientName: 'c' });
+    expect(openApp).toHaveBeenCalledWith({ key: 'c @ ws-a/pty-a1', label: 'c in workspace "api"' }, { app: 'TextEdit' });
+    expect(control).not.toHaveBeenCalled();
+    expect((await errorOf(call('computer.act', { action: 'openApp', senderPtyId: 'pty-a1' }, { clientName: 'c' })))?.code).toBe('invalid_argument');
+    expect(openApp).toHaveBeenCalledTimes(1);
+  });
+
   it('encodes service errors as [code] message and wraps unknown ones as internal', async () => {
     const { call } = setup({
       listApps: vi.fn(async () => { throw new ComputerError('permission_missing', 'accessibility'); }),
@@ -189,6 +226,7 @@ describe('computer.rpc with the real service', () => {
     const prompts: Array<{ key: string; label: string }> = [];
     const service = new ComputerService({
       isEnabled: () => true,
+      askPerApp: () => true,
       createHelper: () => helper,
       requestConsent: async ({ agent }) => {
         prompts.push(agent);

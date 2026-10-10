@@ -10,6 +10,7 @@ import { isSafeGeometry } from '../../shared/terminalGeometry';
 import { isPrefixTrigger, resolveShortcut } from '../../shared/keymap';
 import { mentionKeyClaim } from '../utils/agentMention';
 import { currentShortcutBindings, defaultShortcutBindings, shortcutPressGuard } from '../utils/shortcutBindings';
+import { isPcRailAction, pcRailClaimsKey } from '../components/PcRail/pcRailModel';
 import { xtermWindowsBuildNumber } from '../../shared/conptyWindows';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { useStore } from '../stores';
@@ -25,6 +26,7 @@ import { claimFit } from '../utils/fitGuard';
 import { createFitScheduler } from '../utils/layoutTransitionGate';
 import { installAltClickTrackingGuard } from '../utils/altClickUnderMouseTracking';
 import { createMouseOwnedHint } from '../utils/mouseOwnedHint';
+import { installPlainDragSelect, mouseOwnedHintApplies } from '../utils/plainDragSelect';
 import { resizeOrderFor, runOrderedFit, type CancelOrderedFit } from '../utils/resizeOrder';
 import { createAutoSelectionCopy } from '../utils/autoSelectionCopy';
 import { createOsc52Handler } from '../utils/osc52Clipboard';
@@ -40,6 +42,7 @@ import { resolveMacLineDeleteByte } from '../terminal/macLineDeleteKey';
 import { isWslShell } from '../../shared/imagePaste';
 import { encodeEscape, isBareEscape } from '../terminal/escapeKeys';
 import { resolveCtrlLetterByte } from '../terminal/ctrlLetterKeys';
+import { UnpairedReleaseFilter, imeKeyLeaksUnderKitty, installKittyPromptReset, kittyCtrlLetter, kittyKeyboardForHost, resetXtermKitty, xtermEncodesKey, xtermKittyFlags, type KittyHost } from '../terminal/kittyKeyboard';
 import { isComposeChord, composeOwnerHost, TERMINAL_PTY_ATTR, COMPOSE_OWNER_ATTR } from '../terminal/composeChord';
 import { foldRemoteKeyboardState, INITIAL_REMOTE_KEYBOARD_STATE, type RemoteKeyboardState } from '../components/Remote/keyboardProtocol';
 import { attachImeAnchor } from '../terminal/imeAnchor';
@@ -54,10 +57,12 @@ import { createGlyphRepaintScheduler, type GlyphRepaintScheduler } from '../term
 import { atlasGuard } from '../terminal/atlasGuard';
 import { decideViewerVisibility } from '../terminal/viewerVisibility';
 import { useWindowDisplayed } from './useWindowDisplayed';
-import { createDeadInputWatchdog } from '../terminal/deadInputWatchdog';
+import { createDeadInputWatchdog, describeDeclinedKey, readXtermCompositionState } from '../terminal/deadInputWatchdog';
+import { formatModifiers, modifiersOf, sharedModifierPressTracker } from '../terminal/modifierPressTracker';
 import { awaitParseBarrier } from '../terminal/parseBarrier';
 import { STALE_REPLAY_INPUT_MODE_RESETS, STALE_REPLAY_ALIVE_SHELL_RESETS, STALE_REPLAY_DISPLAY_RESETS, staleReplayResetLevel } from '../../shared/terminal/staleReplayModeReset';
 import { installShellPromptModeReset, shellPromptModeResetFor } from '../../shared/terminal/shellPromptModeReset';
+import { holdNewXtermReplies } from '../../shared/terminal/replyParity';
 import { paneForegroundProbe } from '../terminal/paneForegroundProbe';
 import { attachAltScreenWheel, PAGE_SCROLL_AGENTS } from '../terminal/altScreenWheel';
 import { RestingCursorGuard } from '../terminal/restingCursor';
@@ -77,7 +82,7 @@ import {
 } from '../terminal/terminalOutputScheduler';
 import { reconnectPtyWithRetry as reconnectPtyWithRetryImpl } from './reconnectPtyWithRetry';
 import { adoptTerminal, parkTerminal, restoreParkedViewport, type ParkedTerminal } from '../terminal/terminalPark';
-import { captureColdFrame, coldFrameFits, dropColdFrame, takeColdFrame, WarmFrameSwap, REPAINT_BEGIN, REPAINT_END } from '../terminal/coldFrame';
+import { captureColdFrame, coldFrameFits, dropColdFrame, splitTrailingEscape, takeColdFrame, WarmFrameSwap, FULL_RESET, REPAINT_BEGIN, REPAINT_END, type ColdFrame } from '../terminal/coldFrame';
 
 // One detector for every pane in this renderer: the ESC-pair state is keyed by
 // ptyId, and a per-mount instance would lose a double-tap split across a remount.
@@ -559,6 +564,8 @@ function revealTiming(ptyId: string, stage: string, extra = ''): void {
 // pane must be re-synced before its buffer is scanned, or agents silently read
 // stale output. Keyed by ptyId; registered per mounted terminal.
 const hydrateRegistry = new Map<string, () => Promise<void>>();
+/** Longest a read waits for a painted cold frame to be swapped out. */
+const COLD_FRAME_READ_WAIT_MS = 3000;
 export async function hydrateTerminalForRead(ptyId: string): Promise<void> {
   const fn = hydrateRegistry.get(ptyId);
   if (fn) await fn();
@@ -583,7 +590,7 @@ let webglTokenSeq = 0;
 
 // RCA A1 — reconnect-with-retry policy lives in its own module so it can be
 // unit-tested without xterm/zustand/electron. Bound to the live deps here.
-function reconnectPtyWithRetry(ptyId: string, isCurrent: () => boolean, onRecoveryError?: (message: string | null, info?: { cwdMissing?: boolean }) => void): Promise<{ cols: number; rows: number } | null> {
+function reconnectPtyWithRetry(ptyId: string, isCurrent: () => boolean, onRecoveryError?: (message: string | null, info?: { cwdMissing?: boolean; rateLimited?: boolean }) => void): Promise<{ cols: number; rows: number } | null> {
   return reconnectPtyWithRetryImpl(ptyId, isCurrent, {
     reconnect: (id) => window.electronAPI.pty.reconnect(id),
     onRecoveryError,
@@ -841,6 +848,9 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
   // pane with no session pipe at all. Reset per effect run, like the local
   // in-flight guard it mirrors.
   const reconnectInFlightRef = useRef(false);
+  // True while the last settled reattach left this pane without a session
+  // pipe (rate limited, WSL recovery pending). Also refuses the park.
+  const reconnectPendingRef = useRef(false);
   // #1002 — set by the main effect when this mount adopted a parked terminal.
   // Read by the daemon reattach effect (which runs later in the same commit)
   // to skip its active-at-mount reconnect: the session pipe never detached, so
@@ -1223,6 +1233,10 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       theme: xtermTheme,
       minimumContrastRatio,
       allowProposedApi: true,
+      // Kitty keyboard protocol: xterm answers `CSI ? u` and encodes keys for
+      // a pane that pushed flags. Desktop only, not on Windows (see
+      // kittyKeyboardForHost).
+      vtExtensions: { kittyKeyboard: kittyKeyboardForHost(window.electronAPI as unknown as KittyHost) },
       // #1437: when the foreground app enables mouse tracking (Claude Code
       // does around its input box), a plain drag goes to the app and nothing
       // gets selected. Off macOS, xterm forces a selection on Shift+drag; on
@@ -1256,8 +1270,8 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // before, so an unreadable version changes nothing rather than flipping
       // every install to the opposite branch.
       //
-      // #910: when the PTY is running against the bundled conpty.dll (Win10,
-      // decided by the SAME predicate the spawn sites use — see
+      // #910/#1932: when the PTY is running against the bundled conpty.dll
+      // (decided by the SAME predicate the spawn sites use — see
       // xtermWindowsBuildNumber), report a modern build: reflow behaviour
       // comes from OpenConsole, not the kernel, so 22621 is a capability
       // token here, not an OS claim.
@@ -1398,6 +1412,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // two sides ever measure differently, a restored snapshot paints
       // cell-shifted against the live screen.
       applyUnicodeWidthModel(terminal);
+      holdNewXtermReplies(terminal);
       terminal.open(container);
     }
     // Grok lives on the alt screen, where xterm has no scrollback and turns the
@@ -1465,6 +1480,14 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // short Option+click would reach xterm's click-to-move-cursor and type
     // arrow keys into the app. Keep that feature to shell prompts.
     const detachAltClickGuard = installAltClickTrackingGuard(container, terminal);
+    // #1947: a plain left-drag selects even while the app tracks the mouse
+    // (Codex enables ?1003 at startup); a plain click still reaches the app.
+    // Installed after the alt-click guard so the guard still sees every press,
+    // including the replayed Option+mousedown. The setting is read per press.
+    const detachPlainDragSelect = installPlainDragSelect(container, terminal, {
+      isEnabled: () => useStore.getState().plainDragSelectEnabled,
+      isMac,
+    });
 
     // Issue #167: keep the hidden IME textarea empty while idle. xterm only
     // clears it on blur, so IME-committed text accumulates there after it was
@@ -1573,22 +1596,48 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // mirrored into the main-side log by src/main/index.ts's console-message
     // listener, so it lands in the file the user can share.
     const deadInputWatchdog = createDeadInputWatchdog({
-      report: ({ keydownCount, keyCodes, codes, spanMs }) => {
+      report: (r) => {
         const active = document.activeElement;
         const activeDesc = active
           ? `${active.tagName.toLowerCase()}.${(active.className || '').toString().slice(0, 40)}`
           : 'null';
         // ptyIdRef.current, not the captured ptyId, so a reconnect that swaps
         // the pty still attributes the log to the live session.
+        //
+        // #1950: the rest of the line tells the remaining causes apart.
+        // mods/stale: the modifier flags the keys carried, and those with no
+        // press of that modifier seen since focus-in (a stale Meta silences
+        // Space and letters in xterm on Windows).
+        // verdict: which branch of our key handler declined the keys (`none`
+        // = handed to xterm). prevented: keys already defaultPrevented when
+        // they got here — xterm's textarea listener is capture-phase and runs
+        // first, so `none` + 0 prevented means xterm encoded no byte at all.
+        // xtermComposing: CompositionHelper's own flags, private API.
         console.warn(
-          `[wmux:dead-input] pty=${ptyIdRef.current} ${keydownCount} keys in ${spanMs}ms reached no onData ` +
-          `keyCodes=[${keyCodes.join(',')}] codes=[${codes.join(',')}] activeElement=${activeDesc}`,
+          `[wmux:dead-input] pty=${ptyIdRef.current} ${r.keydownCount} keys in ${r.spanMs}ms reached no onData ` +
+          `keyCodes=[${r.keyCodes.join(',')}] codes=[${r.codes.join(',')}] activeElement=${activeDesc} ` +
+          `keyKinds=[${r.keyKinds.join(',')}] mods=[${r.mods.join(',')}] stale=[${r.staleMods.join(',')}] ` +
+          `verdict=[${r.verdicts.join(',')}] prevented=${r.defaultPrevented} ` +
+          `xtermComposing=${readXtermCompositionState(terminal)} docFocus=${document.hasFocus() ? 1 : 0}`,
         );
       },
     });
+    const modifierPresses = sharedModifierPressTracker();
+    // The key handler's verdict on the latest keydown (set by the wrapper
+    // around attachCustomKeyEventHandler below), read by the watchdog.
+    let keyVerdict: { event: KeyboardEvent; by: string } | null = null;
     const onWatchdogKeyDown = (e: Event): void => {
       const ke = e as KeyboardEvent;
-      deadInputWatchdog.onKeyDown({ keyCode: ke.keyCode, isComposing: ke.isComposing, code: ke.code });
+      deadInputWatchdog.onKeyDown({
+        keyCode: ke.keyCode,
+        isComposing: ke.isComposing,
+        code: ke.code,
+        key: ke.key,
+        mods: formatModifiers(modifiersOf(ke)),
+        staleMods: modifierPresses.staleModifiers(ke).join('+'),
+        defaultPrevented: ke.defaultPrevented,
+        verdict: keyVerdict?.event === ke ? keyVerdict.by : 'unseen',
+      });
     };
     terminal.textarea?.addEventListener('keydown', onWatchdogKeyDown);
 
@@ -1963,6 +2012,12 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     const seedState = useStore.getState();
     const parkedKnownGone = seedState.agentAliveByPtyId[ptyId] === false
       || seedState.commandRunningByPtyId[ptyId] === false;
+    // The same park→adopt window can hide the agent's death edge from the
+    // prompt-mode guard (subscription below): re-ask on adopt when process
+    // truth already reads it dead. A no-op unless the guard declined a reset.
+    if (adopted && seedState.agentAliveByPtyId[ptyId] === false) {
+      shellPromptModeResetFor(terminal)?.processGone();
+    }
     const keyboardRef = { current: adopted && !parkedKnownGone
       ? parkedKeyboardByTerminal.get(terminal) ?? INITIAL_REMOTE_KEYBOARD_STATE
       : INITIAL_REMOTE_KEYBOARD_STATE };
@@ -2006,6 +2061,25 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         );
       }
     };
+    // Whether xterm encodes keys for this pane right now: the extension is on
+    // for this terminal (an adopted one keeps its own) and the pane's app has
+    // pushed kitty flags. Read per key from xterm itself (see xtermKittyFlags);
+    // the fold above (noteKeyboard) is the fallback if that ever moves.
+    const kittyEncoderOn = terminal.options.vtExtensions?.kittyKeyboard === true;
+    const kittyNegotiated = () => {
+      if (!kittyEncoderOn) return false;
+      const flags = xtermKittyFlags(terminal);
+      return flags === undefined ? keyboardRef.current.kitty : flags > 0;
+    };
+    if (kittyEncoderOn) installKittyPromptReset(terminal);
+    // A Ctrl+letter wmux resolves itself goes out in the form the pane asked
+    // for: kitty `CSI <letter>;5u` once it pushed flags, the C0 byte otherwise.
+    const ctrlLetterForPane = (byte: string) => (kittyNegotiated() ? kittyCtrlLetter(byte) : byte);
+    // Releases of keys whose press never reached xterm (see UnpairedReleaseFilter).
+    const unpairedReleases = new UnpairedReleaseFilter();
+    const clearUnpairedReleases = () => unpairedReleases.clear();
+    terminal.textarea?.addEventListener('blur', clearUnpairedReleases);
+
     // #1228 review (C1): the fold is liveness-scoped. When process-truth or
     // OSC 133 says the pane's foreground command is gone, any negotiation it
     // armed (?9001h / kitty push) is stale — the next app in the pane starts
@@ -2024,6 +2098,29 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       ) {
         keyboardRef.current = INITIAL_REMOTE_KEYBOARD_STATE;
         parkedKeyboardByTerminal.delete(terminal);
+        // xterm keeps the kitty flags a dead app pushed and never popped;
+        // drop them with it so the next app gets legacy keys again.
+        if (kittyEncoderOn) resetXtermKitty(terminal);
+      }
+      // The #1794 prompt-mode guard may have declined a mouse / focus reset
+      // because process truth read the agent alive at the prompt: on Windows
+      // when the CIM tree snapshot failed (low memory) and the agent tracker
+      // had not caught up yet, and on every WSL pane. Its death edge re-asks
+      // the probe. Only the agentAlive edge: it is the tracker's confirmed
+      // death of the watched pid (ProcessMonitor never reads "unknown" as
+      // dead), so it cannot fire while that process lives. The
+      // commandRunning edge is not used: the guard already reads OSC 133
+      // in-stream, and the store copy is a 15 s poll that can predate a TUI
+      // started since. A misattributed pick (a wrapper that exited while its
+      // TUI runs on) gains nothing from the edge: a foreground TUI holds the
+      // pane in the command phase, so the guard only keeps the hint for the
+      // next prompt, and the reset still needs the probe's `true`. On native
+      // Windows that is the tree walk, which still sees the TUI. Where the
+      // tracker is the only truth (POSIX, WSL, a failed CIM snapshot) it is
+      // the same single reading a prompt arriving after the edge already
+      // acts on, so the edge admits nothing the first ask would not.
+      if (gone(state.agentAliveByPtyId[ptyId], prev.agentAliveByPtyId[ptyId])) {
+        shellPromptModeResetFor(terminal)?.processGone();
       }
     });
 
@@ -2044,8 +2141,33 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       }
     };
 
-    // Clipboard + shortcut handling
+    // Clipboard + shortcut handling. The wrapper records, for the
+    // dead-input watchdog only, whether each keydown was handed to xterm and,
+    // if not, roughly why (#1950). It never changes the handler's answer.
+    // Ahead of it, on a kitty-negotiated pane, a keyup whose keydown never
+    // reached xterm's encoder is kept from xterm, so the app gets no release
+    // without a press.
     terminal.attachCustomKeyEventHandler((e) => {
+      if (e.type === 'keyup' && unpairedReleases.swallowsKeyup(e, kittyNegotiated())) return false;
+      const pass = handleTerminalKey(e);
+      if (e.type === 'keydown') {
+        keyVerdict = {
+          event: e,
+          by: pass ? 'none' : describeDeclinedKey(e, {
+            isPressDuplicate: (ev) => shortcutPressGuard.isDuplicate(ev),
+            bindings: currentShortcutBindings(),
+            prefixKeyCode: useStore.getState().prefixConfig.key,
+          }),
+        };
+        unpairedReleases.noteKeydown(e, pass);
+      }
+      return pass;
+    });
+    // Runs only from xterm's key events, after this effect has finished.
+    const handleTerminalKey = (e: KeyboardEvent): boolean => {
+      // xtermjs/xterm.js#6112: under kitty, a key the IME consumes must not
+      // reach xterm's encoder (see imeKeyLeaksUnderKitty).
+      if (imeKeyLeaksUnderKitty(e, kittyNegotiated())) return false;
       if (e.type !== 'keydown') return true;
 
       // The IME's plain-key follow-up of a press already acted on (a
@@ -2084,7 +2206,13 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
           codexEndedAt: codexEndedAtRef.current,
         }),
       });
-      if (newlineByte !== null) {
+      // A pane that pushed kitty flags gets Shift+Enter from xterm's encoder.
+      // Ctrl+Enter / Ctrl+J keep wmux's LF: that is a newline wmux promises,
+      // not a key the app asked to receive encoded.
+      const shiftEnterToXterm = newlineByte !== null && e.shiftKey && !e.ctrlKey
+        && (e.key === 'Enter' || e.code === 'Enter' || e.code === 'NumpadEnter')
+        && xtermEncodesKey(e, kittyNegotiated());
+      if (newlineByte !== null && !shiftEnterToXterm) {
         e.preventDefault();
         // #1361: ordered behind an IME commit that xterm has queued but not
         // yet sent. With no IME in play this runs synchronously, exactly as
@@ -2105,7 +2233,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       //      Escape then does nothing for the rest of the turn (#1152).
       // `!isComposing` (inside isBareEscape) defers to the IME while a
       // candidate window is open, where Escape cancels the preedit.
-      if (isBareEscape(e)) {
+      if (isBareEscape(e) && !xtermEncodesKey(e, kittyNegotiated())) {
         const escapeByte = encodeEscape(keyboardRef.current);
         e.preventDefault();
         window.electronAPI.pty.write(ptyId, escapeByte);
@@ -2138,16 +2266,21 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         // #1227 — xterm encodes Ctrl+letter from keyCode (QWERTY position).
         // Write the logical control byte ourselves so a disabled Ctrl+T on
         // Dvorak still delivers 0x14 instead of whatever physical keyCode says.
+        // A pane that pushed kitty flags gets it from xterm's encoder instead.
+        if (xtermEncodesKey(e, kittyNegotiated())) return true;
         const releasedCtrl = resolveCtrlLetterByte(e);
         if (releasedCtrl) {
           e.preventDefault();
           shortcutPressGuard.noteActed(e);
-          window.electronAPI.pty.write(ptyId, releasedCtrl);
+          window.electronAPI.pty.write(ptyId, ctrlLetterForPane(releasedCtrl));
           noteUserKeystroke(releasedCtrl);
           return false;
         }
         return true;
       }
+      // No paired computer, or a custom keybinding on the chord: the PC rail
+      // does not take it, so the pane gets Shift+Alt+Arrow / Home.
+      if (isPcRailAction(shortcut) && !pcRailClaimsKey(useStore.getState(), e)) return true;
       // #1280 — the Rich Input chord bubbles from HERE, instead of merely
       // being preventDefault'd downstream: xterm's own encode path calls
       // stopPropagation (its `cancel()`), so otherwise the chord never reaches
@@ -2340,16 +2473,19 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // these from keyCode, which is the QWERTY position, so a Dvorak Ctrl+C
       // became Ctrl+I. Write the logical control byte ourselves. App shortcuts
       // and clipboard chords already returned above.
+      // A pane that pushed kitty flags gets these from xterm's encoder, which
+      // names the logical key too (`CSI 99;5u` for Ctrl+C on any layout).
+      if (xtermEncodesKey(e, kittyNegotiated())) return true;
       const ctrlByte = resolveCtrlLetterByte(e);
       if (ctrlByte) {
         e.preventDefault();
-        window.electronAPI.pty.write(ptyId, ctrlByte);
+        window.electronAPI.pty.write(ptyId, ctrlLetterForPane(ctrlByte));
         noteUserKeystroke(ctrlByte);
         return false;
       }
 
       return true;
-    });
+    };
 
     // Right-click behavior (Windows Terminal style):
     //  • On a link → show small context menu (open / copy link)
@@ -2584,6 +2720,9 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // Cold-park reveal: the swap from a painted cold frame to the daemon
     // replay (coldFrame.ts). Idle unless this mount painted one.
     const warmSwap = new WarmFrameSwap();
+    // A cold frame taken at mount whose width the first fit did not match yet
+    // (see the paint below); null once painted, given up, or overtaken by output.
+    let deferredColdFrame: ColdFrame | null = null;
     // Phase 3: settle an in-flight resync when its replay flush completes.
     // The reset goes FIRST, in the stream: the replay bytes were held in the
     // resync buffer (never handed to xterm), so nothing can parse between the
@@ -2624,10 +2763,14 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       terminal.write(REPAINT_BEGIN, () => { shellPromptModeResetFor(terminal)?.reset(); });
       // The scanner labels every held chunk at its source. Historical bytes
       // are muted for their exact parse lifetime; live output is not muted.
-      for (const chunk of st.buffer) {
+      // END goes before an escape sequence the replay ends inside, which the
+      // next live bytes finish (splitTrailingEscape).
+      const held = splitTrailingEscape(st.buffer);
+      for (const chunk of held.complete) {
         writePtyDataImmediately(terminal, chunk, replayMuteRef.current);
       }
       terminal.write(REPAINT_END);
+      if (held.pending) writePtyDataImmediately(terminal, held.pending, replayMuteRef.current);
       if (fromBottom > 0) {
         // Trailing empty write = parse barrier (callbacks fire in write
         // order); scrollToLine only after the recovered screen is parsed and
@@ -2761,6 +2904,11 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       });
 
       removeExitListener = ptyExitDispatcher.register(ptyId, (exitCode) => {
+        // A later resize must not paint a cached live screen over the marker,
+        // and a painted one still waiting for its replay goes now: that
+        // replay's RIS would wipe the marker (coldFrame.ts).
+        deferredColdFrame = null;
+        if (warmSwap.phase === 'warm') { warmSwap.cancel(); writeSwapBytes(FULL_RESET); }
         // Through the scheduler so the exit marker cannot overtake output
         // still queued for this (possibly hidden) pane.
         writeTerminalOutput(terminal, `\r\n${t('terminal.exitedBracket', { code: exitCode })}\r\n`, {
@@ -2788,10 +2936,28 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // scrollbackFile pane raises until first data (same as an adoption).
       fireFirstData();
     }
+    // The first fit runs before the WebGL renderer is in, with the DOM
+    // renderer's measured cell; WebGL then rounds the cell to whole device
+    // pixels and refits. At 125 % scaling an 8.2 px cell becomes 8 px, so a
+    // pane captured at 118 columns mounts at 115 and reaches 118 a frame or
+    // two later, long before the replay. Keep a frame the first fit did not
+    // match and paint it at the first resize to its width, unless PTY output
+    // was routed to this mount first (revealFirstDataLogged) or the attach
+    // settled (the flush listeners drop it).
+    deferredColdFrame = coldFrame !== null && !paintColdFrame && initialFitRan ? coldFrame : null;
+    const deferredColdFrameResize = deferredColdFrame ? terminal.onResize(({ cols }) => {
+      const frame = deferredColdFrame;
+      if (!frame || revealFirstDataLogged || !coldFrameFits(frame, cols)) return;
+      deferredColdFrame = null;
+      terminal.write(frame.frame);
+      warmSwap.painted();
+      fireFirstData();
+      revealTiming(ptyId, 'cold-frame-painted', `${cols}x${terminal.rows}`);
+    }) : null;
     if (isVisibleRef.current) {
       if (!adopted) revealTimingT0.set(ptyId, performance.now());
       else revealTimingT0.delete(ptyId);
-      console.log(`[wmux:reveal-timing] ptyId=${ptyId} stage=mount +0.0ms mode=${adopted ? 'adopted' : 'fresh'} cachedFrame=${paintColdFrame ? 'yes' : coldFrame ? `skipped(${coldFrame.cols}x${coldFrame.rows}->${initialFitRan ? `${terminal.cols}x${terminal.rows}` : 'unfitted'})` : 'no'}`);
+      console.log(`[wmux:reveal-timing] ptyId=${ptyId} stage=mount +0.0ms mode=${adopted ? 'adopted' : 'fresh'} cachedFrame=${paintColdFrame ? 'yes' : coldFrame ? `${deferredColdFrame ? 'deferred' : 'skipped'}(${coldFrame.cols}x${coldFrame.rows}->${initialFitRan ? `${terminal.cols}x${terminal.rows}` : 'unfitted'})` : 'no'}`);
     }
 
     // #1002: an adopted terminal carries its own buffer across the restructure,
@@ -2818,6 +2984,9 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       });
 
       removeExitListener = ptyExitDispatcher.register(ptyId, (exitCode) => {
+        // See the connectPty exit listener.
+        deferredColdFrame = null;
+        if (warmSwap.phase === 'warm') { warmSwap.cancel(); writeSwapBytes(FULL_RESET); }
         writeTerminalOutput(terminal, `\r\n${t('terminal.exitedBracket', { code: exitCode })}\r\n`, {
           foreground: isVisibleRef.current,
           retainWhenHidden: hiddenRetentionActive(),
@@ -2833,6 +3002,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         if (terminalRef.current !== terminal) return;
         revealTiming(ptyId, 'flush-complete', `recoveredBytes=${recoveredBytes} swap=${warmSwap.phase}`);
         revealTimingT0.delete(ptyId);
+        deferredColdFrame = null; // the attach is settled: too late for a cosmetic frame
         if (completeResyncFromFlush(recoveredBytes)) return;
         // Cold-park reveal: close the swap opened in front of the replay
         // (or drop the cached frame when nothing was replayed).
@@ -3007,6 +3177,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         if (terminalRef.current !== terminal) return;
         revealTiming(ptyId, 'flush-complete', `recoveredBytes=${recoveredBytes} swap=${warmSwap.phase}`);
         revealTimingT0.delete(ptyId);
+        deferredColdFrame = null; // the attach is settled: too late for a cosmetic frame
         if (completeResyncFromFlush(recoveredBytes)) return;
         // Cold-park reveal: close the swap opened in front of the replay
         // (or drop the cached frame when nothing was replayed).
@@ -3054,6 +3225,14 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // deadline and return nothing. See parseBarrier.ts.
     const hydrateForRead = async (): Promise<void> => {
       if (terminalRef.current !== terminal) return;
+      // Cold-park reveal: a painted cold frame is minutes old. Let the daemon
+      // replay replace it before the buffer is read (bounded: a lost flush
+      // marker reads the frame, as before).
+      const swapDeadline = performance.now() + COLD_FRAME_READ_WAIT_MS;
+      while (warmSwap.phase !== 'idle' && terminalRef.current === terminal && performance.now() < swapDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      if (terminalRef.current !== terminal) return;
       if (isTerminalDirty(terminal)) {
         await startResync('hydrate-read');
       } else {
@@ -3085,7 +3264,9 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       isMouseOwned: () => {
         const mode = (terminal as unknown as { modes?: { mouseTrackingMode?: string } })
           .modes?.mouseTrackingMode ?? 'none';
-        return mode !== 'none';
+        // #1947: with plain-drag select on, a plain drag selects, so there is
+        // nothing to teach (and on macOS Shift+drag is the way to the app).
+        return mouseOwnedHintApplies(mode, useStore.getState().plainDragSelectEnabled);
       },
       show: showMouseOwnedHintToast,
     });
@@ -3151,6 +3332,11 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         // mount skips its own active-at-mount attempt, so the pane would end up
         // with no session pipe at all.
         : reconnectInFlightRef.current ? 'reconnect-in-flight'
+        // The last reconnect gave up without a session pipe (rate limited, WSL
+        // recovery pending). An adopting mount skips its reconnect and loses
+        // the Retry banner, so it would be stuck unattached; dispose instead
+        // and let the fresh mount reattach.
+        : reconnectPendingRef.current ? 'reconnect-pending'
         // Two live instances on one ptyId (the fast unmount→remount ordering
         // the WebGL pool note describes): if the registry no longer points at
         // us, a later mount already owns this pane and ours is the stale copy.
@@ -3166,6 +3352,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       if (pendingFitRaf !== null) cancelAnimationFrame(pendingFitRaf);
       if (isMac) { container.removeEventListener('paste', blockNativePaste, true); }
       detachAltClickGuard();
+      detachPlainDragSelect();
       detachAltScreenWheel();
       terminal.textarea?.removeEventListener('focus', onTextareaFocus);
       terminal.textarea?.removeEventListener('keydown', onWatchdogKeyDown);
@@ -3237,8 +3424,10 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       const captureFrame = isDaemonModeActive() && !fixedGeometryRef.current && parkRefusal !== 'not-registry-owner';
       // A swap still open would leave an adopting mount (which has its own,
       // idle swap) holding a DEC 2026 frame until xterm's timeout; close it.
-      if (warmSwap.phase === 'open') writeSwapBytes(REPAINT_END);
+      writeSwapBytes(warmSwap.close());
       warmSwap.cancel();
+      deferredColdFrameResize?.dispose();
+      deferredColdFrame = null;
       revealTimingT0.delete(ptyId);
       // Drop any output still queued in the shared scheduler — the terminal
       // is being disposed, parsing the backlog would be wasted work and a
@@ -3281,6 +3470,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         disposeTerminal();
       }
       unsubscribeKeyboardLiveness();
+      terminal.textarea?.removeEventListener('blur', clearUnpairedReleases);
       terminalRef.current = null;
       // #1256: clear the published instance too. On a ptyId re-run the next
       // effect publishes the new instance; on a true unmount React ignores
@@ -3316,13 +3506,27 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // reattaches again. Lives in the effect-run closure so it resets per ptyId.
     let inFlight = false;
     reconnectInFlightRef.current = false;
+    reconnectPendingRef.current = false;
+    // A rate-limited give-up keeps the live session but no daemon:connected is
+    // coming (the daemon never disconnected), so try again on a slow timer
+    // until it attaches or this effect is torn down.
+    let slowRetry: ReturnType<typeof setTimeout> | null = null;
     const reattach = (reason: string) => {
       if (inFlight) return;
       inFlight = true;
       reconnectInFlightRef.current = true;
+      if (slowRetry !== null) { clearTimeout(slowRetry); slowRetry = null; }
       console.log(`[useTerminal] daemon reattach ptyId=${id} (${reason})`);
       revealTiming(id, 'reattach-start', `reason=${reason}`);
-      return reconnectPtyWithRetry(id, () => ptyIdRef.current === id && terminalRef.current !== null, (message, info) => onRecoveryErrorRef.current?.(message, info))
+      return reconnectPtyWithRetry(id, () => ptyIdRef.current === id && terminalRef.current !== null, (message, info) => {
+        // A non-null message means the attempt settled WITHOUT a session pipe
+        // (rate limited, WSL recovery pending); null means it attached.
+        reconnectPendingRef.current = message !== null;
+        if (info?.rateLimited && slowRetry === null) {
+          slowRetry = setTimeout(() => { slowRetry = null; void reattach('rate-limit-retry'); }, 8000 + Math.random() * 4000);
+        }
+        onRecoveryErrorRef.current?.(message, info);
+      })
         .then((stored) => {
           revealTiming(id, 'reattach-resolved');
           // #882 — the daemon starts every managed session at `viewerVisible:
@@ -3400,7 +3604,12 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       }
       reattach('pty:restarted');
     });
-    return () => { retryReconnectRef.current = null; if (off) off(); offRestarted(); };
+    return () => {
+      retryReconnectRef.current = null;
+      if (slowRetry !== null) clearTimeout(slowRetry);
+      if (off) off();
+      offRestarted();
+    };
   }, [ptyId]);
 
   // Apply font/theme changes at runtime without recreating the terminal instance.

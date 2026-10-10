@@ -7,7 +7,9 @@ import path from 'node:path';
 // effect that unit tests cannot mount. The cache and the swap state machine
 // are tested for real in terminal/__tests__/coldFrame.test.ts.
 describe('cold-park reveal — cold frame wiring (source-level)', () => {
-  const src = fs.readFileSync(path.join(__dirname, '..', 'useTerminal.ts'), 'utf-8');
+  // LF only: with core.autocrlf (the Windows default) the checkout is CRLF,
+  // and a `.` in the patterns below does not match the `\r`.
+  const src = fs.readFileSync(path.join(__dirname, '..', 'useTerminal.ts'), 'utf-8').replace(/\r\n/g, '\n');
   const mainStart = src.indexOf('if (!container || !ptyId) return;');
   const mainEnd = src.indexOf('}, [ptyId, containerRef]);', mainStart);
   const mainEffect = src.slice(mainStart, mainEnd);
@@ -52,6 +54,25 @@ describe('cold-park reveal — cold frame wiring (source-level)', () => {
     expect(route).not.toMatch(/warmSwap/);
   });
 
+  it('defers a cached frame the first fit did not match to the first resize at its width', () => {
+    // The first fit runs with the DOM renderer's measured cell; WebGL then
+    // rounds it to whole device pixels and refits (125 %: 115 -> 118 cols).
+    expect(mainEffect).toMatch(/deferredColdFrame = coldFrame !== null && !paintColdFrame && initialFitRan \? coldFrame : null;/);
+    const resize = mainEffect.slice(mainEffect.indexOf('const deferredColdFrameResize'), mainEffect.indexOf('if (isVisibleRef.current) {', mainEffect.indexOf('const deferredColdFrameResize')));
+    expect(resize).toMatch(/terminal\.onResize\(/);
+    // Painted only at the cached width, once, and never after PTY output was
+    // routed to this mount (routePtyData sets revealFirstDataLogged for every
+    // payload, before the resync hold-out and the scheduler).
+    expect(resize).toMatch(/if \(!frame \|\| revealFirstDataLogged \|\| !coldFrameFits\(frame, cols\)\) return;\s*\n\s*deferredColdFrame = null;\s*\n\s*terminal\.write\(frame\.frame\);\s*\n\s*warmSwap\.painted\(\);/);
+    expect(mainEffect).toMatch(/const routePtyData = \(payload: PtyDataPayload\) => \{\s*\n\s*logRevealFirstData\(payload\);/);
+    expect(mainEffect).toMatch(/if \(revealFirstDataLogged\) return;\s*\n\s*revealFirstDataLogged = true;/);
+    // Nor after the attach settled (a flush with nothing replayed must not
+    // leave a cosmetic frame on screen for good), at both flush listeners.
+    expect((mainEffect.match(/revealTimingT0\.delete\(ptyId\);\s*\n\s*deferredColdFrame = null;[^\n]*\n\s*if \(completeResyncFromFlush\(recoveredBytes\)\) return;/g) ?? []).length).toBe(2);
+    // The resize subscription goes with the mount.
+    expect(mainEffect).toMatch(/warmSwap\.cancel\(\);\s*\n\s*deferredColdFrameResize\?\.dispose\(\);\s*\n\s*deferredColdFrame = null;/);
+  });
+
   it('closes the swap at both flush-complete listeners, after resync settlement', () => {
     const closes = mainEffect.match(/if \(completeResyncFromFlush\(recoveredBytes\)\) return;\s*\n(?:\s*\/\/.*\n)*\s*writeSwapBytes\(warmSwap\.onFlush\(recoveredBytes\)\);/g) ?? [];
     expect(closes).toHaveLength(2);
@@ -71,7 +92,27 @@ describe('cold-park reveal — cold frame wiring (source-level)', () => {
   });
 
   it('closes an open swap on teardown so an adopting mount is not left holding a 2026 frame', () => {
-    expect(mainEffect).toMatch(/if \(warmSwap\.phase === 'open'\) writeSwapBytes\(REPAINT_END\);\s*\n\s*warmSwap\.cancel\(\);/);
+    expect(mainEffect).toMatch(/writeSwapBytes\(warmSwap\.close\(\)\);\s*\n\s*warmSwap\.cancel\(\);/);
+  });
+
+  it('a resync settlement writes END before the escape sequence its replay ends inside', () => {
+    const flush = mainEffect.slice(mainEffect.indexOf('const completeResyncFromFlush'));
+    expect(flush).toMatch(/const held = splitTrailingEscape\(st\.buffer\);\s*\n\s*for \(const chunk of held\.complete\) \{\s*\n\s*writePtyDataImmediately\(terminal, chunk, replayMuteRef\.current\);\s*\n\s*\}\s*\n\s*terminal\.write\(REPAINT_END\);\s*\n\s*if \(held\.pending\) writePtyDataImmediately\(terminal, held\.pending, replayMuteRef\.current\);/);
+  });
+
+  it('forgets a deferred cold frame when the PTY exits, at both exit listeners', () => {
+    const exits = mainEffect.match(/removeExitListener = ptyExitDispatcher\.register\(ptyId, \(exitCode\) => \{\s*\n(?:\s*\/\/.*\n)*\s*deferredColdFrame = null;/g) ?? [];
+    expect(exits).toHaveLength(2);
+    // A painted frame still waiting for its replay is dropped before the
+    // marker, so that replay's RIS cannot wipe the marker.
+    const drops = mainEffect.match(/deferredColdFrame = null;\s*\n\s*if \(warmSwap\.phase === 'warm'\) \{ warmSwap\.cancel\(\); writeSwapBytes\(FULL_RESET\); \}\s*\n(?:\s*\/\/.*\n)*\s*writeTerminalOutput\(terminal, `\\r\\n\$\{t\('terminal\.exitedBracket'/g) ?? [];
+    expect(drops).toHaveLength(2);
+  });
+
+  it('a read waits (bounded) for a painted cold frame to be swapped out', () => {
+    const hydrate = mainEffect.slice(mainEffect.indexOf('const hydrateForRead'), mainEffect.indexOf('const parsed = await awaitParseBarrier(terminal);'));
+    expect(hydrate).toMatch(/while \(warmSwap\.phase !== 'idle' && terminalRef\.current === terminal && performance\.now\(\) < swapDeadline\)/);
+    expect(hydrate.indexOf('swapDeadline')).toBeLessThan(hydrate.indexOf('isTerminalDirty(terminal)'));
   });
 
   it('drops a cached frame when its PTY exits, through the single exit subscription', () => {

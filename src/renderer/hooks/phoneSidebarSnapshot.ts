@@ -23,6 +23,8 @@
 //                   tab order, active tab) and `activePaneId`
 //   - HQ / moa:     `state.moa` (main's Moa state), as `isMoaHqWorkspace`
 //                   reads it
+//   - moaWakeBlocked: the HQ workspace's agent mode (DECK_MODE_GET), passed
+//                   in by the caller: `off` refuses every brain turn there
 //   - moaHandoff:   main's pending decisions (DECK_MOA_DECISIONS), passed in
 //                   by the caller: a pending hand-off card in that slot
 //   - moaDelegations: Fleet's own tickets (`buildFleetTickets` over main's
@@ -53,8 +55,18 @@ import {
   type PhoneSidebarPane,
   type PhoneSidebarSnapshot,
   type PhoneSidebarWorkspace,
+  type PhoneFleetTicket,
   type SidebarDropReporter,
 } from '../../shared/phoneFleetSidebar';
+import {
+  PHONE_FLEET_TICKET_DETAIL_LIMITS,
+  PHONE_FLEET_TICKET_DETAILS_KEY,
+  clampTicketText,
+  firstTicketLine,
+  type PhoneFleetTicketDetail,
+  type PhoneFleetTicketVerificationItem,
+} from '../../shared/phoneFleetTickets';
+import { selectScheduleNavSummary } from '../stores/selectors/schedules';
 import type { Pane, Surface } from '../../shared/types';
 import type { MoaPendingDecision } from '../../shared/moa';
 import { HANDOFF_OPTIONS } from '../../shared/moaHandoff';
@@ -67,6 +79,7 @@ import { selectWorkspaceAgentRoster, agentSurfaceTitle } from '../stores/selecto
 import { isTaskReadyForReview } from '../stores/selectors/reviewQueue';
 import { buildFleetTickets, type FleetTicket } from '../components/FleetView/fleetTickets';
 import type { WorkLink } from '../../shared/workLink';
+import type { AgentMode } from '../../main/deck/deckAutonomyStore';
 import { agentSlugToDisplay, isAgentSlug } from '../../shared/agentIdentity';
 
 function nonEmpty(value: string | undefined): string | undefined {
@@ -235,6 +248,89 @@ export function projectMoaDelegations(
   return out.sort((a, b) => b.since - a.since).slice(0, PHONE_SIDEBAR_LIMITS.moaDelegations);
 }
 
+/** A finished task's evidence items, each made one safe bounded line. */
+function verificationItemsOf(state: StoreState, taskId: string | undefined): PhoneFleetTicketVerificationItem[] {
+  const items = taskId ? state.a2aTasks?.[taskId]?.status.evidence?.items : undefined;
+  if (!Array.isArray(items)) return [];
+  const max = PHONE_FLEET_TICKET_DETAIL_LIMITS.itemText;
+  const out: PhoneFleetTicketVerificationItem[] = [];
+  for (const item of items.slice(0, PHONE_FLEET_TICKET_DETAIL_LIMITS.items)) {
+    const summary = clampSidebarString(item.summary, max);
+    if (!summary) continue;
+    if (item.kind === 'command') {
+      const command = clampSidebarString(item.command, max);
+      out.push({ kind: 'command', status: item.status, summary, ...(command ? { command } : {}) });
+    } else {
+      const location = clampSidebarString(item.location, max);
+      out.push({ kind: item.kind, status: item.status, summary, ...(location ? { location } : {}) });
+    }
+  }
+  return out;
+}
+
+/**
+ * Every Fleet ticket for the phone, in the desktop's order (needs-you first,
+ * then newest), bounded; and, for the same tickets, the full request, report
+ * and evidence main keeps for the detail route. Agent-authored text is
+ * projected here unconditionally: the daemon applies `--allow-transcript`.
+ */
+export function projectFleetTickets(
+  state: StoreState,
+  links: readonly WorkLink[],
+  decisions: readonly MoaPendingDecision[],
+  now: number,
+): { tickets: PhoneFleetTicket[]; details: PhoneFleetTicketDetail[] } {
+  const L = PHONE_SIDEBAR_LIMITS;
+  const tickets: PhoneFleetTicket[] = [];
+  const details: PhoneFleetTicketDetail[] = [];
+  for (const ticket of buildFleetTickets({ links, decisions, a2aTasks: state.a2aTasks ?? {}, now })) {
+    if (tickets.length >= L.fleetTickets) break;
+    if (!isSidebarId(ticket.id) || !isSidebarId(ticket.workspaceId)) continue;
+    if (!Number.isSafeInteger(ticket.updatedAt) || ticket.updatedAt <= 0) continue;
+    // A hand-off card names its agent itself; a job names the pane's agent
+    // when exactly one is in scope, else the link's slug.
+    const pty = ticket.origin === 'handoff' ? undefined : delegatedPty(state, ticket);
+    const paneAgent = pty !== undefined ? state.surfaceAgent?.[pty]?.name : undefined;
+    const agentName = clampSidebarString(
+      paneAgent ?? (isAgentSlug(ticket.agent) ? agentSlugToDisplay(ticket.agent) : ticket.agent),
+      L.fleetTicketAgentName,
+    );
+    const workspaceName = clampSidebarString(state.workspaces.find((w) => w.id === ticket.workspaceId)?.name, L.fleetTicketWorkspaceName);
+    const requestLine = firstTicketLine(ticket.request, L.fleetTicketRequestLine);
+    const resultSummary = firstTicketLine(ticket.result?.summary, L.fleetTicketResultSummary);
+    const verification = ticket.result?.verification;
+    tickets.push({
+      id: ticket.id,
+      ...(isSidebarId(ticket.a2aTaskId) ? { taskId: ticket.a2aTaskId } : {}),
+      origin: ticket.origin,
+      workspaceId: ticket.workspaceId,
+      ...(workspaceName ? { workspaceName } : {}),
+      ...(agentName ? { agentName } : {}),
+      title: clampSidebarString(ticket.title, L.fleetTicketTitle) ?? 'Untitled task',
+      state: ticket.state,
+      updatedAt: ticket.updatedAt,
+      ...(requestLine ? { requestLine } : {}),
+      ...(resultSummary ? { resultSummary } : {}),
+      ...(verification ? { verification } : {}),
+    });
+    const request = clampTicketText(ticket.request);
+    const result = clampTicketText(ticket.result?.summary);
+    const items = verificationItemsOf(state, ticket.a2aTaskId);
+    details.push({
+      id: ticket.id,
+      updatedAt: ticket.updatedAt,
+      ...(request ? { request } : {}),
+      ...(result ? { result } : {}),
+      ...(verification ? { verification } : {}),
+      ...(items.length > 0 ? { verificationItems: items } : {}),
+    });
+  }
+  return { tickets, details };
+}
+
+/** The snapshot plus the ticket details main keeps and strips (never forwarded). */
+export type PhoneSidebarReply = PhoneSidebarSnapshot & { [PHONE_FLEET_TICKET_DETAILS_KEY]?: PhoneFleetTicketDetail[] };
+
 /**
  * One bad workspace, task record or pane never costs the whole snapshot: each
  * part is projected on its own, and a part that throws is left out and
@@ -245,7 +341,8 @@ export function buildPhoneSidebarSnapshot(
   onDrop: SidebarDropReporter = () => undefined,
   moaDecisions?: readonly MoaPendingDecision[],
   workLinks?: { links: readonly WorkLink[]; now: number },
-): PhoneSidebarSnapshot {
+  hqMode?: { workspaceId: string; mode: AgentMode },
+): PhoneSidebarReply {
   const workspaces = state.workspaces;
   let handoffs = new Map<string, PhoneSidebarMoaHandoff>();
   try {
@@ -421,7 +518,27 @@ export function buildPhoneSidebarSnapshot(
     }
   }
 
+  // Same inputs and the same rule as moaDelegations.
+  let fleet: ReturnType<typeof projectFleetTickets> | undefined;
+  if (workLinks && moaDecisions) {
+    try {
+      fleet = projectFleetTickets(state, workLinks.links, moaDecisions, workLinks.now);
+    } catch {
+      onDrop('fleetTickets');
+    }
+  }
+  let nextScheduleAt: number | undefined;
+  try {
+    const next = selectScheduleNavSummary(state).nextRunAt;
+    if (next !== null && Number.isSafeInteger(next) && next > 0) nextScheduleAt = next;
+  } catch {
+    onDrop('nextScheduleAt');
+  }
+
   const moaOn = state.moa?.config.enabled === true && state.moa.hq.state === 'ok' && hqWorkspaceId !== undefined && liveIds.has(hqWorkspaceId);
+  // A wake would end 409 `moa-mode-off`: say so only for the HQ this snapshot
+  // names, and only on a mode main actually answered (no read → no claim).
+  const wakeBlocked = moaOn && hqMode?.workspaceId === hqWorkspaceId && hqMode.mode === 'off';
 
   return {
     activeWorkspaceId: state.activeWorkspaceId && liveIds.has(state.activeWorkspaceId) ? state.activeWorkspaceId : null,
@@ -429,6 +546,9 @@ export function buildPhoneSidebarSnapshot(
     panes: paneRows,
     ...(hqWorkspaceId !== undefined ? { hqWorkspaceId } : {}),
     ...(moaOn ? { moa: true as const } : {}),
+    ...(wakeBlocked ? { moaWakeBlocked: 'moa-mode-off' as const } : {}),
     ...(moaDelegations ? { moaDelegations } : {}),
+    ...(fleet ? { fleetTickets: fleet.tickets, [PHONE_FLEET_TICKET_DETAILS_KEY]: fleet.details } : {}),
+    ...(nextScheduleAt !== undefined ? { nextScheduleAt } : {}),
   };
 }

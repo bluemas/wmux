@@ -35,7 +35,9 @@ import {
 } from '../../../shared/browserReplay/promotedSkill';
 import { normalizeUrlKey, stepsFingerprint } from '../../../shared/browserReplay/actionTrace';
 import { HumanBehavior } from '../../browser-session/HumanBehavior';
-import { surfaceOpeners } from '../../browser-session/SurfaceOpeners';
+import { surfaceOpeners, type OpenerCaller } from '../../browser-session/SurfaceOpeners';
+import { resolvePaneForPty } from '../../workspace/ptyOwnership';
+import { PANE_PROFILE_UNRESOLVED_CODE } from '../../../shared/chromePaneBinding';
 import { approachPath, defaultStartPoint, type Point } from '../../../shared/pointerPath';
 import {
   dispatchTouchDrag,
@@ -79,6 +81,7 @@ const DEVICE_PROBE_EXPRESSION =
   + ' touch: navigator.maxTouchPoints })';
 import { refererFor } from '../../../shared/referer';
 import { buildUserAgentOverride } from '../../../shared/uaMetadata';
+import { PRIVATE_BROWSER_PARTITION } from '../../../shared/privateBrowser';
 import { WebviewCdpManager } from '../../browser-session/WebviewCdpManager';
 import { BrowserCaptureManager } from '../../browser-session/BrowserCaptureManager';
 import { validateResolvedNavigationUrl } from '../../security/navigationPolicy';
@@ -96,7 +99,7 @@ import {
   CHROME_BACKEND_RPC_UNSUPPORTED_MESSAGE,
   type ExternalOpenResult,
 } from '../../../shared/browserBackend';
-import type { RpcContext, RpcMethod } from '../../../shared/rpc';
+import { isHostedCaller, type RpcContext, type RpcMethod } from '../../../shared/rpc';
 import type {
   BrowserScopeShadowInput,
   BrowserScopeShadowReason,
@@ -149,13 +152,15 @@ export function canDiscloseBrowserAttachInfo(ctx: RpcContext | undefined): boole
 export type BrowserCallerScopeDecision =
   | {
       kind: 'allowed';
-      lane: 'operator' | 'legacy';
+      lane: 'operator';
       workspaceId?: string;
     }
   | {
       kind: 'scoped';
-      lane: 'pinned' | 'hosted' | 'verified' | 'declared';
+      lane: 'pinned' | 'hosted' | 'verified';
       workspaceId: string;
+      /** The caller's pane, when its claim attests one (a pane claim). */
+      ptyId?: string;
     }
   | {
       kind: 'rejected';
@@ -171,6 +176,22 @@ function requestedWorkspaceId(params: Record<string, unknown>): string | undefin
   return typeof params['workspaceId'] === 'string' && params['workspaceId'].length > 0
     ? params['workspaceId']
     : undefined;
+}
+
+/**
+ * The caller's pane for pane-level choices (its Chrome profile, the opener
+ * record): only a pane main attested — a pane claim's `ptyId`. The envelope's
+ * `callerPtyId` is not verified, so it counts only for the in-process lanes
+ * (the operator and an iframe plugin), which have no wire envelope to set it.
+ * A wire caller without an attested pane (a workspace claim from
+ * `mcp.claimWorkspace`, a commander token) gets none, and the workspace's
+ * profile policy applies to it.
+ */
+export function callerPaneOf(ctx: RpcContext | undefined): string | undefined {
+  const claim = ctx?.workspaceClaim;
+  if (claim?.kind === 'bound' && claim.ptyId) return claim.ptyId;
+  if (ctx?.operator === true || isHostedCaller(ctx)) return ctx?.callerPtyId;
+  return undefined;
 }
 
 /**
@@ -259,16 +280,15 @@ function requestedWorkspaceId(params: Record<string, unknown>): string | undefin
  *           because closing it belongs to the shared grandfather deprecation
  *           with `PermissionEnforcer` (#1111), not to this table. Narrowing the
  *           scope without touching the allow keeps one clock, not two.
- *   OPEN    the `declared` lane still checks that `workspaceId` is PRESENT, not
- *           that it is the caller's own, for a wire caller that never claimed.
- *           Nothing binds a bare clientName to a workspace, and the name is
- *           self-asserted, so binding to it would be no stronger than the
- *           capability check that already keys on it.
- *   CLOSED  the `legacy` lane, at the gate rather than here: #1111 closed
- *           `PermissionEnforcer`'s grandfather, so under enforce mode an
- *           envelope-less wire caller is refused before it reaches this table.
- *           The lane below remains for shadow mode (the dev default), where
- *           the handler still runs after the rejection is logged.
+ *   requires (phase 0 of the per-workspace browser backend) every lane
+ *           to derive the workspace from an identity main recorded: the
+ *           validated commander token, the plugin host's binding, or a claim
+ *           token — which the pane MCP obtains from the server-side PID-map
+ *           walk. A request's `workspaceId` only NARROWS one of those (a
+ *           mismatch is refused); it never names the scope by itself. A wire
+ *           caller with none of them (formerly the `declared` lane) and an
+ *           envelope-less one (formerly `legacy` naming a workspace) are
+ *           refused, in both `mcp.mode`s — see `scopeFor`.
  *
  * The hosted lane closes one caller CLASS, not the general problem: it works
  * only because the plugin host derives both halves of the identity itself. The
@@ -426,37 +446,32 @@ export function callerScope(
         verifiedWorkspaceId,
       };
     }
-    return { kind: 'scoped', lane: 'verified', workspaceId: verifiedWorkspaceId };
+    return {
+      kind: 'scoped',
+      lane: 'verified',
+      workspaceId: verifiedWorkspaceId,
+      ...(ctx.workspaceClaim.ptyId && { ptyId: ctx.workspaceClaim.ptyId }),
+    };
   }
 
-  // #922 (c) — the legacy lane: a caller with no identity envelope is still
-  // scoped here as it always was. Closing the lane was `PermissionEnforcer`'s
-  // job, not this table's, and #1111 did it at the gate — under enforce mode
-  // such a caller no longer gets this far; in shadow mode it still does.
-  // What #922 changed here is only the OMITTED case. A legacy caller that names a
-  // workspace is unchanged, byte for byte — it was already scoped to what it
-  // named. One that names nothing used to reach the workspace-blind "first
-  // registered surface" lookup and get whichever surface happened to register
-  // first; that is what is refused now, with the one refusal message an
-  // unidentified caller can act on.
+  // No identity main recorded. The workspace is derived only from the
+  // verified connection or claim above, so a `workspaceId` in the request
+  // cannot stand in for one: it is recorded for the audit log and the call is
+  // refused. A caller with no identity envelope at all (#1111 refuses it at the
+  // gate under enforce mode) gets the same answer here in either mode.
   if (!ctx.clientName) {
-    if (requested) {
-      return { kind: 'allowed', lane: 'legacy', workspaceId: requested };
-    }
     return {
       kind: 'rejected',
       lane: 'legacy',
       reason: 'legacy-workspace-unresolved',
+      ...(requested && { requestedWorkspaceId: requested }),
     };
   }
-  if (requested) {
-    return { kind: 'scoped', lane: 'declared', workspaceId: requested };
-  }
-
   return {
     kind: 'rejected',
     lane: 'declared',
     reason: 'workspace-unresolved',
+    ...(requested && { requestedWorkspaceId: requested }),
   };
 }
 
@@ -725,15 +740,20 @@ const SCOPE_REFUSAL_REMEDY: Record<BrowserScopeShadowReason, string> = {
   'verified-workspace-mismatch':
     'omit workspaceId and this resolves to the workspace you claimed',
   'verified-claim-stale':
-    'the workspace you claimed is gone; call mcp.claimWorkspace again to get a new one',
-  // The one refusal an UNIDENTIFIED caller can receive, so it is the one that
-  // has to teach rather than just refuse: whoever reads it built against the
-  // documented envelope-less path and has no plugin identity to look up.
+    'the workspace you claimed is gone; the wmux MCP server claims again on its next call, ' +
+    'otherwise call mcp.claimWorkspace again to get a new one',
+  // The two refusals a caller without a recorded identity receives, so they
+  // have to teach rather than just refuse: a workspaceId in the params is not
+  // enough on its own, and the message says what is.
   'legacy-workspace-unresolved':
-    'name the workspace this call belongs to — send workspaceId in the params. ' +
-    'workspace.current returns the one you are in; workspace.list returns every id',
+    'browser calls act on the workspace wmux verifies for the caller, and this call carries no ' +
+    'identity envelope. Call from the wmux MCP server inside a wmux pane, or claim a workspace ' +
+    'with mcp.claimWorkspace',
   'workspace-unresolved':
-    'send the workspaceId of the workspace you are calling from',
+    'browser calls act on the workspace wmux verifies for the caller, and this call carries no ' +
+    'verified workspace (a workspaceId in the params only narrows one). Call from the wmux MCP ' +
+    'server inside a wmux pane, or claim a workspace with mcp.claimWorkspace. An agent started ' +
+    'before wmux was updated still runs the older wmux MCP server: restart that agent',
 };
 
 export function scopeRefusalError(
@@ -752,11 +772,11 @@ export function registerBrowserRpc(
   webviewCdpManager: WebviewCdpManager,
   backendStore?: BrowserBackendStore,
   browserScopeShadowSink?: (input: BrowserScopeShadowInput) => void,
-  // `mcp.mode` is resolved above this registration in main/index.ts; the getter
-  // reads it lazily per call so the two never have to stay adjacent. Defaults
-  // to shadow, so a caller that forgets to wire it keeps observing rather than
-  // silently starting to refuse traffic.
-  getEnforcementMode: () => EnforcementMode = () => 'shadow',
+  // `mcp.mode` getter. Kept in the signature for the existing wiring, but the
+  // browser scope no longer reads it: the workspace comes from the verified
+  // identity in both modes (see `scopeFor`).
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  _getEnforcementMode: () => EnforcementMode = () => 'shadow',
   // 'chrome' backend (Phase 2/2.5): per-profile real-Chrome instances behind
   // a workspace-binding registry. Optional so older wirings/tests keep
   // working; chrome-mode calls without it fail with a clear message.
@@ -800,15 +820,93 @@ export function registerBrowserRpc(
   // generic target-miss, never a silent fallback onto another builtin surface.
   const backend = () => backendStore?.get() ?? 'builtin';
 
-  // Resolves the CALLING workspace's launcher (binding ?? 'default') — the
-  // binding is user-set from the workspace card, never agent-selectable, so
-  // workspace 1 drives its own signed-in Chrome and workspace 2 its own.
-  const requireChrome = (method: string, workspaceId: string | undefined): ChromeBackendClient => {
+  // ── Which Chrome a call drives (the ONE resolution point) ───────────────
+  //
+  // The CALLING pane's profile when it has one, else its workspace's binding,
+  // else 'default'. Every binding is user-set (workspace card, pane menu) and
+  // never agent-selectable, so pane 1 drives its own signed-in Chrome and pane
+  // 2 its own. Handlers resolve once per call and pass the result down; none
+  // of them reads the registry's bindings on its own.
+  //
+  // The pane is looked up only when the workspace HAS pane bindings, so every
+  // other workspace pays nothing. When it does and the caller's pane cannot be
+  // identified, the call is refused rather than run in the workspace profile:
+  // that would post, buy or message as a different account than the pane was
+  // bound to.
+
+  interface ChromeProfileChoice {
+    profile: string;
+    /** The profile is the calling pane's exclusive one (R4 opener rule). */
+    paneBound: boolean;
+    callerPtyId?: string;
+  }
+  interface ChromeCaller extends ChromeProfileChoice {
+    client: ChromeBackendClient;
+  }
+
+  /** The profile only — creates no launcher, so status probes can use it. */
+  const resolveChromeProfile = async (
+    method: string,
+    ctx: RpcContext | undefined,
+    workspaceId: string | undefined,
+  ): Promise<ChromeProfileChoice> => {
     if (!chromeRegistry) {
       throw new Error(`${method}: browser backend is 'chrome' but no Chrome launcher is wired in this build.`);
     }
-    return chromeRegistry.forWorkspace(workspaceId);
+    const callerPtyId = callerPaneOf(ctx);
+    // The human at the UI (operator lane) and an approved in-process plugin
+    // (hosted lane) are not any pane's agent: with no PTY to speak for, they
+    // act in the workspace's profile. Only wire callers fail closed below.
+    const inProcessWithoutPane = (ctx?.operator === true || isHostedCaller(ctx)) && !callerPtyId;
+    if (!workspaceId || inProcessWithoutPane || !chromeRegistry.hasPaneBindings(workspaceId)) {
+      return { profile: chromeRegistry.profileFor(workspaceId), paneBound: false, ...(callerPtyId && { callerPtyId }) };
+    }
+    let paneId: string | null = null;
+    if (callerPtyId) {
+      try {
+        paneId = await resolvePaneForPty(getWindow, callerPtyId, workspaceId);
+      } catch {
+        paneId = null; // renderer gone: unidentified, same as a miss
+      }
+    }
+    if (!paneId) {
+      throw new Error(
+        `${method}: ${PANE_PROFILE_UNRESOLVED_CODE}: panes in this workspace have their own Chrome ` +
+          'profiles, and the calling pane could not be identified, so no browser was used. Run the ' +
+          'agent from a wmux pane terminal. Do not retry unchanged.',
+      );
+    }
+    const profile = chromeRegistry.profileFor(workspaceId, paneId);
+    return { profile, paneBound: chromeRegistry.isPaneBound(profile), callerPtyId };
   };
+
+  const resolveChromeClient = async (
+    method: string,
+    ctx: RpcContext | undefined,
+    workspaceId: string | undefined,
+  ): Promise<ChromeCaller> => {
+    const choice = await resolveChromeProfile(method, ctx, workspaceId);
+    // resolveChromeProfile threw already when no registry is wired.
+    return { ...choice, client: (chromeRegistry as ChromeLauncherRegistry).forProfile(choice.profile) };
+  };
+
+  /** A per-call memo of `resolveChromeClient`: the write gate and the handler
+   *  share one resolution, and a call that never needs Chrome pays nothing. */
+  const chromeCallerOf = (
+    method: string,
+    ctx: RpcContext | undefined,
+    workspaceId: string | undefined,
+  ): (() => Promise<ChromeCaller>) => {
+    let pending: Promise<ChromeCaller> | null = null;
+    return () => (pending ??= resolveChromeClient(method, ctx, workspaceId));
+  };
+
+  /** The opener-verdict view of a resolved caller. */
+  const openerCaller = (openerKey: string | undefined, chrome?: ChromeProfileChoice): OpenerCaller => ({
+    ...(openerKey && { openerKey }),
+    ...(chrome?.callerPtyId && { ptyId: chrome.callerPtyId }),
+    ...(chrome?.paneBound && { paneBound: true }),
+  });
 
   // -- Live-Chrome agent window (write scope) --------------------------------
   //
@@ -831,11 +929,13 @@ export function registerBrowserRpc(
    *
    * Resolving the client is what decides live-vs-dedicated — `writeScope` exists
    * only on LiveChromeClient — so this never has to know about profile names.
+   * The client is the caller's RESOLVED one: a pane bound to a dedicated
+   * profile inside a live-bound workspace drives its own Chrome, where the
+   * live policy has nothing to say.
    */
-  const liveWritePolicy = (workspaceId: string | undefined) => {
-    if (backend() !== 'chrome' || !chromeRegistry) return null;
+  const liveWritePolicy = (client: ChromeBackendClient) => {
     if (liveWriteScopeSetting() !== 'agent') return null;
-    return chromeRegistry.forWorkspace(workspaceId).writeScope ?? null;
+    return client.writeScope ?? null;
   };
 
   /** Who owns a live tab, for the reply rows. 'agent' on every other backend:
@@ -856,11 +956,12 @@ export function registerBrowserRpc(
    * a tab wmux just opened is agent-owned. The MCP lane's default pin comes from
    * browser.cdp.info, which lists owned and lent tabs only.
    */
-  const guardLiveWrite = (
+  const guardLiveWrite = async (
     method: string,
     params: Record<string, unknown>,
     scope: string | undefined,
-  ): void => {
+    chrome: () => Promise<ChromeCaller>,
+  ): Promise<void> => {
     if (!LIVE_WRITE_RPC_METHODS.has(method)) return;
     const surfaceId = typeof params['surfaceId'] === 'string' ? params['surfaceId'] : '';
     if (!surfaceId) return;
@@ -868,8 +969,10 @@ export function registerBrowserRpc(
     // in the write set for the latter; letting the read through keeps live
     // reads exactly as open as they were.
     if (method === 'browser.cookies' && params['action'] === 'get') return;
-    const policy = liveWritePolicy(scope);
-    if (!policy) return;
+    // Every cheap exit runs before the client is resolved, so a call this gate
+    // has nothing to say about never pays for a pane lookup.
+    if (backend() !== 'chrome' || !chromeRegistry) return;
+    if (liveWriteScopeSetting() !== 'agent') return;
     // MIXED MODE: a manually opened builtin pane still exists under the chrome
     // backend, and its surface is not a live Chrome tab at all — the live policy
     // has nothing to say about it, and refusing it would break a pane the user
@@ -882,6 +985,8 @@ export function registerBrowserRpc(
     ) {
       return;
     }
+    const policy = liveWritePolicy((await chrome()).client);
+    if (!policy) return;
     if (policy.ownerOf(surfaceId, scope) !== 'user') return;
     throw new Error(agentWindowScopeMessage(method, surfaceId));
   };
@@ -898,11 +1003,13 @@ export function registerBrowserRpc(
    */
   const withOpener = (
     surfaceId: string,
-    callerKey: string | undefined,
+    caller: OpenerCaller | string | undefined,
   ): { opener?: 'mine' | 'other' } => {
-    const owner = surfaceOpeners.get(surfaceId);
-    if (!owner) return {};
-    return { opener: callerKey && owner === callerKey ? 'mine' : 'other' };
+    const verdict = surfaceOpeners.verdict(
+      surfaceId,
+      typeof caller === 'string' ? { openerKey: caller } : (caller ?? {}),
+    );
+    return verdict ? { opener: verdict } : {};
   };
 
   /**
@@ -920,10 +1027,8 @@ export function registerBrowserRpc(
   };
 
   /** Is this surface free for the asking caller to claim? */
-  const isUnclaimedBy = (surfaceId: string, callerKey: string): boolean => {
-    const owner = surfaceOpeners.get(surfaceId);
-    return owner === undefined || owner === callerKey;
-  };
+  const isUnclaimedBy = (surfaceId: string, caller: OpenerCaller | string): boolean =>
+    surfaceOpeners.verdict(surfaceId, typeof caller === 'string' ? { openerKey: caller } : caller) !== 'other';
 
   /**
    * Stamp openers onto a builtin `browser.tabs` reply, and record the opener of
@@ -986,13 +1091,14 @@ export function registerBrowserRpc(
   const reusableBuiltinSurface = async (
     workspaceId: string,
     callerKey: string,
+    wantPrivate: boolean,
   ): Promise<
     | { kind: 'mine'; surfaceId: string; url: string; first: boolean }
     | { kind: 'empty' }
     | { kind: 'blocked' }
   > => {
     let listed:
-      | { ok?: unknown; action?: unknown; tabs?: Array<{ surfaceId?: unknown; url?: unknown }> }
+      | { ok?: unknown; action?: unknown; tabs?: Array<{ surfaceId?: unknown; url?: unknown; private?: unknown }> }
       | undefined;
     try {
       listed = (await sendToRenderer(getWindow, 'browser.tabs', {
@@ -1005,8 +1111,13 @@ export function registerBrowserRpc(
     if (listed?.ok !== true || listed.action !== 'list' || !Array.isArray(listed.tabs)) {
       return { kind: 'blocked' };
     }
+    // Only tabs of the requested kind are candidates: a private open never
+    // reuses a normal tab and a normal open never reuses a private one — the
+    // same split the renderer's own reuse makes, so `first` still means "the
+    // one the renderer would pick".
     const tabs = listed.tabs.filter(
-      (tab): tab is { surfaceId: string; url?: unknown } => typeof tab?.surfaceId === 'string',
+      (tab): tab is { surfaceId: string; url?: unknown } =>
+        typeof tab?.surfaceId === 'string' && (tab.private === true) === wantPrivate,
     );
     if (tabs.length === 0) return { kind: 'empty' };
     const index = tabs.findIndex((tab) => isUnclaimedBy(tab.surfaceId, callerKey));
@@ -1025,14 +1136,14 @@ export function registerBrowserRpc(
    *  Chrome may swap under the tab at any time). */
   const chromeTabDescriptor = (
     t: { surfaceId: string; url: string; title?: string; owner?: LiveTabOwner },
-    callerKey?: string,
+    caller?: OpenerCaller,
   ) => ({
     surfaceId: t.surfaceId,
     paneId: `chrome:${t.surfaceId}`,
     url: t.url,
     title: t.title ?? '',
     selected: false,
-    ...withOpener(t.surfaceId, callerKey),
+    ...withOpener(t.surfaceId, caller),
     // Live only: whether this workspace may WRITE to the tab. `opener` above is
     // about the calling CONNECTION and is only ever a routing default; this one
     // is the permission, and the two disagree often (an agent's own tab opened
@@ -1083,38 +1194,26 @@ export function registerBrowserRpc(
    * The single place a target-resolving browser handler learns which workspace
    * to look a surface up in.
    *
-   * Both modes audit the same decision. They differ in what the caller gets:
-   *
    *        callerScope(ctx, params)
    *                 │
    *      ┌──────────┴────────────┐
    *   rejected                 allowed / scoped
    *      │                        │
-   *   audit-log                   │
-   *      │                        │
-   *      ├─ enforce ─► throw      ├─ enforce ─► decision.workspaceId
-   *      │   (terminal: no        │              (the pinned lane returns the
-   *      │    lookup, wake,       │               TOKEN binding, which is the
-   *      │    lease, or URL       │               point — it may differ from
-   *      │    validation runs)    │               what the caller asked for)
-   *      │                        │
-   *      └─ shadow ──────────────►┴─ shadow ──► requestedWorkspaceId(params)
+   *   audit-log                   └─► decision.workspaceId
+   *      │                            (the verified binding — the pinned,
+   *      └─► throw                     hosted or claim workspace — never the
+   *          (no lookup, wake,         request's own field)
+   *          lease, or URL
+   *          validation runs)
    *
-   * Shadow returns the request-derived workspace on EVERY lane, refused or not.
-   * That is deliberate and load-bearing: shadow is the rollback, so it has to
-   * be pre-#810 behavior exactly, not "pre-#810 except where the new decision
-   * happens to be better". Returning `decision.workspaceId` here would already
-   * re-scope a pinned caller — changing which targets `browser.cdp.info` lists
-   * and whether it sets `targetsScoped` — in the mode whose whole promise is
-   * that it changes nothing.
+   * `mcp.mode` does not change the answer. Shadow mode used to hand back the
+   * request's `workspaceId` on every lane; the workspace now comes only from
+   * the verified identity in both modes, so the scope (and, in phase 1, the
+   * per-workspace backend) is decided the same way on dev and packaged builds.
+   * The permission enforcer still reads `mcp.mode` for its own rollback.
    *
-   * The mode is `mcp.mode`, shared with the permission enforcer rather than a
-   * second knob — both answer "is substrate enforcement live on this install?",
-   * and one switch means one rollback.
-   *
-   * The audit write is best-effort for the same reason as the permission shadow
-   * logger: telemetry must never break a browser call. Note the ordering — the
-   * log happens BEFORE the throw, so an enforced refusal is still evidence.
+   * The audit write is best-effort: telemetry must never break a browser call.
+   * It happens BEFORE the throw, so a refusal is still evidence.
    */
   const scopeFor = (
     method: RpcMethod,
@@ -1122,7 +1221,6 @@ export function registerBrowserRpc(
     ctx: RpcContext | undefined,
   ): string | undefined => {
     const decision = callerScope(ctx, params);
-    const enforcing = getEnforcementMode() === 'enforce';
 
     if (decision.kind === 'rejected') {
       if (browserScopeShadowSink) {
@@ -1148,11 +1246,10 @@ export function registerBrowserRpc(
           /* browser scope audit logging must never affect dispatch */
         }
       }
-      if (enforcing) throw scopeRefusalError(method, decision.reason);
-      return requestedWorkspaceId(params);
+      throw scopeRefusalError(method, decision.reason);
     }
 
-    return enforcing ? decision.workspaceId : requestedWorkspaceId(params);
+    return decision.workspaceId;
   };
 
   // Resolve the guest webview's WebContents for a CDP-backed handler, throwing a
@@ -1263,15 +1360,20 @@ export function registerBrowserRpc(
     // 'chrome' analog: what to do when no builtin target resolves under the
     // chrome backend. Default is the chrome contract error — tools ride the
     // Playwright path there, so an RPC-fallback hit means resolution failed.
-    chromeFallback?: (params: Record<string, unknown>, scope: string | undefined) => Promise<unknown>,
+    chromeFallback?: (
+      params: Record<string, unknown>,
+      scope: string | undefined,
+      chrome: () => Promise<ChromeCaller>,
+    ) => Promise<unknown>,
   ): void => {
     router.register(method, async (params, ctx) => {
       // Before any work: a refused caller must not reach URL validation, the
       // external-backend delegate, or a wake. Throwing here is the whole point.
       const scope = scopeFor(method, params, ctx);
+      const chrome = chromeCallerOf(method, ctx, scope);
       // Before URL validation, before the wake, before the lease: a write aimed
       // at somebody else's live tab must not touch the page at all.
-      guardLiveWrite(method, params, scope);
+      await guardLiveWrite(method, params, scope, chrome);
       const surfaceId = typeof params['surfaceId'] === 'string' ? params['surfaceId'] : undefined;
       // Memory relief (#517 slice C): automation targeting a discarded guest
       // wakes it (renderer remounts + page reloads) before taking the lease,
@@ -1288,7 +1390,7 @@ export function registerBrowserRpc(
           throw new Error(EXTERNAL_BACKEND_UNSUPPORTED_MESSAGE);
         }
         if (backend() === 'chrome') {
-          if (chromeFallback) return chromeFallback(params, scope);
+          if (chromeFallback) return chromeFallback(params, scope, chrome);
           throw new Error(CHROME_BACKEND_RPC_UNSUPPORTED_MESSAGE);
         }
         return handler(params, scope, ctx);
@@ -1445,6 +1547,7 @@ export function registerBrowserRpc(
     workspaceId: string,
     surfaceId: string | undefined,
     prompt: string,
+    ctx: RpcContext | undefined,
   ): Promise<void> => {
     // The surfaceId is caller-supplied and the request store never resolves it,
     // so it is checked here against what the workspace can be PROVEN to hold
@@ -1470,7 +1573,10 @@ export function registerBrowserRpc(
     }
     if (surfaceId) {
       try {
-        const launcher = chromeRegistry?.forWorkspace(workspaceId);
+        // The caller's own Chrome: a pane with its own profile raises its own
+        // tab. Resolution failing (no registry, unidentified pane) lands in the
+        // catch below and skips the raise; the notification still goes out.
+        const launcher = (await resolveChromeClient('browser.help.request', ctx, workspaceId)).client;
         const reachable = launcher
           ? (await launcher.cdpInfoTargets(workspaceId)).some(
               (t) => t.surfaceId === surfaceId || t.targetId === surfaceId,
@@ -1582,7 +1688,7 @@ export function registerBrowserRpc(
       throw err;
     }
 
-    await revealHelpSurface(workspaceId, surfaceId, info.prompt);
+    await revealHelpSurface(workspaceId, surfaceId, info.prompt, ctx);
     return { requestId: info.requestId, deadlineAt: info.deadlineAt, highlighted };
   });
 
@@ -1994,8 +2100,9 @@ export function registerBrowserRpc(
     // Phase 2 'chrome' backend: all four actions operate on the dedicated
     // Chrome instance's wmux-opened tabs (registry-scoped by workspace).
     if (backend() === 'chrome') {
-      const launcher = requireChrome('browser.tabs', workspaceId);
-      const callerKey = openerKeyOf(params);
+      const chrome = await resolveChromeClient('browser.tabs', ctx, workspaceId);
+      const launcher = chrome.client;
+      const caller = openerCaller(openerKeyOf(params), chrome);
       if (action === 'new') {
         if (url) {
           try {
@@ -2011,8 +2118,8 @@ export function registerBrowserRpc(
           const opened = await launcher.openTab(url ?? 'about:blank', workspaceId);
           // Before the descriptor is built, so the reply already reports this
           // caller as the opener of the tab it just asked for.
-          if (callerKey) surfaceOpeners.note(opened.surfaceId, callerKey);
-          return { ok: true, action: 'new', tab: chromeTabDescriptor(opened, callerKey) };
+          if (caller.openerKey) surfaceOpeners.note(opened.surfaceId, caller.openerKey, chrome.callerPtyId);
+          return { ok: true, action: 'new', tab: chromeTabDescriptor(opened, caller) };
         } catch (error) {
           return browserTabsError(
             'BROWSER_TAB_CREATE_FAILED',
@@ -2027,7 +2134,7 @@ export function registerBrowserRpc(
       // they are facts about who opened a tab — but a FILTER whose meaning is
       // "what you may write to" reports the wrong set under the 'all' opt-out,
       // where the answer is everything.
-      const gated = !!liveWritePolicy(workspaceId);
+      const gated = !!liveWritePolicy(launcher);
       if (action === 'list') {
         const rows = targets.map((t) => ({
           ...t,
@@ -2045,7 +2152,7 @@ export function registerBrowserRpc(
         return {
           ok: true,
           action: 'list',
-          tabs: filtered.map((t) => chromeTabDescriptor(t, callerKey)),
+          tabs: filtered.map((t) => chromeTabDescriptor(t, caller)),
         };
       }
       const match =
@@ -2083,7 +2190,7 @@ export function registerBrowserRpc(
             ok: true,
             action: 'borrow',
             result: 'borrowed',
-            tab: chromeTabDescriptor({ ...match, owner: ownerOf(match.surfaceId) }, callerKey),
+            tab: chromeTabDescriptor({ ...match, owner: ownerOf(match.surfaceId) }, caller),
           };
         }
         if (!requestBorrowApproval) {
@@ -2123,7 +2230,7 @@ export function registerBrowserRpc(
             ok: true,
             action: 'borrow',
             result: 'borrowed',
-            tab: chromeTabDescriptor({ ...match, owner: 'borrowed' }, callerKey),
+            tab: chromeTabDescriptor({ ...match, owner: 'borrowed' }, caller),
           };
         }
         return browserTabsError(
@@ -2135,15 +2242,16 @@ export function registerBrowserRpc(
         );
       }
       if (action === 'select') {
-        // Live attach supports real tab focus; dedicated instances leave
-        // focus to the automation itself (Playwright bringToFront) and echo.
+        // Real tab focus where the backend supports it: live attach, and
+        // dedicated instances since "Show in Chrome" (the same activation the
+        // automation's own bringToFront performs).
         if (launcher.selectSurface) await launcher.selectSurface(match.surfaceId);
         return {
           ok: true,
           action: 'select',
           tab: chromeTabDescriptor(
             { ...match, ...(launcher.writeScope && { owner: ownerOf(match.surfaceId) }) },
-            callerKey,
+            caller,
           ),
         };
       }
@@ -2165,7 +2273,7 @@ export function registerBrowserRpc(
       // tab, and no later surface can inherit the ownership of a dead id.
       const closedTab = chromeTabDescriptor(
         { ...match, ...(launcher.writeScope && { owner: closeOwner }) },
-        callerKey,
+        caller,
       );
       surfaceOpeners.forget(match.surfaceId);
       return { ok: true, action: 'close', closed: closedTab };
@@ -2266,20 +2374,39 @@ export function registerBrowserRpc(
     if (!workspaceId || !surfaceId || !openerKey) {
       throw new Error('browser.surface.adopt: workspaceId, surfaceId and openerKey are required.');
     }
-    if (!isUnclaimedBy(surfaceId, openerKey)) {
+    // A Chrome surface is judged by the same rule `browser.cdp.info` reported
+    // it with, so a restarted agent can re-claim its pane's tab.
+    const chrome =
+      backend() === 'chrome' ? await resolveChromeClient('browser.surface.adopt', ctx, workspaceId) : undefined;
+    // Only a tab the caller could have been offered: one its own Chrome holds
+    // for this workspace. Without this, a claim on any id — another pane's,
+    // another workspace's — would be recorded and later read back as `mine`.
+    if (chrome) {
+      const offered = await chrome.client.cdpInfoTargets(workspaceId);
+      if (!offered.some((t) => t.surfaceId === surfaceId && t.workspaceId === workspaceId)) {
+        throw new Error(
+          `browser.surface.adopt: "${surfaceId}" is not a Chrome tab of this workspace in the calling ` +
+            "pane's browser profile.",
+        );
+      }
+    }
+    if (!isUnclaimedBy(surfaceId, openerCaller(openerKey, chrome))) {
       return { ok: true, owner: 'other' as const };
     }
-    surfaceOpeners.note(surfaceId, openerKey);
+    surfaceOpeners.note(surfaceId, openerKey, callerPaneOf(ctx));
     return { ok: true, owner: 'mine' as const };
   });
 
   /**
    * browser.open
    * Opens a new browser surface in the active pane.
-   * params: { url?: string }
+   * params: { url?: string, private?: boolean }
    */
   router.register('browser.open', async (params, ctx) => {
     const url = typeof params['url'] === 'string' ? params['url'] : undefined;
+    // A private tab lives on the one in-memory partition every private tab
+    // shares. It is chosen by this flag, never by a caller-named partition.
+    const wantPrivate = params['private'] === true;
     // #922 PR-C — `browser.open` joins the lane table its siblings already use.
     //
     // It was left out on purpose while `declared` accepted any named workspace:
@@ -2290,29 +2417,30 @@ export function registerBrowserRpc(
     // already gives. So this does not tighten a rule; it stops one method from
     // being the exception to it.
     //
-    // NOT applied on the 'external' branch: that backend hands the url to the
-    // OS browser, which belongs to no workspace, so there is nothing to scope
-    // and refusing an unscoped caller would break a working path for no gain.
-    // That branch returns before this value is used, so it is not computed at
-    // all there — reading the raw request field for it would be dead code, and
-    // keeping it would be the only thing holding this file's "no handler reads
-    // workspaceId out of the body" invariant open.
-    const workspaceId =
-      backend() === 'external' ? undefined : scopeFor('browser.open', params, ctx);
+    // Applied on the 'external' branch too. The OS browser belongs to no
+    // workspace, but the call still comes from one: the caller's identity is
+    // verified the same way as on every other backend, and the backend for a
+    // call is chosen from that workspace (per-workspace backends build on it).
+    const workspaceId = scopeFor('browser.open', params, ctx);
     const openerKey = openerKeyOf(params);
+    if (wantPrivate && backend() === 'chrome') {
+      throw new Error('browser.open: private tabs need the builtin browser backend.');
+    }
     if (backend() === 'chrome') {
       // Dedicated-Chrome open: a tracked tab with a real handle — unlike
       // 'external', about:blank is a valid open here (auto-open path). Always a
       // NEW tab, so there is no reuse question to answer on this backend.
-      const launcher = requireChrome('browser.open', workspaceId);
+      const { client: launcher, callerPtyId } = await resolveChromeClient('browser.open', ctx, workspaceId);
       if (url) await validateUrl(url, 'browser.open');
       const opened = await launcher.openTab(url ?? 'about:blank', workspaceId);
-      if (openerKey) surfaceOpeners.note(opened.surfaceId, openerKey);
+      if (openerKey) surfaceOpeners.note(opened.surfaceId, openerKey, callerPtyId);
       // The launcher's stable surfaceId keeps the engine's auto-open→pin
       // contract AND survives Chrome swapping the target behind the tab.
       return { ok: true, backend: 'chrome', surfaceId: opened.surfaceId, url: opened.url };
     }
-    if (backend() === 'external') {
+    // A private open on the 'external' backend stays in the app: the OS
+    // browser cannot honour "private", and the builtin webview always exists.
+    if (backend() === 'external' && !wantPrivate) {
       // Missing url is an argument error, not the backend contract error —
       // conflating them makes agents "work around" a tool that would succeed
       // with a url (GLM P3). There is no about:blank to open externally.
@@ -2336,7 +2464,7 @@ export function registerBrowserRpc(
     // when it is not the first in the tree. A caller with no opener key (the
     // CLI, a person's pane button) keeps the old behavior exactly.
     if (openerKey && workspaceId) {
-      const reusable = await reusableBuiltinSurface(workspaceId, openerKey);
+      const reusable = await reusableBuiltinSurface(workspaceId, openerKey, wantPrivate);
       if (reusable.kind === 'blocked' || (reusable.kind === 'mine' && !reusable.first)) {
         // `blocked` also covers a list we could not read: opening blind is
         // exactly the case this guard exists for, so it fails CLOSED.
@@ -2365,7 +2493,7 @@ export function registerBrowserRpc(
           action: 'new',
           workspaceId,
           ...(url !== undefined && { url }),
-          partition: getActivePartition(),
+          partition: wantPrivate ? PRIVATE_BROWSER_PARTITION : getActivePartition(),
         });
         const tab = (created as { ok?: unknown; tab?: { surfaceId?: unknown; url?: unknown } })?.ok === true
           ? (created as { tab?: { surfaceId?: unknown; url?: unknown } }).tab
@@ -2384,7 +2512,7 @@ export function registerBrowserRpc(
       }
     }
     const opened = await sendToRenderer(getWindow, 'browser.open', {
-      partition: getActivePartition(),
+      partition: wantPrivate ? PRIVATE_BROWSER_PARTITION : getActivePartition(),
       ...(url && { url }),
       // The workspace now comes from `scopeFor` above, not straight from the
       // request. It is still dropped when absent, and the renderer then falls
@@ -2429,16 +2557,18 @@ export function registerBrowserRpc(
     // place for the two to differ. Called ONCE: `scopeFor` writes an audit
     // entry, and one decision should leave one record.
     const workspaceId = scopeFor('browser.close', params, ctx);
+    const chrome = chromeCallerOf('browser.close', ctx, workspaceId);
     // Not a registerLeased method (it closes a surface rather than driving one),
     // so it takes the live write gate itself. Closing somebody's tab is a write
     // by any reading of the word.
-    guardLiveWrite('browser.close', params, workspaceId);
+    await guardLiveWrite('browser.close', params, workspaceId, chrome);
     // Chrome tabs live outside the renderer entirely, so the bridge send below
     // was a silent no-op for them — browser_close simply never worked on the
     // chrome backend. Close them here instead.
     if (backend() === 'chrome') {
       const scope = workspaceId;
-      const launcher = requireChrome('browser.close', scope);
+      const caller = await chrome();
+      const launcher = caller.client;
       if (surfaceId) {
         // Ownership first, exactly like browser.tabs close: a launcher is
         // shared by every workspace bound to its profile, so closeSurface()
@@ -2461,10 +2591,33 @@ export function registerBrowserRpc(
         // Only the owning workspace may close it — a cross-workspace close is
         // exactly the tear-down-someone-else's-browser hazard #810 exists for.
         const owner = chromeRegistry?.ownerOfSurface(surfaceId);
+        const sameWorkspace =
+          !!owner && (scope === undefined || (owner.workspaceId !== undefined && owner.workspaceId === scope));
+        // A pane's exclusive Chrome is that pane's alone, in both directions:
+        // a pane-bound caller may not reach into the workspace's Chrome, and
+        // nobody else may reach into a pane's. The old cross-profile fallback
+        // (a workspace whose binding changed) survives only when neither side
+        // is pane-bound.
+        const crossesPane =
+          !!owner
+          && owner.profile !== caller.profile
+          && (caller.paneBound || !!chromeRegistry?.isPaneBound(owner.profile));
+        if (owner && crossesPane && sameWorkspace) {
+          // Said plainly rather than folded into "not found": the caller can
+          // see this tab in its workspace and would otherwise retry forever.
+          throw new Error(
+            scope === undefined && !!chromeRegistry?.isPaneBound(owner.profile)
+              ? `browser.close: Chrome tab "${surfaceId}" is in a pane's own Chrome profile and this call ` +
+                  'names no workspace, so it cannot be shown to come from that pane. Close it from the pane ' +
+                  'that owns it.'
+              : `browser.close: Chrome tab "${surfaceId}" is in another pane's Chrome profile; only that ` +
+                  'pane can close it. Do not retry.',
+          );
+        }
         // An undefined scope (shadow mode, caller sent no workspaceId) closes
         // unfiltered — the same meaning the primary path's listTargets(scope)
         // gives it — so an unbound/stale handle stays retirable there too.
-        if (owner && (scope === undefined || (owner.workspaceId !== undefined && owner.workspaceId === scope))) {
+        if (owner && !crossesPane && sameWorkspace) {
           if (await owner.client.closeSurface(surfaceId)) {
             surfaceOpeners.forget(surfaceId);
             return { ok: true, backend: 'chrome', closed: true, surfaceId };
@@ -2644,7 +2797,7 @@ export function registerBrowserRpc(
   // Chrome backend + no builtin surface: pinned-tab navigation rides the
   // engine's Playwright path and never lands here; a bare navigate opens a
   // tracked tab like browser.open does.
-  async (params, scope) => {
+  async (params, scope, chrome) => {
     // A pinned surfaceId reaching this fallback means the caller wanted to
     // navigate an EXISTING chrome tab through the RPC lane — opening a new
     // tab here would report success while the agent keeps reading the old
@@ -2660,7 +2813,7 @@ export function registerBrowserRpc(
     await validateUrl(navUrl, 'browser.navigate');
     // Owner = the caller-verified scope, never a body-supplied workspaceId
     // (#810 scope-coverage guard).
-    const opened = await requireChrome('browser.navigate', scope).openTab(navUrl, scope);
+    const opened = await (await chrome()).client.openTab(navUrl, scope);
     return { ok: true, backend: 'chrome', surfaceId: opened.surfaceId, url: opened.url };
   });
 
@@ -2708,7 +2861,10 @@ export function registerBrowserRpc(
    * Start a browser session with an optional profile.
    * params: { profile?: string }
    */
-  router.register('browser.session.start', async (params) => {
+  router.register('browser.session.start', async (params, ctx) => {
+    // Every browser method requires a verified caller, including the ones that
+    // act on no surface: the scope is the same gate, its value unused here.
+    scopeFor('browser.session.start', params, ctx);
     // Only the builtin backend runs an RPC-started Electron session (the
     // partition dance below). chrome/external never touch that partition, so
     // running it there and returning a port MISLED the agent into "a session
@@ -2784,7 +2940,8 @@ export function registerBrowserRpc(
    * browser.session.stop
    * Stop the active browser session and release resources.
    */
-  router.register('browser.session.stop', async () => {
+  router.register('browser.session.stop', async (params, ctx) => {
+    scopeFor('browser.session.stop', params, ctx);
     // Symmetric with session.start: only the builtin backend has an RPC session
     // to stop. On chrome/external the mutations below (active-profile reset +
     // renderer applyProfile) would "tear down" a session that never existed —
@@ -2817,8 +2974,12 @@ export function registerBrowserRpc(
     // port null" while a real Chrome was up on its CDP port). Report the
     // chrome facts instead — via a pure read that never launches Chrome.
     if (kind === 'chrome' && chromeRegistry) {
+      // Scoped only here: this branch reports one workspace's Chrome. The
+      // builtin answer below is the app-wide session, the same for everyone.
       const ws = scopeFor('browser.session.status', params, ctx);
-      const status = await chromeRegistry.statusForWorkspace(ws || undefined);
+      // The profile only: a status probe must never create a launcher.
+      const { profile } = await resolveChromeProfile('browser.session.status', ctx, ws || undefined);
+      const status = await chromeRegistry.statusForProfile(profile);
       return {
         backend: kind,
         profile: status.profile,
@@ -2848,6 +3009,8 @@ export function registerBrowserRpc(
    * Return all available profiles.
    */
   router.register('browser.session.list', async () => {
+    // The names of the configured profiles, the same for every caller: a probe
+    // with nothing to scope.
     const profiles = profileManager.listProfiles().map((p) => ({
       name: p.name,
       partition: p.partition,
@@ -2865,7 +3028,8 @@ export function registerBrowserRpc(
    * caller (e.g. Playwright MCP) can execute the actual key presses.
    * params: { text: string, selector?: string }
    */
-  router.register('browser.type.humanlike', async (params) => {
+  router.register('browser.type.humanlike', async (params, ctx) => {
+    scopeFor('browser.type.humanlike', params, ctx);
     if (typeof params['text'] !== 'string' || params['text'].length === 0) {
       throw new Error('browser.type.humanlike: missing required param "text"');
     }
@@ -2919,7 +3083,8 @@ export function registerBrowserRpc(
     // no app shell in that instance, and the engine's localhost heuristics
     // must not hide the user's dev-server tabs.
     if (backend() === 'chrome') {
-      const launcher = requireChrome('browser.cdp.info', callerWorkspaceId || undefined);
+      const chrome = await resolveChromeClient('browser.cdp.info', ctx, callerWorkspaceId || undefined);
+      const launcher = chrome.client;
       const ep = await launcher.endpoint();
       // Both client kinds seed only wmux-opened tabs (live additionally
       // reaches pre-existing tabs via browser_tabs + engine-side direct
@@ -2931,6 +3096,10 @@ export function registerBrowserRpc(
         ...(disclose && ep.wsEndpoint && { wsEndpoint: ep.wsEndpoint }),
         ...(callerWorkspaceId && { targetsScoped: true }),
         workspaceBackend: 'chrome' as const,
+        // The profile this caller resolved to (its pane's own, its workspace's,
+        // or 'default'). The engine keys its CDP connection on it, so a pane
+        // that changes profile reconnects to that profile's Chrome.
+        profile: chrome.profile,
         // Live only: the write-scope policy in force, so the MCP lane can apply
         // the SAME gate on the writes it drives over CDP without main seeing
         // them. Disclosed unconditionally, unlike wsEndpoint/cdpPort — it is a
@@ -2948,7 +3117,7 @@ export function registerBrowserRpc(
           // Whether the ASKING caller opened it, so a call that names no
           // surfaceId resolves to its own tab instead of the workspace's
           // newest. A verdict, never anyone's key.
-          ...withOpener(t.surfaceId, callerOpenerKey),
+          ...withOpener(t.surfaceId, openerCaller(callerOpenerKey, chrome)),
           // Live only: whether this workspace may write to the tab. The rows a
           // live client seeds here are its own and its lent ones, so a target
           // MISSING from this list is exactly the case the MCP lane refuses.

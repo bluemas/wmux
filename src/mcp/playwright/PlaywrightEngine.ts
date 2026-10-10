@@ -12,9 +12,16 @@ import {
   isWorkspaceScopeUnresolvedError,
   WorkspaceScopeUnresolvedError,
   WORKSPACE_SCOPE_UNRESOLVED_CODE,
+  paneProfileRefusal,
   type BrowserTargetScope,
 } from './browserScope';
 import { attachPageCapture } from './pageCapture';
+import { trackRequestBaseline } from './actionSettle';
+import {
+  attachModalTracking,
+  modalScopeKey,
+  rememberModalScope,
+} from './modalState';
 import { reassertUserAgentEmulation } from './ua-emulation';
 import {
   getOpenerKey,
@@ -96,6 +103,13 @@ interface CdpInfoResponse {
    * wmux opened.
    */
   liveWriteScope?: 'agent' | 'all';
+  /**
+   * The Chrome profile main resolved for THIS caller — its pane's own profile
+   * when the pane is bound to one, else the workspace's. Absent on an older
+   * main. Two panes of one workspace can resolve to two profiles, i.e. two
+   * Chrome instances on two ports.
+   */
+  profile?: string;
   targets: CdpTargetInfo[];
 }
 
@@ -324,6 +338,7 @@ export class PlaywrightEngine {
     if (info.liveWriteScope) {
       this.liveWriteScope = info.liveWriteScope;
     }
+    if (typeof info.profile === 'string') this.mainReportsProfile = true;
   }
 
   /** The live write-scope policy as main last reported it. undefined until a
@@ -461,6 +476,7 @@ export class PlaywrightEngine {
     // live one, which is the direction that matters.
     this.liveWriteScope = undefined;
     this.connectedWorkspaceId = undefined;
+    this.connectedProfile = undefined;
     if (s) {
       await s.detach().catch(() => { /* session may already be gone */ });
     }
@@ -478,12 +494,21 @@ export class PlaywrightEngine {
   private connectedWorkspaceId: string | undefined;
   /** Resolved endpoint of the live connection (http URL or ws URL). */
   private connectedEndpoint: string | null = null;
+  /** Chrome profile whose cdp.info produced the current connection (undefined
+   *  on a main that reports none). With the workspace it is the reuse key. */
+  private connectedProfile: string | undefined;
+  /** Whether main has ever reported `profile`. Not cleared on disconnect: it
+   *  describes main, not the connection. */
+  private mainReportsProfile = false;
 
   async ensureConnected(workspaceId?: string): Promise<void> {
-    if (
-      this.browser?.isConnected() &&
-      (workspaceId === undefined || this.connectedWorkspaceId === undefined || this.connectedWorkspaceId === workspaceId)
-    ) {
+    const reusable =
+      this.browser?.isConnected() === true &&
+      (workspaceId === undefined || this.connectedWorkspaceId === undefined || this.connectedWorkspaceId === workspaceId);
+    // A main that reports profiles can rebind this pane to another profile —
+    // another Chrome, another port — at any moment, and only cdp.info can say
+    // so. One round trip per call buys that; an older main keeps the free path.
+    if (reusable && (workspaceId === undefined || !this.mainReportsProfile)) {
       return;
     }
 
@@ -495,10 +520,17 @@ export class PlaywrightEngine {
           workspaceId ? { workspaceId } : {},
         )) as CdpInfoResponse;
         this.cacheShellUrl(info);
+        const profile = typeof info.profile === 'string' ? info.profile : undefined;
+        // Same (workspace, profile): keep the live connection.
+        if (reusable && profile === this.connectedProfile) return;
+        // The profile moved: drop the old browser even if the endpoint looks
+        // the same, so nothing keeps driving the previous account's Chrome.
+        if (this.browser && profile !== this.connectedProfile) await this.disconnect();
         // Live-Chrome attach reports a ws endpoint instead of a port.
         if (typeof info.wsEndpoint === 'string' && info.wsEndpoint.startsWith('ws')) {
           await this.connect(info.wsEndpoint);
           this.connectedWorkspaceId = workspaceId;
+          this.connectedProfile = profile;
           return;
         }
         if (
@@ -514,9 +546,17 @@ export class PlaywrightEngine {
         }
         await this.connect(info.cdpPort);
         this.connectedWorkspaceId = workspaceId;
+        this.connectedProfile = profile;
         return;
       } catch (err) {
         if (err instanceof CdpAttachInfoUnavailableError) throw err;
+        // A refusal, like the one above: retrying cannot change main's answer.
+        const refusal = paneProfileRefusal(err);
+        if (refusal) throw refusal;
+        // The profile check itself failed. A rebind may have landed in the same
+        // moment, so the live connection cannot be proven to be this pane's
+        // account any more: drop it, and let the retry (or the call) decide.
+        if (reusable && this.browser) await this.disconnect();
         lastError = err;
         console.error(
           `[PlaywrightEngine] Connection attempt ${attempt}/${MAX_CONNECT_RETRIES} failed:`,
@@ -636,7 +676,16 @@ export class PlaywrightEngine {
     const page = await this.getPage(scope.surfaceId, scope.workspaceId, scope.noSurface === true);
     if (page && opts.intent === 'write') {
       await this.assertLiveWriteAllowed(page, scope);
+      // Records dialogs for the [modal] note. Behaviour-neutral: each one is
+      // still answered at once the way Playwright answers it unattended.
+      attachModalTracking(page, modalScopeKey(scope.workspaceId, scope.surfaceId));
+    } else if (page) {
+      rememberModalScope(page, modalScopeKey(scope.workspaceId, scope.surfaceId));
     }
+    // The page's own request rhythm, so a later action's settle can tell a
+    // poll from what the action caused. Passive; started on first resolution
+    // so the history exists before the first click.
+    if (page) trackRequestBaseline(page);
     // Chrome backend: main's webContents-side lifecycle capture cannot see
     // these tabs, so mirror navigations/closes engine-side (dogfood P1 — the
     // #1063 inline events went silent under 'chrome').
@@ -703,8 +752,8 @@ export class PlaywrightEngine {
     let info: CdpInfoResponse;
     try {
       info = (await sendRpc('browser.cdp.info', { workspaceId: scope.workspaceId })) as CdpInfoResponse;
-    } catch {
-      throw new AgentWindowScopeError(label, targetId);
+    } catch (err) {
+      throw paneProfileRefusal(err) ?? new AgentWindowScopeError(label, targetId);
     }
     this.cacheShellUrl(info);
     // The policy can have been switched to 'all' since the value was cached;
@@ -1070,6 +1119,7 @@ export class PlaywrightEngine {
                     }
                   } catch (resolveErr) {
                     if (isWorkspaceScopeUnresolvedError(resolveErr)) throw resolveErr;
+                    if (paneProfileRefusal(resolveErr)) throw paneProfileRefusal(resolveErr);
                     console.error(
                       '[PlaywrightEngine] Could not pin the auto-opened surface:',
                       resolveErr instanceof Error ? resolveErr.message : String(resolveErr),
@@ -1081,6 +1131,7 @@ export class PlaywrightEngine {
             }
           } catch (openErr) {
             if (isWorkspaceScopeUnresolvedError(openErr)) throw openErr;
+            if (paneProfileRefusal(openErr)) throw paneProfileRefusal(openErr);
             console.error('[PlaywrightEngine] Auto-open failed:', openErr instanceof Error ? openErr.message : String(openErr));
           }
         }
@@ -1094,6 +1145,7 @@ export class PlaywrightEngine {
       } catch (err) {
         if (isWorkspaceScopeUnresolvedError(err)) throw err;
         if (err instanceof CdpAttachInfoUnavailableError) throw err;
+        if (paneProfileRefusal(err)) throw paneProfileRefusal(err);
         console.error(
           `[PlaywrightEngine] getPage attempt ${attempt} failed:`,
           err instanceof Error ? err.message : String(err),
@@ -1294,6 +1346,7 @@ export class PlaywrightEngine {
       }
     } catch (err) {
       if (isWorkspaceScopeUnresolvedError(err)) throw err;
+      if (paneProfileRefusal(err)) throw paneProfileRefusal(err);
       console.error('[PlaywrightEngine] findViaTargetDomain error:', err instanceof Error ? err.message : String(err));
       return null;
     }
@@ -1393,6 +1446,7 @@ export class PlaywrightEngine {
       return null;
     } catch (err) {
       if (isWorkspaceScopeUnresolvedError(err)) throw err;
+      if (paneProfileRefusal(err)) throw paneProfileRefusal(err);
       console.error('[PlaywrightEngine] findViaJsonEndpoint error:', err instanceof Error ? err.message : String(err));
       return null;
     }

@@ -50,12 +50,13 @@ export function endsWithQuestion(text: string): boolean {
   // Strip trailing markdown emphasis/quotes so `**...할까?**` still matches.
   const tail = last.replace(/[*_`"')\]]+$/, '').trim();
   if (tail.endsWith('?') || tail.endsWith('？')) return true;
-  // A list item ending in `-는지` is a checklist entry ("…제대로 나오는지"),
-  // items for the human to verify, not an ask. Only a `?` makes one a question.
-  if (/^(?:[-*•]|\d+[.)])\s/.test(tail)) return false;
   // A Korean question may still be punctuated with a period; strip it before
   // testing the ending so `진행할까.` matches the same as `진행할까`.
   const bare = tail.replace(/[.!。]+$/, '');
+  // A list item ending in `-는지` is a checklist entry ("…제대로 나오는지"),
+  // items for the human to verify, not an ask. Only that ending is exempt: a
+  // list item that ends in `-까요` or `-나요` is still a question.
+  if (/^(?:[-*•]|\d+[.)])\s*/.test(bare) && /(는지|은지|ㄴ지)$/.test(bare)) return false;
   // Korean interrogative endings, which routinely carry no '?' at all.
   //
   // Deliberately narrow. `가요` and `니` were removed after review: ordinary

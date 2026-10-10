@@ -201,6 +201,8 @@ export const METHOD_CAPABILITY: Record<RpcMethod, RequiredCapability> = {
 
   // --- Pane lifecycle ---
   'pane.list':   { capability: 'pane.read', riskClass: 'pane-lifecycle' },
+  // A name → ids lookup: the same ids pane.list already hands out.
+  'pane.resolveName': { capability: 'pane.read', riskClass: 'pane-lifecycle' },
   // The answer carries agent-authored output (last message, tool activity)
   // for every pane, so it is terminal content, not a pane listing: a
   // third-party plugin needs the same grant input.readScreen does.
@@ -310,6 +312,10 @@ export const METHOD_CAPABILITY: Record<RpcMethod, RequiredCapability> = {
   // Moa hand-off proposal. Own commander-token auth (HQ brain only) in
   // deck.rpc.ts, and it only raises an operator card, so no capability gate.
   'deck.proposeHandoff': { capability: null },
+  // Moa's goal contract. Own commander-token auth (HQ brain only) in
+  // deck.rpc.ts; the proposal only raises an operator card.
+  'deck.proposeGoal': { capability: null },
+  'deck.goal': { capability: null },
   // Orphan Deck state prune (`wmux deck state --prune --yes`). Runs inside the
   // app so its writes share the stores' in-process locks and caches; it
   // deletes state, so it carries the same internal gate as workspace.close.
@@ -452,6 +458,43 @@ export const METHOD_CAPABILITY: Record<RpcMethod, RequiredCapability> = {
   'lanlink.send':            { capability: 'wmux.internal' },
   'lanlink.peers.list':      { capability: 'wmux.internal' },
   'lanlink.peers.remove':    { capability: 'wmux.internal' },
+  // Cross-host A2A control plane (Settings → LAN). Same posture as lanlink.*:
+  // daemon control pipe only, never RpcRouter or the A2A listener. A plugin or
+  // MCP caller must not open an invite, join a PC, or revoke a pairing.
+  'a2a.remote.status':      { capability: 'wmux.internal' },
+  'a2a.remote.configure':   { capability: 'wmux.internal' },
+  'a2a.remote.pair.begin':  { capability: 'wmux.internal' },
+  'a2a.remote.pair.cancel': { capability: 'wmux.internal' },
+  'a2a.remote.pair.status': { capability: 'wmux.internal' },
+  'a2a.remote.join':        { capability: 'wmux.internal' },
+  'a2a.remote.hosts.list':  { capability: 'wmux.internal' },
+  'a2a.remote.hosts.remove': { capability: 'wmux.internal' },
+  'a2a.remote.peers.list':  { capability: 'wmux.internal' },
+  'a2a.remote.peers.revoke': { capability: 'wmux.internal' },
+  // Exposure and pane links: the same posture — only the app's own human
+  // exposes panes or accepts a link, never a plugin or an agent.
+  'a2a.remote.exposure.publish': { capability: 'wmux.internal' },
+  'a2a.remote.exposure.get': { capability: 'wmux.internal' },
+  'a2a.remote.exposure.list': { capability: 'wmux.internal' },
+  'a2a.remote.exposure.set': { capability: 'wmux.internal' },
+  'a2a.remote.hosts.exposed': { capability: 'wmux.internal' },
+  'a2a.remote.links.list': { capability: 'wmux.internal' },
+  'a2a.remote.links.propose': { capability: 'wmux.internal' },
+  'a2a.remote.links.accept': { capability: 'wmux.internal' },
+  'a2a.remote.links.reject': { capability: 'wmux.internal' },
+  'a2a.remote.links.revoke': { capability: 'wmux.internal' },
+  'a2a.remote.links.refresh': { capability: 'wmux.internal' },
+  'a2a.remote.local.paneGone': { capability: 'wmux.internal' },
+  // Delivery: main's bridge and the a2a handlers only, never a plugin or MCP caller.
+  'a2a.remote.pending': { capability: 'wmux.internal' },
+  'a2a.remote.mark': { capability: 'wmux.internal' },
+  'a2a.remote.targets': { capability: 'wmux.internal' },
+  'a2a.remote.sendTask': { capability: 'wmux.internal' },
+  'a2a.remote.reply': { capability: 'wmux.internal' },
+  'a2a.remote.state': { capability: 'wmux.internal' },
+  'a2a.remote.held': { capability: 'wmux.internal' },
+  'a2a.remote.rejectHeld': { capability: 'wmux.internal' },
+  'a2a.remote.hosts.status': { capability: 'wmux.internal' },
 
   // --- A2A (agent-to-agent) ---
   'a2a.resolve.identity': { capability: 'a2a.read',    riskClass: 'a2a' },

@@ -11,6 +11,7 @@ import {
   defaultLaunchdRuntime,
   launchdBaseLabel,
   startDaemonViaLaunchd,
+  sweepLeftoverDaemonPlists,
 } from './launchdDaemonJob';
 import { classifyTasklistOutput, classifyKillOutcome, type ProcessLiveness } from '../processLiveness';
 
@@ -1080,6 +1081,12 @@ export async function ensureDaemon(deps: DaemonLauncherDeps): Promise<DaemonInfo
   deps.markBoot?.('daemon-ensure-start');
   const wmuxDir = getWmuxDir();
   const pidFile = path.join(wmuxDir, 'daemon.pid');
+  // A launcher that died between writing a launchd plist and deleting it
+  // leaves the spawn env on disk; clear that on every entry, not only on the
+  // next launchd start.
+  if (shouldLaunchDaemonViaLaunchd(deps)) {
+    sweepLeftoverDaemonPlists(launchdBaseLabel(dataSuffix()), path.join(wmuxDir, 'launchd'));
+  }
 
   // 1. Check PID file
   let existingPid: number | null = null;

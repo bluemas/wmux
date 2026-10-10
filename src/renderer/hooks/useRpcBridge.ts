@@ -3,7 +3,8 @@ import { useEffect } from 'react';
 import { useStore } from '../stores';
 import { resolveStartupCwd, shellDisplayName, withDefaultShell, withRoleBinding, withWorkspaceProfile } from '../utils/ptyCreateOptions';
 import type { Pane, PaneLeaf, Surface, Workspace } from '../../shared/types';
-import { computePaneAutoName, paneDisplayName } from '../utils/paneNaming';
+import { computePaneAutoName, paneDisplayName, paneNameFields } from '../utils/paneNaming';
+import { resolvePaneName } from '../utils/paneNameResolver';
 import { paneForegroundProgram, surfaceForegroundProgram } from '../utils/surfaceProgram';
 import { originFromCaller } from '../utils/fanoutProvenance';
 import { sanitizeFanoutOrigin } from '../../shared/fanoutOrigin';
@@ -12,6 +13,7 @@ import type { Message, Part, TaskState, Artifact, AgentSkill, Task, CompletionEv
 import { normalizeCompletionEvidenceWire, isVerifiedItem } from '../../shared/completionEvidence';
 import type { PaneSearchResult, PaneSearchResponse } from '../../shared/types';
 import { generateId } from '../../shared/types';
+import { isShadowWorkspaceId } from '../../shared/pcRail';
 import { isTaskEnded, isVerifiedTaskSender } from '../../shared/a2aReopen';
 import { applyTaskQueryView } from '../../shared/a2aTaskQueryView';
 import { getLeafPanes, getWorkspaceLeafPanes, getWorkspacePtyIds, getWorkspaceRemoteSessions } from '../../shared/paneUtils';
@@ -31,6 +33,7 @@ import {
   reattachModelEnvMarker,
   splitModelEnvMarker,
 } from '../../shared/workerLaunch';
+import { goalWorkerDenyRules, isGoalWorkerLauncher } from '../../shared/moaGoalWorker';
 import { handleCompanyRpc } from '../../company/renderer/rpcHandlers';
 import { t } from '../i18n';
 import { formatA2aMessage, formatA2aBroadcast, sanitizeA2aName, type A2aFormatOptions } from '../utils/a2aFormat';
@@ -57,6 +60,8 @@ import type { FreshContextReply } from '../../shared/freshContext';
 import { paneAddressOfPty, paneHasOtherOpenA2aTask } from './a2aFreshContext';
 import { publishA2aTask } from '../events/publisher';
 import { isReceiverPaneGone } from '../../shared/a2aOrphanedTask';
+import { isRemoteTaskId, type A2aRemoteTaskMarkerV1 } from '../../shared/a2aRemote';
+import { A2A_REMOTE_NOTIFY_METHOD, isRemoteWorkspaceId, localSideOf, remoteWorkspaceId, sanitizeRemoteText, type A2aRemoteDeliveryResult, type A2aRemoteHeldReason, type A2aRemoteTaskState } from '../../shared/a2aRemoteDelivery';
 import { resolvePaneAddress, activePaneTerminalPty, resolveUnaddressedDelivery, paneHasDetectedAgent, describeAmbiguousDelivery, wsMetadataMayStandIn, NO_AGENT_PANE_HINT, decideSameWsSend, decideReplyDelivery, REPLY_SUPPRESS_HINTS, submitReceiptFields, countRoundTrips, maxSideMessages, REPLY_ROUND_CAP, isTerminalPtyInLeaves, resolveSelfPaneIdentity, resolveSenderPaneAddress, resolvePaneRole, findLeafPanes, detectedAgentTuiSlug, type PaneAddress } from './a2aAddressing';
 import { resolveWorkspaceTarget } from './workspaceTargeting';
 import { destroyRemoteSessions, destroySurfaceRemoteSession, destroyWorkspaceRemoteSessions } from '../utils/remoteSessionTeardown';
@@ -66,6 +71,8 @@ import { findActivePtyId, buildWorkspaceListEntries } from './workspaceMirrorSna
 import { buildPhoneSidebarSnapshot } from './phoneSidebarSnapshot';
 import type { MoaPendingDecision } from '../../shared/moa';
 import type { WorkLink } from '../../shared/workLink';
+import type { AgentMode } from '../../main/deck/deckAutonomyStore';
+import { moaHqId } from '../stores/slices/moaSlice';
 import { createSidebarDropLog } from '../../shared/phoneFleetSidebar';
 import { buildFleetTriage, fleetTriageScopeError } from '../utils/fleetTriage';
 import { workspaceCloseRefusal } from '../components/Moa/moaHqGuard';
@@ -881,6 +888,181 @@ function emitA2aTaskEvent(
 }
 
 // ---------------------------------------------------------------------------
+// Cross-host A2A: a task another wmux host sent to a linked pane here. Only
+// main's RemoteA2aBridge reaches this (main strips `remoteMarker` /
+// `remoteFrom` from every pipe caller). Unlike a local send, the target is
+// exactly the link's pane: no workspace-name matching, no unaddressed pick, no
+// sibling pane. A pane that is gone, or now holds another pty than the one
+// snapshotted when the task was stored here, HOLDS the task instead.
+// ---------------------------------------------------------------------------
+
+function isInboundRemoteMarker(v: unknown): v is A2aRemoteTaskMarkerV1 {
+  if (!v || typeof v !== 'object') return false;
+  const m = v as Partial<A2aRemoteTaskMarkerV1>;
+  return m.v === 1 && m.direction === 'inbound' && typeof m.linkId === 'string' && !!m.linkId
+    && typeof m.hostId === 'string' && typeof m.messageId === 'string' && !!m.messageId;
+}
+
+type RemoteAnchor = { workspaceId: string; paneId?: string; ptyId?: string };
+
+/**
+ * Where a remote delivery for `anchor` (our local side of the task) may go:
+ * the pinned pane's snapshotted pty, or — with `resnapshot`, a person having
+ * approved it — whatever terminal the pane holds now. Otherwise the reason it
+ * is held: the pane is gone, or another pty holds it now.
+ */
+function remoteAnchorTarget(
+  anchor: RemoteAnchor,
+  resnapshot: boolean,
+): { ws: Workspace; pty: string; surfaceId: string } | { held: A2aRemoteHeldReason } {
+  const ws = useStore.getState().workspaces.find((w) => w.id === anchor.workspaceId);
+  if (!ws || !anchor.paneId) return { held: 'pane-missing' };
+  const addr = resolvePaneAddress(getWorkspaceLeafPanes(ws), anchor.paneId, '');
+  if ('error' in addr) return { held: 'pane-missing' };
+  if (resnapshot) return { ws, pty: addr.ptyId, surfaceId: addr.surfaceId };
+  const leaf = getWorkspaceLeafPanes(ws).find((l) => l.id === anchor.paneId);
+  const snap = leaf?.surfaces.find((su) => su.surfaceType !== 'browser' && !!su.ptyId && su.ptyId === anchor.ptyId);
+  return snap && anchor.ptyId ? { ws, pty: anchor.ptyId, surfaceId: snap.id } : { held: 'occupant-changed' };
+}
+
+/**
+ * One gated write of a remote delivery to `pty`, with the outcome in the
+ * bridge's terms. A paste left in the composer (Enter withheld, not cleared)
+ * counts as delivered: pasting it again would duplicate it.
+ */
+async function writeRemoteDelivery(
+  anchor: RemoteAnchor,
+  target: { ws: Workspace; pty: string },
+  write: () => Promise<A2aPtyWrite>,
+): Promise<A2aRemoteDeliveryResult> {
+  if (!a2aTargetHasAgent(target.ws, target.pty)) return { ok: true, delivered: false, reason: 'no_agent_pane' };
+  const res = await write();
+  if (res.ptyId) return { ok: true, delivered: true, ptyId: res.ptyId };
+  if (res.refused?.pasted && !res.refused.cleared) return { ok: true, delivered: true, ptyId: target.pty, note: 'pasted-not-submitted' };
+  // The pane may have changed while the delivery waited.
+  const after = remoteAnchorTarget({ ...anchor, ptyId: target.pty }, false);
+  if ('held' in after) return { ok: true, delivered: false, held: after.held };
+  return { ok: true, delivered: false, reason: res.refused?.reason ?? 'no_target_pty' };
+}
+
+async function handleRemoteTaskSend(params: RpcParams): Promise<A2aRemoteDeliveryResult> {
+  const marker = params.remoteMarker;
+  const from = params.remoteFrom as { workspaceId?: unknown; name?: unknown } | undefined;
+  const taskId = typeof params.presetTaskId === 'string' ? params.presetTaskId : '';
+  const resnapshot = params.resnapshot === true;
+  if (!isInboundRemoteMarker(marker)) return { error: 'a2a.task.send: invalid remote task marker' };
+  // An rt- id is accepted only here, next to its marker.
+  if (!isRemoteTaskId(taskId)) return { error: 'a2a.task.send: a remote task needs its rt- id' };
+  if (!from || !isRemoteWorkspaceId(from.workspaceId) || from.workspaceId !== remoteWorkspaceId(marker.linkId)
+      || typeof from.name !== 'string' || !from.name) {
+    return { error: 'a2a.task.send: a remote sender must be its link\'s remote: workspace' };
+  }
+
+  let store = useStore.getState();
+  let task = store.getTask(taskId);
+  if (task) {
+    const stored = task.metadata.remote as A2aRemoteTaskMarkerV1 | undefined;
+    if (!stored || stored.linkId !== marker.linkId) return { error: `a2a.task.send: task id ${taskId} is taken` };
+    if (stored.delivered === true) return { ok: true, delivered: true, duplicate: true };
+  } else {
+    const rawMessage = typeof params.message === 'string' ? params.message : '';
+    let message: string;
+    try { message = validateMessage(sanitizeRemoteText(rawMessage)); } catch (e) {
+      return { error: `a2a.task.send: ${e instanceof Error ? e.message : 'invalid'}` };
+    }
+    const toWsId = typeof params.to === 'string' ? params.to : '';
+    const paneId = typeof params.paneId === 'string' ? params.paneId : '';
+    const target = store.workspaces.find((w) => w.id === toWsId);
+    const addr = target && paneId ? resolvePaneAddress(getWorkspaceLeafPanes(target), paneId, '') : null;
+    // Nothing is stored for a pane that is not there: a later attempt
+    // snapshots whatever pty the pane has then, before any write.
+    if (!target || !addr || 'error' in addr) return { ok: true, delivered: false, held: 'pane-missing' };
+    const title = typeof params.title === 'string' && params.title ? params.title : message.slice(0, 100);
+    store.createA2aTask({
+      id: taskId,
+      title,
+      from: { workspaceId: from.workspaceId, name: from.name },
+      to: { workspaceId: target.id, name: target.name, paneId: addr.paneId, surfaceId: addr.surfaceId, ptyId: addr.ptyId },
+      history: [{ kind: 'message', messageId: marker.messageId, role: 'user', parts: [{ kind: 'text', text: message }] }],
+      artifacts: [],
+      remote: { ...marker, delivered: false },
+    });
+    store = useStore.getState();
+    task = store.getTask(taskId);
+    if (!task) return { error: 'a2a.task.send: the remote task could not be stored' };
+    emitA2aTaskEvent(task, 'created');
+  }
+
+  const target = remoteAnchorTarget(task.metadata.to, resnapshot);
+  if ('held' in target) return { ok: true, delivered: false, held: target.held };
+  if (resnapshot && target.pty !== task.metadata.to.ptyId) {
+    // A person approved the pane's current occupant: it is the snapshot now.
+    store.setRemoteTaskTarget(taskId, target.pty, target.surfaceId);
+  }
+  const t = useStore.getState().getTask(taskId) as Task;
+  const pty = target.pty;
+  // Peer text, filtered again right before the pane write (the daemon filtered it on receipt).
+  const senderName = sanitizeRemoteText(t.metadata.from.name);
+  const firstPart = t.history[0]?.parts.find((p) => p.kind === 'text');
+  const body = sanitizeRemoteText(firstPart && firstPart.kind === 'text' ? firstPart.text : '');
+  const liveMeta = deliveryLiveMeta(store.surfaceAgent, pty, target.ws.metadata);
+  // Always the gated delivery: wait for the person to stop typing, re-check
+  // the agent before the paste and the Enter, never past main's deadline.
+  const gated: NewTaskDelivery = {
+    taskId,
+    waitQuiet: true,
+    ...(liveMeta?.agentName ? { expectAgent: liveMeta.agentName } : {}),
+    ...(typeof params.deliveryDeadlineAt === 'number' ? { deadlineAt: params.deliveryDeadlineAt } : {}),
+  };
+  const result = await writeRemoteDelivery({ ...t.metadata.to }, target, () => (isLiveTuiAgent(liveMeta)
+    ? deliverPtyNudge(target.ws, (p) => buildA2aNudge(taskId, senderName, 'new', a2aFormatOptionsFor(p).multiline ? t.metadata.title : undefined), pty, false, gated)
+    : deliverPtyNotification(target.ws, senderName, body, pty, false, gated)));
+  if (result.ok === true && result.delivered) useStore.getState().markRemoteTaskDelivered(taskId);
+  return result;
+}
+
+/**
+ * Cross-host A2A: one reply or state change the peer sent into a remote task
+ * (`task` is the daemon's snapshot, `messageId` names the item). Main's
+ * RemoteA2aBridge only. A reply is written to our local pane the way a local
+ * reply is (a one-line pointer to a live agent, the body otherwise), held under
+ * the same pane rules as a new remote task. A state change follows the local
+ * convention for status updates: no pane write, the event-bus pointer only.
+ */
+async function handleRemoteNotify(params: RpcParams): Promise<A2aRemoteDeliveryResult> {
+  const task = params.task as Task | undefined;
+  const messageId = typeof params.messageId === 'string' ? params.messageId : '';
+  if (!task || typeof task !== 'object' || !isRemoteTaskId(task.id) || !task.metadata) {
+    return { error: `${A2A_REMOTE_NOTIFY_METHOD}: invalid task` };
+  }
+  const marker = task.metadata.remote as A2aRemoteTaskState | undefined;
+  const item = marker?.inbox?.find((i) => i.messageId === messageId);
+  if (!marker || marker.v !== 1 || !item) return { error: `${A2A_REMOTE_NOTIFY_METHOD}: no such item` };
+
+  if (item.kind === 'state') {
+    useStore.getState().applyDaemonTaskUpdate(task);
+    const cached = useStore.getState().getTask(task.id) ?? task;
+    const state = task.status.state;
+    emitA2aTaskEvent(cached, state === 'canceled' ? 'cancelled' : 'updated', state);
+    return { ok: true, delivered: true };
+  }
+
+  const side = localSideOf(task);
+  const anchor = task.metadata[side];
+  const target = remoteAnchorTarget(anchor, params.resnapshot === true);
+  if ('held' in target) return { ok: true, delivered: false, held: target.held };
+  const msg = task.history.find((h) => h.messageId === messageId);
+  const part = msg?.parts.find((p) => p.kind === 'text');
+  const text = sanitizeRemoteText(part && part.kind === 'text' ? part.text : '');
+  if (!text) return { error: `${A2A_REMOTE_NOTIFY_METHOD}: the reply has no text` };
+  const senderName = sanitizeRemoteText(task.metadata[side === 'from' ? 'to' : 'from'].name);
+  const liveMeta = deliveryLiveMeta(useStore.getState().surfaceAgent, target.pty, target.ws.metadata);
+  return writeRemoteDelivery({ ...anchor, ptyId: target.pty }, target, () => (isLiveTuiAgent(liveMeta)
+    ? deliverPtyNudge(target.ws, buildA2aNudge(task.id, senderName, 'reply'), target.pty, false)
+    : deliverPtyNotification(target.ws, senderName, text, target.pty, false)));
+}
+
+// ---------------------------------------------------------------------------
 // Dispatch table
 // ---------------------------------------------------------------------------
 
@@ -893,10 +1075,17 @@ function isSelectableBrowserPartition(partition: string): boolean {
   );
 }
 
+function withoutShadows<S extends { workspaces: Workspace[] }>(state: S): S {
+  if (!state.workspaces.some((w) => isShadowWorkspaceId(w.id))) return state;
+  return { ...state, workspaces: state.workspaces.filter((w) => !isShadowWorkspaceId(w.id)) };
+}
+
 // Exported for tests only (a2aFormat.delivery.test.ts).
 export async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcResult> {
   // Always read the freshest state via getState() to avoid stale closures.
-  const store = useStore.getState();
+  // The PC rail's shadow workspaces show another computer's panes: no RPC
+  // lists, resolves or targets them, so every walk below sees local ones only.
+  const store = withoutShadows(useStore.getState());
 
   // Fix 0 — block external RPC during startup reconcile. Even read-only
   // RPCs (workspace.list) return surface.ptyId fields that the external
@@ -953,7 +1142,19 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
     } catch {
       drops.report('moa.workLinks');
     }
-    const snapshot = buildPhoneSidebarSnapshot(store, drops.report, moaDecisions, workLinks);
+    // The HQ's agent mode: `off` means a wake from the phone would be refused.
+    // A failed read, or a null mode, makes no claim (the phone keeps `moaWake`).
+    let hqMode: { workspaceId: string; mode: AgentMode } | undefined;
+    const hqId = moaHqId(store);
+    if (hqId) {
+      try {
+        const reply = await window.electronAPI?.deck?.mode?.get(hqId);
+        if (reply?.mode) hqMode = { workspaceId: hqId, mode: reply.mode };
+      } catch {
+        drops.report('moa.mode');
+      }
+    }
+    const snapshot = buildPhoneSidebarSnapshot(store, drops.report, moaDecisions, workLinks, hqMode);
     const dropped = drops.summary();
     if (dropped) console.warn(`[phone] sidebar projection left out: ${dropped}`);
     return snapshot;
@@ -1295,6 +1496,19 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
         error: `fanout.spawnWorkspace: could not launch ${agentChoice.agent} for this task${swap.note ? ` — ${swap.note}` : ''}`,
       };
     }
+    // A task under an approved Moa goal must carry the goal deny rules, and
+    // only claude takes them (shared/moaGoalWorker.ts). The launcher is final
+    // after the swap, so a role bound to agy or codex — which main cannot see —
+    // is refused here, before any workspace exists. So is a missing mode.
+    const goalWorker = params.goalWorker === true;
+    if (goalWorker && !isGoalWorkerLauncher(commandLauncherStem(swap.command))) {
+      return {
+        error: `fanout.spawnWorkspace: a task under a Moa goal runs only on claude (this one would launch ${commandLauncherStem(swap.command) || 'an unknown command'}), because only claude takes the goal's deny rules`,
+      };
+    }
+    if (goalWorker && !isFanoutWorkerPermissionMode(params.workerPermissionMode)) {
+      return { error: 'fanout.spawnWorkspace: a task under a Moa goal needs its worker permission mode' };
+    }
     if (swap.note) {
       // A refusal (unknown agent, or flags that would not survive the swap) is
       // fail-soft — the task still launches, so the reason must be visible
@@ -1390,7 +1604,7 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
       : undefined;
     const bound =
       workerMode && roleBound.initialCommand
-        ? { ...roleBound, initialCommand: applyWorkerPermissionFlags(roleBound.initialCommand, workerMode) }
+        ? { ...roleBound, initialCommand: applyWorkerPermissionFlags(roleBound.initialCommand, workerMode, goalWorker ? goalWorkerDenyRules() : []) }
         : roleBound;
     // `bound.initialCommand` stays undefined for the "environment only" launch,
     // and it has to: withWorkspaceProfile fills a MISSING command from the
@@ -1776,6 +1990,9 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
       const isStashed = stashedIds.has(l.id);
       return {
         id: l.id,
+        // What the header shows (label or `w1-2(agent)`) and the unique
+        // `#w1-2` address any pane-taking tool accepts in place of an id.
+        ...paneNameFields(store.paneLabel, store.surfaceAgent, ws, l),
         surfaceCount: l.surfaces.length,
         foregroundProgram: paneForegroundProgram(l, store.surfaceAgent, store),
         active: !isStashed && l.id === ws.activePaneId,
@@ -2002,6 +2219,24 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
       return { error: `pane.resolveActiveLeaf: active pane is not a leaf in workspace "${wsId}"` };
     }
     return { paneId: target.id, workspaceId: wsId };
+  }
+
+  if (method === 'pane.resolveName') {
+    // `#w1-2` / `#backend` → ids. Searches every workspace (names are unique
+    // across them) unless a workspaceId narrows it — a hosted caller always
+    // arrives with its binding here. Answers only ids; the tool that asked
+    // still routes and authorizes on those ids as if they had been typed.
+    const name = typeof params.name === 'string' ? params.name : '';
+    const scope = typeof params.workspaceId === 'string' && params.workspaceId.length > 0 ? params.workspaceId : undefined;
+    const workspaces = scope ? store.workspaces.filter((w) => w.id === scope) : store.workspaces;
+    return resolvePaneName(workspaces, store.paneLabel, store.surfaceAgent, name);
+  }
+
+  if (method === 'pane.liveIds') {
+    // Internal main->renderer channel (no router entry): every pane that exists
+    // right now, stashed ones included, for MetadataStore's label-uniqueness
+    // check. Ids only — no labels, no layout.
+    return { paneIds: store.workspaces.flatMap((w) => getWorkspaceLeafPanes(w).map((l) => l.id)) };
   }
 
   if (method === 'pane.validateWorkspace') {
@@ -2658,12 +2893,19 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
     // Workspace-wide (#977). The ownership boundary — "this workspace's own
     // leaves" — is what makes a forged/foreign ptyId fail closed, and that is
     // unchanged; what widens is the OWNED set, not the trust level.
+    const leaves = getWorkspaceLeafPanes(ws);
     const self = resolveSelfPaneIdentity(
-      getWorkspaceLeafPanes(ws),
+      leaves,
       (ptyId) => store.surfaceAgent[ptyId],
       rawSenderPtyId,
     );
-    return self ? { ...base, ...self } : base;
+    if (!self) return base;
+    const selfLeaf = leaves.find((l) => l.id === self.paneId);
+    return {
+      ...base,
+      ...self,
+      ...(selfLeaf ? paneNameFields(store.paneLabel, store.surfaceAgent, ws, selfLeaf) : {}),
+    };
   }
 
   if (method === 'a2a.discover') {
@@ -2696,6 +2938,8 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
           paneId: string;
           surfaceId: string;
           ptyId: string;
+          paneName: string;
+          paneTag: string;
           agentName: string | null;
           agentStatus: string | null;
           paneTitle: string | null;
@@ -2704,6 +2948,7 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
         // side as the same address source. A pane in one and not the other
         // reads as "it disappeared", and acting on that is a silent misroute.
         for (const leaf of getWorkspaceLeafPanes(w)) {
+          const names = paneNameFields(store.paneLabel, store.surfaceAgent, w, leaf);
           for (const s of leaf.surfaces) {
             if (s.surfaceType === 'browser' || !s.ptyId) continue;
             const a = store.surfaceAgent[s.ptyId];
@@ -2717,6 +2962,7 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
               paneId: leaf.id,
               surfaceId: s.id,
               ptyId: s.ptyId,
+              ...names,
               agentName: a?.name ?? null,
               agentStatus: a?.status ?? null,
               paneTitle,
@@ -2750,7 +2996,10 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
     };
   }
 
+  if (method === A2A_REMOTE_NOTIFY_METHOD) return handleRemoteNotify(params);
+
   if (method === 'a2a.task.send') {
+    if (params.remoteMarker !== undefined || params.remoteFrom !== undefined) return handleRemoteTaskSend(params);
     const operator = a2aOperatorOrigin(params);
     const taskId = typeof params.taskId === 'string' ? params.taskId : '';
     const executeRequested = params.execute === true;

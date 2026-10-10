@@ -233,9 +233,12 @@ describe('the ⋮ menu offers exactly what the cluster does', () => {
     // / onSplitVerticalRemote, menu-only rather than icon cluster.
     // rename-tab renames the right-clicked tab (else the active one): the
     // double-click on a tab was its only entry point before.
+    // link-remote-pane (cross-PC pane links) is menu-only too, rendered only
+    // where the daemon's a2a.remote bridge exists. new-private-browser is
+    // menu-only as well: a sixth cluster button would break the width contract.
     for (const key of cluster) expect(menu).toContain(key);
     expect(menu.filter((k) => !cluster.includes(k))).toEqual([
-      'new-remote', 'rename-pane', 'rename-tab', 'split-down-remote', 'split-right-remote',
+      'link-remote-pane', 'new-private-browser', 'new-remote', 'rename-pane', 'rename-tab', 'split-down-remote', 'split-right-remote',
     ]);
   });
 });

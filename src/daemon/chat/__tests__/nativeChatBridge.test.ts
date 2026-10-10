@@ -36,7 +36,8 @@ function fixture() {
       noteInput: (data: string) => { shell.revision++; shell.empty = false; if (data === '\x1b') shell.escAt = Date.now(); }, getLastEscAt: () => shell.escAt, getTitle: () => shell.title,
       noteInterrupt: () => { shell.escAt = Date.now(); } },
     promptLog: { size: 3, isCommandRunning: () => false },
-    ptyProcess: { write: (data) => { typed.push(data); } },
+    // A fresh Claude launch carries a minted `--session-id`; it is random, so it reads as PIN here.
+    ptyProcess: { write: (data) => { typed.push(data.replace(/ --session-id [0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/, ' --session-id PIN')); } },
   };
   const agent: ChatAgentState = { agentName: null, agentVerified: false, agentStatus: 'idle', inputQuiet: true, inputRevision: 0, incarnationId: 'inc' };
   const state = {
@@ -71,7 +72,12 @@ function fixture() {
       : { id: state.pendingApproval, kind: state.pendingKind, answerable: state.pendingAnswerable } }),
     readScreen: async () => state.screen,
     agentProcessAlive: async () => { await aliveGate; return true; },
-    write: (_id, data) => { written.push(data); state.agent.inputRevision++; if (data === '\x1b') shell.escAt = Date.now(); return true; },
+    write: (_id, data) => {
+      written.push(data); state.agent.inputRevision++;
+      if (state.agent.keyInputRevision !== undefined) state.agent.keyInputRevision++;
+      if (data === '\x1b') shell.escAt = Date.now();
+      return true;
+    },
     receipts: new ChatSendReceiptStore(dir),
     cancelReceipts: new ChatCancelReceiptStore(dir),
     idleShell: async () => state.idle,
@@ -211,6 +217,17 @@ describe('send', () => {
     expect(f.bridge.receipt('device:a', 'pane', req.clientMessageId)).toMatchObject({ state: 'submitted', result: 'sent' });
     expect(f.bridge.receipt('device:b', 'pane', req.clientMessageId).state).toBe('unknown');
     expect(f.written).toHaveLength(2);
+  });
+
+  it('finds the owner\'s send under an id without naming the pane (priorSend)', async () => {
+    const f = fixture(); f.liveClaude();
+    const req = phoneSend();
+    await f.bridge.send(req);
+    expect(f.bridge.priorSend?.('device:a', req.clientMessageId, req.text))
+      .toMatchObject({ paneId: 'pane', sameText: true, view: { state: 'submitted', result: 'sent' } });
+    expect(f.bridge.priorSend?.('device:a', req.clientMessageId, 'other')?.sameText).toBe(false);
+    expect(f.bridge.priorSend?.('device:a', req.clientMessageId)).not.toHaveProperty('sameText');
+    expect(f.bridge.priorSend?.('device:b', req.clientMessageId, req.text)).toBeUndefined();
   });
 
   it('dispatches once for two concurrent sends with the same id', async () => {
@@ -410,7 +427,7 @@ describe('launch', () => {
   it('types the fixed launcher once and consumes the empty prompt', async () => {
     const f = fixture();
     expect(await f.bridge.launch({ id: 'pane', agent: 'claude', prompt: "it's done" })).toEqual({ ok: true, effect: 'submitted' });
-    expect(f.typed).toEqual(["claude -- 'it'\\''s done'\r"]);
+    expect(f.typed).toEqual(["claude --session-id PIN -- 'it'\\''s done'\r"]);
     expect(await f.bridge.launch({ id: 'pane', agent: 'claude', prompt: 'again' }))
       .toMatchObject({ ok: false, error: 'launch-not-ready', reason: 'shell-not-empty', effect: 'none' });
   });
@@ -432,7 +449,7 @@ describe('launch', () => {
     f.state.pane!.meta.env = { CLAUDE_CONFIG_DIR: "/acct/it's b", CODEX_HOME: '/ws/codex' };
     f.state.pane!.meta.paneAccount = { vendor: 'claude' };
     expect(await f.bridge.launch({ id: 'pane', agent: 'claude', prompt: 'go' })).toMatchObject({ ok: true });
-    expect(f.typed).toEqual(["CLAUDE_CONFIG_DIR='/acct/it'\\''s b' claude -- 'go'\r"]);
+    expect(f.typed).toEqual(["CLAUDE_CONFIG_DIR='/acct/it'\\''s b' claude --session-id PIN -- 'go'\r"]);
     // The other vendor's agent, and a pane with no chosen account, are typed as before.
     const g = fixture();
     g.state.pane!.meta.env = { CLAUDE_CONFIG_DIR: '/acct/b' };
@@ -442,7 +459,7 @@ describe('launch', () => {
     const h = fixture();
     h.state.pane!.meta.env = { CLAUDE_CONFIG_DIR: '/ws/claude' };
     expect(await h.bridge.launch({ id: 'pane', agent: 'claude', prompt: 'go' })).toMatchObject({ ok: true });
-    expect(h.typed).toEqual(["claude -- 'go'\r"]);
+    expect(h.typed).toEqual(["claude --session-id PIN -- 'go'\r"]);
   });
 
   it('a typed account prefix survives an rc export in a real shell', async () => {
@@ -512,40 +529,29 @@ describe('launch', () => {
     expect(started[0]).toMatchObject({ KEEP_ME: 'yes' });
   });
 
-  it('launches bare with no prompt, and resumes in the pane cwd for both agents', async () => {
+  it('launches bare with no prompt, pinning a fresh Claude to a minted id', async () => {
     const f = fixture();
-    const checked: Array<[string, string]> = [];
-    f.deps.latestResumeSession = async (agent, cwd) => { checked.push([agent, cwd]); return 'sess-1'; };
     const bridge = () => createChatBridge(f.deps);
     const fresh = () => { f.shell.empty = true; };
     expect(await bridge().launch({ id: 'pane', agent: 'claude' })).toEqual({ ok: true, effect: 'submitted' });
     fresh();
     expect(await bridge().launch({ id: 'pane', agent: 'codex' })).toMatchObject({ ok: true });
     fresh();
-    expect(await bridge().launch({ id: 'pane', agent: 'claude', resume: true, mode: 'bypass' })).toMatchObject({ ok: true });
-    fresh();
-    expect(await bridge().launch({ id: 'pane', agent: 'codex', resume: true })).toMatchObject({ ok: true });
-    fresh();
-    expect(await bridge().launch({ id: 'pane', agent: 'claude', resume: true, prompt: "it's next" })).toMatchObject({ ok: true });
-    fresh();
-    expect(await bridge().launch({ id: 'pane', agent: 'codex', resume: true, prompt: 'go', mode: 'yolo' })).toMatchObject({ ok: true });
+    expect(await bridge().launch({ id: 'pane', agent: 'claude', mode: 'bypass', prompt: 'go' })).toMatchObject({ ok: true });
     expect(f.typed).toEqual([
-      'claude\r',
+      'claude --session-id PIN\r',
       'codex --remote unix:///tmp/relay.sock --cd "$PWD"\r',
-      "cd -- '/live' && claude --continue --dangerously-skip-permissions\r",
-      "codex resume --remote unix:///tmp/relay.sock --cd '/live' --last\r",
-      "cd -- '/live' && claude --continue -- 'it'\\''s next'\r",
-      "codex resume --remote unix:///tmp/relay.sock --cd '/live' --last --dangerously-bypass-approvals-and-sandbox -- 'go'\r",
+      "claude --session-id PIN --dangerously-skip-permissions -- 'go'\r",
     ]);
-    expect(checked).toEqual([['claude', '/live'], ['codex', '/live'], ['claude', '/live'], ['codex', '/live']]);
     // A blank prompt is still malformed: only an absent one is a bare launch.
     fresh();
     expect(await bridge().launch({ id: 'pane', agent: 'claude', prompt: '  ' })).toMatchObject({ error: 'invalid-chat-request', effect: 'none' });
   });
 
-  it('refuses a resume with nothing to continue before any relay is touched or anything typed', async () => {
+  // Recovery resumes only the pane's own conversation: with no binding the newest
+  // conversation in the folder is never guessed (another pane there may own it).
+  it('refuses a resume on a pane with no binding before any relay is touched or anything typed', async () => {
     const f = fixture();
-    f.deps.latestResumeSession = async () => undefined;
     const prepare = vi.fn(f.deps.relays.prepare);
     const retire = vi.fn(f.deps.relays.retire);
     f.deps.relays.prepare = prepare; f.deps.relays.retire = retire;
@@ -553,32 +559,36 @@ describe('launch', () => {
     for (const agent of ['claude', 'codex'] as const) {
       expect(await bridge.launch({ id: 'pane', agent, resume: true })).toEqual({ ok: false, error: 'resume-unavailable', effect: 'none' });
       expect(await bridge.launch({ id: 'pane', agent, resume: true, prompt: 'go' })).toMatchObject({ error: 'resume-unavailable', effect: 'none' });
+      expect(await bridge.launch({ id: 'pane', agent, resume: true, mode: agent === 'claude' ? 'bypass' : 'yolo' })).toMatchObject({ error: 'resume-unavailable' });
     }
     expect(prepare).not.toHaveBeenCalled();
     expect(retire).not.toHaveBeenCalled();
     expect(f.typed).toEqual([]);
   });
 
-  it('refuses a resume whose latest session another live pane is running, and one in an unquotable cwd', async () => {
+  it('answers resume-unavailable for an unbound resume before every other check, and never reads it resumable', async () => {
     const f = fixture();
-    const other: ChatPane = { ...f.state.pane!, meta: { ...f.state.pane!.meta, id: 'other' } };
-    const agents: Record<string, ChatAgentState> = { other: { ...f.state.agent, agentName: 'Claude Code', agentVerified: true } };
-    f.deps.pane = (id) => id === 'other' ? other : f.state.pane;
-    f.deps.agentState = (id) => agents[id] ?? { ...f.state.agent };
-    f.deps.latestResumeSession = async () => 'sess-1';
-    f.deps.panesBoundTo = (_agent, sessionId) => sessionId === 'sess-1' ? ['pane', 'other'] : [];
-    const bridge = () => createChatBridge(f.deps);
-    expect(await bridge().launch({ id: 'pane', agent: 'claude', resume: true })).toEqual({ ok: false, error: 'resume-in-use', effect: 'none' });
-    // Codex in the other pane does not hold a Claude session.
-    expect(await bridge().launch({ id: 'pane', agent: 'codex', resume: true })).toMatchObject({ ok: true });
-    f.shell.empty = true;
-    // The agent there has exited: the binding alone does not hold the session.
-    agents.other = { ...f.state.agent, agentName: null };
-    expect(await bridge().launch({ id: 'pane', agent: 'claude', resume: true })).toMatchObject({ ok: true });
-    f.shell.empty = true;
-    f.state.pane!.meta.cwd = "/it's";
-    expect(await bridge().launch({ id: 'pane', agent: 'claude', resume: true })).toMatchObject({ error: 'resume-unavailable', effect: 'none' });
-    expect(f.typed).toHaveLength(2);
+    const go = () => createChatBridge(f.deps).launch({ id: 'pane', agent: 'claude', resume: true, prompt: 'go' });
+    const unavailable = { ok: false, error: 'resume-unavailable', effect: 'none' };
+    f.deps.resumeTakesPrompt = () => false;
+    expect(await go()).toEqual(unavailable);
+    f.state.idle = { ok: false, reason: 'unsupported-shell' };
+    expect(await go()).toEqual(unavailable);
+    f.state.idle = { ok: false, reason: 'shell-has-children' };
+    expect(await go()).toEqual(unavailable);
+    f.state.idle = { ok: true }; f.state.installed = ['codex'];
+    expect(await go()).toEqual(unavailable);
+    f.state.installed = ['claude', 'codex']; f.state.pendingApproval = 'apr';
+    expect(await go()).toEqual(unavailable);
+    f.state.pendingApproval = undefined; f.shell.empty = false;
+    expect(await go()).toEqual(unavailable);
+    // A binding for the other agent is not this agent's conversation.
+    f.state.pane!.meta.resumeBinding = { agent: 'codex', sessionId: '0f1e2d3c-4b5a-4987-8a6b-5c4d3e2f1a0b', cwd: '/proj', ts: 1 };
+    expect(await go()).toEqual(unavailable);
+    f.state.pane!.meta.resumeBinding = undefined;
+    f.deps.boundSessionLives = async () => true;
+    expect(await createChatBridge(f.deps).resumable!('pane')).toBe(false);
+    expect(f.typed).toEqual([]);
   });
 
   describe('resume of a bound pane whose agent exited', () => {
@@ -589,7 +599,6 @@ describe('launch', () => {
         permissionMode: 'bypassPermissions', ts: 1, ...extra };
       f.state.pane!.meta.cmd = '/bin/zsh';
       f.deps.boundSessionLives = async () => true;
-      f.deps.latestResumeSession = async () => { throw new Error('the newest-conversation lookup must not run'); };
     };
     const phone = (agent: 'claude' | 'codex', extra: Record<string, unknown> = {}) =>
       ({ id: 'pane', agent, resume: true, refuseConversation: true, ...extra });
@@ -709,12 +718,11 @@ describe('launch', () => {
 
   it('refuses resume + prompt for an agent whose resume line takes no prompt', async () => {
     const f = fixture();
-    f.deps.latestResumeSession = async () => 'sess-1';
+    f.state.pane!.meta.resumeBinding = { agent: 'codex', sessionId: '0f1e2d3c-4b5a-4987-8a6b-5c4d3e2f1a0b', cwd: '/proj', ts: 1 };
     f.deps.resumeTakesPrompt = (agent) => agent !== 'codex';
     const bridge = createChatBridge(f.deps);
     expect(await bridge.launch({ id: 'pane', agent: 'codex', resume: true, prompt: 'go' })).toEqual({ ok: false, error: 'resume-prompt-unsupported', effect: 'none' });
     expect(f.typed).toEqual([]);
-    expect(await bridge.launch({ id: 'pane', agent: 'codex', resume: true })).toMatchObject({ ok: true });
   });
 
   it('types nothing when the grant is gone, and is uncertain when typing throws', async () => {
@@ -2125,6 +2133,98 @@ describe('daemon queue (chat-queue)', () => {
     expect(after.queue('device:a', 'pane')[0]).not.toHaveProperty('preview');
     idleTurn(f, 1);
     await after.kickQueue('pane');
+    expect(f.written).toEqual([]);
+  });
+});
+
+describe('steer and passive input (a send into a running Claude turn)', () => {
+  const RULE = '─'.repeat(40);
+  const RUNNING = ['✢ Effecting… (9s · thinking)', RULE, '❯ ', RULE];
+  const allow = async () => true;
+  const running = (f: ReturnType<typeof fixture>, n = 1) => {
+    f.state.agent = { ...f.state.agent, agentStatus: 'running', turn: { id: `t1:n.${n}`, state: 'running', startedAt: n } };
+    f.state.screen = RUNNING;
+  };
+  const withQueue = (f: ReturnType<typeof fixture>, over: Partial<NativeChatBridgeDeps<ChatPane>> = {}) => {
+    const events: ChatQueueEvent[] = [];
+    const bridge = createChatBridge({ ...f.deps, queue: new ChatQueueStore(f.dir), onQueueEvent: (e) => events.push(e), queueTickMs: 3_600_000, ...over });
+    const send = (text: string, extra: Record<string, unknown> = {}) =>
+      bridge.send(phoneSend(text, { queue: { authorized: allow }, ...extra }));
+    return { bridge, events, send };
+  };
+  const pastes = (f: ReturnType<typeof fixture>) => f.written.filter((w) => w.startsWith('\x1b[200~'));
+
+  it('pointer motion on the pane does not refuse a cap-less send, nor break its paste-to-Enter proof', async () => {
+    const f = fixture(); f.liveClaude(); running(f);
+    // A desktop renderer reporting motion: all input is recent, keys are quiet.
+    f.state.agent = { ...f.state.agent, inputQuiet: false, keyInputQuiet: true, keyInputRevision: 0 };
+    const bridge = createChatBridge({ ...f.deps, delay: async () => { f.state.agent.inputRevision += 3; } });
+    expect(await bridge.send(phoneSend('also this'))).toMatchObject({ result: 'sent', effect: 'submitted', queued: true });
+    expect(f.written).toEqual(['\x1b[200~also this\x1b[201~', '\r']);
+    // Someone typing is still refused.
+    f.state.agent = { ...f.state.agent, keyInputQuiet: false };
+    expect(await bridge.send(phoneSend('more'))).toMatchObject({ error: 'chat-busy', effect: 'none' });
+  });
+
+  it('next-turn stays the default: held through the running turn', async () => {
+    const f = fixture(); f.liveClaude(); running(f);
+    const q = withQueue(f);
+    expect(await q.send('later')).toMatchObject({ queueState: 'queued', queueDeliver: 'next-turn' });
+    await q.bridge.kickQueue('pane');
+    expect(f.written).toEqual([]);
+    expect(q.bridge.queue('device:a', 'pane')[0]).toMatchObject({ state: 'queued', deliver: 'next-turn' });
+  });
+
+  it('steer types into the running turn, ahead of another owner\'s next-turn items, and never over a dialog', async () => {
+    const f = fixture(); f.liveClaude(); running(f);
+    const q = withQueue(f);
+    await q.send('blocker', { owner: 'device:b' });
+    f.state.pendingApproval = 'apr_1';
+    const { clientMessageId } = await q.send('now', { queue: { authorized: allow, deliver: 'steer' } });
+    expect(f.written).toEqual([]);
+    expect(q.bridge.queue('device:a', 'pane')[0]).toMatchObject({ state: 'queued', deliver: 'steer' });
+    // A dialog only the screen shows holds it too.
+    f.state.pendingApproval = undefined;
+    f.state.screen = ['Select model', '❯ 1. Sonnet', '  2. Opus', 'Esc to cancel'];
+    await q.bridge.kickQueue('pane');
+    expect(f.written).toEqual([]);
+    f.state.screen = RUNNING;
+    await q.bridge.kickQueue('pane');
+    expect(pastes(f)).toEqual(['\x1b[200~now\x1b[201~']);
+    expect(q.bridge.queue('device:a', 'pane')[0]).toMatchObject({ clientMessageId, state: 'delivered', deliver: 'steer' });
+    expect(q.events.filter((e) => e.clientMessageId === clientMessageId).map((e) => [e.state, e.deliver]))
+      .toEqual([['queued', 'steer'], ['delivering', 'steer'], ['delivered', 'steer']]);
+    // The other owner's next-turn item still waits for the turn's end.
+    expect(q.bridge.queue('device:b', 'pane')[0]).toMatchObject({ state: 'queued', deliver: 'next-turn' });
+  });
+
+  it('switching a queued item to steer delivers it once', async () => {
+    const f = fixture(); f.liveClaude(); running(f);
+    const q = withQueue(f);
+    await q.send('blocker', { owner: 'device:b' });
+    const { clientMessageId } = await q.send('mine');
+    await q.bridge.kickQueue('pane');
+    expect(f.written).toEqual([]);
+    expect(q.bridge.steer('device:b', 'pane', clientMessageId)).toEqual({ ok: false, error: 'queue-item-not-found' });
+    expect(q.bridge.steer('device:a', 'pane', clientMessageId)).toEqual({ ok: true, state: 'queued', deliver: 'steer' });
+    await q.bridge.kickQueue('pane');
+    await q.bridge.kickQueue('pane');
+    expect(pastes(f)).toEqual(['\x1b[200~mine\x1b[201~']);
+    expect(q.bridge.queue('device:a', 'pane')[0]).toMatchObject({ state: 'delivered', deliver: 'steer' });
+    expect(q.bridge.steer('device:a', 'pane', clientMessageId)).toEqual({ ok: false, error: 'already-delivered', state: 'delivered' });
+    expect(await q.bridge.send(phoneSend('mine', { clientMessageId }))).toMatchObject({ replayed: true, queueState: 'delivered', queueDeliver: 'steer' });
+  });
+
+  it('Codex: steer falls back to next-turn', async () => {
+    const f = fixture();
+    f.state.projector = { ...FILE, terminal: { ...FILE.terminal!, agent: 'codex' } };
+    f.state.agent = { ...f.state.agent, agentName: 'Codex CLI', agentVerified: true };
+    running(f);
+    const q = withQueue(f);
+    const answer = await q.send('now', { historyEpoch: fileHistoryEpoch('codex', 'conv', 'a.jsonl'), queue: { authorized: allow, deliver: 'steer' } });
+    expect(answer).toMatchObject({ queueState: 'queued', queueDeliver: 'next-turn' });
+    expect(q.bridge.steer('device:a', 'pane', answer.clientMessageId)).toEqual({ ok: true, state: 'queued', deliver: 'next-turn' });
+    await q.bridge.kickQueue('pane');
     expect(f.written).toEqual([]);
   });
 });

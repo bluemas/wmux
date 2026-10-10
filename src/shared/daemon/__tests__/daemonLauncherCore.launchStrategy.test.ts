@@ -127,6 +127,20 @@ describe('daemonLauncherCore — launch strategy', () => {
     expect(spawnMock).not.toHaveBeenCalled();
   });
 
+  it('clears leftover launchd plists on entry, before any start', async () => {
+    const plistDir = path.join(wmuxDir, 'launchd');
+    fs.mkdirSync(plistDir, { recursive: true });
+    const leftover = path.join(plistDir, `com.wmux.daemon${process.env.WMUX_DATA_SUFFIX}.abc-1.plist`);
+    fs.writeFileSync(leftover, 'env');
+    let seenAtStart = true;
+    startMock.mockImplementation(async () => {
+      seenAtStart = fs.existsSync(leftover);
+      throw new Error('stop here');
+    });
+    await expect(ensureDaemon(deps(true))).rejects.toThrow(/stop here/);
+    expect(seenAtStart).toBe(false);
+  });
+
   it('keeps the plain spawn when the host did not opt in', async () => {
     const p = ensureDaemon(deps(false));
     await vi.waitFor(() => expect(spawnMock).toHaveBeenCalledTimes(1));

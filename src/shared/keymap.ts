@@ -35,6 +35,8 @@
  * what the resolver and user overrides speak.
  */
 
+import { PC_RAIL_SHORTCUTS } from './pcRail/shortcuts';
+
 /**
  * Every action a built-in shortcut can run. `prefix` is the tmux-style prefix
  * trigger: its key is configured separately (Settings → Prefix mode) and
@@ -47,6 +49,8 @@ export const SHORTCUT_ACTION_IDS = [
   'toggleNotifications', 'richInput', 'viCopyMode', 'renameWorkspace',
   'highlightPane', 'floatingPane',
   'prevWorkspace', 'nextWorkspace',
+  // PC rail (shared/pcRail/shortcuts.ts): cycle computers, back to this one.
+  'prevPc', 'nextPc', 'thisPc',
   'workspace1', 'workspace2', 'workspace3', 'workspace4', 'workspace5',
   'workspace6', 'workspace7', 'workspace8', 'workspace9',
   'closeWorkspace', 'jumpToUnread',
@@ -54,7 +58,7 @@ export const SHORTCUT_ACTION_IDS = [
   'focusUp', 'focusDown', 'focusLeft', 'focusRight',
   'focusUpAlt', 'focusDownAlt', 'focusLeftAlt', 'focusRightAlt',
   'toggleSidebar', 'openSettings', 'toggleFleetView', 'toggleCompanyView',
-  'clearMultiview', 'openBrowser', 'addBookmark', 'toggleMessageFeed',
+  'clearMultiview', 'openBrowser', 'openPrivateBrowser', 'addBookmark', 'toggleMessageFeed',
   'zoomIn', 'zoomOut', 'zoomReset',
   'mentionAgent',
   // Unbound by default (UNBOUND_SHORTCUTS): command-palette commands a user
@@ -150,6 +154,12 @@ export const WMUX_KEYMAP: readonly KeymapEntry[] = [
   { action: 'closeWorkspace', combo: 'Ctrl+Shift+W', descriptionKey: 'settings.sc.closeWorkspace' },
   { action: 'jumpToUnread', combo: 'Ctrl+Shift+U', descriptionKey: 'settings.sc.jumpToUnread' },
 
+  // Computers in the PC rail, as Alt+Up/Down cycles workspaces. Claimed only
+  // while a computer is paired: with none, or with a custom keybinding on the
+  // chord, the key goes on to the pane (useKeyboard, useTerminal). Never
+  // Ctrl+Alt+digit, which is AltGr on Windows.
+  ...PC_RAIL_SHORTCUTS.map((e): KeymapEntry => ({ action: e.action, combo: e.combo, descriptionKey: e.descriptionKey })),
+
   // Tabs and panes.
   { action: 'nextSurface', combo: 'Ctrl+Shift+]', descriptionKey: 'settings.sc.nextSurface' },
   { action: 'prevSurface', combo: 'Ctrl+Shift+[', descriptionKey: 'settings.sc.prevSurface' },
@@ -176,6 +186,8 @@ export const WMUX_KEYMAP: readonly KeymapEntry[] = [
   { action: 'toggleCompanyView', combo: 'Ctrl+Shift+O', descriptionKey: 'settings.sc.toggleCompanyView' },
   { action: 'clearMultiview', combo: 'Ctrl+Shift+G', descriptionKey: 'settings.sc.clearMultiview' },
   { action: 'openBrowser', combo: 'Ctrl+Shift+L', descriptionKey: 'settings.sc.openBrowser' },
+  // Chrome's incognito key (⌘⇧N on macOS).
+  { action: 'openPrivateBrowser', combo: 'Ctrl+Shift+N', descriptionKey: 'settings.sc.openPrivateBrowser' },
   // Bookmark / message-feed convention → literal Ctrl on every OS.
   { action: 'addBookmark', combo: 'Ctrl+M', literalCtrl: true, descriptionKey: 'settings.sc.addBookmark' },
   { action: 'toggleMessageFeed', combo: 'Ctrl+Shift+M', literalCtrl: true, descriptionKey: 'settings.sc.toggleMessageFeed' },
@@ -529,6 +541,48 @@ export function rebindProblem(
   if (prefixKey !== null && combo === 'Ctrl+' + prefixKey) return { kind: 'prefix' };
   const other = bindings.find((b) => b.combo === combo && b.action !== action);
   return other ? { kind: 'taken', by: other.action } : null;
+}
+
+/** The fields of a custom keybinding the conflict checks below read. */
+export interface CustomKeyLike {
+  key: string;
+  label: string;
+  command: string;
+}
+
+/**
+ * The custom keybindings a built-in moved to `combo` would silently take the
+ * key from (#1885). Built-ins are dispatched first, so a custom keybinding on
+ * the same key stops firing. Not a refusal like rebindProblem: the user may
+ * mean to take the key over, so Settings and the palette ask first.
+ *
+ * Plain string equality is the whole rule. Custom keys are stored with
+ * literal Ctrl / Shift / Alt in that order, the same order comboFromEvent
+ * spells them, and a ⌘ (`Meta+…`) built-in can never equal one, which is
+ * what the custom keybinding list's own conflict icon compares too.
+ */
+export function customKeybindingsOn<T extends CustomKeyLike>(
+  combo: string,
+  customKeybindings: readonly T[],
+): T[] {
+  return customKeybindings.filter((kb) => kb.key === combo);
+}
+
+/**
+ * The built-in that owns `key`, so a custom keybinding recorded there would
+ * never fire (#1885) — or null when nothing does. `bindings` are the
+ * built-ins in force (effectiveBindings), so a switched-off or moved built-in
+ * no longer claims its old key (#818, #1152); the prefix trigger owns
+ * Ctrl+<its key>.
+ */
+export function builtinOwning(
+  key: string,
+  bindings: readonly ShortcutBinding[],
+  prefixKeyCode: string,
+): ShortcutActionId | 'prefix' | null {
+  const prefixKey = comboKeyFromCode(prefixKeyCode);
+  if (prefixKey !== null && key === 'Ctrl+' + prefixKey) return 'prefix';
+  return bindings.find((b) => b.combo === key)?.action ?? null;
 }
 
 /**

@@ -2525,7 +2525,7 @@ SOFTWARE.
 
 ================================================================================
 
-@xterm/addon-fit@0.11.0
+@xterm/addon-fit@0.12.0-beta.301
 License: MIT
 Author: The xterm.js authors (https://xtermjs.org/)
 Repository: https://github.com/xtermjs/xterm.js/tree/master/addons/addon-fit
@@ -2552,7 +2552,7 @@ THE SOFTWARE.
 
 ================================================================================
 
-@xterm/addon-image@0.9.0
+@xterm/addon-image@0.10.0-beta.301
 License: MIT
 Author: The xterm.js authors (https://xtermjs.org/)
 Repository: https://github.com/xtermjs/xterm.js/tree/master/addons/addon-image
@@ -2579,7 +2579,7 @@ THE SOFTWARE.
 
 ================================================================================
 
-@xterm/addon-search@0.16.0
+@xterm/addon-search@0.17.0-beta.301
 License: MIT
 Author: The xterm.js authors (https://xtermjs.org/)
 Repository: https://github.com/xtermjs/xterm.js/tree/master/addons/addon-search
@@ -2606,7 +2606,7 @@ THE SOFTWARE.
 
 ================================================================================
 
-@xterm/addon-unicode11@0.9.0
+@xterm/addon-unicode11@0.10.0-beta.301
 License: MIT
 Author: The xterm.js authors (https://xtermjs.org/)
 Repository: https://github.com/xtermjs/xterm.js/tree/master/addons/addon-unicode11
@@ -2633,7 +2633,7 @@ THE SOFTWARE.
 
 ================================================================================
 
-@xterm/addon-web-links@0.12.0
+@xterm/addon-web-links@0.13.0-beta.301
 License: MIT
 Author: The xterm.js authors (https://xtermjs.org/)
 Repository: https://github.com/xtermjs/xterm.js/tree/master/addons/addon-web-links
@@ -2660,7 +2660,7 @@ THE SOFTWARE.
 
 ================================================================================
 
-@xterm/addon-webgl@0.19.0
+@xterm/addon-webgl@0.20.0-beta.300
 License: MIT
 Author: The xterm.js authors (https://xtermjs.org/)
 Repository: https://github.com/xtermjs/xterm.js/tree/master/addons/addon-webgl
@@ -2687,7 +2687,7 @@ THE SOFTWARE.
 
 ================================================================================
 
-@xterm/xterm@6.0.0
+@xterm/xterm@6.1.0-beta.304
 License: MIT
 Repository: https://github.com/xtermjs/xterm.js
 
@@ -11865,6 +11865,40 @@ The new look (theme tokens and terminal palettes in src/renderer/themes.ts,
   src/shared/ui/Modal.tsx, Popover.tsx, SecondaryButton.tsx
   src-tauri/src/macos.rs
   Icons are not taken.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+
+ego-lite
+License: MIT License
+Repository: https://github.com/citrolabs/ego-lite
+
+Copyright (c) 2026 CitroLabs
+
+Real-browser end-to-end test scenarios adapted from its source at commit
+dca7003349c5f7132189ba00547cbbd7ff8e597e
+(package/ego-browser/scripts/real-browser-e2e: fixture.mjs and the
+cases it names). The fixture pages and assertions were re-expressed as
+runtime tests of wmux's own snapshot and action code in
+src/mcp/playwright/__tests__/egoCorpus; each file names the case it came
+from. Test code only; nothing from it ships in wmux.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

@@ -99,6 +99,7 @@ export const SETTINGS_CATALOG: SettingsCatalogEntry[] = [
   { id: 'startdir', tab: 'terminal', labelKey: 'settings.startupDirectory', descKey: 'settings.startupDirectoryDesc', synonyms: 'cwd home folder path' },
   { id: 'splitcwd', tab: 'terminal', labelKey: 'settings.splitInheritsCwd', descKey: 'settings.splitInheritsCwdDesc', synonyms: 'cwd split inherit' },
   { id: 'closeonexit', tab: 'terminal', labelKey: 'settings.closeTabOnShellExit', descKey: 'settings.closeTabOnShellExitDesc', synonyms: 'exit close tab shell ctrl+d' },
+  { id: 'plaindragselect', tab: 'terminal', labelKey: 'settings.plainDragSelect', descKey: 'settings.plainDragSelectDesc', synonyms: 'mouse drag select selection copy highlight codex tracking shift option alt 드래그 선택 마우스' },
   { id: 'ime', tab: 'terminal', labelKey: 'settings.imeResidueGuard', descKey: 'settings.imeResidueGuardDesc', synonyms: 'ime korean cjk hangul 한글 입력' },
   { id: 'retention', tab: 'terminal', labelKey: 'settings.hiddenPaneRetention', descKey: 'settings.hiddenPaneRetentionDesc', synonyms: 'hidden render cpu park' },
   { id: 'coldpark', tab: 'terminal', labelKey: 'settings.coldPark', descKey: 'settings.coldParkDesc', synonyms: 'memory ram park idle unmount' },
@@ -121,6 +122,7 @@ export const SETTINGS_CATALOG: SettingsCatalogEntry[] = [
   { id: 'workspacesettleidle', tab: 'appearance', labelKey: 'settings.workspaceSettleIdleDays', descKey: 'settings.workspaceSettleIdleDaysDesc', synonyms: 'settle settled idle days finished snooze hide quiet sidebar 마무리 미뤄두기 유휴' },
   { id: 'multiview', tab: 'appearance', labelKey: 'settings.multiviewArrangement', descKey: 'settings.multiviewArrangementDesc', synonyms: 'grid split stack columns rows' },
   { id: 'uiscale', tab: 'appearance', labelKey: 'settings.uiScale', descKey: 'settings.uiScaleDesc', synonyms: 'zoom dpi accessibility scale 배율' },
+  { id: 'titlebarvitals', tab: 'appearance', labelKey: 'settings.titlebarVitals', descKey: 'settings.titlebarVitalsDesc', synonyms: 'memory ram cpu usage gauge chip titlebar status vitals 메모리 사용량 타이틀바' },
   { id: 'toolbar', tab: 'appearance', labelKey: 'settings.agentToolbarShow', descKey: 'settings.agentToolbarShowDesc', synonyms: 'toolbar compose new chat' },
 
   { id: 'sound', tab: 'notifications', labelKey: 'settings.sound', descKey: 'settings.soundDesc', synonyms: 'sound audio beep alarm 소리' },
@@ -168,6 +170,7 @@ export const SETTINGS_CATALOG: SettingsCatalogEntry[] = [
   { id: 'fullpower', tab: 'moa', labelKey: 'settings.orchestratorFullPower', synonyms: 'full power sdk settings sources tools' },
   { id: 'autowake', tab: 'moa', labelKey: 'settings.autoWake', descKey: 'settings.autoWakeDesc', synonyms: 'autowake wake event push tokens' },
   { id: 'ledgergate', tab: 'moa', labelKey: 'settings.ledgerGate', descKey: 'settings.ledgerGateDesc', synonyms: 'ledger gate stop task orchestrator delegated experimental' },
+  { id: 'fleetfastpath', tab: 'moa', labelKey: 'moa.settings.fleetFastPath', descKey: 'moa.settings.fleetFastPathDesc', synonyms: 'fleet status local fast answer who needs me read only 작업 상태 로컬' },
   { id: 'briefing', tab: 'moa', labelKey: 'settings.briefing', descKey: 'settings.briefingDesc', synonyms: 'briefing welcome home summary' },
 
   { id: 'roles', tab: 'roles', labelKey: 'settings.roleBindings', descKey: 'settings.roleBindingsDesc', synonyms: 'role reviewer tester planner model bind' },
@@ -184,8 +187,10 @@ export const SETTINGS_CATALOG: SettingsCatalogEntry[] = [
   { id: 'browserlight', tab: 'browser', labelKey: 'settings.browserLightweight', descKey: 'settings.browserLightweightDesc', synonyms: 'browser throttle cpu lightweight' },
   { id: 'sitememory', tab: 'browser', labelKey: 'settings.siteMemory', descKey: 'settings.siteMemoryDesc', synonyms: 'browser site memory domain replay failure remember' },
   { id: 'computeruse', tab: 'computer-use', labelKey: 'settings.computerUse', descKey: 'settings.computerUseDesc', synonyms: 'computer use desktop control apps screenshot click automation 컴퓨터 사용 데스크톱 조작' },
-  { id: 'computerusehelper', tab: 'computer-use', labelKey: 'settings.computerUseHelper', descKey: 'settings.computerUseHelperDesc', synonyms: 'computer use helper native uia accessibility 헬퍼' },
+  { id: 'computerusehelper', tab: 'computer-use', labelKey: 'settings.computerUseHelper', descKey: 'settings.computerUseHelperDesc', synonyms: 'computer use helper native uia accessibility screen recording permissions reset access tcc 헬퍼 권한 화면 기록' },
   { id: 'computerusestop', tab: 'computer-use', labelKey: 'settings.computerUseStopKey', descKey: 'settings.computerUseStopKeyDesc', synonyms: 'computer use stop abort kill emergency hotkey 정지 중단' },
+  { id: 'computeruseask', tab: 'computer-use', labelKey: 'settings.computerUseConsent', descKey: 'settings.computerUseConsentDesc', synonyms: 'computer use consent ask each app prompt permission 앱마다 묻기 동의' },
+  { id: 'computeruseoverlay', tab: 'computer-use', labelKey: 'settings.computerUseOverlay', descKey: 'settings.computerUseOverlayDesc', synonyms: 'computer use agent cursor halo overlay highlight 테두리' },
   { id: 'siteguides', tab: 'browser', labelKey: 'settings.siteGuides', descKey: 'settings.siteGuidesDesc', synonyms: 'browser site guides notes chrome agent' },
 
   { id: 'paireddevices', tab: 'remote', labelKey: 'web.devicesTitle', descKey: 'web.devicesSubtitle', synonyms: 'phone mobile device paired revoke remote web 휴대폰 기기' },

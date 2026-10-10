@@ -54,6 +54,8 @@ import {
   type FanoutSetupSkipReason,
 } from './fanoutEnvironment';
 import { workerTempEnv } from './fanoutTempDir';
+import { goalWorkerEnv, goalWorkerPromptNote } from '../../shared/moaGoalWorker';
+import type { MoaGoalTerms } from '../../shared/moaGoal';
 import { inheritTaskAutonomy } from './taskAutonomy';
 import { getFanOutGuards, type FanOutGuards } from './fanoutGuards';
 import { loadFanoutWorkerPermissionMode } from './fanoutWorkerPolicy';
@@ -67,6 +69,7 @@ import {
   type FanoutWorkerPermissionMode,
 } from '../../shared/workerLaunch';
 import { promptFileArgument } from '../../shared/promptFileArgument';
+import { AGENT_SLUG_SET } from '../../shared/agentIdentity';
 import {
   clearFirstRunPrompts,
   detectFirstRunPrompt,
@@ -152,6 +155,10 @@ export interface FanOutRendererPort {
      *  task runs on. Data, not a command — the renderer re-validates it and
      *  turns it into a RoleBinding on the same rewrite path a role uses. */
     agentChoice?: FanoutAgentChoice;
+    /** The task runs under an approved Moa goal: the renderer adds the goal
+     *  deny rules to the worker flags and refuses a launcher other than
+     *  claude (shared/moaGoalWorker.ts). */
+    goalWorker?: boolean;
   }): Promise<
     | {
         workspaceId: string;
@@ -164,6 +171,34 @@ export interface FanOutRendererPort {
     | { error: string }
   >;
 }
+
+/**
+ * #1919 — "is an agent running in this pane right now?", asked after a task's
+ * pane is spawned. `true` = an agent was seen; `false` = positive evidence
+ * that none runs (no agent identity, no agent process, and the pane's shell
+ * has no child process); `undefined` = cannot tell (no daemon, the pane is
+ * gone, identity not known yet, the read failed). Only `false` ever counts
+ * against a launch, and only from a `confirm` call: the check polls without
+ * it and asks with it once, after its bound, because confirming reads the
+ * process table.
+ */
+export interface FanOutLaunchProbe {
+  agentRunning(ptyId: string, opts?: { confirm?: boolean }): Promise<boolean | undefined>;
+}
+
+/** #1919 — how long a fan-out worker's agent has to show up in its pane before
+ *  the task is reported as a failed launch. Generous on purpose: the daemon
+ *  names a real agent within seconds (its banner, its first hook, or the
+ *  process probe after OSC 133 command-start), so the bound only has to
+ *  outlast a slow cold start, not a turn. */
+export const FANOUT_LAUNCH_CONFIRM_MS = 45_000;
+/** #1919 — spacing between two launch probes. */
+export const FANOUT_LAUNCH_POLL_MS = 1_500;
+
+/** #1920/#1921 — waits before the second and third attempt of a post-spawn
+ *  daemon write (materialization, mission-channel invite). Both writes are
+ *  idempotent, so a retry after an ambiguous failure is safe. */
+export const FANOUT_WIRING_RETRY_DELAYS_MS: readonly number[] = [500, 2_000];
 
 /**
  * T2 — per-project `wmux.json` state + trust verdict (ProjectConfigStore.getState).
@@ -246,6 +281,15 @@ export interface FanOutRequest {
    *  dropped), so the caller can record it the way it recorded the first wave.
    *  `remaining` is how many still wait; 0 means this fan-out is fully settled. */
   onDeferredLaunch?: (task: FanOutTaskResult, info: { remaining: number; outputBatchDir?: string }) => void;
+  /** Called the moment a task's workspace exists (before the result is
+   *  returned), so a caller that scopes powers to these workspaces (the Moa
+   *  goal contract) knows them before the task's first event can arrive. */
+  onTaskWorkspace?: (workspaceId: string, index: number) => void;
+  /** Set when the fan-out runs under an approved Moa goal contract: every
+   *  task gets the goal worker profile (shared/moaGoalWorker.ts) — extra deny
+   *  rules, credential friction and a prompt note — and a task whose final
+   *  launcher is not claude is refused by the renderer. */
+  goalWorker?: { goalId: string; terms?: MoaGoalTerms };
 }
 
 /** How long a dependent task may wait before it is dropped. A dependency whose
@@ -299,6 +343,11 @@ export interface FanOutTaskResult {
   /** A-1 — the first-run screen is STILL on the worker's pane: it needs a human
    *  keypress, and the task's ledger row was moved to `input_required`. */
   firstRunStuck?: boolean;
+  /** #1919 — the pane was spawned but no agent ever started in it within
+   *  FANOUT_LAUNCH_CONFIRM_MS (the launch line was lost, or the agent exited
+   *  at once). Set after the fan-out result was first returned, so a poll sees
+   *  it; the task's ledger row was moved to `input_required`. */
+  launchFailed?: boolean;
   /** dependsOn — not spawned yet: waiting for these task indices. Replaced in
    *  the cached result by the real task result once it launches (or is
    *  dropped because a dependency failed or was cancelled). */
@@ -360,6 +409,13 @@ export interface FanOutServiceOptions {
   /** Per-worker private temp dir (TMPDIR/TMP/TEMP). Absent = feature off
    *  (tests); production wires the fanoutTempDir module. */
   workerTempDirs?: WorkerTempDirPort;
+  /** #1919 — post-spawn agent liveness probe. Absent = no launch check. */
+  launchProbe?: FanOutLaunchProbe;
+  /** #1919 — launch check tuning (tests shorten it). */
+  launchConfirmMs?: number;
+  launchPollMs?: number;
+  /** #1920/#1921 — retry waits for the post-spawn daemon writes (tests pass zeros). */
+  wiringRetryDelaysMs?: readonly number[];
 }
 
 /** Create / hand over / discard a worker's private temp dir. */
@@ -425,6 +481,12 @@ export class FanOutService {
   /** dependsOn — fan-out key → drop its still-waiting tasks. */
   private readonly waitingDependents = new Map<string, (reason: string) => number>();
   private readonly workerTempDirs?: WorkerTempDirPort;
+  private readonly launchProbe?: FanOutLaunchProbe;
+  private readonly launchConfirmMs: number;
+  private readonly launchPollMs: number;
+  private readonly wiringRetryDelaysMs: readonly number[];
+  /** #1919 — launch checks still in flight (tests await them). */
+  private pendingLaunchChecks: Promise<void>[] = [];
 
   /** §2 G1 멱등: 키 → 완료 결과 LRU. 동일 키 재호출은 직전 결과 반환. */
   private readonly results = new Map<string, FanOutResult>();
@@ -446,6 +508,19 @@ export class FanOutService {
     this.workerTempDirs = opts.workerTempDirs;
     this.ledger = opts.ledger;
     this.dependencyWaitMs = opts.dependencyWaitMs ?? FANOUT_DEPENDENCY_WAIT_MS;
+    this.launchProbe = opts.launchProbe;
+    this.launchConfirmMs = opts.launchConfirmMs ?? FANOUT_LAUNCH_CONFIRM_MS;
+    this.launchPollMs = opts.launchPollMs ?? FANOUT_LAUNCH_POLL_MS;
+    this.wiringRetryDelaysMs = opts.wiringRetryDelaysMs ?? FANOUT_WIRING_RETRY_DELAYS_MS;
+  }
+
+  /** Tests only: settle every launch check scheduled so far. */
+  async settleLaunchChecks(): Promise<void> {
+    while (this.pendingLaunchChecks.length > 0) {
+      const batch = this.pendingLaunchChecks;
+      this.pendingLaunchChecks = [];
+      await Promise.all(batch);
+    }
   }
 
   /** Drop every task of fan-out `key` still waiting on its dependencies (one
@@ -611,9 +686,12 @@ export class FanOutService {
     const env = await this.resolveEnvironment(req.repoPath, n);
     const workerMode = req.workerPermissionMode ?? this.workerPermissionMode();
     const requester = sanitizeFanoutOrigin(req.caller);
+    const launchFailures = lateLaunchFailureSink(this.launchConfirmMs);
 
     // ── 태스크 순차 처리(직렬 큐가 이미 강제하지만, 스폰 부하도 직렬로) ──
     const common = (k: number) => ({
+      onLaunchFailed: launchFailures.notify,
+      ...(req.onTaskWorkspace ? { onWorkspace: req.onTaskWorkspace } : {}),
       index: k,
       title: titles[k],
       prompt: effectivePrompts[k],
@@ -625,6 +703,7 @@ export class FanOutService {
       ...(entries[k].role ? { role: entries[k].role } : {}),
       ...(entries[k].agent ? { agentChoice: entries[k].agent } : {}),
       ...(req.branches?.[k] ? { branch: req.branches[k] } : {}),
+      ...(req.goalWorker ? { goalWorker: req.goalWorker } : {}),
       workerMode,
       requester,
     });
@@ -693,6 +772,9 @@ export class FanOutService {
       }
     });
     if (warnings.length > 0) result.warnings = warnings;
+    // A launch check that already failed (or fails later) reports on this
+    // result: it is the object every later poll reads.
+    launchFailures.attach(result);
     return result;
   }
 
@@ -885,9 +967,12 @@ export class FanOutService {
     }
     const workerMode = req.workerPermissionMode ?? this.workerPermissionMode();
     const requester = sanitizeFanoutOrigin(req.caller);
+    const launchFailures = lateLaunchFailureSink(this.launchConfirmMs);
     const tasks: FanOutTaskResult[] = [];
     const spawnAt = (k: number, done: FanOutTaskResult[]): Promise<FanOutTaskResult> =>
       this.spawnOne({
+        onLaunchFailed: launchFailures.notify,
+        ...(req.onTaskWorkspace ? { onWorkspace: req.onTaskWorkspace } : {}),
         index: k,
         title: entries[k].title,
         prompt: effectivePrompts[k],
@@ -899,6 +984,7 @@ export class FanOutService {
         output: { batchDir },
         ...(entries[k].role ? { role: entries[k].role } : {}),
         ...(entries[k].agent ? { agentChoice: entries[k].agent } : {}),
+        ...(req.goalWorker ? { goalWorker: req.goalWorker } : {}),
         workerMode,
         requester,
         taskNote: taskGraphNote(k, graph, done),
@@ -915,6 +1001,7 @@ export class FanOutService {
     const warnings: string[] = [];
     this.scheduleDependents(req, result, graph, warnings, (k) => spawnAt(k, result.tasks));
     if (warnings.length > 0) result.warnings = warnings;
+    launchFailures.attach(result);
     return result;
   }
 
@@ -1003,6 +1090,12 @@ export class FanOutService {
     requester?: FanoutOrigin;
     /** Write scope / dependency notes (taskGraphNote); '' = none. */
     taskNote?: string;
+    /** #1919 — called when the launch check concludes the agent never started. */
+    onLaunchFailed?: (task: FanOutTaskResult) => void;
+    /** See FanOutRequest.onTaskWorkspace. */
+    onWorkspace?: (workspaceId: string, index: number) => void;
+    /** See FanOutRequest.goalWorker. */
+    goalWorker?: { goalId: string; terms?: MoaGoalTerms };
   }): Promise<FanOutTaskResult> {
     const base: FanOutTaskResult = { index: ctx.index, title: ctx.title, ok: false };
     if (ctx.agentChoice) base.agent = ctx.agentChoice.agent;
@@ -1099,11 +1192,20 @@ export class FanOutService {
     };
 
     let promptPath: string | undefined;
+    // Goal worker profile: an empty gh config dir beside the task's metadata
+    // (outside the worktree). Failing to make it fails the task: the profile
+    // is part of what the operator approved, so no worker runs without it.
+    let goalGhConfigDir: string | undefined;
     try {
       fs.mkdirSync(metaDir, { recursive: true });
+      if (ctx.goalWorker) {
+        goalGhConfigDir = path.join(metaDir, 'goal-gh-config');
+        fs.mkdirSync(goalGhConfigDir, { recursive: true });
+      }
       // A declared scope or dependency is written even with no prompt: the
-      // worker must know what it may edit before it edits anything.
-      const taskNote = ctx.taskNote ?? '';
+      // worker must know what it may edit before it edits anything. So is a
+      // goal worker's note, which says what stays with the operator.
+      const taskNote = (ctx.taskNote ?? '') + (ctx.goalWorker ? goalWorkerPromptNote(ctx.goalWorker.goalId, ctx.goalWorker.terms) : '');
       if (ctx.prompt.length > 0 || taskNote.length > 0) {
         promptPath = path.join(metaDir, 'prompt.md');
         // A3: the caller's prompt verbatim, then the delivery contract (see
@@ -1181,7 +1283,13 @@ export class FanOutService {
     // post-spawn watch below keys on the command that was actually launched.
     // A preset/agents choice names the real CLI; the command main sends still
     // starts with the default one (the renderer swaps it), so key on the choice.
-    const paneEnv = { ...taskEnv, ...firstRunEnvForAgent(ctx.agentChoice?.agent ?? ctx.agentCmd) };
+    // The goal worker's credential friction rides the PANE env only: the setup
+    // hook above ran with the plain task env and may legitimately need git.
+    const paneEnv = {
+      ...taskEnv,
+      ...firstRunEnvForAgent(ctx.agentChoice?.agent ?? ctx.agentCmd),
+      ...(ctx.goalWorker && goalGhConfigDir ? goalWorkerEnv(goalGhConfigDir) : {}),
+    };
     let workspaceId: string;
     // The renderer resolves the final launcher (a role binding may make it agy)
     // and asks main to pre-trust this folder for agy; main agrees only while
@@ -1199,6 +1307,7 @@ export class FanOutService {
         fanoutTaskOf: ctx.verifiedWorkspaceId,
         ...(ctx.requester ? { fanoutOrigin: ctx.requester } : {}),
         workerPermissionMode: ctx.workerMode,
+        ...(ctx.goalWorker ? { goalWorker: true } : {}),
       });
       if ('error' in spawned) {
         handOverTempDir(`task:${taskId}`);
@@ -1220,6 +1329,11 @@ export class FanOutService {
       releaseAgyTrust();
     }
     base.workspaceId = workspaceId;
+    try {
+      ctx.onWorkspace?.(workspaceId, ctx.index);
+    } catch (err) {
+      console.warn(`[fanout] onTaskWorkspace threw for ${workspaceId}: ${String(err)}`);
+    }
     handOverTempDir(workspaceId);
     // The renderer already stamped the lineage before the agent launched; this
     // second write is idempotent and covers a renderer that did not. It carries
@@ -1236,32 +1350,47 @@ export class FanOutService {
     // 이 RPC는 MCP 도구 표면은 없지만 파이프 라우터 등록으로 first-party 클라이언트에
     // 도달 가능하다(F4). 변이 방어는 데몬의 owner OR CEO authz 게이트 + 물질화 단조
     // 게이트(이중 물질화 차단)에 있고, main의 이 경로는 owner 신원으로 스탬프된다.
-    try {
-      const updated = (await this.daemon.rpc('task.mission.update', {
-        taskId,
-        verifiedWorkspaceId: ctx.verifiedWorkspaceId,
-        ...(plan ? { branch: plan.branch, worktreePath: plan.worktreePath } : { outputDir: cwd }),
-        paneGroupId: workspaceId,
-      })) as { ok?: boolean; error?: unknown };
-      if (!updated?.ok) {
-        // 미물질화 — 태스크·워크스페이스·worktree는 성립했으나 필드 커밋 실패.
-        // §2 크래시 창 계약: 태스크는 open으로 남고 리포트가 "미물질화"로 노출,
-        // 사람이 close(자동 재물질화는 J3). 보상 close는 하지 않는다(스폰 성립분 보존).
-        return { ...base, unmaterialized: true, error: `task.update failed: ${describeErr(updated?.error)}` };
+    //
+    // #1921: retried, because the daemon accepts a same-value rewrite as an
+    // idempotent no-op, so a retry after a timeout or a lost reply is safe.
+    // And a failure here no longer ends the wiring: the pane EXISTS and its
+    // worker is starting, so the owner must still get its ledger row (the T5
+    // read lane and the brain both read it) and the worker must still get its
+    // mission-channel seat. Returning early is what left workers the caller
+    // could not read and that could not post their report.
+    let materializeError: string | undefined;
+    const materialized = await this.retryDaemonWrite(async () => {
+      try {
+        const updated = (await this.daemon.rpc('task.mission.update', {
+          taskId,
+          verifiedWorkspaceId: ctx.verifiedWorkspaceId,
+          ...(plan ? { branch: plan.branch, worktreePath: plan.worktreePath } : { outputDir: cwd }),
+          paneGroupId: workspaceId,
+        })) as { ok?: boolean; error?: unknown };
+        if (updated?.ok) return true;
+        materializeError = `task.update failed: ${describeErr(updated?.error)}`;
+      } catch (err) {
+        materializeError = `task.update threw: ${(err as Error).message}`;
       }
-    } catch (err) {
-      return { ...base, unmaterialized: true, error: `task.update threw: ${(err as Error).message}` };
-    }
+      return false;
+    });
+    // 미물질화 — 태스크·워크스페이스·worktree는 성립했으나 필드 커밋 실패.
+    // §2 크래시 창 계약: 태스크는 open으로 남고 리포트가 "미물질화"로 노출,
+    // 사람이 close(자동 재물질화는 J3). 보상 close는 하지 않는다(스폰 성립분 보존).
+    if (!materialized) console.warn(`[fanout] ${taskId} left unmaterialized: ${materializeError}`);
+
     // A-2 precondition: the task workspace inherits the owner's autonomy, or
     // `decideApprovalPress` refuses every press into this worker with
     // `press-capability-off` (a workspace with no entry has no capabilities).
     // Best-effort and never fatal — see taskAutonomy.ts for the policy.
     await this.inheritAutonomy(ctx.verifiedWorkspaceId, workspaceId);
 
-    // Lane F: the materialized task enters the ledger as `working` right here,
-    // so the owner's brain, the Stop gate and the workers read one state from
-    // the first second. Best-effort: a ledger write failure never fails the
-    // fan-out (the reconciler mirrors it on the next look).
+    // Lane F: the task enters the ledger as `working` right here, so the
+    // owner's brain, the Stop gate and the workers read one state from the
+    // first second. Keyed on the workspace the renderer just returned, which
+    // main knows whether or not ④ committed (#1921). Best-effort: a ledger
+    // write failure never fails the fan-out (the reconciler mirrors a
+    // materialized task on the next look).
     try {
       rememberMissionChannel(taskId, channelId);
       await getTaskLedger().register({
@@ -1275,16 +1404,29 @@ export class FanOutService {
     }
 
     // ⑤ 채널 invite — 태스크 워크스페이스를 미션 채널 멤버로(실패 비치명 §2 C3).
-    let channelDisconnected = false;
-    try {
-      const invited = (await this.daemon.rpc('a2a.channel.invite', {
-        channelId,
-        invitedMember: { workspaceId, memberId: workspaceId },
-        verifiedWorkspaceId: ctx.verifiedWorkspaceId,
-      })) as { ok?: boolean; error?: unknown };
-      if (!invited?.ok) channelDisconnected = true;
-    } catch {
-      channelDisconnected = true;
+    // #1920: retried, and DUPLICATE_MEMBER counts as seated — a first attempt
+    // that timed out after the daemon applied it must not read as a failure.
+    // A worker that is still left out can join its own mission channel (the
+    // daemon's join gate admits a mission's materialized task workspace).
+    let inviteError: string | undefined;
+    const invited = await this.retryDaemonWrite(async () => {
+      try {
+        const res = (await this.daemon.rpc('a2a.channel.invite', {
+          channelId,
+          invitedMember: { workspaceId, memberId: workspaceId },
+          verifiedWorkspaceId: ctx.verifiedWorkspaceId,
+        })) as { ok?: boolean; error?: unknown };
+        if (res?.ok) return true;
+        if (errorCode(res?.error) === 'DUPLICATE_MEMBER') return true;
+        inviteError = describeErr(res?.error);
+      } catch (err) {
+        inviteError = (err as Error).message;
+      }
+      return false;
+    });
+    const channelDisconnected = !invited;
+    if (channelDisconnected) {
+      console.warn(`[fanout] ${workspaceId} could not be seated in mission channel ${channelId}: ${inviteError}`);
     }
 
     // T3 — the worker should know its base is not a fresh origin commit. Posted
@@ -1309,7 +1451,127 @@ export class FanOutService {
     // human keypress instead of one that silently never starts.
     await this.watchFirstRun(base, ctx.verifiedWorkspaceId);
 
-    return { ...base, ok: true, channelDisconnected };
+    const done: FanOutTaskResult = materialized
+      ? { ...base, ok: true, channelDisconnected }
+      : {
+          ...base,
+          ok: false,
+          unmaterialized: true,
+          error: materializeError ?? 'task.update failed',
+          channelDisconnected,
+        };
+    // #1919 — confirm the agent actually started. Off the critical path: the
+    // result goes back now, and the check marks it (and the ledger) if not.
+    this.scheduleLaunchCheck(done, ctx.verifiedWorkspaceId, ctx.onLaunchFailed);
+    return done;
+  }
+
+  /** Run `attempt` up to 1 + wiringRetryDelaysMs.length times, waiting the
+   *  given delay before each retry. Resolves true on the first success. */
+  private async retryDaemonWrite(attempt: () => Promise<boolean>): Promise<boolean> {
+    if (await attempt()) return true;
+    for (const delay of this.wiringRetryDelaysMs) {
+      if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+      if (await attempt()) return true;
+    }
+    return false;
+  }
+
+  /**
+   * #1919 — a fan-out answers `accepted` long before its worker's agent is up,
+   * and the launch line typed into the new shell can be lost (an rc file that
+   * discards typeahead, a shell that was not ready yet). The pane then sits at
+   * a bare prompt while every report says the task is running.
+   *
+   * Polls the launch probe until an agent is seen or launchConfirmMs passes,
+   * then asks once more with `confirm`. Only that confirming answer can fail
+   * the task, and only when it is `false` — positive evidence that no agent
+   * process runs in the pane. An unknown answer (no daemon, pane closed,
+   * identity not known yet, read error) is no evidence, so a check that never
+   * got a definite answer concludes nothing.
+   *
+   * On failure: the task result (the object every later poll reads) gets
+   * `launchFailed`, `ok: false` and an error naming the pane and the line to
+   * re-run; the fan-out result gets a warning (onLaunchFailed); the ledger row
+   * moves to `input_required`. Not `failed`: the T5 read lane covers OPEN rows
+   * only, and the caller needs that lane to look at the pane and re-run the
+   * line in it.
+   */
+  private scheduleLaunchCheck(
+    task: FanOutTaskResult,
+    ownerWorkspaceId: string,
+    onLaunchFailed?: (task: FanOutTaskResult) => void,
+  ): void {
+    const probe = this.launchProbe;
+    const ptyId = task.ptyId;
+    if (!probe || !ptyId || !task.workspaceId) return;
+    // A first-run screen was seen: the agent IS running in that pane.
+    if (task.firstRunPrompt) return;
+    // Only a known agent launcher: the daemon names nothing else, so a check
+    // on any other command would report every such task as failed.
+    const { command } = splitModelEnvMarker(task.initialCommand ?? '');
+    if (!AGENT_SLUG_SET.has(launcherStem(command))) return;
+    const confirmMs = this.launchConfirmMs;
+    const pollMs = this.launchPollMs;
+    const ask = (confirm: boolean): Promise<boolean | undefined> =>
+      probe.agentRunning(ptyId, confirm ? { confirm: true } : undefined).catch(() => undefined);
+    const run = async (): Promise<void> => {
+      const started = Date.now();
+      for (;;) {
+        if ((await ask(false)) === true) return;
+        if (Date.now() - started >= confirmMs) break;
+        await new Promise((resolve) => setTimeout(resolve, pollMs));
+      }
+      // The confirming answer decides between "never started" and "could not
+      // tell": only positive evidence of absence fails the task. A pane that
+      // was closed meanwhile, or an agent whose identity is still unknown,
+      // is not a failed launch.
+      if ((await ask(true)) !== false) return;
+      const seconds = Math.round(confirmMs / 1000);
+      task.launchFailed = true;
+      task.ok = false;
+      // The line itself goes in the task's error only: on Windows it is a
+      // long PowerShell expression, and the warning should stay one readable line.
+      task.error =
+        `${launchFailedHeadline(ptyId, seconds)}` +
+        (task.initialCommand ? `; re-run the launch line there: ${task.initialCommand}` : '');
+      await this.markLaunchFailed(task.taskId, ownerWorkspaceId, ptyId, seconds);
+      try {
+        onLaunchFailed?.(task);
+      } catch (err) {
+        console.warn(`[fanout] launch-failure callback failed: ${String(err)}`);
+      }
+      console.warn(`[fanout] ${task.taskId ?? task.title}: ${task.error}`);
+    };
+    this.pendingLaunchChecks.push(run().catch(() => { /* best-effort — see above */ }));
+  }
+
+  /** #1919 — move a never-launched task's ledger row to `input_required`.
+   *  Best-effort, like markFirstRunStuck. A row the worker already moved is
+   *  left alone: it proves the agent ran after all. */
+  private async markLaunchFailed(
+    taskId: string | undefined,
+    ownerWorkspaceId: string,
+    ptyId: string,
+    seconds: number,
+  ): Promise<void> {
+    if (!taskId) return;
+    try {
+      const ledger = getTaskLedger();
+      const entry = ledger.list({ id: taskId })[0];
+      if (!entry || entry.status !== 'working' || entry.rev !== 1) return;
+      await ledger.update({
+        id: taskId,
+        status: 'input_required',
+        actor: { kind: 'system', workspaceId: ownerWorkspaceId },
+        expectedRev: entry.rev,
+        summary:
+          `launch failed: no agent started in pane ${ptyId} within ${seconds}s, so the pane sits at its shell prompt; ` +
+          "re-run the task's launch line in that pane (the fan-out result carries it)",
+      });
+    } catch {
+      // best-effort — the result already carries launchFailed.
+    }
   }
 
   /** A-2 — hand the task workspace its owner's autonomy (see taskAutonomy.ts).
@@ -1501,6 +1763,46 @@ export function taskGraphNote(k: number, graph: FanoutTaskGraph, done: FanOutTas
       'If they are not, merge their branches (local to this repository) before building on them.';
   }
   return note;
+}
+
+/** The `code` of a daemon error envelope, or '' for any other shape. */
+function errorCode(err: unknown): string {
+  if (!err || typeof err !== 'object') return '';
+  const code = (err as { code?: unknown }).code;
+  return typeof code === 'string' ? code : '';
+}
+
+/**
+ * #1919 — where a launch check reports a failure on the fan-out result. The
+ * check can conclude before the result object exists (a test with a zero
+ * bound) or long after it was returned, so failures queue until `attach`.
+ */
+/** #1919 — the one-line statement of a failed launch. */
+function launchFailedHeadline(ptyId: string, seconds: number): string {
+  return `the agent did not start in pane ${ptyId} within ${seconds}s`;
+}
+
+function lateLaunchFailureSink(confirmMs: number): {
+  notify: (task: FanOutTaskResult) => void;
+  attach: (result: FanOutResult) => void;
+} {
+  let target: FanOutResult | undefined;
+  const early: FanOutTaskResult[] = [];
+  const apply = (result: FanOutResult, task: FanOutTaskResult): void => {
+    result.ok = result.tasks.every((t) => t.ok || t.pending);
+    const where = task.ptyId ? launchFailedHeadline(task.ptyId, Math.round(confirmMs / 1000)) : 'the agent did not start';
+    addWarning(result, `task ${task.index + 1} (${task.title}): ${where}; its error carries the line to re-run`);
+  };
+  return {
+    notify: (task) => {
+      if (target) apply(target, task);
+      else early.push(task);
+    },
+    attach: (result) => {
+      target = result;
+      for (const task of early.splice(0)) apply(result, task);
+    },
+  };
 }
 
 /** 에러 값 표시(문자열/객체 방어). */

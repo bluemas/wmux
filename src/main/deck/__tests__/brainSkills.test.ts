@@ -106,7 +106,9 @@ describe('buildBrainSkills', () => {
     // The two ways a brain gets this wrong on its own: treating an unfinished
     // fan-out as failed, and minting a fresh key on a slow poll.
     expect(fanout).toContain('idempotency_key');
-    expect(fanout).toContain('never auto-approved');
+    // Truthful since 2026-09-24: no approval by default, the Settings switch
+    // turns it back on.
+    expect(fanout).toContain('does not ask by default');
     // Roles are the multi-agent story; without this the tool reads as
     // "N copies of the same agent".
     expect(fanout).toContain('roles');
@@ -227,3 +229,12 @@ describe('syncBrainContractFile writes atomically', () => {
     }
   });
 });
+
+describe('Moa on another PC', () => {
+  it('tells Moa not to raise a waiting card once a sent task shows a receipt', () => {
+    const text = buildBrainSkills().map((f) => f.content).join('\n');
+    expect(text).toContain('Do not raise a decision card to ask whether to keep waiting or to be\nwoken');
+    expect(text).toContain('remoteReceipt');
+  });
+});
+

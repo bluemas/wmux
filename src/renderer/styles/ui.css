@@ -132,6 +132,36 @@
   font-variant-numeric: tabular-nums;
   letter-spacing: normal;
 }
+/* PC switcher: the Workspaces title itself, opening the computer dropdown.
+ * Inherits the band's type; a host name keeps its own case. */
+.wmux-pc-switcher {
+  margin-left: -4px;
+  padding: 2px 4px;
+  color: inherit;
+  font: inherit;
+  text-transform: inherit;
+  letter-spacing: inherit;
+}
+.wmux-pc-switcher:hover { background: var(--selection-hover); }
+.wmux-pc-switcher-name { text-transform: none; letter-spacing: normal; }
+/* Needs-you of the computers not on screen: the attention number badge. */
+.wmux-pc-switcher-badge {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 9999px;
+  background: var(--attention);
+  color: var(--attention-ink);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: normal;
+}
 .wmux-sidebar-footer { min-height: 40px; padding: 4px 8px; }
 .wmux-sidebar-footer .wmux-nav-button { min-height: 32px; }
 /* Card rows. The 1px transparent border reserves the room the needs-you
@@ -829,49 +859,94 @@ details[open] > .wmux-chatv2-tool-line .wmux-chatv2-chevron { transform: rotate(
 .wmux-nav-button[aria-expanded="true"] { background: var(--bg-surface); color: var(--text-main); }
 .wmux-nav-button[data-sidebar-nav="remote"] { position: relative; }
 
-/* Remote page: a live board of what is connected. Tiles and cards are told
- * apart by a fill tone alone (no outline); the live dot appears only on a row
- * holding a connection right now. */
-.wmux-remote-page { flex: 1; min-height: 0; overflow-y: auto; container-type: inline-size; padding: 24px 28px 40px; }
-.wmux-remote-header { display: flex; flex-direction: column; gap: 4px; margin-bottom: 20px; }
-.wmux-remote-title { margin: 0; font-size: 20px; font-weight: 600; line-height: 28px; color: var(--text-main); }
-.wmux-remote-summary { display: flex; align-items: center; gap: 7px; margin: 0; font-size: 13px; color: var(--text-sub); font-variant-numeric: tabular-nums; }
-.wmux-remote-layout { display: grid; grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr); gap: 24px; align-items: start; }
-.wmux-remote-connected, .wmux-remote-machine { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
-.wmux-remote-card[data-live="false"], .wmux-remote-card:not([data-live]) { opacity: .62; }
-.wmux-remote-panel { display: flex; flex-direction: column; gap: 2px; padding: 8px 14px 12px; border-radius: 10px; background: var(--selection-subtle); }
-.wmux-remote-panel-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 32px; font-size: 12px; color: var(--text-muted); }
-.wmux-remote-panel-value { display: inline-flex; align-items: center; gap: 6px; min-width: 0; color: var(--text-main); }
-.wmux-remote-panel-actions { display: flex; flex-wrap: wrap; gap: 6px; padding-top: 8px; }
-.wmux-remote-activity { display: flex; flex-direction: column; gap: 2px; margin: 0; padding: 0; list-style: none; }
-.wmux-remote-activity li { display: flex; justify-content: space-between; gap: 12px; padding: 6px 4px; font-size: 12px; color: var(--text-sub); }
-.wmux-remote-activity-when { flex: none; color: var(--text-muted); }
-.wmux-remote-machine .wmux-remote-section-title:not(:first-child) { margin-top: 12px; }
-@container (max-width: 1100px) {
-  .wmux-remote-layout { grid-template-columns: minmax(0, 1fr); }
-  .wmux-remote-machine { order: -1; }
+/* Remote page: one header, this computer on one line (unfolds in place), a
+ * Needs you block while something waits, then one list of every connection.
+ * Rows are told apart by hairlines inside one container; the only orange is
+ * the Needs you block's hairline (plus the rail badge). The live dot is
+ * neutral and drawn only while a connection is held. */
+.wmux-remote-page { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; padding: 20px 28px 32px; }
+.wmux-remote-header { display: flex; flex-direction: column; gap: 2px; }
+.wmux-remote-head-line { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.wmux-remote-title { margin: 0; font-size: 16px; font-weight: 600; line-height: 24px; color: var(--text-main); }
+.wmux-remote-summary { margin: 0; min-height: 18px; font-size: 13px; color: var(--text-sub); font-variant-numeric: tabular-nums; }
+.wmux-remote-dot { flex: none; display: inline-block; width: 7px; height: 7px; border-radius: 9999px; background: var(--text-main); }
+.wmux-remote-dot.is-off { background: transparent; box-shadow: inset 0 0 0 1.5px var(--text-muted); }
+.wmux-remote-chev { display: inline-grid; place-items: center; transform: rotate(90deg); }
+.wmux-remote-chev.is-open { transform: rotate(-90deg); }
+.wmux-remote-icon-btn { width: 26px; height: 26px; }
+.wmux-remote-count { margin-left: 4px; font-weight: 400; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.wmux-remote-wrap { overflow-wrap: anywhere; }
+
+/* This computer */
+.wmux-remote-machine { border-radius: 10px; background: var(--selection-subtle); }
+.wmux-remote-machine-line { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; min-height: 36px; padding: 5px 6px 5px 12px; font-size: 13px; }
+.wmux-remote-machine-lbl { font-weight: 500; color: var(--text-main); }
+.wmux-remote-machine-it { display: inline-flex; align-items: center; gap: 6px; min-width: 0; color: var(--text-sub); white-space: nowrap; }
+.wmux-remote-machine-detail { display: grid; grid-template-columns: 120px minmax(0, 1fr) auto; align-items: center; gap: 2px 12px; margin: 0; padding: 4px 12px 10px; border-top: 1px solid var(--stroke); font-size: 13px; }
+.wmux-remote-machine-detail dt { font-size: 12px; color: var(--text-muted); }
+.wmux-remote-machine-detail dd { display: flex; align-items: center; min-width: 0; min-height: 28px; margin: 0; color: var(--text-main); }
+
+/* Needs you: one bordered block, a hairline over the subtle fill (no wash). */
+.wmux-remote-needs { display: flex; flex-direction: column; gap: 4px; padding: 8px 8px 8px 12px; border: 1px solid var(--attention-hairline); border-radius: 10px; background: var(--selection-subtle); }
+.wmux-remote-quiet { margin: 0; padding: 0 12px; font-size: 12px; color: var(--text-muted); }
+.wmux-remote-needs-title { margin: 0; font-size: 13px; font-weight: 500; color: var(--text-main); }
+.wmux-remote-needs-list { margin: 0; padding: 0; list-style: none; }
+.wmux-remote-needs-list > li + li { border-top: 1px solid var(--stroke); }
+.wmux-remote-req { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; padding: 8px 0; }
+.wmux-remote-req-body { flex: 1 1 320px; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.wmux-remote-req-title { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 6px; font-size: 13px; color: var(--text-main); }
+.wmux-remote-req-title b { font-weight: 500; }
+.wmux-remote-req-when { font-size: 12px; color: var(--text-muted); }
+.wmux-remote-req-text { font-size: 13px; color: var(--text-sub); overflow-wrap: anywhere; }
+.wmux-remote-req-quote { font-size: 13px; color: var(--text-main); overflow-wrap: anywhere; }
+.wmux-remote-req-ev { display: flex; flex-wrap: wrap; gap: 2px 14px; font-size: 12px; color: var(--text-muted); }
+.wmux-remote-req-acts { display: flex; gap: 4px; margin-left: auto; }
+
+/* One list: group headings, 36px rows on shared columns, links nested under their PC. */
+.wmux-remote-list { margin: 0; padding: 0; list-style: none; border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.wmux-remote-list > li + li { border-top: 1px solid var(--stroke); }
+.wmux-remote-grp { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; min-height: 36px; padding: 4px 6px 4px 12px; background: var(--selection-subtle); font-size: 13px; font-weight: 500; color: var(--text-sub); }
+.wmux-remote-grp .wmux-remote-count { margin-left: 0; }
+.wmux-remote-hint { font-size: 12px; font-weight: 400; color: var(--text-muted); }
+.wmux-remote-row { display: grid; grid-template-columns: 16px minmax(96px, 180px) minmax(0, 1fr) auto auto; grid-template-areas: "ic nm meta st acts" ". err err err err"; align-items: center; column-gap: 12px; min-height: 36px; padding: 4px 6px 4px 12px; font-size: 13px; }
+.wmux-remote-ic { grid-area: ic; display: grid; place-items: center; color: var(--text-sub); }
+.wmux-remote-nm { grid-area: nm; display: flex; min-width: 0; font-weight: 500; color: var(--text-main); }
+.wmux-remote-meta { grid-area: meta; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--text-sub); }
+.wmux-remote-st { grid-area: st; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; font-size: 12px; color: var(--text-sub); }
+.wmux-remote-row[data-live="true"] .wmux-remote-st { color: var(--text-main); }
+.wmux-remote-acts { grid-area: acts; display: flex; align-items: center; justify-content: flex-end; gap: 4px; }
+.wmux-remote-row-error { grid-area: err; margin: 0 0 4px; font-size: 12px; color: var(--accent-red); }
+.wmux-remote-link { display: grid; grid-template-columns: 16px minmax(0, 1fr) auto; align-items: center; gap: 12px; min-height: 32px; padding: 2px 6px 2px 40px; font-size: 12px; color: var(--text-sub); }
+.wmux-remote-link-ln { display: grid; place-items: center; color: var(--text-muted); }
+.wmux-remote-link-what { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* A nested row has no named areas: its actions take the third column, not an implicit `acts` track on a row of its own. */
+.wmux-remote-link > .wmux-remote-acts { grid-area: auto; }
+.wmux-remote-confirm { font-size: 12px; color: var(--text-main); }
+.wmux-remote-menu { position: relative; display: inline-flex; }
+.wmux-remote-menu-pop { position: fixed; z-index: var(--z-popover-top); display: flex; flex-direction: column; gap: 1px; min-width: 200px; padding: 6px; }
+.wmux-remote-empty { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; font-size: 13px; color: var(--text-sub); }
+.wmux-remote-empty p { flex: 1 1 260px; margin: 0; }
+.wmux-remote-activity-row { display: flex; justify-content: space-between; gap: 12px; min-height: 30px; align-items: center; padding: 0 12px; font-size: 12px; color: var(--text-sub); }
+.wmux-remote-activity-when { flex: none; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+@container (max-width: 640px) {
+  .wmux-remote-page { padding: 16px 14px 24px; }
+  .wmux-remote-row { grid-template-columns: 16px minmax(0, 1fr) auto; grid-template-areas: "ic nm st" ". meta acts" ". err err"; row-gap: 2px; padding-block: 6px; }
+  .wmux-remote-meta { white-space: normal; }
+  .wmux-remote-link { padding-left: 24px; }
+  .wmux-remote-machine-detail { grid-template-columns: minmax(0, 1fr) auto; }
+  .wmux-remote-machine-detail dt { grid-column: 1 / -1; }
 }
-.wmux-remote-unknown { color: var(--text-muted); font-weight: 400; }
-.wmux-remote-live { flex: none; width: 7px; height: 7px; border-radius: 9999px; background: var(--accent); }
-.wmux-remote-section-title { margin: 0; font-size: 12px; font-weight: 500; color: var(--text-sub); }
-.wmux-remote-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 8px; margin: 0; padding: 0; list-style: none; }
-.wmux-remote-card { display: flex; flex-direction: column; gap: 10px; min-width: 0; padding: 12px 14px 8px; border-radius: 10px; background: var(--selection-subtle); }
-.wmux-remote-card-head { display: flex; align-items: flex-start; gap: 10px; min-width: 0; }
-.wmux-remote-card-icon { flex: none; display: grid; place-items: center; width: 28px; height: 28px; border-radius: 8px; background: var(--selection); color: var(--text-sub); }
-.wmux-remote-card-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 600; color: var(--text-main); }
-.wmux-remote-card-kind { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px; font-size: 11px; color: var(--text-sub); }
-.wmux-remote-card-id { color: var(--text-muted); font-variant-numeric: tabular-nums; }
-.wmux-remote-card-status { flex: none; display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-sub); }
-.wmux-remote-card[data-live="true"] .wmux-remote-card-status { color: var(--text-main); }
-.wmux-remote-card-status[data-status="needs-repair"] { color: var(--accent-yellow); }
-.wmux-remote-card-facts { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 12px; margin: 0; font-size: 12px; }
-.wmux-remote-card-facts dt { color: var(--text-muted); }
-.wmux-remote-card-facts dd { display: flex; min-width: 0; margin: 0; color: var(--text-main); }
-.wmux-remote-card-error { margin: 0; font-size: 11px; color: var(--accent-red); }
-.wmux-remote-card-actions { display: flex; justify-content: flex-end; gap: 4px; }
-.wmux-remote-empty { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 40px 24px; border-radius: 10px; background: var(--selection-subtle); text-align: center; color: var(--text-sub); }
-.wmux-remote-empty h2 { margin: 4px 0 0; font-size: 14px; font-weight: 600; color: var(--text-main); }
-.wmux-remote-empty p { max-width: 440px; margin: 0; font-size: 13px; line-height: 1.6; }
+/* Connect a PC dialog: the invite code, the addresses in the order the other PC tries them. */
+.wmux-remote-connect { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.wmux-remote-connect-note { margin: 0; font-size: 12px; color: var(--text-sub); }
+.wmux-remote-connect-label { font-size: 12px; color: var(--text-sub); }
+.wmux-remote-connect-expiry { margin-right: auto; font-size: 12px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.wmux-remote-code { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 8px 8px 8px 12px; border-radius: 10px; background: var(--selection-subtle); }
+.wmux-remote-code code { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.wmux-remote-order { display: flex; flex-direction: column; gap: 2px; margin: 0; padding: 0; list-style: none; }
+.wmux-remote-order li { display: grid; grid-template-columns: 14px minmax(0, 1fr) auto; align-items: center; gap: 8px; min-height: 24px; }
+.wmux-remote-order-n { font-size: 11px; color: var(--text-muted); text-align: right; font-variant-numeric: tabular-nums; }
+.wmux-remote-order-k { font-size: 11px; color: var(--text-muted); }
 
 /* Schedules page: a list column and a main pane. The column is set off by
  * its own tone, the composer box by a fill — no outlines (one boundary). */
@@ -964,9 +1039,13 @@ details[open] > .wmux-chatv2-tool-line .wmux-chatv2-chevron { transform: rotate(
 
 /* A rail page fills the sheet over the Workspaces page, which stays mounted
  * underneath at full size, so a page never changes terminal geometry. The
- * sheet's own edge is the page's only boundary. */
-.wmux-page { position: absolute; inset: 0; z-index: 40; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; background: var(--bg-base); }
+ * sheet's own edge is the page's only boundary. Clip, not hidden: each page
+ * scrolls inside itself, and a caret reveal must not slide the page (#1688). */
+.wmux-page { position: absolute; inset: 0; z-index: 40; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: clip; background: var(--bg-base); }
 .wmux-page[data-rail-page="fleet"] .wmux-fleet-panel { width: 100%; }
+/* The Remote page's narrow rules (14px sides under a 640px sheet) ask the page
+ * around it: a container never matches its own @container query. */
+.wmux-page[data-rail-page="remote"] { container-type: inline-size; }
 /* The Git page sits beside the dock (Moa); a Git page drag held over the dock. */
 [data-channel-dock][data-handoff-over] { outline: 1px dashed var(--accent); outline-offset: -2px; }
 /* Fleet page: a head, the summary line, the list and the detail area. Amber
@@ -1026,12 +1105,17 @@ details[open] > .wmux-chatv2-tool-line .wmux-chatv2-chevron { transform: rotate(
 .wmux-board .wmux-fleet-board .wmux-fleet-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 4px 8px; min-height: 0; padding: 10px 12px; border-radius: 10px; background: var(--selection-subtle); }
 .wmux-board .wmux-fleet-board .wmux-fleet-card:hover { background: var(--selection); }
 .wmux-board .wmux-fleet-board .wmux-fleet-card[aria-selected="true"] { background: var(--selection-hover); }
-.wmux-fleet-board .wmux-fleet-status { grid-column: 1; grid-row: 1; }
+.wmux-fleet-board .wmux-fleet-status { grid-column: 1; grid-row: 1; min-width: 0; overflow: hidden; }
+.wmux-fleet-board .wmux-fleet-status > span:last-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .wmux-fleet-board .wmux-fleet-action { grid-column: 2; grid-row: 1; margin-right: 52px; }
-.wmux-fleet-board .wmux-fleet-identity, .wmux-fleet-board .wmux-fleet-progress { grid-column: 1 / -1; }
+/* grid-row: auto keeps the list's narrow-panel placement (max-width: 580px)
+ * from pulling the name onto the status line. */
+.wmux-fleet-board .wmux-fleet-identity, .wmux-fleet-board .wmux-fleet-progress { grid-column: 1 / -1; grid-row: auto; }
 .wmux-fleet-board .wmux-fleet-row > .wmux-fleet-row-trigger, .wmux-fleet-board .wmux-fleet-row > .wmux-fleet-row-detail { top: 6px; transform: none; }
 @container (max-width: 760px) {
-  .wmux-board .wmux-fleet-board { grid-auto-flow: row; grid-template-columns: repeat(2, minmax(0, 1fr)); grid-auto-rows: auto; overflow-y: auto; }
+  /* Stacked columns grow to their cards and the board scrolls; an auto row
+   * would shrink to the board's height and let the columns overlap. */
+  .wmux-board .wmux-fleet-board { grid-auto-flow: row; grid-template-columns: repeat(2, minmax(0, 1fr)); grid-auto-rows: max-content; overflow-y: auto; }
   .wmux-fleet-board-cards { overflow: visible; }
 }
 @container (max-width: 420px) {
@@ -2356,6 +2440,34 @@ html[data-fullscreen] .wmux-shell-body {
 .wmux-git-group-head:hover { background: var(--hover-fill); }
 .wmux-git-group-name { font-size: 13px; font-weight: 500; color: var(--text-main); }
 .wmux-git-chevron[data-open] { transform: rotate(90deg); }
+.wmux-git-chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 4px 4px 8px; }
+.wmux-git-chip { display: inline-flex; align-items: center; gap: 6px; height: 26px; max-width: 100%; padding: 0 10px; border-radius: var(--chip-radius, 9999px); box-shadow: inset 0 0 0 1px var(--line); font-size: 12px; color: var(--text-sub); }
+.wmux-git-chip:hover { background: var(--hover-fill); color: var(--text-main); }
+.wmux-git-chip[aria-pressed='true'] { background: var(--selection); box-shadow: none; color: var(--text-main); }
+.wmux-git-chip[aria-pressed='true']:hover { background: var(--selection-hover); }
+.wmux-git-chip[data-state='empty']:not([aria-pressed='true']) { opacity: .5; }
+.wmux-git-chip-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wmux-git-chip-count { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.wmux-git-chip-spin { width: 10px; height: 10px; flex-shrink: 0; border-radius: 9999px; border: 1.5px solid var(--text-muted); border-top-color: transparent; }
+.wmux-git-chip-error { display: inline-flex; flex-shrink: 0; color: var(--accent-red); }
+.wmux-git-chip-rate { display: inline-flex; flex-shrink: 0; color: var(--text-muted); }
+/* All repos flat: who-acts-next sections. Neutral except Needs you's
+   attention dot and count, and Ready to merge's green check (icon only). */
+.wmux-git-turn + .wmux-git-turn { margin-top: 12px; }
+.wmux-git-turn-head { display: flex; align-items: center; gap: 6px; width: 100%; height: 28px; padding: 0 6px; border-radius: 6px; text-align: left; font-size: 12px; font-weight: 600; color: var(--text-sub); scroll-margin-top: 8px; }
+.wmux-git-turn-head:hover { background: var(--hover-fill); color: var(--text-main); }
+.wmux-git-turn-dot { width: 7px; height: 7px; flex-shrink: 0; border-radius: 9999px; background: var(--attention); }
+.wmux-git-turn-check { display: inline-flex; flex-shrink: 0; color: var(--accent-green); }
+.wmux-git-turn-count { font-weight: 400; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.wmux-git-turn[data-git-turn-section='needs_you'] .wmux-git-turn-count { color: var(--attention-text); }
+.wmux-git-turn-jump { border-radius: 4px; color: inherit; font-variant-numeric: tabular-nums; }
+.wmux-git-turn-jump:hover { color: var(--text-main); text-decoration: underline; }
+.wmux-git-tagged-row { position: relative; }
+.wmux-git-tagged-row > .wmux-git-item .wmux-git-item-meta { padding-right: 104px; }
+.wmux-git-repo-tag { position: absolute; right: 8px; bottom: 7px; max-width: 96px; height: 16px; padding: 0 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-radius: var(--chip-radius, 6px); background: var(--selection); font-size: 11px; line-height: 16px; color: var(--text-sub); }
+.wmux-git-repo-tag:hover { background: var(--selection-hover); color: var(--text-main); }
+.wmux-git-repo-tag[aria-pressed='true'] { color: var(--text-main); }
+.wmux-git-item[aria-current='true'] + .wmux-git-repo-tag { background: var(--selection-hover); }
 .wmux-git-detail-head { position: sticky; top: 0; z-index: 1; display: flex; flex-direction: column; gap: 6px; padding: 12px 0 12px; background: var(--bg-base); border-bottom: 1px solid var(--line); }
 .wmux-git-detail-titlerow { display: flex; align-items: flex-start; gap: 12px; }
 .wmux-git-detail-title { flex: 1; min-width: 0; margin: 0; font-size: 16px; font-weight: 600; line-height: 22px; color: var(--text-main); overflow-wrap: anywhere; }
@@ -2367,8 +2479,7 @@ html[data-fullscreen] .wmux-shell-body {
 .wmux-git-branch-chip { font-family: var(--font-mono, ui-monospace, 'SF Mono', Menlo, monospace); font-size: 11px; padding: 1px 6px; border-radius: 6px; background: var(--selection); }
 .wmux-git-detail-empty { display: flex; align-items: center; justify-content: center; height: 100%; min-height: 160px; font-size: 13px; color: var(--text-muted); }
 .wmux-git-worktrees { display: flex; flex-direction: column; gap: 12px; }
-.wmux-git-wt-group .wmux-git-subhead { margin: 0; }
-.wmux-git-wt-caption { margin: 0 4px 4px; font-size: 11px; color: var(--text-muted); }
+.wmux-git-wt-caption { margin: 0 6px 4px; font-size: 11px; color: var(--text-muted); }
 .wmux-git-page-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
 .wmux-git-page-summary { margin: 2px 0 0; font-size: 13px; color: var(--text-sub); }
 .wmux-git-body { display: flex; flex-direction: column; gap: 12px; }
@@ -2504,12 +2615,18 @@ html[data-fullscreen] .wmux-shell-body {
   pointer-events: none;
   transition: opacity var(--motion-feedback, 120ms) ease-out;
 }
-.wmux-git-row:is(:hover, :focus-within) .wmux-git-row-actions { opacity: 1; pointer-events: auto; }
+.wmux-git-row:is(:hover, :focus-within, [data-picking]) .wmux-git-row-actions { opacity: 1; pointer-events: auto; }
 .wmux-git-row:is(:hover, :focus-within) > :is(.wmux-git-stat, .wmux-git-main-badge) { visibility: hidden; }
 .wmux-git-row:is(:hover, :focus-within) [data-git-row-text] {
   -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 176px), transparent calc(100% - 140px));
   mask-image: linear-gradient(to right, #000 calc(100% - 176px), transparent calc(100% - 140px));
 }
+/* A row with Snooze (or its choices) carries one more action. */
+.wmux-git-row[data-wide]:is(:hover, :focus-within, [data-picking]) [data-git-row-text] {
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 276px), transparent calc(100% - 240px));
+  mask-image: linear-gradient(to right, #000 calc(100% - 276px), transparent calc(100% - 240px));
+}
+.wmux-git-row[data-picking] > :is(.wmux-git-stat, .wmux-git-main-badge) { visibility: hidden; }
 .wmux-git-action {
   height: 24px;
   padding: 0 6px;
@@ -2652,3 +2769,17 @@ html[data-fullscreen] .wmux-shell-body {
 .wmux-git-repo-option[aria-selected='true'] .wmux-git-repo-option-label { font-weight: 500; }
 .wmux-git-repo-option-label { font-size: 13px; color: var(--text-main); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .wmux-git-repo-option-sub { font-size: 11px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Cross-PC pane links: the matching dialog's pane list, the Remote page's
+ * link requests and links, and the exposure checklist. One rounded container
+ * per list with inner hairlines (DESIGN.md "Grouped rows"). */
+.wmux-a2a-list { margin: 0; padding: 0; list-style: none; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+.wmux-a2a-list > li + li { border-top: 1px solid var(--line); }
+.wmux-a2a-row { display: flex; flex-direction: column; gap: 2px; width: 100%; min-height: 40px; padding: 8px 12px; text-align: left; font-size: 13px; color: var(--text-main); background: transparent; }
+button.wmux-a2a-row:hover { background: var(--hover-fill); }
+.wmux-a2a-row[aria-selected="true"] { background: var(--selection); }
+.wmux-a2a-row-line { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.wmux-a2a-meta { font-size: 11px; color: var(--text-sub); }
+.wmux-a2a-note { margin: 0; font-size: 12px; color: var(--text-sub); }
+.wmux-a2a-note[data-tone="warning"] { color: var(--accent-yellow); }
+.wmux-a2a-note[data-tone="danger"] { color: var(--accent-red); }

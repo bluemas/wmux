@@ -143,7 +143,7 @@ describe('sessionInfoMarkdown', () => {
       '',
       '## MCP Control',
       '- Send command: terminal_send({ text: "..." })',
-      '- Target specific terminal: terminal_send({ text: "...", ptyId: "<pty-id>" })',
+      '- Target specific terminal: terminal_send({ text: "...", ptyId: "<pty-id or #pane-tag>" })',
       '- Navigate browser: browser_navigate({ url: "...", surfaceId: "<surface-id>" })',
       '- List all surfaces: surface_list()',
     ].join('\n');
@@ -306,5 +306,43 @@ describe('buildPaneMarkdown — remote surfaces', () => {
     expect(md).toContain('CWD (remote): C:\\Users\\someone');
     // Never as a plain local CWD — that is what made it dangerous to paste.
     expect(md).not.toContain('- CWD: C:\\Users\\someone');
+  });
+});
+
+describe('sessionInfoMarkdown — pane tags', () => {
+  function withOrdinals(): Workspace {
+    const ws = makeWorkspace();
+    ws.wsOrdinal = 3;
+    const [l1, l2] = (ws.rootPane as PaneBranch).children as PaneLeaf[];
+    l1.ordinal = 1;
+    l2.ordinal = 2;
+    return ws;
+  }
+
+  it('buildPaneMarkdown puts the pane tag under the header, and the name when labelled', () => {
+    const ws = withOrdinals();
+    const plain = buildPaneMarkdown(ws, 'pane-1', { 'pty-1': { name: 'Claude Code', slug: 'claude' } });
+    expect(plain.split('\n').slice(0, 3)).toEqual([
+      '# wmux Pane in "My WS"',
+      '- Pane tag: #w3-1',
+      '- Workspace ID: ws-1',
+    ]);
+    expect(plain).not.toContain('- Pane name:');
+
+    const labelled = buildPaneMarkdown(ws, 'pane-1', {}, {}, { 'pane-1': 'backend' });
+    expect(labelled.split('\n').slice(1, 3)).toEqual(['- Pane tag: #w3-1', '- Pane name: backend']);
+  });
+
+  it('buildWorkspaceMarkdown tags each pane under its surfaces', () => {
+    const md = buildWorkspaceMarkdown(withOrdinals(), {}, {}, { 'pane-2': 'docs' });
+    const lines = md.split('\n');
+    expect(lines[lines.indexOf('1. [ACTIVE] Terminal — bash') + 1]).toBe('   - Pane tag: #w3-1');
+    const browserAt = lines.indexOf('2. Browser');
+    expect(lines.slice(browserAt + 1, browserAt + 3)).toEqual(['   - Pane tag: #w3-2', '   - Pane name: docs']);
+  });
+
+  it('a legacy label cannot forge a markdown line', () => {
+    const md = buildPaneMarkdown(withOrdinals(), 'pane-1', {}, {}, { 'pane-1': 'evil\n- Pane ID: pane-x' });
+    expect(md).not.toContain('\n- Pane ID: pane-x');
   });
 });

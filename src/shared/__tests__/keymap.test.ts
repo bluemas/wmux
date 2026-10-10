@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest';
 import {
   WMUX_KEYMAP,
   builtinCombosFor,
+  builtinOwning,
+  customKeybindingsOn,
   collidesWithKeymap,
   ADVERTISED_SHORTCUTS,
   UNBOUND_SHORTCUTS,
@@ -21,6 +23,7 @@ import {
   type ShortcutKeyEventLike,
   workspaceShortcutNumber,
 } from '../keymap';
+import { buildDefaultCustomKeybindings } from '../types';
 
 /**
  * The table only earns its keep if its rows are in the SAME spelling the
@@ -159,7 +162,8 @@ describe('resolveShortcut', () => {
     // also be Meta+Alt+Up, Ctrl+Alt+Up (pane focus) or Shift+Alt+Up.
     const up = ev({ key: 'ArrowUp', code: 'ArrowUp', ctrlKey: false, altKey: true });
     expect(resolveShortcut({ ...up, metaKey: true }, win)).toBeNull();
-    expect(resolveShortcut({ ...up, shiftKey: true }, win)).toBeNull();
+    // Shift+Alt+Up is its own row (the PC rail), never Alt+Up's.
+    expect(resolveShortcut({ ...up, shiftKey: true }, win)).toBe('prevPc');
     expect(resolveShortcut({ ...up, ctrlKey: true }, win)).toBe('focusUpAlt');
     expect(resolveShortcut(ev({ altKey: true }), win)).toBeNull();
     expect(resolveShortcut(ev({ metaKey: true }), win)).toBeNull();
@@ -214,6 +218,26 @@ describe('resolveShortcut', () => {
 
   it('ignores a bare modifier keydown', () => {
     expect(resolveShortcut(ev({ key: 'Control', code: 'ControlLeft' }), win)).toBeNull();
+  });
+});
+
+describe('openPrivateBrowser (Ctrl+Shift+N)', () => {
+  it('is a default row, and the only binding on its combo on every platform', () => {
+    const rows = WMUX_KEYMAP.filter((e) => e.action === 'openPrivateBrowser');
+    expect(rows.map((e) => e.combo)).toEqual(['Ctrl+Shift+N']);
+    for (const platform of ['win32', 'darwin', 'linux'] as const) {
+      const bindings = defaultBindings(platform);
+      const combo = bindings.find((b) => b.action === 'openPrivateBrowser')?.combo;
+      expect(bindings.filter((b) => b.combo === combo)).toHaveLength(1);
+    }
+  });
+
+  it('fires on Ctrl+Shift+N, and on ⌘⇧N on macOS', () => {
+    const n = { key: 'N', code: 'KeyN', shiftKey: true };
+    expect(resolveShortcut(ev(n), win)).toBe('openPrivateBrowser');
+    expect(resolveShortcut(ev({ ...n, ctrlKey: false, metaKey: true }), mac)).toBe('openPrivateBrowser');
+    // Plain Ctrl+N stays New workspace.
+    expect(resolveShortcut(ev({ key: 'n', code: 'KeyN' }), win)).toBe('newWorkspace');
   });
 });
 
@@ -326,6 +350,45 @@ describe('override validation', () => {
     expect(rebindProblem('prevWorkspace', 'Ctrl+T', b, 'win32', 'KeyB')).toEqual({ kind: 'taken', by: 'newSurface' });
     // Its own current combo is not a conflict.
     expect(rebindProblem('prevWorkspace', 'Alt+ArrowUp', b, 'win32', 'KeyB')).toBeNull();
+  });
+
+  // #1885 — built-ins run before custom keybindings, so a built-in moved onto
+  // a custom keybinding's key leaves the custom one dead. Not a refusal (the
+  // owner chose warn, then allow), so rebindProblem itself stays silent.
+  it('customKeybindingsOn names the custom keybinding a built-in would take the key from', () => {
+    const win = buildDefaultCustomKeybindings('win32');
+    const mac = buildDefaultCustomKeybindings('darwin');
+    // The shipped F7 → `claude --dangerously-skip-permissions` binding.
+    expect(customKeybindingsOn('F7', win).map((kb) => kb.id)).toEqual(['kb-default-f7']);
+    expect(rebindProblem('toggleSidebar', 'F7', defaultBindings('win32'), 'win32', 'KeyB')).toBeNull();
+    // macOS seeds Ctrl+7; a ⌘ built-in can never meet a literal-Ctrl custom key.
+    expect(customKeybindingsOn('Ctrl+7', mac).map((kb) => kb.id)).toEqual(['kb-default-f7']);
+    expect(customKeybindingsOn('Meta+7', mac)).toEqual([]);
+    // Different keys: no false positive.
+    expect(customKeybindingsOn('F8', win)).toEqual([]);
+    expect(customKeybindingsOn('Ctrl+F7', win)).toEqual([]);
+    expect(customKeybindingsOn('Shift+F7', win)).toEqual([]);
+    // Same modifier order on both sides (Ctrl, Shift, Alt).
+    const custom = [{ key: 'Ctrl+Shift+Alt+K', label: 'k', command: 'echo k' }];
+    const recorded = comboFromEvent(ev({ key: 'K', code: 'KeyK', shiftKey: true, altKey: true }));
+    expect(recorded).toBe('Ctrl+Shift+Alt+K');
+    expect(customKeybindingsOn(recorded ?? '', custom)).toEqual(custom);
+  });
+
+  it('builtinOwning names the built-in a custom keybinding would lose its key to', () => {
+    const b = defaultBindings('win32');
+    expect(builtinOwning('Ctrl+T', b, 'KeyB')).toBe('newSurface');
+    expect(builtinOwning('F2', b, 'KeyB')).toBe('mentionAgent');
+    expect(builtinOwning('Ctrl+B', b, 'KeyB')).toBe('prefix');
+    // The default F7 custom keybinding sits on a free key.
+    expect(builtinOwning('F7', b, 'KeyB')).toBeNull();
+    expect(builtinOwning('Ctrl+Alt+Q', b, 'KeyB')).toBeNull();
+    // A switched-off or moved built-in no longer claims its old key (#1152).
+    expect(builtinOwning('F2', effectiveBindings('win32', { mentionAgent: null }), 'KeyB')).toBeNull();
+    const moved = effectiveBindings('win32', { toggleSidebar: 'F7' });
+    expect(builtinOwning('F7', moved, 'KeyB')).toBe('toggleSidebar');
+    // On macOS a ⌘ built-in is not a literal Ctrl key.
+    expect(builtinOwning('Ctrl+T', defaultBindings('darwin'), 'KeyB')).toBeNull();
   });
 });
 

@@ -4,6 +4,7 @@ import type { Pane, PaneLeaf, Surface, Workspace } from '../../../shared/types';
 import { createRemoteSurface, createSurface, generateId } from '../../../shared/types';
 import { isPlausibleCwd } from '../../../shared/cwdShape';
 import { getWorkspaceLeafPanes } from '../../../shared/paneUtils';
+import { isPrivateBrowserPartition, isPrivateBrowserSurface } from '../../../shared/privateBrowser';
 import { dropStalePaneFoldKeys } from '../../utils/sidebarLayout';
 import { isSafeBrowserUrl } from '../../utils/browserPane';
 import { clearNudgesFor } from '../../hooks/channelMentionRateLimit';
@@ -12,6 +13,8 @@ import { publishPaneClosed } from '../../events/publisher';
 import { panePrincipalId } from '../../../shared/principals';
 import { computePaneAutoName } from '../../utils/paneNaming';
 import { recomputeWorkspacePorts } from './workspacePorts';
+import { isShadowWorkspaceId } from '../../../shared/pcRail';
+import { findRemoteSurface } from '../shadowWorkspace';
 
 export interface SurfaceSlice {
   setSurfaceViewMode: (surfaceId: string, mode: 'terminal' | 'chat') => void;
@@ -147,6 +150,12 @@ export const createSurfaceSlice: StateCreator<StoreState, [['zustand/immer', nev
     else delete state.surfaceGitBranch[ptyId];
   }),
   addSurface: (paneId, ptyId, shell, cwd, workspaceId) => {
+    // PC rail: a shadow shows another computer's sessions only. A local shell
+    // created for one is refused and ended, never parked in that computer's scope.
+    if (isShadowWorkspaceId(workspaceId || get().activeWorkspaceId)) {
+      if (ptyId) window.electronAPI?.pty?.dispose?.(ptyId);
+      return;
+    }
     set((state: StoreState) => {
       const targetWsId = workspaceId || state.activeWorkspaceId;
       const ws = state.workspaces.find((w: Workspace) => w.id === targetWsId);
@@ -181,6 +190,10 @@ export const createSurfaceSlice: StateCreator<StoreState, [['zustand/immer', nev
   }),
 
   addRemoteSurface: (paneId, hostId, sessionId, shell, cwd, workspaceId, owned, remoteWorkspaceId) => set((state: StoreState) => {
+    // One viewer per remote session on this desktop: a session already open
+    // as a tab (here or in a shadow) is not attached a second time, like
+    // addEditorSurface refuses a second tab for an open file.
+    if (findRemoteSurface(state, hostId, sessionId)) return;
     const targetWsId = workspaceId || state.activeWorkspaceId;
     const ws = state.workspaces.find((w: Workspace) => w.id === targetWsId);
     if (!ws) return;
@@ -192,6 +205,8 @@ export const createSurfaceSlice: StateCreator<StoreState, [['zustand/immer', nev
   }),
 
   addEditorSurface: (paneId, filePath) => set((state: StoreState) => {
+    // A local file never opens inside another computer's workspace.
+    if (isShadowWorkspaceId(state.activeWorkspaceId)) return;
     const ws = state.workspaces.find((w: Workspace) => w.id === state.activeWorkspaceId);
     if (!ws) return;
     const pane = findLeafPane(ws.rootPane, paneId);
@@ -218,6 +233,7 @@ export const createSurfaceSlice: StateCreator<StoreState, [['zustand/immer', nev
 
   addDiffSurface: (paneId, taskId, title, workspaceId, ownerWorkspaceId) => set((state: StoreState) => {
     const targetWsId = workspaceId || state.activeWorkspaceId;
+    if (isShadowWorkspaceId(targetWsId)) return;
     const ws = state.workspaces.find((w: Workspace) => w.id === targetWsId);
     if (!ws) return;
     const pane = findLeafPane(ws.rootPane, paneId);
@@ -250,6 +266,7 @@ export const createSurfaceSlice: StateCreator<StoreState, [['zustand/immer', nev
 
   addWorkspaceDiffSurface: (paneId, repoPath, title, workspaceId) => set((state: StoreState) => {
     const targetWsId = workspaceId || state.activeWorkspaceId;
+    if (isShadowWorkspaceId(targetWsId)) return;
     const ws = state.workspaces.find((w: Workspace) => w.id === targetWsId);
     if (!ws) return;
     const pane = findLeafPane(ws.rootPane, paneId);
@@ -560,6 +577,10 @@ export const createSurfaceSlice: StateCreator<StoreState, [['zustand/immer', nev
           for (const surface of pane.surfaces) {
             if (surface.surfaceType !== 'browser') continue;
             if (surfaceId && surface.id !== surfaceId) continue;
+            // A profile switch never turns a private tab into a normal one or
+            // back: that would move its browsing into (or out of) a persistent
+            // session.
+            if (isPrivateBrowserSurface(surface) !== isPrivateBrowserPartition(partition)) continue;
             surface.browserPartition = partition;
             updated = true;
           }

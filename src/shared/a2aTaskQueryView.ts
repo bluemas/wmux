@@ -122,6 +122,12 @@ export function summarizeTask(task: Rec): Rec {
     createdAt: meta.createdAt,
     updatedAt: meta.updatedAt,
     messageCount: history.length,
+    // A task sent to another PC: how far the receiver got (its receipts).
+    ...(isRec(meta.remote) && (meta.remote.remoteReadAt || meta.remote.remoteDeliveredAt)
+      ? { remoteReceipt: meta.remote.remoteReadAt ? 'read' : 'delivered' }
+      : {}),
+    // A remote task: the other PC received every reply and state change this side sent on it.
+    ...(isRec(meta.remote) && str(meta.remote.replyDeliveredAt) ? { replyDeliveredAt: meta.remote.replyDeliveredAt } : {}),
     ...(last !== undefined && {
       lastMessage: {
         ...(isRec(last) && str(last.role) !== undefined && { role: last.role }),

@@ -470,6 +470,12 @@ export interface UISlice {
   inlineImagesEnabled: boolean;
   setInlineImagesEnabled: (enabled: boolean) => void;
 
+  // #1947: a plain left-drag selects text even while the foreground app
+  // tracks the mouse (default ON). Read at every mousedown, so a toggle
+  // applies to open panes immediately.
+  plainDragSelectEnabled: boolean;
+  setPlainDragSelectEnabled: (enabled: boolean) => void;
+
   // #517 browser lightweight mode (default OFF while dogfooding): CPU-throttle
   // embedded browser guests that are effectively invisible (hidden workspace /
   // zoom-hidden / minimized window) and not under automation. CPU-only — does
@@ -511,6 +517,14 @@ export interface UISlice {
   // every real workspace as an orphan.
   sessionRestored: boolean;
   markSessionRestored: () => void;
+  /**
+   * The startup session load has finished, whatever it found (a saved
+   * session, none at all, or one that failed to load). Unlike
+   * `sessionRestored` (true only when saved workspaces came back), this is
+   * the point from which the live tree is the real one.
+   */
+  sessionLoadSettled: boolean;
+  markSessionLoadSettled: () => void;
 
   // #517 backend choice (default 'builtin'). NON-PERSISTED renderer mirror:
   // main owns the authoritative value (userData JSON, read synchronously at
@@ -1545,6 +1559,12 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
     state.inlineImagesEnabled = enabled;
   }),
 
+  plainDragSelectEnabled: true,
+
+  setPlainDragSelectEnabled: (enabled) => set((state) => {
+    state.plainDragSelectEnabled = enabled;
+  }),
+
   setHiddenPaneRetentionEnabled: (enabled) => set((state) => {
     state.hiddenPaneRetentionEnabled = enabled;
     // Explicit user intent — stamp the migration ledger so this choice is
@@ -1595,6 +1615,12 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
 
   markSessionRestored: () => set((state) => {
     state.sessionRestored = true;
+  }),
+
+  sessionLoadSettled: false,
+
+  markSessionLoadSettled: () => set((state) => {
+    state.sessionLoadSettled = true;
   }),
 
   markSessionSettingsLoaded: () => set((state) => {

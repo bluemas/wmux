@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
-import { agentDisplayToSlug } from '../../shared/agentIdentity';
+import { agentDisplayToSlug, agentRow } from '../../shared/agentIdentity';
 import { isBrainPty } from '../../shared/constants';
 import type { AgentStatus } from '../../shared/types';
 import type { ChatSkillCatalog } from '../../shared/transcript/chatSkills';
@@ -15,8 +15,8 @@ import { screenBlocksChatSend, screenShowsRunningTurn, screenShowsTurnEnding, ti
 import { claudeComposerRows, claudeComposerShows, deliverChatPrompt, type ChatScreenRows } from '../transcript/deliverChatPrompt';
 import { INTERRUPT_COOLDOWN_MS, interruptChatTurn, type ChatInterruptVerdict } from '../transcript/interruptChatTurn';
 import { boundResumeCommand, codexRuntimeEnv, resumeCwdUsable, terminalLaunchCommand } from '../transcript/terminalLaunch';
-import { boundSessionLives, latestResumeSession } from '../transcript/resumeAvailable';
-import { isUsableResumeBinding, type ResumeBinding } from '../../shared/agentResume';
+import { boundSessionLives } from '../transcript/resumeAvailable';
+import { isUsableResumeBinding, withLaunchSessionId, type ResumeBinding } from '../../shared/agentResume';
 import { CHATV2_PROVIDER_SESSION_ID } from '../../shared/chatv2/ipc';
 import { classifyShell } from '../shell-integration';
 import { inResumeCwd, type ResumeShell } from './v2/handoff';
@@ -35,6 +35,7 @@ import {
   type ChatLaunchRequest, type ChatLaunchTag, type ChatOwner, type ChatResolution, type ChatSendOutcome, type ChatSendRequest,
   type ChatSendTag, type ChatTurn, type DangerousLaunchTrace,
   type ChatDeliveredMessage, type ChatDequeueResult, type ChatQueueEvent, type ChatQueueItemView, type ChatSendReceiptView,
+  type ChatQueueDeliver, type ChatSteerResult,
 } from './chatBridge';
 
 /** Transcript stamps may trail the daemon's write time by this much and still count after it. */
@@ -78,6 +79,9 @@ export interface ChatAgentState {
   agentStatus: AgentStatus;
   inputQuiet: boolean;
   inputRevision: number;
+  /** Like `inputQuiet` / `inputRevision`, but pointer motion and focus reports do not move them. */
+  keyInputQuiet?: boolean;
+  keyInputRevision?: number;
   incarnationId: string | null;
   /** The pane's running episode; absent when the pane has no PTY bridge. */
   turn?: ChatTurn;
@@ -122,8 +126,6 @@ export interface NativeChatBridgeDeps<P extends ChatPane> {
   /** `anyShell` also accepts PowerShell and cmd (the caller picked its grammar already). */
   idleShell(pid: number, env: NodeJS.ProcessEnv, anyShell?: boolean): Promise<{ ok: true } | { ok: false; reason: 'missing' | 'unsupported-shell' | 'shell-has-children' }>;
   installedAgents(env: NodeJS.ProcessEnv): Promise<AgentLaunchOptions[]>;
-  /** Whether a resume launch has a conversation to continue in `cwd` (default: the agent's own records). */
-  latestResumeSession?(agent: TerminalLaunchAgent, cwd: string, env: NodeJS.ProcessEnv): Promise<string | undefined>;
   /** Whether a pane's binding still names a conversation to continue (default: its transcript and folder exist). */
   boundSessionLives?(binding: ResumeBinding, env: NodeJS.ProcessEnv, fresh: boolean): Promise<boolean>;
   /** Panes whose resume binding names this agent session (the daemon's own records). */
@@ -159,7 +161,7 @@ export interface NativeChatBridgeDeps<P extends ChatPane> {
   delay?: (ms: number) => Promise<void>;
 }
 
-type QueueMethods = 'queueEnabled' | 'queue' | 'dequeue' | 'dropQueue' | 'delivered';
+type QueueMethods = 'queueEnabled' | 'queue' | 'dequeue' | 'steer' | 'dropQueue' | 'delivered';
 
 /** How the desktop RPCs dispatch a pane (contract §2.1). */
 export type ChatRoute =
@@ -228,7 +230,7 @@ const CLEAR_FRAME_POLLS = 8;
 const DELIVERED_KEEP = 32;
 /**
  * Whether the agent takes a first message on its resume command line
- * (`claude --continue -- 'p'`, `codex resume --last -- 'p'`). One that cannot
+ * (`claude --resume <id> -- 'p'`, `codex resume <id> -- 'p'`). One that cannot
  * refuses resume + prompt with `resume-prompt-unsupported`.
  */
 const RESUME_TAKES_PROMPT: Readonly<Record<TerminalLaunchAgent, boolean>> = { claude: true, codex: true };
@@ -451,12 +453,14 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
     const live = deps.chatAgentState(id);
     const slug = slugOf(live);
     const agentAlive = !!slug && slug === status.terminal?.agent && live.agentVerified;
+    // Per-agent capabilities are `terminalChat` on the registry row (agentIdentity.ts).
+    const chat = agentAlive ? agentRow(slug)?.terminalChat : undefined;
     return { ...status, agentStatus: live.agentStatus, agentAlive,
       ...(status.terminal ? { terminal: { ...status.terminal, capabilities: { ...status.terminal.capabilities,
-        send: agentAlive && ['claude', 'codex'].includes(slug!),
-        cancel: agentAlive && ['claude', 'codex'].includes(slug!),
-        images: agentAlive && slug === 'claude',
-        queue: agentAlive && slug === 'claude',
+        send: agentAlive && chat?.send === true,
+        cancel: agentAlive && chat?.cancel === true,
+        images: agentAlive && chat?.images === true,
+        queue: agentAlive && chat?.queue === true,
       } } } : {}) };
   };
 
@@ -690,7 +694,11 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
           const current = deps.chatAgentState(id);
           const slug = slugOf(current);
           return slug && current.agentVerified ? { slug, incarnationId: current.incarnationId, status: current.agentStatus,
-            inputQuiet: current.inputQuiet, inputRevision: current.inputRevision } : null;
+            // Keys only: motion and focus reports from a desktop renderer
+            // change nothing in the composer, and must not refuse the send
+            // or break the paste-to-Enter proof.
+            inputQuiet: current.keyInputQuiet ?? current.inputQuiet,
+            inputRevision: current.keyInputRevision ?? current.inputRevision } : null;
         },
         isAgentProcessAlive: async () => {
           const slug = slugOf(deps.chatAgentState(id));
@@ -856,6 +864,9 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
     agentSessionId: string;
     historyEpoch?: string;
     source: 'file' | 'tui';
+    /** Claude (file binding): `steer` may type it into a running turn. */
+    steerable: boolean;
+    deliver: ChatQueueDeliver;
     incarnation?: string;
     authorized?: (stage?: 'first-write' | 'submit') => Promise<boolean>;
     /** Why the last attempt held it, if a dialog did: the failure reason at the TTL. */
@@ -891,8 +902,13 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
     return fits.length === 1 ? { text: fits[0].text, owner: fits[0].owner, clientMessageId: fits[0].clientMessageId } : undefined;
   };
 
-  const queueOutcome = (record: Readonly<ChatQueueRecord>, replayed: boolean): ChatSendOutcome =>
-    ({ clientMessageId: record.clientMessageId, replayed, queueState: record.state, ...(record.reason ? { queueReason: record.reason } : {}) });
+  const deliverOf = (record: Readonly<ChatQueueRecord>) => queueMemo.get(memoKey(record.owner, record.clientMessageId))?.deliver;
+
+  const queueOutcome = (record: Readonly<ChatQueueRecord>, replayed: boolean): ChatSendOutcome => {
+    const deliver = deliverOf(record);
+    return { clientMessageId: record.clientMessageId, replayed, queueState: record.state, ...(record.reason ? { queueReason: record.reason } : {}),
+      ...(deliver ? { queueDeliver: deliver } : {}) };
+  };
 
   /**
    * A re-post of an id the queue knows. The body must match: by the memory
@@ -912,9 +928,10 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
     state.agentStatus === 'running' || state.turn?.state === 'running' && state.agentStatus !== 'awaiting_input';
 
   const emitQueue = (record: Readonly<ChatQueueRecord>) => {
+    const deliver = deliverOf(record);
     try {
       deps.onQueueEvent?.({ sessionId: record.paneId, owner: record.owner, clientMessageId: record.clientMessageId,
-        state: record.state, ...(record.reason ? { reason: record.reason } : {}), at: record.at });
+        state: record.state, ...(record.reason ? { reason: record.reason } : {}), ...(deliver ? { deliver } : {}), at: record.at });
     } catch (error) {
       deps.log('warn', `[chat] queue event failed: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -979,10 +996,13 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
     if (inserted === 'exists') return heldReplay(queueStore!.get(owner, clientMessageId)!, id, fingerprint, undefined);
     if (inserted === 'full') return refuse(clientMessageId, 'queue-full');
     if (inserted === 'persist-failed') return refuse(clientMessageId, 'chat-persist-failed');
+    // Only a composer that queues a prompt typed mid-turn (`terminalChat.queue` on
+    // the registry row: Claude Code) can be steered; elsewhere `steer` is `next-turn`.
+    const steerable = source === 'file' && agentRow(slugOf(deps.chatAgentState(id)))?.terminalChat?.queue === true;
     queueMemo.set(memoKey(owner, clientMessageId), {
       fingerprint, preview: Array.from(req.text).slice(0, QUEUE_PREVIEW_CHARS).join(''), text: req.text,
       agentSessionId: req.agentSessionId, ...(req.historyEpoch !== undefined ? { historyEpoch: req.historyEpoch } : {}),
-      source, incarnation: deps.pane(id)?.meta.incarnationId, authorized: req.queue!.authorized,
+      source, steerable, deliver: steerable && req.queue!.deliver === 'steer' ? 'steer' : 'next-turn', incarnation: deps.pane(id)?.meta.incarnationId, authorized: req.queue!.authorized,
     });
     const record = queueStore!.get(owner, clientMessageId)!;
     emitQueue(record);
@@ -1026,6 +1046,21 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
     return !!head && head.owner === record.owner && head.clientMessageId === record.clientMessageId;
   };
 
+  /** A steer item is taken out of order, so it only has to be still waiting. */
+  const stillTarget = (id: string, record: Readonly<ChatQueueRecord>, steer: boolean) =>
+    steer ? queueStore?.get(record.owner, record.clientMessageId)?.state === 'queued' : stillHead(id, record);
+
+  /**
+   * The item a pass tries: the head, except while a file-bound agent works
+   * and the head waits for the next turn, when the oldest `steer` item behind
+   * it goes first (it is typed into the running turn).
+   */
+  const queueTarget = (id: string): Readonly<ChatQueueRecord> | undefined => {
+    const head = queueStore?.head(id);
+    if (!head || deliverOf(head) === 'steer' || !agentWorking(deps.chatAgentState(id))) return head;
+    return queueStore!.list(id).find((record) => record.state === 'queued' && deliverOf(record) === 'steer') ?? head;
+  };
+
   /**
    * One pass over a pane's queue: deliver the head when the turn is over,
    * one item per ended turn, through the same guarded dispatch as a direct
@@ -1035,11 +1070,12 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
   const drainQueue = async (id: string): Promise<void> => {
     if (!queueStore) return;
     for (;;) {
-      const head = queueStore.head(id);
+      const head = queueTarget(id);
       if (!head) return;
       const memo = queueMemo.get(memoKey(head.owner, head.clientMessageId));
       if (!memo?.text || !memo.authorized) { settle(head, 'canceled', 'daemon-restart'); continue; }
       const text = memo.text;
+      const steer = memo.deliver === 'steer';
       const pane = deps.pane(id);
       if (!pane) { cancelQueued((record) => record.paneId === id, 'pane-closed'); return; }
       if (memo.retryAt !== undefined && now() < memo.retryAt) return;
@@ -1060,8 +1096,12 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
       // queue's watch nudges when it changes).
       if (memo.source === 'file') {
         const cheap = deps.chatAgentState(id);
-        if (agentWorking(cheap)) { markRunning(id, cheap.turn?.id, false); delete memo.idleSince; return; }
-        if (expired()) continue;
+        if (agentWorking(cheap)) {
+          markRunning(id, cheap.turn?.id, false);
+          delete memo.idleSince;
+          // A steer item is typed into the running turn; the rest wait for its end.
+          if (!steer) return;
+        } else if (expired()) continue;
       }
       const authorize = memo.authorized;
       const incarnation = memo.incarnation;
@@ -1070,11 +1110,11 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
         try { return await authorize(stage); } catch { return false; }
       };
       if (pane.meta.incarnationId !== memo.incarnation || !await authorized('first-write')) {
-        if (stillHead(id, head)) settle(head, 'canceled', 'authorization-revoked');
+        if (stillTarget(id, head, steer)) settle(head, 'canceled', 'authorization-revoked');
         continue;
       }
       const resolution = await resolve(id);
-      if (!stillHead(id, head)) continue;
+      if (!stillTarget(id, head, steer)) continue;
       if (memo.source === 'tui') {
         if (resolution.source === 'tui' && resolution.status.agentStatus === 'running') {
           markRunning(id, undefined, true);
@@ -1107,10 +1147,10 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
       const last = lastDelivered.get(id);
       if (last && (resolution.source === 'tui' || live?.turn?.id === last.turnId)) {
         if (running) last.sawRunning = true;
-        if (!last.sawRunning && now() - last.at < QUEUE_TURN_GATE_STALE_MS) return;
+        if (!steer && !last.sawRunning && now() - last.at < QUEUE_TURN_GATE_STALE_MS) return;
       }
-      if (running) return;
-      if (!stillHead(id, head)) continue;
+      if (running && !steer) return;
+      if (!stillTarget(id, head, steer)) continue;
       // Synchronous from the head check: DELETE now answers delivery-in-progress.
       const delivering = queueStore.transition(head.owner, head.clientMessageId, 'delivering', undefined, { strict: true });
       if (!delivering) {
@@ -1146,7 +1186,9 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
         } };
       let outcome: StoredChatOutcome;
       try {
-        outcome = resolution.source === 'tui' ? await dispatchTui(req, resolution) : await dispatchFile(req, { idleOnly: true });
+        // Steer into a running turn takes Claude's composer queue, like a direct send.
+        outcome = resolution.source === 'tui' ? await dispatchTui(req, resolution)
+          : await dispatchFile(req, { idleOnly: !(steer && running) });
       } catch {
         outcome = { result: 'unconfirmed', effect: 'uncertain', error: 'delivery-unconfirmed' };
       }
@@ -1159,6 +1201,13 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
       }
       if (inserted === 'inserted' && !receipts?.complete(head.owner, head.clientMessageId, outcome)) {
         deps.log('warn', `[chat] send receipt for queued ${id} not persisted`);
+      }
+      if (verdict.state === 'delivered' && outcome.queued) {
+        // Claude queued it inside the running turn: no episode opened, and the
+        // next-turn items still wait for this turn's end.
+        noteDelivered(id, head.owner, head.clientMessageId, text);
+        settle(head, verdict.state, verdict.reason);
+        return;
       }
       if (verdict.state === 'delivered') {
         // The episode this delivery opened (the Enter bumps it synchronously).
@@ -1200,7 +1249,7 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
     return queueStore.list(id).filter((record) => record.owner === owner).map((record) => {
       const memo = queueMemo.get(memoKey(owner, record.clientMessageId));
       return { clientMessageId: record.clientMessageId, state: record.state, ...(record.reason ? { reason: record.reason } : {}),
-        queuedAt: record.queuedAt, at: record.at, ...(memo ? { preview: memo.preview } : {}) };
+        ...(memo ? { deliver: memo.deliver } : {}), queuedAt: record.queuedAt, at: record.at, ...(memo ? { preview: memo.preview } : {}) };
     });
   };
 
@@ -1215,6 +1264,28 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
       case 'delivering': return { ok: false, error: 'delivery-in-progress', ...final };
       default: return { ok: false, error: 'queue-item-final', ...final };
     }
+  };
+
+  /** "Send now": a waiting item switches to `steer` and the queue is kicked at once. */
+  const steer = (owner: ChatOwner, id: string, clientMessageId: string): ChatSteerResult => {
+    const record = queueStore?.get(owner, clientMessageId);
+    const memo = record ? queueMemo.get(memoKey(owner, record.clientMessageId)) : undefined;
+    if (!record || record.paneId !== id) return { ok: false, error: 'queue-item-not-found' };
+    const final = { state: record.state, ...(record.reason ? { reason: record.reason } : {}) };
+    switch (record.state) {
+      case 'queued': break;
+      case 'delivered': return { ok: false, error: 'already-delivered', ...final };
+      case 'delivering': return { ok: false, error: 'delivery-in-progress', ...final };
+      default: return { ok: false, error: 'queue-item-final', ...final };
+    }
+    // A waiting item always has its memory half (a restart cancels it).
+    if (!memo) return { ok: false, error: 'queue-item-not-found' };
+    if (memo.steerable && memo.deliver !== 'steer') {
+      memo.deliver = 'steer';
+      emitQueue(record);
+      void kickQueue(id);
+    }
+    return { ok: true, state: record.state, deliver: memo.deliver };
   };
 
   /** The send receipt, with the queue's record laid over it for a queued message. */
@@ -1594,8 +1665,17 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
     if (agent !== 'claude' && agent !== 'codex') return fail('invalid-chat-request');
     let command: string;
     const resume = req.resume === true;
+    // Only the pane's own conversation is ever resumed. With no exact binding for
+    // this agent there is nothing to continue, whatever the shell or install state
+    // (the newest conversation in the folder is a guess another pane may own), so
+    // this answer comes before every other check. `/turns` `chat.resumable` is false
+    // for such a pane, so a client gating on it never sends the request.
+    if (resume && boundOf(deps.pane(id))?.agent !== agent) return fail('resume-unavailable');
     if (resume && req.prompt !== undefined && !(deps.resumeTakesPrompt?.(agent) ?? RESUME_TAKES_PROMPT[agent])) return fail('resume-prompt-unsupported');
-    try { command = terminalLaunchCommand(agent, req.prompt, req.mode, resume); } catch { return fail('invalid-chat-request'); }
+    try { command = terminalLaunchCommand(agent, req.prompt, req.mode); } catch { return fail('invalid-chat-request'); }
+    // A fresh Claude is pinned to a minted id, so the pane's exact conversation is
+    // on its command line from the start (the daemon binds it from there).
+    if (!resume) command = withLaunchSessionId(command, randomUUID());
     if (launching.has(id)) return fail('launch-pending');
     launching.add(id);
     let relay: LaunchRelay | undefined;
@@ -1633,15 +1713,12 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
       try { buildAgentLaunch({ agent }, await deps.installedAgents(env)); } catch { return fail('agent-not-installed'); }
       // Checked against the agent's own records before anything is typed (or a
       // Codex relay is touched), so a resume never starts an agent that fails.
-      // The resume line names this cwd itself (Claude `cd --`, Codex `--cd`), so
-      // it must be quotable; the agent then runs exactly where it was checked.
-      const cwd = pane.meta.cwd || pane.meta.spawnCwd;
-      const quoted = quotedCwd(cwd);
       // Uncached: a record deleted since the last `/turns` read must not be typed.
       if (bound && !await sessionLives(bound, env, true)) return fail('resume-unavailable');
       const boundCwd = bound && boundShell === 'posix' ? quotedCwd(bound.cwd) : undefined;
       if (resume) {
-        const sessionId = bound?.sessionId ?? (cwd && quoted ? await (deps.latestResumeSession ?? latestResumeSession)(agent, cwd, env) : undefined);
+        // Already refused at the top without a binding; kept so no path can type an unbound resume.
+        const sessionId = bound?.sessionId;
         if (!sessionId) return fail('resume-unavailable');
         // Two agents appending to one conversation: refuse while another pane runs it.
         if (heldElsewhere(id, agent, sessionId)) return fail('resume-in-use');
@@ -1665,8 +1742,8 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
         if (!RELAY_URL.test(relay.url)) return fail('launch-unconfirmed');
         // Typed into an idle zsh/bash/sh prompt (idleShell refuses anything else), so the
         // shell's own "$PWD" is the directory Codex should start in; a tracked cwd can only lag it.
-        // A resume names the directory its availability was checked in, so `--last` filters on that one.
-        command = withCodexRemote(command, relay.url, boundCwd ?? (resume && quoted ? quoted : codexCdOperand()));
+        // A bound resume names its binding's own folder.
+        command = withCodexRemote(command, relay.url, boundCwd ?? codexCdOperand());
       }
       // A pane created with a chosen account launches that vendor's agent on it,
       // whatever the shell's rc files exported (see withChosenAccountEnv).
@@ -1676,7 +1753,7 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
       // A relay Codex is placed by its `--cd`; every other bound line changes folder first.
       if (bound && boundShell) {
         if (agent !== 'codex' || boundShell === 'pwsh') command = inResumeCwd(bound.cwd, command, boundShell);
-      } else if (resume && agent === 'claude') command = `cd -- ${quoted} && ${command}`;
+      }
       const secondIdle = await idle();
       if (secondIdle) return secondIdle;
       if (req.authorized) {
@@ -1737,6 +1814,15 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
     send: (req) => sendWith(req, true),
     cancel,
     receipt: receiptView,
+    priorSend: (owner, clientMessageId, text) => {
+      const entry = deps.receipts?.lookup(owner, clientMessageId);
+      const paneId = entry?.paneId ?? queueStore?.get(owner, clientMessageId)?.paneId;
+      if (!paneId) return undefined;
+      const sameText = text === undefined ? undefined
+        : entry ? entry.fingerprint === ChatSendReceiptStore.fingerprint(entry.paneId, entry.agentSessionId, entry.historyEpoch, text)
+          : true; // a queue record alone keeps no text fingerprint
+      return { paneId, view: receiptView(owner, paneId, clientMessageId), ...(sameText !== undefined ? { sameText } : {}) };
+    },
     launch,
     skills: (id, agent) => skillsWith(id, agent, 'spawnCwd'),
     watch: (id) => deps.terminalChat()?.subscribe(WEB_BRIDGE_CLIENT, id),
@@ -1792,6 +1878,7 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
     queueEnabled: () => !!queueStore,
     queue: queueView,
     dequeue,
+    steer,
     dropQueue: (match, reason) => cancelQueued((record) => match(record.owner), reason),
     delivered: (owner, id) => (deliveredLog.get(id) ?? []).filter((entry) => entry.owner === owner)
       .map(({ clientMessageId, text, at }) => ({ clientMessageId, text, at })),

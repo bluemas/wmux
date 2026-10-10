@@ -160,7 +160,7 @@ describe('#1255 — every fit() apply site is floor-gated, every recovery re-ass
     // Window covers the whole settle fn — #1258's scroll-preservation block
     // and the in-stream reset/END writes also live inside it, ahead of the
     // re-assert.
-    const resync = src.slice(src.indexOf('const completeResyncFromFlush'), src.indexOf('const completeResyncFromFlush') + 3000);
+    const resync = src.slice(src.indexOf('const completeResyncFromFlush'), src.indexOf('const completeResyncFromFlush') + 3400);
     expect(resync).toMatch(/proposedSafeDimensions\(fitAddon, container\)/);
     expect(resync).toMatch(/sendResize\(ptyId, dims\.cols, dims\.rows\)/);
     // Anchor on the reattach log line itself — plain "daemon reattach" also

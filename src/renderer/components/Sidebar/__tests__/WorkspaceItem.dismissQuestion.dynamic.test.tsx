@@ -95,7 +95,8 @@ describe('workspace row — Dismiss question', () => {
     await render();
     openMenu();
     const item = dismissItem();
-    expect(item?.textContent).toBe('Dismiss question');
+    // It clears every pane's question, so the label says how many.
+    expect(item?.textContent).toBe('Dismiss 2 questions');
     act(() => { item!.click(); });
 
     const s = useStore.getState();
@@ -108,5 +109,19 @@ describe('workspace row — Dismiss question', () => {
     expect(dismissItem()).toBeNull();
     act(() => { useStore.getState().setSurfacePendingQuestion('pty-q1', 'Shall I merge?'); });
     expect(useStore.getState().surfacePendingQuestion['pty-q1']).toBeUndefined();
+  });
+
+  it('skips a pane whose agent reports a live prompt, even with a question text', async () => {
+    act(() => {
+      useStore.setState({ surfacePendingQuestion: { 'pty-q1': 'Shall I merge?', 'pty-dialog': 'Allow edit?' } });
+    });
+    await render();
+    openMenu();
+    expect(dismissItem()?.textContent).toBe('Dismiss question');
+    act(() => { dismissItem()!.click(); });
+
+    const s = useStore.getState();
+    expect(s.surfacePendingQuestion).toEqual({ 'pty-dialog': 'Allow edit?' });
+    expect(s.surfaceDismissedQuestion).toEqual({ 'pty-q1': 'Shall I merge?' });
   });
 });

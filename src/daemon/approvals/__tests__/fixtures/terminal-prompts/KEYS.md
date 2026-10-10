@@ -70,7 +70,7 @@ There is no "No, keep planning" row in this build.
 | `shift+tab` on row 3 | Approves with the typed feedback (hint shown, not exercised) |
 | `Esc` | Rejects the plan ("User rejected Claude's plan"), ends the turn, stays in plan mode (measured through the phone `/decline`, 2026-09-28) |
 
-## Claude Code — permission dialogs (Bash, Edit, Write)
+## Claude Code — permission dialogs (Bash, PowerShell, Edit, Write)
 
 | Dialog | Options | Keys |
 | --- | --- | --- |
@@ -85,6 +85,64 @@ The Fetch and Read screens were captured on Claude Code 2.1.292 in manual mode
 (`WMUX_DATA_SUFFIX`), read with `daemon.readSessionText` and padded to the
 grid height; the narrow variants are the same dialog after a pane resize. They
 are in `claude-2.1.292/` (alternate screen).
+
+Measured on Claude Code 2.1.293 and 2.1.294 on Windows (captured 2026-10-08 in
+a 100- and an 80-column ConPTY pane of an isolated daemon, manual mode): the
+Bash dialog draws `Tip: auto mode handles these prompts for you — choose
+"switch to auto mode" below` between the title and the call's description (an
+80-column pane wraps it onto a second prose row, `below`), and its options are
+`1. Yes`, `2. Yes, and always allow access to <dir> from this project`,
+`3. Yes, and switch to auto mode · auto mode handles these prompts for you`,
+`4. No`. Keys on that pane, written raw to the PTY:
+
+| Bytes | Effect |
+| --- | --- |
+| `1` / `4` | Act immediately, as above |
+| lone `ESC` (`\x1b`) | Nothing: the dialog (and an AskUserQuestion picker) stays up. ConPTY runs the pane's input in win32-input-mode; the likely reason (not observed) is that conhost holds a bare ESC as the start of a sequence |
+| `CSI 27;1;27;1;0;1 _` `CSI 27;1;0;0;0;1 _` (the Esc key record pair) | Cancels at once: the Bash dialog interrupts the turn, the picker answers "User declined to answer questions" |
+| lone `\r`, `ESC [ B` | Enter and Down on the picker, as in the table above |
+
+The screens are in `claude-2.1.293/` (alternate screen). The user name in the
+paths is replaced at the same length, so wraps are unchanged, and the banner's
+model and plan names are replaced.
+
+The PowerShell tool (Claude Code 2.1.294 on Windows, captured 2026-10-08 the
+same way, 100x30 and 80x24, #1936). Its call input is `{ command, description
+}`, as Bash's. The dialog is titled `PowerShell command` and laid out as the
+Bash one: the description, the boxed command (a `│` gutter when it wraps), and
+a reason row under the box when Claude has one (`Command contains script block
+that may execute arbitrary code`). No `Tip:` row and no auto-mode option were
+drawn in this run.
+
+| Dialog | Options | Keys |
+| --- | --- | --- |
+| PowerShell | `1. Yes`, `2. Yes, and always allow access to <dir> from this project` (wraps at 80 columns), `3. No` | `1` runs the command. `3` (No) interrupts the turn. The Esc key record pair cancels it ("Interrupted") |
+| PowerShell, with a reason row | `1. Yes`, `2. No` | `1` runs the command |
+| Write (create, 2.1.294) | `1. Yes`, `2. Yes, and switch to accept edits … for this session (shift+tab)`, `3. No` | `3` rejects. With wmux's default PreToolUse gate the call first waits for the gate's deadline (Write is gated, PowerShell is not) |
+
+The screens are in `claude-2.1.294/`, sanitized as above.
+
+The WebSearch tool (Claude Code 2.1.296 on macOS, captured 2026-10-10 in a
+PTY read with `@xterm/headless`, `--permission-mode default --setting-sources
+project --strict-mcp-config` as Moa's brain runs, main buffer). Its call input
+is `{ query, mode: "standard" }`, plus `allowed_domains` when the model sets
+one; the PermissionRequest hook's `tool_input` is the same object. The dialog
+is titled with Claude's generic `Tool use`, draws `│ Claude wants to search
+the web for: <query>`, and boxes the call between dashed rules as
+`Web Search("<query>")` (the query verbatim, quotes not escaped; a `│` gutter
+when it wraps). One allowed domain is drawn as `, only allowing domains:
+github.com` before the closing `)`. Footer `Esc to cancel · Tab to amend`.
+
+| Dialog | Options | Keys |
+| --- | --- | --- |
+| WebSearch, 80 columns or wider | `1. Yes`, `2. Yes, and don't ask again for Web Search commands in <cwd>` (the TUI cuts it with `…` when the cwd does not fit), `3. No` | `Esc` rejects and interrupts the turn ("Interrupted · What should Claude do instead?"). Digits were not pressed |
+| WebSearch, 50 columns | `1. Yes`, `2. No` (the standing grant is not drawn) | as above |
+
+Because `2` is the standing grant in one layout and `No` in the other, wmux
+offers WebSearch's `1. Yes` only and denies with the Esc decline. The screens
+are in `claude-2.1.296/` (the user name in paths replaced at the same length,
+the plan name replaced), with the 2.1.296 Fetch dialog, unchanged from 2.1.292.
+Grep and Glob are not tools on 2.1.296 ("No such tool available").
 
 ## Claude Code — other menus
 

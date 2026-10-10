@@ -1293,17 +1293,20 @@ export default function FleetView() {
               title={t('fleet.sort.tooltip')} aria-label={t('fleet.sort.tooltip')}>
               {t(fleetSortMode === 'attention' ? 'fleet.sort.attention' : 'fleet.sort.workspace')}
             </button>
-            <SegmentedControl
-              value={fleetLayout}
-              onValueChange={setFleetLayout}
-              ariaLabel={t('fleet.layout.label')}
-              data-testid="fleet-layout"
-              options={[
-                { value: 'list', label: t('fleet.layout.list') },
-                { value: 'board', label: t('fleet.layout.board') },
-              ]}
-            />
           </>
+        )}
+        {/* The layout is a setting, so it can be chosen before any agent runs. */}
+        {tab === 'fleet' && (
+          <SegmentedControl
+            value={fleetLayout}
+            onValueChange={setFleetLayout}
+            ariaLabel={t('fleet.layout.label')}
+            data-testid="fleet-layout"
+            options={[
+              { value: 'list', label: t('fleet.layout.list') },
+              { value: 'board', label: t('fleet.layout.board') },
+            ]}
+          />
         )}
         {!empty && (
           <button type="button" className="wmux-board-btn" onClick={openPicker} data-fleet-new-agent>

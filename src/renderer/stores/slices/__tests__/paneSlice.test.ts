@@ -1050,6 +1050,28 @@ describe('dismissPendingQuestion', () => {
     expect(store.getState().surfacePendingQuestion['pty-1']).toBe('Shall I merge?');
   });
 
+  it('shows the SAME question again when it is asked in a new turn', () => {
+    const store = createTestStore();
+    store.getState().setSurfacePendingQuestion('pty-1', 'Shall I merge?');
+    store.getState().dismissPendingQuestion('pty-1');
+    store.getState().markSurfaceTurnOpen('pty-1');
+    expect(store.getState().surfaceDismissedQuestion['pty-1']).toBeUndefined();
+    store.getState().setSurfacePendingQuestion('pty-1', 'Shall I merge?');
+    expect(store.getState().surfacePendingQuestion['pty-1']).toBe('Shall I merge?');
+  });
+
+  it('keeps the SAME question dismissed when it is re-delivered without a new turn', () => {
+    const store = createTestStore();
+    store.getState().setSurfacePendingQuestion('pty-1', 'Shall I merge?');
+    store.getState().dismissPendingQuestion('pty-1');
+    // A reconnect redraw: byte-rate running, no prompt submit.
+    store.getState().markSurfaceRunning('pty-1');
+    store.getState().setSurfaceAgentStatus('pty-1', 'running');
+    store.getState().setSurfacePendingQuestion('pty-1', 'Shall I merge?');
+    expect(store.getState().surfacePendingQuestion['pty-1']).toBeUndefined();
+    expect(store.getState().surfaceDismissedQuestion['pty-1']).toBe('Shall I merge?');
+  });
+
   it('touches only the dismissed pane', () => {
     const store = createTestStore();
     store.getState().setSurfacePendingQuestion('pty-1', 'Shall I merge?');

@@ -31,10 +31,13 @@ import { RemoteAttentionSubscriber } from '../../remote/RemoteAttentionSubscribe
 import type { RemoteAttentionNotification } from '../../remote/remoteAttention';
 import { isCategoryMuted } from '../../notification/mutedCategories';
 import { toastManager } from '../../notification/ToastManager';
+import { isPcRailHostMuted } from './pcRail.handler';
 import { parseRemoteAttachmentKey, parseWebUrl, remoteAttachmentKey, REMOTE_POLL_INTERVAL_MS } from '../../../shared/remoteHosts';
 import { normalizeWorkspaceColor } from '../../../shared/workspaceColors';
 import { DEVICE_KIND_HEADER } from '../../../shared/web';
 import { HostStatusProber, combineHostStatus } from '../../remote/hostStatus';
+import { RemoteBodyTooLargeError, readBoundedJson } from '../../remote/readBoundedJson';
+import { REMOTE_LIMITS, clampRemoteGeometry } from '../../../shared/remoteLimits';
 import { credentialOriginProblem, isCredentialSafeOriginString } from '../../../shared/remotePairInput';
 import type {
   PairFailureReason,
@@ -68,7 +71,9 @@ type ProbeResult =
   | { kind: 'unreachable' }
   /** Plain http to another machine: never probed, the token would go in the clear. */
   | { kind: 'needs-https' }
-  | { kind: 'incompatible' };
+  | { kind: 'incompatible' }
+  /** The host answered with a body over the size limit: not a version question. */
+  | { kind: 'unusable' };
 
 export interface RegisterRemoteHandlersDeps {
   store: RemoteHostsStore;
@@ -141,9 +146,9 @@ async function probeConfig(
   if (!res.ok) return { kind: 'incompatible' };
   let parsed: unknown;
   try {
-    parsed = await res.json();
-  } catch {
-    return { kind: 'incompatible' };
+    parsed = await readBoundedJson(res, REMOTE_LIMITS.smallBodyBytes);
+  } catch (err) {
+    return { kind: err instanceof RemoteBodyTooLargeError ? 'unusable' : 'incompatible' };
   }
   if (!parsed || typeof parsed !== 'object') return { kind: 'incompatible' };
   const allowInput = (parsed as RemoteConfigProbe).allowInput === true;
@@ -165,8 +170,13 @@ function probeFailureMessage(probe: Exclude<ProbeResult, { kind: 'ok' }>): strin
       return NEEDS_HTTPS_MESSAGE;
     case 'incompatible':
       return "that machine's wmux is too old for remote attach";
+    case 'unusable':
+      return 'that host sent an answer this app cannot use';
   }
 }
+
+/** A device credential is a few hundred characters; anything longer is not one. */
+const MAX_PAIR_TOKEN_CHARS = 4096;
 
 /** Shape of a `GET /api/pair` 403 error body (WebTerminalServer.handlePair). */
 interface PairErrorBody {
@@ -214,17 +224,21 @@ async function exchangePairCode(
   if (res.status === 403) {
     let body: PairErrorBody;
     try {
-      body = (await res.json()) as PairErrorBody;
+      body = (await readBoundedJson(res, REMOTE_LIMITS.smallBodyBytes)) as PairErrorBody;
     } catch {
       return { ok: false, reason: 'pairing-failed' };
     }
-    switch (body.error) {
+    switch (body?.error) {
       case 'expired':
         return { ok: false, reason: 'expired' };
       case 'too many attempts':
         return { ok: false, reason: 'too-many-attempts' };
       case 'invalid code':
-        return { ok: false, reason: 'invalid-code', attemptsLeft: body.attemptsLeft };
+        return {
+          ok: false,
+          reason: 'invalid-code',
+          attemptsLeft: Number.isSafeInteger(body.attemptsLeft) && (body.attemptsLeft as number) >= 0 ? body.attemptsLeft : undefined,
+        };
       case 'insecure-transport':
         return { ok: false, reason: 'insecure-transport' };
       default:
@@ -236,11 +250,11 @@ async function exchangePairCode(
 
   let parsed: PairSuccessBody;
   try {
-    parsed = (await res.json()) as PairSuccessBody;
+    parsed = (await readBoundedJson(res, REMOTE_LIMITS.smallBodyBytes)) as PairSuccessBody;
   } catch {
     return { ok: false, reason: 'pairing-failed' };
   }
-  if (typeof parsed.token !== 'string' || !parsed.token) {
+  if (!parsed || typeof parsed.token !== 'string' || !parsed.token || parsed.token.length > MAX_PAIR_TOKEN_CHARS) {
     return { ok: false, reason: 'pairing-failed' };
   }
   return { ok: true, token: parsed.token };
@@ -302,7 +316,7 @@ export function registerRemoteHandlers(deps: RegisterRemoteHandlersDeps): () => 
   // and the toast dedup without a second copy of any of them.
   const attentionSubs = new Map<string, RemoteAttentionSubscriber>(); // hostId -> sub
 
-  function onRemoteAttention(hostLabel: string, n: RemoteAttentionNotification): void {
+  function onRemoteAttention(hostId: string, hostLabel: string, n: RemoteAttentionNotification): void {
     const label = hostLabel || 'Remote';
     // NOT `dispatchNotification`: its renderer leg resolves a notification with
     // no ptyId and no workspaceId onto the ACTIVE LOCAL workspace
@@ -315,6 +329,8 @@ export function registerRemoteHandlers(deps: RegisterRemoteHandlersDeps): () => 
     // the mirrored per-category mute, and ToastManager (which applies the
     // `toastEnabled` setting and stays quiet while a window has OS focus).
     if (isCategoryMuted(n.category)) return;
+    // The PC rail's per-computer mute covers this path too.
+    if (isPcRailHostMuted(hostId)) return;
     toastManager.show(`${label} · ${n.title}`, n.body, { ptyId: null, workspaceId: null });
   }
 
@@ -335,7 +351,7 @@ export function registerRemoteHandlers(deps: RegisterRemoteHandlersDeps): () => 
       if (attentionSubs.has(hostId)) continue;
       const host = store.get(hostId);
       if (!host) continue;
-      const sub = makeAttentionSubscriber(host, onRemoteAttention);
+      const sub = makeAttentionSubscriber(host, (label, n) => onRemoteAttention(host.id, label, n));
       attentionSubs.set(hostId, sub);
       sub.start();
     }
@@ -653,6 +669,8 @@ export function registerRemoteHandlers(deps: RegisterRemoteHandlersDeps): () => 
       // a reason that would wrongly imply the CODE was wrong.
       const probe = await probeConfig(origin, exchange.token, fetchImpl);
       if (probe.kind === 'needs-https') return { ok: false, reason: 'insecure-transport' };
+      // An oversized answer is not an old wmux; the generic failure fits it.
+      if (probe.kind === 'unusable') return { ok: false, reason: 'pairing-failed' };
       if (probe.kind !== 'ok') {
         return { ok: false, reason: 'incompatible' };
       }
@@ -939,7 +957,7 @@ export function registerRemoteHandlers(deps: RegisterRemoteHandlersDeps): () => 
       rows: unknown,
     ): Promise<{ ok: true; cols: number; rows: number } | { ok: false; reason: string }> => {
       const id = assertString(attachId, 'attachId');
-      if (typeof cols !== 'number' || typeof rows !== 'number') {
+      if (clampRemoteGeometry(cols, rows) === null) {
         return { ok: false, reason: 'cols and rows must be numbers' };
       }
       const record = attachRecords.get(id);
@@ -947,7 +965,7 @@ export function registerRemoteHandlers(deps: RegisterRemoteHandlersDeps): () => 
       const client = clients.get(record.hostId);
       if (!client) return { ok: false, reason: 'unknown host' };
       try {
-        return await client.resizeSession(record.sessionId, cols, rows);
+        return await client.resizeSession(record.sessionId, cols as number, rows as number);
       } catch (err) {
         return { ok: false, reason: err instanceof Error ? err.message : String(err) };
       }

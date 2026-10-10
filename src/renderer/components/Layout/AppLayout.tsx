@@ -12,6 +12,7 @@ import { WorkspaceCenter } from './WorkspaceCenter';
 import { EmptyLeafFunnel } from './EmptyLeafFunnel';
 import { selectProjectCwdSignature } from '../../stores/selectors/appLayout';
 import { selectInboxOwnsApprovals } from '../../stores/selectors/approvalInbox';
+import { selectPcRailPersisted } from '../../stores/selectors/pcRail';
 import { shouldShowInstallError, shouldReannounceAfterError, isSmartAppControlHold, truncateReason } from './updateNoticePolicy';
 import { isInstallBlockedByWindowsReason } from '../../../shared/installAbortReasons';
 import { hooksLaunchCheck, nextFirstBootSurface } from './firstBootSequence';
@@ -20,6 +21,7 @@ import { openModalLayerCount, subscribeModalLayers } from '../ui/modalLayer';
 import { registerSessionSaver, saveSessionNow } from '../../utils/sessionSaveBridge';
 import { resolveReconcileRebind } from '../../hooks/resolveReconcileRebind';
 import { getLeafPanes, getWorkspaceLeafPanes } from '../../../shared/paneUtils';
+import { sessionLayoutWithoutPrivate, stashedPanesWithoutPrivate } from '../../../shared/privateBrowser';
 import NotificationPanel from '../Notification/NotificationPanel';
 import RailPage from './RailPage';
 import AutoUpdatePrompt from './AutoUpdatePrompt';
@@ -56,10 +58,13 @@ import { useAgentActivityClock } from '../../hooks/useAgentActivityClock';
 import { useTerminalCopyShortcut } from '../../hooks/useTerminalCopyShortcut';
 import { useNotificationListener } from '../../hooks/useNotificationListener';
 import { useRpcBridge } from '../../hooks/useRpcBridge';
+import { useA2aLinkRequestToast, useA2aRemoteSnapshot } from '../../hooks/useA2aRemoteSnapshot';
+import { useA2aRemoteBridge } from '../../hooks/useA2aRemoteBridge';
 import { useCloseTabOnShellExit } from '../../hooks/useCloseTabOnShellExit';
 import AgentMentionPicker from '../Palette/AgentMentionPicker';
 import HandoffPopover from '../Git/HandoffPopover';
 import { useWorkspaceMirrorPush } from '../../hooks/useWorkspaceMirrorPush';
+import { usePrivateBrowserCleanup } from '../../hooks/usePrivateBrowserCleanup';
 import { useMoaSync } from '../../hooks/useMoaSync';
 import { useResizeGuard } from '../../hooks/useResizeGuard';
 import { useApprovalInboxBridge } from '../../hooks/useApprovalInboxBridge';
@@ -68,6 +73,10 @@ import { useUsageLimitBridge } from '../../hooks/useUsageLimitBridge';
 import { useWorkspaceSettleBridge } from '../../hooks/useWorkspaceSettleBridge';
 import { useRemoteInboxBridge } from '../../hooks/useRemoteInboxBridge';
 import { useRemoteAttachmentsLifecycle } from '../../hooks/useRemoteAttachmentsLifecycle';
+import PcRailFeeds from '../PcRail/PcRailFeeds';
+import ShadowWorkspaceSync from '../Remote/ShadowWorkspaceSync';
+import { isShadowWorkspaceId } from '../../../shared/pcRail';
+import { withoutShadowWorkspaces } from '../../stores/shadowWorkspace';
 import { useDeckStream } from '../../hooks/useDeckStream';
 import { useChannelsEventSubscription } from '../../hooks/useChannelsEventSubscription';
 import { useChannelsHydration } from '../../hooks/useChannelsHydration';
@@ -225,6 +234,8 @@ function dumpScrollbackBuffersSync(): Map<string, boolean> {
   const dumped = new Map<string, boolean>();
   const state = useStore.getState();
   for (const ws of state.workspaces) {
+    // PC rail: a shadow shows another computer's sessions; nothing to dump.
+    if (isShadowWorkspaceId(ws.id)) continue;
     // rootPane only, deliberately (#977): a stashed pane's terminal is
     // unmounted, so it has no entry in terminalRegistry to serialize — and
     // stashing requires a daemon connection, which means this whole function
@@ -299,7 +310,9 @@ function cloneStashedPanes(
   ws: Workspace,
   dumped: Map<string, boolean>,
 ): StashedPane[] | undefined {
-  const stashed = ws.stashedPanes;
+  // Private browser tabs are not saved; a stashed pane that held only private
+  // tabs is left out on purpose (this is not the failure path below).
+  const stashed = ws.stashedPanes && stashedPanesWithoutPrivate(ws.stashedPanes);
   if (!stashed || stashed.length === 0) return undefined;
   return stashed.map((entry) => {
     try {
@@ -366,16 +379,22 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
   const state = useStore.getState();
   const companySafe = state.company ? { ...state.company, skipPermissions: undefined } : null;
   return {
-    workspaces: state.workspaces.map((ws) => ({
-      ...ws,
-      // #1135: never persist listeningPorts. It describes processes that are
-      // alive right now; a saved value outlives them and the daemon's
-      // PortWatcher cannot contradict it (its first empty observation for a
-      // session is a deliberate no-op), so the sidebar chip survived restarts.
-      ...(ws.metadata ? { metadata: stripLivePorts(ws.metadata) } : {}),
-      rootPane: cloneWithScrollback(ws.rootPane, dumped),
-      stashedPanes: cloneStashedPanes(ws, dumped),
-    })),
+    workspaces: state.workspaces.map((ws) => {
+      // Private browser tabs never reach the saved session (no restore after
+      // a restart); a pane that held only private tabs is dropped with them.
+      const layout = sessionLayoutWithoutPrivate(ws.rootPane, ws.activePaneId);
+      return {
+        ...ws,
+        // #1135: never persist listeningPorts. It describes processes that are
+        // alive right now; a saved value outlives them and the daemon's
+        // PortWatcher cannot contradict it (its first empty observation for a
+        // session is a deliberate no-op), so the sidebar chip survived restarts.
+        ...(ws.metadata ? { metadata: stripLivePorts(ws.metadata) } : {}),
+        rootPane: cloneWithScrollback(layout.rootPane, dumped),
+        activePaneId: layout.activePaneId,
+        stashedPanes: cloneStashedPanes(ws, dumped),
+      };
+    }),
     activeWorkspaceId: state.activeWorkspaceId,
     // #1011 — archived snapshots ride the session; restore lists them again.
     ...(state.archivedWorkspaces.length > 0 ? { archivedWorkspaces: state.archivedWorkspaces } : {}),
@@ -423,6 +442,7 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
     hiddenPaneRetentionEnabled: state.hiddenPaneRetentionEnabled,
     coldParkEnabled: state.coldParkEnabled,
     inlineImagesEnabled: state.inlineImagesEnabled,
+    plainDragSelectEnabled: state.plainDragSelectEnabled,
     browserLightweightMode: state.browserLightweightMode,
     browserDiscardHidden: state.browserDiscardHidden,
     siteMemoryEnabled: state.siteMemoryEnabled,
@@ -462,6 +482,7 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
     shortcutOverrides: state.shortcutOverrides,
     autoUpdateEnabled: state.autoUpdateEnabled,
     customThemeColors: state.customThemeColors ?? undefined,
+    pcRail: selectPcRailPersisted(state),
     onboardingCompleted: state.onboardingCompleted,
     // T8a: persist first-run wizard + cheat sheet flags alongside onboardingCompleted.
     // workspaceSlice.loadSession (T5) reads these back, defaulting to false.
@@ -897,12 +918,20 @@ export default function AppLayout() {
   useTerminalCopyShortcut();
   useNotificationListener();
   useRpcBridge();
+  // Cross-host A2A: the pane tree for exposure and gone-pane link breaks.
+  useA2aRemoteSnapshot();
+  useA2aLinkRequestToast(t);
+  // The other PCs' links, connections and held work: the one subscription
+  // behind the Remote page and its rail badge.
+  useA2aRemoteBridge();
   // `exit` in a shell closes its tab (clean exit only).
   useCloseTabOnShellExit();
   // Keep the main-process WorkspaceMirror warm: push the workspace tree +
   // per-pane agent status whenever it changes, so main resolves hooks/routing
   // locally instead of round-tripping workspace.list back to the renderer.
   useWorkspaceMirrorPush();
+  // Wipe the private-tab session when the last private browser tab closes.
+  usePrivateBrowserCleanup();
   useMoaSync();
   // S-C2 Approval Inbox bridge: the SINGLE owner of permissionPrompt.onOpen /
   // onClosed (guard #2). Always-on (not gated on fleetViewVisible) so MCP
@@ -1549,6 +1578,9 @@ export default function AppLayout() {
         // Always flip the gate, even on error — never leave the user
         // staring at a permanent "Restoring panes…" placeholder.
         setPaneGate('ready');
+        // The load is over, whatever it found: from here the pane tree is
+        // the real one (a first run, an empty or a broken session included).
+        if (gen === startupGenRef.current) useStore.getState().markSessionLoadSettled();
       }
     })();
   // setPaneGate / clearAllPtyState are stable zustand action refs; reconcilePtys
@@ -1935,7 +1967,7 @@ export default function AppLayout() {
   useEffect(() => {
     const saveSession = () => {
       const dumped = dumpScrollbackBuffersSync();
-      const data = buildSessionData(dumped);
+      const data = withoutShadowWorkspaces(buildSessionData(dumped), useStore.getState());
       window.electronAPI.session.save(data);
     };
 
@@ -1985,7 +2017,7 @@ export default function AppLayout() {
       // saved session — next startup would load garbage state.
       if (useStore.getState().paneGate !== 'ready') return;
       const dumped = dumpScrollbackBuffersSync();
-      const data = buildSessionData(dumped);
+      const data = withoutShadowWorkspaces(buildSessionData(dumped), useStore.getState());
       window.electronAPI.session.saveAsync(data);
     }, 5_000);
     return () => { clearInterval(interval); };
@@ -2065,6 +2097,14 @@ export default function AppLayout() {
           stays when the sidebar collapses (MiniSidebar `rail`); the sheet holds
           the sidebar, the panes and the dock. */}
       <div className={`wmux-frame-row flex flex-1 min-h-0 ${sidebarPosition === 'right' ? 'flex-row-reverse' : ''}`}>
+      <ErrorBoundary name="PcRail">
+        {/* Host roster, feeds and attention for the sidebar's PC switcher.
+            Mounted once the session is restored, so the saved mutes reach
+            main before any toast; the roster arriving is what shows the
+            switcher (none with 0 hosts). */}
+        {(sessionLoaded || sessionLoadFailed) && <PcRailFeeds />}
+        {(sessionLoaded || sessionLoadFailed) && <ShadowWorkspaceSync />}
+      </ErrorBoundary>
       <ErrorBoundary name="SidebarRail">
         <MiniSidebar rail collapsed={!sidebarVisible} />
       </ErrorBoundary>

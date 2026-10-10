@@ -3,6 +3,8 @@ import type { ChatBridgeApi } from '../shared/transcript/turnEvents';
 import { CHATV2_IPC, type ChatV2BridgeApi, type ChatV2EventsPush, type ChatV2ResyncPush } from '../shared/chatv2/ipc';
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import { IPC } from '../shared/constants';
+import type { PaneLabelRejection } from '../shared/paneLabelRules';
+import { CHROME_PANE_IPC, type ChromePaneBindings } from '../shared/chromePaneBinding';
 import type {
   AgySensorInstallResult,
   AgySensorStatus,
@@ -59,6 +61,27 @@ import type {
   LanLinkPeersListResult,
 } from '../shared/lanlink';
 import type {
+  A2aRemoteExposureGetResult,
+  A2aRemoteHeldListResult,
+  A2aRemoteHeldRejectResult,
+  A2aRemoteHeldRetryResult,
+  A2aRemoteHostStatus,
+  A2aRemoteHostsStatusResult,
+  A2aRemoteHostsExposedResult,
+  A2aRemoteLinkEvent,
+  A2aRemoteLinkProposeParams,
+  A2aRemoteLinkResult,
+  A2aRemoteLinksListResult,
+  A2aRemotePaneSnapshot,
+  A2aRemoteHostsListResult,
+  A2aRemoteHostsRemoveResult,
+  A2aRemoteJoinResult,
+  A2aRemotePairBeginResult,
+  A2aRemotePairStatus,
+  A2aRemotePeersListResult,
+  A2aRemoteStatus,
+} from '../shared/rpc';
+import type {
   PairFlow,
   WebDeviceListError,
   WebDeviceRevokeResult,
@@ -69,6 +92,15 @@ import type {
   WebTerminalInfo,
   WebDiagnosis,
 } from '../shared/web';
+import { PC_RAIL_IPC } from '../shared/pcRail';
+import type {
+  PcRailApprovalsRequest,
+  PcRailApprovalsResult,
+  PcRailAttentionEvent,
+  PcRailMutesRequest,
+  PcRailStreamEvent,
+} from '../shared/pcRail';
+import type { PcRailFeedEvent } from '../main/remote/pcRailWire';
 import type { PairFailureReason, RemoteAttachmentDescriptor, RemoteErrorReason, RemoteHostPublic, RemoteHostStatus, RemoteWorkspaceSummary } from '../shared/remoteHosts';
 
 /** Mirrors {@link McpStatusPayload} in src/main/ipc/handlers/mcp.handler.ts. */
@@ -423,7 +455,11 @@ const electronAPI = {
   // whether this build has the native helper for this OS.
   computerUse: {
     get: () => ipcRenderer.invoke(IPC.COMPUTER_USE_GET) as Promise<ComputerUseSettingsPayload>,
-    set: (enabled: boolean) => ipcRenderer.invoke(IPC.COMPUTER_USE_SET, enabled) as Promise<ComputerUseSettingsPayload>,
+    set: (patch: { enabled?: boolean; askPerApp?: boolean; overlay?: boolean }) =>
+      ipcRenderer.invoke(IPC.COMPUTER_USE_SET, patch) as Promise<ComputerUseSettingsPayload>,
+    // macOS: Request access, Reset access, Show helper in Finder.
+    permissions: (op: 'request' | 'reset' | 'reveal') =>
+      ipcRenderer.invoke(IPC.COMPUTER_USE_PERMISSIONS, { op }) as Promise<ComputerUseSettingsPayload>,
   },
   quickLaunch: {
     settingsGet: () => ipcRenderer.invoke(IPC.QUICK_LAUNCH_SETTINGS_GET) as Promise<QuickLaunchSettingsPayload>,
@@ -509,8 +545,11 @@ const electronAPI = {
       ipcRenderer.invoke(IPC.METADATA_SNAPSHOT) as Promise<Array<{ paneId: string; label: string; role: string }>>,
     // P2 GUI pane rename. Routes through MetadataStore (the sole label authority)
     // so the change persists + relays back to every renderer via METADATA_UPDATE.
+    // A label that breaks the pane label policy resolves { ok: false, code }.
     setLabel: (paneId: string, workspaceId: string, label: string) =>
-      ipcRenderer.invoke(IPC.METADATA_SET, paneId, workspaceId, label) as Promise<{ ok: boolean }>,
+      ipcRenderer.invoke(IPC.METADATA_SET, paneId, workspaceId, label) as Promise<
+        { ok: true } | { ok: false; code: PaneLabelRejection; error: string }
+      >,
     // Fleet dropdown → set a pane's operator-assigned orchestrator role. Routes
     // through MetadataStore (custom deep-merge) so it persists + relays back via
     // METADATA_UPDATE.paneRole. '' clears the assignment (unassigned sentinel).
@@ -840,6 +879,11 @@ const electronAPI = {
         ipcRenderer.invoke(IPC.DECK_MOA_ARCHIVE_LIST) as Promise<{ decisions: import('../shared/moa').MoaArchivedDecision[] }>,
       archiveAck: () => ipcRenderer.invoke(IPC.DECK_MOA_ARCHIVE_ACK) as Promise<{ ok: boolean }>,
       resetStore: () => ipcRenderer.invoke(IPC.DECK_MOA_STORE_RESET) as Promise<{ ok: boolean }>,
+      endGoal: () => ipcRenderer.invoke(IPC.DECK_MOA_GOAL_END) as Promise<{ ok: boolean; code?: string }>,
+      answerDraft: (id: string, answer: 'approve' | 'dismiss') =>
+        ipcRenderer.invoke(IPC.DECK_MOA_DRAFT_ANSWER, { id, answer }) as Promise<{ ok: boolean; code?: string; goalId?: string }>,
+      revertGoal: (goalId: string) =>
+        ipcRenderer.invoke(IPC.DECK_MOA_GOAL_REVERT, goalId) as Promise<{ ok: boolean; code?: string; notes?: string[] }>,
       shadowStats: () =>
         ipcRenderer.invoke(IPC.DECK_MOA_SHADOW_STATS) as Promise<import('../shared/moa').MoaShadowStats>,
       memoryList: () =>
@@ -861,6 +905,9 @@ const electronAPI = {
         ipcRenderer.invoke(IPC.DECK_MOA_DECISIONS) as Promise<{ decisions: import('../shared/moa').MoaPendingDecision[] }>,
       taskResult: (args: { workspaceId: string; taskId: string }) =>
         ipcRenderer.invoke(IPC.DECK_MOA_TASK_RESULT, args) as Promise<{ result: import('../shared/moaResult').MoaTaskResult | null }>,
+      // Work exchanged with other PCs' Moa (cross-host A2A brain links).
+      remoteTasks: () =>
+        ipcRenderer.invoke(IPC.DECK_MOA_REMOTE_TASKS) as Promise<{ tasks: import('../shared/a2aRemoteDelivery').MoaRemoteTask[] }>,
       delegatedApprovals: () =>
         ipcRenderer.invoke(IPC.DECK_MOA_DELEGATED_APPROVALS) as Promise<{ approvals: import('../shared/moa').MoaDelegatedApproval[] }>,
       delegatedAnswer: (args: { approvalId: string; choiceKey: string; promptFingerprint: string }) =>
@@ -1003,6 +1050,14 @@ const electronAPI = {
         ipcRenderer.invoke(IPC.DECK_LEDGER_GATE_GET) as Promise<{ enabled: boolean }>,
       set: (enabled: boolean) =>
         ipcRenderer.invoke(IPC.DECK_LEDGER_GATE_SET, { enabled }) as Promise<{ enabled: boolean }>,
+    },
+    // `deck.fleetFastPath` — answer short read-only Fleet questions from the
+    // local Fleet board instead of a Moa turn. Persisted in main, default off.
+    fleetFastPath: {
+      get: () =>
+        ipcRenderer.invoke(IPC.DECK_FLEET_FAST_PATH_GET) as Promise<{ enabled: boolean }>,
+      set: (enabled: boolean) =>
+        ipcRenderer.invoke(IPC.DECK_FLEET_FAST_PATH_SET, { enabled }) as Promise<{ enabled: boolean }>,
     },
     // The Deck status panel's ledger read + its "re-read now" ping. The push
     // carries only the owner workspace: `summary` is the single projection.
@@ -1225,6 +1280,9 @@ const electronAPI = {
     // #517 slice C — memory relief (discard long-invisible guests)
     setDiscard: (enabled: boolean) =>
       ipcRenderer.invoke('browser:set-discard', enabled),
+    // Private tabs: wipe the shared in-memory session once the last one closes.
+    clearPrivateSession: (): Promise<{ ok: boolean }> =>
+      ipcRenderer.invoke('browser:clear-private-session'),
     // #517 backend choice — main owns the persisted value; renderer mirrors it
     getBackend: (): Promise<'builtin' | 'external' | 'chrome'> =>
       ipcRenderer.invoke('browser:get-backend'),
@@ -1237,12 +1295,24 @@ const electronAPI = {
       ipcRenderer.invoke('browser:set-backend', backend),
     // Phase 2.5 — chrome-backend profiles + workspace bindings.
     chromeProfiles: {
-      list: (): Promise<{ profiles: string[]; bindings: Record<string, string> }> =>
-        ipcRenderer.invoke('browser:chrome-profiles:list'),
+      list: (): Promise<{
+        profiles: string[];
+        bindings: Record<string, string>;
+        paneBindings?: ChromePaneBindings;
+      }> => ipcRenderer.invoke('browser:chrome-profiles:list'),
       create: (name: string): Promise<{ ok: boolean; error?: string }> =>
         ipcRenderer.invoke('browser:chrome-profiles:create', name),
       bind: (workspaceId: string, profileName: string | null): Promise<{ ok: boolean; error?: string }> =>
         ipcRenderer.invoke('browser:chrome-profiles:bind', { workspaceId, profileName }),
+      // Per-pane binding (src/shared/chromePaneBinding.ts).
+      bindPane: (
+        paneId: string,
+        workspaceId: string,
+        profileName: string | null,
+      ): Promise<{ ok: boolean; error?: string }> =>
+        ipcRenderer.invoke(CHROME_PANE_IPC.bind, { paneId, workspaceId, profileName }),
+      revealPane: (paneId: string, workspaceId: string): Promise<{ ok: boolean; error?: string }> =>
+        ipcRenderer.invoke(CHROME_PANE_IPC.reveal, { paneId, workspaceId }),
     },
     onDiscarded: (callback: (surfaceId: string) => void) => {
       const listener = (_e: Electron.IpcRendererEvent, surfaceId: string) => callback(surfaceId);
@@ -1295,6 +1365,15 @@ const electronAPI = {
       ipcRenderer.invoke(IPC.GITHUB_ISSUE_DETAIL, repoPath, number, updatedAt) as Promise<
         import('../shared/issueSurface').IssueDetailResult
       >,
+    // The signed-in gh login (lowercased) and the viewer's role on the repo
+    // with the login it was read under; null when unknown. force re-reads both.
+    viewerLogin: (repoPath: string, force?: boolean) =>
+      ipcRenderer.invoke(IPC.GITHUB_VIEWER_LOGIN, repoPath, force === true) as Promise<{ login: string | null }>,
+    repoPermission: (repoPath: string, force?: boolean) =>
+      ipcRenderer.invoke(IPC.GITHUB_REPO_PERMISSION, repoPath, force === true) as Promise<{
+        permission: import('../shared/issueSurface').RepoPermission | null;
+        login: string | null;
+      }>,
     // PR review and CI: reads, and writes tied to the head the person saw
     // (main re-reads it right before writing and refuses if it moved).
     prChecks: (repoPath: string, prUrl: string, force?: boolean) =>
@@ -1413,6 +1492,11 @@ const electronAPI = {
     summary: (worktreePath: string, knownStateKey?: string) =>
       ipcRenderer.invoke(IPC.DIFF_SUMMARY, worktreePath, knownStateKey ?? '') as Promise<
         import('../shared/diffParse').DiffSummaryResult | import('../shared/diffParse').DiffReadError
+      >,
+    // Git page Worktrees — the count of paths with uncommitted changes (git status only).
+    status: (worktreePath: string) =>
+      ipcRenderer.invoke(IPC.DIFF_STATUS, worktreePath) as Promise<
+        import('../shared/diffParse').DiffStatusResult | import('../shared/diffParse').DiffReadError
       >,
     // 워크스페이스 diff — 임의 cwd를 자기 worktree toplevel로 정규화(비-git이면 ok:false).
     resolveRepo: (cwd: string) =>
@@ -2010,6 +2094,52 @@ document.addEventListener('DOMContentLoaded', () => {
     ipcRenderer.invoke(IPC.LANLINK_PEERS_REMOVE, peerUuid) as Promise<{ ok: true }>,
 };
 
+// Cross-host A2A control plane (Settings → LAN). Request/response via invoke,
+// mirroring .lanlink above; the daemon re-validates every argument.
+(electronAPI as Record<string, unknown>).a2aRemote = {
+  status: () => ipcRenderer.invoke(IPC.A2A_REMOTE_STATUS) as Promise<A2aRemoteStatus>,
+  configure: (patch: { enabled?: boolean; port?: number }) =>
+    ipcRenderer.invoke(IPC.A2A_REMOTE_CONFIGURE, patch) as Promise<A2aRemoteStatus>,
+  pairBegin: () => ipcRenderer.invoke(IPC.A2A_REMOTE_PAIR_BEGIN) as Promise<A2aRemotePairBeginResult>,
+  pairCancel: () => ipcRenderer.invoke(IPC.A2A_REMOTE_PAIR_CANCEL) as Promise<{ ok: true }>,
+  pairStatus: () => ipcRenderer.invoke(IPC.A2A_REMOTE_PAIR_STATUS) as Promise<A2aRemotePairStatus>,
+  join: (invite: string) => ipcRenderer.invoke(IPC.A2A_REMOTE_JOIN, invite) as Promise<A2aRemoteJoinResult>,
+  hostsList: () => ipcRenderer.invoke(IPC.A2A_REMOTE_HOSTS_LIST) as Promise<A2aRemoteHostsListResult>,
+  hostsRemove: (hostId: string) =>
+    ipcRenderer.invoke(IPC.A2A_REMOTE_HOSTS_REMOVE, hostId) as Promise<A2aRemoteHostsRemoveResult>,
+  peersList: () => ipcRenderer.invoke(IPC.A2A_REMOTE_PEERS_LIST) as Promise<A2aRemotePeersListResult>,
+  peersRevoke: (peerId: string) => ipcRenderer.invoke(IPC.A2A_REMOTE_PEERS_REVOKE, peerId) as Promise<{ ok: boolean }>,
+  snapshot: (snapshot: A2aRemotePaneSnapshot) =>
+    ipcRenderer.invoke(IPC.A2A_REMOTE_SNAPSHOT, snapshot) as Promise<{ ok: boolean }>,
+  exposureGet: (hostId: string) =>
+    ipcRenderer.invoke(IPC.A2A_REMOTE_EXPOSURE_GET, hostId) as Promise<A2aRemoteExposureGetResult>,
+  exposureSet: (hostId: string, workspaceIds: string[], paneIds: Record<string, string[]>, brain: boolean) =>
+    ipcRenderer.invoke(IPC.A2A_REMOTE_EXPOSURE_SET, hostId, workspaceIds, paneIds, brain) as Promise<A2aRemoteExposureGetResult>,
+  hostsExposed: (hostId: string) =>
+    ipcRenderer.invoke(IPC.A2A_REMOTE_HOSTS_EXPOSED, hostId) as Promise<A2aRemoteHostsExposedResult>,
+  linksList: () => ipcRenderer.invoke(IPC.A2A_REMOTE_LINKS_LIST) as Promise<A2aRemoteLinksListResult>,
+  linksPropose: (params: A2aRemoteLinkProposeParams) =>
+    ipcRenderer.invoke(IPC.A2A_REMOTE_LINKS_PROPOSE, params) as Promise<A2aRemoteLinkResult>,
+  linksAccept: (linkId: string) => ipcRenderer.invoke(IPC.A2A_REMOTE_LINKS_ACCEPT, linkId) as Promise<A2aRemoteLinkResult>,
+  linksReject: (linkId: string) => ipcRenderer.invoke(IPC.A2A_REMOTE_LINKS_REJECT, linkId) as Promise<A2aRemoteLinkResult>,
+  linksRevoke: (linkId: string) => ipcRenderer.invoke(IPC.A2A_REMOTE_LINKS_REVOKE, linkId) as Promise<A2aRemoteLinkResult>,
+  linksRefresh: (linkId: string) => ipcRenderer.invoke(IPC.A2A_REMOTE_LINKS_REFRESH, linkId) as Promise<A2aRemoteLinkResult>,
+  onLinkEvent: (callback: (event: A2aRemoteLinkEvent) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: A2aRemoteLinkEvent) => callback(payload);
+    ipcRenderer.on(IPC.A2A_REMOTE_LINK_EVENT, listener);
+    return () => { ipcRenderer.removeListener(IPC.A2A_REMOTE_LINK_EVENT, listener); };
+  },
+  hostsStatus: () => ipcRenderer.invoke(IPC.A2A_REMOTE_HOSTS_STATUS) as Promise<A2aRemoteHostsStatusResult>,
+  onHostStatus: (callback: (status: A2aRemoteHostStatus) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: A2aRemoteHostStatus) => callback(payload);
+    ipcRenderer.on(IPC.A2A_REMOTE_HOST_STATUS_EVENT, listener);
+    return () => { ipcRenderer.removeListener(IPC.A2A_REMOTE_HOST_STATUS_EVENT, listener); };
+  },
+  heldList: () => ipcRenderer.invoke(IPC.A2A_REMOTE_HELD_LIST) as Promise<A2aRemoteHeldListResult>,
+  heldRetry: (taskId: string) => ipcRenderer.invoke(IPC.A2A_REMOTE_HELD_RETRY, taskId) as Promise<A2aRemoteHeldRetryResult>,
+  heldReject: (taskId: string) => ipcRenderer.invoke(IPC.A2A_REMOTE_HELD_REJECT, taskId) as Promise<A2aRemoteHeldRejectResult>,
+};
+
 // wmux web — titlebar toggle bridge (renderer → main → daemon control pipe).
 // Request/response via invoke (mirrors mcp / lanlink). Every call resolves a
 // WebTerminalInfo; the main handler never rejects (daemon-unreachable is
@@ -2137,6 +2267,42 @@ document.addEventListener('DOMContentLoaded', () => {
     return () => { ipcRenderer.removeListener(IPC.REMOTE_POLL_TICK, listener); };
   },
 };
+
+// PC rail — the computer column's feeds (main polls every web-paired host and
+// holds one attention stream per host while at least one subscribe is live).
+// `subscribe` returns its own release, so one mount balances one count.
+export interface PcRailBridge {
+  subscribe(): () => void;
+  onFeed(callback: (e: PcRailFeedEvent) => void): () => void;
+  onAttention(callback: (e: PcRailAttentionEvent) => void): () => void;
+  onStream(callback: (e: PcRailStreamEvent) => void): () => void;
+  approvalsList(request: PcRailApprovalsRequest): Promise<PcRailApprovalsResult>;
+  setMutes(request: PcRailMutesRequest): Promise<void>;
+}
+
+function onPcRailPush<T>(channel: string, callback: (payload: T) => void): () => void {
+  const listener = (_event: unknown, payload: T) => callback(payload);
+  ipcRenderer.on(channel, listener);
+  return () => { ipcRenderer.removeListener(channel, listener); };
+}
+
+const pcRailBridge: PcRailBridge = {
+  subscribe: () => {
+    ipcRenderer.send(PC_RAIL_IPC.SUBSCRIBE);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      ipcRenderer.send(PC_RAIL_IPC.UNSUBSCRIBE);
+    };
+  },
+  onFeed: (callback) => onPcRailPush(PC_RAIL_IPC.FEED_EVENT, callback),
+  onAttention: (callback) => onPcRailPush(PC_RAIL_IPC.ATTENTION_EVENT, callback),
+  onStream: (callback) => onPcRailPush(PC_RAIL_IPC.STREAM_EVENT, callback),
+  approvalsList: (request) => ipcRenderer.invoke(PC_RAIL_IPC.APPROVALS_LIST, request) as Promise<PcRailApprovalsResult>,
+  setMutes: (request) => ipcRenderer.invoke(PC_RAIL_IPC.MUTES_SET, request) as Promise<void>,
+};
+(electronAPI as Record<string, unknown>).pcRail = pcRailBridge;
 
 contextBridge.exposeInMainWorld('electronAPI', electronAPI);
 

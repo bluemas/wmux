@@ -17,6 +17,7 @@ import type {
   WorkspaceMirrorPushPayload,
 } from '../../shared/workspaceMirror';
 import { normalizeRoleBinding } from '../../shared/orchestratorRole';
+import { isShadowWorkspaceId } from '../../shared/pcRail';
 import type { StoreState } from '../stores';
 import { selectFleetPanes, surfaceAttentionStatus, type FleetPane, type FleetSelectorState } from '../stores/selectors/fleet';
 
@@ -332,17 +333,48 @@ export function buildRoleBindings(state: MirrorSnapshotState): Record<string, un
   return out;
 }
 
+/**
+ * ptyId → paneId for every surface of every pane, stashed panes included
+ * (per-pane Chrome profiles). COMPLETE by construction, so main can resolve a
+ * calling PTY's pane locally and prune bindings of panes that are gone — which
+ * is exactly why the walk is workspace-OWNED: a visible-only map would make a
+ * stashed pane's binding look orphaned.
+ */
+export function buildPanePtys(workspaces: Workspace[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const w of workspaces) {
+    for (const leaf of getWorkspaceLeafPanes(w)) {
+      for (const s of leaf.surfaces) {
+        if (s.ptyId) out[s.ptyId] = leaf.id;
+      }
+    }
+  }
+  return out;
+}
+
+/** Every pane id in the layout, stashed panes included (see `paneIds`). */
+export function buildPaneIds(workspaces: Workspace[]): string[] {
+  return workspaces.flatMap((w) => getWorkspaceLeafPanes(w).map((leaf) => leaf.id));
+}
+
 /** Assemble the full push payload from the live store state at `now()`. */
 export function buildWorkspaceMirrorPayload(
   state: MirrorSnapshotState,
   now: () => number = Date.now,
 ): WorkspaceMirrorPushPayload {
   const ts = now();
+  // The PC rail's shadow workspaces show another computer's panes: main and
+  // the daemon never see them (no workspace_list row, fan-out target or pane).
+  if (state.workspaces.some((w) => isShadowWorkspaceId(w.id))) {
+    state = { ...state, workspaces: state.workspaces.filter((w) => !isShadowWorkspaceId(w.id)) };
+  }
   return {
     ts,
     entries: buildWorkspaceListEntries(state.workspaces),
     fleets: buildFleetSnapshots(state, ts),
     roleBindings: buildRoleBindings(state),
+    panePtys: buildPanePtys(state.workspaces),
+    paneIds: buildPaneIds(state.workspaces),
     sessionRestored: state.sessionRestored === true,
     pinnedIds: [...(state.sidebarPinnedIds ?? [])],
     viewed: buildViewed(state),

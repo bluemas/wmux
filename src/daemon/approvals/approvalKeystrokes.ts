@@ -63,6 +63,9 @@
 // clients keep working. See ApprovalRegistry.resolve and the phone-client
 // contract (`docs/phone-client-contract.md`, "choices" / "choiceKey").
 
+import { agentRow, type AgentDialogFamily } from '../../shared/agentIdentity';
+import { ESCAPE_WIN32 } from '../../shared/win32InputKeys';
+
 /** The two byte sequences for one agent. Single presses — never a CR chaser. */
 export interface ApprovalKeystrokes {
   approve: string;
@@ -71,21 +74,43 @@ export interface ApprovalKeystrokes {
 
 /**
  * Keystroke map v1 — the Claude Code family ONLY. openclaude is a fork of
- * Claude Code that draws the same AskUserQuestion select, so it shares the map
- * (the same set `isClaudeFamilyAgent` names). Every other slug is
- * `unsupported-agent` rather than a guess: pressing the wrong byte into a TUI
- * is not a recoverable error, and a codex/gemini/opencode pane has neither the
- * same prompt shape nor the same hook wiring. Measured key semantics per TUI:
- * `__tests__/fixtures/terminal-prompts/KEYS.md`.
+ * Claude Code that draws the same AskUserQuestion select, so it shares the map:
+ * the map is keyed by dialog family, and an agent's family is `dialogs` on its
+ * registry row (the same field `isClaudeFamilyAgent` reads). Every other slug
+ * is `unsupported-agent` rather than a guess: pressing the wrong byte into a
+ * TUI is not a recoverable error, and a codex/gemini/opencode pane has neither
+ * the same prompt shape nor the same hook wiring. Measured key semantics per
+ * TUI: `__tests__/fixtures/terminal-prompts/KEYS.md`.
  */
-const CLAUDE_KEYSTROKES: ApprovalKeystrokes = { approve: '1', deny: '\x1b' };
-const KEYSTROKES_BY_AGENT: Readonly<Record<string, ApprovalKeystrokes>> = {
-  claude: CLAUDE_KEYSTROKES,
-  openclaude: CLAUDE_KEYSTROKES,
-};
+const KEYSTROKES_BY_DIALOG_FAMILY = {
+  claude: { approve: '1', deny: '\x1b' },
+} as const satisfies Record<AgentDialogFamily, ApprovalKeystrokes>;
 
 export function keystrokesForAgent(agentSlug: string): ApprovalKeystrokes | null {
-  return KEYSTROKES_BY_AGENT[agentSlug] ?? null;
+  const family = agentRow(agentSlug)?.dialogs;
+  return family ? KEYSTROKES_BY_DIALOG_FAMILY[family] : null;
+}
+
+/**
+ * The bytes that press one answer key in a pane, at write time.
+ *
+ * On a pane whose input conhost parses as win32-input-mode records (every
+ * ConPTY pane on Windows) Esc goes out as its key record pair (#1915,
+ * measured on Claude Code 2.1.293: the bare byte left the AskUserQuestion
+ * picker and the Bash permission dialog up, the record closed both; see
+ * shared/win32InputKeys.ts for the likely reason). Everything else is
+ * unchanged, also measured on that pane: a digit, a lone `\r` and the VT arrow
+ * `ESC [ B` each pressed their key as plain bytes, because none of them is
+ * ambiguous to conhost's input parser. The keys the registry reasons about
+ * (step lists, `expect` screens) stay in their plain form; only the write
+ * encodes.
+ *
+ * The desktop's own Escape key (renderer `encodeEscape`) is a separate case
+ * and stays a bare byte: it was measured interrupting a RUNNING turn (#1373),
+ * not dismissing a dialog. Changing either one does not settle the other.
+ */
+export function encodeAnswerKey(key: string, win32Input: boolean): string {
+  return win32Input && key === '\x1b' ? ESCAPE_WIN32 : key;
 }
 
 /**

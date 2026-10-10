@@ -239,6 +239,7 @@ JSON backlog fetch (Bearer only).
 | `agent.liveness` | `{sessionId, state, tool?, agent, at, failure?}` — what the pane is doing right now; `failure` only on the `idle` frame that ends a failed turn (contract v-next item 1) |
 | `gate.state` | `{gateEnabled}` — the permission gate was armed or disarmed |
 | `channel.mention` | `{channelId, seq, fromMemberName, text, postedAt, tier}` — a channel message mentioned the operator row; re-fetch `/api/channels` (§9). Recorded, not live-only |
+| `moa` | `{moaSessionId}` — the Moa pane appeared (an id) or went away (`null`); see *Waking Moa from the phone*. Live only |
 
 `phase` is `create` / `resolve` / `expire` / `supersede`.
 
@@ -377,7 +378,8 @@ GET /api/events?since=<cursor>     (Bearer)
 
 ```
 GET /api/config    → {allowInput, allowUpload, allowTranscript, inlineImages?, liveActivityPush?,
-                      gatedTools, gateEnabled?, fleetSidebar?, moaDelegations?, moa?, moaSessionId?, channels?, terminalPromptDetail?,
+                      gatedTools, gateEnabled?, fleetSidebar?, moaDelegations?, fleetTickets?, moa?, moaSessionId?, moaWake?,
+                      moaWakeBlocked?, channels?, terminalPromptDetail?,
                       terminalPromptDecline?, protocolVersion, minProtocolVersion,
                       serverVersion, hostPlatform}
 GET /api/sessions  → {sessions: [{id, cwd, spawnCwd?, cols, rows, state, agent, lastActivity,
@@ -714,6 +716,27 @@ and `!` shell mode: the command (`bash_input`, labelled with the command line)
 and what it printed (`bash_output`, a fixed label; the output itself is not
 sent). The subtype set is additive: render an unknown one as a neutral meta row.
 
+**A linked pull request is a `pr_link` row.** When Claude Code records that the
+session opened or linked a PR, the row is
+
+```
+{id, kind: 'meta', subtype: 'pr_link', label, ts?, url, number?, repo?}
+```
+
+`url` is always an `http(s)` url with any user name or password removed, in
+the URL parser's own serialization rather than the string the transcript held
+(so no surrounding spaces, control characters or `\` separators; at most 2048
+characters), and `label` is the same url, so a client that does not know
+`pr_link` still shows it as before. `number` (a positive integer) and `repo`
+(`owner/name`, neither part `.` or `..`) are
+present when the transcript names them or the url's path is
+`/owner/name/pull/N` (any case); a non-GitHub url carries `url` alone. Claude
+Code writes the entry again on later turns, so the same PR can arrive several
+times — fold repeats on `url`. An entry with no usable `http(s)` url stays a
+`subtype: 'unknown'` row with no `url` and the fixed label `pull request`.
+Daemons before this sent every PR link as `unknown`, with whatever string the
+entry held in `label`.
+
 **A snapshot reads past an oversized entry.** A first page whose tail window
 starts inside one very large entry (Claude Code's session-start attachments
 can exceed the window) keeps reading backward until it holds the recent rows,
@@ -801,9 +824,11 @@ via OSC 7 — and the uploads directory. Anything else is `404 image not found`,
 and so is a symlink inside those directories pointing out of them. Note what the
 boundary implies in practice: a screenshot on the Desktop, or a temp file under
 `/var/folders`, is not servable, and an agent that `cd`s out of its spawn cwd
-does not widen it. Fall back to the filename chip. The one addition is a file
+does not widen it. Fall back to the filename chip. The two additions are a file
 the pane's agent explicitly sent to the user — see
-[Files the agent sent with `SendUserFile`](#files-the-agent-sent-with-senduserfile).
+[Files the agent sent with `SendUserFile`](#files-the-agent-sent-with-senduserfile) —
+and an image the agent opened with `Read` — see
+[Images the agent opened with `Read`](#images-the-agent-opened-with-read).
 
 **`404 image not found` is deliberately one answer for four situations** —
 outside the boundary, missing, a directory, unreadable. A separate code for
@@ -951,6 +976,53 @@ the device, the pane, the file's basename and its size — never the full path o
 the content. Repeats for the same device, pane and file within 10 minutes write
 no further line. On `/turns/file` the line is written once the whole body has
 been sent.
+
+#### Images the agent opened with `Read`
+
+```
+GET /api/config → {…, turnReadImages?: true}
+
+GET /api/sessions/<id>/turns/image?path=<absolute path>   (unchanged shape and codes)
+```
+
+Claude Code agents write their screenshots and renders to a per-session scratch
+folder (`/private/tmp/claude-<uid>/<cwd-slug>/<session>/scratchpad/…` on macOS)
+and then look at them with `Read`. Those paths are outside the spawn cwd, so
+`/turns/image` also serves an image the pane's agent opened with `Read` — at
+whatever absolute path it read, not only the scratch folder. `/turns/file` does
+not: it keeps the `SendUserFile` addition only.
+
+**Gate on `turnReadImages` from `/api/config`.** Present (and `true`) only
+alongside `turnImages`, behind the same `--allow-transcript` grant. A daemon
+predating the addition omits the key; read a missing key as `false` — on such a
+daemon those fetches 404, as before.
+
+**When a path is served.** Rules 1–9 of the `SendUserFile` section, with these
+differences:
+
+- Rule 1 reads `input.file_path` of a `Read` `tool_use` (in the transcript bound
+  to **that pane**) instead of `input.files[]`, and only a path ending in `.png`,
+  `.jpg`, `.jpeg`, `.gif` or `.webp` (any case) counts. Send the path exactly as
+  the turn page gave it. On a macOS daemon one respelling is also accepted: the
+  same string with a leading `/tmp/` in place of `/private/tmp/`, or the
+  reverse. It is a text comparison; any other respelling — a `.` or `..`
+  segment, a path through a linked folder, a different name that links to the
+  file — is refused, even when it reaches the same file. When both spellings
+  were read, the newest `Read` still inside the 24-hour window decides.
+- Rule 3: the `Read`'s `tool_result` must be a success (no `is_error: true`)
+  **and** hold an image content block — what Claude Code returns when it loaded
+  the file as an image. A `Read` of a missing file is an error result and grants
+  nothing.
+- A `Read` result is one transcript line holding the image base64-encoded, and
+  a line over 8 MiB is not indexed, so an image larger than about 6 MiB that the
+  agent read is not served this way (`404 image not found`).
+- Rule 6 is measured from the `Read`: an image rewritten after the agent looked
+  at it is refused.
+- No audit line: an image the agent read is what the transcript grant already
+  covers, as for images under the spawn cwd.
+
+Every refusal is the same `404 {error: 'image not found'}`, and the types and the
+8 MiB cap are unchanged.
 
 ---
 
@@ -1130,6 +1202,7 @@ above and gives the same record; only what the rows must spell differs:
 | `<Tool> command` (`Bash command`) | the tool | the command | the command (and its description) | `Do you want to proceed?` | `Yes`, a plain `No` |
 | `Fetch` | `WebFetch` | the URL | `url: <url>` and `prompt: <prompt>` in the dashed box; the URL as Claude parses it (`https://example.com` → `https://example.com/`) | `Do you want to allow Claude to fetch this content?` | `1. Yes`, `3. No, and tell Claude what to do differently (esc)` |
 | `Read file` | `Read` | the path | `Read(<path>)` in the dashed box | `Do you want to proceed?` | `1. Yes`, `3. No` |
+| `Tool use` (2.1.296), with the box starting `Web Search(` | `WebSearch` | the query, then `(only allowing domains: <domain>)` when the call has one | `Web Search("<query>")` in the dashed box, the query verbatim; one allowed domain adds `, only allowing domains: <domain>` before the `)` | `Do you want to proceed?` | `1. Yes` only: deny with `/decline` (Esc) |
 
 The Fetch dialog draws no `Esc to cancel` footer: it is active when nothing but
 blank rows follows its options, and a narrow pane wraps its question over two
@@ -1137,6 +1210,20 @@ rows (read as one). Fetch and Read dialogs bind only with their title on screen,
 never with the top scrolled off. Their option 2 (`Yes, and don't ask again for
 <host>`, `Yes, allow reading from <dir> during this session`) is never a
 choice. Other titles (`Edit file`, `Create file`) stay informational.
+
+`Tool use` is Claude's generic title: only the box's first row names the tool,
+and a `Tool use` dialog for anything else stays informational. A WebSearch
+record's `choices` hold the Yes alone, in every layout: its option 2 is the
+standing grant in a pane 80 columns or wider and `No` in a 50-column one, so
+the record is denied only with `POST /api/approvals/<id>/decline`. A WebSearch
+call with two or more allowed domains, blocked domains, or another `mode` is
+not a measured shape and stays informational.
+
+A row the TUI cut (ending in `…`) still makes a dialog unanswerable, with one
+exception: an option whose visible text already says it writes a lasting rule
+or switches the permission mode (WebSearch's `2. Yes, and don't ask again for
+Web Search commands in <cwd>…`). It is never a choice, so its cut does not
+hide anything a key would press.
 
 `choices` then holds only the plain `Yes` and a plain `No` (`No`, or `No, …`
 such as "No, and tell Claude what to do differently"). An option that writes a
@@ -1465,11 +1552,12 @@ v1 paths.
 | `chatCancel` | Whether this caller may use `POST /api/sessions/<id>/chat/cancel`: the server runs with `--allow-transcript`, the caller has the input grant, and the chat bridge is wired |
 | `chatCancelOutcome` | `true` when `chatCancel` is true and the cancel receipt store loaded; omitted otherwise (never `false`). Advertises `cancel` on the cancel answer, the cancel receipt route and SSE `chat.cancel` (see Chat cancel outcome) |
 | `chatQueue` | Whether this caller's `chat-queue` sends are held by the daemon queue, and `DELETE …/chat/queue/<clientMessageId>` is open to it: the same condition as `chatSend`, plus a queue that loaded |
+| `chatSteer` | `true` when `chatQueue` is true and the daemon has steer: a send may carry `deliver`, and `PATCH …/chat/queue/<clientMessageId>` is open (see Chat queue, Steer); omitted otherwise (never `false`) |
 
 **Advertised = accepted.** The chat write keys (`chatSend`, `chatLaunch`,
-`chatQueue`, `chatCancel`, `chatCancelOutcome`) are computed from the same
+`chatQueue`, `chatSteer`, `chatCancel`, `chatCancelOutcome`) are computed from the same
 caller gates their routes (`POST …/chat/messages`, `…/chat/launch`,
-`…/chat/cancel`, `DELETE …/chat/queue/<id>`) check before they look at the
+`…/chat/cancel`, `DELETE` and `PATCH …/chat/queue/<id>`) check before they look at the
 pane: `--allow-transcript`, then the input grant, plus a wired chat bridge.
 The keys are a snapshot taken when `/api/config` is read: a caller that saw a
 key is not refused that write with 403 for the grants it held then, or 503
@@ -2082,8 +2170,8 @@ left there fails the item (`draft-present`) and stays as it was. A screen
 without the composer (a dialog, a usage view) holds the item like any other
 dialog, and fails it as `blocked` only when its time runs out.
 
-**Send answer.** 202 `{state:"queued", replayed:false, clientMessageId,
-effect:"queued"}`. A repeat with the same id and body answers 200 with the
+**Send answer.** 202 `{state:"queued", deliver, replayed:false, clientMessageId,
+effect:"queued"}` (`deliver` from a daemon with steer; see Steer). A repeat with the same id and body answers 200 with the
 item's current `state` (and `reason`), `replayed:true`, also after delivery
 started; `effect` is `queued` while it waits, `submitted` once delivered,
 `uncertain` for `uncertain`, and `none` otherwise. The same id with another
@@ -2121,7 +2209,7 @@ every `queued` item reads `canceled` (`daemon-restart`) and every `delivering`
 item `uncertain` (`restart-uncertain`); nothing is delivered.
 
 **`/turns`.** For a `chat-queue` caller on a daemon whose queue loaded, the
-chat object carries `queue: [{clientMessageId, state, reason?, queuedAt, at,
+chat object carries `queue: [{clientMessageId, state, reason?, deliver?, queuedAt, at,
 preview?}]`: the caller's own items on the pane, most recent kept, in enqueue
 order. `preview` is the first 80 characters, held in memory only (absent after
 a restart). `capabilities.queue` is `true` for a live Claude, Codex or
@@ -2148,12 +2236,86 @@ back. Needs the input grant (403 otherwise); only the owner's items are found.
 A 404 without one of these two `error` values means the route is missing (an
 older daemon).
 
-**SSE `chat.queue`.** `{sessionId, clientMessageId, state, reason?, at}` on
-every state change. `delivering` is sent only once the first write
+**SSE `chat.queue`.** `{sessionId, clientMessageId, state, reason?, deliver?, at}` on
+every state change, and once more (same `state`) when an item switches to
+`steer`. `delivering` is sent only once the first write
 is about to happen; an item the daemon holds back before that never shows
 `delivering` then `queued`. Live-only like `chat.blocked` (no `id:`, never replayed),
 and only to the item's owner among the pane's `/turns` watchers. `/turns` is
 the authoritative state after a reconnect.
+
+#### Steer
+
+Advertised by `/api/config` `chatSteer:true`. Every queue item has a `deliver`
+mode, memory-only like `preview` (absent after a restart, when the item is
+final anyway):
+
+| `deliver` | When it is typed |
+| --- | --- |
+| `next-turn` | After the running turn ends, one item per ended turn, as above. The default |
+| `steer` | Claude only: as soon as the pane allows, **during** the running turn. It goes into Claude's own composer queue, which applies it at the next tool boundary, exactly like a message typed into a running Claude in Terminal |
+
+On a Codex or OpenCode pane, `steer` behaves as `next-turn`, and the item
+reads `deliver:"next-turn"` everywhere (send answer, `/turns`, SSE, the PATCH
+answer), so the app can tell that "send now" was not available there.
+
+**Choosing steer at send time.** Add `"deliver":"steer"` to a `chat-queue`
+send. When the daemon would hold it (a turn runs, or the pane's queue is not
+empty), it is queued as a steer item and the daemon tries it at once; the
+answer is the usual 202 `{state:"queued", deliver:"steer", …, effect:"queued"}`
+and the delivery shows on SSE `chat.queue` (`delivering`, then `delivered`)
+and in `/turns`. When nothing would hold it, it is sent directly, as without
+the capability. Omitted `deliver` is `next-turn`.
+
+**Order.** The queue stays FIFO per pane, with one exception: while a Claude
+turn runs, the oldest `steer` item goes ahead of `next-turn` items, of any
+owner, that wait for the turn's end. A steer item is not held by them, so a
+pane whose queue is blocked by the any-owner rule can be unblocked by
+switching your item to steer. When the turn is not running, the head is
+delivered first, whatever its mode.
+
+**Same safety as a direct send.** A steer item is typed through the same
+guarded paste: bracketed paste, then Enter; only into Claude's empty composer
+on screen (a draft there holds it); never while an approval, a dialog or a
+screen without the composer is up (it is held, as `queued`, and fails as
+`blocked` or `prompt-active` only when its idle lifetime runs out); never while
+someone is typing into the pane (held); with the owner re-authorized before the
+first write and before Enter; at most once (`delivering` is final for a
+retry). A steer item delivered mid-turn opens no new episode: the receipt reads
+`submitted` with `queued:true`, and `next-turn` items still wait for the
+running turn's end.
+
+**`PATCH /api/sessions/<id>/chat/queue/<clientMessageId>`** with body exactly
+`{"deliver":"steer"}` switches a waiting item to steer (the app's "send now"
+on a queued bubble) and kicks the queue. Same gates as `DELETE`: the input
+grant (403 otherwise), owner-bound (another owner's item is not found). Any
+other body is 400 `invalid-chat-request`. There is no switch back.
+
+| Status | Body |
+| --- | --- |
+| 200 | `{state:"queued", deliver, clientMessageId}`: `deliver:"steer"`, also on a repeat; `deliver:"next-turn"` on Codex/OpenCode (unchanged). The delivery itself follows on SSE `chat.queue` |
+| 409 | `already-delivered` `{state}` |
+| 409 | `delivery-in-progress` `{state}` |
+| 409 | `queue-item-final` `{state, reason}`: `canceled`, `failed` or `uncertain` |
+| 404 | `queue-item-not-found` |
+| 404 | `pane-not-found` |
+| 400 | `invalid-chat-request` |
+
+Example, a pane busy with a long turn and another owner's item waiting:
+
+```
+POST /api/sessions/web-1/chat/messages   (X-Wmux-Client-Caps: chat-queue)
+{ …, "clientMessageId": "1791…-…", "text": "also add a test" }
+→ 202 {"state":"queued","deliver":"next-turn","replayed":false,"clientMessageId":"1791…-…","effect":"queued"}
+
+PATCH /api/sessions/web-1/chat/queue/1791…-…
+{"deliver":"steer"}
+→ 200 {"state":"queued","deliver":"steer","clientMessageId":"1791…-…"}
+
+SSE chat.queue {"sessionId":"web-1","clientMessageId":"1791…-…","state":"queued","deliver":"steer","at":…}
+SSE chat.queue {…,"state":"delivering","deliver":"steer",…}
+SSE chat.queue {…,"state":"delivered","deliver":"steer",…}
+```
 
 ---
 
@@ -3101,8 +3263,9 @@ The pre-existing `GET /api/workspaces` remains the daemon's live-pane roster
 from the input-gated desktop registry. New pane selection uses the live roster's
 IDs even on older hosts; opening a newly created desktop workspace uses
 `/api/desktop-workspaces` to resolve its active pane. While the desktop is
-attached the roster also carries the sidebar fields below; its rows are still
-exactly the workspaces with a live pane.
+attached the roster also carries the sidebar fields below, plus one `empty`
+row for each desktop workspace with no live pane (see *Workspaces with no
+terminal* below).
 
 ### Desktop sidebar fields (phone Fleet)
 
@@ -3129,9 +3292,37 @@ as "the desktop did not say" and fall back to what you draw without it; fields
 may appear or disappear between polls, and may lag the desktop by a second or
 two.
 
-Nothing is added: the fields are merged by id onto rows the daemon already
-lists. A desktop-only workspace with no live pane never becomes a row, and the
-orchestrator brain's pane and workspace stay excluded exactly as before.
+The fields are merged by id onto rows the daemon already lists. The one
+addition is the `empty` row below; the orchestrator brain's pane and workspace
+stay excluded exactly as before.
+
+#### Workspaces with no terminal (`empty: true`)
+
+While the desktop is attached, `GET /api/workspaces` also lists each workspace
+the desktop sidebar shows that has **no live pane**, after the live rows:
+
+```json
+{ "id": "ws-…", "name": "", "panes": [], "empty": true, "order": 3, "pinned": false }
+```
+
+- `empty` is only ever `true`, and then `panes` is `[]`. A row with panes never
+  carries it.
+- `name` is `""`: a workspace name reaches the daemon only in a pane's spawn
+  environment, so a workspace with no pane has none here. Label the row by its
+  id or leave it out.
+- It carries the desktop fields above (`order`, `pinned`, `color`, `gitBranch`,
+  …) but never `layout`, never `paneId`s, and it is never `activeWorkspaceId`.
+- Moa's HQ, a workspace whose only pane is the orchestrator brain, a fan-out
+  task workspace, and a workspace the desktop still lists any pane for (one
+  whose session has ended, say) are never listed this way.
+- No desktop (the host app is closed, or its window is locked, occluded or
+  headless and the snapshot lapsed): no `empty` rows. The list is then exactly
+  the live rows, as before.
+
+Nothing can be opened in an `empty` row. A client that groups host → workspace
+→ pane should either skip rows with `panes: []` or draw them as a quiet,
+non-interactive "no terminal" row; a client that assumed every row had at least
+one pane must not index `panes[0]` on them. Older daemons never send the key.
 
 `GET /api/sessions`, per session:
 
@@ -3231,11 +3422,29 @@ not the desktop fields.
   the phone. It disappears on the next poll after the card is answered.
   Omitted, never `null`, when nothing is pending, when the desktop is too old
   to say, and when the desktop's reply was over its size budget (it is cut
-  after the layout trees and `moaDelegations`, before the pane placement).
+  after `fleetTickets`, the layout trees and `moaDelegations`, before the pane
+  placement).
 
 Each `panes[]` entry of `GET /api/workspaces` also carries `paneId` (same
 value and rules as on `GET /api/sessions`) when the desktop places that
 session in a pane of that workspace.
+
+Beside `paneId`, under the same condition, a `panes[]` entry also carries:
+
+- `paneName` — the desktop sidebar's name for that pane: the user's label, or
+  its `w1-1` coordinate. Same text as `panes[].paneName` in the sidebar
+  snapshot. Absent when the desktop has none for it.
+- `surfaceTitle` — the tab's title as the desktop sidebar's pane row reads it
+  (a tab still titled after the shell that hosts an agent is left out).
+
+And on every `panes[]` entry, desktop or not:
+
+- `lastActivity` — ISO 8601 time of the session's last output (the same stamp
+  `GET /api/sessions` reports as `lastActivity`), for an "idle 10m" label.
+
+All three are additive and optional: older daemons never send them, and a
+pane that has nothing to report omits the key rather than sending an empty
+string. Nothing else in the row changes.
 
 Top level of `GET /api/workspaces`: `activeWorkspaceId` — the workspace the
 desktop is showing, present only when it is one of the listed rows.
@@ -3280,11 +3489,122 @@ wired); like `fleetSidebar` it describes support, not presence. Read-only:
   move it.
 
 The request text, the agent's report, its verification and any transcript are
-never sent. The key is an empty array when the desktop has no such jobs, and
-omitted, never `null`, when the desktop is too old to say, when it could not
-read its job records for this poll, and when its reply was over its size
-budget (the list goes whole, right after the layout trees). Read an absent key
+never sent in `moaDelegations`, and that stays true. The same jobs' text now
+travels only in `fleetTickets` (below), and only from a server started with
+`--allow-transcript`. The key is an empty array when the desktop has no such
+jobs, and omitted, never `null`, when the desktop is too old to say, when it
+could not read its job records for this poll, and when its reply was over its
+size budget (the list goes whole, right after the layout trees). Read an absent key
 as "unknown", not as "no jobs": keep showing what the last poll returned.
+
+#### Fleet tickets (`fleetTickets`, `nextScheduleAt`)
+
+Top level of `GET /api/workspaces`: `fleetTickets` — every delegated job the
+desktop Fleet shows as a ticket, of any origin, for a "what needs doing"
+screen. `/api/config` carries `fleetTickets: true` when this daemon can serve
+the key, the next-run key and the detail route below (a desktop bridge is
+wired); like `moaDelegations` it describes support, not presence. Read-only:
+
+```json
+"fleetTickets": [
+  { "id": "handoff:dec-…", "origin": "handoff", "workspaceId": "ws-…",
+    "workspaceName": "api", "agentName": "Claude Code",
+    "title": "Fix the login redirect", "state": "needs-you",
+    "updatedAt": 1759600000000, "requestLine": "Fix the login redirect" },
+  { "id": "wl-…", "taskId": "task-…", "origin": "manual", "workspaceId": "ws-…",
+    "workspaceName": "wtask: retry test", "agentName": "Codex CLI",
+    "title": "Add the retry test", "state": "done", "updatedAt": 1759590000000,
+    "requestLine": "Add a test for the retry path", "resultSummary": "Added and green",
+    "verification": "3/4" }
+]
+```
+
+- **Which tickets.** The desktop Fleet's own list: every job carried by an A2A
+  task (a send between workspaces, a `wtask` worker, a Git page issue, a Moa
+  hand-off) plus every Moa hand-off still waiting on the operator's click. A
+  plain chat message is never a ticket. Every open ticket however old, plus
+  tickets that ended (`done`, `failed`) within the last 24 hours. At most 30,
+  in the desktop's order: `needs-you` first, then `failed`, `working`,
+  `queued`, `done`, newest `updatedAt` first within each.
+- `id` — the desktop ticket id, stable for the ticket's life; key rows and the
+  detail route by it. A hand-off card's id is `handoff:<decision id>`; once
+  the operator hands it off, that row goes and a new one (the job) appears.
+- `taskId` — the A2A task carrying the job; absent on a hand-off card.
+- `origin` — `moa`, `moa-auto` (handed off without a click), `manual` (a
+  send between workspaces, `wtask` workers included), `issue`, `pr`, or
+  `handoff` (a proposal not yet handed off). Treat an unknown value as
+  `manual`.
+- `workspaceId` — the workspace doing the work; it may not be in
+  `workspaces[]` (finished workers' workspaces are often closed).
+- `workspaceName` — that workspace's name (at most 100 characters). The
+  desktop remembers it after the workspace closes, for as long as it keeps
+  the ticket in memory (it is lost when the desktop restarts). Absent when not
+  known.
+- `agentName` — the agent's display name (at most 64 characters), when known.
+- `title` — one line, at most 80 characters (`Untitled task` when none).
+  Agent-derived: a task sent without a title is titled by its request's first
+  words. Without `--allow-transcript` it is replaced by a fixed label for the
+  origin (`Moa task`, `Task`, `Issue task`, `Pull request task`, `Hand-off
+  waiting`).
+- `state` — `queued`, `working`, `needs-you`, `done` or `failed`, the
+  desktop's own words. `needs-you` means a decision or an input waits on the
+  operator; send the user to the desktop to answer it. Treat an unknown value
+  as `working` (this daemon already maps a word from a newer desktop that way,
+  and an unknown `origin` to `manual`, rather than dropping the row).
+- `updatedAt` — epoch ms the ticket last changed on the desktop's record. A
+  ticket's final report is new when `updatedAt` is: the phone keeps its own
+  "seen" mark per `id` and `updatedAt` (nothing on the server records it).
+- `requestLine` — the request's first non-blank line, at most 160 characters.
+- `resultSummary` — the final report's first non-blank line, at most 240
+  characters; only on `done` and `failed`.
+- `verification` — verified evidence items over all items, e.g. `"3/4"`; only
+  on `done` and `failed`, and only when the worker attached evidence.
+
+`title`, `requestLine`, `resultSummary` and `verification` are agent-authored
+text. A server started without `--allow-transcript` (the same gate as history
+and `/turns`) leaves the last three out, sends the fixed label as `title`, and
+sends the rest as is. Every
+string is one line with control and bidi characters removed. The key is an
+empty array when there are no tickets, and omitted, never `null`, when the
+desktop is away or too old to say, when it could not read its job records
+for this poll, and when its reply was over its size budget (the text fields go
+first — `title` becoming the fixed label — then the list whole, before any
+older field). Read an
+absent key as "unknown": keep showing what the last poll returned.
+
+Top level of `GET /api/workspaces`: `nextScheduleAt` — epoch ms of the
+earliest next run among the enabled schedules, as the desktop's schedule
+list shows it. Omitted when no enabled schedule has a next run, and while the
+desktop is away (the value comes from the desktop's copy of the schedules).
+It can be briefly in the past while a run is starting.
+
+```
+GET /api/fleet/tickets/<id>   (Bearer; id URL-encoded)
+  → 200 {ticket: {id, updatedAt, request?, result?, verification?,
+                  verificationItems?: [{kind, status, summary, command?, location?}]}}
+  → 403 {error: "transcript-disabled"}   server started without --allow-transcript
+  → 404 {error: "ticket-not-found"}      unknown id, or one past the desktop's window
+  → 503 {error: "desktop-unavailable"}   no desktop attached, one too old for details,
+                                         or one that could not read its tickets just now
+  → 504 {error: "desktop-timeout"} / 502 {error: "desktop-bad-reply"}
+```
+
+One ticket's full text, all of it agent-authored, so the whole route is behind
+`--allow-transcript` (the 403 comes before any lookup, so it says nothing
+about whether the id exists). `request` is the request as sent and `result`
+the final report, both multi-line (`\n` only; other control and bidi
+characters removed) and at most 4000 characters. `verificationItems` holds at
+most 16 evidence items: `kind` is `command`, `inspection` or `artifact`;
+`status` is `passed` / `failed` for a command and `verified` / `unverified`
+otherwise; `summary`, `command` (commands) and `location` (the others) are one
+line, at most 200 characters each. Any field may be absent: a ticket that has
+not ended has no `result`, and the desktop keeps a ticket's text in memory
+only (at most 50 tickets; a finished one until 24 hours after it ended, the
+same window as the list, then the route answers 404), so
+after a desktop restart a finished ticket's request and evidence may be gone
+while its report (kept on the desktop's job record) remains. `updatedAt` is
+the ticket version the detail belongs to; refetch when the list's
+`updatedAt` moves. Responses are `Cache-Control: no-store`.
 
 #### The Moa HQ (`role`, `moa`)
 
@@ -3340,7 +3660,8 @@ GET /api/config → { ..., moa: true, moaSessionId: "brain-<24 hex>" }
   otherwise: Moa off, no HQ, the HQ changed or missing, no desktop attached,
   an older daemon, or before Moa's first turn (the brain terminal starts on
   its first turn, not when Moa is switched on — show "Moa has not started
-  yet" rather than an error). Treat it as opaque: never derive or guess it,
+  yet" rather than an error, and with `moaWake: true` offer to start it, see
+  *Waking Moa from the phone* below). Treat it as opaque: never derive or guess it,
   and re-read `/api/config` rather than caching it across launches; a new
   brain terminal gets a new id.
 - Only a live pane qualifies: a Moa terminal that has exited is gone at
@@ -3428,6 +3749,148 @@ admission but withdrawn before its first write answers
 `{error:"authorization-expired", effect:"none"}`; a queued message is dropped
 at delivery; a `/turns` read answers `404`. On any of these, re-read
 `/api/config`: no `moaSessionId` means Moa is closed.
+
+#### Waking Moa from the phone (`moaWake`, `/api/moa/messages`)
+
+`moaSessionId` exists only once Moa's brain terminal runs, and the desktop
+starts that terminal on Moa's first turn. A phone can be that first turn: its
+first message starts the brain and becomes the brain's first prompt.
+
+```
+GET /api/config → { ..., moa: true, moaWake: true }
+```
+
+- `moaWake: true` — `POST /api/moa/messages` can start Moa here. Present only
+  when **all** hold: `moa: true`, no `moaSessionId` yet, the attached desktop
+  supports the wake (it announced `moa.wake`), `--allow-transcript`, and this
+  caller holds input (the same gates as a chat send). Omitted, never `false`,
+  otherwise. With `moaSessionId` present the same route still works (below);
+  `moaWake` only says the brain can be started from here.
+- `moaWakeBlocked` — a string naming why a wake would be refused right now,
+  served **instead of** `moaWake` (never both) where every `moaWake` gate above
+  holds but the desktop knows the wake would fail. Today the only value is
+  `"moa-mode-off"`: the HQ workspace's agent mode is off, so the wake would
+  end `409 moa-mode-off`. Show that reason (for example "Turn on Moa's agent
+  mode on the desktop") instead of offering a send that fails. Treat an
+  unknown value as blocked with a generic reason. Omitted when nothing blocks
+  the wake, when any other `moaWake` gate fails, when the desktop could not
+  read the mode, and by older daemons or desktops — read its absence as
+  today's `moaWake` rule. Like `moa`, it reflects the desktop's sidebar
+  snapshot, so a mode change on the desktop shows up within a poll or two;
+  `POST /api/moa/messages` still answers `409 moa-mode-off` if the mode
+  turned off in between.
+
+```
+GET /api/config → { ..., moa: true, moaWakeBlocked: "moa-mode-off" }
+```
+
+**`POST /api/moa/messages`** `{clientMessageId, text}` — a message to Moa
+whether or not its brain runs yet. Exactly these two fields (another field is
+`400 invalid-chat-request`). Requires transcript and input, like
+`POST …/chat/messages`; the operator token may use it too (logged as the
+operator, not as a device). `clientMessageId` follows the chat send rules
+(`<13-digit ms>-<lowercase uuid>`, unused for 24 h): malformed is `400
+{error:"invalid-chat-request", detail:"clientMessageId", effect:"none"}`,
+too old is `400 {error:"message-id-expired"}`. `text` has the chat send limit
+and the same refusal: more than 16,000 UTF-16 code units is `400
+{error:"text-too-long", result:"error", limit:"units", effect:"none"}`; blank is
+`400 invalid-chat-request` (`detail:"text"`). All of these are checked before
+anything is recorded or sent. Send the text as typed: the daemon and the
+desktop add nothing to it.
+
+The daemon answers, in this order:
+
+1. **The id was already used for a wake** (same caller): the recorded answer
+   again, with `replayed: true` — never a second turn, even when the Moa pane
+   appeared since. Same id with different text: `409
+   {error:"message-id-reused"}`. Still in flight: `202 {state:"pending",
+   replayed:true}`.
+   **The id was already used for a chat send to a Moa pane** (step 2 below),
+   even one that has gone away since: that send's answer again, exactly as the
+   chat route replays it (`200 {result:"sent", replayed:true, effect, …}`) —
+   never a wake, never a second send. Same id with different text, or an id
+   this caller spent on an ordinary pane: `409 {error:"message-id-reused"}`.
+2. **`moaSessionId` resolves:** the message takes the chat send path for the
+   Moa pane with the same `clientMessageId` (the daemon fills in
+   `agentSessionId` / `historyEpoch` itself), so every answer is the one
+   `POST /api/sessions/:moaSessionId/chat/messages` documents — `202
+   {result:"sent", …}`, `409 chat-busy`, `409 chat-blocked`, … — and the id is
+   in that pane's chat receipt too. The `chat-queue` capability applies as
+   on the chat route. The pane is up but Moa has not reported its
+   conversation yet: `409 {error:"moa-starting"}` with `Retry-After: 3`.
+3. **No Moa pane:** the desktop starts Moa's brain with this message.
+
+| Answer | Meaning | Retry |
+|---|---|---|
+| `202 {state:"accepted", clientMessageId}` | The desktop accepted the message as Moa's next turn and is starting the brain. It answers on accept, not when the turn ends (a cold start takes 20 s or more). | — |
+| `409 {error:"moa-starting"}`, `Retry-After: 3` | An accepted wake is still starting the brain and its pane is not up yet. Nothing recorded. | same id, after the delay |
+| `409 {error:"moa-busy", state:"failed"}`, `Retry-After: 5` | Moa is mid-turn (for example someone typed on the desktop). Nothing ran; the id is released. | same id, after the delay |
+| `409 {error:"moa-off", state:"failed"}` | Moa is switched off on the desktop. Final for this id. | new id, after Moa is on |
+| `409 {error:"moa-mode-off", state:"failed"}` | The HQ workspace's agent mode is off. Final for this id. | new id |
+| `409 {error:"no-hq", reason, state:"failed"}` | No HQ, or it is not ready: `reason` is `not-hq`, `hq-missing` or `hq-unknown`. Final for this id. | new id |
+| `503 {error:"desktop-unavailable"}` | No desktop attached, a desktop without the wake, or Moa's brain is not the terminal brain (`reason:"unsupported-vendor"`). Nothing ran; nothing recorded. | same id, later |
+| `429 {error:"desktop-busy"}`, `Retry-After: 2` | The desktop bridge is full. Nothing ran; nothing recorded. | same id, after the delay |
+| `202 {state:"uncertain"}` | The request reached the desktop and no answer came back (timeout, disconnect, an answer the daemon could not read). Moa may have the message. **Never re-sent** — retrying this id answers `uncertain` again. | read the receipt; send again only with a new id, and only if the user wants to |
+| `409 {error:"message-history-full"}` | This caller holds the most live wake ids (512). | later |
+| `409 {error:"moa-wake-failed", code, state:"failed"}` | The desktop accepted, then reported before this answer was sent that Moa never took the message (`code` as on the receipt below: `tui-dialog`, `spawn-failed`). Also the replay of any wake that failed after its accept. | new id, after fixing the cause |
+
+Every recorded answer carries `clientMessageId`; a replay adds `replayed:
+true`. Only the requests that never reached the desktop, and Moa's
+`moa-busy` / `unsupported-vendor` answers (nothing ran, and the client is told
+to retry), are released, so the same id can try again; every other answer is
+the id's final one.
+
+**`GET /api/moa/messages/:clientMessageId`** — the caller's own message to
+Moa, whichever path carried it. Transcript only (like the chat receipt, so a
+device whose input grant was withdrawn still learns how its send ended);
+another device's id reads as unknown.
+
+```
+200 {clientMessageId, state, code?, moaSessionId?}
+```
+
+- `state`: `pending` (still in flight), `accepted` (Moa took it), `failed`
+  (Moa did not; `code` says why), `uncertain` (may or may not have reached
+  Moa; never re-sent).
+- `code` on `failed`: the refusal's `error` above (`moa-off`, `moa-mode-off`,
+  `no-hq`), or a failure the desktop learned after it accepted:
+  - `tui-dialog` — Moa's terminal stopped on a startup screen of its own
+    (folder trust, sign-in) before it read the message. It needs an answer on
+    the desktop; then send again with a new id.
+  - `spawn-failed` — Moa's terminal never came up.
+  For a message the chat path carried, `code` is its chat error tag. Such a
+  message is found by id even after the Moa pane it went to has gone away.
+- `moaSessionId` — whenever the Moa pane is up, in any state (a `failed:
+  tui-dialog` wake has a pane stopped on its startup screen). Use it for the
+  pane's `/turns` and chat routes as usual.
+- An id the daemon has no record of for this caller: `404
+  {error:"unknown-message", clientMessageId}`.
+
+Wake receipts are kept **24 hours** — the chat send receipt retention — in
+their own file (the text is never stored, only a hash of it), and survive a
+daemon restart; a wake that was in flight when the daemon stopped reads
+`uncertain`.
+
+**The wake's row in `/turns`.** Once the Moa pane is up, the wake's message is
+the brain's first `user_text` row, and on `GET /api/sessions/:moaSessionId/turns`
+it carries the wake's `clientMessageId`, exactly like a row a chat send typed
+(best effort, matched on text and time) — so the phone can retire its
+"sending" bubble by id.
+
+**The `moa` event** on the global `GET /api/events` stream:
+`{moaSessionId: "brain-…"}` when the Moa pane appears (or is replaced by a
+new one), and `{moaSessionId: null}` when it goes away (Moa switched off, the
+HQ changed, the brain exited, the desktop disconnected). Live only, like
+`gate.state`: a client that reconnects re-reads `/api/config`. Every client
+of the stream receives it.
+
+**A startup screen is a dialog too.** While Moa's terminal is stopped on a
+startup screen (folder trust, sign-in), the Moa pane is fenced exactly as for
+its permission dialog above — `/turns` `chat.blocked` `{by:"terminal"}`,
+`POST …/chat/messages` and `POST /api/moa/messages` answer `409
+{error:"chat-blocked", blockedBy:"terminal"}`, `POST /api/input` refuses
+anything but ESC or Ctrl-C — but no approval record is raised for it: it is
+not a tool call, and only the desktop can answer it.
 
 Every send that reaches the Moa pane from a paired device writes one
 `moa-send` line to the device audit log with the device id, the pane and the
@@ -4033,7 +4496,7 @@ bridge. A missing key reads as `false`; none of them moves `protocolVersion`.
 | `chatLaunchModes` | Present only when `chatLaunch` is true. `{claude:[…], codex:[…]}`: `default` only, plus `bypass` (Claude) / `yolo` (Codex) when the server was started with `wmux web --allow-dangerous-launch` |
 | `chatSkills` | `/commands` accepts `?agent=` and answers the native catalogue |
 | `chatLaunchBare` | `POST …/chat/launch` accepts an omitted or empty `prompt` (starts the agent with no first message). Daemon capability; `chatLaunch` still says whether this caller may launch |
-| `chatLaunchResume` | `POST …/chat/launch` accepts `resume: true` (continue the newest conversation in the pane's cwd). Daemon capability, same as above |
+| `chatLaunchResume` | `POST …/chat/launch` accepts `resume: true`. Since the exact-id rule (see **Resume** below) it continues only a pane's own bound conversation (`chatResumeBound`); a pane with no binding answers `409 resume-unavailable`. Daemon capability, same as above |
 | `chatResumeBound` | `resume: true` is also accepted on a pane that keeps a binding whose agent exited, and continues exactly that conversation; `/turns` `chat.resumable` says when. Daemon capability, same as above |
 | `chatVersion` | Version of this chat contract (`1`). Bumped only on a breaking change |
 
@@ -4058,7 +4521,7 @@ transcript), then the Claude/Codex transcript file — and adds `chat` to every
   "maxSendBytes": 23000,          // only when the binding has a byte limit (OpenCode)
   "agentStatus": "complete",      // open set
   "agentAlive": true,
-  "resumable": false,             // terminal only; see "Resuming a bound pane"
+  "resumable": false,             // terminal and "none" (always false there); absent for "managed"; see "Resuming a bound pane"
   "capabilities": { "history": true, "send": true, "permissions": false, "cancel": false,
                     "fileUndo": false, "streaming": false, "launch": false, "skills": true },
   "blocked": { "by": "approval", "approvalId": "apr_…" },  // only while blocked
@@ -4149,8 +4612,10 @@ with **no** `cursor`. Drop the rows and read again without one.
   not graphemes). When `chat.maxSendBytes` is present, also at most that many
   UTF-8 bytes; the daemon's own measurement of the exact OpenCode request stays
   authoritative. Newlines are allowed.
-- All four fields are required strings; any other key is
-  `400 invalid-chat-request`. The body cap is 96 KiB.
+- All four fields are required strings. One optional key, `deliver`
+  (`"next-turn"` or `"steer"`), applies only to a `chat-queue` send (see
+  Chat queue, Steer) and is ignored without that capability; any other value,
+  or any other key, is `400 invalid-chat-request`. The body cap is 96 KiB.
 
 **Grants.** `--allow-transcript` and input permission, both checked before the
 body is read and again after it with a fresh authentication of the same caller;
@@ -4233,6 +4698,10 @@ receipt); show it as queued until its `user_text` row appears in `/turns`. Absen
 `queued` means the prompt was submitted into an idle agent. A running Claude
 turn with a draft in the composer still answers `chat-busy`, and a running
 Codex turn is refused as before (`chat-busy` or `input-not-provably-empty`).
+Someone typing into the pane (a key, click or wheel turn in the last 3 seconds,
+including the daemon's own previous send) also answers `chat-busy`; retry after
+a moment. Pointer motion and focus reports from a desktop that shows the pane
+never count as typing.
 
 `opencode-receipts-full` reaches the daemon from the plugin as
 `{result:"unavailable", reason:"receipts-full"}`, so a daemon that predates the
@@ -4294,44 +4763,36 @@ allowed (`launch-id-expired`). Model, effort, arguments, command, cwd and
 environment are refused; model and effort for new panes stay on
 `POST /api/sessions {agentLaunch}`.
 
-**Resume.** `resume: true` continues the newest conversation recorded for that
-agent in the pane's cwd. Claude is typed as `cd -- '<cwd>' && claude --continue`
-and Codex as `codex resume --remote <relay> --cd '<cwd>' --last`, so the agent runs
-in the directory the daemon checked. A cwd that cannot be written as one
-single-quoted word (not absolute, or containing a quote, backslash or control
-character) is `resume-unavailable`. The command line is built from fixed tokens
-only, never from request text. It combines with `mode`, and the dangerous-mode
-rules below are unchanged: `bypass`/`yolo` still need the ceiling and the exact
-`confirm`. With a non-empty `prompt` the agent resumes first and the prompt is
-its first message, passed the same gated way as on a fresh launch
-(`-- '<prompt>'` after the resume flags). An agent that cannot take one refuses
-with `409 resume-prompt-unsupported` (none today).
+**Fresh Claude launches carry their id.** A launch without `resume` types Claude
+as `claude --session-id <uuid> …` with a daemon-minted lowercase UUID, so the
+pane's exact conversation id is known from the agent's command line before the
+first hook. The binding (and `/turns` `agentSessionId`) then names that id.
+Codex launches are typed as before.
 
-Before anything is typed, the daemon finds the conversation the agent would
-continue:
-
-- **Claude:** the most recently modified non-empty transcript in Claude's
-  project directory for that cwd, under `CLAUDE_CONFIG_DIR` when it is set. A
-  cwd whose project name is longer than 200 characters counts only when the
-  transcript records that cwd.
-- **Codex:** the most recently updated interactive Codex CLI thread whose
-  recorded cwd is that cwd, excluding `codex exec` and sub-agent threads, within
-  a bounded scan. Because the launch goes through the pane's relay
-  (`--remote`), Codex filters `--last` on that exact cwd. Its linked-worktree
-  widening applies only to a local launch, so a sibling worktree's thread is
-  neither counted nor resumed.
-
-If there is no such conversation, the answer is `409 resume-unavailable`
-(`effect:"none"`); the daemon never launches an agent that would fail. If
+**Resume.** `resume: true` continues only the pane's **own** conversation: the
+one its binding names (see *Resuming a bound pane* below). It never picks the
+newest conversation recorded in the pane's folder: several panes can share a
+folder, and each would reopen the same one. A pane with no binding for the
+requested agent answers `409 resume-unavailable` (`effect:"none"`) and nothing
+is typed, whatever its folder holds. That answer comes before every readiness
+check of the launch (shell state, approvals, installed agents, a launch already
+pending, `resume-prompt-unsupported`); only the request checks run first: the
+grants, a malformed body or `clientLaunchId`, the dangerous-mode ceiling and
+`confirm`, and the launch-id receipt. `/turns` `chat.resumable` is always
+`false` on such a pane, so offer Resume only where it is `true`. If
 another live pane is running that conversation (its binding names it and the
 same agent is running there), the answer is `409 resume-in-use`
-(`effect:"none"`), because two agents would append to one conversation. The
-lookup is cached for 30 s per agent, cwd and account.
+(`effect:"none"`), because two agents would append to one conversation. With a
+non-empty `prompt` the agent resumes first and the prompt is its first message,
+passed the same gated way as on a fresh launch (`-- '<prompt>'` after the
+resume flags). An agent that cannot take one refuses with
+`409 resume-prompt-unsupported` (none today). It combines with `mode`, and the
+dangerous-mode rules below are unchanged: `bypass`/`yolo` still need the
+ceiling and the exact `confirm`.
 
 Without `resume`, a pane that already resolves to a conversation (including
 one whose agent has exited but whose binding remains) is still
-`conversation-exists`. The newest-conversation lookup above is for a pane with
-no binding, typically a fresh pane opened in the project's directory.
+`conversation-exists`.
 
 **Resuming a bound pane** (`chatResumeBound`). On a pane that keeps a binding
 and whose agent is not running, `resume: true` continues exactly that binding's
@@ -4366,7 +4827,9 @@ rules are unchanged.
 The agent may start a new session id on resume. The binding then moves and
 `historyEpoch` changes, so re-read the conversation as a new one.
 
-`chat.resumable` (terminal bindings) is `false` wherever a bound resume launch
+`chat.resumable` is present on `terminal` and `none` bindings. On `none` (a
+pane with no binding) it is always `false`, sent explicitly rather than left
+out. On a `terminal` binding it is `false` wherever a bound resume launch
 (without a prompt) would refuse before typing, checked in the launch's order:
 the agent is running, the pane holds a managed conversation, the shell is not
 one of the above (fish, nu, cmd.exe, WSL), the binding's id or folder fails its
@@ -4374,7 +4837,7 @@ check, the conversation's record is gone, or another live pane runs it. The
 record must be a non-empty transcript inside the session root of the account
 the pane launches with (`CLAUDE_CONFIG_DIR` or `CODEX_HOME` when set; no other
 root counts) and its folder must exist. For `resumable` that lookup is cached
-for 30 s, like the one above. The launch re-checks the record without the
+for 30 s. The launch re-checks the record without the
 cache, so a record deleted meanwhile is `409 resume-unavailable`, and the
 pane-state checks (empty prompt, approvals) apply as for any launch.
 Receipts and the binding wait are the same as for any launch.
@@ -4409,7 +4872,7 @@ changes; never persist it.
 | launch receipt store full | 429 | `{error:"launch-busy"}` | `none` — retry later |
 | another launch running on this pane | 409 | `{error:"launch-pending"}` | `none` |
 | pane already has a conversation (no `resume`, or a managed record) | 409 | `{error:"conversation-exists"}` | `none` |
-| `resume` with nothing to continue in the pane's cwd; on a bound pane: the record is gone or unreadable, the id or folder fails its check, or `agent` is not the binding's agent | 409 | `{error:"resume-unavailable"}` | `none` |
+| `resume` on a pane with no binding (the newest conversation in its folder is never guessed); on a bound pane: the record is gone or unreadable, the id or folder fails its check, or `agent` is not the binding's agent | 409 | `{error:"resume-unavailable"}` | `none` |
 | `resume` of a conversation another live pane is running | 409 | `{error:"resume-in-use"}` | `none` |
 | `resume` on a bound pane whose agent is still running | 409 | `{error:"launch-not-ready", reason:"agent-running"}` | `none` |
 | `resume` + `prompt` for an agent that cannot take both, or a bound resume with a `prompt` on a PowerShell pane | 409 | `{error:"resume-prompt-unsupported"}` | `none` |
@@ -4867,7 +5330,7 @@ after the profile, right before the agent, on the first launch and on every
 recovery replay. `chat/launch` types into the pane's interactive shell, whose
 `.zshrc` / `.bashrc` can export another account too: on a pane created with
 `accountId`, a launch of that account's vendor is typed with the account's key
-as a one-command prefix (`CLAUDE_CONFIG_DIR='<dir>' claude -- '…'`), so the
+as a one-command prefix (`CLAUDE_CONFIG_DIR='<dir>' claude --session-id <uuid> -- '…'`), so the
 agent runs on the chosen account. A pane without `accountId` and the other
 vendor's agent are typed as before. Not covered: fish and PowerShell wrappers
 for `agentLaunch` (a launch is only typed into zsh, bash or sh), and an agent
@@ -5300,3 +5763,244 @@ characters; anything else is dropped.
 - #1653 (remote pane from the + menu) creates panes on a paired remote host
   through the Surface model, not `POST /api/sessions`; `accountId` does not
   apply to remote panes.
+
+## Phone git write actions: push, PR create, merge (not served yet)
+
+> **Status.** The contract, gate, confirm tokens, receipts and identity are in
+> place (`src/shared/phoneGitWrite.ts`, `src/daemon/web/phoneGitWrite*.ts`),
+> and `wmux web --allow-git-write --git-write-login <login>` arms them.
+> The actions themselves land separately. Until an action is served its
+> routes answer `501 {error:"not-implemented"}` and its `/api/config` key is
+> omitted, so a phone that follows the keys never calls them.
+
+This adds three actions: `push`, `pr.create` and `pr.merge`. The daemon
+derives the repository, the refs and the remote from the session's trusted
+`spawnCwd`; **the phone never sends a path, a ref or a refspec.**
+
+### Gate and discovery
+
+The `/api/config` keys are **omitted, not false**, when the caller cannot use
+them:
+
+| Key | Advertises |
+|---|---|
+| `gitPush` | push preview, execute, receipt |
+| `gitPrCreate` | PR creation and its receipt |
+| `gitPrMerge` | `{methods:["squash"]}`; merge preview, execute, receipt |
+
+A key appears only when all of these hold: the host runs
+`wmux web --allow-git-write` (off by default), the host has a GitHub login set
+for writes (`--git-write-login`), the receipt store loaded, this caller holds
+the input grant, the device's grant was **set explicitly**, and that action is
+served. Devices paired before grants existed read as allowed for typing but
+not here: the desktop has to set their grant first. There is no reason hint
+when the keys are absent. Never probe with a write.
+
+The operator token passes the grant check; it still needs the ceiling.
+
+### Two-step flow (push and merge)
+
+1. `POST …/preview` with body `{}` returns the facts plus a `confirmToken`
+   and `expiresAt` (epoch ms, 90 s, single use).
+2. Show the facts, then run Face ID / hold-to-confirm.
+3. `POST` execute with `requestId` (a new UUID per user intent),
+   `confirmToken` and the pinned values from the preview. It answers 202
+   `{requestId, replayed:false, state:"pending"}`.
+4. Poll `GET …/<requestId>` (1 s, backing off to 5 s) until `done`, `refused`
+   or `uncertain`.
+
+`pr.create` has no preview or token; send `requestId` directly.
+
+The token is bound to the device, the session, the repository, the action,
+the gh login and the pinned values (push: `head`, `ref`, `target.ref`,
+`remoteTip`; merge: `number`, `headRefOid`). A restart voids every token. The
+app's Face ID / hold happens on the phone and the server cannot verify it.
+
+**Retry rules.**
+
+- **Lost response:** resend the **same** body with the same `requestId`, even
+  though the token is spent. You get the stored receipt with `replayed:true`;
+  nothing runs twice.
+- **428 `confirm-required` or a 409:** start a new preview with a new
+  `requestId`, and ask for confirmation again. Never swap the token silently.
+- **Never** reuse a `requestId` with a different body (409
+  `request-id-reused`).
+
+**Execute order.** (1) `requestId` lookup: an existing receipt with the same
+body returns with `replayed:true`, whatever its state, even after its session
+closed; a different body, another session, or a live session that now
+resolves to another repository is 409 `request-id-reused`. (2) In one
+synchronous step the receipt is written `pending` to disk and the token is
+spent; if the write fails the token stays valid and the answer is 503
+`git-receipts-unavailable` (or 429 `git-busy` when the device's receipts are
+full). (3) Re-authorization with the same credential: the ceiling and the
+explicit grant are read again. (4) The pinned facts and the identity are read
+again. (5) The receipt goes `inFlight` on disk, then git or gh runs. The body
+fingerprint excludes `confirmToken`, which is why a resend after the token was
+spent still matches.
+
+**Preview budget.** Each preview runs git and gh, so a device gets one preview
+at a time and at most 12 a minute, and the daemon four at a time;
+beyond that, 429 `git-busy`.
+
+### Receipts
+
+Receipts are keyed by device and `requestId`, persisted on disk with the
+repository they were accepted for, and **kept for at least 72 hours**. Nothing
+evicts a receipt inside that window: a device holding 200 live receipts (or a
+daemon holding 4000) gets 429 `git-busy` for new requests until older ones
+expire. A resend or a GET within the window returns the stored receipt, also
+after the session closed; after it, a GET answers 404 `receipt-expired` and the
+app re-checks the branch or PR instead. A daemon has one writer for the
+receipt file; when it cannot hold it, every route answers 503
+`git-receipts-unavailable`.
+
+| State | Meaning |
+|---|---|
+| `pending` | accepted, not started |
+| `inFlight` | running |
+| `done` | finished |
+| `refused` | not done; `error` holds the tag |
+| `uncertain` | may or may not have happened; the daemon is checking. Do not retry. Re-read the receipt, or re-check the branch or PR. |
+
+An uncertain action is **never re-run** automatically. A daemon restart turns
+an `inFlight` receipt into `uncertain`, and a `pending` one (nothing was
+started) into `refused` / `confirm-required`.
+
+### Endpoints
+
+| Action | Preview | Execute | Receipt |
+|---|---|---|---|
+| push | `POST /api/sessions/<id>/git/push/preview` | `POST …/git/push` | `GET …/git/push/<requestId>` |
+| pr.create | — | `POST …/git/pr` | `GET …/git/pr/receipts/<requestId>` |
+| pr.merge | `POST …/git/pr/<number>/merge/preview` | `POST …/git/pr/<number>/merge` | `GET …/git/pr/<number>/merge/<requestId>` |
+
+`GET …/git/pr` (the PR list) is unchanged.
+
+#### push
+
+```json
+preview 200 {
+  "branch": "feat/x", "ref": "refs/heads/feat/x", "head": "<oid>",
+  "target": {"remote": "origin", "ref": "refs/heads/feat/x", "create": false},
+  "repo": "github.com/owner/repo",
+  "ahead": 3, "behind": 0, "remoteTip": "<oid>|null", "remoteMoved": false, "fastForward": true,
+  "commits": [{"oid": "<oid>", "subject": "…", "author": "…"}], "commitsTruncated": false,
+  "identity": {"login": "octocat"},
+  "confirmToken": "…", "expiresAt": 1760000090000
+}
+execute {"requestId": "<uuid>", "confirmToken": "…", "expectedHead": "<head>", "expectedRef": "<ref>"}
+receipt {"requestId": "…", "state": "done", "pushed": "<oid>", "target": "refs/heads/feat/x"}
+```
+
+- **Where it pushes.** To the upstream branch, which may have a different
+  name than the local branch; show `target.ref`. `create:true` means a new
+  remote branch (the app shows its own copy on the same sheet).
+- **`fastForward:false`.** The push will fail with `non-fast-forward`.
+  Disable the button.
+- **Never force-pushes.** There is no override.
+- **Default branch.** Pushing to the repository's default branch is refused
+  (`protected-target`).
+- **Which commit.** The daemon pushes exactly `expectedHead`, the commit the
+  user saw.
+- **Commits.** At most 20; show "and N more" from `ahead`.
+
+#### pr.create
+
+```json
+execute {"requestId": "<uuid>", "title": "…", "body": "…", "base": "main", "draft": false}
+receipt {"requestId": "…", "state": "done", "number": 1980, "url": "https://github.com/owner/repo/pull/1980"}
+```
+
+- `base` is optional; it defaults to the repository's default branch.
+- `title` is 1–256 chars and `body` ≤ 64 KiB, no NUL.
+- The branch must already be pushed (`not-pushed`).
+
+#### pr.merge
+
+```json
+preview 200 {
+  "number": 1980, "title": "…", "state": "OPEN", "isDraft": false,
+  "headRefOid": "<oid>", "headRefName": "feat/x", "baseRefName": "main",
+  "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN", "block": null,
+  "squashAllowed": true,
+  "checks": {"overall": "success", "counts": {}, "requiredFailing": [], "requiredPending": []},
+  "methods": ["squash"], "subject": "Title (#1980)", "body": "",
+  "identity": {"login": "octocat"}, "confirmToken": "…", "expiresAt": 1760000090000
+}
+execute {"requestId": "<uuid>", "confirmToken": "…", "expectHead": "<headRefOid>", "method": "squash", "subject": "…", "body": "…"}
+receipt {"requestId": "…", "state": "done", "mergeCommitOid": "<oid>"}
+```
+
+- **`PrMergeFacts`.** The preview without `confirmToken` and `expiresAt` is
+  the shared `PrMergeFacts` type. A Moa pr.merge decision carries the same
+  object, so one sheet serves both; a head that moves after the decision was
+  created reads `stale`.
+- **Method.** Squash only.
+- **`block` values.** Non-null means the merge will be refused. Values:
+  `not-open`, `draft`, `conflicts`, `checks-failing`, `checks-pending`,
+  `blocked` (required reviews, rulesets), `behind`, `unknown`.
+- **Required checks.** `requiredFailing` and `requiredPending` are
+  **omitted** when GitHub could not say which checks are required. Do not
+  read their absence as "none required".
+- **Checks not all read.** When some checks could not be read, `counts` is
+  `{}` and `overall` is `failure` (a check that was read failed) or
+  `pending`, never `success`; the required lists are omitted.
+- **`squashAllowed:false`.** The repository forbids squash merges, so merging
+  from the phone is impossible.
+
+### Identity
+
+Every push and merge goes out as the host's `gitWriteLogin`. Each git or gh
+network call gets that login's stored token as `GH_TOKEN`, replacing any
+token the daemon inherited, so switching the active gh account on the desktop
+does not change who the phone writes as. Show `identity.login` on the confirm
+sheet. No stored token for that login → 424 `gh-auth-missing`;
+`identity-changed` means the token was removed between preview and execute.
+
+### Errors (`{error, …}`)
+
+| HTTP | `error` | Do |
+|---|---|---|
+| 400 | `invalid-git-request`, `merge-method-unsupported`, `invalid-pr-title`, `invalid-base` | fix the request |
+| 401 | `authorization-expired` | re-authenticate |
+| 403 | `git-write-disabled` | the host has the feature off |
+| 403 | `read-only: …` | no input grant, or one that was never set explicitly |
+| 404 | `session not found`, `pr-not-found` | refresh |
+| 404 | `receipt-expired` | the receipt is older than 72 h (or never existed for this device); re-check the branch or PR |
+| 409 | `stale` (+ `head` / `headRefOid`) | new preview |
+| 409 | `non-fast-forward` (+ `remoteTip`, `behind`) | pull on the desktop |
+| 409 | `blocked` (+ `reason`) | show the reason |
+| 409 | `not-a-git-repo` | the session is not in a repository |
+| 500 | `git-operation-failed` | git could not answer; retry later |
+| 501 | `not-implemented` | this daemon does not serve the action yet (its key is absent) |
+| 409 | `squash-disabled`, `protected-target`, `remote-branch-exists`, `remote-unsupported`, `not-pushed`, `pr-exists` (+ `number`), `no-commits-ahead`, `detached-head`, `git-operation-in-progress`, `merge-in-flight`, `identity-changed`, `request-id-reused` | show; usually re-preview |
+| 424 | `gh-auth-missing`, `remote-forbidden` (+ `login`) | fix on the desktop |
+| 428 | `confirm-required` | new preview |
+| 429 | `git-busy` | retry later (preview budget, or receipts full) |
+| 429 | `rate-limited` (+ `retryAt`, epoch ms) | wait until `retryAt` |
+| 502 | `gh-unavailable`, `remote-unreachable` | retry later |
+| 503 | `git-receipts-unavailable` | retry later |
+
+Refusals inside a receipt use the same tags, plus `push-not-landed`.
+
+### Moa mapping (one merge sheet)
+
+| Phone merge | Moa decision |
+|---|---|
+| path `number` | `prNumber` |
+| `expectHead` | `answer.expectHead` (same full-sha format) |
+| execute | `answer.approve: true`; decline = don't execute |
+| `stale` + `headRefOid` | `stale` |
+| `blocked` + `reason` | `blocked-<reason>` |
+| `rate-limited` + `retryAt` | same |
+| receipt `state` | merge effect status (same five names) |
+| `mergeCommitOid` | same |
+| preview facts | `PrMergeFacts` |
+
+### What this guards against
+
+`--allow-git-write` and the two-step flow protect against mis-taps, replays,
+stale screens and mistakes. They do not protect against a stolen, unlocked,
+paired device: a device with the input grant can already type into a shell.
+Revoking the device is the answer to theft. See `docs/SECURITY.md` §1.5.

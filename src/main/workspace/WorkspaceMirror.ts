@@ -35,6 +35,11 @@ export class WorkspaceMirror {
   // null ⇒ the last push carried no roleBindings field (old renderer) — callers
   // must treat the bindings as UNKNOWN and round-trip, never as "unbound".
   private roleBindings: Record<string, unknown> | null = null;
+  // null ⇒ the last push carried no panePtys field (old renderer): unknown,
+  // round-trip — never "this PTY belongs to no pane".
+  private panePtys: Record<string, string> | null = null;
+  // null ⇒ no paneIds field (old renderer): the pane set is unknown.
+  private paneIds: string[] | null = null;
   private viewed: ViewedPointer | null = null;
   private setAt = 0;
   private populated = false;
@@ -54,6 +59,8 @@ export class WorkspaceMirror {
     this.entries = payload.entries;
     this.fleets = new Map(payload.fleets.map((f) => [f.workspaceId, f]));
     this.roleBindings = payload.roleBindings ?? null;
+    this.panePtys = payload.panePtys ?? null;
+    this.paneIds = payload.paneIds ? [...payload.paneIds] : null;
     this.sessionRestored = payload.sessionRestored === true;
     this.viewed = payload.viewed ? { ...payload.viewed } : null;
     // Stamp with our own clock, not the renderer's `payload.ts`: `peek().ageMs`
@@ -114,6 +121,43 @@ export class WorkspaceMirror {
   peekRoleBinding(ptyId: string): { binding: unknown; ageMs: number } | null {
     if (this.roleBindings === null) return null;
     return { binding: this.roleBindings[ptyId], ageMs: this.now() - this.setAt };
+  }
+
+  /**
+   * The pane that owns ONE pty, plus the snapshot's age. null when nothing was
+   * pushed or the renderer predates the field (unknown — round-trip). A
+   * non-null result with `paneId: undefined` means the pty is in no pane OF
+   * THAT SNAPSHOT, which a pty spawned after the push also is — callers
+   * round-trip on a miss rather than treating it as authoritative.
+   */
+  peekPaneForPty(ptyId: string): { paneId: string | undefined; ageMs: number } | null {
+    if (this.panePtys === null) return null;
+    const paneId = Object.prototype.hasOwnProperty.call(this.panePtys, ptyId) ? this.panePtys[ptyId] : undefined;
+    return { paneId, ageMs: this.now() - this.setAt };
+  }
+
+  /** Every pane id the last push named (stashed and PTY-less panes
+   *  included), or null when the renderer did not send the list. */
+  getKnownPaneIds(): Set<string> | null {
+    return this.paneIds === null ? null : new Set(this.paneIds);
+  }
+
+  /**
+   * paneId → the workspace it lives in, for every pane that holds a PTY
+   * (panePtys joined with each entry's owned ptyIds). A pane with no PTY is
+   * simply absent — its workspace is unknown, not "none". null when the
+   * renderer sent no panePtys.
+   */
+  getPaneWorkspaces(): Map<string, string> | null {
+    if (this.panePtys === null || this.entries === null) return null;
+    const out = new Map<string, string>();
+    for (const entry of this.entries) {
+      for (const ptyId of entry.ptyIds ?? []) {
+        const paneId = Object.prototype.hasOwnProperty.call(this.panePtys, ptyId) ? this.panePtys[ptyId] : undefined;
+        if (paneId) out.set(paneId, entry.id);
+      }
+    }
+    return out;
   }
 
   /**

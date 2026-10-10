@@ -158,9 +158,10 @@ describe('phone wizard — mounted', () => {
   it('opens by itself on an empty roster and walks check → permissions → QR → connected', async () => {
     await mountAndOpen();
     expect(diagnose).toHaveBeenCalledTimes(1);
-    expect(stepText()).toBe('Step 1 of 4');
+    // Ready: one click finishes it, so no "Step 1 of 4" on this screen.
+    expect(stepText()).toBe('');
 
-    await click('Next');
+    await click('Options…');
     expect(stepText()).toBe('Step 2 of 4');
     await click('Remote control');
     await typeName('my phone');
@@ -181,6 +182,27 @@ describe('phone wizard — mounted', () => {
     expect(setGrants).not.toHaveBeenCalled();
   });
 
+  it('Pair a phone on step 1: one click to the QR, view only, prefilled name', async () => {
+    await mountAndOpen();
+    await click('Pair a phone');
+    // Tailnet, input off; upload is left to the daemon (inherited), as the
+    // hub's Start leaves it.
+    expect(start).toHaveBeenCalledWith({ tailscale: true, allowInput: false });
+    expect(setGrants).not.toHaveBeenCalled();
+    expect(pairStart).toHaveBeenCalledWith('Phone', false, 'phone');
+    expect(stepText()).toBe('Step 3 of 4');
+    expect(document.querySelector('[aria-label="QR code that pairs this phone"]')).not.toBeNull();
+  });
+
+  it('Pair a phone on step 1 leaves a running server\'s grants as they are', async () => {
+    status = { ...FRONTED, allowUpload: true };
+    await mountAndOpen();
+    await click('Pair a phone');
+    expect(start).not.toHaveBeenCalled();
+    expect(setGrants).not.toHaveBeenCalled();
+    expect(pairStart).toHaveBeenCalledWith('Phone', false, 'phone');
+  });
+
   it('a problem shows describeTailscaleProblem text and a retry that re-runs the check', async () => {
     diagnose.mockImplementationOnce(async () => ({
       tailscale: { ok: false, problem: 'not-logged-in', lines: ['Error: Tailscale is installed but not logged in.'] },
@@ -190,13 +212,13 @@ describe('phone wizard — mounted', () => {
     expect(document.body.textContent).toContain('not logged in');
     await click('Check again');
     expect(diagnose).toHaveBeenCalledTimes(2);
-    expect(button('Next')).toBeTruthy();
+    expect(button('Pair a phone')).toBeTruthy();
   });
 
   it('View only on a running server with input on never lowers the ceiling', async () => {
     status = { ...FRONTED, allowInput: true };
     await mountAndOpen();
-    await click('Next');
+    await click('Options…');
     await typeName('tablet');
     await click('Show QR code');
     expect(start).not.toHaveBeenCalled();
@@ -210,7 +232,7 @@ describe('phone wizard — mounted', () => {
     // Nothing paired yet → wizard; but a legacy device shows up in the roster
     // read on step 2 and would start typing too.
     roster = [{ deviceId: 'old', name: 'old', createdAt: 1, lastSeenAt: 1, allowInput: true }];
-    await click('Next');
+    await click('Options…');
     await click('Remote control');
     await typeName('tablet');
     const impacts = document.querySelector('[data-testid="wizard-impacts"]')?.textContent ?? '';
@@ -233,7 +255,7 @@ describe('phone wizard — mounted', () => {
 
   it('a phone that pairs while the popover is closed is found on reopen', async () => {
     await mountAndOpen();
-    await click('Next');
+    await click('Options…');
     await typeName('my phone');
     await click('Show QR code');
     expect(stepText()).toBe('Step 3 of 4');
@@ -248,7 +270,7 @@ describe('phone wizard — mounted', () => {
 
   it('a code that lapses without a phone goes back to step 2 and restores the ceiling', async () => {
     await mountAndOpen();
-    await click('Next');
+    await click('Options…');
     await click('Remote control');
     await typeName('my phone');
     await click('Show QR code');
@@ -265,7 +287,7 @@ describe('phone wizard — mounted', () => {
     expect(stepText()).toBe('');
     expect(button('Start')).toBeTruthy();
     await click('Connect a phone step by step');
-    expect(stepText()).toBe('Step 1 of 4');
+    expect(button('Pair a phone')).toBeTruthy();
 
     await act(async () => {
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));

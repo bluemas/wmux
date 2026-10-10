@@ -1,6 +1,7 @@
 import * as net from 'net';
 import * as fs from 'fs';
 import * as crypto from 'crypto';
+import { AsyncLocalStorage } from 'async_hooks';
 import type { RpcMethod, RpcResponse } from '../shared/rpc';
 import { getPipeName, getAuthTokenPath, getTcpPortPath } from '../shared/constants';
 import { getConnectionScope } from './connectionScope';
@@ -61,11 +62,13 @@ export function clearClientIdentity(): void {
     scope.rpcIdentity.clientName = undefined;
     scope.rpcIdentity.clientVersion = undefined;
     scope.rpcIdentity.workspaceToken = undefined;
+    scope.rpcIdentity.callerPtyId = undefined;
     return;
   }
   CLIENT_NAME = undefined;
   CLIENT_VERSION = undefined;
   WORKSPACE_TOKEN = undefined;
+  CALLER_PTY_ID = undefined;
 }
 
 export function getClientIdentity(): { name?: string; version?: string } {
@@ -103,6 +106,89 @@ export function getWorkspaceToken(): string | undefined {
   const scope = getConnectionScope();
   if (scope) return scope.rpcIdentity.workspaceToken;
   return WORKSPACE_TOKEN;
+}
+
+// The PTY this caller runs in, stamped on every envelope as `callerPtyId` so
+// main can pick the caller's PANE browser profile (src/shared/chromePaneBinding.ts).
+// Set by index.ts from the server's own identity (PID-map walk, WMUX_PTY_ID
+// hint, external claim) — never from tool arguments, which only ever reach the
+// envelope's `params`. Scope-aware and cleared exactly like the claim token.
+let CALLER_PTY_ID: string | undefined;
+
+// A per-call source that overrides the connection value: a shared Codex
+// app-server (#1778) identifies each call by its own thread, so the
+// connection-wide value (the daemon starter's pane) must not be stamped there.
+// The source returns the call's pane, '' for "no pane — omit the field", or
+// undefined to defer to the connection value.
+const callerPtyIdSource = new AsyncLocalStorage<() => string | undefined>();
+
+export function setCallerPtyId(ptyId: string | undefined): void {
+  const trimmed = typeof ptyId === 'string' ? ptyId.trim() : '';
+  const value = trimmed.length > 0 ? trimmed : undefined;
+  const scope = getConnectionScope();
+  if (scope) {
+    scope.rpcIdentity.callerPtyId = value;
+    return;
+  }
+  CALLER_PTY_ID = value;
+}
+
+/** The callerPtyId the next envelope built in this context will carry. */
+export function getCallerPtyId(): string | undefined {
+  const source = callerPtyIdSource.getStore();
+  const fromCall = source ? source() : undefined;
+  if (fromCall !== undefined) return fromCall.length > 0 ? fromCall : undefined;
+  const scope = getConnectionScope();
+  if (scope) return scope.rpcIdentity.callerPtyId;
+  return CALLER_PTY_ID;
+}
+
+/** Run `fn` with a per-call callerPtyId source (see `callerPtyIdSource`). */
+export function runWithCallerPtyIdSource<T>(source: () => string | undefined, fn: () => T): T {
+  return callerPtyIdSource.run(source, fn);
+}
+
+// The per-call claim of a shared Codex app-server call (#1778): main mints it
+// for the calling thread's pane, so the connection-wide token (if any) must not
+// be stamped instead. Same contract as `callerPtyIdSource`: the call's token,
+// '' for "no claim — omit the field", or undefined to defer to the connection.
+const workspaceTokenSource = new AsyncLocalStorage<() => string | undefined>();
+
+/** Run `fn` with a per-call workspace claim source (see `workspaceTokenSource`). */
+export function runWithWorkspaceTokenSource<T>(source: () => string | undefined, fn: () => T): T {
+  return workspaceTokenSource.run(source, fn);
+}
+
+// What a browser call does when main answers that the caller's identity is
+// stale (a pane moved, main restarted): set per tool call by index.ts, so the
+// tool modules that call sendRpc directly get the same recovery as callRpc.
+// `failed` is true when main refused the call (the outcome is its error text).
+type StaleIdentityHandler = (outcome: string, failed: boolean) => void;
+const staleIdentitySource = new AsyncLocalStorage<StaleIdentityHandler>();
+
+/** Run `fn` with a stale-identity handler for every browser RPC it makes. */
+export function runWithStaleIdentityHandler<T>(handler: StaleIdentityHandler, fn: () => T): T {
+  return staleIdentitySource.run(handler, fn);
+}
+
+/** Hand a browser RPC's outcome to the current stale-identity handler (exported for tests). */
+export function noteBrowserOutcome(method: string, outcome: unknown, failed: boolean): void {
+  if (!method.startsWith('browser.')) return;
+  const handler = staleIdentitySource.getStore();
+  if (!handler) return;
+  try {
+    handler(typeof outcome === 'string' ? outcome : JSON.stringify(outcome ?? ''), failed);
+  } catch {
+    /* recovery is best-effort: it must never change the call's own result */
+  }
+}
+
+/** The workspaceToken the next envelope built in this context will carry. */
+function envelopeWorkspaceToken(connectionToken: string | undefined): string | undefined {
+  const source = workspaceTokenSource.getStore();
+  const fromCall = source ? source() : undefined;
+  if (fromCall !== undefined) return fromCall.length > 0 ? fromCall : undefined;
+  return connectionToken;
 }
 
 // BYOB P4: commander role claim. Set once at startup by index.ts when the
@@ -175,7 +261,11 @@ function attemptRpc(
     // #922 PR-A. Absent until a claim succeeds, and omitted entirely when
     // there is none — an empty string would read as a presented-but-stale
     // token to the lane PR-B adds, which must refuse rather than demote.
-    if (identity.workspaceToken !== undefined) envelope.workspaceToken = identity.workspaceToken;
+    const workspaceToken = envelopeWorkspaceToken(identity.workspaceToken);
+    if (workspaceToken !== undefined) envelope.workspaceToken = workspaceToken;
+    // Omitted, never '', when this caller has no known pane.
+    const callerPtyId = getCallerPtyId();
+    if (callerPtyId !== undefined) envelope.callerPtyId = callerPtyId;
     const request = JSON.stringify(envelope) + '\n';
 
     const socket = typeof target === 'string' ? net.connect(target) : net.connect(target);
@@ -271,9 +361,12 @@ export async function sendRpc(
   for (const pipePath of pipePaths) {
     for (let attempt = 0; attempt < RETRY_COUNT; attempt++) {
       try {
-        return await attemptRpc(pipePath, token, method, params, timeoutMs);
+        const result = await attemptRpc(pipePath, token, method, params, timeoutMs);
+        noteBrowserOutcome(method, result, false);
+        return result;
       } catch (err) {
         lastError = err as Error;
+        noteBrowserOutcome(method, lastError.message, true);
         const msg = lastError.message;
         const isRetryable = msg.includes('not running') || msg.includes('unauthorized');
         const isPerm = msg.includes('EPERM');
@@ -293,7 +386,9 @@ export async function sendRpc(
   // TCP localhost fallback — bypasses Windows named pipe ACL issues
   if (tcpPort) {
     try {
-      return await attemptRpc({ host: '127.0.0.1', port: tcpPort }, token, method, params, timeoutMs);
+      const result = await attemptRpc({ host: '127.0.0.1', port: tcpPort }, token, method, params, timeoutMs);
+      noteBrowserOutcome(method, result, false);
+      return result;
     } catch { /* fall through */ }
   }
 

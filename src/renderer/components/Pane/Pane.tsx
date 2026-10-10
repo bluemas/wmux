@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useState, useMemo, useRef } fr
 import { Panel, Group, Separator } from 'react-resizable-panels';
 import type { PaneLeaf, Workspace } from '../../../shared/types';
 import { maybeDelegateExternalBrowser } from '../../utils/browserPaneActions';
+import { PRIVATE_BROWSER_PARTITION } from '../../../shared/privateBrowser';
 import { createTerminalSurface } from '../../utils/createTerminalSurface';
 import { destroyRemoteSessions, destroySurfaceRemoteSession } from '../../utils/remoteSessionTeardown';
 import { getWorkspaceLeafPanes } from '../../../shared/paneUtils';
@@ -31,13 +32,15 @@ import SurfaceTabs, {
 import { PANE_CORNER_GUTTER } from './paneChrome';
 import { useElementWidth } from '../../hooks/useElementWidth';
 import { ErrorBoundary } from '../ErrorBoundary';
-import { agentSupportsPermissionFlag, normalizeResumeCwd, permissionFlagFor, resumeGrammarFor } from '../../../shared/agentResume';
+import { type ResumeBinding, agentSupportsPermissionFlag, defaultResumeSkipPermissions, normalizeResumeCwd, permissionFlagFor, resumeGrammarFor, resumePermissionFlag } from '../../../shared/agentResume';
 import { applyRoleBinding, type RoleBinding } from '../../../shared/orchestratorRole';
 import { CHATV2_PROVIDER_SESSION_ID } from '../../../shared/chatv2/ipc';
 import { ResumeInfoChipGate } from './ResumeInfoChip';
 import { tokenAttrs } from '../../themes';
 import PaneDecorations from '../../plugins/PaneDecorations';
 import { isRemoteMirrorVisible } from '../../stores/slices/remoteWorkspacesSlice';
+import { selectHostPickName } from '../../stores/shadowWorkspace';
+import { isShadowWorkspaceId } from '../../../shared/pcRail';
 
 interface PaneProps {
   pane: PaneLeaf;
@@ -213,10 +216,12 @@ export function planRecoveryPillType(args: {
   launcher: string;
   /** The exact-session id when the cwd+agent gates passed, else undefined. */
   sessionId: string | undefined;
-  /** The permission-restore flag(s) for this launch, or '' when none apply. */
+  /** The permission-restore flag(s) for this launch, or '' when none apply.
+   *  Ignored without `sessionId` (#1916). */
   permFlag: string;
   /** Toggle-ON path: type the whole `--dangerously-skip-permissions` line at
-   *  once (no progressive stage). */
+   *  once (no progressive stage). Ignored without `sessionId` (#1916): the
+   *  session picker never carries a skip flag. */
   forceSkip: boolean;
   /** Progressive-assembly stage: 0 = nothing typed yet, 1 = base typed. */
   resumeStage: number;
@@ -232,20 +237,36 @@ export function planRecoveryPillType(args: {
   // With the skip toggle offered (Claude) and OFF, the user's explicit choice
   // wins over the role's skipPermissions: the role's skip flag is withheld (and
   // dropped from the role's args, #1681) so the restored mode is what runs. forceSkip is exactly `canSkip && toggle`.
-  const toggledOff = !forceSkip && agentSupportsPermissionFlag(launcher);
+  // #1916: without an exact session the line does not name a conversation
+  // wmux can vouch for (#1946: it opens the session picker). It never carries a
+  // permission flag: not the toggle's, and none of the role's (skip flag or a
+  // permission choice in its args), for any agent.
+  const toggledOff = !sessionId || (!forceSkip && agentSupportsPermissionFlag(launcher));
   const rewrite = (cmd: string): { text: string; rewritten: boolean } => {
-    const r = applyRoleBinding(cmd, roleBinding, { suppressSkipPermissions: toggledOff });
+    const r = applyRoleBinding(cmd, roleBinding, {
+      suppressSkipPermissions: toggledOff,
+      suppressPermissionChoices: !sessionId,
+    });
     return { text: r.command, rewritten: r.changed };
   };
-  const resumeArg = sessionId ? grammar.withId(sessionId) : grammar.fallback;
-  if (forceSkip) {
-    // Toggle ON: the WHOLE line at once so both flags land together (F6).
-    const { text, rewritten } = rewrite(`${launcher}${permFlag ? ` ${permFlag}` : ''} ${resumeArg}`);
+  if (!sessionId) {
+    // No exact binding → the agent's own session picker (Claude `--resume`,
+    // Codex `resume`), with no permission flag (#1916). Never the cwd-relative
+    // `--continue` / `resume --last`: several recovered panes can share a
+    // folder, and each would reopen the same newest conversation (#1946).
+    const { text, rewritten } = rewrite(`${launcher} ${grammar.picker}`);
     return { text, clearHint: true, advanceStage: false, rewritten };
   }
-  if (!sessionId) {
-    // No binding → cwd-relative fallback (Claude `--continue`, Codex `resume --last`).
-    const { text, rewritten } = rewrite(`${launcher} ${grammar.fallback}`);
+  if (resumeStage === 1) {
+    // Click 2: append the exact-session resume to the already-typed base. NOT
+    // launcher-prefixed, so it is never independently rewritten (the model is
+    // already on the base line typed in stage 0). Checked before forceSkip: a
+    // whole line appended to the typed base would be malformed.
+    return { text: ` ${grammar.withId(sessionId)}`, clearHint: true, advanceStage: false, rewritten: false };
+  }
+  if (forceSkip) {
+    // Toggle ON: the WHOLE line at once so both flags land together (F6).
+    const { text, rewritten } = rewrite(`${launcher}${permFlag ? ` ${permFlag}` : ''} ${grammar.withId(sessionId)}`);
     return { text, clearHint: true, advanceStage: false, rewritten };
   }
   if (resumeStage === 0 && permFlag) {
@@ -254,15 +275,41 @@ export function planRecoveryPillType(args: {
     const { text, rewritten } = rewrite(`${launcher} ${permFlag}`);
     return { text, clearHint: false, advanceStage: true, rewritten };
   }
-  if (resumeStage === 0) {
-    // Default mode (no permission flag) → one click types the full id-resume.
-    const { text, rewritten } = rewrite(`${launcher} ${grammar.withId(sessionId)}`);
-    return { text, clearHint: true, advanceStage: false, rewritten };
-  }
-  // Click 2: append the exact-session resume to the already-typed base. NOT
-  // launcher-prefixed, so it is never independently rewritten (the model is
-  // already on the base line typed in stage 0).
-  return { text: ` ${grammar.withId(sessionId)}`, clearHint: true, advanceStage: false, rewritten: false };
+  // Default mode (no permission flag) → one click types the full id-resume.
+  const { text, rewritten } = rewrite(`${launcher} ${grammar.withId(sessionId)}`);
+  return { text, clearHint: true, advanceStage: false, rewritten };
+}
+
+/**
+ * #1916 — the recovery pill's skip-permissions toggle and permission flag.
+ *
+ * `--dangerously-skip-permissions` needs an exact session. Without one the pill
+ * opens the session picker (`claude --resume`, #1946), where the user may pick
+ * any conversation in the folder, so the toggle is not offered (`canSkip`
+ * false) and no permission flag is typed.
+ * On an exact resume the toggle starts at the session's recorded mode (on only
+ * for `bypassPermissions`) until the user sets it (`skipOverride`); OFF
+ * restores the recorded mode without bypass.
+ */
+export function resolveRecoveryPillPermissions(args: {
+  launcher: string;
+  /** The exact-session id when the cwd+agent gates passed, else undefined. */
+  sessionId: string | undefined;
+  recordedMode: ResumeBinding['permissionMode'];
+  /** The user's explicit toggle choice, or undefined for the default. */
+  skipOverride: boolean | undefined;
+}): { canSkip: boolean; skipChecked: boolean; forceSkip: boolean; permFlag: string } {
+  const exact = !!args.sessionId;
+  const canSkip = exact && agentSupportsPermissionFlag(args.launcher);
+  const skipChecked = args.skipOverride ?? defaultResumeSkipPermissions(args.recordedMode, exact);
+  const forceSkip = canSkip && skipChecked;
+  const permFlag = resumePermissionFlag({
+    agent: args.launcher,
+    exact,
+    recordedMode: args.recordedMode,
+    skipPermissions: forceSkip,
+  });
+  return { canSkip, skipChecked, forceSkip, permFlag };
 }
 
 /**
@@ -286,11 +333,15 @@ export function claimAutoResume(ptyId: string): boolean {
 
 /**
  * The line to run when a recovered Claude pane is resumed on app start, or null
- * when it should be left alone. Same assembly as the Resume pill — the exact
- * conversation when the saved binding still matches the pane's cwd, otherwise
- * the cwd-relative `claude --continue` — with the permission mode that session
- * had restored. `--dangerously-skip-permissions` is never added here: that is
- * the pill toggle's explicit choice, not something to grant on every start.
+ * when it should be left alone. Same assembly as the Resume pill, with the
+ * permission mode that session had restored. Only the EXACT conversation is
+ * resumed automatically, when the saved binding still matches the pane's cwd.
+ * Without one this returns null and the pill stays up, offering the session
+ * picker (#1946): `claude --continue` would reopen the same newest conversation
+ * in every recovered pane sharing the folder, and opening a picker in each pane
+ * on start is not a resume. `--dangerously-skip-permissions` is never added
+ * here: that is the pill toggle's explicit choice, not something to grant on
+ * every start.
  */
 export function planAutoResume(args: {
   /** The user's opt-in setting (`claudeResumeOnStart`); off means the pill only. */
@@ -311,19 +362,20 @@ export function planAutoResume(args: {
   if (args.commandRunning === true || args.agentAlive === true) return null;
   const { binding } = args;
   // Validate the session id before typing it: only a well-formed Claude session
-  // id is ever put on the line; anything else falls back to `--continue`.
+  // id is ever put on the line; anything else leaves the pane to the pill.
   const sessionId = binding?.sessionId && CHATV2_PROVIDER_SESSION_ID.test(binding.sessionId)
     ? binding.sessionId
     : undefined;
   const exact = !!binding && !!sessionId && binding.agent === 'claude' &&
     args.paneCwds.some((c) => !!c && normalizeResumeCwd(binding.cwd) === normalizeResumeCwd(c));
+  if (!binding || !sessionId || !exact) return null; // #1946: the pill offers the picker
   const plan = planRecoveryPillType({
     launcher: 'claude',
-    sessionId: exact ? sessionId : undefined,
+    sessionId,
     // A saved bypassPermissions mode restores as the default mode here: only
     // the pill's explicit toggle may type --dangerously-skip-permissions.
-    permFlag: exact && binding?.permissionMode !== 'bypassPermissions'
-      ? permissionFlagFor(binding?.permissionMode)
+    permFlag: binding.permissionMode !== 'bypassPermissions'
+      ? permissionFlagFor(binding.permissionMode)
       : '',
     forceSkip: false,
     // Both flags land on one line: the staged click flow does not apply here.
@@ -423,7 +475,7 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
   // hides the local area (WorkspaceCenter, display:none) without touching
   // activeWorkspaceId, so this pane still reports isActive while nobody can
   // see it — a question arriving then must stay unseen.
-  const remoteSelected = useStore(isRemoteMirrorVisible);
+  const remoteSelected = useStore((s) => isRemoteMirrorVisible(s) || selectHostPickName(s) !== null);
   useEffect(() => {
     if (isActive && !remoteSelected && activeSurfacePtyId && activePendingQuestion) {
       markSurfaceQuestionSeen(activeSurfacePtyId);
@@ -507,6 +559,12 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
     // mounting an embedded webview pane. No url here → the default homepage.
     if (maybeDelegateExternalBrowser(undefined)) return;
     addBrowserSurface(pane.id, undefined, undefined, workspace.id);
+  }, [addBrowserSurface, pane.id, workspace.id]);
+
+  // Never delegated to the external backend: the OS browser cannot honour
+  // "private", so a private tab always opens in the app's own webview.
+  const handleAddPrivateBrowser = useCallback(() => {
+    addBrowserSurface(pane.id, undefined, PRIVATE_BROWSER_PARTITION, workspace.id);
   }, [addBrowserSurface, pane.id, workspace.id]);
 
   const handleAddRemote = useCallback(() => {
@@ -649,10 +707,17 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
   // X6 ③: the pill TYPES the command (no Enter) and assembles progressively —
   // click 1 restores the permission mode (Claude only), an optional click 2
   // appends the EXACT-session resume; the user presses Enter to run. With no
-  // binding it falls back to the agent's cwd-relative form (Claude `--continue`,
-  // Codex `resume --last`).
+  // exact binding it opens the agent's session picker (Claude `--resume`, Codex
+  // `resume`) rather than the newest conversation in the folder (#1946).
   const resumeHint = useStore((s) =>
     activeSurfacePtyId ? s.resumeHintByPtyId[activeSurfacePtyId] : undefined,
+  );
+  // The pane's agent is running right now (process truth or OSC 133). A hint
+  // can outlive the resume it asked for when the daemon outlives an app quit;
+  // the pill must not offer a resume into that running agent.
+  const resumeAgentLive = useStore((s) =>
+    !!activeSurfacePtyId &&
+    (s.agentAliveByPtyId[activeSurfacePtyId] === true || s.commandRunningByPtyId[activeSurfacePtyId] === true),
   );
   const resumeBinding = useStore((s) =>
     activeSurfacePtyId ? s.resumeBindingByPtyId[activeSurfacePtyId] : undefined,
@@ -685,6 +750,8 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
       binding: resumeBinding,
       paneCwds: autoResumeCwds,
       roleBinding: paneRoleBinding,
+      commandRunning: useStore.getState().commandRunningByPtyId[ptyId],
+      agentAlive: useStore.getState().agentAliveByPtyId[ptyId],
     });
     if (!line) return;
     // A beat after the first output, so the prompt is up and reading input.
@@ -715,14 +782,17 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
   // Progressive-assembly stage: 0 = nothing typed; 1 = base command (permission
   // flag) typed, awaiting an optional second click to append the session resume.
   const [resumeStage, setResumeStage] = useState(0);
-  // --dangerously-skip-permissions toggle for the recovery pill, default ON
-  // (the owner routinely resumes in bypass mode and was retyping the flag by
-  // hand). Claude-only; mirrors the persistent chip's toggle.
-  const [resumeSkipPermissions, setResumeSkipPermissions] = useState(true);
+  // --dangerously-skip-permissions toggle for the recovery pill. Claude-only;
+  // mirrors the persistent chip's toggle. #1916: this holds only the user's
+  // explicit choice. Until they make one, the toggle follows the binding:
+  // on only for an exact resume of a session recorded in bypassPermissions
+  // mode (defaultResumeSkipPermissions), computed at render because the
+  // binding can land after the hint.
+  const [resumeSkipOverride, setResumeSkipOverride] = useState<boolean | undefined>(undefined);
   // Never carry a stale stage/toggle across panes or a re-offer.
   useEffect(() => {
     setResumeStage(0);
-    setResumeSkipPermissions(true);
+    setResumeSkipOverride(undefined);
   }, [activeSurfacePtyId, resumeHint]);
 
   const handleCloseSurface = useCallback((surfaceId: string) => {
@@ -913,6 +983,7 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
         onSplitVertical={handleSplitVertical}
         onAddTerminal={handleAddTerminal}
         onAddBrowser={handleAddBrowser}
+        onAddPrivateBrowser={handleAddPrivateBrowser}
         onAddRemote={handleAddRemote}
         onSplitHorizontalRemote={handleSplitRemoteHorizontal}
         onSplitVerticalRemote={handleSplitRemoteVertical}
@@ -926,7 +997,7 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
           resumePtyReady: it then takes its height before the recovered pane's
           first fit instead of shrinking the terminal (a resize, a SIGWINCH)
           once the pane is live. Only the button waits for readiness. */}
-      {resumeHint && !supervision && activeSurfacePtyId && !chatV2OwnsPane && (() => {
+      {resumeHint && !resumeAgentLive && !supervision && activeSurfacePtyId && !chatV2OwnsPane && (() => {
         const ptyId = activeSurfacePtyId;
         const launcher = resumeHint; // slug doubles as the launcher stem ('claude'/'codex')
         const agentName = launcher.charAt(0).toUpperCase() + launcher.slice(1);
@@ -934,7 +1005,7 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
         // exact-session resume when the binding's origin cwd still matches the
         // pane's LIVE cwd. The daemon checks this at recovery, but the shell can
         // `cd` afterwards (OSC 7 updates surface.cwd) — re-validate here so a
-        // post-recovery cd drops to the cwd-relative `--continue` (plan line 220).
+        // post-recovery cd drops to the session picker (plan line 220, #1946).
         const normCwd = (p: string | undefined) => {
           // Lowercase ONLY a leading Windows drive letter — drive letters are
           // case-insensitive, but POSIX paths are fully case-sensitive, so a blanket
@@ -946,7 +1017,7 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
         };
         // Candidates, not a single cwd (2026-07-21): surface.cwd goes stale
         // across `cd X; claude` one-liners (no prompt render → no OSC 7), which
-        // wrongly downgraded a legitimate exact resume to `--continue`. The
+        // wrongly downgraded a legitimate exact resume to the fallback. The
         // workspace's hook-reported agent cwd (metadata.cwd) is the second
         // candidate — same rationale as buildPaneResumeCommand (ResumeInfoChip).
         const paneCwdCandidates = [
@@ -963,15 +1034,16 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
         const agentMatches = resumeBinding?.agent === launcher;
         const exactOk = cwdMatches && agentMatches;
         const sessionId = exactOk ? resumeBinding?.sessionId : undefined;
-        // --dangerously-skip-permissions is a launch preference, not tied to the
-        // exact conversation, so the explicit toggle forces it on EITHER the exact
-        // resume or the cwd-relative fallback. When the toggle is OFF, fall back
-        // to restoring the captured mode (acceptEdits/plan), exact-resume only.
-        const canSkip = agentSupportsPermissionFlag(launcher);
-        const forceSkip = canSkip && resumeSkipPermissions;
-        const permFlag = forceSkip
-          ? permissionFlagFor('bypassPermissions')
-          : (exactOk ? permissionFlagFor(resumeBinding?.permissionMode) : '');
+        // #1916: the skip toggle and the permission flag (see the helper).
+        const { canSkip, skipChecked, forceSkip, permFlag } = resolveRecoveryPillPermissions({
+          launcher,
+          sessionId,
+          recordedMode: resumeBinding?.permissionMode,
+          skipOverride: resumeSkipOverride,
+        });
+        // #1916: the folder the typed line will run in (the shell's tracked
+        // cwd), so a stale recovered cwd is visible before the click.
+        const runCwd = paneCwdCandidates[0] || '';
 
         // Paste WITHOUT a trailing \r. The user presses Enter to run — so bypass
         // is re-granted only by an explicit keystroke, never automatically (D6).
@@ -981,23 +1053,25 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
           useStore.getState().clearResumeHint(ptyId);
         };
 
+        // Assemble the exact string the next click types — with the role's
+        // bound model re-asserted on the launcher-prefixed variants (mirrors the
+        // chip and the input.send path). The permission-restore (click 1) /
+        // exact-resume (click 2) staging and the D6 no-auto-submit contract are
+        // unchanged; planRecoveryPillType only injects the model where
+        // applyRoleBinding's gates allow it. Planned at render so the tooltip
+        // can show the very line the click types (#1916).
+        const plan = planRecoveryPillType({
+          launcher,
+          sessionId,
+          permFlag,
+          forceSkip,
+          resumeStage,
+          roleBinding: paneRoleBinding,
+        });
+
         const onPrimary = (e: React.MouseEvent) => {
           e.stopPropagation();
           if (!resumePtyReady) return; // EI6: the recovered pipe is not writable yet
-          // Assemble the exact string to type — with the role's bound model
-          // re-asserted on the launcher-prefixed variants (mirrors the chip and
-          // the input.send path). The permission-restore (click 1) / exact-resume
-          // (click 2) staging and the D6 no-auto-submit contract are unchanged;
-          // planRecoveryPillType only injects the model where applyRoleBinding's
-          // gates allow it.
-          const plan = planRecoveryPillType({
-            launcher,
-            sessionId,
-            permFlag,
-            forceSkip,
-            resumeStage,
-            roleBinding: paneRoleBinding,
-          });
           if (!plan) return; // not resumable — pill shouldn't have shown (defensive)
           // The staged first click keeps the hint up; keep automatic resume
           // from appending a second line to what the pill typed.
@@ -1018,10 +1092,22 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
 
         // The two-stage progressive assembly only applies to the toggle-OFF
         // captured-mode path; with the toggle ON, one click types everything.
+        // #1946: without an exact session the click opens the agent's session
+        // picker, and the label says so instead of promising a resume.
         const primaryLabel = resumeStage === 1
           ? `+ ${t('resume.addSession')}`
-          : `▶ ${t('resume.label', { agent: agentName })}`;
-        const primaryTooltip = resumeStage === 1 ? t('resume.addSessionTooltip') : t('resume.tooltip');
+          : sessionId
+            ? `▶ ${t('resume.label', { agent: agentName })}`
+            : `▶ ${t('resume.pickLabel', { agent: agentName })}`;
+        // #1916: the tooltip names the line this click types and the folder it
+        // runs in; the picker line also says why it opens a picker and carries
+        // no bypass (#1946).
+        const primaryTooltip = [
+          resumeStage === 1 ? t('resume.addSessionTooltip') : sessionId ? t('resume.tooltip') : t('resume.pickTooltip'),
+          plan ? t('resume.typesLine', { command: plan.text.trim() }) : '',
+          runCwd ? t('resume.runsIn', { cwd: runCwd }) : '',
+          !sessionId ? t('resume.pickerNote') : '',
+        ].filter(Boolean).join('\n');
 
         return (
           <span
@@ -1048,8 +1134,9 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
               letterSpacing: '0.04em',
             }}
           >
-            {/* --dangerously-skip-permissions toggle (Claude only, default on).
-                A launch preference the owner used to retype by hand; the primary
+            {/* --dangerously-skip-permissions toggle (Claude only). Offered only
+                for an exact resume, and on by default only when that session
+                was recorded in bypassPermissions mode (#1916); the primary
                 button types it onto the resume line when checked. */}
             {canSkip && (
               <label
@@ -1075,8 +1162,11 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
               >
                 <input
                   type="checkbox"
-                  checked={resumeSkipPermissions}
-                  onChange={(e) => setResumeSkipPermissions(e.target.checked)}
+                  checked={skipChecked}
+                  // Locked after the staged first click: the base line is
+                  // already typed, so the toggle can no longer change it.
+                  disabled={resumeStage === 1}
+                  onChange={(e) => setResumeSkipOverride(e.target.checked)}
                   style={{ accentColor: 'var(--accent-cursor)', cursor: 'pointer', margin: 0, flexShrink: 0 }}
                 />
                 <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>--dangerously-skip-permissions</span>
@@ -1136,6 +1226,30 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
               ×
             </button>
             </span>
+            {/* #1916: the folder the typed line runs in, so a stale recovered
+                cwd is visible before the click. A path, so mono, muted
+                metadata with no colour (DESIGN.md); it ellipsizes at the
+                START so the folder name stays visible, full path on hover. */}
+            {runCwd && (
+              <span
+                data-resume-cwd
+                title={t('resume.runsIn', { cwd: runCwd })}
+                style={{
+                  flex: '0 1 auto',
+                  minWidth: 0,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                  direction: 'rtl',
+                  textAlign: 'left',
+                  fontWeight: 400,
+                  letterSpacing: 0,
+                  color: 'var(--text-muted)',
+                }}
+              >
+                <bdi>{t('resume.inCwd', { cwd: runCwd })}</bdi>
+              </span>
+            )}
           </span>
         );
       })()}
@@ -1267,7 +1381,7 @@ function SplitSurfaceView({
 
   if (pane.surfaces.length === 0) {
     return (
-      <div className="flex-1 relative overflow-hidden flex items-center justify-center text-[var(--text-muted)] text-sm" {...tokenAttrs('textMuted', 'text')}>
+      <div className="flex-1 min-h-0 min-w-0 relative overflow-clip flex items-center justify-center text-[var(--text-muted)] text-sm" {...tokenAttrs('textMuted', 'text')}>
         {emptyMessage}
       </div>
     );
@@ -1276,7 +1390,7 @@ function SplitSurfaceView({
   // Only terminals or only browsers — no split needed
   if (!hasBoth) {
     return (
-      <div className="flex-1 relative overflow-hidden">
+      <div className="flex-1 min-h-0 min-w-0 relative overflow-clip">
         {pane.surfaces.map((surface) =>
           surface.surfaceType === 'editor' ? (
             <EditorPanel
@@ -1335,6 +1449,7 @@ function SplitSurfaceView({
               cwd={surface.cwd}
               isActive={surface.id === activeSurfaceId}
               onTitleChange={updateRemoteSurfaceTitle}
+              fixedFont={isShadowWorkspaceId(workspaceId)}
             />
           ) : (
             <TerminalSurface
@@ -1363,11 +1478,11 @@ function SplitSurfaceView({
   // — report it occluded so lightweight mode can throttle it.
   const overlayActive = others.some((s) => s.id === activeSurfaceId);
   return (
-    <div className="flex-1 relative overflow-hidden">
+    <div className="flex-1 min-h-0 min-w-0 relative overflow-clip">
       <Group orientation="horizontal" className="h-full w-full" resizeTargetMinimumSize={{ coarse: 37, fine: 16 }}>
         {/* Terminal panel */}
         <Panel defaultSize={50} minSize={20}>
-          <div className="h-full w-full relative overflow-hidden">
+          <div className="h-full w-full min-h-0 min-w-0 relative overflow-clip">
             {terminals.map((surface) => (
               <TerminalSurface
                 key={surface.id}
@@ -1388,7 +1503,7 @@ function SplitSurfaceView({
 
         {/* Browser panel */}
         <Panel defaultSize={50} minSize={20}>
-          <div className="h-full w-full relative overflow-hidden">
+          <div className="h-full w-full min-h-0 min-w-0 relative overflow-clip">
             {browsers.map((surface) => (
               <BrowserPanel
                 key={`${surface.id}:${surface.browserPartition || 'persist:wmux-default'}`}
@@ -1443,6 +1558,7 @@ function SplitSurfaceView({
             cwd={surface.cwd}
             isActive={surface.id === activeSurfaceId}
             onTitleChange={updateRemoteSurfaceTitle}
+            fixedFont={isShadowWorkspaceId(workspaceId)}
           />
         ) : (
           <EditorPanel
