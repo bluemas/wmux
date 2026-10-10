@@ -42,6 +42,12 @@ export const vi = {
 
   // Pane stash (#977) — the pane leaves the layout, its session keeps running.
   'pane.rename': 'Đổi tên khung',
+  'pane.renameError.whitespace': "Tên khung không được chứa khoảng trắng",
+  'pane.renameError.reservedChar': "Tên khung không được chứa # hoặc @",
+  'pane.renameError.leadingDigit': "Tên khung không được bắt đầu bằng chữ số",
+  'pane.renameError.autoName': "Các tên như w1-2 được dành cho tên khung tự động",
+  'pane.renameError.duplicate': "Một khung khác đã dùng tên này",
+  'pane.renameError.failed': "Không thể đổi tên khung",
   'pane.stash': 'Cất khung',
   'pane.stashHint': 'Gỡ khỏi bố cục — phiên vẫn tiếp tục chạy',
   'pane.unstash': 'Đưa trở lại',
@@ -511,4 +517,25 @@ export const vi = {
   // ─── Workspace item: task worktree boundary warning ───
   'workspace.cwdDeparted': 'cwd của khung đã rời khỏi ranh giới worktree của tác vụ: {cwd}',
   'workspace.departed': 'đã rời',
+  'settings.plainDragSelect': "Kéo để chọn văn bản, kể cả khi ứng dụng dùng chuột",
+  'settings.plainDragSelectDesc': "Kéo thông thường sẽ chọn văn bản ngay cả trong ứng dụng dùng chuột như Codex; cú nhấp vẫn được gửi tới ứng dụng. Giữ Shift (macOS) hoặc Alt (Windows, Linux) khi kéo để gửi thao tác kéo tới ứng dụng.",
+  'pcRail.notChecked': "Chưa kiểm tra",
+  'pcRail.access.revokeHintUnknown': "Để thu hồi: nếu máy này được ghép bằng mã, hãy xóa nó trong Thiết bị đã ghép trên {name}. Nếu được thêm bằng liên kết web của {name}, chỉ một liên kết mới (wmux web --new-token) mới cắt được.",
+  'remote.scope.read': "Thiết bị đã ghép có thể đọc và tìm kiếm đầu ra của mọi không gian làm việc trên máy này, kể cả những cái mở sau.",
+  'remote.scope.viewOnly': "Chỉ xem chặn việc gõ, nhưng vẫn có thể trả lời các lời nhắc trên màn hình chỉ cần một phím.",
+  'remote.scope.input': "Có thể gõ còn cho phép mở và đóng phiên cũng như trả lời các yêu cầu phê duyệt.",
+  'remotePage.connect.pasteScope': "Nếu lời mời chia sẻ không gian làm việc, máy này có thể đọc và tìm kiếm mọi không gian làm việc trên PC đó, kể cả những cái mở sau. Trong khi ghép, wmux kiểm tra nó vài giây một lần, giữ kết nối để nhận cảnh báo và hiển thị thông báo của nó; tắt tiếng từ menu máy tính ở tiêu đề thanh bên.",
+  'pcSwitcher.open': "Đổi máy tính",
+  'pcSwitcher.manage': "Cài đặt {name}",
+  'pcSwitcher.othersNeedYou': "{count} đang chờ bạn trên máy tính khác",
+  // Quit and Stop Sessions (main-process native confirm)
+  'quitAndStop.message': "Thoát wmux và dừng tất cả phiên?",
+  'quitAndStop.detail': "Đang chạy: {agents} phiên agent, tổng cộng {sessions} terminal. Tất cả sẽ bị dừng. Thoát thông thường để chúng tiếp tục chạy ở chế độ nền.",
+  'quitAndStop.detailUnknown': "wmux không đếm được các phiên đang chạy. Mọi terminal và phiên agent sẽ bị dừng. Thoát thông thường để chúng tiếp tục chạy ở chế độ nền.",
+  'quitAndStop.confirm': "Thoát và dừng phiên",
+  'quitAndStop.cancel': "Hủy",
+  'quitAndStop.stopFailedMessage': "wmux không thể dừng các phiên.",
+  'quitAndStop.stopFailedDetail': "Daemon wmux không dừng, nên wmux vẫn mở và các phiên vẫn đang chạy. Hãy chạy wmux daemon stop trong terminal rồi thoát lại.",
+  'quitAndStop.alreadyQuittingMessage': "wmux đang thoát.",
+  'quitAndStop.alreadyQuittingDetail': "Lần thoát này để các phiên tiếp tục chạy ở chế độ nền. Để dừng chúng, hãy chạy wmux daemon stop trong terminal.",
 } as const;

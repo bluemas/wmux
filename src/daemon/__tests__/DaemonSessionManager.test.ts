@@ -36,7 +36,10 @@ class MockPty extends EventEmitter {
     return { dispose: () => { /* noop */ } };
   }
 
-  write(_data: string): void { /* noop */ }
+  /** Everything written to the PTY's input, in order. */
+  writes: string[] = [];
+
+  write(data: string): void { this.writes.push(data); }
 
   /** Count of resize() calls = SIGWINCH emissions, for startup-grace assertions. */
   resizeCalls = 0;
@@ -87,6 +90,7 @@ import { restoreSeam } from '../../shared/restoreSeam';
 import { createDefaultConfig } from '../config';
 import { PWSH_EXIT_TAIL } from '../execWrapper';
 import { FACTORY_DEFAULT_SCOPES, __setPolicyProbeForTests } from '../../shared/pwshExecutionPolicy';
+import { CONPTY_BACKEND_ENV } from '../../shared/conptyWindows';
 
 // #1620: never let the host's real registry decide PowerShell argv here. Pin a
 // machine with an explicit policy (no extra args) unless a test opts in.
@@ -94,9 +98,15 @@ const EXPLICIT_POLICY = { scopes: { ...FACTORY_DEFAULT_SCOPES, currentUser: 'set
 
 describe('DaemonSessionManager', () => {
   let manager: DaemonSessionManager;
+  let prevBackendEnv: string | undefined;
 
   beforeEach(() => {
     __setPolicyProbeForTests(EXPLICIT_POLICY);
+    // The mocked PTY models the in-box ConPTY (it "repaints" when a test says
+    // so). Windows hosts default to the bundled backend since #1932, so pin
+    // in-box here; the bundled cases set `conptyBackend` on the session.
+    prevBackendEnv = process.env[CONPTY_BACKEND_ENV];
+    process.env[CONPTY_BACKEND_ENV] = 'inbox';
     manager = new DaemonSessionManager();
     lastMockPty = null;
   });
@@ -104,6 +114,8 @@ describe('DaemonSessionManager', () => {
   afterEach(() => {
     manager.disposeAll();
     __setPolicyProbeForTests(null);
+    if (prevBackendEnv === undefined) delete process.env[CONPTY_BACKEND_ENV];
+    else process.env[CONPTY_BACKEND_ENV] = prevBackendEnv;
   });
 
   // 1. createSession → session created with state = detached
@@ -340,6 +352,46 @@ describe('DaemonSessionManager', () => {
     } finally {
       if (prev === undefined) delete process.env.WMUX_DATA_SUFFIX; else process.env.WMUX_DATA_SUFFIX = prev;
     }
+  });
+
+  // shared/exeSearch.ts: the daemon sets NoDefaultCurrentDirectoryInExePath on
+  // itself (marked WMUX_EXE_SEARCH_GUARD) so its helper spawns never start an
+  // executable out of a working directory. A pane is the user's shell and must
+  // not inherit that — but a value the user set themselves passes through.
+  describe('executable-lookup guard does not reach panes', () => {
+    const KEYS = ['NoDefaultCurrentDirectoryInExePath', 'WMUX_EXE_SEARCH_GUARD'] as const;
+    let saved: Record<string, string | undefined>;
+    beforeEach(() => { saved = Object.fromEntries(KEYS.map((k) => [k, process.env[k]])); });
+    afterEach(() => {
+      for (const k of KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+    });
+    const guardKeys = (env: Record<string, string>) =>
+      Object.keys(env).filter((k) => ['NODEFAULTCURRENTDIRECTORYINEXEPATH', 'WMUX_EXE_SEARCH_GUARD'].includes(k.toUpperCase()));
+
+    it('strips it from a supplied env (any case) when wmux added it', () => {
+      process.env.NoDefaultCurrentDirectoryInExePath = '1';
+      process.env.WMUX_EXE_SEARCH_GUARD = '1';
+      manager.createSession({
+        id: 'exe-guard-supplied', cmd: 'cmd.exe', cwd: '.',
+        env: { NoDefaultCurrentDirectoryInExePath: '1', nodefaultcurrentdirectoryinexepath: '1', WMUX_EXE_SEARCH_GUARD: '1', FOO: 'bar' },
+      });
+      expect(guardKeys(lastMockPty?.spawnEnv ?? {})).toEqual([]);
+      expect(lastMockPty?.spawnEnv?.FOO).toBe('bar');
+    });
+
+    it('strips it from the process.env fallback when wmux added it', () => {
+      process.env.NoDefaultCurrentDirectoryInExePath = '1';
+      process.env.WMUX_EXE_SEARCH_GUARD = '1';
+      manager.createSession({ id: 'exe-guard-fallback', cmd: 'cmd.exe', cwd: '.' });
+      expect(guardKeys(lastMockPty?.spawnEnv ?? {})).toEqual([]);
+    });
+
+    it("keeps the user's own setting", () => {
+      process.env.NoDefaultCurrentDirectoryInExePath = '1';
+      delete process.env.WMUX_EXE_SEARCH_GUARD;
+      manager.createSession({ id: 'exe-guard-user', cmd: 'cmd.exe', cwd: '.', env: { NoDefaultCurrentDirectoryInExePath: '1' } });
+      expect(lastMockPty?.spawnEnv?.NoDefaultCurrentDirectoryInExePath).toBe('1');
+    });
   });
 
   it("propagates the daemon's own suffix in the process.env fallback (no supplied env)", () => {
@@ -1171,6 +1223,54 @@ describe('DaemonSessionManager', () => {
       }
     });
 
+    // #1965: the bundled OpenConsole (Windows 10, or WMUX_CONPTY_BACKEND)
+    // emits 0 bytes on every resize, so nothing would replace held output that
+    // is discarded, and a repaint request is answered by nothing.
+    it('#1965: bundled ConPTY keeps and replays held output across a size change, with no repaint request', () => {
+      vi.useFakeTimers();
+      try {
+        manager.createSession({ id: 'rec-bundled', cmd: 'cmd.exe', cwd: '.', cols: 62, rows: 44, deferOutput: true });
+        const managed = manager.getSession('rec-bundled')!;
+        managed.conptyBackend = 'bundled';
+        const pty = lastMockPty!;
+        const sizes = recordSizes();
+        withPlatform('win32', () => {
+          pty.simulateData('prompt-at-spawn-geometry > ');
+          manager.resizeSession('rec-bundled', 62, 44);
+          vi.advanceTimersByTime(50);
+          manager.resizeSession('rec-bundled', 62, 42);
+          vi.advanceTimersByTime(50);
+          vi.advanceTimersByTime(200);
+        });
+        expect(managed.bridge.isMuted).toBe(false);
+        // The only frame there is reaches the viewer, at the spawn geometry.
+        expect(managed.ringBuffer.readAll().toString()).toBe('prompt-at-spawn-geometry > ');
+        // One real change, no same-size repaint request after it.
+        expect(sizes).toEqual([[62, 42]]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('#1965: bundled ConPTY gets no repaint request on the first desk resize after a web activation', () => {
+      vi.useFakeTimers();
+      try {
+        manager.createSession({ id: 'rec-bundled-web', cmd: 'sh', cwd: '.', cols: 62, rows: 44, deferOutput: true });
+        const managed = manager.getSession('rec-bundled-web')!;
+        managed.conptyBackend = 'bundled';
+        const sizes = recordSizes();
+        withPlatform('win32', () => {
+          manager.activateDeferred('rec-bundled-web');
+          vi.advanceTimersByTime(100);
+          manager.resizeSession('rec-bundled-web', 100, 30);
+          vi.advanceTimersByTime(200);
+        });
+        expect(sizes).toEqual([[100, 30]]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
     it('default (non-deferred) sessions capture data immediately', () => {
       // Regression guard: Bug 2 fix must not change normal create flow.
       manager.createSession({ id: 'live-1', cmd: 'cmd.exe', cwd: '.' });
@@ -1199,6 +1299,58 @@ describe('DaemonSessionManager', () => {
 
       expect(diedHandler).toHaveBeenCalledWith(expect.objectContaining({ id: 'rec-exit', exitCode: 2 }));
       expect(manager.getSession('rec-exit')?.meta.state).toBe('dead');
+    });
+  });
+
+  // #1965: the bundled OpenConsole waits ~3 s for an answer to its startup
+  // DA1. The daemon answers it only for a bundled session, and only when no
+  // renderer receives that chunk live.
+  describe('startup DA1 reply (#1965)', () => {
+    const PREAMBLE = '\x1b[1t\x1b[c\x1b[?1004h\x1b[?9001h';
+    const REPLY = '\x1b[?62;4;9;22c';
+
+    it('answers once for a bundled session no renderer is receiving live', () => {
+      manager.createSession({ id: 'da1-bundled', cmd: 'sh', cwd: '.' });
+      manager.getSession('da1-bundled')!.conptyBackend = 'bundled';
+      const pty = lastMockPty!;
+      pty.simulateData(PREAMBLE);
+      pty.simulateData('\x1b[c');
+      expect(pty.writes).toEqual([REPLY]);
+    });
+
+    it('does not answer for an in-box session', () => {
+      manager.createSession({ id: 'da1-inbox', cmd: 'sh', cwd: '.' });
+      manager.getSession('da1-inbox')!.conptyBackend = 'inbox';
+      const pty = lastMockPty!;
+      pty.simulateData(PREAMBLE);
+      expect(pty.writes).toEqual([]);
+    });
+
+    it('does not answer while a renderer receives the output live', () => {
+      manager.setLiveRendererProbe((id) => id === 'da1-live');
+      manager.createSession({ id: 'da1-live', cmd: 'sh', cwd: '.' });
+      manager.getSession('da1-live')!.conptyBackend = 'bundled';
+      const pty = lastMockPty!;
+      pty.simulateData(PREAMBLE);
+      expect(pty.writes).toEqual([]);
+    });
+
+    it('answers for a muted (recovered) session even with a live renderer pipe', () => {
+      manager.setLiveRendererProbe(() => true);
+      manager.createSession({ id: 'da1-muted', cmd: 'sh', cwd: '.', deferOutput: true });
+      manager.getSession('da1-muted')!.conptyBackend = 'bundled';
+      const pty = lastMockPty!;
+      pty.simulateData(PREAMBLE);
+      expect(pty.writes).toEqual([REPLY]);
+    });
+
+    it('does not answer a query that follows shell output', () => {
+      manager.createSession({ id: 'da1-late', cmd: 'sh', cwd: '.' });
+      manager.getSession('da1-late')!.conptyBackend = 'bundled';
+      const pty = lastMockPty!;
+      pty.simulateData('Microsoft Windows\r\n');
+      pty.simulateData('\x1b[c');
+      expect(pty.writes).toEqual([]);
     });
   });
 

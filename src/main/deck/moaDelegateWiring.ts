@@ -24,7 +24,7 @@ import { moaAskSwitchPath, readMoaAskEnabled } from '../../shared/moaAskSwitch';
 import type { DaemonClient } from '../DaemonClient';
 import { detectRemote } from '../github/PrProvider';
 import { ghPrReviewService } from '../github/GhPrReviewService';
-import { ghIssueService } from '../github/GhIssueService';
+import { ghIssueEnv, ghIssueService, splitRepoKey } from '../github/GhIssueService';
 import { getTaskLedger } from './taskLedgerHost';
 import { getMoaConfig, onHqStoreWritten, setMoaAutoRules } from './deckHqStore';
 import { loadPolicyBook } from './deckPolicy';
@@ -33,6 +33,7 @@ import { MoaDecisionStore } from './moaDecisionStore';
 import { MoaEffectStore } from './moaEffectStore';
 import { MoaMergeExecutor } from './moaMergeExecutor';
 import { MoaAskService, type MoaAskConfig } from './moaAskService';
+import { moaMergeSubject, ttlReader } from './moaMergeFacts';
 import { findShadowJudgment, readPaneScreen, runMoaJudge } from './moaShadowHost';
 import type { AskerPaneState, CourierSendResult } from './moaAnswerCourier';
 import { getWorkspaceMirror } from '../workspace/WorkspaceMirror';
@@ -46,6 +47,7 @@ const TICK_MS = 10 * 60 * 1000;
 /** The audit of merges without a lane receipt. */
 const AUDIT_MS = 24 * 60 * 60 * 1000;
 const GIT_TIMEOUT_MS = 5_000;
+const GH_TIMEOUT_MS = 15_000;
 
 /** The ask mode in force: off unless Moa is on and the owner chose one. */
 export function moaAskModeNow(): MoaAskMode {
@@ -93,6 +95,42 @@ let deps: MoaDelegateWiringDeps | null = null;
 let settingsWatched = false;
 /** Owner logins by GitHub host (the owner's own PRs are trusted authors). */
 const ownerLogins = new Map<string, string>();
+
+/** Squash permission is a repository setting: re-read after SQUASH_TTL_MS. */
+const SQUASH_TTL_MS = 10 * 60 * 1000;
+const gh = process.platform === 'win32' ? 'gh.exe' : 'gh';
+
+const squashMergeAllowed = ttlReader(async (repo: { key: string; path: string }): Promise<boolean | null> => {
+  const parts = splitRepoKey(repo.key);
+  if (!parts) return null;
+  try {
+    const { stdout } = await execFileAsync(gh, [
+      'api', 'graphql', '--hostname', parts.host,
+      '-f', 'query=query($owner: String!, $repo: String!) { repository(owner: $owner, name: $repo) { squashMergeAllowed } }',
+      '-f', `owner=${parts.owner}`, '-f', `repo=${parts.repo}`,
+      '--jq', '.data.repository.squashMergeAllowed',
+    ], { cwd: repo.path, timeout: GH_TIMEOUT_MS, env: ghIssueEnv(), windowsHide: true });
+    const v = stdout.trim();
+    return v === 'true' ? true : v === 'false' ? false : null;
+  } catch {
+    return null;
+  }
+}, (repo) => repo.key, SQUASH_TTL_MS);
+
+/** The login gh signs in as on the repo's host now: never cached, so an
+ *  account switch shows on the next card and stops the next merge. */
+async function currentGhLogin(repo: { key: string; path: string }): Promise<string | null> {
+  const parts = splitRepoKey(repo.key);
+  if (!parts) return null;
+  try {
+    const { stdout } = await execFileAsync(gh, ['api', '--hostname', parts.host, 'user', '--jq', '.login'], {
+      cwd: repo.path, timeout: GH_TIMEOUT_MS, env: ghIssueEnv(), windowsHide: true,
+    });
+    return stdout.trim().toLowerCase() || null;
+  } catch {
+    return null;
+  }
+}
 
 async function git(args: string[], cwd: string): Promise<string | null> {
   try {
@@ -186,13 +224,13 @@ function build(d: MoaDelegateWiringDeps): MoaAskService {
     merge: async (e) => {
       // The subject GitHub would give a squash: the title and the number.
       const head = await ghPrReviewService.checks(e.repoPath, e.repoKey, e.prNumber, true);
-      const title = head.ok ? head.value.head.title.trim() : '';
       return ghPrReviewService.merge(e.repoPath, e.repoKey, e.prNumber, {
-        expectHead: e.expectHead, subject: `${title || `Pull request #${e.prNumber}`} (#${e.prNumber})`, body: '',
+        expectHead: e.expectHead, subject: moaMergeSubject(head.ok ? head.value.head.title : '', e.prNumber), body: '',
       });
     },
     laneContext: (e) => (service as MoaAskService).laneContext(e),
     authorize: (e) => (service as MoaAskService).authorize(e),
+    identity: (e) => (service as MoaAskService).identity(e),
     emit: (e) => service?.emitEffect(e),
     log,
   });
@@ -216,6 +254,13 @@ function build(d: MoaDelegateWiringDeps): MoaAskService {
       return { key: remote.key, path: cwd };
     },
     askerBranches: (asker, repoPath) => askerBranches(d.getDaemonClient, asker, repoPath),
+    // Per-PR facts come from the lane read; squash permission is per repo,
+    // and the login is read now, as the executor's identity gate reads it.
+    mergeFactsExtras: async (repo) => {
+      const [squash, login] = await Promise.all([squashMergeAllowed(repo), currentGhLogin(repo)]);
+      return squash === null || !login ? null : { squashAllowed: squash, login };
+    },
+    currentLogin: currentGhLogin,
     priorJudgment: findShadowJudgment,
     ...(submit
       ? {

@@ -9,6 +9,7 @@ import {
 } from '../tailscale';
 import type { RpcResponse } from '../../shared/rpc';
 import type { WebTlsConfig } from '../../shared/web';
+import { GITHUB_LOGIN } from '../../shared/phoneGitWrite';
 import { isPermissionGateInstalled } from './setupHooks';
 import { planWebStart, type PreviousWebShape } from '../webStartPlan';
 import { getWmuxDir } from '../../daemon/config';
@@ -29,6 +30,10 @@ interface WebInfo {
   allowTranscript?: boolean;
   /** Whether chat launch may start an agent with approvals or the sandbox off. */
   allowDangerousLaunch?: boolean;
+  /** Whether a paired phone may push, open PRs and squash-merge. */
+  allowGitWrite?: boolean;
+  /** The GitHub login those writes run as. */
+  gitWriteLogin?: string;
   /** Whether the browser terminal draws inline images. Absent reads as on. */
   inlineImages?: boolean;
   /** True when the daemon itself terminates HTTPS. */
@@ -170,6 +175,14 @@ export async function handleWeb(args: string[], jsonMode: boolean): Promise<void
     console.error('Error: --inline-images and --no-inline-images cannot be used together');
     process.exit(1);
   }
+  let gitWrite: { gitWriteLogin?: string };
+  try {
+    gitWrite = resolveGitWriteLogin(args);
+  } catch (error) {
+    console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(1);
+    return;
+  }
   if (!Number.isInteger(port) || port <= 0 || port >= 65536) {
     console.error('Error: --port must be an integer between 1 and 65535');
     process.exit(1);
@@ -198,6 +211,10 @@ export async function handleWeb(args: string[], jsonMode: boolean): Promise<void
     ...(grants.allowDangerousLaunch === true || (unknownGrant && grants.allowDangerousLaunch === false)
       ? { allowDangerousLaunch: grants.allowDangerousLaunch }
       : {}),
+    // The git write ceiling follows the same rule.
+    ...(grants.allowGitWrite === true || (unknownGrant && grants.allowGitWrite === false)
+      ? { allowGitWrite: grants.allowGitWrite }
+      : {}),
     ...(unknownGrant ? { inheritUnsetGrants: true } : {}),
   };
 
@@ -223,6 +240,7 @@ export async function handleWeb(args: string[], jsonMode: boolean): Promise<void
         host,
         ...grantParams,
         ...(imagesOn || imagesOff ? { inlineImages: imagesOn } : {}),
+        ...gitWrite,
         allowedHosts: hosts,
         newToken,
         // Explicit false distinguishes "the operator chose HTTP" from a re-run
@@ -253,6 +271,18 @@ export async function handleWeb(args: string[], jsonMode: boolean): Promise<void
 }
 
 /**
+ * `--git-write-login <login>`. Sent only when given: the daemon keeps the
+ * running or persisted login otherwise. (`--allow-git-write` is a grant and
+ * goes through planWebStart like the others.)
+ */
+export function resolveGitWriteLogin(args: string[]): { gitWriteLogin?: string } {
+  if (!hasFlag(args, '--git-write-login')) return {};
+  const login = parseFlag(args, '--git-write-login') ?? '';
+  if (!GITHUB_LOGIN.test(login)) throw new Error('--git-write-login must be a GitHub login');
+  return { gitWriteLogin: login };
+}
+
+/**
  * What this re-run starts from: the running server, else the persisted record
  * the daemon keeps for a server it should be running (a boot restore that
  * failed). Undefined for a fresh start or after `--stop`, which clears the
@@ -274,6 +304,7 @@ async function loadPreviousWebShape(): Promise<PreviousWebShape | undefined> {
         allowUpload: typeof r.allowUpload === 'boolean' ? r.allowUpload : undefined,
         allowTranscript: typeof r.allowTranscript === 'boolean' ? r.allowTranscript : undefined,
         allowDangerousLaunch: typeof r.allowDangerousLaunch === 'boolean' ? r.allowDangerousLaunch : undefined,
+        allowGitWrite: typeof r.allowGitWrite === 'boolean' ? r.allowGitWrite : undefined,
       };
     }
   } catch {
@@ -291,6 +322,7 @@ async function loadPreviousWebShape(): Promise<PreviousWebShape | undefined> {
     allowUpload: state.allowUpload,
     allowTranscript: state.allowTranscript === true,
     allowDangerousLaunch: state.allowDangerousLaunch === true,
+    allowGitWrite: state.allowGitWrite === true,
   };
 }
 
@@ -439,7 +471,7 @@ function report(
   const nativeTls = info.tls === true;
 
   console.log('');
-  console.log(`  wmux web ${mode === 'start' ? 'started' : 'running'} — ${info.allowInput ? 'INPUT ENABLED' : 'read-only'}${info.allowUpload ? '  ·  uploads ENABLED' : ''}${info.allowTranscript ? '  ·  transcript ENABLED' : ''}${info.allowDangerousLaunch ? '  ·  DANGEROUS LAUNCH ENABLED' : ''}${info.inlineImages === false ? '  ·  inline images off' : ''}`);
+  console.log(`  wmux web ${mode === 'start' ? 'started' : 'running'} — ${info.allowInput ? 'INPUT ENABLED' : 'read-only'}${info.allowUpload ? '  ·  uploads ENABLED' : ''}${info.allowTranscript ? '  ·  transcript ENABLED' : ''}${info.allowDangerousLaunch ? '  ·  DANGEROUS LAUNCH ENABLED' : ''}${info.allowGitWrite ? '  ·  GIT WRITE ENABLED' : ''}${info.inlineImages === false ? '  ·  inline images off' : ''}`);
   console.log(`  bind ${info.host}:${info.port}${typeof info.clients === 'number' ? `  ·  ${info.clients} viewer(s)` : ''}`);
   console.log('');
 
@@ -557,6 +589,11 @@ function report(
     console.log('  Dangerous launch is ENABLED: a paired phone with input can start Claude');
     console.log('  with --dangerously-skip-permissions or Codex with approvals and the');
     console.log('  sandbox off. Each launch needs an explicit confirmation and is logged.');
+  }
+  if (info.allowGitWrite) {
+    console.log(`  Git write is ENABLED: a paired phone with an explicit input grant can push,`);
+    console.log(`  open PRs and squash-merge${info.gitWriteLogin ? ` as @${info.gitWriteLogin}` : ' once --git-write-login is set'}. Push and merge`);
+    console.log('  need a fresh preview and confirmation; force-push is never offered.');
   }
   if (tailnet || nativeTls) {
     console.log('  PWA: served over HTTPS, so "Add to Home Screen", Android install and');

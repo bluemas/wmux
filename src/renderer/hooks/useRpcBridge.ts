@@ -3,7 +3,8 @@ import { useEffect } from 'react';
 import { useStore } from '../stores';
 import { resolveStartupCwd, shellDisplayName, withDefaultShell, withRoleBinding, withWorkspaceProfile } from '../utils/ptyCreateOptions';
 import type { Pane, PaneLeaf, Surface, Workspace } from '../../shared/types';
-import { computePaneAutoName, paneDisplayName } from '../utils/paneNaming';
+import { computePaneAutoName, paneDisplayName, paneNameFields } from '../utils/paneNaming';
+import { resolvePaneName } from '../utils/paneNameResolver';
 import { paneForegroundProgram, surfaceForegroundProgram } from '../utils/surfaceProgram';
 import { originFromCaller } from '../utils/fanoutProvenance';
 import { sanitizeFanoutOrigin } from '../../shared/fanoutOrigin';
@@ -12,6 +13,7 @@ import type { Message, Part, TaskState, Artifact, AgentSkill, Task, CompletionEv
 import { normalizeCompletionEvidenceWire, isVerifiedItem } from '../../shared/completionEvidence';
 import type { PaneSearchResult, PaneSearchResponse } from '../../shared/types';
 import { generateId } from '../../shared/types';
+import { isShadowWorkspaceId } from '../../shared/pcRail';
 import { isTaskEnded, isVerifiedTaskSender } from '../../shared/a2aReopen';
 import { applyTaskQueryView } from '../../shared/a2aTaskQueryView';
 import { getLeafPanes, getWorkspaceLeafPanes, getWorkspacePtyIds, getWorkspaceRemoteSessions } from '../../shared/paneUtils';
@@ -1072,10 +1074,17 @@ function isSelectableBrowserPartition(partition: string): boolean {
   );
 }
 
+function withoutShadows<S extends { workspaces: Workspace[] }>(state: S): S {
+  if (!state.workspaces.some((w) => isShadowWorkspaceId(w.id))) return state;
+  return { ...state, workspaces: state.workspaces.filter((w) => !isShadowWorkspaceId(w.id)) };
+}
+
 // Exported for tests only (a2aFormat.delivery.test.ts).
 export async function handleRpcMethod(method: string, params: RpcParams): Promise<RpcResult> {
   // Always read the freshest state via getState() to avoid stale closures.
-  const store = useStore.getState();
+  // The PC rail's shadow workspaces show another computer's panes: no RPC
+  // lists, resolves or targets them, so every walk below sees local ones only.
+  const store = withoutShadows(useStore.getState());
 
   // Fix 0 — block external RPC during startup reconcile. Even read-only
   // RPCs (workspace.list) return surface.ptyId fields that the external
@@ -1967,6 +1976,9 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
       const isStashed = stashedIds.has(l.id);
       return {
         id: l.id,
+        // What the header shows (label or `w1-2(agent)`) and the unique
+        // `#w1-2` address any pane-taking tool accepts in place of an id.
+        ...paneNameFields(store.paneLabel, store.surfaceAgent, ws, l),
         surfaceCount: l.surfaces.length,
         foregroundProgram: paneForegroundProgram(l, store.surfaceAgent, store),
         active: !isStashed && l.id === ws.activePaneId,
@@ -2193,6 +2205,24 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
       return { error: `pane.resolveActiveLeaf: active pane is not a leaf in workspace "${wsId}"` };
     }
     return { paneId: target.id, workspaceId: wsId };
+  }
+
+  if (method === 'pane.resolveName') {
+    // `#w1-2` / `#backend` → ids. Searches every workspace (names are unique
+    // across them) unless a workspaceId narrows it — a hosted caller always
+    // arrives with its binding here. Answers only ids; the tool that asked
+    // still routes and authorizes on those ids as if they had been typed.
+    const name = typeof params.name === 'string' ? params.name : '';
+    const scope = typeof params.workspaceId === 'string' && params.workspaceId.length > 0 ? params.workspaceId : undefined;
+    const workspaces = scope ? store.workspaces.filter((w) => w.id === scope) : store.workspaces;
+    return resolvePaneName(workspaces, store.paneLabel, store.surfaceAgent, name);
+  }
+
+  if (method === 'pane.liveIds') {
+    // Internal main->renderer channel (no router entry): every pane that exists
+    // right now, stashed ones included, for MetadataStore's label-uniqueness
+    // check. Ids only — no labels, no layout.
+    return { paneIds: store.workspaces.flatMap((w) => getWorkspaceLeafPanes(w).map((l) => l.id)) };
   }
 
   if (method === 'pane.validateWorkspace') {
@@ -2849,12 +2879,19 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
     // Workspace-wide (#977). The ownership boundary — "this workspace's own
     // leaves" — is what makes a forged/foreign ptyId fail closed, and that is
     // unchanged; what widens is the OWNED set, not the trust level.
+    const leaves = getWorkspaceLeafPanes(ws);
     const self = resolveSelfPaneIdentity(
-      getWorkspaceLeafPanes(ws),
+      leaves,
       (ptyId) => store.surfaceAgent[ptyId],
       rawSenderPtyId,
     );
-    return self ? { ...base, ...self } : base;
+    if (!self) return base;
+    const selfLeaf = leaves.find((l) => l.id === self.paneId);
+    return {
+      ...base,
+      ...self,
+      ...(selfLeaf ? paneNameFields(store.paneLabel, store.surfaceAgent, ws, selfLeaf) : {}),
+    };
   }
 
   if (method === 'a2a.discover') {
@@ -2887,6 +2924,8 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
           paneId: string;
           surfaceId: string;
           ptyId: string;
+          paneName: string;
+          paneTag: string;
           agentName: string | null;
           agentStatus: string | null;
           paneTitle: string | null;
@@ -2895,6 +2934,7 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
         // side as the same address source. A pane in one and not the other
         // reads as "it disappeared", and acting on that is a silent misroute.
         for (const leaf of getWorkspaceLeafPanes(w)) {
+          const names = paneNameFields(store.paneLabel, store.surfaceAgent, w, leaf);
           for (const s of leaf.surfaces) {
             if (s.surfaceType === 'browser' || !s.ptyId) continue;
             const a = store.surfaceAgent[s.ptyId];
@@ -2908,6 +2948,7 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
               paneId: leaf.id,
               surfaceId: s.id,
               ptyId: s.ptyId,
+              ...names,
               agentName: a?.name ?? null,
               agentStatus: a?.status ?? null,
               paneTitle,

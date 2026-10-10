@@ -11,10 +11,13 @@ import { sessionPullRequests } from './sessionPullRequests';
 import { SessionGitController, SessionGitError } from './sessionGit';
 import { PhoneGitReads, type PhoneGitSessionRef } from './phoneGitRead';
 import type { PhoneWorktreeService } from './phoneWorktree';
+import type { PhoneGitWriteGate } from './phoneGitWriteGate';
+import { matchPhoneGitWriteRoute, PhoneGitWriteRoutes } from './phoneGitWriteRoutes';
 import { PHONE_WORKTREE_REQUEST_ID } from '../../shared/phoneGitV1';
 import { sessionFiles, searchSessionFiles, SessionFileError } from './sessionFiles';
 import { openResolvedFile } from './openResolvedFile';
-import { SENT_FILE_CLOCK_SKEW_MS, SentFileIndex, sentFileParts } from '../transcript/sentFiles';
+import { SENT_FILE_CLOCK_SKEW_MS, SentFileIndex, sentFileParts, type GrantTool } from '../transcript/sentFiles';
+import { isLocalClientPath } from './clientPath';
 import { listFolders, FolderBrowseError, homeIsBrowsable } from './phoneFolders';
 import {
   createSearchCursorCodec,
@@ -171,6 +174,7 @@ import {
 } from './chatWire';
 import { MOA_WAKE_RETRY_AFTER, type MoaWakeService, type MoaWakeWire } from '../phone/MoaWakeService';
 import { MOA_WAKE_COMMAND } from '../../shared/moaWake';
+import { FLEET_TICKET_ROUTE_PREFIX, fleetTicketDetailResponse, fleetTicketsFields } from './fleetTickets';
 import type { ChatV2Binding } from '../../shared/chatv2/ipc';
 import { buildWebCsp, WEB_APP_FONT_FILE } from './webCsp';
 // Type only — the channel service implementation stays out of this module.
@@ -348,6 +352,15 @@ export interface WebTerminalStartOptions {
    */
   allowDangerousLaunch?: boolean;
   /**
+   * Whether the phone may push, open PRs and squash-merge
+   * (`--allow-git-write`). A server CEILING on top of an explicit per-device
+   * input grant; a device record that predates grants does not pass. Absent →
+   * false. See phoneGitWriteRoutes.ts.
+   */
+  allowGitWrite?: boolean;
+  /** The GitHub login every phone push and merge runs as (`--git-write-login`). Absent: none run. */
+  gitWriteLogin?: string;
+  /**
    * Whether the web client draws inline images (sixel, iTerm2) (#1641).
    * Absent → on; `wmux web --no-inline-images` turns it off. Advertised on
    * `/api/config` as `inlineImages`.
@@ -399,6 +412,10 @@ export interface WebTerminalInfo {
   allowTranscript?: boolean;
   /** Whether chat launch may use `bypass`/`yolo`. Its own opt-in (contract §3.4). */
   allowDangerousLaunch?: boolean;
+  /** Whether phone push / PR create / merge are armed (`--allow-git-write`). */
+  allowGitWrite?: boolean;
+  /** The GitHub login those writes run as. */
+  gitWriteLogin?: string;
   /** Whether the web client draws inline images (#1641). */
   inlineImages?: boolean;
   /** True when this listener terminates HTTPS inside the daemon. */
@@ -528,6 +545,11 @@ export interface WebDeviceResolver {
    * daemon injects here.
    */
   list?(): WebDeviceSummary[];
+  /**
+   * Whether the device's input grant was set explicitly (a record that
+   * predates grants answers false). Absent: no device passes the git write gate.
+   */
+  hasExplicitInputGrant?(deviceId: string): boolean;
   revoke?(deviceId: string, actor: DeviceActor): { ok: boolean; reason?: 'not-found' | 'persist-failed' };
   setInput?(
     deviceId: string,
@@ -742,6 +764,8 @@ interface WebTerminalServerDeps {
   git?: GitRunner;
   /** Phone worktree creation (contract item 5). Absent: the routes 503 and `gitWorktrees` is omitted. */
   phoneWorktrees?: () => PhoneWorktreeService;
+  /** Phone git write actions: tokens, receipts, identity. Absent: the routes 503 and no config key is set. */
+  phoneGitWrite?: () => PhoneGitWriteGate;
   /**
    * Where `POST /api/upload` writes photos. Optional like `approvals`: a daemon
    * that did not wire one still serves every other route, and the upload route
@@ -1753,6 +1777,8 @@ export class WebTerminalServer {
     allowUpload: boolean;
     allowTranscript: boolean;
     allowDangerousLaunch: boolean;
+    allowGitWrite: boolean;
+    gitWriteLogin?: string;
     inlineImages: boolean;
   } | undefined {
     if (!this.server || !this.opts) return undefined;
@@ -1766,6 +1792,8 @@ export class WebTerminalServer {
       allowUpload: this.opts.allowUpload === true,
       allowTranscript: this.opts.allowTranscript === true,
       allowDangerousLaunch: this.opts.allowDangerousLaunch === true,
+      allowGitWrite: this.opts.allowGitWrite === true,
+      ...(this.opts.gitWriteLogin ? { gitWriteLogin: this.opts.gitWriteLogin } : {}),
       inlineImages: this.opts.inlineImages !== false,
     };
   }
@@ -1898,7 +1926,7 @@ export class WebTerminalServer {
 
     this.deps.log(
       'info',
-      `[web] ${options.tls ? 'HTTPS' : 'HTTP'} listening on ${this.opts.host}:${this.opts.port} (input ${options.allowInput ? 'ENABLED' : 'read-only'}, uploads ${options.allowUpload ? 'ENABLED' : 'off'}${options.allowDangerousLaunch ? ', dangerous chat launch ENABLED' : ''})`,
+      `[web] ${options.tls ? 'HTTPS' : 'HTTP'} listening on ${this.opts.host}:${this.opts.port} (input ${options.allowInput ? 'ENABLED' : 'read-only'}, uploads ${options.allowUpload ? 'ENABLED' : 'off'}${options.allowDangerousLaunch ? ', dangerous chat launch ENABLED' : ''}${options.allowGitWrite ? ', git write ENABLED' : ''})`,
     );
     // N7 — the bridge's OpenCode watches poll the plugin once a second, so a
     // watch nobody reads any more has to end on its own. Unref'd: this timer
@@ -2093,6 +2121,22 @@ export class WebTerminalServer {
       if (client.principal.kind === 'device') ids.add(client.principal.deviceId);
     }
     return ids;
+  }
+
+  /**
+   * Which panes each device is watching right now, by pty session id.
+   * Device principals only (the operator's own streams are not a "phone"),
+   * deduplicated per device. A device with no pane stream is absent.
+   */
+  liveSessionsByDevice(): Map<string, string[]> {
+    const byDevice = new Map<string, Set<string>>();
+    for (const client of this.clients) {
+      if (client.principal.kind !== 'device') continue;
+      const ids = byDevice.get(client.principal.deviceId) ?? new Set<string>();
+      ids.add(client.sessionId);
+      byDevice.set(client.principal.deviceId, ids);
+    }
+    return new Map([...byDevice].map(([deviceId, ids]) => [deviceId, [...ids]]));
   }
 
   /**
@@ -2301,6 +2345,8 @@ export class WebTerminalServer {
         allowUpload: this.opts.allowUpload,
         allowTranscript: this.opts?.allowTranscript === true,
         allowDangerousLaunch: this.opts.allowDangerousLaunch === true,
+        allowGitWrite: this.opts.allowGitWrite === true,
+        ...(this.opts.gitWriteLogin ? { gitWriteLogin: this.opts.gitWriteLogin } : {}),
         inlineImages: this.opts.inlineImages !== false,
         tls: this.opts.tls !== undefined,
         token: this.token,
@@ -2321,6 +2367,8 @@ export class WebTerminalServer {
       allowUpload: this.opts.allowUpload,
       allowTranscript: this.opts.allowTranscript === true,
       allowDangerousLaunch: this.opts.allowDangerousLaunch === true,
+      allowGitWrite: this.opts.allowGitWrite === true,
+      ...(this.opts.gitWriteLogin ? { gitWriteLogin: this.opts.gitWriteLogin } : {}),
       inlineImages: this.opts.inlineImages !== false,
       tls: this.opts.tls !== undefined,
       token: this.token,
@@ -2593,6 +2641,10 @@ export class WebTerminalServer {
         // `SendUserFile` (outside the spawn cwd and uploads). Same grant, same
         // omit-when-off shape; the phone shows chips for those files only on true.
         ...(this.opts?.allowTranscript === true ? { turnSentFiles: true } : {}),
+        // Whether `/turns/image` also serves an image the pane's agent opened
+        // with `Read` outside the spawn cwd (its session scratch folder, a temp
+        // directory). Same grant, same omit-when-off shape.
+        ...(this.opts?.allowTranscript === true ? { turnReadImages: true } : {}),
         // Advertised only when BOTH grants the route needs are held, the same
         // way `agentSettings` is: a phone that reads this as "browsable" and
         // then meets a 403 on every listing is worse off than one that never
@@ -2625,6 +2677,9 @@ export class WebTerminalServer {
         // Phone Git v1 (contract item 5): OMITTED, not false, without the grant.
         ...(this.mayInput(principal) ? { gitProjects: true, gitChecks: true } : {}),
         ...(this.mayInput(principal) && this.phoneWorktreeService()?.available ? { gitWorktrees: true } : {}),
+        // Phone git write actions: OMITTED, not false, unless that action can
+        // run for this caller (see PhoneGitWriteRoutes.configKeys).
+        ...this.gitWriteRoutes.configKeys(principal),
         runHistory: this.opts?.allowTranscript === true && this.deps.runHistory !== undefined,
         // `GET /api/search`, and which of its scopes can answer. OMITTED, not
         // false, when none can — the shape a daemon predating the route serves.
@@ -2670,6 +2725,10 @@ export class WebTerminalServer {
         // Same meaning as `fleetSidebar`: supported here, present only while
         // a desktop new enough to compute it answers.
         ...(this.deps.desktop ? { moaDelegations: true } : {}),
+        // `/api/workspaces` can carry `fleetTickets` and `nextScheduleAt`,
+        // and `GET /api/fleet/tickets/<id>` answers (see fleetTickets.ts).
+        // Same meaning as `moaDelegations`.
+        ...(this.deps.desktop ? { fleetTickets: true } : {}),
         // Moa (the desktop's HQ main bot) is on and its HQ workspace exists.
         // OMITTED, not false, otherwise — Moa off, no HQ, no desktop attached,
         // or an older desktop or daemon: the phone reads all of them as "no Moa".
@@ -2790,6 +2849,12 @@ export class WebTerminalServer {
       if ((req.method === 'GET' || req.method === 'POST') && rest.endsWith('/accounts')) {
         return this.handleSessionAccounts(req,res,rest.slice(0,-'/accounts'.length),url,principal);
       }
+      // Before the `/git/pr` list and `/git` matches below: POST `…/git/pr` is pr.create.
+      const gitWrite = matchPhoneGitWriteRoute(req.method, rest);
+      if (gitWrite) {
+        void this.gitWriteRoutes.handle(req, res, gitWrite, url, principal).catch((err: unknown) => this.failRequest(res, err));
+        return;
+      }
       const phoneGitRead = req.method === 'GET' ? /^([^/]+)\/git\/(branches|checks)$/.exec(rest) : null;
       if (phoneGitRead) return this.handlePhoneGitRead(res, phoneGitRead[1], principal, phoneGitRead[2] as 'branches' | 'checks');
       const worktreeRoute = /^([^/]+)\/git\/worktree(?:\/([^/]+))?$/.exec(rest);
@@ -2877,6 +2942,11 @@ export class WebTerminalServer {
     }
     if ((req.method === 'GET' || req.method === 'POST') && p.startsWith('/api/desktop-workspaces/') && p.endsWith('/browser')) {
       void this.handleWorkspaceBrowser(req,res,p.slice('/api/desktop-workspaces/'.length,-'/browser'.length),url,principal);
+      return;
+    }
+    if (req.method === 'GET' && p.startsWith(FLEET_TICKET_ROUTE_PREFIX)) {
+      void fleetTicketDetailResponse(p.slice(FLEET_TICKET_ROUTE_PREFIX.length), { allowTranscript: this.opts?.allowTranscript === true, desktop: this.availableDesktop() })
+        .then(r => this.json(res,r.status,r.body,{'Cache-Control':'no-store'}));
       return;
     }
     if ((req.method === 'GET' && p === '/api/desktop-workspaces') || (req.method === 'POST' && p === '/api/workspaces')) return this.handlePhoneWorkspaces(req,res,url,principal);
@@ -3290,10 +3360,16 @@ export class WebTerminalServer {
   private async handleWorkspacesList(res: http.ServerResponse): Promise<void> {
     const sidebar = await this.desktopSidebar();
     const byId = new Map<string, { id: string; name: string; panes: RemotePaneSummary[] }>();
+    // Workspaces holding a brain pane, so the empty rows below never list one.
+    const brainWorkspaces = new Set<string>();
     for (const s of this.deps.sessionManager.listLiveSessions()) {
       // Same exclusion as /api/sessions: the orchestrator brain pane must be
       // neither listed nor allowed to synthesize a phantom workspace row.
-      if (isBrainPty({ id: s.id, env: s.env })) continue;
+      if (isBrainPty({ id: s.id, env: s.env })) {
+        const brainWs = s.env?.[ENV_KEYS.WORKSPACE_ID];
+        if (typeof brainWs === 'string' && brainWs) brainWorkspaces.add(brainWs);
+        continue;
+      }
       const id = s.env?.[ENV_KEYS.WORKSPACE_ID];
       if (typeof id !== 'string' || !id) continue; // no workspace id → unaddressable, omitted
       const entry = byId.get(id) ?? { id, name: '', panes: [] };
@@ -3388,15 +3464,29 @@ export class WebTerminalServer {
           }
         : { ...w, panes, ...hqRole(sidebar, w.id) };
     });
+    // Workspaces the desktop shows that have no live terminal: listed as
+    // `empty: true` rows with no panes (and no name or layout — the snapshot
+    // carries neither, and a name only arrives with a session's env), after
+    // the live ones. Moa's HQ is never one: its only pane is the brain, which
+    // must not synthesize a row, and neither does a fan-out task workspace
+    // (it nests under its owner), nor one the desktop still lists a pane for
+    // (a hidden brain pane, or one whose session is gone). No desktop
+    // (locked, occluded, headless), no empty rows: this list cannot know
+    // about them.
+    const paneWorkspaces = new Set(sidebar.panes.map((p) => p.workspaceId));
+    const empty = sidebar.workspaces
+      .filter((w) => !byId.has(w.id) && !brainWorkspaces.has(w.id) && !paneWorkspaces.has(w.id) && w.id !== sidebar.hqWorkspaceId && w.task === undefined)
+      .map((w) => ({ id: w.id, name: '', panes: [], empty: true as const, ...sidebarWorkspaceFields(w, undefined, undefined, undefined) }));
     // Only an id this reply lists, so the active workspace cannot name one the
     // phone is not allowed to see (a brain-only workspace, for one).
     const active = sidebar.activeWorkspaceId;
     return this.json(res, 200, {
-      workspaces: merged,
+      workspaces: [...merged, ...empty],
       ...(active && byId.has(active) ? { activeWorkspaceId: active } : {}),
       // Not limited to the listed rows: a finished job's workspace is often
       // closed by then, and its id names nothing the phone may not see.
       ...(sidebar.moaDelegations !== undefined ? { moaDelegations: sidebar.moaDelegations } : {}),
+      ...fleetTicketsFields(sidebar, this.opts?.allowTranscript === true),
     });
   }
 
@@ -4081,6 +4171,38 @@ export class WebTerminalServer {
       if (error instanceof SessionGitError) return this.json(res, error.status, { error: error.tag });
       return this.json(res, 500, { error: 'git-operation-failed' });
     }).finally(() => { this.phoneGitRequests -= 1; });
+  }
+
+  private gitWriteRoutesInstance: PhoneGitWriteRoutes | undefined;
+
+  /** Push, PR create and merge (phoneGitWriteRoutes.ts), reading this server's state at request time. */
+  private get gitWriteRoutes(): PhoneGitWriteRoutes {
+    return this.gitWriteRoutesInstance ??= new PhoneGitWriteRoutes({
+      ceiling: () => ({
+        allowGitWrite: this.server !== null && this.opts?.allowGitWrite === true,
+        ...(this.opts?.gitWriteLogin ? { login: this.opts.gitWriteLogin } : {}),
+      }),
+      mayInput: (p) => this.mayInput(p as WebPrincipal),
+      explicitInputGrant: (deviceId) => {
+        try { return this.deps.devices?.hasExplicitInputGrant?.(deviceId) === true; } catch { return false; }
+      },
+      refuseInput: (res, p, detail) => this.refuseInput(res, p as WebPrincipal, detail),
+      session: (p, id) => this.attachableSession(p as WebPrincipal, id)?.meta,
+      stillAuthorized: async (req, url, p, id) => {
+        const principal = p as WebPrincipal;
+        const fresh = await this.authenticate(req, url, false).catch(() => ({ ok: false as const }));
+        if (!fresh.ok || fresh.principal.kind !== principal.kind) return false;
+        if (principal.kind === 'device' && (fresh.principal.kind !== 'device' || fresh.principal.deviceId !== principal.deviceId)) return false;
+        if (!this.mayInput(fresh.principal)) return false;
+        if (fresh.principal.kind === 'device' && this.deps.devices?.hasExplicitInputGrant?.(fresh.principal.deviceId) !== true) return false;
+        return this.attachableSession(fresh.principal, id) !== undefined;
+      },
+      readJsonBody: (req, res, onBody, maxBytes) => this.readJsonBody(req, res, onBody, maxBytes),
+      json: (res, status, body) => this.json(res, status, body, { 'Cache-Control': 'no-store' }),
+      gate: () => this.deps.phoneGitWrite?.(),
+      git: () => (this.git ??= this.deps.git ?? createGitRunner()),
+      log: (level, msg) => this.deps.log(level, msg),
+    });
   }
 
   /** The worktree service, or undefined when it is not wired or could not be built. */
@@ -5839,8 +5961,8 @@ export class WebTerminalServer {
    * can move it with three bytes of terminal output and aim this route at the
    * whole home directory. A record with no `spawnCwd` leaves the uploads
    * directory as the only root; with neither there is nothing to serve.
-   * Outside the roots, the one path served is a file the pane's agent sent
-   * with `SendUserFile` — see `sentFileTarget`.
+   * Outside the roots, the paths served are a file the pane's agent sent with
+   * `SendUserFile`, or an image it opened with `Read` — see `sentFileTarget`.
    *
    * Everything a caller could use to map the disk answers 404 `image not
    * found` — outside the boundary, missing, a directory, unreadable. A 403 for
@@ -5877,6 +5999,12 @@ export class WebTerminalServer {
       });
       return;
     }
+    // Before ANY filesystem call: on Windows a lookup on a UNC or device path
+    // reaches the host it names (#1976). Same 404 as a missing file.
+    if (!isLocalClientPath(raw)) {
+      this.json(res, 404, { error: 'image not found' });
+      return;
+    }
 
     const roots = [managed.meta.spawnCwd, this.deps.uploadsDir].filter(
       (dir): dir is string => typeof dir === 'string' && dir.length > 0,
@@ -5910,9 +6038,12 @@ export class WebTerminalServer {
         break;
       }
     }
-    // Outside the roots, a file the pane's agent sent with SendUserFile is the
-    // one other path served. Unlisted, expired and missing all get the same 404.
-    const sent = real === null ? await this.sentFileTarget(sessionId, raw) : null;
+    // Outside the roots, a file the pane's agent sent with SendUserFile, or an
+    // image it opened with Read, is the other path served. Unlisted, expired
+    // and missing all get the same 404. Only a sent file is audited: an image
+    // the agent read is what the transcript grant already covers.
+    const sentByAgent = real === null ? await this.sentFileTarget(sessionId, raw, 'SendUserFile') : null;
+    const sent = sentByAgent ?? (real === null ? await this.sentFileTarget(sessionId, raw, 'Read') : null);
     if (sent) real = sent.real;
     if (real === null) {
       this.json(res, 404, { error: 'image not found' });
@@ -5986,7 +6117,7 @@ export class WebTerminalServer {
         this.json(res, 404, { error: 'image not found' });
         return;
       }
-      if (sent) this.auditSentFile(principal, sessionId, sent.name, stat.size);
+      if (sentByAgent) this.auditSentFile(principal, sessionId, sentByAgent.name, stat.size);
       res.writeHead(200, {
         'Content-Type': contentType,
         ...this.securityHeaders(),
@@ -6023,9 +6154,11 @@ export class WebTerminalServer {
    * it was rewired to call. Shipped phone builds depend on that route, and the
    * contract this one was written to (wmux-ios, 2026-09-20) asks in as many
    * words that it not be touched; refactoring it to reach a new abstraction is
-   * a change to it, whatever the diff says about behaviour. The one shared
-   * piece is the open itself, `openResolvedFile`: #1434 asked for both routes
-   * to change together, and two copies of that check could drift apart.
+   * a change to it, whatever the diff says about behaviour. The shared pieces
+   * are the open itself, `openResolvedFile`: #1434 asked for both routes to
+   * change together, and two copies of that check could drift apart; and the
+   * `isLocalClientPath` gate that runs before any filesystem call, for the same
+   * reason (#1976).
    *
    * Every piece of the boundary is load-bearing here for the reasons spelled
    * out on that handler: the roots are `meta.spawnCwd` ∪ `deps.uploadsDir` and
@@ -6072,6 +6205,10 @@ export class WebTerminalServer {
       });
       return;
     }
+    if (!isLocalClientPath(raw)) {
+      this.json(res, 404, { error: 'file not found' });
+      return;
+    }
 
     const roots = [managed.meta.spawnCwd, this.deps.uploadsDir].filter(
       (dir): dir is string => typeof dir === 'string' && dir.length > 0,
@@ -6098,8 +6235,9 @@ export class WebTerminalServer {
         break;
       }
     }
-    // The SendUserFile addition, exactly as on the image route.
-    const sent = real === null ? await this.sentFileTarget(sessionId, raw) : null;
+    // The SendUserFile addition, exactly as on the image route. (The Read
+    // addition is image-route only.)
+    const sent = real === null ? await this.sentFileTarget(sessionId, raw, 'SendUserFile') : null;
     if (sent) real = sent.real;
     if (real === null) {
       this.json(res, 404, { error: 'file not found' });
@@ -6227,12 +6365,15 @@ export class WebTerminalServer {
 
   /**
    * Where to open `raw` when the transcript bound to this pane says its agent
-   * sent that exact path to the user with `SendUserFile` (successfully, under
-   * 24 hours ago), with the call's time — or null.
+   * sent that exact path to the user with `SendUserFile` — or, for `tool:
+   * 'Read'`, opened that image with `Read` — successfully, under 24 hours ago,
+   * with the call's time; or null.
    *
    * The match is on `raw` as the request spelled it, byte for byte against the
-   * transcript's `input.files[]`; `sentFileParts` separately refuses `.`/`..`
-   * segments and doubled separators. Only the PARENT is resolved: the last
+   * transcript's `input.files[]` (or `input.file_path`); `sentFileParts`
+   * separately refuses `.`/`..` segments and doubled separators. A `Read`
+   * grant also matches macOS's `/tmp/` ↔ `/private/tmp/` respelling, as a
+   * string. Only the PARENT is resolved: the last
    * component is opened as named, so `openResolvedFile` refuses it when it is a
    * symlink and checks the handle is the regular file it looked up.
    *
@@ -6243,13 +6384,15 @@ export class WebTerminalServer {
   private async sentFileTarget(
     sessionId: string,
     raw: string,
+    tool: GrantTool,
   ): Promise<{ real: string; name: string; sentAt: number } | null> {
+    if (!isLocalClientPath(raw)) return null;
     const parts = sentFileParts(raw);
     if (!parts) return null;
     const projector = this.deps.projector?.() ?? null;
     const before = projector?.sentFileBinding(sessionId) ?? null;
     if (!projector || !before) return null;
-    const sentAt = await this.sentFiles.sentAt(before.transcriptPath, raw, this.now());
+    const sentAt = await this.sentFiles.grantedAt(before.transcriptPath, raw, this.now(), tool);
     if (sentAt === null) return null;
     const after = projector.sentFileBinding(sessionId);
     if (

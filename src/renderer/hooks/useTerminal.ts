@@ -10,6 +10,7 @@ import { isSafeGeometry } from '../../shared/terminalGeometry';
 import { isPrefixTrigger, resolveShortcut } from '../../shared/keymap';
 import { mentionKeyClaim } from '../utils/agentMention';
 import { currentShortcutBindings, defaultShortcutBindings, shortcutPressGuard } from '../utils/shortcutBindings';
+import { isPcRailAction, pcRailClaimsKey } from '../components/PcRail/pcRailModel';
 import { xtermWindowsBuildNumber } from '../../shared/conptyWindows';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { useStore } from '../stores';
@@ -25,6 +26,7 @@ import { claimFit } from '../utils/fitGuard';
 import { createFitScheduler } from '../utils/layoutTransitionGate';
 import { installAltClickTrackingGuard } from '../utils/altClickUnderMouseTracking';
 import { createMouseOwnedHint } from '../utils/mouseOwnedHint';
+import { installPlainDragSelect, mouseOwnedHintApplies } from '../utils/plainDragSelect';
 import { resizeOrderFor, runOrderedFit, type CancelOrderedFit } from '../utils/resizeOrder';
 import { createAutoSelectionCopy } from '../utils/autoSelectionCopy';
 import { createOsc52Handler } from '../utils/osc52Clipboard';
@@ -40,6 +42,7 @@ import { resolveMacLineDeleteByte } from '../terminal/macLineDeleteKey';
 import { isWslShell } from '../../shared/imagePaste';
 import { encodeEscape, isBareEscape } from '../terminal/escapeKeys';
 import { resolveCtrlLetterByte } from '../terminal/ctrlLetterKeys';
+import { UnpairedReleaseFilter, imeKeyLeaksUnderKitty, installKittyPromptReset, kittyCtrlLetter, kittyKeyboardForHost, resetXtermKitty, xtermEncodesKey, xtermKittyFlags, type KittyHost } from '../terminal/kittyKeyboard';
 import { isComposeChord, composeOwnerHost, TERMINAL_PTY_ATTR, COMPOSE_OWNER_ATTR } from '../terminal/composeChord';
 import { foldRemoteKeyboardState, INITIAL_REMOTE_KEYBOARD_STATE, type RemoteKeyboardState } from '../components/Remote/keyboardProtocol';
 import { attachImeAnchor } from '../terminal/imeAnchor';
@@ -59,6 +62,7 @@ import { formatModifiers, modifiersOf, sharedModifierPressTracker } from '../ter
 import { awaitParseBarrier } from '../terminal/parseBarrier';
 import { STALE_REPLAY_INPUT_MODE_RESETS, STALE_REPLAY_ALIVE_SHELL_RESETS, STALE_REPLAY_DISPLAY_RESETS, staleReplayResetLevel } from '../../shared/terminal/staleReplayModeReset';
 import { installShellPromptModeReset, shellPromptModeResetFor } from '../../shared/terminal/shellPromptModeReset';
+import { holdNewXtermReplies } from '../../shared/terminal/replyParity';
 import { paneForegroundProbe } from '../terminal/paneForegroundProbe';
 import { attachAltScreenWheel, PAGE_SCROLL_AGENTS } from '../terminal/altScreenWheel';
 import { RestingCursorGuard } from '../terminal/restingCursor';
@@ -1202,6 +1206,10 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       theme: xtermTheme,
       minimumContrastRatio,
       allowProposedApi: true,
+      // Kitty keyboard protocol: xterm answers `CSI ? u` and encodes keys for
+      // a pane that pushed flags. Desktop only, not on Windows (see
+      // kittyKeyboardForHost).
+      vtExtensions: { kittyKeyboard: kittyKeyboardForHost(window.electronAPI as unknown as KittyHost) },
       // #1437: when the foreground app enables mouse tracking (Claude Code
       // does around its input box), a plain drag goes to the app and nothing
       // gets selected. Off macOS, xterm forces a selection on Shift+drag; on
@@ -1235,8 +1243,8 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // before, so an unreadable version changes nothing rather than flipping
       // every install to the opposite branch.
       //
-      // #910: when the PTY is running against the bundled conpty.dll (Win10,
-      // decided by the SAME predicate the spawn sites use — see
+      // #910/#1932: when the PTY is running against the bundled conpty.dll
+      // (decided by the SAME predicate the spawn sites use — see
       // xtermWindowsBuildNumber), report a modern build: reflow behaviour
       // comes from OpenConsole, not the kernel, so 22621 is a capability
       // token here, not an OS claim.
@@ -1377,6 +1385,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // two sides ever measure differently, a restored snapshot paints
       // cell-shifted against the live screen.
       applyUnicodeWidthModel(terminal);
+      holdNewXtermReplies(terminal);
       terminal.open(container);
     }
     // Grok lives on the alt screen, where xterm has no scrollback and turns the
@@ -1444,6 +1453,14 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // short Option+click would reach xterm's click-to-move-cursor and type
     // arrow keys into the app. Keep that feature to shell prompts.
     const detachAltClickGuard = installAltClickTrackingGuard(container, terminal);
+    // #1947: a plain left-drag selects even while the app tracks the mouse
+    // (Codex enables ?1003 at startup); a plain click still reaches the app.
+    // Installed after the alt-click guard so the guard still sees every press,
+    // including the replayed Option+mousedown. The setting is read per press.
+    const detachPlainDragSelect = installPlainDragSelect(container, terminal, {
+      isEnabled: () => useStore.getState().plainDragSelectEnabled,
+      isMac,
+    });
 
     // Issue #167: keep the hidden IME textarea empty while idle. xterm only
     // clears it on blur, so IME-committed text accumulates there after it was
@@ -1968,6 +1985,12 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     const seedState = useStore.getState();
     const parkedKnownGone = seedState.agentAliveByPtyId[ptyId] === false
       || seedState.commandRunningByPtyId[ptyId] === false;
+    // The same park→adopt window can hide the agent's death edge from the
+    // prompt-mode guard (subscription below): re-ask on adopt when process
+    // truth already reads it dead. A no-op unless the guard declined a reset.
+    if (adopted && seedState.agentAliveByPtyId[ptyId] === false) {
+      shellPromptModeResetFor(terminal)?.processGone();
+    }
     const keyboardRef = { current: adopted && !parkedKnownGone
       ? parkedKeyboardByTerminal.get(terminal) ?? INITIAL_REMOTE_KEYBOARD_STATE
       : INITIAL_REMOTE_KEYBOARD_STATE };
@@ -2011,6 +2034,25 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         );
       }
     };
+    // Whether xterm encodes keys for this pane right now: the extension is on
+    // for this terminal (an adopted one keeps its own) and the pane's app has
+    // pushed kitty flags. Read per key from xterm itself (see xtermKittyFlags);
+    // the fold above (noteKeyboard) is the fallback if that ever moves.
+    const kittyEncoderOn = terminal.options.vtExtensions?.kittyKeyboard === true;
+    const kittyNegotiated = () => {
+      if (!kittyEncoderOn) return false;
+      const flags = xtermKittyFlags(terminal);
+      return flags === undefined ? keyboardRef.current.kitty : flags > 0;
+    };
+    if (kittyEncoderOn) installKittyPromptReset(terminal);
+    // A Ctrl+letter wmux resolves itself goes out in the form the pane asked
+    // for: kitty `CSI <letter>;5u` once it pushed flags, the C0 byte otherwise.
+    const ctrlLetterForPane = (byte: string) => (kittyNegotiated() ? kittyCtrlLetter(byte) : byte);
+    // Releases of keys whose press never reached xterm (see UnpairedReleaseFilter).
+    const unpairedReleases = new UnpairedReleaseFilter();
+    const clearUnpairedReleases = () => unpairedReleases.clear();
+    terminal.textarea?.addEventListener('blur', clearUnpairedReleases);
+
     // #1228 review (C1): the fold is liveness-scoped. When process-truth or
     // OSC 133 says the pane's foreground command is gone, any negotiation it
     // armed (?9001h / kitty push) is stale — the next app in the pane starts
@@ -2029,6 +2071,29 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       ) {
         keyboardRef.current = INITIAL_REMOTE_KEYBOARD_STATE;
         parkedKeyboardByTerminal.delete(terminal);
+        // xterm keeps the kitty flags a dead app pushed and never popped;
+        // drop them with it so the next app gets legacy keys again.
+        if (kittyEncoderOn) resetXtermKitty(terminal);
+      }
+      // The #1794 prompt-mode guard may have declined a mouse / focus reset
+      // because process truth read the agent alive at the prompt: on Windows
+      // when the CIM tree snapshot failed (low memory) and the agent tracker
+      // had not caught up yet, and on every WSL pane. Its death edge re-asks
+      // the probe. Only the agentAlive edge: it is the tracker's confirmed
+      // death of the watched pid (ProcessMonitor never reads "unknown" as
+      // dead), so it cannot fire while that process lives. The
+      // commandRunning edge is not used: the guard already reads OSC 133
+      // in-stream, and the store copy is a 15 s poll that can predate a TUI
+      // started since. A misattributed pick (a wrapper that exited while its
+      // TUI runs on) gains nothing from the edge: a foreground TUI holds the
+      // pane in the command phase, so the guard only keeps the hint for the
+      // next prompt, and the reset still needs the probe's `true`. On native
+      // Windows that is the tree walk, which still sees the TUI. Where the
+      // tracker is the only truth (POSIX, WSL, a failed CIM snapshot) it is
+      // the same single reading a prompt arriving after the edge already
+      // acts on, so the edge admits nothing the first ask would not.
+      if (gone(state.agentAliveByPtyId[ptyId], prev.agentAliveByPtyId[ptyId])) {
+        shellPromptModeResetFor(terminal)?.processGone();
       }
     });
 
@@ -2052,7 +2117,11 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // Clipboard + shortcut handling. The wrapper records, for the
     // dead-input watchdog only, whether each keydown was handed to xterm and,
     // if not, roughly why (#1950). It never changes the handler's answer.
+    // Ahead of it, on a kitty-negotiated pane, a keyup whose keydown never
+    // reached xterm's encoder is kept from xterm, so the app gets no release
+    // without a press.
     terminal.attachCustomKeyEventHandler((e) => {
+      if (e.type === 'keyup' && unpairedReleases.swallowsKeyup(e, kittyNegotiated())) return false;
       const pass = handleTerminalKey(e);
       if (e.type === 'keydown') {
         keyVerdict = {
@@ -2063,11 +2132,15 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
             prefixKeyCode: useStore.getState().prefixConfig.key,
           }),
         };
+        unpairedReleases.noteKeydown(e, pass);
       }
       return pass;
     });
     // Runs only from xterm's key events, after this effect has finished.
     const handleTerminalKey = (e: KeyboardEvent): boolean => {
+      // xtermjs/xterm.js#6112: under kitty, a key the IME consumes must not
+      // reach xterm's encoder (see imeKeyLeaksUnderKitty).
+      if (imeKeyLeaksUnderKitty(e, kittyNegotiated())) return false;
       if (e.type !== 'keydown') return true;
 
       // The IME's plain-key follow-up of a press already acted on (a
@@ -2106,7 +2179,13 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
           codexEndedAt: codexEndedAtRef.current,
         }),
       });
-      if (newlineByte !== null) {
+      // A pane that pushed kitty flags gets Shift+Enter from xterm's encoder.
+      // Ctrl+Enter / Ctrl+J keep wmux's LF: that is a newline wmux promises,
+      // not a key the app asked to receive encoded.
+      const shiftEnterToXterm = newlineByte !== null && e.shiftKey && !e.ctrlKey
+        && (e.key === 'Enter' || e.code === 'Enter' || e.code === 'NumpadEnter')
+        && xtermEncodesKey(e, kittyNegotiated());
+      if (newlineByte !== null && !shiftEnterToXterm) {
         e.preventDefault();
         // #1361: ordered behind an IME commit that xterm has queued but not
         // yet sent. With no IME in play this runs synchronously, exactly as
@@ -2127,7 +2206,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       //      Escape then does nothing for the rest of the turn (#1152).
       // `!isComposing` (inside isBareEscape) defers to the IME while a
       // candidate window is open, where Escape cancels the preedit.
-      if (isBareEscape(e)) {
+      if (isBareEscape(e) && !xtermEncodesKey(e, kittyNegotiated())) {
         const escapeByte = encodeEscape(keyboardRef.current);
         e.preventDefault();
         window.electronAPI.pty.write(ptyId, escapeByte);
@@ -2160,16 +2239,21 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         // #1227 — xterm encodes Ctrl+letter from keyCode (QWERTY position).
         // Write the logical control byte ourselves so a disabled Ctrl+T on
         // Dvorak still delivers 0x14 instead of whatever physical keyCode says.
+        // A pane that pushed kitty flags gets it from xterm's encoder instead.
+        if (xtermEncodesKey(e, kittyNegotiated())) return true;
         const releasedCtrl = resolveCtrlLetterByte(e);
         if (releasedCtrl) {
           e.preventDefault();
           shortcutPressGuard.noteActed(e);
-          window.electronAPI.pty.write(ptyId, releasedCtrl);
+          window.electronAPI.pty.write(ptyId, ctrlLetterForPane(releasedCtrl));
           noteUserKeystroke(releasedCtrl);
           return false;
         }
         return true;
       }
+      // No paired computer, or a custom keybinding on the chord: the PC rail
+      // does not take it, so the pane gets Shift+Alt+Arrow / Home.
+      if (isPcRailAction(shortcut) && !pcRailClaimsKey(useStore.getState(), e)) return true;
       // #1280 — the Rich Input chord bubbles from HERE, instead of merely
       // being preventDefault'd downstream: xterm's own encode path calls
       // stopPropagation (its `cancel()`), so otherwise the chord never reaches
@@ -2362,10 +2446,13 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // these from keyCode, which is the QWERTY position, so a Dvorak Ctrl+C
       // became Ctrl+I. Write the logical control byte ourselves. App shortcuts
       // and clipboard chords already returned above.
+      // A pane that pushed kitty flags gets these from xterm's encoder, which
+      // names the logical key too (`CSI 99;5u` for Ctrl+C on any layout).
+      if (xtermEncodesKey(e, kittyNegotiated())) return true;
       const ctrlByte = resolveCtrlLetterByte(e);
       if (ctrlByte) {
         e.preventDefault();
-        window.electronAPI.pty.write(ptyId, ctrlByte);
+        window.electronAPI.pty.write(ptyId, ctrlLetterForPane(ctrlByte));
         noteUserKeystroke(ctrlByte);
         return false;
       }
@@ -3030,7 +3117,9 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       isMouseOwned: () => {
         const mode = (terminal as unknown as { modes?: { mouseTrackingMode?: string } })
           .modes?.mouseTrackingMode ?? 'none';
-        return mode !== 'none';
+        // #1947: with plain-drag select on, a plain drag selects, so there is
+        // nothing to teach (and on macOS Shift+drag is the way to the app).
+        return mouseOwnedHintApplies(mode, useStore.getState().plainDragSelectEnabled);
       },
       show: showMouseOwnedHintToast,
     });
@@ -3111,6 +3200,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       if (pendingFitRaf !== null) cancelAnimationFrame(pendingFitRaf);
       if (isMac) { container.removeEventListener('paste', blockNativePaste, true); }
       detachAltClickGuard();
+      detachPlainDragSelect();
       detachAltScreenWheel();
       terminal.textarea?.removeEventListener('focus', onTextareaFocus);
       terminal.textarea?.removeEventListener('keydown', onWatchdogKeyDown);
@@ -3214,6 +3304,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         disposeTerminal();
       }
       unsubscribeKeyboardLiveness();
+      terminal.textarea?.removeEventListener('blur', clearUnpairedReleases);
       terminalRef.current = null;
       // #1256: clear the published instance too. On a ptyId re-run the next
       // effect publishes the new instance; on a true unmount React ignores

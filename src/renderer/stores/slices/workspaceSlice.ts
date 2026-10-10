@@ -22,6 +22,15 @@ import { decUnread } from './notificationSlice';
 import { mergeDeadPaneRecovery, type DeadPaneRecovery } from '../../../shared/ptyRecovery';
 import { stashedPaneLiveness } from '../../../shared/paneStash';
 import { resolveAttentionBlink, resolveAttentionBlinkFinished, resolveAttentionRemindMs } from '../../components/Sidebar/attentionBlink';
+import { restorePcRail } from './pcRailSlice';
+import { LOCAL_PC_ID, isShadowWorkspaceId } from '../../../shared/pcRail';
+import {
+  buildShadowWorkspace,
+  findRemoteSurface,
+  reconcileShadowWorkspace,
+  shadowBinding,
+  shadowsToEvict,
+} from '../shadowWorkspace';
 import { clampSidebarWidth, dropOwnerFoldKeys, movePinned, pinnedFirst, pruneTaskGroupExpanded, resolveSidebarSortMode, sortModeMigratedToAttention, unpinNestedTasks } from '../../utils/sidebarLayout';
 import {
   collectLeafIds,
@@ -32,6 +41,15 @@ import {
 
 /** Collect all leaf panes from a pane tree (canonical walk, aliased locally). */
 const collectLeafPanes = getLeafPanes;
+
+/** A leaf's working directory: its active terminal's cwd, else the first
+ *  terminal's that has one, else ''. */
+function leafCwd(leaf: PaneLeaf): string {
+  const isTerminal = (s: PaneLeaf['surfaces'][number]) => (s.surfaceType ?? 'terminal') === 'terminal' && !!s.cwd;
+  const active = leaf.surfaces.find((s) => s.id === leaf.activeSurfaceId);
+  if (active && isTerminal(active)) return active.cwd;
+  return leaf.surfaces.find(isTerminal)?.cwd ?? '';
+}
 
 /**
  * Cold-park (TASK-9) is safe ONLY for terminal-only workspaces. Unmounting a
@@ -250,6 +268,21 @@ export interface WorkspaceSlice {
   /** Destroy the snapshot forever. */
   deleteArchivedWorkspace: (archivedId: string) => void;
   setActiveWorkspace: (id: string) => void;
+  /** PC rail: when each shadow workspace was last active (memory only; LRU input). */
+  shadowUsedAt: Record<string, number>;
+  /** PC rail: per shadow, the host sessions it has shown (memory only), so a tab closed here is not re-added. */
+  shadowKnownSessions: Record<string, string[]>;
+  /**
+   * PC rail: open one workspace of a web-paired computer from its feed row.
+   * An open shadow is activated; otherwise one is built from the host's
+   * layout, activated, and the least recently used shadows past the limit
+   * are closed. Returns the shadow id, or null when the row cannot be shown.
+   */
+  openShadowWorkspace: (hostId: string, remoteWorkspaceId: string) => string | null;
+  /** PC rail: apply the host's current rows to its open shadows (membership, names, close). */
+  reconcileShadowWorkspaces: (hostId: string) => void;
+  /** PC rail: close a shadow. Its tabs only detach; nothing on the host is closed. */
+  closeShadowWorkspace: (id: string) => void;
   renameWorkspace: (id: string, name: string) => void;
   updateWorkspaceMetadata: (id: string, metadata: Partial<WorkspaceMetadata>) => void;
   /**
@@ -307,6 +340,15 @@ function isArchivedLayoutNode(node: unknown, depth: number): boolean {
     && n.children.every((c) => isArchivedLayoutNode(c, depth + 1));
 }
 
+/** The copy a shadow's placeholders use, for a host named `name`. */
+function shadowCopy(name: string) {
+  return {
+    browserNotShown: i18nT('pcRail.browserNotShown', { name }),
+    openElsewhere: (workspace: string) => i18nT('pcRail.openElsewhere', { workspace }),
+    terminal: 'Terminal',
+  };
+}
+
 export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', never]], [], WorkspaceSlice> = (set, get) => {
   const initial = createWorkspace('Workspace 1', 1);
   return {
@@ -315,6 +357,8 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
     archivedWorkspaces: [],
     phoneWorkspaceRequestIds: [],
     nextWorkspaceOrdinal: 2,
+    shadowUsedAt: {},
+    shadowKnownSessions: {},
     lastVisibleAt: {},
     parkedWorkspaceIds: {},
 
@@ -446,6 +490,8 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       const ws = get().workspaces.find((w: Workspace) => w.id === id);
       // Same protection as removeWorkspace: never archive the last workspace.
       if (!ws || get().workspaces.length <= 1) return;
+      // A shadow is another computer's workspace: there is nothing here to archive.
+      if (isShadowWorkspaceId(id)) return;
       // Moa's HQ is app-owned: it is never archived (the UI disables it too).
       if (isMoaHqWorkspace(get(), id)) return;
       const color = normalizeWorkspaceColor(ws.color);
@@ -455,6 +501,9 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
         ...(color ? { color } : {}),
         ...(ws.profile ? { profile: ws.profile } : {}),
         tree: extractLayout(ws.rootPane),
+        // extractLayout keeps only the shape (it also saves layout templates,
+        // which must not carry paths), so each leaf's directory travels here.
+        leafCwds: collectLeafPanes(ws.rootPane).map(leafCwd),
         archivedAt: Date.now(),
       };
       get().removeWorkspace(id);
@@ -488,6 +537,13 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
         ws.nextPaneOrdinal = assignPaneOrdinals(rootPane, 1);
         ws.rootPane = rootPane;
         ws.activePaneId = leaves[0]?.id ?? rootPane.id;
+        // Reopen each terminal where it was: the restored leaves are empty, and
+        // without a seed the funnel opens them in the startup directory (~).
+        // Same leaf order as the archive (both walk the tree depth-first).
+        leaves.forEach((leaf, i) => {
+          const cwd = archived.leafCwds?.[i];
+          if (typeof cwd === 'string' && cwd) state.projectPaneSeed[leaf.id] = { cwd };
+        });
         const color = normalizeWorkspaceColor(archived.color);
         if (color) ws.color = color;
         // Same sanitize policy every other profile-entry path runs
@@ -513,6 +569,8 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
     }),
 
     duplicateWorkspace: (id) => set((state: StoreState) => {
+      // A clone of a shadow would spawn local shells from another computer's layout.
+      if (isShadowWorkspaceId(id)) return;
       const idx = state.workspaces.findIndex((w: Workspace) => w.id === id);
       if (idx === -1) return;
       const src = state.workspaces[idx];
@@ -580,12 +638,15 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       // for it; main refuses workspace.close for it). It also does not count
       // toward the last-workspace guard: the operator must keep one of theirs.
       if (isMoaHqWorkspace(get(), id)) return;
+      // Shadows are another computer's workspaces: they never count as one of
+      // the operator's, and closing one is never refused by this guard.
+      const removingShadow = isShadowWorkspaceId(id);
       const visibleCount = (ws: readonly Workspace[]): number =>
-        ws.filter((w) => !isMoaHqWorkspace(get(), w.id)).length;
+        ws.filter((w) => !isMoaHqWorkspace(get(), w.id) && !isShadowWorkspaceId(w.id)).length;
       const willRemove =
-        visibleCount(get().workspaces) > 1 && get().workspaces.some((w: Workspace) => w.id === id);
+        (removingShadow || visibleCount(get().workspaces) > 1) && get().workspaces.some((w: Workspace) => w.id === id);
       set((state: StoreState) => {
-        if (visibleCount(state.workspaces) <= 1) return;
+        if (!removingShadow && visibleCount(state.workspaces) <= 1) return;
         const idx = state.workspaces.findIndex((w: Workspace) => w.id === id);
         if (idx === -1) return;
         const closedAt = new Date().toISOString();
@@ -682,16 +743,25 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
         // Promotion is an activation like any other: the helper un-parks the
         // promoted workspace and drops any remote mirror selection, so the user
         // actually lands on it instead of on a mirror that stayed on top.
-        activateLocalWorkspace(
-          state,
-          next ?? state.workspaces[Math.min(idx, state.workspaces.length - 1)].id,
-        );
+        // Never promote a shadow: closing a workspace must not land the user
+        // on another computer's. The last local one the PC rail remembers
+        // wins, then the nearest local one.
+        const remembered = state.pcRail?.lastWorkspaceByPc?.local;
+        const locals = state.workspaces.filter((w) => !isShadowWorkspaceId(w.id));
+        const nearest = locals.length > 0
+          ? (locals.find((w) => w.id === remembered)
+            ?? state.workspaces.slice(Math.min(idx, state.workspaces.length - 1)).find((w) => !isShadowWorkspaceId(w.id))
+            ?? locals[locals.length - 1]).id
+          : state.workspaces[Math.min(idx, state.workspaces.length - 1)].id;
+        activateLocalWorkspace(state, next && !isShadowWorkspaceId(next) ? next : nearest);
       }
       // D-teardown: removing a workspace (sidebar X, Ctrl+Shift+W, kill-pane)
       // unmounts the marked-region DOM the inspect overlay queries. setActiveWorkspace
       // already tears inspect down on a switch; mirror that here so killing/closing
       // the workspace while inspecting can't leave a stale overlay dangling.
       if (state.inspectModeActive) resetInspectState(state);
+      if (removingShadow && state.shadowUsedAt?.[id] !== undefined) delete state.shadowUsedAt[id];
+      if (removingShadow && state.shadowKnownSessions?.[id] !== undefined) delete state.shadowKnownSessions[id];
       });
       // Cross-process failure pointer (publishA2aTask), so the teardown is
       // visible beyond same-process queryTasks (review A8 P1). NOTE: this is a
@@ -708,7 +778,9 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       // Optional call: the minimal test store has no channels slice (in the
       // production store it always exists — same convention as the
       // paneNotificationRing guard).
-      if (willRemove) {
+      // A shadow never had channel members, principals, missions or fan-out
+      // state here, and its id must not reach the daemon as a workspace.
+      if (willRemove && !removingShadow) {
         void get().purgeMembershipDaemon?.({ workspaceId: id });
         void get().principalMarkStaleWorkspaceDaemon?.(id);
         // Missions are bound to the lifetime of their fan-out workspace: when
@@ -725,10 +797,13 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
         if (foldKeys.some((k) => k === id || k.endsWith(`:${id}`) || k.includes(`:${id}:`))) {
           set((s: StoreState) => { dropOwnerFoldKeys(s.sidebarTaskGroupExpanded, id); });
         }
-        // Glance board: a removed workspace keeps no pin or new-workspace hold.
-        if (get().sidebarPinnedIds?.includes(id) || get().sidebarNewAt?.[id] !== undefined) {
+        // Glance board: a removed workspace keeps no pin, bookmark or
+        // new-workspace hold.
+        if (get().sidebarPinnedIds?.includes(id) || get().sidebarBookmarkedIds?.includes(id)
+          || get().sidebarNewAt?.[id] !== undefined) {
           set((s: StoreState) => {
             s.sidebarPinnedIds = s.sidebarPinnedIds.filter((p) => p !== id);
+            s.sidebarBookmarkedIds = (s.sidebarBookmarkedIds ?? []).filter((b) => b !== id);
             delete s.sidebarNewAt[id];
           });
         }
@@ -742,6 +817,95 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
         // fan-out audit log still names it (#1481 — so its orphaned tasks can be
         // told apart from detached ones and closed), so it stays bounded.
       }
+    },
+
+    openShadowWorkspace: (hostId, remoteWorkspaceId) => {
+      const st = get();
+      const host = st.pcRailHosts?.find((h) => h.id === hostId);
+      const row = st.pcRailFeeds?.[hostId]?.workspaces.find((w) => w.id === remoteWorkspaceId);
+      if (!host || !row) return null;
+      // The local workspace to come back to when the shadow closes.
+      if (st.activeWorkspaceId && !isShadowWorkspaceId(st.activeWorkspaceId)) st.rememberPcWorkspace?.(LOCAL_PC_ID, st.activeWorkspaceId);
+      const open = st.workspaces.find((w) => {
+        const b = shadowBinding(w);
+        return !!b && b.hostId === hostId && b.remoteId === remoteWorkspaceId;
+      });
+      if (open) {
+        st.setActiveWorkspace(open.id);
+        return open.id;
+      }
+      const ws = buildShadowWorkspace(hostId, row, shadowCopy(host.label || hostId), (sessionId) => {
+        const hit = findRemoteSurface(st, hostId, sessionId);
+        return hit ? (st.workspaces.find((w) => w.id === hit.workspaceId)?.name ?? hit.workspaceId) : null;
+      });
+      if (!ws) return null;
+      set((state: StoreState) => {
+        if (state.workspaces.some((w) => w.id === ws.id)) return;
+        state.workspaces.push(ws);
+        if (state.shadowKnownSessions) state.shadowKnownSessions[ws.id] = row.panes.map((p) => p.sessionId);
+      });
+      get().setActiveWorkspace(ws.id);
+      const after = get();
+      const shadowIds = after.workspaces.filter((w) => isShadowWorkspaceId(w.id)).map((w) => w.id);
+      for (const id of shadowsToEvict(shadowIds, after.activeWorkspaceId, after.shadowUsedAt ?? {})) {
+        get().closeShadowWorkspace(id);
+      }
+      return ws.id;
+    },
+
+    reconcileShadowWorkspaces: (hostId) => {
+      const st = get();
+      const rows = st.pcRailFeeds?.[hostId]?.workspaces;
+      // No feed yet (or the host was unpaired): nothing to reconcile against
+      // until the roster drops it, and a missing feed never closes anything.
+      if (!rows) return;
+      const toClose: string[] = [];
+      const updates: { id: string; rootPane: Pane; activePaneId: string; name: string }[] = [];
+      const known: Record<string, string[]> = {};
+      const copy = shadowCopy(st.pcRailHosts?.find((h) => h.id === hostId)?.label || hostId);
+      // Sessions a shadow of this pass is about to show: the duplicate-attach
+      // guard must see them before the store does.
+      const claimed = new Map<string, string>();
+      for (const ws of st.workspaces) {
+        const b = shadowBinding(ws);
+        if (!b || b.hostId !== hostId) continue;
+        const row = rows.find((r) => r.id === b.remoteId) ?? null;
+        const elsewhere = (sessionId: string): string | null => {
+          const mine = claimed.get(sessionId);
+          if (mine !== undefined) return mine;
+          const hit = findRemoteSurface(st, hostId, sessionId);
+          if (hit) return st.workspaces.find((w) => w.id === hit.workspaceId)?.name ?? hit.workspaceId;
+          claimed.set(sessionId, ws.name);
+          return null;
+        };
+        const result = reconcileShadowWorkspace(ws, hostId, row, new Set(st.shadowKnownSessions?.[ws.id] ?? []), elsewhere, copy);
+        if (result.kind === 'close') toClose.push(ws.id);
+        else if (result.kind === 'update') updates.push({ id: ws.id, rootPane: result.rootPane, activePaneId: result.activePaneId, name: result.name });
+        // Every session the row lists is now shown, closed here, or just added.
+        const listed = row ? row.panes.map((p) => p.sessionId) : [];
+        const prev = st.shadowKnownSessions?.[ws.id] ?? [];
+        if (result.kind !== 'close' && (listed.length !== prev.length || listed.some((id, i) => id !== prev[i]))) known[ws.id] = listed;
+      }
+      if (updates.length > 0 || Object.keys(known).length > 0) {
+        set((state: StoreState) => {
+          if (state.shadowKnownSessions) Object.assign(state.shadowKnownSessions, known);
+          for (const u of updates) {
+            const ws = state.workspaces.find((w) => w.id === u.id);
+            if (!ws) continue;
+            if (ws.rootPane !== u.rootPane) ws.rootPane = u.rootPane;
+            ws.activePaneId = u.activePaneId;
+            if (ws.name !== u.name) ws.name = u.name;
+          }
+        });
+      }
+      for (const id of toClose) get().closeShadowWorkspace(id);
+    },
+
+    closeShadowWorkspace: (id) => {
+      if (!isShadowWorkspaceId(id)) return;
+      // Non-owned tabs only detach (their components unmount); removeWorkspace
+      // never issues REMOTE_SESSION_CLOSE, and no caller here disposes anything.
+      get().removeWorkspace(id);
     },
 
     setActiveWorkspace: (id) => set((state: StoreState) => {
@@ -760,6 +924,14 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
         if (state.lastVisibleAt[id] !== undefined) delete state.lastVisibleAt[id];
       }
       activateLocalWorkspace(state, id);
+      if (isShadowWorkspaceId(id)) {
+        if (state.shadowUsedAt) state.shadowUsedAt[id] = Date.now();
+      } else if (state.pcRail && state.pcRail.activePcId !== LOCAL_PC_ID) {
+        // PC rail: choosing one of this computer's workspaces (Ctrl+N, the
+        // palette, a notification, an agent) selects this computer too, so
+        // the centre shows it instead of keeping it active behind another's.
+        state.pcRail.activePcId = LOCAL_PC_ID;
+      }
       // D-teardown: a workspace switch invalidates any marked-region queries
       // the inspect overlay is holding, so exit inspect explicitly rather than
       // letting it dangle against a now-unmounted DOM (inspect is preserved as
@@ -862,11 +1034,24 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
     }),
 
     loadSession: (data: SessionData) => set((state: StoreState) => {
+      // PC rail: a shadow is a projection of another computer and is never
+      // restored, even from a hand-edited session file.
+      if (Array.isArray(data.workspaces) && data.workspaces.some((w) => isShadowWorkspaceId(w?.id))) {
+        const workspaces = data.workspaces.filter((w) => !isShadowWorkspaceId(w?.id));
+        data = {
+          ...data,
+          workspaces,
+          activeWorkspaceId: isShadowWorkspaceId(data.activeWorkspaceId) ? (workspaces[0]?.id ?? '') : data.activeWorkspaceId,
+        };
+      }
       state.phoneWorkspaceRequestIds = [...new Set([
         ...state.phoneWorkspaceRequestIds,
         ...(Array.isArray(data.phoneWorkspaceRequestIds) ? data.phoneWorkspaceRequestIds.filter(isPhoneWorkspaceId) : []),
         ...(Array.isArray(data.workspaces) ? data.workspaces.map(w => w.id).filter(isPhoneWorkspaceId) : []),
       ])].slice(0, PHONE_WORKSPACE_REQUEST_LIMIT);
+      // PC rail: optional `pcRail` field, parsed (and shadow ids refused) by the
+      // shared parser. Ahead of the empty-workspace return below.
+      if (data.pcRail !== undefined) restorePcRail(state, data.pcRail);
       // Site guides are restored ahead of the empty-workspace return below:
       // that return would otherwise skip the saved marker while the session
       // still counts as loaded, and the Chrome auto-enable would override a
@@ -1280,6 +1465,10 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       if (typeof data.titlebarClockVisible === 'boolean') {
         state.titlebarClockVisible = data.titlebarClockVisible;
       }
+      // Always-on memory/CPU chips — default OFF, same rule as the clock.
+      if (typeof data.titlebarVitalsAlwaysVisible === 'boolean') {
+        state.titlebarVitalsAlwaysVisible = data.titlebarVitalsAlwaysVisible;
+      }
       // Pane action cluster — default ON; only an explicit false hides it.
       if (typeof data.paneActionsVisible === 'boolean') {
         state.paneActionsVisible = data.paneActionsVisible;
@@ -1362,6 +1551,8 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       if (typeof data.coldParkEnabled === 'boolean') state.coldParkEnabled = data.coldParkEnabled;
       // #1641: default ON; only an explicit persisted false opts out.
       if (typeof data.inlineImagesEnabled === 'boolean') state.inlineImagesEnabled = data.inlineImagesEnabled;
+      // #1947: default ON; only an explicit persisted false opts out.
+      if (typeof data.plainDragSelectEnabled === 'boolean') state.plainDragSelectEnabled = data.plainDragSelectEnabled;
       if (typeof data.startupDirectory === 'string') state.startupDirectory = data.startupDirectory.trim();
       if (data.scrollbackLines != null) state.scrollbackLines = data.scrollbackLines;
       if (data.scrollbackRestoreEnabled != null) state.scrollbackRestoreEnabled = data.scrollbackRestoreEnabled;
@@ -1390,6 +1581,10 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
         const liveIds = new Set((data.workspaces ?? []).map((w) => w.id));
         state.sidebarPinnedIds = Array.isArray(data.sidebarPinnedIds)
           ? [...new Set(data.sidebarPinnedIds.filter((id): id is string => typeof id === 'string' && liveIds.has(id)))]
+          : [];
+        // Bookmarks: only ids of workspaces this session restores, once each.
+        state.sidebarBookmarkedIds = Array.isArray(data.sidebarBookmarkedIds)
+          ? [...new Set(data.sidebarBookmarkedIds.filter((id): id is string => typeof id === 'string' && liveIds.has(id)))]
           : [];
         // Pinned to top (2026-09-26): a pin used to hold a row's manual slot
         // in the Attention order. Sessions saved then keep their pins, and the

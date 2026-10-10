@@ -42,6 +42,12 @@ export const th = {
 
   // Pane stash (#977) — the pane leaves the layout, its session keeps running.
   'pane.rename': 'เปลี่ยนชื่อพาเนล',
+  'pane.renameError.whitespace': "ชื่อพาเนลต้องไม่มีช่องว่าง",
+  'pane.renameError.reservedChar': "ชื่อพาเนลต้องไม่มี # หรือ @",
+  'pane.renameError.leadingDigit': "ชื่อพาเนลต้องไม่ขึ้นต้นด้วยตัวเลข",
+  'pane.renameError.autoName': "ชื่ออย่าง w1-2 สงวนไว้สำหรับชื่อพาเนลอัตโนมัติ",
+  'pane.renameError.duplicate': "มีพาเนลอื่นใช้ชื่อนี้อยู่แล้ว",
+  'pane.renameError.failed': "ไม่สามารถเปลี่ยนชื่อพาเนลได้",
   'pane.stash': 'เก็บพาเนลไว้ก่อน',
   'pane.stashHint': 'นำออกจากเลย์เอาต์ — เซสชันยังทำงานต่อ',
   'pane.unstash': 'นำกลับมา',
@@ -511,4 +517,25 @@ export const th = {
   // ─── Workspace item: task worktree boundary warning ───
   'workspace.cwdDeparted': 'cwd ของพาเนลออกนอกขอบเขต worktree ของงาน: {cwd}',
   'workspace.departed': 'ออกไปแล้ว',
+  'settings.plainDragSelect': "ลากเพื่อเลือกข้อความ แม้แอปจะใช้เมาส์อยู่",
+  'settings.plainDragSelectDesc': "การลากตามปกติจะเลือกข้อความได้แม้ในแอปที่ใช้เมาส์ เช่น Codex ส่วนการคลิกยังส่งไปที่แอปเหมือนเดิม กด Shift (macOS) หรือ Alt (Windows, Linux) ค้างไว้ขณะลากเพื่อส่งการลากไปที่แอป",
+  'pcRail.notChecked': "ยังไม่ได้ตรวจ",
+  'pcRail.access.revokeHintUnknown': "วิธีเพิกถอน: ถ้าคอมพิวเตอร์นี้จับคู่ด้วยรหัส ให้นำออกที่อุปกรณ์ที่จับคู่บน {name} ถ้าเพิ่มด้วยลิงก์เว็บของ {name} จะตัดได้ด้วยลิงก์ใหม่ (wmux web --new-token) เท่านั้น",
+  'remote.scope.read': "อุปกรณ์ที่จับคู่สามารถอ่านและค้นหาเอาต์พุตของทุกพื้นที่ทำงานบนคอมพิวเตอร์นี้ได้ รวมถึงที่เปิดภายหลัง",
+  'remote.scope.viewOnly': "ดูอย่างเดียวจะบล็อกการพิมพ์ แต่ยังตอบพรอมต์บนหน้าจอที่ใช้ปุ่มเดียวได้",
+  'remote.scope.input': "พิมพ์ได้จะอนุญาตให้เปิดและปิดเซสชันและตอบการอนุมัติด้วย",
+  'remotePage.connect.pasteScope': "ถ้าคำเชิญแชร์พื้นที่ทำงาน คอมพิวเตอร์นี้จะอ่านและค้นหาทุกพื้นที่ทำงานบนพีซีเครื่องนั้นได้ รวมถึงที่เปิดภายหลัง ระหว่างที่จับคู่ wmux จะตรวจทุกไม่กี่วินาที เปิดการเชื่อมต่อไว้สำหรับการแจ้งเตือน และแสดงการแจ้งเตือนของเครื่องนั้น ปิดเสียงได้จากเมนูคอมพิวเตอร์ในหัวข้อแถบด้านข้าง",
+  'pcSwitcher.open': "สลับคอมพิวเตอร์",
+  'pcSwitcher.manage': "การตั้งค่า {name}",
+  'pcSwitcher.othersNeedYou': "{count} รายการรอคุณอยู่บนคอมพิวเตอร์เครื่องอื่น",
+  // Quit and Stop Sessions (main-process native confirm)
+  'quitAndStop.message': "ออกจาก wmux และหยุดเซสชันทั้งหมดหรือไม่",
+  'quitAndStop.detail': "กำลังทำงาน: เซสชันเอเจนต์ {agents} รายการ เทอร์มินัลทั้งหมด {sessions} รายการ ทั้งหมดจะถูกหยุด การออกตามปกติจะปล่อยให้ทำงานต่อในเบื้องหลัง",
+  'quitAndStop.detailUnknown': "wmux นับเซสชันที่กำลังทำงานไม่ได้ เทอร์มินัลและเซสชันเอเจนต์ทั้งหมดจะถูกหยุด การออกตามปกติจะปล่อยให้ทำงานต่อในเบื้องหลัง",
+  'quitAndStop.confirm': "ออกและหยุดเซสชัน",
+  'quitAndStop.cancel': "ยกเลิก",
+  'quitAndStop.stopFailedMessage': "wmux หยุดเซสชันไม่ได้",
+  'quitAndStop.stopFailedDetail': "เดมอนของ wmux ไม่หยุดทำงาน wmux จึงยังเปิดอยู่และเซสชันยังทำงานอยู่ ให้รัน wmux daemon stop ในเทอร์มินัล แล้วออกอีกครั้ง",
+  'quitAndStop.alreadyQuittingMessage': "wmux กำลังออกอยู่แล้ว",
+  'quitAndStop.alreadyQuittingDetail': "การออกครั้งนี้จะปล่อยให้เซสชันทำงานต่อในเบื้องหลัง หากต้องการหยุด ให้รัน wmux daemon stop ในเทอร์มินัล",
 } as const;

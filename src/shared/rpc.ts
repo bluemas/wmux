@@ -296,7 +296,9 @@ export interface RpcContext {
    * two is load-bearing:
    *   `undefined`  no token was presented. The caller never claimed; every
    *                lane behaves for it exactly as before.
-   *   `{ bound }`  a live claim. This IS the caller's workspace.
+   *   `{ bound }`  a live claim. This IS the caller's workspace — and, when
+   *                `ptyId` is set (a pane claim main minted from its own
+   *                process-tree walk), the caller's pane.
    *   `{ stale }`  a token was presented and did not resolve — revoked, or its
    *                workspace closed. A handler that scopes on this must REFUSE.
    *                Falling through to a lane that accepts a caller-named
@@ -307,7 +309,7 @@ export interface RpcContext {
    * Deliberately NOT flattened to `string | undefined`: that collapses `stale`
    * into `unclaimed` and makes the demotion the easy thing to write.
    */
-  workspaceClaim?: { kind: 'bound'; workspaceId: string } | { kind: 'stale' };
+  workspaceClaim?: { kind: 'bound'; workspaceId: string; ptyId?: string } | { kind: 'stale' };
   /**
    * The envelope's `callerPtyId`, copied verbatim by RpcRouter (trimmed, empty
    * dropped). Advisory — see `RpcRequest.callerPtyId`.
@@ -401,6 +403,8 @@ export type RpcMethod =
   | 'surface.focus'
   | 'surface.close'
   | 'pane.list'
+  // `#w1-2` / `#backend` → the pane's ids (MCP tools accept pane names).
+  | 'pane.resolveName'
   // The Fleet attention board (needs you / running / idle) as data.
   | 'fleet.triage'
   | 'pane.focus'
@@ -692,6 +696,7 @@ export const ALL_RPC_METHODS = [
   'surface.focus',
   'surface.close',
   'pane.list',
+  'pane.resolveName',
   'fleet.triage',
   'pane.focus',
   'pane.split',

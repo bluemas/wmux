@@ -42,6 +42,12 @@ export const it = {
 
   // Pane stash (#977) — the pane leaves the layout, its session keeps running.
   'pane.rename': 'Rinomina pannello',
+  'pane.renameError.whitespace': "I nomi dei pannelli non possono contenere spazi",
+  'pane.renameError.reservedChar': "I nomi dei pannelli non possono contenere # o @",
+  'pane.renameError.leadingDigit': "I nomi dei pannelli non possono iniziare con una cifra",
+  'pane.renameError.autoName': "I nomi come w1-2 sono riservati ai nomi automatici dei pannelli",
+  'pane.renameError.duplicate': "Un altro pannello usa già questo nome",
+  'pane.renameError.failed': "Impossibile rinominare il pannello",
   'pane.stash': 'Metti da parte il pannello',
   'pane.stashHint': 'Rimosso dal layout — la sessione resta in esecuzione',
   'pane.unstash': 'Riporta indietro',
@@ -516,4 +522,25 @@ export const it = {
   // ─── Elemento area di lavoro: avviso confine del worktree dell'attività ───
   'workspace.cwdDeparted': "Il cwd del pannello è uscito dal confine del worktree dell'attività: {cwd}",
   'workspace.departed': 'uscito',
+  'settings.plainDragSelect': "Seleziona il testo trascinando, anche se l'app usa il mouse",
+  'settings.plainDragSelectDesc': "Un semplice trascinamento seleziona il testo anche nelle app che usano il mouse, come Codex; un clic arriva comunque all'app. Tieni premuto Maiusc (macOS) o Alt (Windows, Linux) mentre trascini per inviare il trascinamento all'app.",
+  'pcRail.notChecked': "Non ancora controllato",
+  'pcRail.access.revokeHintUnknown': "Per revocare: se questo computer è stato associato con un codice, rimuovilo in Dispositivi associati su {name}. Se è stato aggiunto con il link web di {name}, solo un nuovo link (wmux web --new-token) lo scollega.",
+  'remote.scope.read': "Un dispositivo associato può leggere e cercare l'output di ogni workspace su questo computer, compresi quelli aperti in seguito.",
+  'remote.scope.viewOnly': "Solo visualizzazione blocca la digitazione, ma può ancora rispondere ai prompt sullo schermo che richiedono un solo tasto.",
+  'remote.scope.input': "Può digitare consente anche di aprire e chiudere sessioni e rispondere alle approvazioni.",
+  'remotePage.connect.pasteScope': "Se l'invito condivide i workspace, questo computer può leggere e cercare ogni workspace su quel PC, compresi quelli aperti in seguito. Finché sono associati, wmux lo controlla ogni pochi secondi, tiene aperta una connessione per i suoi avvisi e mostra le sue notifiche; silenziale dal menu dei computer nel titolo della barra laterale.",
+  'pcSwitcher.open': "Cambia computer",
+  'pcSwitcher.manage': "Impostazioni di {name}",
+  'pcSwitcher.othersNeedYou': "{count} ti aspettano su altri computer",
+  // Quit and Stop Sessions (main-process native confirm)
+  'quitAndStop.message': "Uscire da wmux e arrestare tutte le sessioni?",
+  'quitAndStop.detail': "Sessioni di agenti in esecuzione: {agents}. Terminali in tutto: {sessions}. Verranno arrestate tutte. L'uscita normale le lascia in esecuzione in background.",
+  'quitAndStop.detailUnknown': "wmux non è riuscito a contare le sessioni in esecuzione. Tutti i terminali e le sessioni di agenti verranno arrestati. L'uscita normale le lascia in esecuzione in background.",
+  'quitAndStop.confirm': "Esci e arresta le sessioni",
+  'quitAndStop.cancel': "Annulla",
+  'quitAndStop.stopFailedMessage': "wmux non è riuscito ad arrestare le sessioni.",
+  'quitAndStop.stopFailedDetail': "Il daemon di wmux non si è arrestato, quindi wmux resta aperto e le sessioni sono ancora in esecuzione. Esegui wmux daemon stop in un terminale, poi esci di nuovo.",
+  'quitAndStop.alreadyQuittingMessage': "wmux è già in chiusura.",
+  'quitAndStop.alreadyQuittingDetail': "Questa chiusura lascia le sessioni in esecuzione in background. Per arrestarle, esegui wmux daemon stop in un terminale.",
 } as const;

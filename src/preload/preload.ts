@@ -3,6 +3,7 @@ import type { ChatBridgeApi } from '../shared/transcript/turnEvents';
 import { CHATV2_IPC, type ChatV2BridgeApi, type ChatV2EventsPush, type ChatV2ResyncPush } from '../shared/chatv2/ipc';
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import { IPC } from '../shared/constants';
+import type { PaneLabelRejection } from '../shared/paneLabelRules';
 import { CHROME_PANE_IPC, type ChromePaneBindings } from '../shared/chromePaneBinding';
 import type {
   AgySensorInstallResult,
@@ -91,6 +92,15 @@ import type {
   WebTerminalInfo,
   WebDiagnosis,
 } from '../shared/web';
+import { PC_RAIL_IPC } from '../shared/pcRail';
+import type {
+  PcRailApprovalsRequest,
+  PcRailApprovalsResult,
+  PcRailAttentionEvent,
+  PcRailMutesRequest,
+  PcRailStreamEvent,
+} from '../shared/pcRail';
+import type { PcRailFeedEvent } from '../main/remote/pcRailWire';
 import type { PairFailureReason, RemoteAttachmentDescriptor, RemoteErrorReason, RemoteHostPublic, RemoteHostStatus, RemoteWorkspaceSummary } from '../shared/remoteHosts';
 
 /** Mirrors {@link McpStatusPayload} in src/main/ipc/handlers/mcp.handler.ts. */
@@ -535,8 +545,11 @@ const electronAPI = {
       ipcRenderer.invoke(IPC.METADATA_SNAPSHOT) as Promise<Array<{ paneId: string; label: string; role: string }>>,
     // P2 GUI pane rename. Routes through MetadataStore (the sole label authority)
     // so the change persists + relays back to every renderer via METADATA_UPDATE.
+    // A label that breaks the pane label policy resolves { ok: false, code }.
     setLabel: (paneId: string, workspaceId: string, label: string) =>
-      ipcRenderer.invoke(IPC.METADATA_SET, paneId, workspaceId, label) as Promise<{ ok: boolean }>,
+      ipcRenderer.invoke(IPC.METADATA_SET, paneId, workspaceId, label) as Promise<
+        { ok: true } | { ok: false; code: PaneLabelRejection; error: string }
+      >,
     // Fleet dropdown → set a pane's operator-assigned orchestrator role. Routes
     // through MetadataStore (custom deep-merge) so it persists + relays back via
     // METADATA_UPDATE.paneRole. '' clears the assignment (unassigned sentinel).
@@ -1033,6 +1046,14 @@ const electronAPI = {
       set: (enabled: boolean) =>
         ipcRenderer.invoke(IPC.DECK_LEDGER_GATE_SET, { enabled }) as Promise<{ enabled: boolean }>,
     },
+    // `deck.fleetFastPath` — answer short read-only Fleet questions from the
+    // local Fleet board instead of a Moa turn. Persisted in main, default off.
+    fleetFastPath: {
+      get: () =>
+        ipcRenderer.invoke(IPC.DECK_FLEET_FAST_PATH_GET) as Promise<{ enabled: boolean }>,
+      set: (enabled: boolean) =>
+        ipcRenderer.invoke(IPC.DECK_FLEET_FAST_PATH_SET, { enabled }) as Promise<{ enabled: boolean }>,
+    },
     // The Deck status panel's ledger read + its "re-read now" ping. The push
     // carries only the owner workspace: `summary` is the single projection.
     ledger: {
@@ -1339,6 +1360,15 @@ const electronAPI = {
       ipcRenderer.invoke(IPC.GITHUB_ISSUE_DETAIL, repoPath, number, updatedAt) as Promise<
         import('../shared/issueSurface').IssueDetailResult
       >,
+    // The signed-in gh login (lowercased) and the viewer's role on the repo
+    // with the login it was read under; null when unknown. force re-reads both.
+    viewerLogin: (repoPath: string, force?: boolean) =>
+      ipcRenderer.invoke(IPC.GITHUB_VIEWER_LOGIN, repoPath, force === true) as Promise<{ login: string | null }>,
+    repoPermission: (repoPath: string, force?: boolean) =>
+      ipcRenderer.invoke(IPC.GITHUB_REPO_PERMISSION, repoPath, force === true) as Promise<{
+        permission: import('../shared/issueSurface').RepoPermission | null;
+        login: string | null;
+      }>,
     // PR review and CI: reads, and writes tied to the head the person saw
     // (main re-reads it right before writing and refuses if it moved).
     prChecks: (repoPath: string, prUrl: string, force?: boolean) =>
@@ -1457,6 +1487,11 @@ const electronAPI = {
     summary: (worktreePath: string, knownStateKey?: string) =>
       ipcRenderer.invoke(IPC.DIFF_SUMMARY, worktreePath, knownStateKey ?? '') as Promise<
         import('../shared/diffParse').DiffSummaryResult | import('../shared/diffParse').DiffReadError
+      >,
+    // Git page Worktrees — the count of paths with uncommitted changes (git status only).
+    status: (worktreePath: string) =>
+      ipcRenderer.invoke(IPC.DIFF_STATUS, worktreePath) as Promise<
+        import('../shared/diffParse').DiffStatusResult | import('../shared/diffParse').DiffReadError
       >,
     // 워크스페이스 diff — 임의 cwd를 자기 worktree toplevel로 정규화(비-git이면 ok:false).
     resolveRepo: (cwd: string) =>
@@ -2227,6 +2262,42 @@ document.addEventListener('DOMContentLoaded', () => {
     return () => { ipcRenderer.removeListener(IPC.REMOTE_POLL_TICK, listener); };
   },
 };
+
+// PC rail — the computer column's feeds (main polls every web-paired host and
+// holds one attention stream per host while at least one subscribe is live).
+// `subscribe` returns its own release, so one mount balances one count.
+export interface PcRailBridge {
+  subscribe(): () => void;
+  onFeed(callback: (e: PcRailFeedEvent) => void): () => void;
+  onAttention(callback: (e: PcRailAttentionEvent) => void): () => void;
+  onStream(callback: (e: PcRailStreamEvent) => void): () => void;
+  approvalsList(request: PcRailApprovalsRequest): Promise<PcRailApprovalsResult>;
+  setMutes(request: PcRailMutesRequest): Promise<void>;
+}
+
+function onPcRailPush<T>(channel: string, callback: (payload: T) => void): () => void {
+  const listener = (_event: unknown, payload: T) => callback(payload);
+  ipcRenderer.on(channel, listener);
+  return () => { ipcRenderer.removeListener(channel, listener); };
+}
+
+const pcRailBridge: PcRailBridge = {
+  subscribe: () => {
+    ipcRenderer.send(PC_RAIL_IPC.SUBSCRIBE);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      ipcRenderer.send(PC_RAIL_IPC.UNSUBSCRIBE);
+    };
+  },
+  onFeed: (callback) => onPcRailPush(PC_RAIL_IPC.FEED_EVENT, callback),
+  onAttention: (callback) => onPcRailPush(PC_RAIL_IPC.ATTENTION_EVENT, callback),
+  onStream: (callback) => onPcRailPush(PC_RAIL_IPC.STREAM_EVENT, callback),
+  approvalsList: (request) => ipcRenderer.invoke(PC_RAIL_IPC.APPROVALS_LIST, request) as Promise<PcRailApprovalsResult>,
+  setMutes: (request) => ipcRenderer.invoke(PC_RAIL_IPC.MUTES_SET, request) as Promise<void>,
+};
+(electronAPI as Record<string, unknown>).pcRail = pcRailBridge;
 
 contextBridge.exposeInMainWorld('electronAPI', electronAPI);
 

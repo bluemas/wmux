@@ -42,6 +42,12 @@ export const da = {
 
   // Pane stash (#977) — the pane leaves the layout, its session keeps running.
   'pane.rename': 'Omdøb panel',
+  'pane.renameError.whitespace': "Panelnavne må ikke indeholde mellemrum",
+  'pane.renameError.reservedChar': "Panelnavne må ikke indeholde # eller @",
+  'pane.renameError.leadingDigit': "Panelnavne må ikke starte med et ciffer",
+  'pane.renameError.autoName': "Navne som w1-2 er reserveret til automatiske panelnavne",
+  'pane.renameError.duplicate': "Et andet panel bruger allerede dette navn",
+  'pane.renameError.failed': "Panelet kunne ikke omdøbes",
   'pane.stash': 'Læg panelet til side',
   'pane.stashHint': 'Fjernes fra layoutet — sessionen kører videre',
   'pane.unstash': 'Hent tilbage',
@@ -515,4 +521,25 @@ export const da = {
   // ─── Workspace item: task worktree boundary warning ───
   'workspace.cwdDeparted': 'Panelets cwd forlod opgavens worktree-grænse: {cwd}',
   'workspace.departed': 'forladt',
+  'settings.plainDragSelect': "Markér tekst ved at trække, også når appen bruger musen",
+  'settings.plainDragSelectDesc': "Et almindeligt træk markerer tekst, også i apps der bruger musen, som Codex; et klik går stadig til appen. Hold Shift (macOS) eller Alt (Windows, Linux) nede, mens du trækker, for at sende trækket til appen.",
+  'pcRail.notChecked': "Ikke tjekket endnu",
+  'pcRail.access.revokeHintUnknown': "Sådan tilbagekalder du: Hvis denne computer blev parret med en kode, så fjern den under Parrede enheder på {name}. Hvis den blev tilføjet med {name}s weblink, er det kun et nyt link (wmux web --new-token), der afbryder den.",
+  'remote.scope.read': "En parret enhed kan læse og søge i outputtet fra alle arbejdsområder på denne computer, også dem der åbnes senere.",
+  'remote.scope.viewOnly': "Kun visning blokerer indtastning, men kan stadig besvare prompter på skærmen, der kræver én tast.",
+  'remote.scope.input': "Kan skrive lader den også åbne og lukke sessioner og besvare godkendelser.",
+  'remotePage.connect.pasteScope': "Hvis invitationen deler arbejdsområder, kan denne computer læse og søge i alle arbejdsområder på den pc, også dem der åbnes senere. Mens de er parret, tjekker wmux den med få sekunders mellemrum, holder en forbindelse åben til dens advarsler og viser dens notifikationer; slå dem fra i computermenuen i sidepanelets titel.",
+  'pcSwitcher.open': "Skift computer",
+  'pcSwitcher.manage': "Indstillinger for {name}",
+  'pcSwitcher.othersNeedYou': "{count} venter på dig på andre computere",
+  // Quit and Stop Sessions (main-process native confirm)
+  'quitAndStop.message': "Afslut wmux og stop alle sessioner?",
+  'quitAndStop.detail': "Kørende agentsessioner: {agents}. Terminaler i alt: {sessions}. De bliver alle stoppet. Almindelig Afslut lader dem køre videre i baggrunden.",
+  'quitAndStop.detailUnknown': "wmux kunne ikke tælle de kørende sessioner. Alle terminaler og agentsessioner bliver stoppet. Almindelig Afslut lader dem køre videre i baggrunden.",
+  'quitAndStop.confirm': "Afslut og stop sessioner",
+  'quitAndStop.cancel': "Annuller",
+  'quitAndStop.stopFailedMessage': "wmux kunne ikke stoppe sessionerne.",
+  'quitAndStop.stopFailedDetail': "wmux-dæmonen stoppede ikke, så wmux forbliver åben, og dine sessioner kører stadig. Kør wmux daemon stop i en terminal, og afslut igen.",
+  'quitAndStop.alreadyQuittingMessage': "wmux er allerede ved at afslutte.",
+  'quitAndStop.alreadyQuittingDetail': "Denne afslutning lader dine sessioner køre videre i baggrunden. Kør wmux daemon stop i en terminal for at stoppe dem.",
 } as const;

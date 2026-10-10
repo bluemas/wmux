@@ -12,6 +12,7 @@ import { WorkspaceCenter } from './WorkspaceCenter';
 import { EmptyLeafFunnel } from './EmptyLeafFunnel';
 import { selectProjectCwdSignature } from '../../stores/selectors/appLayout';
 import { selectInboxOwnsApprovals } from '../../stores/selectors/approvalInbox';
+import { selectPcRailPersisted } from '../../stores/selectors/pcRail';
 import { shouldShowInstallError, shouldReannounceAfterError, isSmartAppControlHold, truncateReason } from './updateNoticePolicy';
 import { isInstallBlockedByWindowsReason } from '../../../shared/installAbortReasons';
 import { hooksLaunchCheck, nextFirstBootSurface } from './firstBootSequence';
@@ -58,6 +59,7 @@ import { useTerminalCopyShortcut } from '../../hooks/useTerminalCopyShortcut';
 import { useNotificationListener } from '../../hooks/useNotificationListener';
 import { useRpcBridge } from '../../hooks/useRpcBridge';
 import { useA2aLinkRequestToast, useA2aRemoteSnapshot } from '../../hooks/useA2aRemoteSnapshot';
+import { useA2aRemoteBridge } from '../../hooks/useA2aRemoteBridge';
 import { useCloseTabOnShellExit } from '../../hooks/useCloseTabOnShellExit';
 import AgentMentionPicker from '../Palette/AgentMentionPicker';
 import HandoffPopover from '../Git/HandoffPopover';
@@ -71,6 +73,10 @@ import { useUsageLimitBridge } from '../../hooks/useUsageLimitBridge';
 import { useWorkspaceSettleBridge } from '../../hooks/useWorkspaceSettleBridge';
 import { useRemoteInboxBridge } from '../../hooks/useRemoteInboxBridge';
 import { useRemoteAttachmentsLifecycle } from '../../hooks/useRemoteAttachmentsLifecycle';
+import PcRailFeeds from '../PcRail/PcRailFeeds';
+import ShadowWorkspaceSync from '../Remote/ShadowWorkspaceSync';
+import { isShadowWorkspaceId } from '../../../shared/pcRail';
+import { withoutShadowWorkspaces } from '../../stores/shadowWorkspace';
 import { useDeckStream } from '../../hooks/useDeckStream';
 import { useChannelsEventSubscription } from '../../hooks/useChannelsEventSubscription';
 import { useChannelsHydration } from '../../hooks/useChannelsHydration';
@@ -228,6 +234,8 @@ function dumpScrollbackBuffersSync(): Map<string, boolean> {
   const dumped = new Map<string, boolean>();
   const state = useStore.getState();
   for (const ws of state.workspaces) {
+    // PC rail: a shadow shows another computer's sessions; nothing to dump.
+    if (isShadowWorkspaceId(ws.id)) continue;
     // rootPane only, deliberately (#977): a stashed pane's terminal is
     // unmounted, so it has no entry in terminalRegistry to serialize — and
     // stashing requires a daemon connection, which means this whole function
@@ -426,6 +434,7 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
     paneActionsVisible: state.paneActionsVisible,
     chatViewEnabled: state.chatViewEnabled,
     titlebarClockVisible: state.titlebarClockVisible,
+    titlebarVitalsAlwaysVisible: state.titlebarVitalsAlwaysVisible,
     paneNewTerminalButton: state.paneNewTerminalButton,
     splitInheritsCwd: state.splitInheritsCwd,
     closeTabOnShellExit: state.closeTabOnShellExit,
@@ -433,6 +442,7 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
     hiddenPaneRetentionEnabled: state.hiddenPaneRetentionEnabled,
     coldParkEnabled: state.coldParkEnabled,
     inlineImagesEnabled: state.inlineImagesEnabled,
+    plainDragSelectEnabled: state.plainDragSelectEnabled,
     browserLightweightMode: state.browserLightweightMode,
     browserDiscardHidden: state.browserDiscardHidden,
     siteMemoryEnabled: state.siteMemoryEnabled,
@@ -451,6 +461,7 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
     sidebarSortMode: state.sidebarSortMode,
     sidebarSortModeChosen: state.sidebarSortModeChosen,
     sidebarPinnedIds: state.sidebarPinnedIds,
+    sidebarBookmarkedIds: state.sidebarBookmarkedIds,
     sidebarWidth: state.sidebarWidth,
     sidebarTaskGroupExpanded: state.sidebarTaskGroupExpanded,
     // A dismissed question must stay dismissed across a restart: the PTY
@@ -471,6 +482,7 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
     shortcutOverrides: state.shortcutOverrides,
     autoUpdateEnabled: state.autoUpdateEnabled,
     customThemeColors: state.customThemeColors ?? undefined,
+    pcRail: selectPcRailPersisted(state),
     onboardingCompleted: state.onboardingCompleted,
     // T8a: persist first-run wizard + cheat sheet flags alongside onboardingCompleted.
     // workspaceSlice.loadSession (T5) reads these back, defaulting to false.
@@ -909,6 +921,9 @@ export default function AppLayout() {
   // Cross-host A2A: the pane tree for exposure and gone-pane link breaks.
   useA2aRemoteSnapshot();
   useA2aLinkRequestToast(t);
+  // The other PCs' links, connections and held work: the one subscription
+  // behind the Remote page and its rail badge.
+  useA2aRemoteBridge();
   // `exit` in a shell closes its tab (clean exit only).
   useCloseTabOnShellExit();
   // Keep the main-process WorkspaceMirror warm: push the workspace tree +
@@ -1952,7 +1967,7 @@ export default function AppLayout() {
   useEffect(() => {
     const saveSession = () => {
       const dumped = dumpScrollbackBuffersSync();
-      const data = buildSessionData(dumped);
+      const data = withoutShadowWorkspaces(buildSessionData(dumped), useStore.getState());
       window.electronAPI.session.save(data);
     };
 
@@ -2002,7 +2017,7 @@ export default function AppLayout() {
       // saved session — next startup would load garbage state.
       if (useStore.getState().paneGate !== 'ready') return;
       const dumped = dumpScrollbackBuffersSync();
-      const data = buildSessionData(dumped);
+      const data = withoutShadowWorkspaces(buildSessionData(dumped), useStore.getState());
       window.electronAPI.session.saveAsync(data);
     }, 5_000);
     return () => { clearInterval(interval); };
@@ -2082,6 +2097,14 @@ export default function AppLayout() {
           stays when the sidebar collapses (MiniSidebar `rail`); the sheet holds
           the sidebar, the panes and the dock. */}
       <div className={`wmux-frame-row flex flex-1 min-h-0 ${sidebarPosition === 'right' ? 'flex-row-reverse' : ''}`}>
+      <ErrorBoundary name="PcRail">
+        {/* Host roster, feeds and attention for the sidebar's PC switcher.
+            Mounted once the session is restored, so the saved mutes reach
+            main before any toast; the roster arriving is what shows the
+            switcher (none with 0 hosts). */}
+        {(sessionLoaded || sessionLoadFailed) && <PcRailFeeds />}
+        {(sessionLoaded || sessionLoadFailed) && <ShadowWorkspaceSync />}
+      </ErrorBoundary>
       <ErrorBoundary name="SidebarRail">
         <MiniSidebar rail collapsed={!sidebarVisible} />
       </ErrorBoundary>

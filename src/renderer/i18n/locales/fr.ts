@@ -42,6 +42,12 @@ export const fr = {
 
   // Pane stash (#977) — the pane leaves the layout, its session keeps running.
   'pane.rename': 'Renommer le panneau',
+  'pane.renameError.whitespace': "Un nom de panneau ne peut pas contenir d'espaces",
+  'pane.renameError.reservedChar': "Un nom de panneau ne peut pas contenir # ou @",
+  'pane.renameError.leadingDigit': "Un nom de panneau ne peut pas commencer par un chiffre",
+  'pane.renameError.autoName': "Les noms comme w1-2 sont réservés aux noms de panneau automatiques",
+  'pane.renameError.duplicate': "Un autre panneau utilise déjà ce nom",
+  'pane.renameError.failed': "Impossible de renommer le panneau",
   'pane.stash': 'Mettre le panneau de côté',
   'pane.stashHint': 'Retiré de la disposition — la session continue de tourner',
   'pane.unstash': 'Ramener',
@@ -516,4 +522,25 @@ export const fr = {
   // ─── Élément d'espace de travail : avertissement de limite du worktree de tâche ───
   'workspace.cwdDeparted': 'Le cwd du panneau est sorti de la limite du worktree de la tâche : {cwd}',
   'workspace.departed': 'sorti',
+  'settings.plainDragSelect': "Sélectionner le texte en faisant glisser, même si l'app utilise la souris",
+  'settings.plainDragSelectDesc': "Un simple glisser sélectionne le texte même dans les apps qui utilisent la souris, comme Codex ; un clic reste transmis à l'app. Maintenez Maj (macOS) ou Alt (Windows, Linux) pendant le glisser pour l'envoyer à l'app.",
+  'pcRail.notChecked': "Pas encore vérifié",
+  'pcRail.access.revokeHintUnknown': "Pour révoquer : si cet ordinateur a été appairé avec un code, retirez-le dans Appareils appairés sur {name}. S'il a été ajouté avec le lien web de {name}, seul un nouveau lien (wmux web --new-token) le coupe.",
+  'remote.scope.read': "Un appareil appairé peut lire et rechercher la sortie de chaque espace de travail de cet ordinateur, y compris ceux ouverts plus tard.",
+  'remote.scope.viewOnly': "Lecture seule empêche la saisie, mais peut encore répondre aux invites à l'écran qui attendent une seule touche.",
+  'remote.scope.input': "Peut saisir permet aussi d'ouvrir et de fermer des sessions et de répondre aux approbations.",
+  'remotePage.connect.pasteScope': "Si l'invitation partage des espaces de travail, cet ordinateur peut lire et rechercher chaque espace de travail de ce PC, y compris ceux ouverts plus tard. Tant qu'ils sont appairés, wmux le vérifie toutes les quelques secondes, garde une connexion ouverte pour ses alertes et affiche ses notifications ; coupez-les depuis le menu des ordinateurs dans le titre de la barre latérale.",
+  'pcSwitcher.open': "Changer d'ordinateur",
+  'pcSwitcher.manage': "Réglages de {name}",
+  'pcSwitcher.othersNeedYou': "{count} vous attendent sur d'autres ordinateurs",
+  // Quit and Stop Sessions (main-process native confirm)
+  'quitAndStop.message': "Quitter wmux et arrêter toutes les sessions ?",
+  'quitAndStop.detail': "Sessions d'agent en cours : {agents}. Terminaux au total : {sessions}. Toutes seront arrêtées. Quitter normalement les laisse tourner en arrière-plan.",
+  'quitAndStop.detailUnknown': "wmux n'a pas pu compter les sessions en cours. Tous les terminaux et sessions d'agent seront arrêtés. Quitter normalement les laisse tourner en arrière-plan.",
+  'quitAndStop.confirm': "Quitter et arrêter les sessions",
+  'quitAndStop.cancel': "Annuler",
+  'quitAndStop.stopFailedMessage': "wmux n’a pas pu arrêter les sessions.",
+  'quitAndStop.stopFailedDetail': "Le démon wmux ne s’est pas arrêté : wmux reste ouvert et vos sessions tournent toujours. Exécutez wmux daemon stop dans un terminal, puis quittez à nouveau.",
+  'quitAndStop.alreadyQuittingMessage': "wmux est déjà en train de quitter.",
+  'quitAndStop.alreadyQuittingDetail': "Cette fermeture laisse vos sessions tourner en arrière-plan. Pour les arrêter, exécutez wmux daemon stop dans un terminal.",
 } as const;

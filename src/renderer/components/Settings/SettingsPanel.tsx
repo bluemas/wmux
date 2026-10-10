@@ -1913,6 +1913,8 @@ function TabTerminal() {
   const setSplitInheritsCwd = useStore((s) => s.setSplitInheritsCwd);
   const closeTabOnShellExit = useStore((s) => s.closeTabOnShellExit);
   const setCloseTabOnShellExit = useStore((s) => s.setCloseTabOnShellExit);
+  const plainDragSelectEnabled = useStore((s) => s.plainDragSelectEnabled);
+  const setPlainDragSelectEnabled = useStore((s) => s.setPlainDragSelectEnabled);
   const imeResidueGuardEnabled = useStore((s) => s.imeResidueGuardEnabled);
   const setImeResidueGuardEnabled = useStore((s) => s.setImeResidueGuardEnabled);
   const hiddenPaneRetentionEnabled = useStore((s) => s.hiddenPaneRetentionEnabled);
@@ -2026,6 +2028,13 @@ function TabTerminal() {
         </SettingRow>
       </SettingsSection>
       <SettingsSection title={t('settings.sectionInput')}>
+        <SettingRow id="plaindragselect" label={t('settings.plainDragSelect')} description={t('settings.plainDragSelectDesc')}>
+          <Toggle
+            checked={plainDragSelectEnabled}
+            onChange={setPlainDragSelectEnabled}
+            label={t('settings.plainDragSelect')}
+          />
+        </SettingRow>
         <SettingRow id="ime" label={t('settings.imeResidueGuard')} description={t('settings.imeResidueGuardDesc')}>
           <Toggle
             checked={imeResidueGuardEnabled}
@@ -3601,6 +3610,8 @@ function TabAppearance() {
   const setChatViewEnabled = useStore((s) => s.setChatViewEnabled);
   const titlebarClockVisible = useStore((s) => s.titlebarClockVisible);
   const setTitlebarClockVisible = useStore((s) => s.setTitlebarClockVisible);
+  const titlebarVitalsAlwaysVisible = useStore((s) => s.titlebarVitalsAlwaysVisible);
+  const setTitlebarVitalsAlwaysVisible = useStore((s) => s.setTitlebarVitalsAlwaysVisible);
   const paneNewTerminalButton = useStore((s) => s.paneNewTerminalButton);
   const setPaneNewTerminalButton = useStore((s) => s.setPaneNewTerminalButton);
   const applyChromePreset = useStore((s) => s.applyChromePreset);
@@ -3699,6 +3710,15 @@ function TabAppearance() {
             checked={titlebarClockVisible}
             onChange={setTitlebarClockVisible}
             label={t('settings.titlebarClock')}
+          />
+        </SettingRow>
+        {/* Off by default for the same reason: memory and CPU otherwise appear
+            only when memory is worth interrupting for. */}
+        <SettingRow id="titlebarvitals" label={t('settings.titlebarVitals')} description={t('settings.titlebarVitalsDesc')}>
+          <Toggle
+            checked={titlebarVitalsAlwaysVisible}
+            onChange={setTitlebarVitalsAlwaysVisible}
+            label={t('settings.titlebarVitals')}
           />
         </SettingRow>
       </SettingsSection>

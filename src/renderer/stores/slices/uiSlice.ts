@@ -134,6 +134,7 @@ import {
   type TokenRole,
 } from '../../themes';
 import { sanitizeFontFamily } from '../../utils/terminalFont';
+import { isMoaHqWorkspace } from './moaSlice';
 import {
   DEFAULT_TERMINAL_CURSOR_STYLE,
   sanitizeTerminalCursorStyle,
@@ -405,6 +406,15 @@ export interface UISlice {
   setTitlebarClockVisible: (visible: boolean) => void;
 
   /**
+   * Keep the memory and CPU chips in the titlebar at every reading. Off by
+   * default: they then appear only when memory is worth interrupting for
+   * (StatusClock's shouldShowMemoryChip). An explicit opt-in for people who
+   * want the gauges on screen all the time.
+   */
+  titlebarVitalsAlwaysVisible: boolean;
+  setTitlebarVitalsAlwaysVisible: (visible: boolean) => void;
+
+  /**
    * EXPERIMENTAL, default OFF: a `+` on the pane's tab strip that adds a
    * SECOND terminal to that pane.
    *
@@ -459,6 +469,12 @@ export interface UISlice {
   // disposes the image addon on every terminal.
   inlineImagesEnabled: boolean;
   setInlineImagesEnabled: (enabled: boolean) => void;
+
+  // #1947: a plain left-drag selects text even while the foreground app
+  // tracks the mouse (default ON). Read at every mousedown, so a toggle
+  // applies to open panes immediately.
+  plainDragSelectEnabled: boolean;
+  setPlainDragSelectEnabled: (enabled: boolean) => void;
 
   // #517 browser lightweight mode (default OFF while dogfooding): CPU-throttle
   // embedded browser guests that are effectively invisible (hidden workspace /
@@ -609,6 +625,10 @@ export interface UISlice {
    *  `workspaces` (sidebarLayout.pinnedFirst), so the stored order is pinned-first. */
   sidebarPinnedIds: string[];
   toggleSidebarPin: (workspaceId: string) => void;
+  /** Bookmarked workspaces, in the order they were bookmarked. A bookmark is a
+   *  mark for the sidebar filter (Bookmarked only); it never moves a row. */
+  sidebarBookmarkedIds: string[];
+  toggleSidebarBookmark: (workspaceId: string) => void;
   /** Session-only: when a workspace was created, for the new-workspace hold. */
   sidebarNewAt: Record<string, number>;
   /**
@@ -1475,6 +1495,13 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
   }),
 
   // Off unless asked for — see the interface note.
+  titlebarVitalsAlwaysVisible: false,
+
+  setTitlebarVitalsAlwaysVisible: (visible) => set((state) => {
+    state.titlebarVitalsAlwaysVisible = visible;
+  }),
+
+  // Off unless asked for — see the interface note.
   paneNewTerminalButton: false,
 
   setPaneNewTerminalButton: (visible) => set((state) => {
@@ -1530,6 +1557,12 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
 
   setInlineImagesEnabled: (enabled) => set((state) => {
     state.inlineImagesEnabled = enabled;
+  }),
+
+  plainDragSelectEnabled: true,
+
+  setPlainDragSelectEnabled: (enabled) => set((state) => {
+    state.plainDragSelectEnabled = enabled;
   }),
 
   setHiddenPaneRetentionEnabled: (enabled) => set((state) => {
@@ -1745,6 +1778,16 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
     if (!r) return;
     state.workspaces = r.items;
     state.sidebarPinnedIds = r.pinnedIds;
+  }),
+  sidebarBookmarkedIds: [],
+  toggleSidebarBookmark: (workspaceId) => set((state) => {
+    if (state.sidebarBookmarkedIds.includes(workspaceId)) {
+      state.sidebarBookmarkedIds = state.sidebarBookmarkedIds.filter((id) => id !== workspaceId);
+      return;
+    }
+    // Only a live workspace can be bookmarked; Moa's HQ is never in the list.
+    if (!state.workspaces.some((w) => w.id === workspaceId) || isMoaHqWorkspace(state, workspaceId)) return;
+    state.sidebarBookmarkedIds = [...state.sidebarBookmarkedIds, workspaceId];
   }),
   sidebarNewAt: {},
   sidebarSeen: {},

@@ -42,6 +42,12 @@ export const ms = {
 
   // Pane stash (#977) — the pane leaves the layout, its session keeps running.
   'pane.rename': 'Namakan semula panel',
+  'pane.renameError.whitespace': "Nama panel tidak boleh mengandungi ruang",
+  'pane.renameError.reservedChar': "Nama panel tidak boleh mengandungi # atau @",
+  'pane.renameError.leadingDigit': "Nama panel tidak boleh bermula dengan digit",
+  'pane.renameError.autoName': "Nama seperti w1-2 dikhaskan untuk nama panel automatik",
+  'pane.renameError.duplicate': "Panel lain sudah menggunakan nama ini",
+  'pane.renameError.failed': "Tidak dapat menamakan semula panel",
   'pane.stash': 'Ketepikan panel',
   'pane.stashHint': 'Dikeluarkan dari susun atur — sesi terus berjalan',
   'pane.unstash': 'Bawa kembali',
@@ -517,4 +523,25 @@ export const ms = {
   // ─── Workspace item: task worktree boundary warning ───
   'workspace.cwdDeparted': 'cwd panel keluar dari sempadan worktree tugas: {cwd}',
   'workspace.departed': 'keluar',
+  'settings.plainDragSelect': "Pilih teks dengan menyeret, walaupun aplikasi menggunakan tetikus",
+  'settings.plainDragSelectDesc': "Seretan biasa memilih teks walaupun dalam aplikasi yang menggunakan tetikus, seperti Codex; klik tetap dihantar ke aplikasi. Tahan Shift (macOS) atau Alt (Windows, Linux) semasa menyeret untuk menghantar seretan ke aplikasi.",
+  'pcRail.notChecked': "Belum disemak",
+  'pcRail.access.revokeHintUnknown': "Untuk membatalkan: jika komputer ini dipasangkan dengan kod, buangnya di Peranti dipasangkan pada {name}. Jika ditambah dengan pautan web {name}, hanya pautan baharu (wmux web --new-token) yang memutuskannya.",
+  'remote.scope.read': "Peranti yang dipasangkan boleh membaca dan mencari output setiap ruang kerja di komputer ini, termasuk yang dibuka kemudian.",
+  'remote.scope.viewOnly': "Lihat sahaja menyekat menaip, tetapi masih boleh menjawab gesaan pada skrin yang memerlukan satu kekunci.",
+  'remote.scope.input': "Boleh menaip juga membenarkannya membuka dan menutup sesi serta menjawab kelulusan.",
+  'remotePage.connect.pasteScope': "Jika jemputan berkongsi ruang kerja, komputer ini boleh membaca dan mencari setiap ruang kerja di PC itu, termasuk yang dibuka kemudian. Semasa dipasangkan, wmux menyemaknya setiap beberapa saat, mengekalkan sambungan untuk amarannya dan memaparkan pemberitahuannya; senyapkan daripada menu komputer dalam tajuk bar sisi.",
+  'pcSwitcher.open': "Tukar komputer",
+  'pcSwitcher.manage': "Tetapan {name}",
+  'pcSwitcher.othersNeedYou': "{count} menunggu anda di komputer lain",
+  // Quit and Stop Sessions (main-process native confirm)
+  'quitAndStop.message': "Keluar daripada wmux dan hentikan semua sesi?",
+  'quitAndStop.detail': "Sedang berjalan: {agents} sesi ejen, jumlah {sessions} terminal. Semuanya akan dihentikan. Keluar biasa membiarkannya terus berjalan di latar belakang.",
+  'quitAndStop.detailUnknown': "wmux tidak dapat mengira sesi yang sedang berjalan. Semua terminal dan sesi ejen akan dihentikan. Keluar biasa membiarkannya terus berjalan di latar belakang.",
+  'quitAndStop.confirm': "Keluar dan Hentikan Sesi",
+  'quitAndStop.cancel': "Batal",
+  'quitAndStop.stopFailedMessage': "wmux tidak dapat menghentikan sesi.",
+  'quitAndStop.stopFailedDetail': "Daemon wmux tidak berhenti, jadi wmux kekal terbuka dan sesi anda masih berjalan. Jalankan wmux daemon stop dalam terminal, kemudian keluar semula.",
+  'quitAndStop.alreadyQuittingMessage': "wmux sedang keluar.",
+  'quitAndStop.alreadyQuittingDetail': "Keluar kali ini membiarkan sesi anda terus berjalan di latar belakang. Untuk menghentikannya, jalankan wmux daemon stop dalam terminal.",
 } as const;

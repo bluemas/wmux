@@ -443,6 +443,16 @@ describe('remote.handler — hostsPair', () => {
     expect(res).toEqual({ ok: false, reason: 'invalid-code', attemptsLeft: 3 });
   });
 
+  it.each([-5, 1.5, 1e300])('drops an attemptsLeft of %s rather than showing it as a count', async (attemptsLeft) => {
+    const store = fakeStore();
+    const fetchImpl = vi.fn(async () => jsonResponse({ error: 'invalid code', attemptsLeft }, false, 403));
+    registerRemoteHandlers({ store: store as never, attachments: fakeAttachments() as never, fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    const res = await getHandler(IPC.REMOTE_HOSTS_PAIR)({}, 'https://box:9600', 'WRONG');
+
+    expect(res).toEqual({ ok: false, reason: 'invalid-code', attemptsLeft: undefined });
+  });
+
   it('reports unreachable when the fetch itself throws', async () => {
     const store = fakeStore();
     const fetchImpl = vi.fn(async () => { throw new Error('ECONNREFUSED'); });
@@ -1578,5 +1588,70 @@ describe('remote.handler — hostsAdd names needs-HTTPS, never "could not reach"
     expect(res.error).toContain('needs HTTPS');
     expect(res.error).not.toContain('could not reach');
     expect(fetchImpl).not.toHaveBeenCalled();
+  });
+});
+
+describe('remote.handler — bounds on what a host sends', () => {
+  it('a remote toast never names a local pane or workspace, whatever ids the event carries', async () => {
+    const { toastManager } = await import('../../../notification/ToastManager');
+    const show = vi.spyOn(toastManager, 'show').mockImplementation(() => undefined);
+    const host: RemoteHost = { id: 'h1', label: 'office-mac', origin: 'https://box:9600', token: 't', addedAt: 0 };
+    let fire: ((label: string, n: unknown) => void) | undefined;
+    registerRemoteHandlers({
+      store: fakeStore([host]) as never,
+      attachments: fakeAttachments([{ key: 'h1:ws-1', hostId: 'h1', hostLabel: 'office-mac', workspaceId: 'ws-1', name: 'w' }]) as never,
+      fetchImpl: vi.fn() as unknown as typeof fetch,
+      attentionSubscriberFactory: ((_h: RemoteHost, onNotification: (label: string, n: unknown) => void) => {
+        fire = onNotification;
+        return { start: vi.fn(), stop: vi.fn() };
+      }) as never,
+    });
+    // A session id that collides with a local pty id is still only a remote id.
+    fire?.('office-mac', { sessionId: 'local-pty-1', title: 'Approval needed', body: 'x', type: 'warning', category: 'approval' });
+    expect(show).toHaveBeenCalledWith('office-mac · Approval needed', 'x', { ptyId: null, workspaceId: null });
+    show.mockRestore();
+  });
+
+  it('a host muted in the PC rail does not toast through the attach path', async () => {
+    const { toastManager } = await import('../../../notification/ToastManager');
+    const { registerPcRailHandlers } = await import('../pcRail.handler');
+    const { PC_RAIL_IPC } = await import('../../../../shared/pcRail');
+    const show = vi.spyOn(toastManager, 'show').mockImplementation(() => undefined);
+    const host: RemoteHost = { id: 'h1', label: 'office-mac', origin: 'https://box:9600', token: 't', addedAt: 0 };
+    let fire: ((label: string, n: unknown) => void) | undefined;
+    registerRemoteHandlers({
+      store: fakeStore([host]) as never,
+      attachments: fakeAttachments([{ key: 'h1:ws-1', hostId: 'h1', hostLabel: 'office-mac', workspaceId: 'ws-1', name: 'w' }]) as never,
+      fetchImpl: vi.fn() as unknown as typeof fetch,
+      attentionSubscriberFactory: ((_h: RemoteHost, onNotification: (label: string, n: unknown) => void) => {
+        fire = onNotification;
+        return { start: vi.fn(), stop: vi.fn() };
+      }) as never,
+    });
+    const disposePcRail = registerPcRailHandlers({ store: { list: () => [], get: () => null }, attachments: { list: () => [] } });
+    const n = { sessionId: 's', title: 'Approval needed', body: 'x', type: 'warning', category: 'approval' };
+    await getHandler(PC_RAIL_IPC.MUTES_SET)({}, { hostIds: ['h1'] });
+    fire?.('office-mac', n);
+    expect(show).not.toHaveBeenCalled();
+    await getHandler(PC_RAIL_IPC.MUTES_SET)({}, { hostIds: [] });
+    fire?.('office-mac', n);
+    expect(show).toHaveBeenCalledTimes(1);
+    disposePcRail();
+    show.mockRestore();
+  });
+
+  it('probe refuses an oversized /api/config body', async () => {
+    const big = new Response(`{"allowInput":true,"pad":"${'x'.repeat(200 * 1024)}"}`);
+    const fetchImpl = vi.fn(async () => big);
+    registerRemoteHandlers({ store: fakeStore() as never, attachments: fakeAttachments() as never, fetchImpl: fetchImpl as unknown as typeof fetch });
+    const res = await getHandler(IPC.REMOTE_HOSTS_ADD)({}, 'https://box:9600?token=t') as { ok: boolean; error?: string };
+    // Its own case: an oversized answer is not an old wmux.
+    expect(res).toEqual({ ok: false, error: 'that host sent an answer this app cannot use' });
+  });
+
+  it('resize request refuses non-finite geometry before reaching the host', async () => {
+    registerRemoteHandlers({ store: fakeStore() as never, attachments: fakeAttachments() as never, fetchImpl: vi.fn() as unknown as typeof fetch });
+    const res = await getHandler(IPC.REMOTE_PANE_RESIZE_REQUEST)({}, 'a1', Number.NaN, 24);
+    expect(res).toEqual({ ok: false, reason: 'cols and rows must be numbers' });
   });
 });

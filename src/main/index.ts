@@ -1,3 +1,5 @@
+// Must stay the first import: turns off working-directory executable lookup (Windows) before any module runs.
+import '../shared/exeSearchGuard';
 import { randomUUID as phoneBrowserRequestId } from 'node:crypto';
 import { webContents as phoneWebContents } from 'electron';
 import { withPhoneBrowserInputFocus, dispatchPhoneBrowserScroll, phoneBrowserNativeBounds } from './phone/PhoneBrowserInput';
@@ -94,7 +96,7 @@ import { registerPluginSchemePrivileges, registerPluginProtocolHandler } from '.
 import { registerPluginHostHandlers } from './ipc/handlers/pluginHost.handler';
 import { registerProjectConfigHandlers } from './ipc/handlers/projectConfig.handler';
 import { registerChannelLocalHandlers } from './ipc/handlers/channelLocal.handler';
-import { registerRemoteHandlers } from './ipc/handlers/remote.handler';
+import { registerRemoteSurfaces } from './ipc/handlers/remoteRegistration';
 import { RemoteHostsStore } from './remote/RemoteHostsStore';
 import { RemoteAttachmentsStore } from './remote/RemoteAttachmentsStore';
 import { registerFanOutHandler, startGuiFanOut } from './ipc/handlers/fanout.handler';
@@ -1080,7 +1082,8 @@ registerChannelLocalHandlers(() => daemonClient);
 // channelLocal above). Registered once, outside the daemon-swap cycle: the
 // registered hosts/tokens live on disk in main, independent of the local
 // daemon connection. See remote.handler.ts for the push-routing contract.
-registerRemoteHandlers({
+// The PC rail feeds share the same two stores (remoteRegistration.ts).
+registerRemoteSurfaces({
   store: new RemoteHostsStore(path.join(getWmuxDir(), 'remote-hosts.json')),
   attachments: new RemoteAttachmentsStore(path.join(getWmuxDir(), 'remote-attachments.json')),
 });
@@ -1665,7 +1668,18 @@ app.on('ready', async () => {
   // itself. A window built during that gap would be governed by the default
   // menu — the exact startup path this change exists to close. App-global and
   // idempotent, so this one call covers those windows too.
-  installApplicationMenu();
+  // "Quit and Stop Sessions" stops the daemon before quitting (so a failed
+  // stop can keep the app open), then takes the tray's full-shutdown path.
+  // The respawn loop goes first, or it would bring the daemon straight back.
+  installApplicationMenu({
+    onShutdownAll: () => { fullShutdownRequested = true; },
+    getDaemonClient: () => daemonClient,
+    isQuitting: () => isQuitting,
+    prepareStop: () => {
+      daemonRespawnController?.dispose();
+      daemonRespawnController = null;
+    },
+  });
 
   // P3 — macOS CLI shim: DMG/ZIP 설치엔 Squirrel 훅이 없으므로 첫 실행 시 1회만
   // `/usr/local/bin/wmux`(폴백 `~/.local/bin/wmux`) 심링크 설치를 시도한다.

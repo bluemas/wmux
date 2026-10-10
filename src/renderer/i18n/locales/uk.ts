@@ -42,6 +42,12 @@ export const uk = {
 
   // Pane stash (#977) — the pane leaves the layout, its session keeps running.
   'pane.rename': 'Перейменувати панель',
+  'pane.renameError.whitespace': "Назва панелі не може містити пробіли",
+  'pane.renameError.reservedChar': "Назва панелі не може містити # або @",
+  'pane.renameError.leadingDigit': "Назва панелі не може починатися з цифри",
+  'pane.renameError.autoName': "Назви на кшталт w1-2 зарезервовані для автоматичних назв панелей",
+  'pane.renameError.duplicate': "Цю назву вже використовує інша панель",
+  'pane.renameError.failed': "Не вдалося перейменувати панель",
   'pane.stash': 'Відкласти панель',
   'pane.stashHint': 'Прибрати з макета — сесія продовжить працювати',
   'pane.unstash': 'Повернути',
@@ -517,4 +523,25 @@ export const uk = {
   // ─── Workspace item: task worktree boundary warning ───
   'workspace.cwdDeparted': 'cwd панелі вийшов за межу worktree задачі: {cwd}',
   'workspace.departed': 'поза межами',
+  'settings.plainDragSelect': "Виділяти текст перетягуванням, навіть якщо застосунок використовує мишу",
+  'settings.plainDragSelectDesc': "Звичайне перетягування виділяє текст навіть у застосунках, що використовують мишу, як-от Codex; клацання й надалі передається застосунку. Утримуйте Shift (macOS) або Alt (Windows, Linux) під час перетягування, щоб передати його застосунку.",
+  'pcRail.notChecked': "Ще не перевірено",
+  'pcRail.access.revokeHintUnknown': "Щоб відкликати: якщо цей комп'ютер спарено за кодом, видаліть його в розділі «Спарені пристрої» на {name}. Якщо його додано за веб-посиланням {name}, від'єднати його можна лише новим посиланням (wmux web --new-token).",
+  'remote.scope.read': "Спарений пристрій може читати й шукати вивід усіх робочих просторів на цьому комп'ютері, зокрема відкритих пізніше.",
+  'remote.scope.viewOnly': "«Лише перегляд» блокує введення, але пристрій усе одно може відповідати на екранні запити, що потребують однієї клавіші.",
+  'remote.scope.input': "«Може вводити» також дозволяє відкривати й закривати сеанси та відповідати на запити схвалення.",
+  'remotePage.connect.pasteScope': "Якщо запрошення відкриває доступ до робочих просторів, цей комп'ютер може читати й шукати всі робочі простори того ПК, зокрема відкриті пізніше. Поки їх спарено, wmux перевіряє його кожні кілька секунд, тримає з'єднання для сповіщень і показує його сповіщення; вимкнути їх можна в меню комп'ютерів у заголовку бічної панелі.",
+  'pcSwitcher.open': "Змінити комп'ютер",
+  'pcSwitcher.manage': "Налаштування {name}",
+  'pcSwitcher.othersNeedYou': "{count} чекають на вас на інших комп'ютерах",
+  // Quit and Stop Sessions (main-process native confirm)
+  'quitAndStop.message': "Вийти з wmux і зупинити всі сеанси?",
+  'quitAndStop.detail': "Зараз працюють: сеанси агентів — {agents}, усього терміналів — {sessions}. Усі їх буде зупинено. Звичайний вихід залишає їх працювати у фоні.",
+  'quitAndStop.detailUnknown': "wmux не вдалося підрахувати активні сеанси. Усі термінали та сеанси агентів буде зупинено. Звичайний вихід залишає їх працювати у фоні.",
+  'quitAndStop.confirm': "Вийти й зупинити сеанси",
+  'quitAndStop.cancel': "Скасувати",
+  'quitAndStop.stopFailedMessage': "wmux не вдалося зупинити сеанси.",
+  'quitAndStop.stopFailedDetail': "Демон wmux не зупинився, тому wmux залишається відкритим, а сеанси й далі працюють. Виконайте wmux daemon stop у терміналі й завершіть роботу ще раз.",
+  'quitAndStop.alreadyQuittingMessage': "wmux уже завершує роботу.",
+  'quitAndStop.alreadyQuittingDetail': "Під час цього виходу сеанси й далі працюватимуть у фоні. Щоб зупинити їх, виконайте wmux daemon stop у терміналі.",
 } as const;

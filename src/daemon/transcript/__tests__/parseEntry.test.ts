@@ -77,10 +77,133 @@ describe('parseTranscriptLine — claude-basic.jsonl (full envelope)', () => {
     expect(result.kind === 'tool_result' && result.diffLike).toBeUndefined();
   });
 
-  it('surfaces pr-link as a meta chip carrying the url', () => {
-    const meta = events[5];
-    expect(meta.kind === 'meta' && meta.subtype).toBe('unknown');
-    expect(meta.kind === 'meta' && meta.label).toBe('https://example.invalid/org/repo/pull/1');
+  it('surfaces pr-link as a pr_link meta row carrying the url, number and repo', () => {
+    expect(events[5]).toEqual({
+      id: 'cccc0000-0000-4000-8000-000000000006',
+      kind: 'meta',
+      subtype: 'pr_link',
+      label: 'https://example.invalid/org/repo/pull/1',
+      ts: Date.parse('2026-07-27T09:00:07.000Z'),
+      url: 'https://example.invalid/org/repo/pull/1',
+      number: 1,
+      repo: 'org/repo',
+    });
+  });
+});
+
+describe('parseTranscriptLine — pr-link entries', () => {
+  const parse = (entry: Record<string, unknown>): TurnEvent[] =>
+    parseTranscriptLine(JSON.stringify({ type: 'pr-link', timestamp: '2026-10-08T14:31:51.298Z', ...entry }), 40);
+
+  it('reads the fields Claude Code writes (prUrl, prNumber, prRepository)', () => {
+    expect(parse({ prNumber: 20, prUrl: 'https://github.com/acme/web/pull/20', prRepository: 'acme/web' })).toEqual([{
+      id: '40:0',
+      kind: 'meta',
+      subtype: 'pr_link',
+      label: 'https://github.com/acme/web/pull/20',
+      ts: Date.parse('2026-10-08T14:31:51.298Z'),
+      url: 'https://github.com/acme/web/pull/20',
+      number: 20,
+      repo: 'acme/web',
+    }]);
+  });
+
+  it('prefers the explicit fields, and fills a missing one from the url path', () => {
+    const [explicit] = parse({ prUrl: 'https://github.com/a/b/pull/7', prNumber: 8, prRepository: 'c/d' });
+    expect(explicit).toMatchObject({ subtype: 'pr_link', number: 8, repo: 'c/d' });
+    const [derived] = parse({ prUrl: 'https://ghe.example.com/a/b/pull/7/files', prNumber: 'seven', prRepository: 'not a repo' });
+    expect(derived).toMatchObject({ subtype: 'pr_link', number: 7, repo: 'a/b' });
+  });
+
+  it('carries the url alone when nothing names a number or repo', () => {
+    const [event] = parse({ prUrl: 'https://gitlab.example.com/a/b/-/merge_requests/3' });
+    expect(event).toMatchObject({ subtype: 'pr_link', url: 'https://gitlab.example.com/a/b/-/merge_requests/3' });
+    expect(event).not.toHaveProperty('number');
+    expect(event).not.toHaveProperty('repo');
+  });
+
+  it('keeps a malformed entry as the neutral chip it was', () => {
+    for (const entry of [
+      {},
+      { prUrl: 42 },
+      { prUrl: '' },
+      { prUrl: 'not a url', prNumber: 3 },
+      { prUrl: 'javascript:alert(1)//github.com/a/b/pull/1' },
+      { prUrl: `https://github.com/a/b/pull/1?${'x'.repeat(2100)}` },
+    ]) {
+      const [event] = parse(entry);
+      expect(event).toMatchObject({ kind: 'meta', subtype: 'unknown' });
+      expect(event).not.toHaveProperty('url');
+      expect(event).not.toHaveProperty('number');
+    }
+    expect(parse({})[0]).toMatchObject({ label: 'pull request' });
+  });
+
+  it('never echoes a non-http string into the fallback label', () => {
+    for (const entry of [
+      { prUrl: 'javascript:alert(1)' },
+      { url: 'not a url' },
+      { link: 'file:///etc/hosts' },
+    ]) {
+      expect(parse(entry)[0]).toEqual(expect.objectContaining({ subtype: 'unknown', label: 'pull request' }));
+    }
+  });
+
+  it('removes a user name and password from the url and the label', () => {
+    const [event] = parse({ prUrl: 'https://user:secret@github.com/a/b/pull/5' });
+    expect(event).toMatchObject({
+      subtype: 'pr_link',
+      url: 'https://github.com/a/b/pull/5',
+      label: 'https://github.com/a/b/pull/5',
+      number: 5,
+      repo: 'a/b',
+    });
+    expect(JSON.stringify(event)).not.toContain('secret');
+    expect(JSON.stringify(parse({ prUrl: 'https://token@github.com/a/b/pull/6' }))).not.toContain('token@');
+  });
+
+  it('sends the url as the parser reads it, not the string the entry held', () => {
+    for (const [raw, url] of [
+      ['  https://github.com/a/b/pull/1  ', 'https://github.com/a/b/pull/1'],
+      ['\u0001https://github.com/a/b/pull/2', 'https://github.com/a/b/pull/2'],
+      ['https://github.com/a/b/pull/3\n', 'https://github.com/a/b/pull/3'],
+      ['https://github.com\t.evil.example/a/b/pull/4', 'https://github.com.evil.example/a/b/pull/4'],
+      ['https:\\\\github.com\\a\\b\\pull\\5', 'https://github.com/a/b/pull/5'],
+      ['https://:@github.com/a/b/pull/6', 'https://github.com/a/b/pull/6'],
+      ['HTTPS://GITHUB.COM/a/b/pull/7', 'https://github.com/a/b/pull/7'],
+    ]) {
+      expect(parse({ prUrl: raw })[0]).toMatchObject({ subtype: 'pr_link', url, label: url });
+    }
+  });
+
+  it('applies the length cap to the url it sends, after encoding', () => {
+    const head = 'https://github.com/a/b/pull/1?q=';
+    const [event] = parse({ prUrl: `${head}${'é'.repeat(2048 - head.length)}` });
+    expect(event).toMatchObject({ subtype: 'unknown', label: 'pull request' });
+    expect(event).not.toHaveProperty('url');
+  });
+
+  it('never sends a repo with a . or .. part', () => {
+    for (const prRepository of ['../..', './x', 'x/.', 'x/..', '../x']) {
+      const [event] = parse({ prUrl: 'https://ghe.example.com/a/b/-/c', prRepository });
+      expect(event).toMatchObject({ subtype: 'pr_link' });
+      expect(event).not.toHaveProperty('repo');
+    }
+    // A dotted name is still a name, and the url path still fills the gap.
+    expect(parse({ prUrl: 'https://github.com/a/b/pull/1', prRepository: 'x.y/.github' })[0]).toMatchObject({ repo: 'x.y/.github' });
+    expect(parse({ prUrl: 'https://github.com/a/b/pull/1', prRepository: '../..' })[0]).toMatchObject({ repo: 'a/b' });
+  });
+
+  it('takes the first key holding a usable http(s) url, prUrl first', () => {
+    expect(parse({ prUrl: 'https://github.com/a/b/pull/1', url: 'https://github.com/c/d/pull/2' })[0])
+      .toMatchObject({ url: 'https://github.com/a/b/pull/1' });
+    expect(parse({ prUrl: 'javascript:void(0)', url: 'notaurl', link: 'https://github.com/e/f/pull/3' })[0])
+      .toMatchObject({ subtype: 'pr_link', url: 'https://github.com/e/f/pull/3', number: 3, repo: 'e/f' });
+  });
+
+  it('reads a /owner/name/PULL/N path whatever its case', () => {
+    expect(parse({ prUrl: 'https://GitHub.com/Acme/Web/PULL/12' })[0])
+      .toMatchObject({ subtype: 'pr_link', number: 12, repo: 'Acme/Web' });
   });
 });
 
@@ -750,5 +873,24 @@ describe('parseTranscriptLine — `!` shell mode is never "You"', () => {
     const stderrOnly = parseTranscriptLine(line([{ type: 'text', text: '<bash-stderr>boom</bash-stderr>' }], 'u-3'), 200);
     expect(stderrOnly[0]).toMatchObject({ kind: 'meta', subtype: 'bash_output' });
     expect([...input, ...output, ...stderrOnly].some((e) => e.kind === 'user_text')).toBe(false);
+  });
+});
+
+describe('parseTranscriptLine — compact summary is never "You"', () => {
+  const summary = 'This session is being continued from a previous conversation that ran out of context. Summary: …';
+  it.each([
+    ['string content', summary],
+    ['block content', [{ type: 'text', text: summary }]],
+  ])('emits one quiet meta row for %s, without the summary body', (_name, content) => {
+    const events = parseTranscriptLine(JSON.stringify({
+      type: 'user', uuid: 'c1', isCompactSummary: true, isVisibleInTranscriptOnly: true,
+      timestamp: '2026-10-10T00:00:00.000Z', message: { role: 'user', content },
+    }), 0);
+    expect(events).toEqual([{ id: 'c1', kind: 'meta', subtype: 'caveat', label: 'Conversation compacted', ts: Date.parse('2026-10-10T00:00:00.000Z') }]);
+  });
+
+  it('leaves a user entry without the flag as the user\'s own text', () => {
+    const [event] = parseTranscriptLine(JSON.stringify({ type: 'user', uuid: 'u1', message: { role: 'user', content: summary } }), 0);
+    expect(event).toMatchObject({ kind: 'user_text', text: summary });
   });
 });

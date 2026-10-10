@@ -15,6 +15,8 @@ import {
   splitLinkedLine,
   webQrPayload,
   webBindLabel,
+  uniqueDeviceName,
+  oneClickReachable,
   WebPopoverBody,
   type WebPopoverBodyProps,
 } from '../WebToggle';
@@ -131,22 +133,112 @@ describe('WebToggle pure helpers', () => {
   });
 });
 
-describe('WebPopoverBody — off state', () => {
-  const html = renderBody({ info: { running: false } });
+describe('uniqueDeviceName', () => {
+  const device = (name: string, revokedAt?: number) => ({
+    deviceId: name,
+    name,
+    createdAt: 1,
+    lastSeenAt: 1,
+    allowInput: false,
+    ...(revokedAt !== undefined ? { revokedAt } : {}),
+  });
 
-  it('shows the headline, both checkboxes and the Start primary', () => {
+  it('is the bare base on an empty or unread roster', () => {
+    expect(uniqueDeviceName('Phone', [])).toBe('Phone');
+    expect(uniqueDeviceName('Phone', null)).toBe('Phone');
+  });
+
+  it('counts up past live names, case-insensitively, and the pending one', () => {
+    expect(uniqueDeviceName('Phone', [device('phone'), device('Phone 2')])).toBe('Phone 3');
+    expect(uniqueDeviceName('Phone', [device('Phone')], 'Phone 2')).toBe('Phone 3');
+  });
+
+  it('a revoked device frees its name', () => {
+    expect(uniqueDeviceName('Phone', [device('Phone', 5)])).toBe('Phone');
+  });
+
+  it('stays inside the name cap', () => {
+    const long = 'x'.repeat(40);
+    const name = uniqueDeviceName(long, [device('x'.repeat(32))]);
+    expect(name.length).toBeLessThanOrEqual(32);
+    expect(name.endsWith(' 2')).toBe(true);
+  });
+});
+
+describe('oneClickReachable', () => {
+  it('the LAN when ticked, or a ticked tailnet known to work', () => {
+    expect(oneClickReachable(true, false, { state: 'checking' })).toBe(true);
+    expect(oneClickReachable(false, true, { state: 'ok' })).toBe(true);
+    expect(oneClickReachable(false, true, { state: 'checking' })).toBe(false);
+    expect(oneClickReachable(false, true, { state: 'problem', lines: [] })).toBe(false);
+    // Loopback only: a code minted there reaches nothing off this machine.
+    expect(oneClickReachable(false, false, { state: 'ok' })).toBe(false);
+  });
+
+  it('trusts the ticked box when this bridge cannot check', () => {
+    expect(oneClickReachable(false, true, undefined)).toBe(true);
+    expect(oneClickReachable(false, false, undefined)).toBe(false);
+  });
+});
+
+describe('WebPopoverBody — one-click readiness', () => {
+  const stopped = { info: { running: false }, deviceName: 'Phone' } as const;
+
+  it('while Tailscale is being checked: says so, nothing is primary', () => {
+    const html = renderBody({ ...stopped, tailscale: false, tailscaleCheck: { state: 'checking' } });
+    expect(html).toContain('web.wizardChecking');
+    expect(html).toMatch(/disabled="">web\.connectPhonePair/);
+    expect(html).not.toContain('ui-btn-primary');
+  });
+
+  it('when Tailscale cannot front it: quotes why, with the link', () => {
+    const html = renderBody({
+      ...stopped,
+      tailscaleCheck: { state: 'problem', lines: ['Install it from https://tailscale.com/download, then sign in.'] },
+    });
+    expect(html).toContain('>https://tailscale.com/download</button>');
+    expect(html).toMatch(/disabled="">web\.connectPhonePair/);
+    expect(html).not.toContain('web.computerTurnOnHttps');
+  });
+
+  it('usable but unticked: the inline fix is the primary', () => {
+    const html = renderBody({ ...stopped, tailscale: false, tailscaleCheck: { state: 'ok' }, onTurnOnHttps: vi.fn() });
+    expect(html).toContain('web.connectPhoneNeedsTailscale');
+    expect(html).toMatch(/ui-btn-primary[^>]*>web\.computerTurnOnHttps/);
+    expect(html.split('ui-btn-primary').length - 1).toBe(1);
+  });
+
+  it('a ticked LAN enables the one-click (the daemon then says why it will not pair)', () => {
+    const html = renderBody({ ...stopped, expose: true, tailscaleCheck: { state: 'problem', lines: [] } });
+    expect(html).not.toMatch(/disabled="">web\.connectPhonePair/);
+  });
+});
+
+describe('WebPopoverBody — off state', () => {
+  const html = renderBody({ info: { running: false }, deviceName: 'Phone', tailscale: true, tailscaleCheck: { state: 'ok' } });
+
+  it('leads with Pair a phone, keeps the options and Start', () => {
+    expect(html).toContain('web.connectPhonePair');
+    expect(html).toContain('value="Phone"');
     expect(html).toContain('web.shareThisComputer');
     expect(html).toContain('web.allowInput');
     expect(html).toContain('web.expose');
     expect(html).toContain('web.start');
   });
 
+  it('offers the computer link only while the tailnet transport is chosen', () => {
+    expect(html).toContain('>web.connectComputer<');
+    expect(renderBody({ info: { running: false }, deviceName: 'Phone', tailscale: false })).not.toContain(
+      '>web.connectComputer<',
+    );
+  });
+
   it('surfaces the scrollback-exposure warning', () => {
     expect(html).toContain('web.scrollbackWarning');
   });
 
-  it('Start uses the single amber primary fill', () => {
-    expect(html).toContain('ui-btn-primary');
+  it('Pair a phone uses the single amber primary fill; Start is secondary', () => {
+    expect(html).toMatch(/ui-btn-primary[^>]*>web\.connectPhonePair/);
     // One primary per surface: nothing else in the stopped body is filled.
     expect(html.split('ui-btn-primary').length - 1).toBe(1);
   });
@@ -247,7 +339,7 @@ describe('WebPopoverBody — on state', () => {
     expect(html).toContain('web.connectPhone');
     // A spent code lands back on the name field, which IS the way back: the
     // next device needs a name anyway, and minting from there gives it one.
-    expect(html).toContain('web.showPairCode');
+    expect(html).toContain('web.connectPhonePair');
   });
 
   it('★ the QR replaces the address text, and copy stays reachable', () => {
@@ -281,7 +373,7 @@ describe('WebPopoverBody — on state', () => {
     });
     expect(html).not.toContain('48293576');
     expect(html).toContain('web.nameHint');
-    expect(html).toContain('web.showPairCode');
+    expect(html).toContain('web.connectPhonePair');
   });
 
   it('names the device the code will register, next to the code', () => {
@@ -306,7 +398,7 @@ describe('WebPopoverBody — on state', () => {
       deviceName: 'phone',
     });
     // Same button, now reachable.
-    expect(named).toContain('web.showPairCode');
+    expect(named).toContain('web.connectPhonePair');
     expect(named.split('disabled=""').length).toBeLessThan(empty.split('disabled=""').length);
   });
 

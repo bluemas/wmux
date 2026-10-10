@@ -52,6 +52,16 @@ describe('formatRemoteAttention', () => {
     expect(formatRemoteAttention('approval', { tier: 'info', phase: 'resolved' })).toBeNull();
     expect(formatRemoteAttention('approval', { tier: 'act', toolName: 'Bash' })?.body).toBe('Bash');
   });
+
+  it('replaces C1 controls and bidi overrides in toast text, not only C0', () => {
+    const ch = (...codes: number[]) => String.fromCharCode(...codes);
+    const out = formatRemoteAttention('notify', {
+      title: `Build ${ch(0x202e)}gnp.exe${ch(0x202c)} done`,
+      body: `line one${ch(0x85)}line two${ch(0x2028)}three${ch(0x1b)}[31m`,
+    });
+    expect(out?.title).toBe('Build  gnp.exe  done');
+    expect(out?.body).toBe('line one line two three [31m');
+  });
 });
 
 describe('RemoteAttentionGate', () => {
@@ -218,6 +228,28 @@ describe('RemoteAttentionSubscriber', () => {
     sub.stop();
   });
 
+  it('backs off to the slowest step after an oversized frame, even though the reset frame reset the counter', async () => {
+    const h = timerHarness();
+    const fetchImpl = vi.fn(async () => fakeStream([
+      frame('reset', { epoch: 'e1', headId: 0 }),
+      'event: notify\ndata: ' + 'A'.repeat(300 * 1024),
+    ]));
+    const sub = new RemoteAttentionSubscriber({
+      host: HOST,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      jitter: () => 0.5,
+      setTimeoutImpl: h.setTimeoutImpl,
+      clearTimeoutImpl: h.clearTimeoutImpl,
+      onNotification: () => { throw new Error('must not notify'); },
+    });
+    sub.start();
+    await vi.waitFor(() => expect(h.reconnectDelays()).toEqual([60_000]));
+    h.fireReconnect();
+    await vi.waitFor(() => expect(h.reconnectDelays()).toEqual([60_000, 60_000]));
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    sub.stop();
+  });
+
   it('stops delivering after stop(), even mid-stream', async () => {
     const seen: string[] = [];
     const h = timerHarness();
@@ -241,5 +273,50 @@ describe('RemoteAttentionSubscriber', () => {
     await new Promise((r) => setTimeout(r, 10));
     expect(h.scheduled.length).toBe(before);
     expect(seen).toEqual(['one']);
+  });
+});
+
+describe('RemoteAttentionGate — bounds', () => {
+  it('drops an event whose epoch or session id is over the id bound', () => {
+    const gate = new RemoteAttentionGate();
+    gate.beginStream();
+    gate.consume('reset', JSON.stringify({ epoch: 'e1', headId: 0 }));
+    const long = 'e'.repeat(10_000);
+    expect(gate.consume('notify', JSON.stringify({ sessionId: 's', body: 'b', epoch: long, id: 1 }))).toBeNull();
+    expect(gate.consume('notify', JSON.stringify({ sessionId: long, body: 'b', epoch: 'e1', id: 2 }))).toBeNull();
+    expect(gate.consume('notify', JSON.stringify({ sessionId: 's', body: 'b', epoch: 'e1', id: 3 }))).not.toBeNull();
+  });
+});
+
+describe('RemoteAttentionSubscriber — byte bounds', () => {
+  it('drops the stream on a frame over the byte cap, even when its UTF-16 length is under it', async () => {
+    const notes: unknown[] = [];
+    // 3 bytes per character: ~384 KiB on the wire, ~128K UTF-16 units.
+    const big = '한'.repeat(128 * 1024);
+    let calls = 0;
+    const fetchImpl = vi.fn(async () => {
+      calls += 1;
+      return fakeStream([
+        'event: reset\ndata: {"epoch":"e1","headId":0}\n\n',
+        `event: notify\ndata: ${JSON.stringify({ sessionId: 's', epoch: 'e1', id: 1, title: big })}\n\n`,
+      ]);
+    });
+    const sub = new RemoteAttentionSubscriber({
+      host: HOST,
+      onNotification: (_l, n) => notes.push(n),
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      setTimeoutImpl: (() => 0) as never,
+      clearTimeoutImpl: () => undefined,
+    });
+    sub.start();
+    for (let i = 0; i < 20; i += 1) await new Promise((r) => setImmediate(r));
+    sub.stop();
+    expect(calls).toBe(1);
+    expect(notes).toEqual([]);
+  });
+
+  it('cuts a tool + summary approval body to the body limit', () => {
+    const out = formatRemoteAttention('approval', { tier: 'act', toolName: 't'.repeat(500), toolInputSummary: 's'.repeat(500) });
+    expect(out?.body.length).toBe(240);
   });
 });

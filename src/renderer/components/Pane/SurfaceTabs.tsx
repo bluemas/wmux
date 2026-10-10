@@ -10,13 +10,15 @@ import {
 } from '../../utils/sessionInfoMarkdown';
 import { tokenAttrs } from '../../themes';
 import UsageLimitChip from './UsageLimitChip';
-import { computePaneAutoName, paneDisplayName } from '../../utils/paneNaming';
+import { computePaneAutoName, paneDisplayName, paneLabelRejectionKey, paneTag } from '../../utils/paneNaming';
+import { beginPaneTagDrag, endPaneTagDrag } from '../../utils/paneTagDrag';
 import { findPane } from '../../../shared/paneUtils';
 import PaneDragGrip from './PaneDragGrip';
 import { FOCUS_RING } from '../focusRing';
 import { HIT_TARGET_24 } from '../hitArea';
 import { IconSplitRight, IconSplitDown, IconBrowser, IconExternalLink, IconEyeOff, IconPencil, IconGrid, IconComputer, IconLock } from '../icons';
 import { isPrivateBrowserSurface } from '../../../shared/privateBrowser';
+import { LOCAL_PC_ID, isShadowWorkspaceId } from '../../../shared/pcRail';
 import A2aLinkDialog from '../Remote/A2aLinkDialog';
 import { displayPath } from '../../utils/displayPath';
 import { workspaceColorHex } from '../../../shared/workspaceColors';
@@ -80,6 +82,10 @@ export function showsEnforcedModelBadge(opts: {
  *  width: it is opt-in (see the note at its render site) and lives on the
  *  left, with the tabs. */
 export const PANE_ACTIONS_CLUSTER_WIDTH = 142;
+
+/** Pane menu entries a shadow workspace leaves out: its layout belongs to the
+ *  host, so no split, no new pane and (by the `snap-` prefix) no layout snap. */
+const HIDDEN_ON_SHADOW: ReadonlySet<string> = new Set(['split-right', 'split-down', 'new-remote', 'split-right-remote', 'split-down-remote']);
 
 /** Rendered width (px) of the COLLAPSED cluster: the ⋮ trigger alone, which
  *  opens the same actions as a vertical menu. Same outer box as the full
@@ -559,6 +565,10 @@ export default function SurfaceTabs({
   // input, which fires onBlur=commitPaneRename first and would SAVE. This flag
   // lets that blur skip persistence so Escape discards (CodeRabbit review).
   const paneRenameCancelRef = useRef(false);
+  // A rename MetadataStore refused (the pane label policy): the editor stays
+  // open with the reason instead of silently snapping back to the old name.
+  const [paneRenameError, setPaneRenameError] = useState<string | null>(null);
+  const paneRenamePendingRef = useRef(false);
 
   // Double-click a tab to rename it (a free-text "mark" so a powershell is
   // easier to recognise). Edits surface.title directly — nothing auto-updates
@@ -650,6 +660,7 @@ export default function SurfaceTabs({
     // Clear any stale cancel flag from a prior edit whose unmount-blur didn't
     // fire (e.g. parent unmounted) — else this rename would refuse to save (GLM).
     paneRenameCancelRef.current = false;
+    setPaneRenameError(null);
     setPaneEditName(paneLabel ?? '');
     setPaneEditing(true);
   }, [paneLabel]);
@@ -676,6 +687,11 @@ export default function SurfaceTabs({
   useEffect(() => {
     if (menu === 'main') reloadChromeProfiles();
   }, [menu, reloadChromeProfiles]);
+  // PC rail: with another computer on screen (or in its shadow workspace) a
+  // new browser still opens on this one, so its label says so.
+  const shadow = isShadowWorkspaceId(workspace.id);
+  const otherPcShown = useStore((s) => s.pcRail.activePcId !== LOCAL_PC_ID) || shadow;
+  const newBrowserLabel = otherPcShown ? t('pcRail.browserThisComputer') : t('pane.newBrowser');
   const menuItems: PaneActionItem[] = useMemo(() => [
     {
       key: 'split-right',
@@ -693,7 +709,7 @@ export default function SurfaceTabs({
     },
     {
       key: 'new-browser',
-      label: t('pane.newBrowser'),
+      label: newBrowserLabel,
       icon: <IconBrowser size={14} />,
       onSelect: onAddBrowser,
     },
@@ -774,26 +790,38 @@ export default function SurfaceTabs({
       separatorBefore: i === 0,
       onSelect: () => { useStore.getState().snapToLayoutTemplate(tmpl.id); },
     })),
-  ], [
-    t, onSplitHorizontal, onSplitVertical, onAddBrowser, onAddPrivateBrowser, chromeProfile.mainItems, onAddRemote,
+  ].filter((item) => !shadow || !(HIDDEN_ON_SHADOW.has(item.key) || item.key.startsWith('snap-'))), [
+    t, onSplitHorizontal, onSplitVertical, onAddBrowser, newBrowserLabel, onAddPrivateBrowser, chromeProfile.mainItems, onAddRemote,
     onSplitHorizontalRemote, onSplitVerticalRemote, startPaneRename,
     menuTabSurface, startRename, canLinkRemote,
     stashChord, stashDisabled, stashTooltip, stashThisPane, isZoomed, toggleZoom,
-    layoutTemplates,
+    layoutTemplates, shadow,
   ]);
 
   const commitPaneRename = () => {
     // Escape set the cancel flag — discard without persisting and reset it.
     if (paneRenameCancelRef.current) {
       paneRenameCancelRef.current = false;
+      setPaneRenameError(null);
       setPaneEditing(false);
       return;
     }
+    if (paneRenamePendingRef.current) return;
+    paneRenamePendingRef.current = true;
     // Empty clears the custom label (reverts to the auto name). The renderer is
     // not the label authority — route through MetadataStore so the change
-    // persists (metadata.json) and relays back via pane.metadata.changed.
-    void window.electronAPI.metadata.setLabel(paneId, workspace.id, paneEditName.trim());
-    setPaneEditing(false);
+    // persists (metadata.json) and relays back via pane.metadata.changed. A
+    // refusal keeps the editor open with its reason; Escape discards.
+    void window.electronAPI.metadata.setLabel(paneId, workspace.id, paneEditName.trim())
+      .then((res) => {
+        if (res.ok) {
+          setPaneRenameError(null);
+          setPaneEditing(false);
+        } else {
+          setPaneRenameError(t(paneLabelRejectionKey(res.code)));
+        }
+      }, () => setPaneRenameError(t('pane.renameError.failed')))
+      .finally(() => { paneRenamePendingRef.current = false; });
   };
 
   // Always render the strip — even for a single surface — so the X button is
@@ -817,9 +845,14 @@ export default function SurfaceTabs({
     // silently failed. text/plain alone behaves like a paste and is
     // accepted by every chat client we have tested.
     const state = useStore.getState();
-    const md = buildPaneMarkdown(workspace, paneId, state.surfaceAgent, state);
+    const md = buildPaneMarkdown(workspace, paneId, state.surfaceAgent, state, state.paneLabel);
     e.dataTransfer.setData('text/plain', md);
     e.dataTransfer.effectAllowed = 'copy';
+    // Dropped on a wmux terminal, the drag types just `#w1-2 ` (paneTagDrag.ts);
+    // text/plain above stays the full markdown for every other drop target.
+    if (leaf && leaf.type === 'leaf' && typeof workspace.wsOrdinal === 'number' && typeof leaf.ordinal === 'number') {
+      beginPaneTagDrag(md, paneTag(workspace, leaf));
+    }
     setTerminalTextDropDragActive(true);
   };
 
@@ -888,6 +921,7 @@ export default function SurfaceTabs({
           user names the pane (explicit intent to see it), or while the rename
           editor is open (reachable from the pane-actions menu). */}
       {(paneEditing || hasUserLabel || surfaces.length > 1) && (paneEditing ? (
+        <>
         <input
           ref={paneInputRef}
           data-pane-label-input
@@ -895,6 +929,9 @@ export default function SurfaceTabs({
           value={paneEditName}
           maxLength={64}
           placeholder={paneAutoName}
+          aria-invalid={paneRenameError ? true : undefined}
+          aria-describedby={paneRenameError ? `pane-rename-error-${paneId}` : undefined}
+          title={paneRenameError ?? undefined}
           onChange={(e) => setPaneEditName(e.target.value)}
           onBlur={commitPaneRename}
           onKeyDown={(e) => {
@@ -903,13 +940,31 @@ export default function SurfaceTabs({
               // Flag the cancel BEFORE exiting edit mode so the unmount-blur's
               // commitPaneRename discards instead of saving.
               paneRenameCancelRef.current = true;
+              setPaneRenameError(null);
               setPaneEditing(false);
             }
             e.stopPropagation();
           }}
           onClick={(e) => e.stopPropagation()}
-          {...tokenAttrs('accent', 'border')}
+          {...(paneRenameError ? tokenAttrs('danger', 'border') : tokenAttrs('accent', 'border'))}
+          style={paneRenameError ? { borderColor: 'var(--accent-red)' } : undefined}
         />
+        {/* Absolute, so it escapes the tab strip's horizontal scroll: inline,
+            a narrow pane clipped the reason down to its first letter. The
+            containing block is the pane root, just under the 40px header. */}
+        {paneRenameError && (
+          <span
+            id={`pane-rename-error-${paneId}`}
+            role="alert"
+            data-pane-rename-error
+            className="absolute left-2 top-11 z-20 max-w-[calc(100%-16px)] rounded border border-[var(--accent-red)] bg-[var(--bg-overlay)] px-2 py-1 text-[11px] leading-snug text-[var(--accent-red)]"
+            title={paneRenameError}
+            {...tokenAttrs('danger', 'text')}
+          >
+            {paneRenameError}
+          </span>
+        )}
+        </>
       ) : (
         <span
           data-pane-label
@@ -926,7 +981,10 @@ export default function SurfaceTabs({
           key={s.id}
           draggable={!readOnly && editingId !== s.id}
           onDragStart={handleDragStart}
-          onDragEnd={() => setTerminalTextDropDragActive(false)}
+          onDragEnd={() => {
+            endPaneTagDrag();
+            setTerminalTextDropDragActive(false);
+          }}
           // Tab pill: 30px, 6px radius, centered in the 40px strip. Active =
           // --selection fill + full text; inactive = 50% text, hover fill.
           // pr-3 keeps the 12px right padding the close button's refund uses.
@@ -1131,6 +1189,9 @@ export default function SurfaceTabs({
               in the tab strip above, behind the opt-in paneNewTerminalButton
               setting, because a second terminal in one pane breaks the one pane
               = one terminal concept. Ctrl+T stays bound either way. */}
+          {/* A shadow's layout belongs to the host: no split, and a new
+              browser (it opens on this computer) is left to the ⋮ menu. */}
+          {!shadow && (<>
           <button
             className={`ui-icon-btn ${FOCUS_RING} w-6 h-6`}
             onClick={(e) => { e.stopPropagation(); onSplitHorizontal(); }}
@@ -1152,12 +1213,13 @@ export default function SurfaceTabs({
           <button
             className={`ui-icon-btn ${FOCUS_RING} w-6 h-6`}
             onClick={(e) => { e.stopPropagation(); onAddBrowser(); }}
-            title={t('pane.newBrowser')}
-            aria-label={t('pane.newBrowser')}
+            title={newBrowserLabel}
+            aria-label={newBrowserLabel}
             data-pane-action="new-browser"
           >
             <IconBrowser size={14} />
           </button>
+          </>)}
           {/* Stash — take this pane out of the layout, keep the session (#977).
               It sits next to ✕ with the same visual weight while one is fully
               reversible and the other kills an agent, so the tooltip says what

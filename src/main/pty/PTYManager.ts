@@ -10,12 +10,18 @@ import { getPipeName, ENV_KEYS, getPidMapDir } from '../../shared/constants';
 import { expandTilde } from '../../shared/expandTilde';
 import { resolveSpawnEnv } from './resolveSpawnEnv';
 import { withFreshWindowsPath } from '../../shared/windowsPathEnv';
+import { withoutExeSearchGuard } from '../../shared/exeSearch';
 import { resolveEnvPolicy, type SpawnKind } from '../../shared/spawnKind';
 import { getAccountStore } from '../account/accountStore';
 import { withheldCredentialNames } from '../../shared/envFilter';
 import { getShellUtf8Locale } from './shellLocale';
 import { isWindows, parseWindowsBuildNumber } from '../../shared/platform';
-import { shouldUseBundledConpty, spawnWithConptyPolicy } from '../../shared/conptyWindows';
+import {
+  CONPTY_BACKEND_ENV,
+  parseConptyBackendOverride,
+  shouldUseBundledConpty,
+  spawnWithConptyPolicy,
+} from '../../shared/conptyWindows';
 import { ShellDetector } from '../../shared/ShellDetector';
 import { forgetPtyShell, recordPtyShell } from './ptyShellRegistry';
 import { windowsPowerShellPolicyArgs } from '../../shared/pwshExecutionPolicy';
@@ -279,7 +285,10 @@ export class PTYManager {
     // Refresh PATH from the live registry (win32) so a pane spawned by a
     // long-lived control process still finds tools installed after it started —
     // native-terminal freshness. No-op off win32 / on failure (withFreshWindowsPath).
-    const env = resolveSpawnEnv(withFreshWindowsPath(globalThis.process.env), options?.env, identity, getShellUtf8Locale(), policy, accountEnv);
+    // A pane is the user's own shell: drop the executable-lookup guard wmux set
+    // on its own process (see shared/exeSearch.ts), so cmd.exe in the pane
+    // keeps its usual lookup. Same rule as DaemonSessionManager.createSession.
+    const env = withoutExeSearchGuard(resolveSpawnEnv(withFreshWindowsPath(globalThis.process.env), options?.env, identity, getShellUtf8Locale(), policy, accountEnv));
     // 관측 floor: gated pane에서 자격증명을 withheld하면 로컬 로그 1줄로 남긴다.
     // 침묵이 신고 사건의 실제 원인이었다 — "왜 없지?"를 로그로 즉시 답한다.
     if (policy === 'gated') {
@@ -304,13 +313,17 @@ export class PTYManager {
     // Windows). Surface an actionable error instead of the raw node-pty throw.
     // (useConpty is a Windows-only hint; node-pty ignores it elsewhere.)
     //
-    // #910: below Windows 11 the in-box ConPTY never forwards mouse-mode
-    // DECSETs (see shared/platform.ts shouldUseBundledConpty), so local-mode
-    // spawns take the bundled conpty.dll there too. DLL-load failures fall
+    // #910/#1932: Windows spawns take the bundled conpty.dll (see
+    // shared/conptyWindows.ts shouldUseBundledConpty), so local-mode spawns
+    // match the daemon's backend. DLL-load failures fall
     // back to in-box exactly once; anything else keeps failing so transient
     // ConPTY errors reach the supervisor's restart backoff.
     let ptyProcess: ReturnType<typeof pty.spawn>;
-    const useConptyDll = shouldUseBundledConpty(process.platform, parseWindowsBuildNumber(os.release()));
+    const useConptyDll = shouldUseBundledConpty(
+      process.platform,
+      parseWindowsBuildNumber(os.release()),
+      parseConptyBackendOverride(process.env[CONPTY_BACKEND_ENV]),
+    );
     try {
       ptyProcess = spawnWithConptyPolicy(
         (useBundled) => pty.spawn(shell, spawnArgs, {

@@ -2,7 +2,7 @@
 // read, gh env, TTL cache, single-flight and the rate-limit breaker (exec
 // mocked, as in GhPrService.test).
 import { describe, it, expect, vi } from 'vitest';
-import { GhIssueService, ghIssueEnv, issueListPath, isRateLimitError, mapRestIssue, mapRestItem, mapGhIssueDetail } from '../GhIssueService';
+import { GhIssueService, ghIssueEnv, issueListPath, isRateLimitError, mapRestIssue, mapRestItem, mapGhIssueDetail, roleOf } from '../GhIssueService';
 import { getExecEnv } from '../../../shared/execEnv';
 import type { IssueFilter } from '../../../shared/issueSurface';
 
@@ -128,6 +128,123 @@ describe('list path and explicit repo', () => {
     const bad = await svc.listIssues('/repo', { kind: 'all' }, '/some/path');
     expect(bad.ok).toBe(false);
     expect(calls).toHaveLength(1);
+  });
+});
+
+describe('repo permission', () => {
+  it('maps the strongest REST flag to its role, none to null', () => {
+    expect(roleOf({ admin: true, maintain: true, push: true, pull: true })).toBe('ADMIN');
+    expect(roleOf({ admin: false, maintain: true, push: true })).toBe('MAINTAIN');
+    expect(roleOf({ admin: false, maintain: false, push: true, triage: true, pull: true })).toBe('WRITE');
+    expect(roleOf({ triage: true, pull: true })).toBe('TRIAGE');
+    expect(roleOf({ pull: true })).toBe('READ');
+    expect(roleOf(null)).toBeNull();
+    expect(roleOf({})).toBeNull();
+  });
+
+  const roleCalls = (calls: Array<{ args: string[] }>) => calls.filter((c) => c.args.includes('repos/o/r'));
+
+  it('reads the named repo once per login and keeps it for the session; concurrent reads share one call', async () => {
+    const { svc, calls, nowRef } = makeService((args) => (args.includes('user')
+      ? 'Me\n'
+      : '{"admin":false,"maintain":false,"push":false,"triage":false,"pull":true}\n'));
+    const [a, b] = await Promise.all([svc.repoPermission(KEY, '/r'), svc.repoPermission(KEY, '/r')]);
+    expect([a, b]).toEqual([{ permission: 'READ', login: 'me' }, { permission: 'READ', login: 'me' }]);
+    expect(roleCalls(calls)).toHaveLength(1);
+    expect(roleCalls(calls)[0].args).toEqual(['api', '--hostname', 'github.com', 'repos/o/r', '--jq', '.permissions']);
+    nowRef.t += 24 * 60 * 60 * 1000;
+    expect(await svc.repoPermission(KEY, '/r')).toEqual({ permission: 'READ', login: 'me' });
+    expect(roleCalls(calls)).toHaveLength(1);
+  });
+
+  it('another login on the host (gh auth switch) reads its own role and drops the old ones', async () => {
+    let who = 'me';
+    let role = '{"push":true}';
+    const { svc, calls, nowRef } = makeService((args) => (args.includes('user') ? `${who}\n` : role));
+    expect(await svc.repoPermission(KEY, '/r')).toEqual({ permission: 'WRITE', login: 'me' });
+    who = 'other';
+    role = '{"pull":true}';
+    nowRef.t += 6 * 60_000; // past the login TTL
+    expect(await svc.repoPermission(KEY, '/r')).toEqual({ permission: 'READ', login: 'other' });
+    expect(roleCalls(calls)).toHaveLength(2);
+    // Back to the first account: its role was dropped, so it is read again.
+    who = 'me';
+    role = '{"push":true}';
+    nowRef.t += 6 * 60_000;
+    expect(await svc.repoPermission(KEY, '/r')).toEqual({ permission: 'WRITE', login: 'me' });
+    expect(roleCalls(calls)).toHaveLength(3);
+  });
+
+  it('the page\'s refresh (force) reads the login and the role again', async () => {
+    let role = '{"push":true}';
+    const { svc, calls } = makeService((args) => (args.includes('user') ? 'me\n' : role));
+    expect((await svc.repoPermission(KEY, '/r')).permission).toBe('WRITE');
+    role = '{"pull":true}';
+    expect((await svc.repoPermission(KEY, '/r')).permission).toBe('WRITE');
+    expect((await svc.repoPermission(KEY, '/r', true)).permission).toBe('READ');
+    expect(calls.filter((c) => c.args.includes('user'))).toHaveLength(2);
+    expect(roleCalls(calls)).toHaveLength(2);
+  });
+
+  it('a refresh never takes the answer of a read that began before it', async () => {
+    let release: (v: string) => void = () => undefined;
+    let first = true;
+    const { svc, calls } = makeService((args) => {
+      if (args.includes('user')) return 'me\n';
+      if (first) { first = false; return new Promise<string>((r) => { release = r; }); }
+      return '{"pull":true}';
+    });
+    const early = svc.repoPermission(KEY, '/r');
+    await Promise.resolve();
+    const forced = svc.repoPermission(KEY, '/r', true);
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    release('{"push":true}');
+    expect((await early).permission).toBe('WRITE');
+    expect((await forced).permission).toBe('READ');
+    expect(roleCalls(calls)).toHaveLength(2);
+  });
+
+  it('a refresh that waited on a read which tripped the rate limit makes no call of its own', async () => {
+    let release: (v: string | Error) => void = () => undefined;
+    const { svc, calls } = makeService((args) => (args.includes('user')
+      ? 'me\n'
+      : new Promise<string>((resolve, reject) => { release = (v) => (v instanceof Error ? reject(v) : resolve(v)); })));
+    const early = svc.repoPermission(KEY, '/r');
+    await Promise.resolve();
+    const forced = svc.repoPermission(KEY, '/r', true);
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    release(rateLimitErr());
+    expect((await early).permission).toBeNull();
+    expect((await forced).permission).toBeNull();
+    expect(roleCalls(calls)).toHaveLength(1);
+  });
+
+  it('a repo that answers with no permissions is read-only and kept; a failed read is null and not kept', async () => {
+    let fail = true;
+    const { svc, calls } = makeService((args) => (args.includes('user') ? 'me\n' : fail ? new Error('boom') : 'null\n'));
+    expect(await svc.repoPermission(KEY, '/r')).toEqual({ permission: null, login: 'me' });
+    fail = false;
+    // A public repo the viewer does not collaborate on: no permissions field.
+    expect(await svc.repoPermission(KEY, '/r')).toEqual({ permission: 'READ', login: 'me' });
+    expect(await svc.repoPermission(KEY, '/r')).toEqual({ permission: 'READ', login: 'me' });
+    expect(roleCalls(calls)).toHaveLength(2);
+    expect(await svc.repoPermission('/some/path', '/r')).toEqual({ permission: null, login: null });
+    expect(roleCalls(calls)).toHaveLength(2);
+  });
+
+  it('with the login unreadable, the role is still read, answered with no login and not kept', async () => {
+    const { svc, calls } = makeService((args) => (args.includes('user') ? new Error('no user scope') : '{"pull":true}'));
+    expect(await svc.repoPermission(KEY, '/r')).toEqual({ permission: 'READ', login: null });
+    expect(await svc.repoPermission(KEY, '/r')).toEqual({ permission: 'READ', login: null });
+    expect(roleCalls(calls)).toHaveLength(2);
+  });
+
+  it('makes no call while the rate-limit breaker is open', async () => {
+    const { svc, calls } = makeService((args) => (args.includes('user') ? rateLimitErr() : '{"push":true}'));
+    expect(await svc.signedInLogin('github.com', '/r')).toBeNull();
+    const before = calls.length;
+    expect(await svc.repoPermission(KEY, '/r')).toEqual({ permission: null, login: null });
+    expect(calls).toHaveLength(before);
   });
 });
 

@@ -299,6 +299,12 @@ export const IPC = {
   //   renderer-only trust boundary.
   DECK_LEDGER_GATE_GET: 'deck:ledger-gate:get',
   DECK_LEDGER_GATE_SET: 'deck:ledger-gate:set',
+  //   DECK_FLEET_FAST_PATH_* — the `deck.fleetFastPath` switch (Settings
+  //   toggle). ON answers short read-only Fleet questions from the desktop
+  //   composer with the local Fleet board instead of a Moa turn. Backed by
+  //   deck-fleet-fast-path.json (main/deck/deckFleetFastPathStore.ts).
+  DECK_FLEET_FAST_PATH_GET: 'deck:fleet-fast-path:get',
+  DECK_FLEET_FAST_PATH_SET: 'deck:fleet-fast-path:set',
   //   DECK_LEDGER_SUMMARY — the Deck status panel's read: the open task
   //   ledger rows one workspace's brain owns, joined with the workspace
   //   mirror's per-worker agent status. Read-only projection.
@@ -618,6 +624,9 @@ export const IPC = {
   // Fleet Ready to review — a task's change counts only (numstat + untracked),
   // no patch text; answers `unchanged` when the worktree state key matches.
   DIFF_SUMMARY: 'diff:summary',
+  // Git page Worktrees — how many paths have uncommitted changes, from
+  // `git status` alone (no file is read).
+  DIFF_STATUS: 'diff:status',
   // Deck Git 탭 — 워크트리 GUI (list/add/remove; remove는 --force 미제공)
   WORKTREE_LIST: 'worktree:list',
   WORKTREE_ADD: 'worktree:add',
@@ -634,6 +643,9 @@ export const IPC = {
   // Git page Issues view (gh CLI, 30s TTL, rate-limit breaker)
   GITHUB_ISSUE_LIST: 'github:issueList',
   GITHUB_ISSUE_DETAIL: 'github:issueDetail',
+  // The signed-in gh login and the viewer's role on a repo (read on Git page show, cached in main)
+  GITHUB_VIEWER_LOGIN: 'github:viewerLogin',
+  GITHUB_REPO_PERMISSION: 'github:repoPermission',
   // PR review and CI on the Git page's detail pane (src/main/github/GhPrReviewService.ts).
   PR_REVIEW_CHECKS: 'prReview:checks',
   PR_REVIEW_FILES: 'prReview:files',

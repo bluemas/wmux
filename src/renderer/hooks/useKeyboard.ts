@@ -6,8 +6,10 @@ import { terminalRegistry } from './useTerminal';
 import { t } from '../i18n';
 import { pastePtyChunked } from '../utils/clipboardChunk';
 import { isPrefixTrigger, resolveShortcut, type ShortcutActionId } from '../../shared/keymap';
+import { isPcRailAction, pcRailClaimsKey, pcShortcutTarget } from '../components/PcRail/pcRailModel';
 import { currentShortcutBindings, shortcutPressGuard } from '../utils/shortcutBindings';
 import { createTerminalSurface } from '../utils/createTerminalSurface';
+import { selectHostPickName } from '../stores/shadowWorkspace';
 import { openUrlInBrowserPane } from '../utils/browserPaneActions';
 import { PRIVATE_BROWSER_PARTITION } from '../../shared/privateBrowser';
 import {
@@ -385,6 +387,12 @@ export function useKeyboard() {
       }
     };
 
+    // PC rail: cycle the computer column, or return to this computer.
+    const selectPc = (action: 'prevPc' | 'nextPc' | 'thisPc'): void => {
+      const st = store.getState();
+      st.setActivePc(pcShortcutTarget(action, st.pcRailHosts.map((h) => h.id), st.pcRail.activePcId));
+    };
+
     const builtinActions: Partial<Record<ShortcutActionId, () => void>> = {
       splitHorizontal: () => {
         const ws = activeWorkspace();
@@ -465,6 +473,9 @@ export function useKeyboard() {
       floatingPane: () => { store.getState().toggleFloatingPane(); },
       prevWorkspace: () => { prefixActions.prevWorkspace(); },
       nextWorkspace: () => { prefixActions.nextWorkspace(); },
+      prevPc: () => selectPc('prevPc'),
+      nextPc: () => selectPc('nextPc'),
+      thisPc: () => selectPc('thisPc'),
       workspace1: () => jumpToWorkspace(0),
       workspace2: () => jumpToWorkspace(1),
       workspace3: () => jumpToWorkspace(2),
@@ -632,8 +643,10 @@ export function useKeyboard() {
       // Read prefix mode from store (fresh, no stale closure)
       const prefixMode = store.getState().prefixMode;
       // Another rail page covers the panes: nothing below may reach a PTY or
-      // change the layout (see WORKSPACES_ONLY_ACTIONS).
-      const onWorkspaces = store.getState().appRoute === 'workspaces';
+      // change the layout (see WORKSPACES_ONLY_ACTIONS). Nor while another
+      // computer is selected with none of its workspaces open: this
+      // computer's panes are hidden behind "Pick a workspace" then.
+      const onWorkspaces = store.getState().appRoute === 'workspaces' && selectHostPickName(store.getState()) === null;
 
       // Custom-keybinding dispatch: runs when no built-in owns the combo —
       // including one the user switched off or moved away, so a custom macro
@@ -808,7 +821,11 @@ export function useKeyboard() {
       const mentionClaim = action === 'mentionAgent'
         ? mentionKeyClaim(store.getState(), e, window.electronAPI?.platform)
         : undefined;
-      if (action && run && mentionClaim !== null) {
+      // A PC rail chord is the rail's only while a computer is paired and no
+      // custom keybinding sits on it; otherwise it goes on (useTerminal lets
+      // xterm encode it), as for a switched-off built-in.
+      const pcUnclaimed = isPcRailAction(action) && !pcRailClaimsKey(store.getState(), e);
+      if (action && run && mentionClaim !== null && !pcUnclaimed) {
         e.preventDefault();
         if (STOP_PROPAGATION_ACTIONS.has(action)) e.stopImmediatePropagation();
         shortcutPressGuard.noteActed(e);

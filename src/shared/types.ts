@@ -24,6 +24,7 @@ import type { WorkspaceColorId } from './workspaceColors';
 // cycle, which TypeScript resolves without any runtime import.
 import type { AgentSlug } from './events';
 import type { OrchestratorRoleBindings } from './orchestratorRole';
+import type { PcRailPersisted } from './pcRail';
 import type { AgentSignalKind } from './hooks/signal-types';
 
 // Re-export for backward compatibility
@@ -783,6 +784,11 @@ export interface ArchivedWorkspace {
   color?: string;            // WorkspaceColorId — string-typed like the persisted tag
   profile?: WorkspaceProfile;
   tree: LayoutNode;
+  /** Each leaf's working directory when it was archived, in `tree`'s leaf
+   *  order ('' for a leaf without a terminal cwd). Restore opens each
+   *  terminal there instead of the startup directory. Absent on entries
+   *  archived before this field existed. */
+  leafCwds?: string[];
   archivedAt: number;        // epoch ms, for the "3d ago" trailer
 }
 
@@ -868,6 +874,8 @@ export interface SessionData {
   // Titlebar wall-clock (2026-09-05). Default off; persisted so the people who
   // turn it on keep it across restarts.
   titlebarClockVisible?: boolean;
+  /** Memory/CPU chips at every reading. Default off; persisted like the clock. */
+  titlebarVitalsAlwaysVisible?: boolean;
   /** Experimental opt-in; absent means off. See uiSlice.paneNewTerminalButton. */
   paneNewTerminalButton?: boolean;
   scrollbackLines?: number;
@@ -898,6 +906,8 @@ export interface SessionData {
   coldParkEnabled?: boolean;
   /** #1641: draw sixel / iTerm2 inline images (default true). */
   inlineImagesEnabled?: boolean;
+  /** #1947: plain left-drag selects text under app mouse tracking (default true). */
+  plainDragSelectEnabled?: boolean;
   /**
    * #517 browser lightweight mode: CPU-throttle effectively-invisible embedded
    * browser guests (automation-leased guests stay full-speed). Default false.
@@ -968,6 +978,9 @@ export interface SessionData {
   /** Workspaces pinned to the top of the sidebar (2026-09-26; before that a pin
    *  held a manual slot in the Attention order — same shape, loaded as pinned-to-top). */
   sidebarPinnedIds?: string[];
+  /** Bookmarked workspaces: a mark the sidebar filter can narrow to. Unlike a
+   *  pin it never changes the order. */
+  sidebarBookmarkedIds?: string[];
   /** #1481 — expanded sidebar width in px. Clamped on load. */
   sidebarWidth?: number;
   /** #1481 — owner workspace id → user-chosen expansion of its fan-out task group. */
@@ -1001,6 +1014,8 @@ export interface SessionData {
   shortcutOverrides?: Partial<Record<string, string | null>>;
   autoUpdateEnabled?: boolean;
   customThemeColors?: CustomThemeColors;
+  /** PC rail: the selected computer, the last workspace per computer, muted hosts. Never a shadow id. */
+  pcRail?: PcRailPersisted;
   sidebarMode?: 'workspaces' | 'company';
   company?: Company | null;
   memberCosts?: Record<string, number>;

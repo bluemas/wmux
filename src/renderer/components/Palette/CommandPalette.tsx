@@ -9,6 +9,7 @@ import { resolveStartupCwd, withDefaultShell, withWorkspaceProfile } from '../..
 import { pastePtyChunked } from '../../utils/clipboardChunk';
 import { openUrlInBrowserPane } from '../../utils/browserPaneActions';
 import { PRIVATE_BROWSER_PARTITION } from '../../../shared/privateBrowser';
+import { isShadowWorkspaceId } from '../../../shared/pcRail';
 import { hasAdoptableTaskDiff, openTaskDiff } from '../../utils/openTaskDiff';
 import { tokenAttrs } from '../../themes';
 import { usePlugins } from '../../plugins/usePlugins';
@@ -35,6 +36,7 @@ import {
   showGitDiff,
   stashActivePane,
   toggleAgentToolbarPin,
+  toggleActiveWorkspaceBookmark,
 } from '../../utils/commandActions';
 
 // ---------------------------------------------------------------------------
@@ -330,7 +332,8 @@ export default function CommandPalette() {
             return;
           }
           const ws = state.workspaces.find((w) => w.id === state.activeWorkspaceId);
-          if (ws) {
+          // Another computer's (shadow) workspace never gets a local shell.
+          if (ws && !isShadowWorkspaceId(ws.id)) {
             // Issue #175: new tabs honor profile.startupCwd > global startupDirectory.
             const cwd = resolveStartupCwd({ splitInheritsCwd: false, profile: ws.profile, startupDirectory: state.startupDirectory });
             void ipcInvoke<{ id: string; cwd?: string }>(() =>
@@ -405,6 +408,11 @@ export default function CommandPalette() {
         label: t('palette.cmd.renameTab'),
         shortcut: 'renameTab',
         action: () => { setVisible(false); renameActiveTab(); },
+      },
+      {
+        // No default key: bookmarking is occasional, and the row menu has it.
+        label: t('palette.cmd.toggleBookmark'),
+        action: () => { toggleActiveWorkspaceBookmark(); setVisible(false); },
       },
     ];
 

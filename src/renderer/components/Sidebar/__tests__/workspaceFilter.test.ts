@@ -7,7 +7,7 @@ import type { StoreState } from '../../../stores';
 import type { Pane, Workspace } from '../../../../shared/types';
 
 const facts = (over: Partial<WorkspaceFacts> = {}): WorkspaceFacts => ({
-  status: 'idle', hasAgent: true, agents: ['claude'], hasPr: false, hasChanges: false, isTask: false, ...over,
+  status: 'idle', hasAgent: true, agents: ['claude'], hasPr: false, hasChanges: false, isTask: false, isBookmarked: false, ...over,
 });
 const f = (over: Partial<WorkspaceFilter>): WorkspaceFilter => ({ ...EMPTY_FILTER, ...over });
 
@@ -46,6 +46,44 @@ describe('workspace filter', () => {
     const after = toggleFacet(filter, chips[0]);
     expect(after.status).toEqual([]);
     expect(isFilterActive(toggleFacet(toggleFacet(after, chips[1]), chips[2]))).toBe(false);
+  });
+
+  it('narrows to bookmarked workspaces on its own, as a removable chip listed first', () => {
+    const filter = toggleFacet(EMPTY_FILTER, { group: 'bookmarked', value: true });
+    expect(filter.bookmarked).toBe(true);
+    expect(isFilterActive(filter)).toBe(true);
+    expect(matchesFilter(filter, facts({ isBookmarked: true }))).toBe(true);
+    expect(matchesFilter(filter, facts())).toBe(false);
+    // It ANDs with the other groups.
+    const both = f({ bookmarked: true, status: ['running'] });
+    expect(matchesFilter(both, facts({ isBookmarked: true, status: 'running' }))).toBe(true);
+    expect(matchesFilter(both, facts({ isBookmarked: true }))).toBe(false);
+    expect(filterChips(both).map((c) => c.group)).toEqual(['bookmarked', 'status']);
+    expect(isFilterActive(toggleFacet(filter, { group: 'bookmarked', value: true }))).toBe(false);
+  });
+
+  it('reads a bookmark from the store, and a nested task follows its bookmarked owner', () => {
+    const ws = (id: string): Workspace => {
+      const leaf: Pane = { id: `p-${id}`, type: 'leaf', activeSurfaceId: `s-${id}`,
+        surfaces: [{ id: `s-${id}`, ptyId: `pty-${id}`, title: 'sh', shell: 'zsh', cwd: '/repo', surfaceType: 'terminal' }] };
+      return { id, name: id, rootPane: leaf, activePaneId: leaf.id };
+    };
+    const state = {
+      workspaces: [ws('owner'), ws('task'), ws('plain'), ws('loose')],
+      activeWorkspaceId: 'owner',
+      surfaceAgent: {}, surfaceAgentStatus: {},
+      surfacePendingQuestion: {}, surfaceQuestionSeen: {}, surfaceActivity: {}, surfaceActivityAt: {},
+      surfaceTurnOpenAt: {}, paneLabel: {}, agentClockMs: 0, remoteWorkspaces: [],
+      // `task` nests under `owner`; `loose` was spawned by `plain`.
+      missionByPaneGroup: {}, fanoutLineage: { task: 'owner', loose: 'plain' }, fanoutSpawnOwner: {},
+      usageLimitWaiting: {},
+      sidebarBookmarkedIds: ['owner'],
+    } as unknown as StoreState;
+    const keys = selectWorkspaceFactKeys(state);
+    expect(factsFromKey(keys.owner).isBookmarked).toBe(true);
+    expect(factsFromKey(keys.task).isBookmarked).toBe(true);
+    expect(factsFromKey(keys.plain).isBookmarked).toBe(false);
+    expect(factsFromKey(keys.loose).isBookmarked).toBe(false);
   });
 
   it('reads status with the sidebar classification', () => {

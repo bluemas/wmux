@@ -41,6 +41,26 @@ describe('moa_propose_handoff', () => {
     expect(params).not.toHaveProperty('callerPtyId');
   });
 
+  it('resolves a #pane name in ptyId or paneId before calling main', async () => {
+    const callRpc = vi.fn(async (_method: string, _params: Record<string, unknown>) => ({ content: [{ type: "text" as const, text: "{}" }] }));
+    let handler: Handler | undefined;
+    registerMoaHandoffTool(((name: string, _d: string, _s: unknown, h: Handler) => {
+      if (name === 'moa_propose_handoff') handler = h;
+    }) as never, {
+      callRpc,
+      getCommanderToken: () => 'tok-hq',
+      resolvePtyId: async (ref) => (ref === '#backend' ? 'daemon-1' : ref),
+      resolvePaneId: async (ref) => (ref === '#w2-1' ? 'pane-21' : ref),
+    });
+    await handler!({ ptyId: '#backend', body: 'x' });
+    await handler!({ paneId: '#w2-1', body: 'y' });
+    expect(callRpc.mock.calls[0][1]).toEqual({ token: 'tok-hq', ptyId: 'daemon-1', body: 'x' });
+    expect(callRpc.mock.calls[1][1]).toEqual({ token: 'tok-hq', paneId: 'pane-21', body: 'y' });
+    // With a ptyId, main ignores paneId, so a paneId name is not looked up.
+    await handler!({ ptyId: 'daemon-9', paneId: '#stale', body: 'z' });
+    expect(callRpc.mock.calls[2][1]).toEqual({ token: 'tok-hq', ptyId: 'daemon-9', paneId: '#stale', body: 'z' });
+  });
+
   it('is commander-only, with its RPC in the commander lane and the first-party set', () => {
     expect(COMMANDER_ONLY_TOOLS).toContain('moa_propose_handoff');
     expect(COMMANDER_RPC_METHODS.has('deck.proposeHandoff')).toBe(true);

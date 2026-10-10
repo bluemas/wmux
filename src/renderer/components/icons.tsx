@@ -477,6 +477,27 @@ export function IconCornerUpLeft({ size = 14 }: { size?: number }) {
   );
 }
 
+/** Horizontal ellipsis — a row's overflow menu trigger. */
+export function IconMoreHorizontal({ size = 14 }: { size?: number }) {
+  return (
+    <Icon size={size}>
+      <line x1="3" y1="7" x2="3.1" y2="7" />
+      <line x1="7" y1="7" x2="7.1" y2="7" />
+      <line x1="11" y1="7" x2="11.1" y2="7" />
+    </Icon>
+  );
+}
+
+/** Elbow — a row nested under the one above it (a link under its PC). */
+export function IconElbow({ size = 14 }: { size?: number }) {
+  return <Icon size={size}><path d="M4.5 2.5v4.8a1.8 1.8 0 0 0 1.8 1.8h4.4" /></Icon>;
+}
+
+/** Speech bubble — a message-only link. */
+export function IconMessage({ size = 14 }: { size?: number }) {
+  return <Icon size={size}><path d="M2.2 3h9.6v6.2H6.4L3.8 11.4V9.2H2.2z" /></Icon>;
+}
+
 /** Vertical ellipsis — an overflow menu trigger. */
 export function IconMoreVertical({ size = 14 }: { size?: number }) {
   return (
@@ -489,6 +510,11 @@ export function IconMoreVertical({ size = 14 }: { size?: number }) {
 }
 
 /** Pin — a row that keeps its place in the sidebar's Attention order. */
+/** Bookmark ribbon — a bookmarked workspace (sidebar row mark, filter). */
+export function IconBookmark({ size = 14 }: { size?: number }) {
+  return <Icon size={size}><path d="M4.2 1.8 H9.8 V12.2 L7 9.8 L4.2 12.2 Z" /></Icon>;
+}
+
 export function IconPin({ size = 14 }: { size?: number }) {
   return (
     <Icon size={size}>

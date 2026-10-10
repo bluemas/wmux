@@ -42,6 +42,12 @@ export const tr = {
 
   // Pane stash (#977) — the pane leaves the layout, its session keeps running.
   'pane.rename': 'Bölmeyi yeniden adlandır',
+  'pane.renameError.whitespace': "Bölme adları boşluk içeremez",
+  'pane.renameError.reservedChar': "Bölme adları # veya @ içeremez",
+  'pane.renameError.leadingDigit': "Bölme adları rakamla başlayamaz",
+  'pane.renameError.autoName': "w1-2 gibi adlar otomatik bölme adları için ayrılmıştır",
+  'pane.renameError.duplicate': "Bu adı başka bir bölme zaten kullanıyor",
+  'pane.renameError.failed': "Bölme yeniden adlandırılamadı",
   'pane.stash': 'Bölmeyi kenara al',
   'pane.stashHint': 'Düzenden çıkarılır — oturum çalışmaya devam eder',
   'pane.unstash': 'Geri getir',
@@ -517,4 +523,25 @@ export const tr = {
   // ─── Çalışma alanı ögesi: görev worktree sınırı uyarısı ───
   'workspace.cwdDeparted': "Bölme cwd'si görev worktree sınırının dışına çıktı: {cwd}",
   'workspace.departed': 'ayrıldı',
+  'settings.plainDragSelect': "Uygulama fareyi kullansa bile sürükleyerek metin seç",
+  'settings.plainDragSelectDesc': "Düz sürükleme, Codex gibi fareyi kullanan uygulamalarda bile metni seçer; tıklama yine uygulamaya gider. Sürüklemeyi uygulamaya göndermek için sürüklerken Shift (macOS) veya Alt (Windows, Linux) tuşunu basılı tutun.",
+  'pcRail.notChecked': "Henüz denetlenmedi",
+  'pcRail.access.revokeHintUnknown': "İptal etmek için: Bu bilgisayar bir kodla eşleştirildiyse {name} üzerindeki Eşleştirilmiş cihazlar bölümünden kaldırın. {name} web bağlantısıyla eklendiyse yalnızca yeni bir bağlantı (wmux web --new-token) onu keser.",
+  'remote.scope.read': "Eşleştirilmiş bir cihaz, bu bilgisayardaki her çalışma alanının çıktısını okuyabilir ve arayabilir; sonradan açılanlar dahil.",
+  'remote.scope.viewOnly': "Yalnızca görüntüleme yazmayı engeller, ancak tek tuş isteyen ekran istemlerini yine de yanıtlayabilir.",
+  'remote.scope.input': "Yazabilir ayrıca oturum açıp kapatmaya ve onayları yanıtlamaya izin verir.",
+  'remotePage.connect.pasteScope': "Davet çalışma alanlarını paylaşıyorsa bu bilgisayar o PC'deki her çalışma alanını okuyabilir ve arayabilir; sonradan açılanlar dahil. Eşleşik kaldığı sürece wmux onu birkaç saniyede bir denetler, uyarıları için bir bağlantı açık tutar ve bildirimlerini gösterir; kenar çubuğu başlığındaki bilgisayar menüsünden sessize alın.",
+  'pcSwitcher.open': "Bilgisayar değiştir",
+  'pcSwitcher.manage': "{name} ayarları",
+  'pcSwitcher.othersNeedYou': "Diğer bilgisayarlarda {count} öğe sizi bekliyor",
+  // Quit and Stop Sessions (main-process native confirm)
+  'quitAndStop.message': "wmux'tan çıkıp tüm oturumlar durdurulsun mu?",
+  'quitAndStop.detail': "Şu an çalışan: {agents} ajan oturumu, toplam {sessions} terminal. Hepsi durdurulacak. Normal Çıkış onları arka planda çalışır bırakır.",
+  'quitAndStop.detailUnknown': "wmux çalışan oturumları sayamadı. Tüm terminaller ve ajan oturumları durdurulacak. Normal Çıkış onları arka planda çalışır bırakır.",
+  'quitAndStop.confirm': "Çık ve Oturumları Durdur",
+  'quitAndStop.cancel': "İptal",
+  'quitAndStop.stopFailedMessage': "wmux oturumları durduramadı.",
+  'quitAndStop.stopFailedDetail': "wmux arka plan hizmeti durmadı; bu yüzden wmux açık kalıyor ve oturumlarınız hâlâ çalışıyor. Bir terminalde wmux daemon stop komutunu çalıştırın, ardından yeniden çıkın.",
+  'quitAndStop.alreadyQuittingMessage': "wmux zaten kapanıyor.",
+  'quitAndStop.alreadyQuittingDetail': "Bu çıkış oturumlarınızı arka planda çalışır halde bırakır. Durdurmak için bir terminalde wmux daemon stop komutunu çalıştırın.",
 } as const;
