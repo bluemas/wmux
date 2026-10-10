@@ -3447,4 +3447,14 @@ export const zh = {
   'remote.scope.viewOnly': "仅查看会阻止输入，但仍可回应只需按一个键的屏幕提示。",
   'remote.scope.input': "可输入还允许它打开和关闭会话以及回应审批。",
   'remotePage.connect.pasteScope': "如果邀请共享了工作区，这台电脑可以读取和搜索那台电脑上的所有工作区，包括之后打开的。配对期间，wmux 每隔几秒检查一次，保持连接以接收提醒并显示其通知；可在电脑栏中该电脑的图标上将其静音。",
+  // Quit and Stop Sessions (main-process native confirm)
+  'quitAndStop.message': "退出 wmux 并停止所有会话？",
+  'quitAndStop.detail': "正在运行：{agents} 个智能体会话，共 {sessions} 个终端。它们都将被停止。普通退出会让它们在后台继续运行。",
+  'quitAndStop.detailUnknown': "无法统计正在运行的会话。所有终端和智能体会话都将被停止。普通退出会让它们在后台继续运行。",
+  'quitAndStop.confirm': "退出并停止会话",
+  'quitAndStop.cancel': "取消",
+  'quitAndStop.stopFailedMessage': "无法停止会话。",
+  'quitAndStop.stopFailedDetail': "wmux 守护进程未停止，因此 wmux 保持打开，会话仍在运行。请在终端中运行 wmux daemon stop，然后再次退出。",
+  'quitAndStop.alreadyQuittingMessage': "wmux 正在退出。",
+  'quitAndStop.alreadyQuittingDetail': "此次退出会让会话在后台继续运行。要停止它们，请在终端中运行 wmux daemon stop。",
 } as const;

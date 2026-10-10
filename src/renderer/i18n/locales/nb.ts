@@ -530,4 +530,14 @@ export const nb = {
   'remote.scope.viewOnly': "Bare visning blokkerer skriving, men kan fortsatt svare på ledetekster på skjermen som krever én tast.",
   'remote.scope.input': "Kan skrive lar den også åpne og lukke økter og svare på godkjenninger.",
   'remotePage.connect.pasteScope': "Hvis invitasjonen deler arbeidsområder, kan denne datamaskinen lese og søke i alle arbeidsområder på den PC-en, også de som åpnes senere. Mens de er paret, sjekker wmux den med noen sekunders mellomrom, holder en tilkobling åpen for varslene og viser varslingene; demp dem fra ikonet i datamaskinkolonnen.",
+  // Quit and Stop Sessions (main-process native confirm)
+  'quitAndStop.message': "Avslutt wmux og stopp alle økter?",
+  'quitAndStop.detail': "Agentøkter som kjører: {agents}. Terminaler totalt: {sessions}. Alle blir stoppet. Vanlig Avslutt lar dem kjøre videre i bakgrunnen.",
+  'quitAndStop.detailUnknown': "wmux kunne ikke telle øktene som kjører. Alle terminaler og agentøkter blir stoppet. Vanlig Avslutt lar dem kjøre videre i bakgrunnen.",
+  'quitAndStop.confirm': "Avslutt og stopp økter",
+  'quitAndStop.cancel': "Avbryt",
+  'quitAndStop.stopFailedMessage': "wmux kunne ikke stoppe øktene.",
+  'quitAndStop.stopFailedDetail': "wmux-daemonen stoppet ikke, så wmux forblir åpen og øktene dine kjører fortsatt. Kjør wmux daemon stop i en terminal, og avslutt på nytt.",
+  'quitAndStop.alreadyQuittingMessage': "wmux avslutter allerede.",
+  'quitAndStop.alreadyQuittingDetail': "Denne avslutningen lar øktene kjøre videre i bakgrunnen. Kjør wmux daemon stop i en terminal for å stoppe dem.",
 } as const;

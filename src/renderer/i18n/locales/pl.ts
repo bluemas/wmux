@@ -4276,4 +4276,14 @@ export const pl = {
   'remote.scope.viewOnly': "Tylko podgląd blokuje pisanie, ale urządzenie nadal może odpowiadać na monity ekranowe wymagające jednego klawisza.",
   'remote.scope.input': "Może pisać pozwala też otwierać i zamykać sesje oraz odpowiadać na zatwierdzenia.",
   'remotePage.connect.pasteScope': "Jeśli zaproszenie udostępnia obszary robocze, ten komputer może czytać i przeszukiwać każdy obszar roboczy na tamtym komputerze, także otwarte później. Po sparowaniu wmux sprawdza go co kilka sekund, utrzymuje połączenie dla alertów i pokazuje jego powiadomienia; wycisz je z jego ikony w kolumnie komputerów.",
+  // Quit and Stop Sessions (main-process native confirm)
+  'quitAndStop.message': "Zamknąć wmux i zatrzymać wszystkie sesje?",
+  'quitAndStop.detail': "Teraz działa: sesje agentów: {agents}, terminale łącznie: {sessions}. Wszystkie zostaną zatrzymane. Zwykłe zamknięcie zostawia je działające w tle.",
+  'quitAndStop.detailUnknown': "wmux nie mógł policzyć działających sesji. Wszystkie terminale i sesje agentów zostaną zatrzymane. Zwykłe zamknięcie zostawia je działające w tle.",
+  'quitAndStop.confirm': "Zamknij i zatrzymaj sesje",
+  'quitAndStop.cancel': "Anuluj",
+  'quitAndStop.stopFailedMessage': "wmux nie mógł zatrzymać sesji.",
+  'quitAndStop.stopFailedDetail': "Demon wmux się nie zatrzymał, więc wmux pozostaje otwarty, a sesje nadal działają. Uruchom wmux daemon stop w terminalu, a potem zamknij aplikację ponownie.",
+  'quitAndStop.alreadyQuittingMessage': "wmux już się zamyka.",
+  'quitAndStop.alreadyQuittingDetail': "To zamknięcie pozostawia sesje działające w tle. Aby je zatrzymać, uruchom wmux daemon stop w terminalu.",
 } as const;

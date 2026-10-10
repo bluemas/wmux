@@ -530,4 +530,14 @@ export const id = {
   'remote.scope.viewOnly': "Hanya lihat memblokir pengetikan, tetapi masih dapat menjawab perintah di layar yang meminta satu tombol.",
   'remote.scope.input': "Bisa mengetik juga mengizinkannya membuka dan menutup sesi serta menjawab persetujuan.",
   'remotePage.connect.pasteScope': "Jika undangan membagikan ruang kerja, komputer ini dapat membaca dan mencari setiap ruang kerja di PC itu, termasuk yang dibuka nanti. Selama terpasang, wmux memeriksanya setiap beberapa detik, menjaga koneksi terbuka untuk peringatannya, dan menampilkan notifikasinya; bisukan dari ikonnya di kolom komputer.",
+  // Quit and Stop Sessions (main-process native confirm)
+  'quitAndStop.message': "Keluar dari wmux dan hentikan semua sesi?",
+  'quitAndStop.detail': "Sedang berjalan: {agents} sesi agen, total {sessions} terminal. Semuanya akan dihentikan. Keluar biasa membiarkannya tetap berjalan di latar belakang.",
+  'quitAndStop.detailUnknown': "wmux tidak dapat menghitung sesi yang berjalan. Semua terminal dan sesi agen akan dihentikan. Keluar biasa membiarkannya tetap berjalan di latar belakang.",
+  'quitAndStop.confirm': "Keluar dan Hentikan Sesi",
+  'quitAndStop.cancel': "Batal",
+  'quitAndStop.stopFailedMessage': "wmux tidak dapat menghentikan sesi.",
+  'quitAndStop.stopFailedDetail': "Daemon wmux tidak berhenti, jadi wmux tetap terbuka dan sesi Anda masih berjalan. Jalankan wmux daemon stop di terminal, lalu keluar lagi.",
+  'quitAndStop.alreadyQuittingMessage': "wmux sedang keluar.",
+  'quitAndStop.alreadyQuittingDetail': "Keluar kali ini membiarkan sesi Anda tetap berjalan di latar belakang. Untuk menghentikannya, jalankan wmux daemon stop di terminal.",
 } as const;

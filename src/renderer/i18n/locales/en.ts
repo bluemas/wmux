@@ -4316,6 +4316,16 @@ export const en = {
   'remote.scope.viewOnly': "View only blocks typing, but it can still answer on-screen prompts that take a single key.",
   'remote.scope.input': "Can type also lets it open and close sessions and answer approvals.",
   'remotePage.connect.pasteScope': "If the invite shares workspaces, this computer can read and search every workspace on that PC, including later ones. While paired, wmux checks it every few seconds, keeps a connection open for its alerts and shows its notifications; mute them from its icon in the computer column.",
+  // Quit and Stop Sessions (main-process native confirm)
+  'quitAndStop.message': "Quit wmux and stop all sessions?",
+  'quitAndStop.detail': "Agent sessions running: {agents}. Terminals in all: {sessions}. All of them will be stopped. Plain Quit leaves them running in the background.",
+  'quitAndStop.detailUnknown': "wmux could not count the running sessions. Every terminal and agent session will be stopped. Plain Quit leaves them running in the background.",
+  'quitAndStop.confirm': "Quit and Stop Sessions",
+  'quitAndStop.cancel': "Cancel",
+  'quitAndStop.stopFailedMessage': "wmux could not stop the sessions.",
+  'quitAndStop.stopFailedDetail': "The wmux daemon did not stop, so wmux stays open and your sessions are still running. Run wmux daemon stop in a terminal, then quit again.",
+  'quitAndStop.alreadyQuittingMessage': "wmux is already quitting.",
+  'quitAndStop.alreadyQuittingDetail': "This quit leaves your sessions running in the background. To stop them, run wmux daemon stop in a terminal.",
 } as const;
 
 export type TranslationKey = keyof typeof en;
