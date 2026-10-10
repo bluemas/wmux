@@ -18,6 +18,9 @@ export interface MoaGoalToolDeps {
   getCommanderToken: () => string | undefined;
 }
 
+/** How long `moa_goal complete` waits: the gate's own deadline per task plus room. */
+export const MOA_GOAL_COMPLETE_TIMEOUT_MS = 30 * 60 * 1000;
+
 export const MOA_PROPOSE_GOAL_SHAPE = {
   goal: z.string().describe('The goal in one or two plain sentences (≤400 characters), as the operator asked for it.'),
   repo: z.string().optional().describe('Absolute path inside the git repository the work happens in. Fan-out runs there.'),
@@ -40,7 +43,8 @@ const PROPOSE_DESCRIPTION =
 
 const GOAL_DESCRIPTION =
   'HQ (Moa) only. Your goal contract: action "status" (default) shows it — what it grants right now, the budget used, the task workspaces it owns. '
-  + 'action "complete" with a summary of what was done and how you verified it ends it; "cancel" ends it early. Ending only takes powers away.';
+  + 'action "complete" ends it only when it is proved: wmux runs every goal task\'s gate (scripts/verify.sh or npm lint + test; a project with no test command fails) on the task\'s current commit, and each done criterion needs `criteria: [{criterion: n, artifacts: [absolute file paths]}]` naming a log, test result file or screenshot inside the task worktrees, the goal repository or the goal evidence folder. '
+  + 'A refusal (code "unverified") lists every problem; fix them and complete again. "cancel" ends it early. Ending only takes powers away.';
 
 export function registerMoaGoalTools(register: McpServer['tool'], deps: MoaGoalToolDeps): void {
   register(
@@ -70,11 +74,19 @@ export function registerMoaGoalTools(register: McpServer['tool'], deps: MoaGoalT
     {
       action: z.enum(['status', 'complete', 'cancel']).optional().describe('status (default), complete or cancel.'),
       summary: z.string().optional().describe('For complete: what was done and how you verified it. For cancel: why.'),
+      criteria: z.array(z.object({
+        criterion: z.number().int().min(1).describe('The done criterion number, as numbered on the goal (1-based).'),
+        artifacts: z.array(z.string()).min(1).max(8).describe('Absolute paths of the files that prove it: logs, test result files, screenshots.'),
+      })).optional().describe('For complete: the evidence for each done criterion.'),
     },
-    async ({ action, summary }) => {
+    async ({ action, summary, criteria }) => {
       const params: Record<string, unknown> = { token: deps.getCommanderToken(), action: action ?? 'status' };
       if (summary) params.summary = summary;
-      return deps.callRpc('deck.goal', params);
+      if (criteria) params.criteria = criteria;
+      // Completing runs every goal task's gate, which can take minutes.
+      return action === 'complete'
+        ? deps.callRpc('deck.goal', params, MOA_GOAL_COMPLETE_TIMEOUT_MS)
+        : deps.callRpc('deck.goal', params);
     },
   );
 }

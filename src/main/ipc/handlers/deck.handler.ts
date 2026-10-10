@@ -827,6 +827,8 @@ export function registerDeckHandler(
     notify: () => emitMoaChanged(),
     // W5: a wake carrying another PC's Moa's work never fans out on the goal.
     turnWokenByRemoteMoa: (hq) => managers.get(hq)?.manager.turnWokenByRemoteMoa === true,
+    // The goal verifier lists the goal's tasks through the daemon.
+    getDaemonClient: () => (opts.getDaemonClient?.() ?? null) as { rpc(method: string, params?: unknown): Promise<unknown> } | null,
   });
   setMoaGoalService(moaGoals);
   installMoaLevelGate(moaGoals, { getWindow, getDaemonClient: () => opts.getDaemonClient?.() ?? null });

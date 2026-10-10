@@ -112,7 +112,7 @@ import { registerAutomationRpc } from './pipe/handlers/automation.rpc';
 import { registerWorktaskHandlers, type WorktaskServices } from './ipc/handlers/worktask.handler';
 import { registerWorktaskRpc } from './pipe/handlers/worktask.rpc';
 import { TaskAdoptService } from './worktask/TaskAdoptService';
-import { TaskGateRunner } from './worktask/TaskGateRunner';
+import { TaskGateRunner, setSharedTaskGateRunner } from './worktask/TaskGateRunner';
 import { createHostedLedgerPort } from './worktask/ledgerPort';
 import { getProjectConfigStore } from './project/ProjectConfigStore';
 import { createWorkspaceFactsPublisher, invalidateAutonomyCache, registerWorkspaceFactsPublisher } from './workspace/workspaceFactsFeed';
@@ -1157,12 +1157,17 @@ registerWorktaskHandlers(() => daemonClient, (services: WorktaskServices) => {
     close: services.close,
     pr: services.pr,
     adopt: new TaskAdoptService(),
-    gate: new TaskGateRunner({
-      // In-process: the TaskLedger is hosted in main, and `recordGate` is a
-      // system-actor write no wire caller may make (see ledgerPort.ts).
-      ledger: createHostedLedgerPort(),
-      project: { getState: (cwd: string) => getProjectConfigStore().getState(cwd) },
-    }),
+    gate: (() => {
+      const runner = new TaskGateRunner({
+        // In-process: the TaskLedger is hosted in main, and `recordGate` is a
+        // system-actor write no wire caller may make (see ledgerPort.ts).
+        ledger: createHostedLedgerPort(),
+        project: { getState: (cwd: string) => getProjectConfigStore().getState(cwd) },
+      });
+      // Moa's goal verifier runs goal tasks' gates through the same runner.
+      setSharedTaskGateRunner(runner);
+      return runner;
+    })(),
   });
 });
 // ── Press-scope fact feed (main → daemon) ───────────────────────────────────

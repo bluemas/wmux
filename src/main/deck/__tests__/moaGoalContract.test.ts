@@ -6,6 +6,7 @@ import { MoaGoalService, renderGoalBlock, type MoaGoalPorts } from '../moaGoalCo
 import type { WorkspaceDecision } from '../deckDecisionStore';
 import type { MoaLevel } from '../../../shared/moa';
 import type { FanoutWorkerPermissionMode } from '../../../shared/workerLaunch';
+import type { MoaGoalVerification } from '../../../shared/moaGoal';
 
 const HQ = 'ws-hq';
 const HOUR = 3_600_000;
@@ -75,6 +76,13 @@ function rig(over: Partial<MoaGoalPorts> = {}, file = path.join(dir, 'moa-goals.
   };
   return { svc: new MoaGoalService(ports), slots, state, file, ports };
 }
+
+const VERIFIED: MoaGoalVerification = {
+  at: 1,
+  gates: [{ taskId: 't1', workspaceId: 'ws-task', headSha: 'a'.repeat(40), command: 'npm test', exitCode: 0, at: 1, logPath: '/e/t1.log', logSha256: 'b'.repeat(64) }],
+  criteria: [],
+};
+const passingVerify: NonNullable<MoaGoalPorts['verify']> = async () => ({ ok: true, verification: VERIFIED });
 
 const GOAL = { goal: 'Fix the flaky login test', repo: '/repo/sub', humanOnly: ['database migration'], budget: { maxTasks: 2, maxHours: 2, maxTurns: 3 } };
 
@@ -332,8 +340,10 @@ describe('moa goal — budget, kill switches, coverage', () => {
     expect(await r.svc.end('operator', 'canceled', 'no')).toMatchObject({ ok: true });
     expect(r.slots.size).toBe(0);
     const id = await approved(r);
+    r.ports.verify = passingVerify;
     expect(await r.svc.end('moa', 'completed', 'login test fixed and verified')).toEqual({ ok: true, id });
     expect(r.svc.get(id)?.endNote).toBe('Moa: login test fixed and verified');
+    expect(r.svc.get(id)?.verification).toEqual(VERIFIED);
     expect(await r.svc.end('operator', 'canceled', 'x')).toEqual({ ok: false, code: 'no_goal' });
   });
 
@@ -493,6 +503,7 @@ describe('moa goal — an end whose save fails stays ended across a restart', ()
     const id = await approved(r);
     await r.svc.save();
     r.ports.writeJSON = failingWrite;
+    r.ports.verify = passingVerify;
     await r.svc.end('moa', 'completed', 'done and verified');
     expect(rig({}, r.file).svc.get(id)?.status).toBe('completed');
   });
@@ -566,5 +577,73 @@ describe('moa goal — done criteria, evidence and constraints', () => {
     const r = rig();
     expect(await r.svc.propose(HQ, { ...GOAL, doneCriteria: 'npm test' })).toMatchObject({ ok: false, error: 'done_criteria_invalid' });
     expect(r.slots.get(HQ)).toBeUndefined();
+  });
+});
+
+describe('moa goal — completion needs proof, never a memo', () => {
+  it('without a verifier Moa cannot complete; the goal stays active', async () => {
+    const r = rig();
+    const id = await approved(r);
+    const res = await r.svc.end('moa', 'completed', 'fixed it, trust me');
+    expect(res).toMatchObject({ ok: false, code: 'unverified' });
+    expect(res.problems?.[0]).toMatch(/no goal verifier/);
+    expect(r.svc.get(id)?.status).toBe('active');
+  });
+
+  it('a failing verification keeps it active and returns every problem', async () => {
+    const r = rig();
+    const id = await approved(r);
+    r.ports.verify = async () => ({ ok: false, code: 'unverified', problems: ['task t1: the gate failed', 'criterion 1: no evidence named'] });
+    expect(await r.svc.end('moa', 'completed', 'done')).toEqual({ ok: false, code: 'unverified', problems: ['task t1: the gate failed', 'criterion 1: no evidence named'] });
+    expect(r.svc.get(id)).toMatchObject({ status: 'active' });
+    expect(r.svc.get(id)?.verification).toBeUndefined();
+  });
+
+  it('the verifier gets the contract and the claims; a pass stores the verification and survives a restart', async () => {
+    const r = rig();
+    const id = await approved(r);
+    const verify = vi.fn(passingVerify);
+    r.ports.verify = verify;
+    const claims = [{ criterion: 1, artifacts: ['/repo/sub/out.log'] }];
+    expect(await r.svc.end('moa', 'completed', 'done', claims)).toEqual({ ok: true, id });
+    expect(verify).toHaveBeenCalledWith(expect.objectContaining({ id }), claims);
+    expect(rig({}, r.file).svc.get(id)).toMatchObject({ status: 'completed', verification: VERIFIED });
+  });
+
+  it('a verifier that throws is a refusal, not a completion', async () => {
+    const r = rig();
+    const id = await approved(r);
+    r.ports.verify = async () => {
+      throw new Error('boom');
+    };
+    expect(await r.svc.end('moa', 'completed', 'done')).toMatchObject({ ok: false, code: 'unverified', problems: ['the verifier failed: boom'] });
+    expect(r.svc.get(id)?.status).toBe('active');
+  });
+
+  it('a pending goal cannot be completed by Moa', async () => {
+    const r = rig();
+    await r.svc.propose(HQ, GOAL);
+    r.ports.verify = passingVerify;
+    expect(await r.svc.end('moa', 'completed', 'done')).toMatchObject({ ok: false, code: 'unverified' });
+  });
+
+  it('a goal cancelled while it was being verified is not completed', async () => {
+    const r = rig();
+    const id = await approved(r);
+    r.ports.verify = async () => {
+      await r.svc.end('operator', 'canceled', 'stop');
+      return { ok: true, verification: VERIFIED };
+    };
+    expect(await r.svc.end('moa', 'completed', 'done')).toMatchObject({ ok: false, code: 'no_goal' });
+    expect(r.svc.get(id)?.status).toBe('canceled');
+  });
+
+  it('cancel and the operator end need no verification', async () => {
+    const r = rig();
+    const verify = vi.fn(passingVerify);
+    r.ports.verify = verify;
+    await approved(r);
+    expect(await r.svc.end('moa', 'canceled', 'not needed')).toMatchObject({ ok: true });
+    expect(verify).not.toHaveBeenCalled();
   });
 });

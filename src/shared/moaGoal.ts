@@ -73,6 +73,34 @@ export interface MoaGoalTerms {
   constraints: string[];
 }
 
+/** One task gate that proved a completed goal, pinned to the commit it ran on. */
+export interface MoaGoalVerificationGate {
+  taskId: string;
+  workspaceId: string;
+  /** The worktree HEAD the gate ran on (unchanged through the run). */
+  headSha: string;
+  command: string;
+  exitCode: number | null;
+  at: number;
+  /** The gate output the verifier saved, and its sha256. */
+  logPath: string;
+  logSha256: string;
+}
+
+/** A file named as evidence for a done criterion, hashed when verified. */
+export interface MoaGoalVerificationArtifact {
+  path: string;
+  sha256: string;
+  bytes: number;
+}
+
+/** What a goal Moa completed showed (moaGoalVerifier.ts). */
+export interface MoaGoalVerification {
+  at: number;
+  gates: MoaGoalVerificationGate[];
+  criteria: { criterion: number; text: string; artifacts: MoaGoalVerificationArtifact[] }[];
+}
+
 export interface MoaGoalContract {
   /** `G-` + 6 hex characters: short enough to read on a card and in a label. */
   id: string;
@@ -95,6 +123,9 @@ export interface MoaGoalContract {
   evidence?: string[];
   /** Constraints the work must respect. */
   constraints?: string[];
+  /** Set when Moa completed the goal: the gates and evidence that proved it.
+   *  Absent on an operator end and on records from before the gate. */
+  verification?: MoaGoalVerification;
   status: MoaGoalStatus;
   /** The card that asks for approval (HQ slot). */
   decisionId?: string;

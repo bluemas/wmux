@@ -3,7 +3,14 @@
 // decision store and git. deck.handler owns the lifetime.
 
 import fs from 'node:fs';
+import path from 'node:path';
 import { MoaGoalService } from './moaGoalContract';
+import { verifyGoal, type GoalCriterionClaim, type GoalTaskRef } from './moaGoalVerifier';
+import { getTaskLedger } from './taskLedgerHost';
+import { getSharedTaskGateRunner } from '../worktask/TaskGateRunner';
+import { git } from '../git/git';
+import { getWmuxDir } from '../../daemon/config';
+import type { MoaGoalContract } from '../../shared/moaGoal';
 import { setMoaLevelGate } from './moaLevelGate';
 import { getHqWorkspaceId, getMoaConfig, hqPresence, isMoaEnabled } from './deckHqStore';
 import {
@@ -23,11 +30,51 @@ import { isGoalWorkerSession } from './goalWorkerSessions';
 
 type GetWindow = Parameters<typeof resolvePtyOwnerWorkspace>[0];
 
+/** Where a goal's evidence is kept: `<wmux dir>/moa-goal-evidence/<goal id>`. */
+export function goalEvidenceDir(goalId: string, dir: string = getWmuxDir()): string {
+  return path.join(dir, 'moa-goal-evidence', goalId);
+}
+
+/** The contract's fan-out tasks: the daemon's mission list for the HQ (task
+ *  id → worktree) joined with the ledger (task id → task workspace). Null when
+ *  the daemon cannot answer. Exported for tests. */
+export async function listGoalTasks(
+  contract: MoaGoalContract,
+  rpc: ((method: string, params?: unknown) => Promise<unknown>) | null,
+  taskWorkspaceOf: (taskId: string) => string | null = (id) => getTaskLedger().get(id)?.taskWorkspaceId ?? null,
+): Promise<GoalTaskRef[] | null> {
+  if (!rpc) return null;
+  let reply: unknown;
+  try {
+    reply = await rpc('task.mission.list', { verifiedWorkspaceId: contract.hqWorkspaceId });
+  } catch {
+    return null;
+  }
+  if (!isRec(reply) || reply.ok !== true || !Array.isArray(reply.tasks)) return null;
+  const out: GoalTaskRef[] = [];
+  for (const t of reply.tasks as unknown[]) {
+    if (!isRec(t) || typeof t.id !== 'string') continue;
+    const ws = taskWorkspaceOf(t.id);
+    if (!ws || !contract.taskWorkspaceIds.includes(ws)) continue;
+    out.push({ taskId: t.id, workspaceId: ws, ...(typeof t.worktreePath === 'string' ? { worktreePath: t.worktreePath } : {}) });
+  }
+  return out;
+}
+
+async function headShaOf(worktreePath: string): Promise<string | null> {
+  const r = await git(['rev-parse', 'HEAD'], worktreePath);
+  const sha = r.stdout.trim();
+  return r.code === 0 && /^[0-9a-f]{40,64}$/.test(sha) ? sha : null;
+}
+
 export function createMoaGoalService(opts: {
   notify: () => void;
   filePath?: string;
   turnWokenByRemoteMoa?: (hqWorkspaceId: string) => boolean;
+  /** The daemon, for the goal's task list. Absent ⇒ Moa cannot complete a goal. */
+  getDaemonClient?: () => { rpc(method: string, params?: unknown): Promise<unknown> } | null;
 }): MoaGoalService {
+  const getDaemon = opts.getDaemonClient;
   return new MoaGoalService({
     hqWorkspaceId: () => getHqWorkspaceId(),
     hqLevel: () => getMoaConfig().level,
@@ -61,6 +108,21 @@ export function createMoaGoalService(opts: {
     },
     notify: opts.notify,
     ...(opts.filePath ? { filePath: opts.filePath } : {}),
+    ...(getDaemon
+      ? {
+          verify: async (contract: MoaGoalContract, claims: readonly GoalCriterionClaim[]) => {
+            const runner = getSharedTaskGateRunner();
+            if (!runner) return { ok: false as const, code: 'unverified' as const, problems: ['the task gate runner is not up yet; try again shortly'] };
+            const client = getDaemon();
+            return verifyGoal(contract, claims, {
+              tasks: (c) => listGoalTasks(c, client ? (m, p) => client.rpc(m, p) : null),
+              runGate: (input) => runner.run(input),
+              headSha: headShaOf,
+              evidenceDir: (id) => goalEvidenceDir(id),
+            });
+          },
+        }
+      : {}),
   });
 }
 
