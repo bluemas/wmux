@@ -8,6 +8,8 @@
 // Every row renders before the first read answers (controls inert, status
 // "Checking…"), so search can always jump to it.
 
+import { MoaGoalDrafts } from '../Moa/MoaGoalDrafts';
+import { resolveTaskLink } from '../../utils/fanoutProvenance';
 import { useEffect, useState, type ReactNode } from 'react';
 import { useStore } from '../../stores';
 import { isMoaHqWorkspace } from '../../stores/slices/moaSlice';
@@ -403,6 +405,13 @@ export function TabMoa({ registerDialog }: TabMoaProps) {
 
   // ── Per-workspace modes (every workspace but the HQ) ──
   const modeRows = workspaces.filter((w) => !isMoaHqWorkspace({ moa }, w.id));
+  // Fan-out task worktrees inherit their owner's mode; listing each one beside
+  // the real workspaces buries them, so they sit in one collapsed group.
+  const missionByPaneGroup = useStore((s) => s.missionByPaneGroup);
+  const fanoutLineage = useStore((s) => s.fanoutLineage);
+  const fanoutSpawnOwner = useStore((s) => s.fanoutSpawnOwner);
+  const isTaskRow = (id: string) => resolveTaskLink(missionByPaneGroup[id], fanoutLineage[id], fanoutSpawnOwner[id]) !== null;
+  const [showTaskModes, setShowTaskModes] = useState(false);
   const modeIds = modeRows.map((w) => w.id).join('\n');
   const [modes, setModes] = useState<Record<string, AgentMode>>({});
   const [modeFailed, setModeFailed] = useState(false);
@@ -686,7 +695,27 @@ export function TabMoa({ registerDialog }: TabMoaProps) {
         data-testid="moa-modes"
       >
         {modeRows.length === 0 && <SettingNote>{t('moa.settings.modesEmpty')}</SettingNote>}
-        {modeRows.map((w) => (
+        {modeRows.filter((w) => !isTaskRow(w.id)).map((w) => (
+          <SettingRow key={w.id} label={w.name}>
+            {modes[w.id] ? (
+              <SegmentedControl
+                value={modes[w.id]}
+                options={modeOptions}
+                onValueChange={(m) => onModeChange(w.id, m)}
+                data-testid={`moa-mode-${w.id}`}
+              />
+            ) : (
+              <span className="ui-note">{t('moa.settings.modeLoading')}</span>
+            )}
+          </SettingRow>
+        ))}
+        {modeRows.some((w) => isTaskRow(w.id)) && (
+          <button type="button" className="settings-note ui-note underline text-left" data-tone="muted" data-testid="moa-modes-tasks-toggle"
+            aria-expanded={showTaskModes} onClick={() => setShowTaskModes((v) => !v)}>
+            {t(showTaskModes ? 'moa.settings.modesTasksHide' : 'moa.settings.modesTasksShow', { n: modeRows.filter((w) => isTaskRow(w.id)).length })}
+          </button>
+        )}
+        {showTaskModes && modeRows.filter((w) => isTaskRow(w.id)).map((w) => (
           <SettingRow key={w.id} label={w.name}>
             {modes[w.id] ? (
               <SegmentedControl
@@ -724,6 +753,14 @@ export function TabMoa({ registerDialog }: TabMoaProps) {
             </Button>
           )}
         </SettingRow>
+        {(moa?.learning?.drafts.length ?? 0) > 0 && (
+          <div className="settings-note ui-note" data-tone="muted" data-testid="moa-settings-drafts">
+            <MoaGoalDrafts />
+          </div>
+        )}
+        {(moa?.learning?.flakes ?? 0) > 0 && (
+          <SettingNote data-testid="moa-settings-flakes">{t('moa.drafts.flakes', { n: moa?.learning?.flakes ?? 0 })}</SettingNote>
+        )}
         {goalEndFailed && (
           <SettingNote tone="danger" role="alert">{t('moa.settings.goalEndFailed')}</SettingNote>
         )}
@@ -736,7 +773,16 @@ export function TabMoa({ registerDialog }: TabMoaProps) {
               </div>
             ))}
             {goal.problems?.map((p, i) => (
-              <div key={`p${i}`} data-testid="moa-goal-problem">✗ {p}</div>
+              <div key={`p${i}`} data-testid="moa-goal-problem">
+                ✗ {p.text}
+                {p.logPath && (
+                  <button type="button" className="ml-1.5 underline" data-testid="moa-goal-log"
+                    onClick={() => { void window.electronAPI.shell?.openPath?.(p.logPath as string); }}>
+                    {t('moa.goalStrip.openLog')}
+                  </button>
+                )}
+                {p.excerpt && <pre className="m-0 mt-0.5 whitespace-pre-wrap text-[11px] opacity-80" data-testid="moa-goal-log-excerpt">{p.excerpt.join('\n')}</pre>}
+              </div>
             ))}
             {goal.delivery?.items.map((d) => (
               <div key={d.branch || d.prUrl} data-testid="moa-goal-delivery">

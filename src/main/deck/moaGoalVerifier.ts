@@ -26,6 +26,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { GateRunInput, GateRunResult } from '../worktask/TaskGateRunner';
+import type { GateOutcome } from './moaGoalLearning';
 import {
   goalTermsOf,
   type MoaGoalContract,
@@ -70,6 +71,10 @@ export interface MoaGoalVerifierPorts {
   realpath?: (p: string) => string | null;
   readFile?: (p: string) => Buffer;
   writeFile?: (p: string, data: string) => void;
+  /** Learning loop (moaGoalLearning.ts): a failed gate is run once more; a
+   *  pass on the retry is a flake. Each real failure and each flake is
+   *  reported here. Absent ⇒ no retry, nothing reported. */
+  onGateOutcome?: (o: GateOutcome) => void;
 }
 
 export type MoaGoalVerifyResult =
@@ -195,7 +200,29 @@ export async function verifyGoal(
           : `task ${t.taskId}: the gate did not run (${res.skipped}: ${res.detail})`);
         continue;
       }
-      const after = await ports.headSha(wt);
+      let after = await ports.headSha(wt);
+      let flakyRetry = false;
+      if (ports.onGateOutcome && res.result.exitCode !== 0 && res.result.command !== 'none' && after === before) {
+        // One retry tells a flaky test from a real failure.
+        const first = res.result;
+        const retry = await ports.runGate({
+          taskId: t.taskId,
+          worktreePath: wt,
+          systemWorkspaceId,
+          ...(contract.repoRoot ? { projectRoot: contract.repoRoot } : {}),
+        }).catch(() => null);
+        after = await ports.headSha(wt);
+        const flaky = !!retry && retry.ok && retry.status !== 'skipped' && retry.result.exitCode === 0 && after === before;
+        try {
+          ports.onGateOutcome({ kind: flaky ? 'flake' : 'failure', goalId: contract.id, repoRoot: contract.repoRoot, taskId: t.taskId, command: first.command, tail: first.tail, at: now() });
+        } catch {
+          /* learning never breaks verification */
+        }
+        if (flaky && retry && retry.ok) {
+          res = retry;
+          flakyRetry = true;
+        }
+      }
       const log = `# goal ${contract.id} task ${t.taskId}\n# head ${before}\n# command ${res.result.command}\n# exit ${String(res.result.exitCode)}\n\n${res.result.tail}\n`;
       const logPath = path.join(evidenceDir, `${t.taskId}-${before.slice(0, 12)}.log`);
       let logSha256 = sha256(log);
@@ -214,6 +241,7 @@ export async function verifyGoal(
         at: res.result.at,
         logPath,
         logSha256,
+        ...(flakyRetry ? { flaky: true as const } : {}),
       };
       gates.push(gate);
       if (res.result.skipped === 'no_gate_command' || res.result.command === 'none') {

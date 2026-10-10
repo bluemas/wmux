@@ -204,3 +204,35 @@ describe('parseCriterionClaims', () => {
     }
   });
 });
+
+describe('verifyGoal — one retry tells a flake from a failure (learning loop)', () => {
+  it('fails twice: a real failure is reported and the goal is refused', async () => {
+    const outcomes: unknown[] = [];
+    let runs = 0;
+    const r = await verifyGoal(contract(), [{ criterion: 1, artifacts: [artifact()] }], ports({
+      runGate: async () => { runs++; return passed('npm test', 1); },
+      onGateOutcome: (o) => outcomes.push(o),
+    }));
+    expect(runs).toBe(2);
+    expect(r.ok).toBe(false);
+    expect(outcomes).toEqual([expect.objectContaining({ kind: 'failure', taskId: 't1', command: 'npm test', goalId: contract().id })]);
+  });
+
+  it('fails then passes: a flake is reported, the gate counts as passed and is marked flaky', async () => {
+    const outcomes: { kind: string }[] = [];
+    let runs = 0;
+    const r = await verifyGoal(contract(), [{ criterion: 1, artifacts: [artifact()] }], ports({
+      runGate: async () => (++runs === 1 ? passed('npm test', 1) : passed()),
+      onGateOutcome: (o) => outcomes.push(o),
+    }));
+    expect(outcomes.map((o) => o.kind)).toEqual(['flake']);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.verification.gates[0]).toMatchObject({ exitCode: 0, flaky: true });
+  });
+
+  it('without the learning port nothing is retried', async () => {
+    let runs = 0;
+    await verifyGoal(contract(), [{ criterion: 1, artifacts: [artifact()] }], ports({ runGate: async () => { runs++; return passed('npm test', 1); } }));
+    expect(runs).toBe(1);
+  });
+});

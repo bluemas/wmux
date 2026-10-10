@@ -85,6 +85,8 @@ export interface MoaGoalVerificationGate {
   /** The gate output the verifier saved, and its sha256. */
   logPath: string;
   logSha256: string;
+  /** Failed once, passed on the one retry (moaGoalLearning.ts): a flake. */
+  flaky?: true;
 }
 
 /** A file named as evidence for a done criterion, hashed when verified. */
@@ -328,11 +330,11 @@ export function buildMoaGoalCard(
     `Goal: ${c.goal}`,
     `Repository: ${c.repoRoot ?? '(none)'}`,
     ...(ws.length ? [`Workspaces: ${ws.join(', ')}`] : []),
+    ...goalCardTermsLines(goalTermsOf(c)),
     `Moa may, without asking: fan out up to ${c.budget.maxTasks} task${c.budget.maxTasks === 1 ? '' : 's'} in that repository, answer and instruct those tasks${ws.length ? ', hand work to the workspaces above' : ''}. Level ${c.level}; ends after ${c.budget.maxHours} h or ${c.budget.maxTurns} automatic turns.`,
     'Once proved: Moa pushes task branches and opens PRs itself.',
     `Workers: Claude Code only, permission mode ${c.workerPermissionMode ?? 'unknown'}; push, PR, tag, release, publish and recursive-delete commands denied; GitHub credentials withheld.`,
     `Always yours: ${[...MOA_GOAL_DEFAULT_HUMAN_ONLY, ...c.humanOnly].join('; ')}.`,
-    ...goalTermsLines(goalTermsOf(c)),
   ];
   return {
     question: `Approve Moa's goal ${c.id}? ${c.goal}`.slice(0, 1000),
@@ -341,7 +343,19 @@ export function buildMoaGoalCard(
   };
 }
 
-/** The terms as lines for the card, the [goal] block and the worker note.
+/** The card's terms: one line per criterion, so a long list reads as a list
+ *  (the card renders its context with line breaks kept). */
+export function goalCardTermsLines(t: MoaGoalTerms): string[] {
+  return [
+    ...(t.doneCriteria.length
+      ? ['Done when:', ...t.doneCriteria.map((x, i) => `  (${i + 1}) ${x}`)]
+      : ['Done when: (no criteria stated; Moa must say how it verified the goal)']),
+    ...(t.evidence.length ? ['Evidence:', ...t.evidence.map((x) => `  • ${x}`)] : []),
+    ...(t.constraints.length ? ['Constraints:', ...t.constraints.map((x) => `  • ${x}`)] : []),
+  ];
+}
+
+/** The terms as lines for the [goal] block and the worker note.
  *  An empty done-criteria list is said out loud, so nobody reads silence as
  *  "anything counts as done". */
 export function goalTermsLines(t: MoaGoalTerms): string[] {

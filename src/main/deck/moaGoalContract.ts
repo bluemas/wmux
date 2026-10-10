@@ -397,8 +397,8 @@ export class MoaGoalService {
     const card = buildMoaGoalCard(contract, (id) => this.ports.workspaceName(id));
     // The operator approves what the card shows: a contract that does not fit
     // on one card is refused instead of cut.
-    if (card.context.length > DECISION_LIMITS.MAX_CONTEXT_CHARS) {
-      return { ok: false, error: 'card_too_long', message: `the contract does not fit on one card (${card.context.length}/${DECISION_LIMITS.MAX_CONTEXT_CHARS} characters); shorten the goal or the human-only list` };
+    if (card.context.length > DECISION_LIMITS.MAX_GOAL_CONTEXT_CHARS) {
+      return { ok: false, error: 'card_too_long', message: `the contract does not fit on one card (${card.context.length}/${DECISION_LIMITS.MAX_GOAL_CONTEXT_CHARS} characters); shorten the goal or the human-only list` };
     }
     const decision = await this.ports.decisions
       .raiseIfFree(hq, { ...card, origin: 'moa-goal', ref: contract.id })

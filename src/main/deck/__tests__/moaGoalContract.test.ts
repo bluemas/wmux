@@ -549,7 +549,7 @@ describe('moa goal — done criteria, evidence and constraints', () => {
     const p = await r.svc.propose(HQ, { ...GOAL, ...TERMS });
     if (!p.ok) throw new Error(p.error);
     const card = r.slots.get(HQ)!;
-    expect(JSON.stringify(card)).toContain('Done when: (1) npm test passes');
+    expect(card.context).toContain('Done when:\n  (1) npm test passes');
     await r.svc.resolveCard(HQ, card.id, 'Approve goal');
     expect(r.svc.get(p.id)).toMatchObject(TERMS);
     expect(new MoaGoalService(r.ports).get(p.id)).toMatchObject(TERMS);
