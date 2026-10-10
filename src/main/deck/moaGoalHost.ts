@@ -10,7 +10,13 @@ import { getTaskLedger } from './taskLedgerHost';
 import { getSharedTaskGateRunner } from '../worktask/TaskGateRunner';
 import { git } from '../git/git';
 import { getWmuxDir } from '../../daemon/config';
-import type { MoaGoalContract } from '../../shared/moaGoal';
+import type { MoaGoalContract, MoaGoalDelivery, MoaGoalVerification } from '../../shared/moaGoal';
+import { getMoaGoalLearning } from './moaGoalLearning';
+import { deliverGoal, revertDelivery, type ExecResult, type MoaGoalDeliveryPorts } from './moaGoalDelivery';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { getExecEnv } from '../../shared/execEnv';
+import { resolveExecutable } from '../../shared/exeSearch';
 import { setMoaLevelGate } from './moaLevelGate';
 import { getHqWorkspaceId, getMoaConfig, hqPresence, isMoaEnabled } from './deckHqStore';
 import {
@@ -61,6 +67,26 @@ export async function listGoalTasks(
   return out;
 }
 
+const execFileAsync = promisify(execFile);
+
+/** `gh` in main with the operator's own environment; never throws. */
+async function ghExec(args: string[], cwd: string): Promise<ExecResult> {
+  try {
+    const env = getExecEnv();
+    const { stdout, stderr } = await execFileAsync(resolveExecutable('gh', { env }), args, {
+      cwd,
+      env,
+      timeout: 120_000,
+      windowsHide: true,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+    return { code: 0, stdout, stderr };
+  } catch (e) {
+    const err = e as { stdout?: string; stderr?: string; code?: number };
+    return { code: typeof err.code === 'number' ? err.code : 1, stdout: err.stdout ?? '', stderr: err.stderr ?? String(e) };
+  }
+}
+
 async function headShaOf(worktreePath: string): Promise<string | null> {
   const r = await git(['rev-parse', 'HEAD'], worktreePath);
   const sha = r.stdout.trim();
@@ -75,6 +101,11 @@ export function createMoaGoalService(opts: {
   getDaemonClient?: () => { rpc(method: string, params?: unknown): Promise<unknown> } | null;
 }): MoaGoalService {
   const getDaemon = opts.getDaemonClient;
+  const deliveryPorts = (client: { rpc(method: string, params?: unknown): Promise<unknown> } | null | undefined): MoaGoalDeliveryPorts => ({
+    tasks: (c) => listGoalTasks(c, client ? (m, p) => client.rpc(m, p) : null),
+    git: (args, cwd) => git(args, cwd),
+    gh: ghExec,
+  });
   return new MoaGoalService({
     hqWorkspaceId: () => getHqWorkspaceId(),
     hqLevel: () => getMoaConfig().level,
@@ -110,6 +141,12 @@ export function createMoaGoalService(opts: {
     ...(opts.filePath ? { filePath: opts.filePath } : {}),
     ...(getDaemon
       ? {
+          deliver: (contract: MoaGoalContract, verification: MoaGoalVerification) => {
+            const client = getDaemon();
+            return deliverGoal(contract, verification, deliveryPorts(client));
+          },
+          revertDelivery: (contract: MoaGoalContract, delivery: MoaGoalDelivery) =>
+            revertDelivery(contract, delivery, deliveryPorts(getDaemon()), 'operator'),
           verify: async (contract: MoaGoalContract, claims: readonly GoalCriterionClaim[]) => {
             const runner = getSharedTaskGateRunner();
             if (!runner) return { ok: false as const, code: 'unverified' as const, problems: ['the task gate runner is not up yet; try again shortly'] };
@@ -119,6 +156,7 @@ export function createMoaGoalService(opts: {
               runGate: (input) => runner.run(input),
               headSha: headShaOf,
               evidenceDir: (id) => goalEvidenceDir(id),
+              onGateOutcome: (o) => { getMoaGoalLearning()?.record(o); },
             });
           },
         }

@@ -1,3 +1,4 @@
+import type { MoaGoalContract as _C, MoaGoalDelivery } from '../../../shared/moaGoal';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -548,7 +549,7 @@ describe('moa goal — done criteria, evidence and constraints', () => {
     const p = await r.svc.propose(HQ, { ...GOAL, ...TERMS });
     if (!p.ok) throw new Error(p.error);
     const card = r.slots.get(HQ)!;
-    expect(JSON.stringify(card)).toContain('Done when: (1) npm test passes');
+    expect(card.context).toContain('Done when:\n  (1) npm test passes');
     await r.svc.resolveCard(HQ, card.id, 'Approve goal');
     expect(r.svc.get(p.id)).toMatchObject(TERMS);
     expect(new MoaGoalService(r.ports).get(p.id)).toMatchObject(TERMS);
@@ -647,3 +648,60 @@ describe('moa goal — completion needs proof, never a memo', () => {
     expect(verify).not.toHaveBeenCalled();
   });
 });
+
+describe('moa goal — delivery and revert', () => {
+  const DELIVERY = { at: 5, items: [{ taskId: 't1', branch: 'wtask/x', headSha: 'a'.repeat(40), base: 'main', pushed: true, prUrl: 'https://github.com/o/r/pull/7', prNumber: 7 }], revertRecipe: ['gh pr close 7'] };
+
+  it('a verified completion is delivered, stored and reported', async () => {
+    const r = rig();
+    const id = await approved(r);
+    r.ports.verify = passingVerify;
+    const deliver = vi.fn(async () => DELIVERY);
+    r.ports.deliver = deliver;
+    const res = await r.svc.end('moa', 'completed', 'done');
+    expect(res).toEqual({ ok: true, id, delivered: [{ branch: 'wtask/x', pushed: true, prUrl: 'https://github.com/o/r/pull/7' }] });
+    expect(deliver).toHaveBeenCalledWith(expect.objectContaining({ id }), VERIFIED);
+    expect(rig({}, r.file).svc.get(id)?.delivery).toEqual(DELIVERY);
+  });
+
+  it('nothing is delivered for a refused completion; the refusal is kept for Settings', async () => {
+    const r = rig();
+    const id = await approved(r);
+    r.ports.verify = async () => ({ ok: false, code: 'unverified', problems: ['task t1: the gate failed'] });
+    const deliver = vi.fn(async () => DELIVERY);
+    r.ports.deliver = deliver;
+    await r.svc.end('moa', 'completed', 'done');
+    expect(deliver).not.toHaveBeenCalled();
+    expect(r.svc.get(id)?.lastCheck?.problems).toEqual(['task t1: the gate failed']);
+    r.ports.verify = passingVerify;
+    await r.svc.end('moa', 'completed', 'done');
+    expect(r.svc.get(id)?.lastCheck).toBeUndefined();
+  });
+
+  it('a delivery that throws still completes the verified goal', async () => {
+    const r = rig();
+    const id = await approved(r);
+    r.ports.verify = passingVerify;
+    r.ports.deliver = async () => {
+      throw new Error('gh exploded');
+    };
+    expect(await r.svc.end('moa', 'completed', 'done')).toMatchObject({ ok: true, id });
+    expect(r.svc.get(id)?.status).toBe('completed');
+  });
+
+  it('revert closes what was delivered once, and refuses goals with nothing delivered', async () => {
+    const r = rig();
+    const id = await approved(r);
+    expect(await r.svc.revert(id)).toEqual({ ok: false, code: 'not_completed' });
+    r.ports.verify = passingVerify;
+    r.ports.deliver = async () => DELIVERY;
+    await r.svc.end('moa', 'completed', 'done');
+    const revertDelivery = vi.fn(async (_c: _C, d: MoaGoalDelivery) => ({ ok: true, delivery: { ...d, reverted: { at: 9, by: 'operator' as const, notes: ['closed PR #7'] } }, notes: ['closed PR #7'] }));
+    r.ports.revertDelivery = revertDelivery;
+    expect(await r.svc.revert(id)).toEqual({ ok: true, notes: ['closed PR #7'] });
+    expect(r.svc.get(id)?.delivery?.reverted?.notes).toEqual(['closed PR #7']);
+    expect(await r.svc.revert(id)).toEqual({ ok: true, notes: ['closed PR #7'] });
+    expect(revertDelivery).toHaveBeenCalledTimes(1);
+  });
+});
+

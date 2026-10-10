@@ -44,8 +44,10 @@ export function makeSandbox(name) {
   const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), `wmux-e2e-${name}-`)));
   const bin = path.join(home, '.local', 'bin');
   fs.mkdirSync(bin, { recursive: true });
-  fs.copyFileSync(path.join(ROOT, 'e2e', 'fake-bin', 'claude'), path.join(bin, 'claude'));
-  fs.chmodSync(path.join(bin, 'claude'), 0o755);
+  for (const tool of ['claude', 'gh']) {
+    fs.copyFileSync(path.join(ROOT, 'e2e', 'fake-bin', tool), path.join(bin, tool));
+    fs.chmodSync(path.join(bin, tool), 0o755);
+  }
   fs.writeFileSync(path.join(home, '.bashrc'), 'export PATH="$HOME/.local/bin:$PATH"\n');
   fs.writeFileSync(path.join(home, '.profile'), '. "$HOME/.bashrc"\n');
   const remote = path.join(home, 'remote.git');
@@ -71,6 +73,19 @@ export function makeSandbox(name) {
   git(['clone', '-q', remote, project], home);
   fs.rmSync(seed, { recursive: true, force: true });
   return { home, bin, remote, project, runId: crypto.randomUUID() };
+}
+
+/** The pull requests the fake gh recorded, by number. */
+export function fakePrs(sb) {
+  const db = path.join(sb.home, '.e2e-gh');
+  if (!fs.existsSync(db)) return {};
+  const out = {};
+  for (const f of fs.readdirSync(db).filter((x) => /^pr-\d+\.json$/.test(x))) {
+    const pr = JSON.parse(fs.readFileSync(path.join(db, f), 'utf8'));
+    pr.body = fs.readFileSync(path.join(db, f.replace('.json', '.body')), 'utf8');
+    out[pr.number] = pr;
+  }
+  return out;
 }
 
 /** The script the fake claude runs once in its worktree. */
