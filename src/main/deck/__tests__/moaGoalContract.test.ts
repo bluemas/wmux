@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { MoaGoalService, renderGoalBlock, type MoaGoalPorts } from '../moaGoalContract';
 import type { WorkspaceDecision } from '../deckDecisionStore';
 import type { MoaLevel } from '../../../shared/moa';
+import type { FanoutWorkerPermissionMode } from '../../../shared/workerLaunch';
 
 const HQ = 'ws-hq';
 const HOUR = 3_600_000;
@@ -20,18 +21,27 @@ afterEach(() => {
 interface Rig {
   svc: MoaGoalService;
   slots: Map<string, WorkspaceDecision>;
-  state: { level: MoaLevel; ready: boolean; now: number; hq: string | null };
+  state: { level: MoaLevel; ready: boolean; now: number; hq: string | null; mode: FanoutWorkerPermissionMode; remote: boolean };
   file: string;
   ports: MoaGoalPorts;
 }
 
 function rig(over: Partial<MoaGoalPorts> = {}, file = path.join(dir, 'moa-goals.json')): Rig {
   const slots = new Map<string, WorkspaceDecision>();
-  const state = { level: 2 as MoaLevel, ready: true, now: 1_000, hq: HQ as string | null };
+  const state = {
+    level: 2 as MoaLevel,
+    ready: true,
+    now: 1_000,
+    hq: HQ as string | null,
+    mode: 'auto' as FanoutWorkerPermissionMode,
+    remote: false,
+  };
   let n = 0;
   const ports: MoaGoalPorts = {
     hqWorkspaceId: () => state.hq,
     hqLevel: () => state.level,
+    workerPermissionMode: () => state.mode,
+    turnWokenByRemoteMoa: () => state.remote,
     moaReady: () => state.ready,
     vetRepo: async (p) => (p.startsWith('/repo') ? '/repo' : null),
     workspaceExists: (id) => id === 'ws-a' || id === HQ,
@@ -162,6 +172,48 @@ describe('moa goal — one card, one approval', () => {
     const d2 = r2.slots.get(HQ)!;
     const human = await r2.svc.settleResolved(HQ, { ...d2, status: 'resolved', resolution: 'Approve goal' } as WorkspaceDecision);
     expect(human).toMatchObject({ ok: true, status: 'active' });
+  });
+});
+
+describe('moa goal — the worker permission mode is pinned (W1/W8)', () => {
+  it('the card shows the mode and the contract records it', async () => {
+    const r = rig();
+    r.state.mode = 'acceptEdits';
+    await r.svc.propose(HQ, GOAL);
+    expect(r.slots.get(HQ)!.context).toContain('permission mode acceptEdits');
+    expect(r.svc.current()?.workerPermissionMode).toBe('acceptEdits');
+  });
+
+  it('a mode changed between the card and the click grants nothing', async () => {
+    const r = rig();
+    await r.svc.propose(HQ, GOAL);
+    r.state.mode = 'bypassPermissions';
+    const res = await r.svc.resolveCard(HQ, r.slots.get(HQ)!.id, 'Approve goal');
+    expect(res).toMatchObject({ ok: true, status: 'declined' });
+    expect(res && res.ok && res.note).toMatch(/bypassPermissions now, but the card showed auto/);
+    expect(r.svc.powers().ok).toBe(false);
+    expect(r.svc.latest()?.endNote).toMatch(/not approved/);
+  });
+
+  it('an unreadable mode at approval grants nothing', async () => {
+    const r = rig();
+    await r.svc.propose(HQ, GOAL);
+    r.ports.workerPermissionMode = () => {
+      throw new Error('settings gone');
+    };
+    const res = await r.svc.resolveCard(HQ, r.slots.get(HQ)!.id, 'Approve goal');
+    expect(res).toMatchObject({ ok: true, status: 'declined' });
+  });
+
+  it('reports the HQ turn a remote Moa woke, failing closed when unreadable', () => {
+    const r = rig();
+    expect(r.svc.turnWokenByRemoteMoa(HQ)).toBe(false);
+    r.state.remote = true;
+    expect(r.svc.turnWokenByRemoteMoa(HQ)).toBe(true);
+    r.ports.turnWokenByRemoteMoa = () => {
+      throw new Error('x');
+    };
+    expect(r.svc.turnWokenByRemoteMoa(HQ)).toBe(true);
   });
 });
 

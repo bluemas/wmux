@@ -881,14 +881,26 @@ describe('moa hand-off — under an approved goal contract', () => {
   const G = { goalId: 'G-abc123', humanOnly: ['database migration'] };
   const msgOf = (r: Rig): string => (r.deliver.mock.calls[0][0] as { message: string }).message;
 
-  it('a covered workspace takes the hand-off without a card, even in assist mode and with no live operator request', async () => {
+  it('a covered workspace takes the hand-off without a card during the operator\'s own request, even in assist mode', async () => {
     const r = rig(covered(G));
-    r.state.operatorRequest = false;
+    r.state.operatorRequest = true;
     const res = await propose(r, 'Answer: use the existing fixture and re-run the login test.');
     expect(res).toMatchObject({ ok: true, mode: 'auto' });
     expect(r.slots.size).toBe(0);
     expect(msgOf(r)).toContain('under goal G-abc123');
     expect(r.svc.handoffDetail((res as { taskId: string }).taskId)).toMatchObject({ goalId: 'G-abc123' });
+  });
+
+  // W4: the goal path honours record.externalSource exactly like the no-goal
+  // path. A wake (worker output, a PR comment, another PC's Moa) is not the
+  // operator's request, so its hand-off asks with a card.
+  it('from a wake (no live operator request) a covered workspace still gets a card', async () => {
+    const r = rig(covered(G));
+    r.state.operatorRequest = false;
+    const res = await propose(r, 'Answer: use the existing fixture and re-run the login test.');
+    expect(res).toMatchObject({ ok: true, mode: 'card' });
+    expect(r.deliver).not.toHaveBeenCalled();
+    expect(r.slots.get(SEAL)?.origin).toBe('moa-handoff');
   });
 
   it('a workspace the goal does not cover asks with a card', async () => {

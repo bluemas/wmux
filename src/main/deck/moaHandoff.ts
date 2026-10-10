@@ -577,12 +577,14 @@ export class MoaHandoffService {
       at: now,
     };
     // GOAL PATH: a workspace an approved goal covers takes the hand-off without
-    // a card, unless Moa itself said the body carries outside text or the body
-    // asks for something that stays the operator's (shared/moaGoal.ts). The
-    // operator's turn is not required here: approving the goal is the grant
-    // to follow it through on wakes. Anything short of a delivery falls back
-    // to the card, exactly like the danger path.
-    const goal = params.externalSource === true ? null : this.goalAllows(record);
+    // a card, unless the body may carry outside text or asks for something
+    // that stays the operator's (shared/moaGoal.ts). "Outside text" is the
+    // SAME test the no-goal path uses: record.externalSource, which main sets
+    // for every turn the operator did not start (a wake carries worker output,
+    // PR comments or another PC's Moa's work), not only when Moa says so. So
+    // under a goal, a hand-off from a wake still asks with a card. Anything
+    // short of a delivery falls back to the card, exactly like the danger path.
+    const goal = record.externalSource ? null : this.goalAllows(record);
     if (goal) {
       const res = await this.deliver({ ...record, goalId: goal }, body, true);
       if (res.delivered && res.taskId) return { ok: true, mode: 'auto', id: record.id, taskId: res.taskId };

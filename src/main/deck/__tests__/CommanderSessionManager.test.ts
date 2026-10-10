@@ -335,4 +335,22 @@ describe('CommanderSessionManager — turn origin (the no-click hand-off gate)',
     mgr.notifyForeignTurnStart();
     expect(mgr.turnOrigin).toBe('human');
   });
+
+  it('marks a wake that carries another PC\'s Moa for exactly that turn (W5)', async () => {
+    const adapter = new FakeAdapter();
+    adapter.setScript([{ type: 'turn-end', sessionId: null }]);
+    const mgr = new CommanderSessionManager({ adapter, sink: vi.fn() });
+    expect(mgr.turnWokenByRemoteMoa).toBe(false);
+    await mgr.send('remote wake', { origin: 'automation', remoteMoa: true });
+    expect(mgr.turnWokenByRemoteMoa).toBe(true);
+    // A human turn never carries it, even if a caller passed the flag.
+    await mgr.send('operator', { origin: 'human', remoteMoa: true });
+    expect(mgr.turnWokenByRemoteMoa).toBe(false);
+    await mgr.send('remote wake', { origin: 'automation', remoteMoa: true });
+    await mgr.send('local wake', { origin: 'automation' });
+    expect(mgr.turnWokenByRemoteMoa).toBe(false);
+    await mgr.send('remote wake', { origin: 'automation', remoteMoa: true });
+    mgr.notifyForeignTurnStart();
+    expect(mgr.turnWokenByRemoteMoa).toBe(false);
+  });
 });

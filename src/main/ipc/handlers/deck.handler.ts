@@ -801,7 +801,11 @@ export function registerDeckHandler(
   // decides, never the brain.
   // Moa's goal contract (moaGoalContract.ts): one operator card per goal, and
   // the level gate RpcRouter asks on every HQ commander request.
-  const moaGoals = createMoaGoalService({ notify: () => emitMoaChanged() });
+  const moaGoals = createMoaGoalService({
+    notify: () => emitMoaChanged(),
+    // W5: a wake carrying another PC's Moa's work never fans out on the goal.
+    turnWokenByRemoteMoa: (hq) => managers.get(hq)?.manager.turnWokenByRemoteMoa === true,
+  });
   setMoaGoalService(moaGoals);
   installMoaLevelGate(moaGoals, { getWindow, getDaemonClient: () => opts.getDaemonClient?.() ?? null });
 
@@ -1703,6 +1707,9 @@ export function registerDeckHandler(
       // The dock's Wake button: a human press, so the HQ turn cap does not
       // apply (it caps automatic turns only).
       human?: boolean;
+      // The wake carries work another PC's Moa sent (a2a.received). Recorded
+      // on the manager for the turn; under a goal, fan-out refuses it.
+      remoteMoa?: boolean;
     } = {},
   ): Promise<{ ok: boolean; code?: string; retryAfterMs?: number }> => {
     if (!WORKSPACE_ID_RE.test(workspaceId)) {
@@ -1831,7 +1838,7 @@ export function registerDeckHandler(
       // loop, scheduler, decision resume, startup reconcile) — never a human at
       // the composer. Marking the origin lets the terminal brain re-check for a
       // human turn it may have raced before it types into the shared TUI.
-      const verdict = await mgr.send(prompted, { origin: 'automation' });
+      const verdict = await mgr.send(prompted, { origin: 'automation', ...(runOpts.remoteMoa ? { remoteMoa: true } : {}) });
       settleAmbient(workspaceId, verdict);
       if (verdict.ok) {
         if (runOpts.reExamine) {
@@ -2070,7 +2077,8 @@ export function registerDeckHandler(
     });
   });
   coalescer = new CommanderEventCoalescer({
-    runTurn: (workspaceId, prompt) => runTurnForWorkspace(prompt, workspaceId),
+    runTurn: (workspaceId, prompt, wake) =>
+      runTurnForWorkspace(prompt, workspaceId, wake?.remoteMoa ? { remoteMoa: true } : {}),
     // Lane F: worker events parked while this workspace had no brain —
     // peeked at boot, acknowledged only once a wake delivered them.
     peekOrphanBacklog: (workspaceId) => peekOrphanBacklog(workspaceId),
@@ -3675,11 +3683,13 @@ export function registerDeckHandler(
     'above). They chose none of its options: do NOT act on any of them. Carry on from the ' +
     'current state; if a real fork still remains, raise a fresh decision.';
   /** Tell Moa how the operator answered its goal card (moaGoalContract.ts). */
-  const wakeMoaForGoal = (hq: string, goalId: string, status: 'active' | 'declined'): void => {
+  const wakeMoaForGoal = (hq: string, goalId: string, status: 'active' | 'declined', note?: string): void => {
     if (hq !== getHqWorkspaceId()) return;
     const prompt = status === 'active'
       ? `[goal] The operator APPROVED goal ${goalId} (see the [goal] block). Start on it now: plan it, fan out in its repository, answer and instruct its tasks, verify the results, then call moa_goal({action:"complete", summary}) and report once. Push, PRs and merges stay the operator's.`
-      : `[goal] The operator DECLINED goal ${goalId}. Do not act on it. If the request still stands, ask them what they want instead, or work as before.`;
+      : note
+        ? `[goal] Goal ${goalId} was NOT approved: ${note}. Do not act on it. If the work still stands, propose it again with moa_propose_goal so the card shows the current setting.`
+        : `[goal] The operator DECLINED goal ${goalId}. Do not act on it. If the request still stands, ask them what they want instead, or work as before.`;
     void runTurnForWorkspace(prompt, hq, { queued: true }).catch(() => undefined);
   };
   const resumePromptFor = (d: WorkspaceDecision): string =>
@@ -3709,7 +3719,7 @@ export function registerDeckHandler(
       } else if (workspaceId && decision?.status === 'resolved' && decision.origin === 'moa-goal') {
         // A goal card answered by a click whose effect was not recorded.
         void moaGoals.settleResolved(workspaceId, decision).then((r) => {
-          if (r?.ok) wakeMoaForGoal(workspaceId, r.id, r.status);
+          if (r?.ok) wakeMoaForGoal(workspaceId, r.id, r.status, r.note);
         }).catch(() => undefined);
       } else if (workspaceId && decision?.status === 'resolved' && isMainOwnedDecision(decision)) {
         // A hand-off card claimed by a click that did not finish clearing it.
@@ -3767,7 +3777,7 @@ export function registerDeckHandler(
         if (!r) return { ok: false, code: 'not_pending' };
         if (!r.ok) return { ok: false, code: r.code };
         emitMoaChanged();
-        wakeMoaForGoal(workspaceId, r.id, r.status);
+        wakeMoaForGoal(workspaceId, r.id, r.status, r.note);
         return { ok: true };
       }
       if (current && current.id === id && current.origin === 'moa-handoff') {
@@ -3986,7 +3996,7 @@ export function registerDeckHandler(
       }
       if (decision.status === 'resolved' && decision.origin === 'moa-goal') {
         const r = await moaGoals.settleResolved(workspaceId, decision).catch(() => null);
-        if (r?.ok) wakeMoaForGoal(workspaceId, r.id, r.status);
+        if (r?.ok) wakeMoaForGoal(workspaceId, r.id, r.status, r.note);
         continue;
       }
       if (decision.status === 'resolved' && !(await moaProposals.handleResolved(workspaceId, decision))) {

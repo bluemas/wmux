@@ -266,7 +266,13 @@ export interface CoalescerDeps {
    *  turn-start before send and reject `busy` when a turn is in flight. */
   /** `rate_limited` (with `retryAfterMs`) is a cap the caller enforces on
    *  automatic turns: the buffer is kept and retried once it lifts. */
-  runTurn: (workspaceId: string, prompt: string) => Promise<{ ok: boolean; code?: string; retryAfterMs?: number }>;
+  runTurn: (
+    workspaceId: string,
+    prompt: string,
+    /** What woke it: `remoteMoa` when the flush carries another PC's Moa's
+     *  work (a2a.received). The caller marks the turn with it. */
+    wake?: { remoteMoa: boolean },
+  ) => Promise<{ ok: boolean; code?: string; retryAfterMs?: number }>;
   /** True when this workspace's brain is mid-turn (a flush must wait). */
   isBusy: (workspaceId: string) => boolean;
   /** Resolve this workspace's autonomy caps (fail-closed). */
@@ -1317,7 +1323,7 @@ export class CommanderEventCoalescer {
     st.phase = 'send-pending';
 
     void this.deps
-      .runTurn(workspaceId, prompt)
+      .runTurn(workspaceId, prompt, { remoteMoa: flushEvents.some(isRemoteMoa) })
       .then((r) => {
         if (this.disposed) return;
         if (r.ok) {

@@ -21,7 +21,7 @@ export interface MoaGoalToolDeps {
 export const MOA_PROPOSE_GOAL_SHAPE = {
   goal: z.string().describe('The goal in one or two plain sentences (≤400 characters), as the operator asked for it.'),
   repo: z.string().optional().describe('Absolute path inside the git repository the work happens in. Fan-out runs there.'),
-  workspace_ids: z.array(z.string()).max(4).optional().describe('Existing workspaces (ids from workspace_list) whose agents may receive hand-offs without a card.'),
+  workspace_ids: z.array(z.string()).max(4).optional().describe('Existing workspaces (ids from workspace_list) whose agents may receive hand-offs without a card while the operator\'s own request is live.'),
   level: z.union([z.literal(2), z.literal(3)]).optional().describe('2 (default): delegate inside the goal. 3 is reserved for merging and acts like 2 for now.'),
   max_tasks: z.number().int().optional().describe('Fan-out tasks the goal may create in total (1-16, default 4).'),
   max_hours: z.number().int().optional().describe('Hours until the goal expires (1-24, default 4).'),
@@ -31,7 +31,7 @@ export const MOA_PROPOSE_GOAL_SHAPE = {
 
 const PROPOSE_DESCRIPTION =
   'HQ (Moa) only. Propose a GOAL CONTRACT for a piece of work the operator asked for: the goal, its repository and/or workspaces, a budget, and decisions the operator keeps. '
-  + 'Main shows the operator ONE card; nothing changes until they click Approve. Once approved (and Moa is at level 2+ in Settings), inside the goal you may fan out in its repository, answer and instruct the tasks it creates, and hand work to its workspaces without a card. '
+  + 'Main shows the operator ONE card; nothing changes until they click Approve. Once approved (and Moa is at level 2+ in Settings), inside the goal you may fan out in its repository (claude workers only, with push/PR/release/delete commands denied and GitHub credentials withheld), answer and instruct the tasks it creates, and hand work to its workspaces (without a card only during the operator\'s own request; from a wake it asks). '
   + 'Push, PRs, merges, releases, secrets, deletes and approvals always stay the operator\'s. After proposing, END YOUR TURN; you are woken with the answer. '
   + 'Errors: level_too_low (ask the operator to raise the level, or work as before), goal_open (one goal at a time), busy (a card is already waiting), repo_not_git, card_too_long.';
 

@@ -41,6 +41,7 @@ import {
   type MoaGoalStatus,
   type MoaGoalView,
 } from '../../shared/moaGoal';
+import type { FanoutWorkerPermissionMode } from '../../shared/workerLaunch';
 
 const MAX_RECORDS = 50;
 
@@ -63,6 +64,11 @@ export interface MoaGoalPorts {
     clearResolved: (workspaceId: string, id: string) => Promise<void>;
     clearPendingIfUnchanged: (workspaceId: string, expected: WorkspaceDecision) => Promise<boolean>;
   };
+  /** The fan-out worker permission mode in Settings right now. Shown on the
+   *  card, pinned at approval (shared/moaGoal.ts workerPermissionMode). */
+  workerPermissionMode?: () => FanoutWorkerPermissionMode;
+  /** The HQ's current turn was woken by another PC's Moa (a2a.received). */
+  turnWokenByRemoteMoa?: (hqWorkspaceId: string) => boolean;
   /** Something the panel shows moved. */
   notify?: () => void;
   now?: () => number;
@@ -86,7 +92,7 @@ export type ProposeGoalResult =
     };
 
 export type ResolveGoalResult =
-  | { ok: true; id: string; status: 'active' | 'declined' }
+  | { ok: true; id: string; status: 'active' | 'declined'; note?: string }
   | { ok: false; code: 'not_pending' | 'error' };
 
 export function getMoaGoalsPath(dir: string = getWmuxDir()): string {
@@ -281,6 +287,7 @@ export class MoaGoalService {
       taskWorkspaceIds: [],
       tasksUsed: 0,
       turnsUsed: 0,
+      ...(this.workerMode() ? { workerPermissionMode: this.workerMode() } : {}),
     };
     const card = buildMoaGoalCard(contract, (id) => this.ports.workspaceName(id));
     // The operator approves what the card shows: a contract that does not fit
@@ -331,13 +338,40 @@ export class MoaGoalService {
 
   private async apply(c: MoaGoalContract, approve: boolean): Promise<ResolveGoalResult> {
     const now = this.now();
-    const next: MoaGoalContract = approve
+    // The card showed the worker permission mode; an approval is for that
+    // mode only. Changed (or unreadable) since the card went up: nothing is
+    // granted, and Moa is told to propose again.
+    const modeNow = this.workerMode();
+    const modeMoved = approve && (!c.workerPermissionMode || modeNow !== c.workerPermissionMode);
+    const note = modeMoved
+      ? `not approved: the fan-out worker permission mode is ${modeNow ?? 'unreadable'} now, but the card showed ${c.workerPermissionMode ?? 'none'}`
+      : undefined;
+    const granted = approve && !modeMoved;
+    const next: MoaGoalContract = granted
       ? { ...c, status: 'active', approvedAt: now, decisionId: undefined }
-      : { ...c, status: 'declined', endedAt: now, endNote: 'declined by the operator', decisionId: undefined };
+      : { ...c, status: 'declined', endedAt: now, endNote: note ?? 'declined by the operator', decisionId: undefined };
     this.put(next);
     if (!(await this.save())) return { ok: false, code: 'error' };
     this.notify();
-    return { ok: true, id: c.id, status: approve ? 'active' : 'declined' };
+    return { ok: true, id: c.id, status: granted ? 'active' : 'declined', ...(note ? { note } : {}) };
+  }
+
+  private workerMode(): FanoutWorkerPermissionMode | undefined {
+    try {
+      return this.ports.workerPermissionMode?.();
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The HQ's current turn was woken by another PC's Moa. Unreadable = yes
+   *  (the caller refuses; fail closed). */
+  turnWokenByRemoteMoa(hqWorkspaceId: string): boolean {
+    try {
+      return this.ports.turnWokenByRemoteMoa?.(hqWorkspaceId) === true;
+    } catch {
+      return true;
+    }
   }
 
   // ── use ───────────────────────────────────────────────────────────────────
@@ -443,7 +477,7 @@ export function renderGoalBlock(view: MoaGoalView | null): string | null {
   ].filter(Boolean).join(' and ');
   return [
     `[goal] ${view.id} — approved by the operator (level ${e.level}). Goal (operator-approved text): "${view.goal}". Scope: ${scope}.`,
-    'Inside it you may, without asking: fanout_start (it runs in the goal\'s repository), answer and instruct the tasks it creates (send_message / terminal_send), and hand work to the goal\'s workspaces with moa_propose_handoff (delivered without a card).',
+    'Inside it you may, without asking: fanout_start (it runs in the goal\'s repository, on claude workers only, with push, PR, release and delete commands denied and GitHub credentials withheld), answer and instruct the tasks it creates (send_message / terminal_send), and hand work to the goal\'s workspaces with moa_propose_handoff (without a card only while the operator\'s own request is live; from a wake it asks with a card). A turn woken by another PC\'s Moa cannot fan out under the goal.',
     `Never yours, whatever the goal says: push, PRs, merges, releases, secrets, deleting data, critical or permission approvals, other workspaces${view.humanOnly.length ? `, and: ${view.humanOnly.join('; ')}` : ''}. Raise those with deck_ask_decision; wmux refuses them in what you send.`,
     `${left}. When the goal is done and verified, call moa_goal({action:"complete", summary}) and report once.`,
   ].join('\n');

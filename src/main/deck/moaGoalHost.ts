@@ -18,13 +18,22 @@ import { resolveRepoRoot } from './moaReadGate';
 import { resolvePtyOwnerWorkspace } from '../workspace/ptyOwnership';
 import { sendToRenderer } from '../pipe/handlers/_bridge';
 import { isRemoteTaskId } from '../../shared/a2aRemote';
+import { loadFanoutWorkerPermissionMode } from '../worktask/fanoutWorkerPolicy';
 
 type GetWindow = Parameters<typeof resolvePtyOwnerWorkspace>[0];
 
-export function createMoaGoalService(opts: { notify: () => void; filePath?: string }): MoaGoalService {
+export function createMoaGoalService(opts: {
+  notify: () => void;
+  filePath?: string;
+  turnWokenByRemoteMoa?: (hqWorkspaceId: string) => boolean;
+}): MoaGoalService {
   return new MoaGoalService({
     hqWorkspaceId: () => getHqWorkspaceId(),
     hqLevel: () => getMoaConfig().level,
+    // The same Settings read fan-out uses at spawn time, so the pin compares
+    // like with like.
+    workerPermissionMode: () => loadFanoutWorkerPermissionMode(),
+    ...(opts.turnWokenByRemoteMoa ? { turnWokenByRemoteMoa: opts.turnWokenByRemoteMoa } : {}),
     moaReady: () => {
       const hq = getHqWorkspaceId();
       return isMoaEnabled() && hq !== null && hqPresence(hq) === 'present';
