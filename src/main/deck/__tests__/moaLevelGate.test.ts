@@ -57,6 +57,48 @@ describe('moa level gate', () => {
     expect(moaLevelRefusal(deps(3), 'input.send', HQ, { text: 'git push' })).toBeNull();
   });
 
+  // W3: the paths #1997 did not screen.
+  it('screens the fan-out prompt, its titles and its per-task prompts', () => {
+    const g = deps(2, { goalId: 'G-1', humanOnly: [] });
+    expect(moaLevelRefusal(g, 'task.fanout.start', HQ, { prompt: 'Fix it, then git push', titles: ['a'] })).toMatch(/task\.fanout\.start.*G-1.*remote/);
+    expect(moaLevelRefusal(g, 'task.fanout.start', HQ, { prompt: 'Fix it', titles: ['a', 'add a retry'], taskPrompts: [] })).toBeNull();
+    expect(moaLevelRefusal(g, 'task.fanout.start', HQ, { prompt: 'Fix it', titles: ['a', 'publish the release'] })).toMatch(/release/);
+    expect(moaLevelRefusal(g, 'task.fanout.start', HQ, { prompt: 'Fix it', titles: ['a', 'b'], taskPrompts: ['', 'then npm publish'] })).toMatch(/release/);
+    expect(moaLevelRefusal(g, 'task.fanout.start', HQ, { prompt: 'Fix the flaky test; commit on your branch.', titles: ['fix'] })).toBeNull();
+  });
+
+  it('screens A2A task updates and channel posts', () => {
+    const g = deps(2, { goalId: 'G-1', humanOnly: [] });
+    expect(moaLevelRefusal(g, 'a2a.task.update', HQ, { taskId: 't', message: 'Looks good, git push it' })).toMatch(/a2a\.task\.update.*remote/);
+    expect(moaLevelRefusal(g, 'a2a.task.update', HQ, { taskId: 't', status: 'completed' })).toBeNull();
+    expect(moaLevelRefusal(g, 'a2a.channel.post', HQ, { channelId: 'c', text: 'cat ~/.git-credentials' })).toMatch(/secret/);
+  });
+
+  it('input.send text split across calls is screened as one line, and Enter re-checks it', () => {
+    const g: MoaLevelGateDeps = { ...deps(2, { goalId: 'G-1', humanOnly: [] }), typed: new Map() };
+    expect(moaLevelRefusal(g, 'input.send', HQ, { ptyId: 'p1', text: 'git pu' })).toBeNull();
+    expect(moaLevelRefusal(g, 'input.send', HQ, { ptyId: 'p1', text: 'sh origin main' })).toMatch(/remote/);
+    // Refused: the line is forgotten, so the next fragment starts clean.
+    expect(moaLevelRefusal(g, 'input.send', HQ, { ptyId: 'p1', text: 'run the tests' })).toBeNull();
+    // A submitted line clears; another pane's line is separate.
+    expect(moaLevelRefusal(g, 'input.send', HQ, { ptyId: 'p1', text: ' now', submit: true })).toBeNull();
+    expect(moaLevelRefusal(g, 'input.send', HQ, { ptyId: 'p2', text: 'git' })).toBeNull();
+    expect(moaLevelRefusal(g, 'input.send', HQ, { ptyId: 'p1', text: ' push' })).toBeNull();
+    // Enter submits what is on the line: screened, then forgotten.
+    g.typed!.set('pty:p3', 'git push');
+    expect(moaLevelRefusal(g, 'input.sendKey', HQ, { ptyId: 'p3', key: 'enter' })).toMatch(/input\.sendKey.*remote/);
+    expect(g.typed!.has('pty:p3')).toBe(false);
+    expect(moaLevelRefusal(g, 'input.sendKey', HQ, { ptyId: 'p2', key: 'ctrl+c' })).toBeNull();
+    expect(g.typed!.has('pty:p2')).toBe(false);
+    expect(moaLevelRefusal(g, 'input.sendKey', HQ, { ptyId: 'p4', key: 'enter' })).toBeNull();
+  });
+
+  it('the installed gate keeps its own typed-line memory', () => {
+    setMoaLevelGate(deps(2, { goalId: 'G-1', humanOnly: [] }));
+    expect(commanderLevelRefusal('input.send', HQ, { ptyId: 'p1', text: 'git pu' })).toBeNull();
+    expect(commanderLevelRefusal('input.send', HQ, { ptyId: 'p1', text: 'sh' })).toMatch(/remote/);
+  });
+
   it('the router hook: uninstalled = null, a throwing gate fails closed', () => {
     expect(commanderLevelRefusal('input.send', HQ, {})).toBeNull();
     setMoaLevelGate({ hqWorkspaceId: () => { throw new Error('boom'); }, level: () => 1, activeGoal: () => null });

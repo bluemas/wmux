@@ -9,24 +9,47 @@
 // What an ACTIVE contract changes, and only while the HQ's autonomy level is
 // 2 or more (moaLevelGate.ts) and the budget lasts:
 //   - fan-out from the HQ anchors on the contract's repository instead of the
-//     HQ's active pane (fanout.rpc.ts);
+//     HQ's active pane, and its workers start with the goal worker profile
+//     (fanout.rpc.ts, shared/moaGoalWorker.ts). A fan-out from a turn that
+//     another PC's Moa woke is refused;
 //   - the fan-out tasks it creates are the contract's: Moa may answer their
 //     questions and send follow-ups without asking (CommanderEventCoalescer);
 //   - a hand-off to a workspace the contract names (or to one of its tasks) is
-//     delivered without a card (moaHandoff.ts).
+//     delivered without a card, but only while the operator's own request is
+//     live: a hand-off from a wake (worker output, PR comments, another PC's
+//     Moa) still asks with a card, as it does without a goal (moaHandoff.ts).
 //
 // What it never changes (code, not prompt): the human-only list below and the
 // operator's own entries, push / PR / merge / release, secrets, destructive
 // commands, critical approvals, permission gates (`allow` stays the phone's
 // alone, src/daemon/index.ts) and any workspace the contract does not name.
 //
-// THE TEXT SCREEN IS A TRIPWIRE, NOT A SANDBOX. goalHardRuleHit reads what Moa
-// is about to send a worker and refuses the obvious "push it" / "here is the
-// token" lines. A paraphrase can get past it. What actually stops a push or a
-// merge is unchanged: the worker's own permission prompts, which Moa can only
-// deny, and task_pr / task_close, which still ask the operator.
+// How those rules are held, outermost first, and what each one really is:
+//   - BOUNDARY (outside wmux): the remote's branch protection and required
+//     reviews. wmux cannot see or vouch for them.
+//   - DENY RULES (cheap first line): a worker a goal fans out runs Claude Code
+//     with `--disallowedTools` rules for push, PR, release, tag, publish and
+//     recursive-delete commands (shared/moaGoalWorker.ts). They match the
+//     command as written, so `git -C . push` or a wrapper script slips past;
+//     an argv-normalising PreToolUse hook is a listed follow-up.
+//   - FRICTION: the goal worker's environment withholds GitHub credentials
+//     (placeholder GH_TOKEN, empty GH_CONFIG_DIR, git credential helpers
+//     reset, an unusable push URL for `origin`). The launch is typed into a
+//     login shell after its rc files, so the operator's own rc can undo it.
+//   - TRIPWIRE: goalHardRuleHit reads what Moa is about to send a worker and
+//     refuses the plain ways of asking for those things. A paraphrase,
+//     a translation or a split message can get past it.
+// Workers that cannot carry the deny rules (agy, codex, a role bound to
+// another CLI) are not started under a goal at all. task_pr / task_close
+// still ask the operator, and permission gates are never answered with
+// `allow` by Moa (src/daemon/index.ts).
+//
+// NOTE: by default fan-out workers run `--permission-mode auto`, which lets a
+// worker push and open a PR it was asked for. Nothing here changes that for
+// fan-outs outside an active goal (owner decision, 2026-09-24).
 
 import type { MoaLevel } from './moa';
+import type { FanoutWorkerPermissionMode } from './workerLaunch';
 
 export type MoaGoalStatus = 'pending' | 'active' | 'declined' | 'completed' | 'canceled' | 'expired' | 'exhausted';
 
@@ -67,6 +90,10 @@ export interface MoaGoalContract {
   taskWorkspaceIds: string[];
   tasksUsed: number;
   turnsUsed: number;
+  /** The fan-out worker permission mode shown on the card, pinned at
+   *  approval: a goal fan-out is refused once Settings says otherwise.
+   *  Absent on a record written before the pin existed (refused too). */
+  workerPermissionMode?: FanoutWorkerPermissionMode;
 }
 
 export const MOA_GOAL_LIMITS = {
@@ -167,7 +194,7 @@ export function parseMoaGoalProposal(params: Record<string, unknown>): MoaGoalPr
 /** The approval card's text. Everything the contract grants is on it: a card
  *  whose context had to be cut is refused at proposal time (`card_too_long`). */
 export function buildMoaGoalCard(
-  c: Pick<MoaGoalContract, 'id' | 'goal' | 'repoRoot' | 'workspaceIds' | 'level' | 'budget' | 'humanOnly'>,
+  c: Pick<MoaGoalContract, 'id' | 'goal' | 'repoRoot' | 'workspaceIds' | 'level' | 'budget' | 'humanOnly' | 'workerPermissionMode'>,
   workspaceName: (id: string) => string | undefined,
 ): { question: string; options: string[]; context: string } {
   const ws = c.workspaceIds.map((id) => workspaceName(id) ?? id);
@@ -176,6 +203,7 @@ export function buildMoaGoalCard(
     `Repository: ${c.repoRoot ?? '(none)'}`,
     ...(ws.length ? [`Workspaces: ${ws.join(', ')}`] : []),
     `Moa may, without asking: fan out up to ${c.budget.maxTasks} task${c.budget.maxTasks === 1 ? '' : 's'} in that repository, answer and instruct those tasks${ws.length ? ', hand work to the workspaces above' : ''}. Level ${c.level}; ends after ${c.budget.maxHours} h or ${c.budget.maxTurns} automatic turns.`,
+    `Workers: Claude Code only, permission mode ${c.workerPermissionMode ?? 'unknown'}; push, PR, tag, release, publish and recursive-delete commands denied; GitHub credentials withheld.`,
     `Always yours: ${[...MOA_GOAL_DEFAULT_HUMAN_ONLY, ...c.humanOnly].join('; ')}.`,
   ];
   return {
@@ -186,36 +214,96 @@ export function buildMoaGoalCard(
 }
 
 // ── hard rules on outbound text ─────────────────────────────────────────────
+//
+// A TRIPWIRE, NOT THE BOUNDARY. These patterns read what Moa is about to send
+// a worker and refuse the plain ways of asking for a push, a release, a secret
+// or a destructive command. They are deliberately broad (a refusal only costs
+// Moa a rephrase or a deck_ask_decision), but a regex over natural language
+// can always be paraphrased, split or translated past. What actually holds a
+// goal worker is layered under this: the worker's own deny rules and the
+// credential friction of the goal worker profile (shared/moaGoalWorker.ts),
+// and outside wmux the remote's branch protection.
 
 export type MoaGoalHardRule = 'remote' | 'release' | 'secret' | 'destructive' | 'human-only';
 
+/** Global git options that may stand between `git` and its subcommand
+ *  (`git -C . push`, `git -c k=v push`, `git --no-pager push`). */
+const GIT_OPTS = String.raw`(?:\s+(?:-[cC]\s+\S+|--[a-z][\w-]*(?:=\S+)?|-[a-zA-Z]))*`;
+
+function gitCmd(sub: string): RegExp {
+  return new RegExp(String.raw`\bgit${GIT_OPTS}\s+(?:${sub})`, 'i');
+}
+
+const REMOTE_PLACE = String.raw`(?:the\s+)?(?:origin|remote|upstream|github|gitlab|bitbucket)`;
+
 const HARD_RULES: ReadonlyArray<{ rule: MoaGoalHardRule; re: RegExp; literal?: true }> = [
-  { rule: 'remote', re: /\bgit\s+push\b/i },
-  { rule: 'remote', re: /\bpush\s+(it|this|that|them|the\s+(branch|changes?|commits?))\b/i },
-  { rule: 'remote', re: /\bpush\s+(to|into)\s+(origin|remote|upstream|github|main|master)\b/i },
-  { rule: 'remote', re: /\bforce[- ]push/i },
-  { rule: 'remote', re: /\bgh\s+pr\s+(create|merge|ready)\b/i },
-  { rule: 'remote', re: /\b(open|create|raise|merge|submit)\s+(a\s+|the\s+|your\s+)?(pull\s+request|PR)\b/i },
-  { rule: 'release', re: /\b(npm|pnpm|yarn|cargo)\s+publish\b/i },
+  // remote
+  { rule: 'remote', re: gitCmd(String.raw`push\b`) },
+  { rule: 'remote', re: /\bpush\s+(it|this|that|them|everything|the\s+(branch|changes?|commits?|fix|work)|your\s+(branch|changes?|commits?|work))\b/i },
+  { rule: 'remote', re: new RegExp(String.raw`\bpush\s+((it|this|them|everything)\s+)?(up\s+)?(to|into)\s+(${REMOTE_PLACE}|main|master)\b`, 'i') },
+  { rule: 'remote', re: /\bforce[- ]?push/i },
+  { rule: 'remote', re: /\bgh\s+pr\s+(create|merge|ready|close|reopen|edit|comment|review)\b/i },
+  { rule: 'remote', re: /\bgh\s+(api|workflow\s+run|run\s+rerun|repo\s+(create|delete|edit|rename|archive|fork|sync))\b/i },
+  { rule: 'remote', re: /\b(open|create|raise|file|merge|submit|land)\s+(a\s+|an\s+|the\s+|your\s+)?(draft\s+)?(pull\s+request|PR|merge\s+request|MR)s?\b/i },
+  { rule: 'remote', re: new RegExp(String.raw`\b(publish|upload|sync)\w*\s+(\S+\s+){0,4}?(to|with|on|onto)\s+${REMOTE_PLACE}\b`, 'i') },
+  { rule: 'remote', re: /\bpublish\s+(your|the|this)\s+branch\b/i },
+  { rule: 'remote', re: /(\bgit|깃)\s*(푸시|푸쉬)|(푸시|푸쉬)\s*(해|하|를|좀)|원격\S*\s*(에|으로)?\s*(올려|푸시|푸쉬)|(PR|풀\s*리퀘스트|풀리퀘)\s*(을|를)?\s*(만들|열어|올려|생성|머지|병합)|(머지|병합)\s*(해|하)|プッシュ|プルリク|マージして|推送|合并请求|拉取请求/i },
+  // release
+  { rule: 'release', re: /\b(npm|pnpm|yarn|bun|cargo|gem|poetry|vsce|ovsx|changeset|lerna)\s+(npm\s+)?publish\b|\btwine\s+upload\b/i },
+  { rule: 'release', re: /\b(npm|pnpm|yarn|bun)\s+(run\s+)?(release|publish|deploy|version)\b/i },
+  { rule: 'release', re: /\b(make|just|task)\s+(release|publish|deploy)\b/i },
+  { rule: 'release', re: /[\w./-]*\b(release|publish|deploy)[\w.-]*\.(sh|ps1|cmd|bat|mjs|cjs|js|ts|py)\b/i },
   { rule: 'release', re: /\bgh\s+release\b/i },
-  { rule: 'release', re: /\bgit\s+tag\b/i },
-  { rule: 'release', re: /\b(cut|publish|ship|tag)\s+(a\s+|the\s+)?release\b/i },
+  { rule: 'release', re: gitCmd(String.raw`tag\b`) },
+  { rule: 'release', re: /\bdocker\s+push\b/i },
+  { rule: 'release', re: /\b(cut|publish|ship|tag|make|create|do)\s+(a\s+|an\s+|the\s+)?(new\s+)?release\b/i },
+  { rule: 'release', re: /\bbump\s+(the\s+)?version\b/i },
+  { rule: 'release', re: /(릴리스|릴리즈|배포)\s*(해|하|를|좀|만들)|버전\s*(을|를)?\s*올려|リリースして|发布/i },
+  // secret
   { rule: 'secret', re: /\b(api[_ -]?key|access[_ -]?token|auth[_ -]?token|secret[_ -]?key|private[_ -]?key|password|passwd|credentials?)\b/i },
-  { rule: 'secret', re: /(^|[\s'"`(/])(\.env(\.[\w-]+)?|id_rsa|id_ed25519|\.ssh\/|\.npmrc|\.aws\/credentials)\b/i },
+  { rule: 'secret', re: /(^|[\s(/=:])(\.env(\.[\w-]+)?|id_(rsa|ed25519|ecdsa|dsa)|\.ssh\/|\.npmrc|\.pypirc|[._]netrc|\.git-credentials|\.aws\/credentials)\b/i },
+  { rule: 'secret', re: /\.config\/gh\b|\bgh\/hosts\.yml\b|\bhosts\.yml\b|github cli\/|\.docker\/config\.json|\.kube\/config\b|\bcredentials\.json\b/i },
+  { rule: 'secret', re: /\bgh\s+auth\s+(token|login|refresh|status\s+(-t|--show-token))\b|\bgit\s+credential\b|\bcmdkey\b|\bsecurity\s+find-(generic|internet)-password\b/i },
+  { rule: 'secret', re: /(토큰|비밀번호|패스워드|자격\s*증명|시크릿)\S*\s*(을|를)?\s*(알려|보여|붙여|출력|복사|읽어|찾아)/ },
   // A token itself: refused even in a negated sentence.
-  { rule: 'secret', re: /\b(gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|xox[abp]-[A-Za-z0-9-]{10,})\b/, literal: true },
-  { rule: 'destructive', re: /\brm\s+-[a-z]*r[a-z]*f|\brm\s+-[a-z]*f[a-z]*r/i },
-  { rule: 'destructive', re: /\bgit\s+(reset\s+--hard|clean\s+-[a-z]*f|branch\s+-D|push\s+--delete)\b/i },
-  { rule: 'destructive', re: /\bdrop\s+(table|database|schema)\b/i },
+  { rule: 'secret', re: /\b(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|xox[abp]-[A-Za-z0-9-]{10,})\b/, literal: true },
+  // destructive
+  { rule: 'destructive', re: /\brm(\s+-{1,2}[\w-]+)*?\s+(-[a-zA-Z]*[rR][a-zA-Z]*|--recursive)(?=\s|$)/ },
+  { rule: 'destructive', re: /\b(Remove-Item|ri|rmdir|rd|del|erase)\b[^\n;|&]*?\s[-/](Recurse|r|s)\b/i },
+  { rule: 'destructive', re: /\bfind\b[^\n;|&]*\s-(delete|exec\s+rm)\b/i },
+  { rule: 'destructive', re: gitCmd(String.raw`reset\s+--hard|clean\s+-[a-z]*f|branch\s+-D|push\s+--delete|checkout\s+--\s|restore\s+(--\S+\s+)*\.(\s|$)|stash\s+(drop|clear)|filter-branch|update-ref\s+-d`) },
+  { rule: 'destructive', re: /\b(drop\s+(table|database|schema)|truncate\s+table)\b|\bmkfs\b|\bformat\s+[a-z]:/i },
 ];
 
-/** A negation shortly before the match in the same clause ("do not push it")
- *  is an instruction to stay local, which is what the rules want. */
-const NEGATION_RE = /\b(do\s+not|don['’]t|never|must\s+not|mustn['’]t|should\s+not|shouldn['’]t|without|no)\b[^.;:!?\n]*$/i;
+/** Breaks a clause: punctuation, a dash between spaces, or a joining word.
+ *  A negation only covers the clause it is in ("No rush, git push" is not). */
+const CLAUSE_BREAK = /[.,;:!?\n]|\s[-–—]+\s|\b(then|and|but|so|after|before|once|when|while|also)\b/gi;
+
+/** A negation directly in front of the match: at most two words between. */
+const NEGATION_TAIL = /\b(do\s+not|dont|never|must\s+not|mustnt|should\s+not|shouldnt|cannot|cant|wont|not|no|without)\s+(\S+\s+){0,2}$/i;
+
+/** Phrases that look like a negation and are not. */
+const NOT_A_NEGATION = /\b(never\s+mind|no\s+(rush|worries|problem|need|hurry|matter)|not\s+(only|just)|(dont|do\s+not|never)\s+(forget|hesitate)|without\s+(delay|waiting|asking|hesitation))\b/i;
 
 function negated(text: string, index: number): boolean {
-  const before = text.slice(Math.max(0, index - 48), index);
-  return NEGATION_RE.test(before);
+  const before = text.slice(Math.max(0, index - 60), index);
+  let start = 0;
+  for (const m of before.matchAll(CLAUSE_BREAK)) start = (m.index ?? 0) + m[0].length;
+  const clause = before.slice(start);
+  if (NOT_A_NEGATION.test(clause)) return false;
+  return NEGATION_TAIL.test(clause);
+}
+
+/** Text as the rules read it: compatibility-folded (full-width forms), with
+ *  zero-width / format characters and quote marks removed (so `git` "push"
+ *  and `g​it push` read as one command), and Windows path separators
+ *  turned into `/`. */
+export function goalScreenText(raw: string): string {
+  return raw
+    .normalize('NFKC')
+    .replace(/[­​-‏⁠-⁤﻿]/g, '')
+    .replace(/["'`‘’“”]/g, '')
+    .replace(/\\/g, '/');
 }
 
 function escapeRe(s: string): string {
@@ -225,14 +313,15 @@ function escapeRe(s: string): string {
 /**
  * The first hard rule `text` trips, or null. `humanOnly` is the contract's own
  * list (the operator approved it); each entry matches as a whole phrase,
- * case-insensitively. Negated mentions are allowed through.
+ * case-insensitively. A mention negated in its own clause ("do not push it")
+ * is an instruction to stay local and passes; a literal token never does.
  */
 export function goalHardRuleHit(
   text: string,
   humanOnly: readonly string[] = [],
 ): { rule: MoaGoalHardRule; match: string } | null {
   if (typeof text !== 'string' || text.length === 0) return null;
-  const folded = text.normalize('NFKC');
+  const folded = goalScreenText(text);
   for (const { rule, re, literal } of HARD_RULES) {
     const g = new RegExp(re.source, re.flags.includes('g') ? re.flags : `${re.flags}g`);
     for (const m of folded.matchAll(g)) {
@@ -241,12 +330,30 @@ export function goalHardRuleHit(
     }
   }
   for (const phrase of humanOnly) {
-    const p = goalOneLine(phrase);
+    const p = goalScreenText(goalOneLine(phrase));
     if (p.length < 3) continue;
     const re = new RegExp(`(^|[^\\p{L}\\p{N}])${escapeRe(p)}($|[^\\p{L}\\p{N}])`, 'giu');
     for (const m of folded.matchAll(re)) {
-      if (negated(folded, m.index ?? 0)) continue;
+      // The match starts with the separator in front of the phrase.
+      if (negated(folded, (m.index ?? 0) + (m[1]?.length ?? 0))) continue;
       return { rule: 'human-only', match: p };
+    }
+  }
+  return null;
+}
+
+/** Screen several texts (a fan-out's prompt, titles and per-task prompts). */
+export function goalHardRuleHitAny(
+  texts: readonly unknown[],
+  humanOnly: readonly string[] = [],
+): { rule: MoaGoalHardRule; match: string } | null {
+  for (const t of texts) {
+    if (typeof t === 'string') {
+      const hit = goalHardRuleHit(t, humanOnly);
+      if (hit) return hit;
+    } else if (Array.isArray(t)) {
+      const hit = goalHardRuleHitAny(t, humanOnly);
+      if (hit) return hit;
     }
   }
   return null;

@@ -11,8 +11,11 @@
 //   level 1  today's behaviour, unchanged (the default for every install).
 //   level 2+ the same lane, plus whatever an ACTIVE goal contract grants
 //            (moaGoalContract.ts). While a contract is active, what Moa sends
-//            a worker (input.send / a2a.task.send / a2a.broadcast) is read
-//            against the contract's hard rules (shared/moaGoal.ts), and what
+//            a worker (input.send — joined across calls up to the Enter that
+//            submits it — a2a.task.send / a2a.task.update / a2a.broadcast /
+//            a2a.channel.post, and the fan-out prompt, titles and per-task
+//            prompts) is read against the contract's hard rules
+//            (shared/moaGoal.ts; a tripwire, not the boundary), and what
 //            it types, keys or messages DIRECTLY may only reach a workspace
 //            inside the contract (moaScopeRefusal below). Anything else goes
 //            through moa_propose_handoff, which asks the operator with a card.
@@ -28,7 +31,7 @@
 // src/daemon/index.ts).
 
 import type { MoaLevel } from '../../shared/moa';
-import { goalHardRuleHit } from '../../shared/moaGoal';
+import { goalHardRuleHit, goalHardRuleHitAny } from '../../shared/moaGoal';
 
 /** Methods that change something outside Moa's own records. Refused at level 0. */
 export const MOA_L0_REFUSED_METHODS: ReadonlySet<string> = new Set<string>([
@@ -64,12 +67,32 @@ export const MOA_L0_REFUSED_METHODS: ReadonlySet<string> = new Set<string>([
   'approval.press',
 ]);
 
-/** Methods whose text reaches a worker, screened while a contract is active. */
+/** Methods whose text reaches a worker, screened while a contract is active.
+ *  A field may hold a string or an array of strings (fan-out titles and
+ *  per-task prompts). The fan-out prompt is the most important instruction a
+ *  worker ever gets, so it is screened like everything else. */
 const SCREENED_TEXT_PARAMS: Readonly<Record<string, readonly string[]>> = {
   'input.send': ['text'],
   'a2a.task.send': ['message', 'title'],
+  'a2a.task.update': ['message'],
   'a2a.broadcast': ['message'],
+  'a2a.channel.post': ['text'],
+  'task.fanout.start': ['prompt', 'titles', 'taskPrompts'],
 };
+
+/** Keys that submit (or discard) what is typed on a terminal's line. */
+const SUBMIT_KEYS: ReadonlySet<string> = new Set(['enter']);
+const DISCARD_KEYS: ReadonlySet<string> = new Set(['ctrl+c', 'escape', 'ctrl+d', 'ctrl+z']);
+/** Typed-but-unsubmitted text kept per target, and how much of it. */
+const TYPED_MAX_TARGETS = 64;
+const TYPED_MAX_CHARS = 4000;
+
+function typedKey(params: Record<string, unknown> | undefined): string | null {
+  const pty = params?.ptyId;
+  if (typeof pty === 'string' && pty.length > 0) return `pty:${pty}`;
+  const ws = params?.workspaceId;
+  return typeof ws === 'string' && ws.length > 0 ? `ws:${ws}` : null;
+}
 
 export interface MoaLevelGateDeps {
   hqWorkspaceId: () => string | null;
@@ -87,6 +110,11 @@ export interface MoaLevelGateDeps {
   paneOwner?: (paneId: string) => Promise<string | null>;
   /** The member workspaces of a channel, read as the HQ; null when unreadable. */
   channelMembers?: (hqWorkspaceId: string, channelId: string) => Promise<string[] | null>;
+  /** What Moa typed into a terminal without submitting it, per target, so a
+   *  line split across input.send calls (`git pu` + `sh`) and submitted with
+   *  input.sendKey is screened as one line. setMoaLevelGate supplies one;
+   *  absent, each call is screened alone. */
+  typed?: Map<string, string>;
 }
 
 /** The refusal for `method` from the commander bound to `workspaceId`, or null. Pure. */
@@ -102,19 +130,56 @@ export function moaLevelRefusal(
   if (level === 0 && MOA_L0_REFUSED_METHODS.has(method)) {
     return `method ${method} is refused: Moa is at level 0 (observe only) in Settings › Moa. Read, report, or ask the operator with deck_ask_decision.`;
   }
+  if (level < 2) return null;
   const fields = SCREENED_TEXT_PARAMS[method];
-  if (!fields || level < 2) return null;
+  if (!fields && method !== 'input.sendKey') return null;
   const goal = deps.activeGoal();
   if (!goal) return null;
-  for (const f of fields) {
-    const v = params?.[f];
-    if (typeof v !== 'string') continue;
-    const hit = goalHardRuleHit(v, goal.humanOnly);
-    if (hit) {
-      return `method ${method} is refused under goal ${goal.goalId}: the text asks for something that stays the operator's (${hit.rule}: "${hit.match}"). Leave that step out and raise it with deck_ask_decision.`;
+  const refuse = (hit: { rule: string; match: string }): string =>
+    `method ${method} is refused under goal ${goal.goalId}: the text asks for something that stays the operator's (${hit.rule}: "${hit.match}"). Leave that step out and raise it with deck_ask_decision.`;
+  const key = typedKey(params);
+  const typed = deps.typed;
+
+  // input.sendKey carries only a key name, but Enter submits whatever Moa
+  // typed on that line before it: screen that line as one piece.
+  if (method === 'input.sendKey') {
+    const k = typeof params?.key === 'string' ? params.key.toLowerCase() : '';
+    if (!key || !typed) return null;
+    if (SUBMIT_KEYS.has(k)) {
+      const line = typed.get(key) ?? '';
+      typed.delete(key);
+      const hit = line ? goalHardRuleHit(line, goal.humanOnly) : null;
+      return hit ? refuse(hit) : null;
     }
+    if (DISCARD_KEYS.has(k)) typed.delete(key);
+    return null;
   }
-  return null;
+
+  // input.send: the text joined to what is still unsubmitted on that line, so
+  // `git pu` then `sh` is read as `git push`.
+  if (method === 'input.send') {
+    const text = typeof params?.text === 'string' ? params.text : '';
+    const prior = key && typed ? typed.get(key) ?? '' : '';
+    const hit = goalHardRuleHit(prior + text, goal.humanOnly);
+    if (key && typed) {
+      const submitted = params?.submit === true || /[\r\n]/.test(text);
+      if (hit || submitted) {
+        typed.delete(key);
+      } else {
+        typed.delete(key); // re-insert: most recent last, for the size bound
+        typed.set(key, (prior + text).slice(-TYPED_MAX_CHARS));
+        while (typed.size > TYPED_MAX_TARGETS) {
+          const oldest = typed.keys().next().value;
+          if (oldest === undefined) break;
+          typed.delete(oldest);
+        }
+      }
+    }
+    return hit ? refuse(hit) : null;
+  }
+
+  const hit = goalHardRuleHitAny((fields ?? []).map((f) => params?.[f]), goal.humanOnly);
+  return hit ? refuse(hit) : null;
 }
 
 type Gate = (method: string, workspaceId: string, params: Record<string, unknown> | undefined) => string | null;
@@ -124,8 +189,9 @@ let installedDeps: MoaLevelGateDeps | null = null;
 
 /** deck.handler installs the production gate; null uninstalls it. */
 export function setMoaLevelGate(deps: MoaLevelGateDeps | null): void {
-  installed = deps ? (m, w, p) => moaLevelRefusal(deps, m, w, p) : null;
-  installedDeps = deps;
+  const withTyped = deps ? { ...deps, typed: deps.typed ?? new Map<string, string>() } : null;
+  installed = withTyped ? (m, w, p) => moaLevelRefusal(withTyped, m, w, p) : null;
+  installedDeps = withTyped;
 }
 
 /** RpcRouter's call. Never throws: a gate that fails refuses (fail closed). */
