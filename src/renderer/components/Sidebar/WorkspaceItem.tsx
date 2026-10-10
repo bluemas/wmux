@@ -96,6 +96,8 @@ interface WorkspaceItemProps {
 /** Longest question the row keeps (it truncates on screen; the full text is
  *  in the tooltip and Fleet's detail). */
 const ROW_QUESTION_MAX = 240;
+/** Stable empty result for the dismiss-question selector. */
+const NO_PTY_IDS: string[] = [];
 
 /**
  * X1 — PR badge for the current branch. Color encodes state; the trailing
@@ -538,6 +540,22 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumb
     return '';
   });
   const question = needsYou ? sanitizeDisplayText(rawQuestion, ROW_QUESTION_MAX) : undefined;
+  // The panes here that need you because their agent ended a turn on a
+  // question — what the context menu's Dismiss clears. Live permission dialogs
+  // are not in it: those wait for an answer. Read only while the menu is open.
+  const questionPtyIds = useStore(useShallow((s) => {
+    if (!menuPos) return NO_PTY_IDS;
+    const ws = s.workspaces.find((w) => w.id === workspaceId);
+    if (!ws) return NO_PTY_IDS;
+    const ids: string[] = [];
+    for (const surf of collectWorkspaceTerminalSurfaces(ws)) {
+      // A pane whose agent reports a live prompt is skipped even with a
+      // question text: dismissing would leave it needing you anyway.
+      if (surf.ptyId && s.surfacePendingQuestion?.[surf.ptyId]?.trim()
+        && s.surfaceAgent?.[surf.ptyId]?.status !== 'awaiting_input') ids.push(surf.ptyId);
+    }
+    return ids.length > 0 ? ids : NO_PTY_IDS;
+  }));
   // Roving tabindex: the row's own buttons join the Tab order only while the
   // keyboard is on this row, so Tab walks rows' actions one row at a time
   // instead of every hidden button in the list.
@@ -1535,6 +1553,22 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumb
           style={{ left: menuPos.x, top: menuPos.y, background: 'var(--bg-surface)', border: '1px solid color-mix(in srgb, var(--bg-overlay) 70%, transparent)' }}
           onMouseDown={(e) => e.stopPropagation()}
         >
+          {questionPtyIds.length > 0 && (
+            <button
+              className="w-full text-left px-3 py-1.5 text-xs transition-colors hover:bg-[var(--bg-overlay)]"
+              style={{ color: 'var(--text-main)' }}
+              onClick={() => {
+                setMenuPos(null);
+                const { dismissPendingQuestion } = useStore.getState();
+                for (const ptyId of questionPtyIds) dismissPendingQuestion(ptyId);
+              }}
+              data-workspace-action="dismiss-question"
+            >
+              {questionPtyIds.length > 1
+                ? t('workspace.dismissQuestions', { count: questionPtyIds.length })
+                : t('workspace.dismissQuestion')}
+            </button>
+          )}
           <button
             className="w-full text-left px-3 py-1.5 text-xs transition-colors hover:bg-[var(--bg-overlay)]"
             style={{ color: 'var(--text-main)' }}
