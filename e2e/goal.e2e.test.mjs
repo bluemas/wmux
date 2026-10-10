@@ -29,6 +29,16 @@ let logs;
 let token;
 let fanouts = 0;
 
+const learning = () => {
+  const f = path.join(sb.home, '.wmux-e2e', 'moa-goal-learning.json');
+  return fs.existsSync(f) ? JSON.parse(fs.readFileSync(f, 'utf8')) : { failures: [], flakes: [], drafts: [] };
+};
+const BROKEN_WORKER = [
+  'mkdir -p node_modules',
+  'echo broken > feature.txt',
+  'git add feature.txt',
+  'git -c user.name=fake-worker -c user.email=w@wmux.invalid commit -q -m "e2e worker: broken change"',
+].join('\n');
 const goals = () => JSON.parse(fs.readFileSync(path.join(sb.home, '.wmux-e2e', 'moa-goals.json'), 'utf8')).items;
 const brain = (method, params, timeout) => rpc(sb, method, params, { commanderToken: token, ...(timeout ? { timeout } : {}) });
 
@@ -200,12 +210,7 @@ describe('Moa goal evidence gate (Electron e2e)', () => {
   });
 
   it('2: a failing project test keeps the goal open as unverified', async () => {
-    setWorkerScript(sb, [
-      'mkdir -p node_modules',
-      'echo broken > feature.txt',
-      'git add feature.txt',
-      'git -c user.name=fake-worker -c user.email=w@wmux.invalid commit -q -m "e2e worker: broken change"',
-    ].join('\n'));
+    setWorkerScript(sb, BROKEN_WORKER);
     const id = await proposeAndApprove('Break-check: feature.txt must say done', ['npm test passes'], null);
     const task = await fanOutOne('try the feature');
     const r = await brain('deck.goal', {
@@ -218,6 +223,11 @@ describe('Moa goal evidence gate (Electron e2e)', () => {
     assert.match(r.problems.join('\n'), /the gate failed \(npm test, exit 1\)/);
     assert.equal(goals()[id].status, 'active');
     assert.equal(goals()[id].verification, undefined);
+    // Learning loop: the failure failed its retry too, so it is recorded as a
+    // real failure. Seen once: no draft yet.
+    assert.equal(learning().failures.length, 1);
+    assert.equal(learning().drafts.length, 0);
+    assert.equal(await win.getByTestId('moa-goal-draft').count(), 0);
     // Main screen: the strip shows the failure as a summary with an openable
     // log, not a raw temp path.
     await win.getByTestId('moa-goal-strip-problem').waitFor({ timeout: 15_000 });
@@ -255,6 +265,87 @@ describe('Moa goal evidence gate (Electron e2e)', () => {
     assert.equal(goals()[id].status, 'active');
     await shot(win, '05-memo-only-refused');
     assert.equal((await brain('deck.goal', { action: 'cancel', summary: 'e2e cleanup' })).ok, true);
+  });
+
+  it('4: the same gate failure in a second goal drafts one regression-test goal; approving it is the operator click', async () => {
+    setWorkerScript(sb, BROKEN_WORKER);
+    const id = await proposeAndApprove('Break-check again: feature.txt must say done', ['npm test passes'], null);
+    const task = await fanOutOne('try the feature again');
+    const r = await brain('deck.goal', {
+      action: 'complete',
+      summary: 'claims done again',
+      criteria: [{ criterion: 1, artifacts: [path.join(task.worktreePath, 'feature.txt')] }],
+    }, 300_000);
+    assert.equal(r.code, 'unverified');
+    const L = learning();
+    assert.equal(L.failures.length, 2);
+    assert.equal(L.failures[0].signature, L.failures[1].signature, 'same mistake, same signature');
+    assert.equal(L.drafts.length, 1);
+    const draft = L.drafts[0];
+    assert.equal(draft.status, 'draft');
+    assert.match(draft.doneCriteria.join('\n'), /FAILS on the original buggy code/);
+    assert.match(draft.doneCriteria.join('\n'), /PASSES with the fix/);
+    // The draft is on the main screen, not auto-approved: the goal in force is
+    // still the operator-approved one.
+    const strip = win.getByTestId('moa-goal-strip');
+    await strip.getByTestId('moa-goal-draft').waitFor({ timeout: 15_000 });
+    await shot(win, '06-draft-on-main-screen');
+    assert.equal(Object.values(goals()).filter((g) => g.goal === draft.goal).length, 0, 'a draft is never a goal by itself');
+    assert.equal((await brain('deck.goal', { action: 'cancel', summary: 'e2e cleanup' })).ok, true);
+    assert.notEqual(goals()[id].status, 'active');
+    // Settings lists it with its criteria; Approve turns it into an active goal.
+    await showGoalRow();
+    const settingsDraft = win.getByTestId('moa-settings-drafts');
+    await settingsDraft.waitFor();
+    await settingsDraft.scrollIntoViewIfNeeded();
+    await shot(win, '07-draft-in-settings');
+    await settingsDraft.getByTestId('moa-goal-draft-approve').click();
+    const approved = await waitFor(() => Object.values(goals()).find((g) => g.goal === draft.goal && g.status === 'active') ?? null, { what: 'draft approved into a goal' });
+    assert.deepEqual(approved.doneCriteria, draft.doneCriteria);
+    assert.equal(learning().drafts[0].status, 'approved');
+    assert.equal(learning().drafts[0].goalId, approved.id);
+    await win.getByTestId('moa-goal-draft').waitFor({ state: 'detached' });
+    await win.getByTestId('moa-goal-end').waitFor();
+    await win.getByText("Moa's goal", { exact: true }).first().scrollIntoViewIfNeeded();
+    await shot(win, '08-draft-approved-goal-active');
+    await win.keyboard.press('Escape');
+    assert.equal((await brain('deck.goal', { action: 'cancel', summary: 'e2e cleanup' })).ok, true);
+  });
+
+  it('5: a flaky test (fails, then passes on the retry) is recorded as a flake and never drafted', async () => {
+    const once = path.join(sb.home, '.e2e-flaky-once');
+    setWorkerScript(sb, [
+      'mkdir -p node_modules e2e-evidence',
+      'echo done > feature.txt',
+      // Fails the first time it runs anywhere, passes after.
+      `printf '%s\\n' "const __f=require('fs');if(!__f.existsSync('${once}')){__f.writeFileSync('${once}','1');console.log('FAIL timing-sensitive check timed out');process.exit(1)}" | cat - test.js > t2 && mv t2 test.js`,
+      'git add feature.txt test.js',
+      'git -c user.name=fake-worker -c user.email=w@wmux.invalid commit -q -m "e2e worker: flaky"',
+    ].join('\n'));
+    const before = learning();
+    const id = await proposeAndApprove('Flaky check: feature.txt says done', ['feature.txt says done'], null);
+    const task = await fanOutOne('flaky feature');
+    const r = await brain('deck.goal', {
+      action: 'complete',
+      summary: 'done (the test is flaky)',
+      criteria: [{ criterion: 1, artifacts: [path.join(task.worktreePath, 'feature.txt')] }],
+    }, 300_000);
+    if (!r.ok) {
+      const log = /see (\S+\.log)/.exec(r.problems.join('\n'))?.[1];
+      assert.fail(`${JSON.stringify(r)}\n${log && fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : ''}\n${JSON.stringify(learning())}\ntest.js:\n${fs.readFileSync(path.join(task.worktreePath, 'test.js'), 'utf8')}`);
+    }
+    assert.equal(goals()[id].verification.gates[0].flaky, true);
+    const after = learning();
+    assert.equal(after.flakes.length, before.flakes.length + 1);
+    assert.match(after.flakes.at(-1).summary, /timing-sensitive/);
+    assert.equal(after.failures.length, before.failures.length, 'a flake is not a failure');
+    assert.equal(after.drafts.length, before.drafts.length, 'no draft for a flake');
+    await showGoalRow();
+    const note = win.getByTestId('moa-settings-flakes');
+    await note.waitFor();
+    await note.scrollIntoViewIfNeeded();
+    await shot(win, '09-flake-recorded-no-draft');
+    await win.keyboard.press('Escape');
   });
 });
 

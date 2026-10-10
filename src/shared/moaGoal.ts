@@ -85,6 +85,8 @@ export interface MoaGoalVerificationGate {
   /** The gate output the verifier saved, and its sha256. */
   logPath: string;
   logSha256: string;
+  /** Failed once, passed on the one retry (moaGoalLearning.ts): a flake. */
+  flaky?: true;
 }
 
 /** A file named as evidence for a done criterion, hashed when verified. */

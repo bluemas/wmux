@@ -8,6 +8,7 @@
 // Every row renders before the first read answers (controls inert, status
 // "Checking…"), so search can always jump to it.
 
+import { MoaGoalDrafts } from '../Moa/MoaGoalDrafts';
 import { resolveTaskLink } from '../../utils/fanoutProvenance';
 import { useEffect, useState, type ReactNode } from 'react';
 import { useStore } from '../../stores';
@@ -752,6 +753,14 @@ export function TabMoa({ registerDialog }: TabMoaProps) {
             </Button>
           )}
         </SettingRow>
+        {(moa?.learning?.drafts.length ?? 0) > 0 && (
+          <div className="settings-note ui-note" data-tone="muted" data-testid="moa-settings-drafts">
+            <MoaGoalDrafts />
+          </div>
+        )}
+        {(moa?.learning?.flakes ?? 0) > 0 && (
+          <SettingNote data-testid="moa-settings-flakes">{t('moa.drafts.flakes', { n: moa?.learning?.flakes ?? 0 })}</SettingNote>
+        )}
         {goalEndFailed && (
           <SettingNote tone="danger" role="alert">{t('moa.settings.goalEndFailed')}</SettingNote>
         )}
