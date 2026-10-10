@@ -8,6 +8,7 @@ import { handlePhoneWorkspaces } from './phone/PhoneWorkspaces';
 import { handlePhoneQuickCommands } from './quickCommands/QuickCommandStore';
 import { installPhoneBridge } from './phone/installPhoneBridge';
 import { handlePhoneMoaWake } from './deck/moaWake';
+import { clearGoalWorkerSessions } from './deck/goalWorkerSessions';
 import { MOA_WAKE_COMMAND } from '../shared/moaWake';
 import { handlePhoneAccounts } from './phone/PhoneAccounts';
 // #582: Suppress Electron's dev-only "Insecure Content-Security-Policy"
@@ -2061,6 +2062,9 @@ app.on('ready', async () => {
       // surface the original code used; the swap is logged for the
       // race-investigation breadcrumb trail kept by previous fixes.
       logLine('info', 'main', 'handler swap (daemon connect): cleanup begin');
+      // Sessions this daemon recovered are new processes, not the goal worker
+      // spawns main recorded (goalWorkerSessions.ts).
+      clearGoalWorkerSessions();
       cleanupHandlers();
       logLine('info', 'main', 'handler swap (daemon connect): cleanup done, register begin');
       cleanupHandlers = registerAllHandlers(ptyManager, ptyBridge, () => mainWindow, daemonClient, {
@@ -2161,6 +2165,7 @@ app.on('ready', async () => {
         mainWindow.webContents.send('daemon:disconnected');
       }
       logLine('warn', 'main', 'handler swap (daemon disconnect): cleanup begin');
+      clearGoalWorkerSessions();
       cleanupHandlers();
       logLine('warn', 'main', 'handler swap (daemon disconnect): cleanup done, register begin');
       cleanupHandlers = registerAllHandlers(ptyManager, ptyBridge, () => mainWindow, undefined, {

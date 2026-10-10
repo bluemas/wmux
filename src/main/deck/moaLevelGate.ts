@@ -146,7 +146,7 @@ export interface MoaLevelGateDeps {
   level: () => MoaLevel;
   /** The active contract's id and human-only list when it currently grants
    *  powers; null otherwise. */
-  activeGoal: () => { goalId: string; humanOnly: readonly string[]; scope?: readonly string[] } | null;
+  activeGoal: () => { goalId: string; humanOnly: readonly string[]; scope?: readonly string[]; tasks?: readonly string[] } | null;
   /** Which workspace owns a pane (the same mirror/renderer lookup the input
    *  handlers' ownership check uses). Absent or failing: unknown. */
   ptyOwner?: (ptyId: string) => Promise<string | null>;
@@ -157,6 +157,9 @@ export interface MoaLevelGateDeps {
   paneOwner?: (paneId: string) => Promise<string | null>;
   /** The member workspaces of a channel, read as the HQ; null when unreadable. */
   channelMembers?: (hqWorkspaceId: string, channelId: string) => Promise<string[] | null>;
+  /** Whether a session is the goal worker main spawned (goalWorkerSessions.ts).
+   *  Absent: no session is, so typing into a goal task pane is refused. */
+  goalWorkerSession?: (ptyId: string) => boolean;
   /** What Moa typed into a terminal without submitting it, per target, so a
    *  line split across input.send calls (`git pu` + `sh`) and submitted with
    *  input.sendKey is screened as one line. setMoaLevelGate supplies one;
@@ -310,12 +313,12 @@ function str(v: unknown): string | null {
 
 /** The workspaces Moa may reach directly under the active goal, or null when
  *  no goal is active for this HQ (today's lane). Pure over `deps`. */
-export function moaGoalScopeOf(deps: MoaLevelGateDeps, workspaceId: string): { goalId: string; scope: string[] } | null {
+export function moaGoalScopeOf(deps: MoaLevelGateDeps, workspaceId: string): { goalId: string; scope: string[]; tasks: string[] } | null {
   const hq = deps.hqWorkspaceId();
   if (!hq || workspaceId !== hq || deps.level() < 2) return null;
   const goal = deps.activeGoal();
   if (!goal) return null;
-  return { goalId: goal.goalId, scope: [...new Set([hq, ...(goal.scope ?? [])])] };
+  return { goalId: goal.goalId, scope: [...new Set([hq, ...(goal.scope ?? [])])], tasks: [...(goal.tasks ?? [])] };
 }
 
 /** The refusal for a direct send outside the contract, or null. */
@@ -352,6 +355,13 @@ export async function moaScopeRefusal(
       } else {
         target = str(p.workspaceId);
         if (!target) return unknown('no pane or workspace was named');
+      }
+      // A task the goal fanned out: only the session the fan-out spawned with
+      // the goal worker profile. A recreated or extra shell in that workspace
+      // has no profile, and an agent Moa starts there would have none either.
+      if (g.scope.includes(target) && g.tasks.includes(target) && !(pty && deps.goalWorkerSession?.(pty) === true)) {
+        return `method ${method} is refused under goal ${g.goalId}: ${pty ? `pane ${pty}` : `the pane Moa would type into in ${target}`} is not the goal worker session the goal's fan-out started (its shell was recreated, or it is another shell in the task's workspace), so it runs without the goal worker profile. `
+          + `${pty ? '' : 'Name the pane with its ptyId. '}Ask the operator with deck_ask_decision; they can restart the task's agent themselves.`;
       }
       break;
     }

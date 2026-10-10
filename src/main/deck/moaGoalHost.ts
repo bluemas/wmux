@@ -19,6 +19,7 @@ import { resolvePtyOwnerWorkspace } from '../workspace/ptyOwnership';
 import { sendToRenderer } from '../pipe/handlers/_bridge';
 import { isRemoteTaskId } from '../../shared/a2aRemote';
 import { loadFanoutWorkerPermissionMode } from '../worktask/fanoutWorkerPolicy';
+import { isGoalWorkerSession } from './goalWorkerSessions';
 
 type GetWindow = Parameters<typeof resolvePtyOwnerWorkspace>[0];
 
@@ -112,9 +113,11 @@ export function installMoaLevelGate(goals: MoaGoalService | null, lookups: MoaLe
             goalId: p.contract.id,
             humanOnly: p.contract.humanOnly,
             scope: [...p.contract.workspaceIds, ...p.contract.taskWorkspaceIds],
+            tasks: [...p.contract.taskWorkspaceIds],
           }
         : null;
     },
+    goalWorkerSession: isGoalWorkerSession,
     ...(lookups.getWindow
       ? { ptyOwner: (ptyId: string) => resolvePtyOwnerWorkspace(lookups.getWindow as GetWindow, ptyId) }
       : {}),
