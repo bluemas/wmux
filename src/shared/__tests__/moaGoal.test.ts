@@ -85,6 +85,9 @@ describe('goalHardRuleHit — what never leaves the operator', () => {
     ['now git push origin main', 'remote'],
     ['please push the branch when done', 'remote'],
     ['force-push it', 'remote'],
+    // Live dogfood 2026-10-10: a fan-out titled this way launched under a goal.
+    ['release v9 and push tags', 'remote'],
+    ['then push the tags', 'remote'],
     ['gh pr create --fill', 'remote'],
     ['open a pull request for this', 'remote'],
     ['merge the PR', 'remote'],

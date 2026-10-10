@@ -240,7 +240,7 @@ const REMOTE_PLACE = String.raw`(?:the\s+)?(?:origin|remote|upstream|github|gitl
 const HARD_RULES: ReadonlyArray<{ rule: MoaGoalHardRule; re: RegExp; literal?: true }> = [
   // remote
   { rule: 'remote', re: gitCmd(String.raw`push\b`) },
-  { rule: 'remote', re: /\bpush\s+(it|this|that|them|everything|the\s+(branch|changes?|commits?|fix|work)|your\s+(branch|changes?|commits?|work))\b/i },
+  { rule: 'remote', re: /\bpush\s+(it|this|that|them|everything|the\s+(branch|changes?|commits?|fix|work|tags?)|your\s+(branch|changes?|commits?|work|tags?)|(all\s+)?(the\s+)?tags?)\b/i },
   { rule: 'remote', re: new RegExp(String.raw`\bpush\s+((it|this|them|everything)\s+)?(up\s+)?(to|into)\s+(${REMOTE_PLACE}|main|master)\b`, 'i') },
   { rule: 'remote', re: /\bforce[- ]?push/i },
   { rule: 'remote', re: /\bgh\s+pr\s+(create|merge|ready|close|reopen|edit|comment|review)\b/i },
