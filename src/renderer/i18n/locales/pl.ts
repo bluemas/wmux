@@ -4250,6 +4250,7 @@ export const pl = {
   'pcRail.access.viewOnly': "Tylko podgląd",
   'pcRail.access.canType': "Może pisać",
   'pcRail.access.revokeHint': "Aby cofnąć dostęp, usuń ten komputer w Sparowanych urządzeniach na {name}.",
+  'pcRail.access.revokeHintUnknown': "Aby cofnąć: jeśli ten komputer sparowano kodem, usuń go w Sparowanych urządzeniach na {name}. Jeśli dodano go linkiem webowym {name}, odetnie go tylko nowy link (wmux web --new-token).",
   'pcRail.operatorToken': "Link operatora",
   'pcRail.operatorTokenHint': "Dodano przez własny link webowy {name}, więc nie ma go na liście Sparowanych urządzeń. Sparuj ponownie kodem, aby użyć poświadczenia urządzenia, które można tam cofnąć.",
   'pcRail.thisComputerOnly': "Ten komputer · {name} nie jest tu jeszcze pokazywany",
@@ -4266,4 +4267,9 @@ export const pl = {
   'pcRail.consent.mute': "Powiadomienia można wyciszyć osobno dla każdego komputera.",
   'pcRail.consent.accept': "Pokaż {name}",
   'pcRail.consent.decline': "Nie teraz",
+  'pcRail.notChecked': "Jeszcze nie sprawdzono",
+  'remote.scope.read': "Sparowane urządzenie może czytać i przeszukiwać wyjście każdego obszaru roboczego na tym komputerze, także obszarów otwartych później.",
+  'remote.scope.viewOnly': "Tylko podgląd blokuje pisanie, ale urządzenie nadal może odpowiadać na monity ekranowe wymagające jednego klawisza.",
+  'remote.scope.input': "Może pisać pozwala też otwierać i zamykać sesje oraz odpowiadać na zatwierdzenia.",
+  'remotePage.connect.pasteScope': "Jeśli zaproszenie udostępnia obszary robocze, ten komputer może czytać i przeszukiwać każdy obszar roboczy na tamtym komputerze, także otwarte później. Po sparowaniu wmux sprawdza go co kilka sekund, utrzymuje połączenie dla alertów i pokazuje jego powiadomienia; wycisz je z jego ikony w kolumnie komputerów.",
 } as const;

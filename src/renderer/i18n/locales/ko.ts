@@ -3732,6 +3732,7 @@ export const ko = {
   'pcRail.access.viewOnly': "보기 전용",
   'pcRail.access.canType': "입력 가능",
   'pcRail.access.revokeHint': "해제하려면 {name}의 페어링된 기기에서 이 컴퓨터를 제거하세요.",
+  'pcRail.access.revokeHintUnknown': "해제 방법: 코드로 페어링했다면 {name}의 페어링된 기기에서 이 컴퓨터를 제거하세요. {name}의 웹 링크로 추가했다면 새 링크(wmux web --new-token)를 만들어야만 끊깁니다.",
   'pcRail.operatorToken': "운영자 링크",
   'pcRail.operatorTokenHint': "{name}의 자체 웹 링크로 추가되어 그쪽 페어링된 기기 목록에 없습니다. 그 목록에서 해제할 수 있는 기기 자격 증명을 쓰려면 코드로 다시 페어링하세요.",
   'pcRail.thisComputerOnly': "이 컴퓨터 · {name}은(는) 아직 여기 표시되지 않습니다",
@@ -3748,4 +3749,9 @@ export const ko = {
   'pcRail.consent.mute': "컴퓨터마다 알림을 따로 끌 수 있습니다.",
   'pcRail.consent.accept': "{name} 표시",
   'pcRail.consent.decline': "나중에",
+  'pcRail.notChecked': "아직 확인 전",
+  'remote.scope.read': "페어링된 기기는 이 컴퓨터의 모든 워크스페이스 출력을 읽고 검색할 수 있습니다. 나중에 여는 워크스페이스도 포함됩니다.",
+  'remote.scope.viewOnly': "보기 전용은 입력을 막지만, 키 하나로 답하는 화면 프롬프트에는 응답할 수 있습니다.",
+  'remote.scope.input': "입력 가능은 세션 열기·닫기와 승인 응답도 허용합니다.",
+  'remotePage.connect.pasteScope': "초대에 워크스페이스 공유가 포함되면 이 컴퓨터는 그 PC의 모든 워크스페이스(나중에 여는 것 포함)를 읽고 검색할 수 있습니다. 페어링된 동안 wmux는 몇 초마다 상태를 확인하고, 알림용 연결을 열어 두며, 그 알림을 표시합니다. 알림은 컴퓨터 열의 해당 아이콘에서 끌 수 있습니다.",
 } as const;

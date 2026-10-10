@@ -4290,6 +4290,7 @@ export const en = {
   'pcRail.access.viewOnly': "View only",
   'pcRail.access.canType': "Can type",
   'pcRail.access.revokeHint': "To revoke, remove this computer under Paired devices on {name}.",
+  'pcRail.access.revokeHintUnknown': "To revoke: if this computer was paired with a code, remove it under Paired devices on {name}. If it was added with {name}'s web link, only a new link (wmux web --new-token) cuts it off.",
   'pcRail.operatorToken': "Operator link",
   'pcRail.operatorTokenHint': "Added with {name}'s own web link, so it is not listed under Paired devices there. Pair again with a code to use a device credential you can revoke from that list.",
   'pcRail.thisComputerOnly': "This computer · {name} isn't shown here yet",
@@ -4306,6 +4307,11 @@ export const en = {
   'pcRail.consent.mute': "You can mute notifications from each computer separately.",
   'pcRail.consent.accept': "Show {name}",
   'pcRail.consent.decline': "Not now",
+  'pcRail.notChecked': "Not checked yet",
+  'remote.scope.read': "A paired device can read and search the output of every workspace on this computer, including workspaces opened later.",
+  'remote.scope.viewOnly': "View only blocks typing, but it can still answer on-screen prompts that take a single key.",
+  'remote.scope.input': "Can type also lets it open and close sessions and answer approvals.",
+  'remotePage.connect.pasteScope': "If the invite shares workspaces, this computer can read and search every workspace on that PC, including later ones. While paired, wmux checks it every few seconds, keeps a connection open for its alerts and shows its notifications; mute them from its icon in the computer column.",
 } as const;
 
 export type TranslationKey = keyof typeof en;

@@ -3425,6 +3425,7 @@ export const zh = {
   'pcRail.access.viewOnly': "仅查看",
   'pcRail.access.canType': "可输入",
   'pcRail.access.revokeHint': "要撤销，请在 {name} 的已配对设备中移除本机。",
+  'pcRail.access.revokeHintUnknown': "撤销方法：如果这台电脑是用配对码配对的，请在 {name} 的已配对设备中将其移除。如果是用 {name} 的网页链接添加的，只有生成新链接（wmux web --new-token）才能断开。",
   'pcRail.operatorToken': "操作员链接",
   'pcRail.operatorTokenHint': "通过 {name} 自己的网页链接添加，因此不在其已配对设备列表中。用配对码重新配对，即可使用可在该列表中撤销的设备凭据。",
   'pcRail.thisComputerOnly': "本机 · {name} 暂不在此显示",
@@ -3441,4 +3442,9 @@ export const zh = {
   'pcRail.consent.mute': "可以为每台电脑分别静音通知。",
   'pcRail.consent.accept': "显示 {name}",
   'pcRail.consent.decline': "以后再说",
+  'pcRail.notChecked': "尚未检查",
+  'remote.scope.read': "已配对的设备可以读取和搜索这台电脑上所有工作区的输出，包括之后打开的工作区。",
+  'remote.scope.viewOnly': "仅查看会阻止输入，但仍可回应只需按一个键的屏幕提示。",
+  'remote.scope.input': "可输入还允许它打开和关闭会话以及回应审批。",
+  'remotePage.connect.pasteScope': "如果邀请共享了工作区，这台电脑可以读取和搜索那台电脑上的所有工作区，包括之后打开的。配对期间，wmux 每隔几秒检查一次，保持连接以接收提醒并显示其通知；可在电脑栏中该电脑的图标上将其静音。",
 } as const;
