@@ -81,7 +81,7 @@ import {
 } from '../terminal/terminalOutputScheduler';
 import { reconnectPtyWithRetry as reconnectPtyWithRetryImpl } from './reconnectPtyWithRetry';
 import { adoptTerminal, parkTerminal, restoreParkedViewport, type ParkedTerminal } from '../terminal/terminalPark';
-import { captureColdFrame, coldFrameFits, dropColdFrame, takeColdFrame, WarmFrameSwap, REPAINT_BEGIN, REPAINT_END, type ColdFrame } from '../terminal/coldFrame';
+import { captureColdFrame, coldFrameFits, dropColdFrame, splitTrailingEscape, takeColdFrame, WarmFrameSwap, REPAINT_BEGIN, REPAINT_END, type ColdFrame } from '../terminal/coldFrame';
 
 // One detector for every pane in this renderer: the ESC-pair state is keyed by
 // ptyId, and a per-mount instance would lose a double-tap split across a remount.
@@ -2728,10 +2728,14 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       terminal.write(REPAINT_BEGIN, () => { shellPromptModeResetFor(terminal)?.reset(); });
       // The scanner labels every held chunk at its source. Historical bytes
       // are muted for their exact parse lifetime; live output is not muted.
-      for (const chunk of st.buffer) {
+      // END goes before an escape sequence the replay ends inside, which the
+      // next live bytes finish (splitTrailingEscape).
+      const held = splitTrailingEscape(st.buffer);
+      for (const chunk of held.complete) {
         writePtyDataImmediately(terminal, chunk, replayMuteRef.current);
       }
       terminal.write(REPAINT_END);
+      if (held.pending) writePtyDataImmediately(terminal, held.pending, replayMuteRef.current);
       if (fromBottom > 0) {
         // Trailing empty write = parse barrier (callbacks fire in write
         // order); scrollToLine only after the recovered screen is parsed and
@@ -3364,7 +3368,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       const captureFrame = isDaemonModeActive() && !fixedGeometryRef.current && parkRefusal !== 'not-registry-owner';
       // A swap still open would leave an adopting mount (which has its own,
       // idle swap) holding a DEC 2026 frame until xterm's timeout; close it.
-      if (warmSwap.phase === 'open') writeSwapBytes(REPAINT_END);
+      writeSwapBytes(warmSwap.close());
       warmSwap.cancel();
       deferredColdFrameResize?.dispose();
       deferredColdFrame = null;

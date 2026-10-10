@@ -1,5 +1,6 @@
 import type { Terminal } from '@xterm/xterm';
 import { SerializeAddon } from '@xterm/addon-serialize';
+import { splitIncompleteEscape } from '../../shared/incompleteEscape';
 
 // Cold-park reveal: paint the last-seen screen at once, then swap in the
 // daemon's screen without an empty frame in between.
@@ -51,6 +52,40 @@ export const REPAINT_BEGIN = '\x1bc\x1b[?2026h';
 export const REPAINT_END = '\x1b[?2026l';
 /** Bare RIS: drops a cached frame when the daemon had nothing to replay. */
 export const FULL_RESET = '\x1bc';
+
+/** Longest unfinished escape sequence held back for REPAINT_END (the daemon
+ *  caps a snapshot's partial tail at the same size). Anything longer, such as
+ *  an image DCS streaming in, passes through rather than being re-scanned on
+ *  every chunk. */
+const MAX_ESCAPE_CARRY_CHARS = 4096;
+
+/** `carry + data`, split before a trailing unfinished escape sequence. */
+function carryEscape(carry: string, data: string): { complete: string; pending: string } {
+  const split = splitIncompleteEscape(carry + data);
+  if (split.pending.length > MAX_ESCAPE_CARRY_CHARS) return { complete: carry + data, pending: '' };
+  return split;
+}
+
+/**
+ * Split a run of payloads before the escape sequence their stream ends
+ * inside, so REPAINT_END can be written before it. A daemon snapshot ends with
+ * whatever sequence its ring was still inside (HeadlessSnapshot's partial
+ * tail) for the next live bytes to finish; END written after it would abort
+ * the sequence with its ESC, and those live bytes would print as text.
+ * `pending` keeps the last payload's other fields.
+ */
+export function splitTrailingEscape<T extends { data: string }>(payloads: readonly T[]): { complete: T[]; pending: T | null } {
+  const complete: T[] = [];
+  let carry = '';
+  let last: T | null = null;
+  for (const payload of payloads) {
+    const split = carryEscape(carry, payload.data);
+    carry = split.pending;
+    last = payload;
+    if (split.complete) complete.push(split.complete === payload.data ? payload : { ...payload, data: split.complete });
+  }
+  return { complete, pending: carry && last ? { ...last, data: carry } : null };
+}
 
 // Insertion order is recency: an entry is consumed on read, and a recapture
 // deletes before it sets, so the first key is always the least recent.
@@ -128,7 +163,9 @@ export function coldFrameFits(entry: ColdFrame, cols: number): boolean {
  *
  * `warm`: the cached frame is on screen and nothing has replaced it yet.
  * `open`: REPAINT_BEGIN went out in front of the first payload; REPAINT_END is
- * owed after the flush marker.
+ * owed after the flush marker. While open, an escape sequence a payload ends
+ * inside is held back and goes out after REPAINT_END (or in front of the next
+ * payload), so END never lands inside it (see splitTrailingEscape).
  */
 export class WarmFrameSwap {
   private _phase: 'idle' | 'warm' | 'open' = 'idle';
@@ -136,6 +173,8 @@ export class WarmFrameSwap {
    *  those bytes are held by the mount (scrollback-load race) and will be
    *  delivered later, so END is owed right after that delivery. */
   private _flushSeen = false;
+  /** Unfinished escape sequence held back from the last payload while open. */
+  private _carry = '';
 
   get phase(): 'idle' | 'warm' | 'open' {
     return this._phase;
@@ -145,24 +184,35 @@ export class WarmFrameSwap {
   painted(): void {
     this._phase = 'warm';
     this._flushSeen = false;
+    this._carry = '';
   }
 
   /** Rewrite one payload on its way to xterm. The first payload after a paint
    *  is the daemon replay's first chunk: prefix RIS + BEGIN. */
   onData(data: string): string {
-    if (this._phase !== 'warm') return data;
-    this._phase = 'open';
-    return REPAINT_BEGIN + data;
+    if (this._phase === 'idle') return data;
+    if (this._phase === 'warm') {
+      this._phase = 'open';
+      data = REPAINT_BEGIN + data;
+    }
+    const split = carryEscape(this._carry, data);
+    this._carry = split.pending;
+    return split.complete;
+  }
+
+  /** Close an open frame now: REPAINT_END, then any held-back sequence.
+   *  Null when no frame is open. */
+  close(): string | null {
+    if (this._phase !== 'open') return null;
+    const bytes = REPAINT_END + this._carry;
+    this.cancel();
+    return bytes;
   }
 
   /** The flush marker arrived. Returns bytes to write in stream order, or
    *  null when nothing is owed yet. */
   onFlush(recoveredBytes: number): string | null {
-    if (this._phase === 'open') {
-      this._phase = 'idle';
-      this._flushSeen = false;
-      return REPAINT_END;
-    }
+    if (this._phase === 'open') return this.close();
     if (this._phase === 'warm') {
       if (recoveredBytes > 0) {
         this._flushSeen = true;
@@ -179,10 +229,8 @@ export class WarmFrameSwap {
   /** Held payloads were just delivered. Closes the frame when the flush
    *  marker overtook them (see `_flushSeen`). */
   settleHeld(): string | null {
-    if (this._phase !== 'open' || !this._flushSeen) return null;
-    this._phase = 'idle';
-    this._flushSeen = false;
-    return REPAINT_END;
+    if (!this._flushSeen) return null;
+    return this.close();
   }
 
   /** Something else repainted the screen from scratch (a resync settled, the
@@ -190,6 +238,7 @@ export class WarmFrameSwap {
   cancel(): void {
     this._phase = 'idle';
     this._flushSeen = false;
+    this._carry = '';
   }
 }
 

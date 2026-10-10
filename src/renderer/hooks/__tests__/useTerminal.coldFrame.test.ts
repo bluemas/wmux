@@ -92,7 +92,12 @@ describe('cold-park reveal — cold frame wiring (source-level)', () => {
   });
 
   it('closes an open swap on teardown so an adopting mount is not left holding a 2026 frame', () => {
-    expect(mainEffect).toMatch(/if \(warmSwap\.phase === 'open'\) writeSwapBytes\(REPAINT_END\);\s*\n\s*warmSwap\.cancel\(\);/);
+    expect(mainEffect).toMatch(/writeSwapBytes\(warmSwap\.close\(\)\);\s*\n\s*warmSwap\.cancel\(\);/);
+  });
+
+  it('a resync settlement writes END before the escape sequence its replay ends inside', () => {
+    const flush = mainEffect.slice(mainEffect.indexOf('const completeResyncFromFlush'));
+    expect(flush).toMatch(/const held = splitTrailingEscape\(st\.buffer\);\s*\n\s*for \(const chunk of held\.complete\) \{\s*\n\s*writePtyDataImmediately\(terminal, chunk, replayMuteRef\.current\);\s*\n\s*\}\s*\n\s*terminal\.write\(REPAINT_END\);\s*\n\s*if \(held\.pending\) writePtyDataImmediately\(terminal, held\.pending, replayMuteRef\.current\);/);
   });
 
   it('drops a cached frame when its PTY exits, through the single exit subscription', () => {
