@@ -1,6 +1,6 @@
 import type { Terminal } from '@xterm/xterm';
 import { SerializeAddon } from '@xterm/addon-serialize';
-import { splitIncompleteEscape } from '../../shared/incompleteEscape';
+import { IncompleteEscapeSplitter } from '../../shared/incompleteEscape';
 
 // Cold-park reveal: paint the last-seen screen at once, then swap in the
 // daemon's screen without an empty frame in between.
@@ -53,19 +53,6 @@ export const REPAINT_END = '\x1b[?2026l';
 /** Bare RIS: drops a cached frame when the daemon had nothing to replay. */
 export const FULL_RESET = '\x1bc';
 
-/** Longest unfinished escape sequence held back for REPAINT_END (the daemon
- *  caps a snapshot's partial tail at the same size). Anything longer, such as
- *  an image DCS streaming in, passes through rather than being re-scanned on
- *  every chunk. */
-const MAX_ESCAPE_CARRY_CHARS = 4096;
-
-/** `carry + data`, split before a trailing unfinished escape sequence. */
-function carryEscape(carry: string, data: string): { complete: string; pending: string } {
-  const split = splitIncompleteEscape(carry + data);
-  if (split.pending.length > MAX_ESCAPE_CARRY_CHARS) return { complete: carry + data, pending: '' };
-  return split;
-}
-
 /**
  * Split a run of payloads before the escape sequence their stream ends
  * inside, so REPAINT_END can be written before it. A daemon snapshot ends with
@@ -76,15 +63,15 @@ function carryEscape(carry: string, data: string): { complete: string; pending: 
  */
 export function splitTrailingEscape<T extends { data: string }>(payloads: readonly T[]): { complete: T[]; pending: T | null } {
   const complete: T[] = [];
-  let carry = '';
+  const splitter = new IncompleteEscapeSplitter();
   let last: T | null = null;
   for (const payload of payloads) {
-    const split = carryEscape(carry, payload.data);
-    carry = split.pending;
+    const data = splitter.push(payload.data);
     last = payload;
-    if (split.complete) complete.push(split.complete === payload.data ? payload : { ...payload, data: split.complete });
+    if (data) complete.push(data === payload.data ? payload : { ...payload, data });
   }
-  return { complete, pending: carry && last ? { ...last, data: carry } : null };
+  const held = splitter.take();
+  return { complete, pending: held && last ? { ...last, data: held } : null };
 }
 
 // Insertion order is recency: an entry is consumed on read, and a recapture
@@ -173,8 +160,8 @@ export class WarmFrameSwap {
    *  those bytes are held by the mount (scrollback-load race) and will be
    *  delivered later, so END is owed right after that delivery. */
   private _flushSeen = false;
-  /** Unfinished escape sequence held back from the last payload while open. */
-  private _carry = '';
+  /** Holds back the unfinished escape sequence a payload ends inside while open. */
+  private readonly _tail = new IncompleteEscapeSplitter();
 
   get phase(): 'idle' | 'warm' | 'open' {
     return this._phase;
@@ -184,7 +171,7 @@ export class WarmFrameSwap {
   painted(): void {
     this._phase = 'warm';
     this._flushSeen = false;
-    this._carry = '';
+    this._tail.take();
   }
 
   /** Rewrite one payload on its way to xterm. The first payload after a paint
@@ -195,16 +182,14 @@ export class WarmFrameSwap {
       this._phase = 'open';
       data = REPAINT_BEGIN + data;
     }
-    const split = carryEscape(this._carry, data);
-    this._carry = split.pending;
-    return split.complete;
+    return this._tail.push(data);
   }
 
   /** Close an open frame now: REPAINT_END, then any held-back sequence.
    *  Null when no frame is open. */
   close(): string | null {
     if (this._phase !== 'open') return null;
-    const bytes = REPAINT_END + this._carry;
+    const bytes = REPAINT_END + this._tail.take();
     this.cancel();
     return bytes;
   }
@@ -238,7 +223,7 @@ export class WarmFrameSwap {
   cancel(): void {
     this._phase = 'idle';
     this._flushSeen = false;
-    this._carry = '';
+    this._tail.take();
   }
 }
 

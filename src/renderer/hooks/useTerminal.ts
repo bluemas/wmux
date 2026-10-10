@@ -81,7 +81,7 @@ import {
 } from '../terminal/terminalOutputScheduler';
 import { reconnectPtyWithRetry as reconnectPtyWithRetryImpl } from './reconnectPtyWithRetry';
 import { adoptTerminal, parkTerminal, restoreParkedViewport, type ParkedTerminal } from '../terminal/terminalPark';
-import { captureColdFrame, coldFrameFits, dropColdFrame, splitTrailingEscape, takeColdFrame, WarmFrameSwap, REPAINT_BEGIN, REPAINT_END, type ColdFrame } from '../terminal/coldFrame';
+import { captureColdFrame, coldFrameFits, dropColdFrame, splitTrailingEscape, takeColdFrame, WarmFrameSwap, FULL_RESET, REPAINT_BEGIN, REPAINT_END, type ColdFrame } from '../terminal/coldFrame';
 
 // One detector for every pane in this renderer: the ESC-pair state is keyed by
 // ptyId, and a per-mount instance would lose a double-tap split across a remount.
@@ -563,6 +563,8 @@ function revealTiming(ptyId: string, stage: string, extra = ''): void {
 // pane must be re-synced before its buffer is scanned, or agents silently read
 // stale output. Keyed by ptyId; registered per mounted terminal.
 const hydrateRegistry = new Map<string, () => Promise<void>>();
+/** Longest a read waits for a painted cold frame to be swapped out. */
+const COLD_FRAME_READ_WAIT_MS = 3000;
 export async function hydrateTerminalForRead(ptyId: string): Promise<void> {
   const fn = hydrateRegistry.get(ptyId);
   if (fn) await fn();
@@ -2869,8 +2871,11 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       });
 
       removeExitListener = ptyExitDispatcher.register(ptyId, (exitCode) => {
-        // A later resize must not paint a cached live screen over the marker.
+        // A later resize must not paint a cached live screen over the marker,
+        // and a painted one still waiting for its replay goes now: that
+        // replay's RIS would wipe the marker (coldFrame.ts).
         deferredColdFrame = null;
+        if (warmSwap.phase === 'warm') { warmSwap.cancel(); writeSwapBytes(FULL_RESET); }
         // Through the scheduler so the exit marker cannot overtake output
         // still queued for this (possibly hidden) pane.
         writeTerminalOutput(terminal, `\r\n${t('terminal.exitedBracket', { code: exitCode })}\r\n`, {
@@ -2946,7 +2951,9 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       });
 
       removeExitListener = ptyExitDispatcher.register(ptyId, (exitCode) => {
-        deferredColdFrame = null; // see the connectPty exit listener
+        // See the connectPty exit listener.
+        deferredColdFrame = null;
+        if (warmSwap.phase === 'warm') { warmSwap.cancel(); writeSwapBytes(FULL_RESET); }
         writeTerminalOutput(terminal, `\r\n${t('terminal.exitedBracket', { code: exitCode })}\r\n`, {
           foreground: isVisibleRef.current,
           retainWhenHidden: hiddenRetentionActive(),
@@ -3184,6 +3191,14 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // would otherwise never call back, and the read would burn its whole RPC
     // deadline and return nothing. See parseBarrier.ts.
     const hydrateForRead = async (): Promise<void> => {
+      if (terminalRef.current !== terminal) return;
+      // Cold-park reveal: a painted cold frame is minutes old. Let the daemon
+      // replay replace it before the buffer is read (bounded: a lost flush
+      // marker reads the frame, as before).
+      const swapDeadline = performance.now() + COLD_FRAME_READ_WAIT_MS;
+      while (warmSwap.phase !== 'idle' && terminalRef.current === terminal && performance.now() < swapDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
       if (terminalRef.current !== terminal) return;
       if (isTerminalDirty(terminal)) {
         await startResync('hydrate-read');

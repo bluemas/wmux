@@ -103,6 +103,16 @@ describe('cold-park reveal — cold frame wiring (source-level)', () => {
   it('forgets a deferred cold frame when the PTY exits, at both exit listeners', () => {
     const exits = mainEffect.match(/removeExitListener = ptyExitDispatcher\.register\(ptyId, \(exitCode\) => \{\s*\n(?:\s*\/\/.*\n)*\s*deferredColdFrame = null;/g) ?? [];
     expect(exits).toHaveLength(2);
+    // A painted frame still waiting for its replay is dropped before the
+    // marker, so that replay's RIS cannot wipe the marker.
+    const drops = mainEffect.match(/deferredColdFrame = null;\s*\n\s*if \(warmSwap\.phase === 'warm'\) \{ warmSwap\.cancel\(\); writeSwapBytes\(FULL_RESET\); \}\s*\n(?:\s*\/\/.*\n)*\s*writeTerminalOutput\(terminal, `\\r\\n\$\{t\('terminal\.exitedBracket'/g) ?? [];
+    expect(drops).toHaveLength(2);
+  });
+
+  it('a read waits (bounded) for a painted cold frame to be swapped out', () => {
+    const hydrate = mainEffect.slice(mainEffect.indexOf('const hydrateForRead'), mainEffect.indexOf('const parsed = await awaitParseBarrier(terminal);'));
+    expect(hydrate).toMatch(/while \(warmSwap\.phase !== 'idle' && terminalRef\.current === terminal && performance\.now\(\) < swapDeadline\)/);
+    expect(hydrate.indexOf('swapDeadline')).toBeLessThan(hydrate.indexOf('isTerminalDirty(terminal)'));
   });
 
   it('drops a cached frame when its PTY exits, through the single exit subscription', () => {

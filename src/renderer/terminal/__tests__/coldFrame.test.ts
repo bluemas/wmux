@@ -283,6 +283,13 @@ describe('the swap sequence on a real parser', () => {
     expect(screen(term)[0]).toBe('hello world');
   });
 
+  it('a flush boundary inside a long OSC (a raw replay has no tail cap) still sets the title', async () => {
+    const long = 'x'.repeat(6000);
+    const { term, titles } = await swapAcrossFlush(`hello\x1b]0;${long}`, 'y\x07 world');
+    expect(titles).toEqual([`${long}y`]);
+    expect(screen(term)[0]).toBe('hello world');
+  });
+
   it('splitTrailingEscape lets a resync write END before the replay tail, across chunks', async () => {
     const held = [
       { data: 'hello\x1b', replay: true },
