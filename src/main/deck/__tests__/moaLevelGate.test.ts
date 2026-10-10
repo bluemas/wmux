@@ -78,7 +78,9 @@ describe('moa level gate', () => {
     const g: MoaLevelGateDeps = { ...deps(2, { goalId: 'G-1', humanOnly: [] }), typed: new Map() };
     expect(moaLevelRefusal(g, 'input.send', HQ, { ptyId: 'p1', text: 'git pu' })).toBeNull();
     expect(moaLevelRefusal(g, 'input.send', HQ, { ptyId: 'p1', text: 'sh origin main' })).toMatch(/remote/);
-    // Refused: the line is forgotten, so the next fragment starts clean.
+    // Refused: the refused text never reached the pane, but `git pu` is still
+    // on its line, so the line keeps it.
+    expect(g.typed!.get('pty:p1')).toBe('git pu');
     expect(moaLevelRefusal(g, 'input.send', HQ, { ptyId: 'p1', text: 'run the tests' })).toBeNull();
     // A submitted line clears; another pane's line is separate.
     expect(moaLevelRefusal(g, 'input.send', HQ, { ptyId: 'p1', text: ' now', submit: true })).toBeNull();
@@ -91,6 +93,20 @@ describe('moa level gate', () => {
     expect(moaLevelRefusal(g, 'input.sendKey', HQ, { ptyId: 'p2', key: 'ctrl+c' })).toBeNull();
     expect(g.typed!.has('pty:p2')).toBe(false);
     expect(moaLevelRefusal(g, 'input.sendKey', HQ, { ptyId: 'p4', key: 'enter' })).toBeNull();
+  });
+
+  // dot review P2: refusing `sh` after `git pu` used to forget `git pu`, so the
+  // same `sh` sent again passed and the terminal composed `git push`.
+  it('a refused suffix sent again is refused again: the prefix still on the line is kept', () => {
+    const g: MoaLevelGateDeps = { ...deps(2, { goalId: 'G-1', humanOnly: [] }), typed: new Map() };
+    expect(moaLevelRefusal(g, 'input.send', HQ, { ptyId: 'p1', text: 'git pu' })).toBeNull();
+    expect(moaLevelRefusal(g, 'input.send', HQ, { ptyId: 'p1', text: 'sh' })).toMatch(/remote.*still holds unsubmitted text/);
+    expect(moaLevelRefusal(g, 'input.send', HQ, { ptyId: 'p1', text: 'sh' })).toMatch(/remote/);
+    // Enter would submit `git pu` alone: screened, and harmless.
+    expect(moaLevelRefusal(g, 'input.send', HQ, { ptyId: 'p1', text: 'sh', submit: true })).toMatch(/remote/);
+    // A discard key clears the line; then the same text is just `sh`.
+    expect(moaLevelRefusal(g, 'input.sendKey', HQ, { ptyId: 'p1', key: 'escape' })).toBeNull();
+    expect(moaLevelRefusal(g, 'input.send', HQ, { ptyId: 'p1', text: 'sh' })).toBeNull();
   });
 
   it('the installed gate keeps its own typed-line memory', () => {

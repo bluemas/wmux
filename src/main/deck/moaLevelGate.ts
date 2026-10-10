@@ -161,9 +161,18 @@ export function moaLevelRefusal(
     const text = typeof params?.text === 'string' ? params.text : '';
     const prior = key && typed ? typed.get(key) ?? '' : '';
     const hit = goalHardRuleHit(prior + text, goal.humanOnly);
+    if (hit) {
+      // The refused text never reaches the pane, but what was typed before it
+      // is still on the terminal's line: keep it, so retrying the same suffix
+      // is read as the same command again. Only a discard key (or Enter, which
+      // submits the harmless prefix) clears it. The gate never writes to the
+      // pane itself to clear the line: it only refuses, and no one key clears
+      // a line in every shell.
+      return `${refuse(hit)}${prior ? ' The line still holds unsubmitted text; send ctrl+c to discard it.' : ''}`;
+    }
     if (key && typed) {
       const submitted = params?.submit === true || /[\r\n]/.test(text);
-      if (hit || submitted) {
+      if (submitted) {
         typed.delete(key);
       } else {
         typed.delete(key); // re-insert: most recent last, for the size bound
@@ -175,7 +184,7 @@ export function moaLevelRefusal(
         }
       }
     }
-    return hit ? refuse(hit) : null;
+    return null;
   }
 
   const hit = goalHardRuleHitAny((fields ?? []).map((f) => params?.[f]), goal.humanOnly);
