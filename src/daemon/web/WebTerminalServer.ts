@@ -3360,10 +3360,16 @@ export class WebTerminalServer {
   private async handleWorkspacesList(res: http.ServerResponse): Promise<void> {
     const sidebar = await this.desktopSidebar();
     const byId = new Map<string, { id: string; name: string; panes: RemotePaneSummary[] }>();
+    // Workspaces holding a brain pane, so the empty rows below never list one.
+    const brainWorkspaces = new Set<string>();
     for (const s of this.deps.sessionManager.listLiveSessions()) {
       // Same exclusion as /api/sessions: the orchestrator brain pane must be
       // neither listed nor allowed to synthesize a phantom workspace row.
-      if (isBrainPty({ id: s.id, env: s.env })) continue;
+      if (isBrainPty({ id: s.id, env: s.env })) {
+        const brainWs = s.env?.[ENV_KEYS.WORKSPACE_ID];
+        if (typeof brainWs === 'string' && brainWs) brainWorkspaces.add(brainWs);
+        continue;
+      }
       const id = s.env?.[ENV_KEYS.WORKSPACE_ID];
       if (typeof id !== 'string' || !id) continue; // no workspace id → unaddressable, omitted
       const entry = byId.get(id) ?? { id, name: '', panes: [] };
@@ -3458,11 +3464,24 @@ export class WebTerminalServer {
           }
         : { ...w, panes, ...hqRole(sidebar, w.id) };
     });
+    // Workspaces the desktop shows that have no live terminal: listed as
+    // `empty: true` rows with no panes (and no name or layout — the snapshot
+    // carries neither, and a name only arrives with a session's env), after
+    // the live ones. Moa's HQ is never one: its only pane is the brain, which
+    // must not synthesize a row, and neither does a fan-out task workspace
+    // (it nests under its owner), nor one the desktop still lists a pane for
+    // (a hidden brain pane, or one whose session is gone). No desktop
+    // (locked, occluded, headless), no empty rows: this list cannot know
+    // about them.
+    const paneWorkspaces = new Set(sidebar.panes.map((p) => p.workspaceId));
+    const empty = sidebar.workspaces
+      .filter((w) => !byId.has(w.id) && !brainWorkspaces.has(w.id) && !paneWorkspaces.has(w.id) && w.id !== sidebar.hqWorkspaceId && w.task === undefined)
+      .map((w) => ({ id: w.id, name: '', panes: [], empty: true as const, ...sidebarWorkspaceFields(w, undefined, undefined, undefined) }));
     // Only an id this reply lists, so the active workspace cannot name one the
     // phone is not allowed to see (a brain-only workspace, for one).
     const active = sidebar.activeWorkspaceId;
     return this.json(res, 200, {
-      workspaces: merged,
+      workspaces: [...merged, ...empty],
       ...(active && byId.has(active) ? { activeWorkspaceId: active } : {}),
       // Not limited to the listed rows: a finished job's workspace is often
       // closed by then, and its id names nothing the phone may not see.
