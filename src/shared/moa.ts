@@ -108,6 +108,18 @@ export interface MoaGoalPanel {
   /** Why an active contract grants nothing right now. */
   inertReason?: string;
   endNote?: string;
+  /** Per done criterion: proved (✓), refused at the last check (✗), or not
+   *  checked yet, with the evidence files that proved it. */
+  criteria?: { n: number; text: string; state: 'pass' | 'fail' | 'open'; evidence: string[] }[];
+  /** The last refused completion's problems that name no single criterion
+   *  (a failing gate, a missing task). */
+  problems?: string[];
+  /** What Moa pushed and opened, and whether it was reverted. */
+  delivery?: {
+    items: { branch: string; pushed: boolean; prUrl?: string; prNumber?: number; error?: string }[];
+    reverted: boolean;
+    revertNotes?: string[];
+  };
 }
 
 export interface MoaState {

@@ -19,6 +19,7 @@
 // same renderer-trust basis as the rest of this surface — but the value is
 // format-checked because it keys maps and persisted files.
 
+import { goalPanelDetail } from '../../deck/moaGoalPanel';
 import { ipcMain, app, type BrowserWindow } from 'electron';
 import { sanitizeClaudeEffort, type ClaudeEffort } from '../../../shared/claudeModels';
 import { IPC } from '../../../shared/constants';
@@ -331,7 +332,7 @@ export const MOA_LEVEL_LINES: Record<0 | 1 | 2 | 3, string> = {
   0: '[moa] Level 0 — observe only: read, summarize and report. wmux refuses every call that writes (panes, messages, fan-out, hand-offs, task tools, approvals); ask the operator with deck_ask_decision instead.',
   1: '[moa] Level 1 — observe and report: surface decisions and completion reports to the human. Delegate work only when the human asks you to, via moa_propose_handoff. A goal contract grants nothing at this level.',
   2: '[moa] Level 2 — delegate: when the human asks for a piece of work, you may propose a goal contract with moa_propose_goal (the operator approves it once); inside an approved goal you plan, fan out, answer and instruct its tasks yourself. Without one, delegate via moa_propose_handoff and track it.',
-  3: '[moa] Level 3 — like level 2 for now (merging under a goal is not enabled yet): propose goals with moa_propose_goal and follow through inside them; push, PRs and merges stay the operator\'s.',
+  3: '[moa] Level 3 — like level 2 for now (merging under a goal is not enabled yet): propose goals with moa_propose_goal and follow through inside them; once a goal is proved done wmux pushes its task branches and opens the PRs, and merges stay the operator\'s.',
 };
 
 export function renderAutonomyBlock(mode: AgentMode): string | null {
@@ -2713,6 +2714,7 @@ export function registerDeckHandler(
       live,
       ...(view && !view.effective.ok && c.status === 'active' ? { inertReason: view.effective.reason } : {}),
       ...(c.endNote ? { endNote: c.endNote } : {}),
+      ...goalPanelDetail(c),
     };
   };
   const readMoaState = (): {
@@ -2763,6 +2765,18 @@ export function registerDeckHandler(
       const r = await moaGoals.end('operator', 'canceled', 'ended from Settings');
       emitMoaChanged();
       return r.ok ? { ok: true } : { ok: false, code: r.code ?? 'error' };
+    }),
+  );
+
+  // "Revert this goal" (Settings › Moa): undo what Moa delivered.
+  ipcMain.removeHandler(IPC.DECK_MOA_GOAL_REVERT);
+  ipcMain.handle(
+    IPC.DECK_MOA_GOAL_REVERT,
+    wrapHandler(IPC.DECK_MOA_GOAL_REVERT, async (_e: unknown, goalId: unknown): Promise<{ ok: boolean; code?: string; notes?: string[] }> => {
+      if (typeof goalId !== 'string' || !/^G-[0-9a-f]{6}$/.test(goalId)) return { ok: false, code: 'bad_id' };
+      const r = await moaGoals.revert(goalId);
+      emitMoaChanged();
+      return r;
     }),
   );
 
@@ -3776,7 +3790,7 @@ export function registerDeckHandler(
   const wakeMoaForGoal = (hq: string, goalId: string, status: 'active' | 'declined', note?: string): void => {
     if (hq !== getHqWorkspaceId()) return;
     const prompt = status === 'active'
-      ? `[goal] The operator APPROVED goal ${goalId} (see the [goal] block). Start on it now: plan it, fan out in its repository, answer and instruct its tasks, verify the results, then call moa_goal({action:"complete", summary}) and report once. Push, PRs and merges stay the operator's.`
+      ? `[goal] The operator APPROVED goal ${goalId} (see the [goal] block). Start on it now: plan it, fan out in its repository, answer and instruct its tasks, verify the results, then call moa_goal({action:"complete", summary, criteria}) with evidence for each done criterion and report once. When it passes, wmux pushes the task branches and opens the PRs; merges stay the operator's.`
       : note
         ? `[goal] Goal ${goalId} was NOT approved: ${note}. Do not act on it. If the work still stands, propose it again with moa_propose_goal so the card shows the current setting.`
         : `[goal] The operator DECLINED goal ${goalId}. Do not act on it. If the request still stands, ask them what they want instead, or work as before.`;
@@ -4262,6 +4276,7 @@ export function registerDeckHandler(
     ipcMain.removeHandler(IPC.DECK_MOA_ARCHIVE_ACK);
     ipcMain.removeHandler(IPC.DECK_MOA_STORE_RESET);
     ipcMain.removeHandler(IPC.DECK_MOA_GOAL_END);
+    ipcMain.removeHandler(IPC.DECK_MOA_GOAL_REVERT);
     setMoaLevelGate(null);
     setMoaGoalService(null);
     ipcMain.removeHandler(IPC.DECK_MOA_SHADOW_STATS);

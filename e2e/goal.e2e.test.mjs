@@ -14,11 +14,13 @@
 //   2. the worker's change fails the project's test: completion is refused
 //      as `unverified` and the goal stays open;
 //   3. a memo-only completion is refused.
+// Delivery (fake gh shim, bare remote): scenario 1 checks the push and the PR
+// Moa opens itself, and 1b reverts it from Settings.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { after, before, describe, it } from 'node:test';
-import { git, killRun, launchApp, makeSandbox, rpc, setWorkerScript, shot, sleep, waitFor } from './lib.mjs';
+import { fakePrs, git, killRun, launchApp, makeSandbox, rpc, setWorkerScript, shot, sleep, waitFor } from './lib.mjs';
 
 const sb = makeSandbox('goal');
 let app;
@@ -79,6 +81,7 @@ async function fanOutOne(title) {
   }, { timeout: 60_000, what: 'fan-out' });
   const task = r.result.tasks[0];
   assert.equal(task.ok, true, JSON.stringify(task));
+  await shot(win, `progress-${fanouts}-after-fanout`);
   await waitFor(() => git(['log', '-1', '--format=%s'], task.worktreePath).startsWith('e2e worker:'), { timeout: 60_000, what: 'worker commit' });
   return task;
 }
@@ -133,7 +136,23 @@ describe('Moa goal evidence gate (Electron e2e)', () => {
         { criterion: 2, artifacts: [path.join(task.worktreePath, 'feature.txt')] },
       ],
     }, 300_000);
-    assert.deepEqual(r, { ok: true, id });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    assert.equal(r.id, id);
+    // Delivered by Moa: the verified commit is on the bare remote under the
+    // task branch, and a PR (fake gh) was opened against main with the proof.
+    assert.equal(r.delivered.length, 1);
+    assert.equal(r.delivered[0].pushed, true, JSON.stringify(r.delivered));
+    assert.equal(r.delivered[0].branch, task.branch);
+    assert.match(r.delivered[0].prUrl, /\/pull\/1$/);
+    assert.equal(git(['rev-parse', `refs/heads/${task.branch}`], sb.remote), head);
+    const pr = fakePrs(sb)[1];
+    assert.equal(pr.head, task.branch);
+    assert.equal(pr.base, 'main');
+    assert.equal(pr.state, 'open');
+    assert.match(pr.body, /✅ \(1\) npm test passes/);
+    assert.match(pr.body, new RegExp(head));
+    // main itself is untouched: merging stays the operator's.
+    assert.equal(git(['rev-parse', 'refs/heads/main'], sb.remote), git(['rev-parse', 'origin/main'], sb.project));
     const g = goals()[id];
     assert.equal(g.status, 'completed');
     assert.equal(g.verification.gates.length, 1);
@@ -141,10 +160,29 @@ describe('Moa goal evidence gate (Electron e2e)', () => {
     assert.equal(g.verification.gates[0].exitCode, 0);
     assert.match(fs.readFileSync(g.verification.gates[0].logPath, 'utf8'), /PASS 1 test/);
     assert.deepEqual(g.verification.criteria.map((c) => c.criterion), [1, 2]);
-    // Nothing reached the remote: delivery is a later step.
-    assert.equal(git(['branch', '--list', 'wtask/*'], sb.remote), '');
     await showGoalRow();
-    await shot(win, '03-goal-completed');
+    // Settings shows each criterion ✓ with its evidence, and the PR.
+    await win.getByTestId('moa-goal-criterion-1').waitFor();
+    assert.equal(await win.getByTestId('moa-goal-criterion-1').getAttribute('data-state'), 'pass');
+    assert.equal(await win.getByTestId('moa-goal-criterion-2').getAttribute('data-state'), 'pass');
+    assert.match(await win.getByTestId('moa-goal-delivery').innerText(), /PR #1/);
+    await win.getByTestId('moa-goal-detail').scrollIntoViewIfNeeded();
+    await shot(win, '03-goal-completed-criteria-and-pr');
+    await win.keyboard.press('Escape');
+  });
+
+  it('1b: "Revert this goal" closes the PR Moa opened and keeps the branch', async () => {
+    await showGoalRow();
+    const revert = win.getByTestId('moa-goal-revert');
+    await revert.scrollIntoViewIfNeeded();
+    await revert.click();
+    await win.getByTestId('moa-goal-reverted').waitFor({ timeout: 15_000 });
+    assert.equal(fakePrs(sb)[1].state, 'closed');
+    assert.equal(await win.getByTestId('moa-goal-revert').count(), 0);
+    const branch = fakePrs(sb)[1].head;
+    assert.ok(git(['rev-parse', `refs/heads/${branch}`], sb.remote), 'branch kept on the remote');
+    await win.getByTestId('moa-goal-detail').scrollIntoViewIfNeeded();
+    await shot(win, '03b-goal-reverted');
     await win.keyboard.press('Escape');
   });
 
@@ -169,6 +207,10 @@ describe('Moa goal evidence gate (Electron e2e)', () => {
     assert.equal(goals()[id].verification, undefined);
     await showGoalRow();
     await win.getByTestId('moa-goal-end').waitFor(); // the goal is still open: "End goal" is offered
+    // The refusal is visible: the gate failure is listed with ✗.
+    assert.match(await win.getByTestId('moa-goal-problem').first().innerText(), /gate failed/);
+    assert.equal(Object.keys(fakePrs(sb)).length, 1, 'nothing delivered for a refused goal');
+    await win.getByTestId('moa-goal-detail').scrollIntoViewIfNeeded();
     await shot(win, '04-failing-test-goal-still-open');
     await win.keyboard.press('Escape');
     assert.equal((await brain('deck.goal', { action: 'cancel', summary: 'e2e cleanup' })).ok, true);

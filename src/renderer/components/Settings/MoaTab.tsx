@@ -313,6 +313,17 @@ export function TabMoa({ registerDialog }: TabMoaProps) {
     }
     await refreshMoa();
   };
+  const [goalRevertFailed, setGoalRevertFailed] = useState(false);
+  const onRevertGoal = async (id: string) => {
+    setGoalRevertFailed(false);
+    try {
+      const r = await window.electronAPI.deck?.moa?.revertGoal(id);
+      if (!r?.ok) setGoalRevertFailed(true);
+    } catch {
+      setGoalRevertFailed(true);
+    }
+    await refreshMoa();
+  };
   const goalLine = !goal
     ? t('moa.settings.goalNone')
     : goal.status === 'pending'
@@ -716,6 +727,36 @@ export function TabMoa({ registerDialog }: TabMoaProps) {
         {goalEndFailed && (
           <SettingNote tone="danger" role="alert">{t('moa.settings.goalEndFailed')}</SettingNote>
         )}
+        {goal && (goal.criteria?.length || goal.problems?.length || goal.delivery) ? (
+          <div className="settings-note ui-note" data-tone="muted" data-testid="moa-goal-detail">
+            {goal.criteria?.map((c) => (
+              <div key={c.n} data-testid={`moa-goal-criterion-${c.n}`} data-state={c.state}>
+                {c.state === 'pass' ? '✓' : c.state === 'fail' ? '✗' : '○'} ({c.n}) {c.text}
+                {c.evidence.length > 0 && <span> — {t('moa.settings.goalEvidence')}: {c.evidence.map((p) => p.split(/[\\/]/).pop()).join(', ')}</span>}
+              </div>
+            ))}
+            {goal.problems?.map((p, i) => (
+              <div key={`p${i}`} data-testid="moa-goal-problem">✗ {p}</div>
+            ))}
+            {goal.delivery?.items.map((d) => (
+              <div key={d.branch || d.prUrl} data-testid="moa-goal-delivery">
+                {d.prUrl ? (
+                  <a href={d.prUrl} onClick={(e) => { e.preventDefault(); void window.electronAPI.shell?.openExternal?.(d.prUrl as string); }}>
+                    {t('moa.settings.goalPr', { n: d.prNumber ?? '?', branch: d.branch })}
+                  </a>
+                ) : d.pushed ? t('moa.settings.goalPushed', { branch: d.branch }) : `✗ ${d.error ?? d.branch}`}
+                {d.prUrl && d.error ? ` (✗ ${d.error})` : ''}
+              </div>
+            ))}
+            {goal.delivery?.reverted && <div data-testid="moa-goal-reverted">{t('moa.settings.goalReverted')}</div>}
+            {goal.status === 'completed' && goal.delivery && !goal.delivery.reverted && goal.delivery.items.some((d) => d.prUrl) && (
+              <Button variant="secondary" size="md" onClick={() => { void onRevertGoal(goal.id); }} disabled={!loaded} data-testid="moa-goal-revert">
+                {t('moa.settings.goalRevert')}
+              </Button>
+            )}
+            {goalRevertFailed && <SettingNote tone="danger" role="alert">{t('moa.settings.goalRevertFailed')}</SettingNote>}
+          </div>
+        ) : null}
         <SettingRow id="moaturncap" label={t('moa.settings.turnCap')} description={t('moa.settings.turnCapDesc')}>
           <Input
             type="number"
