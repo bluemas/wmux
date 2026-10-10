@@ -397,6 +397,9 @@ export function registerDeckRpc(router: RpcRouter, getWindow: GetWindow, deps: D
       level: params['level'],
       budget: params['budget'],
       humanOnly: params['humanOnly'],
+      doneCriteria: params['doneCriteria'],
+      evidence: params['evidence'],
+      constraints: params['constraints'],
     });
   });
 

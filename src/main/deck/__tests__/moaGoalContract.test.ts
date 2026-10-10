@@ -528,3 +528,43 @@ describe('moa goal — an end whose save fails stays ended across a restart', ()
     expect(rig({}, s.file).svc.current()).toMatchObject({ id: next, status: 'active' });
   });
 });
+
+describe('moa goal — done criteria, evidence and constraints', () => {
+  const TERMS = { doneCriteria: ['npm test passes'], evidence: ['vitest output'], constraints: ['no new dependencies'] };
+
+  it('a proposal with terms shows them on the card, stores them and survives a restart', async () => {
+    const r = rig();
+    const p = await r.svc.propose(HQ, { ...GOAL, ...TERMS });
+    if (!p.ok) throw new Error(p.error);
+    const card = r.slots.get(HQ)!;
+    expect(JSON.stringify(card)).toContain('Done when: (1) npm test passes');
+    await r.svc.resolveCard(HQ, card.id, 'Approve goal');
+    expect(r.svc.get(p.id)).toMatchObject(TERMS);
+    expect(new MoaGoalService(r.ports).get(p.id)).toMatchObject(TERMS);
+    expect(r.svc.view()).toMatchObject(TERMS);
+  });
+
+  it('the [goal] block carries the terms', async () => {
+    const r = rig();
+    const p = await r.svc.propose(HQ, { ...GOAL, ...TERMS });
+    if (!p.ok) throw new Error(p.error);
+    await r.svc.resolveCard(HQ, r.slots.get(HQ)!.id, 'Approve goal');
+    const block = renderGoalBlock(r.svc.view())!;
+    expect(block).toContain('Done when: (1) npm test passes');
+    expect(block).toContain('Evidence: vitest output');
+    expect(block).toContain('Constraints: no new dependencies');
+  });
+
+  it('a goal without terms says no criteria were stated', async () => {
+    const r = rig();
+    await approved(r);
+    expect(r.svc.view()).toMatchObject({ doneCriteria: [], evidence: [], constraints: [] });
+    expect(renderGoalBlock(r.svc.view())).toContain('Done when: (no criteria stated');
+  });
+
+  it('bad terms are refused before any card is raised', async () => {
+    const r = rig();
+    expect(await r.svc.propose(HQ, { ...GOAL, doneCriteria: 'npm test' })).toMatchObject({ ok: false, error: 'done_criteria_invalid' });
+    expect(r.slots.get(HQ)).toBeUndefined();
+  });
+});

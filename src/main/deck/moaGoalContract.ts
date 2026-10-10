@@ -38,6 +38,8 @@ import {
   moaGoalPowers,
   parseMoaGoalProposal,
   type MoaGoalContract,
+  goalTermsLines,
+  goalTermsOf,
   type MoaGoalInertReason,
   type MoaGoalStatus,
   type MoaGoalView,
@@ -319,6 +321,7 @@ export class MoaGoalService {
       ...(c.approvedAt !== undefined ? { expiresAt: c.approvedAt + c.budget.maxHours * 3_600_000 } : {}),
       taskWorkspaceIds: [...c.taskWorkspaceIds],
       humanOnly: [...c.humanOnly],
+      ...goalTermsOf(c),
     };
   }
 
@@ -370,6 +373,9 @@ export class MoaGoalService {
       level: parsed.level,
       budget: parsed.budget,
       humanOnly: parsed.humanOnly,
+      doneCriteria: parsed.doneCriteria,
+      evidence: parsed.evidence,
+      constraints: parsed.constraints,
       status: 'pending',
       createdAt: now,
       taskWorkspaceIds: [],
@@ -649,6 +655,7 @@ export function renderGoalBlock(view: MoaGoalView | null): string | null {
     `[goal] ${view.id} — approved by the operator (level ${e.level}). Goal (operator-approved text): "${view.goal}". Scope: ${scope}.`,
     'Inside it you may, without asking: fanout_start (it runs in the goal\'s repository, on claude workers only, with push, PR, release and delete commands denied and GitHub credentials withheld), answer and instruct the tasks it creates (send_message / terminal_send), and hand work to the goal\'s workspaces with moa_propose_handoff (without a card only while the operator\'s own request is live; from a wake it asks with a card). A turn woken by another PC\'s Moa cannot fan out under the goal.',
     `Never yours, whatever the goal says: push, PRs, merges, releases, secrets, deleting data, critical or permission approvals, other workspaces${view.humanOnly.length ? `, and: ${view.humanOnly.join('; ')}` : ''}. Raise those with deck_ask_decision; wmux refuses them in what you send.`,
-    `${left}. When the goal is done and verified, call moa_goal({action:"complete", summary}) and report once.`,
+    ...goalTermsLines(view),
+    `${left}. When the goal is done and verified against the criteria above, call moa_goal({action:"complete", summary}) and report once.`,
   ].join('\n');
 }
