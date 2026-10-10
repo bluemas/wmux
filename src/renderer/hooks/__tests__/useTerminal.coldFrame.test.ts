@@ -100,6 +100,11 @@ describe('cold-park reveal — cold frame wiring (source-level)', () => {
     expect(flush).toMatch(/const held = splitTrailingEscape\(st\.buffer\);\s*\n\s*for \(const chunk of held\.complete\) \{\s*\n\s*writePtyDataImmediately\(terminal, chunk, replayMuteRef\.current\);\s*\n\s*\}\s*\n\s*terminal\.write\(REPAINT_END\);\s*\n\s*if \(held\.pending\) writePtyDataImmediately\(terminal, held\.pending, replayMuteRef\.current\);/);
   });
 
+  it('forgets a deferred cold frame when the PTY exits, at both exit listeners', () => {
+    const exits = mainEffect.match(/removeExitListener = ptyExitDispatcher\.register\(ptyId, \(exitCode\) => \{\s*\n(?:\s*\/\/.*\n)*\s*deferredColdFrame = null;/g) ?? [];
+    expect(exits).toHaveLength(2);
+  });
+
   it('drops a cached frame when its PTY exits, through the single exit subscription', () => {
     expect(src).toMatch(/window\.electronAPI\.pty\.onExit\(\(ptyId, exitCode\) => \{[\s\S]{0,400}dropColdFrame\(ptyId\);\s*\n\s*cb\(ptyId, exitCode\);/);
     expect((src.match(/window\.electronAPI\.pty\.onExit\(/g) ?? []).length).toBe(1);

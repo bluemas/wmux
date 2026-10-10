@@ -2869,6 +2869,8 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       });
 
       removeExitListener = ptyExitDispatcher.register(ptyId, (exitCode) => {
+        // A later resize must not paint a cached live screen over the marker.
+        deferredColdFrame = null;
         // Through the scheduler so the exit marker cannot overtake output
         // still queued for this (possibly hidden) pane.
         writeTerminalOutput(terminal, `\r\n${t('terminal.exitedBracket', { code: exitCode })}\r\n`, {
@@ -2944,6 +2946,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       });
 
       removeExitListener = ptyExitDispatcher.register(ptyId, (exitCode) => {
+        deferredColdFrame = null; // see the connectPty exit listener
         writeTerminalOutput(terminal, `\r\n${t('terminal.exitedBracket', { code: exitCode })}\r\n`, {
           foreground: isVisibleRef.current,
           retainWhenHidden: hiddenRetentionActive(),
