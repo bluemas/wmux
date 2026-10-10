@@ -303,6 +303,7 @@ export const ko = {
   'roster.recoverAction': '꺼내서 복구하기',
   'workspace.close': '워크스페이스 닫기',
   'workspace.dismissQuestion': '질문 무시',
+  'workspace.dismissQuestions': '질문 {count}개 무시',
   'workspace.copyInfo': '세션 정보 복사',
   'workspace.copied': '복사됨!',
   'workspace.gitSyncTooltip': 'ahead {ahead} · behind {behind} · 커밋 안 된 변경 {dirty}',

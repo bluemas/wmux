@@ -515,6 +515,7 @@ export const en = {
   'workspace.configureProfile': 'Configure profile…',
   'workspace.duplicate': 'Duplicate workspace',
   'workspace.dismissQuestion': 'Dismiss question',
+  'workspace.dismissQuestions': 'Dismiss {count} questions',
   'workspace.colorTag': 'Color tag',
   'workspace.colorNone': 'No color',
   'workspace.color.red': 'Red',

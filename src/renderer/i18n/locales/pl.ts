@@ -512,6 +512,7 @@ export const pl = {
   'workspace.configureProfile': 'Konfiguruj profil…',
   'workspace.duplicate': 'Duplikuj obszar roboczy',
   'workspace.dismissQuestion': 'Odrzuć pytanie',
+  'workspace.dismissQuestions': 'Odrzuć pytania ({count})',
   'workspace.colorTag': 'Znacznik koloru',
   'workspace.colorNone': 'Brak koloru',
   'workspace.color.red': 'Czerwony',

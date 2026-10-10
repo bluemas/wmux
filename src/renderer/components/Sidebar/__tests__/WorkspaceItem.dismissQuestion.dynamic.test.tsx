@@ -95,7 +95,8 @@ describe('workspace row — Dismiss question', () => {
     await render();
     openMenu();
     const item = dismissItem();
-    expect(item?.textContent).toBe('Dismiss question');
+    // It clears every pane's question, so the label says how many.
+    expect(item?.textContent).toBe('Dismiss 2 questions');
     act(() => { item!.click(); });
 
     const s = useStore.getState();
@@ -116,6 +117,7 @@ describe('workspace row — Dismiss question', () => {
     });
     await render();
     openMenu();
+    expect(dismissItem()?.textContent).toBe('Dismiss question');
     act(() => { dismissItem()!.click(); });
 
     const s = useStore.getState();

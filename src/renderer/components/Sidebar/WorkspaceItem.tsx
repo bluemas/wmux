@@ -1564,7 +1564,9 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumb
               }}
               data-workspace-action="dismiss-question"
             >
-              {t('workspace.dismissQuestion')}
+              {questionPtyIds.length > 1
+                ? t('workspace.dismissQuestions', { count: questionPtyIds.length })
+                : t('workspace.dismissQuestion')}
             </button>
           )}
           <button

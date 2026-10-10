@@ -999,6 +999,7 @@ export const zh = {
   'workspace.configureProfile': '配置配置文件…',
   'workspace.duplicate': '复制工作区',
   'workspace.dismissQuestion': '忽略问题',
+  'workspace.dismissQuestions': '忽略 {count} 个问题',
   'workspace.workingDirs': '工作目录',
   'workspace.noWorkingDirs': '此工作区没有终端',
   'workspace.copyPath': '复制目录',
