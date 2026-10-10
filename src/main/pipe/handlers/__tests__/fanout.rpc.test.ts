@@ -1896,11 +1896,29 @@ describe('a commander under an approved Moa goal fans out over the goal reposito
   const COMMANDER: RpcContext = { origin: 'local', commanderWorkspace: CALLER_WS };
   const brainParams = (o: Record<string, unknown> = {}) => ({ ...goodParams(o), senderPtyId: undefined });
 
-  function goalPort(over: Partial<{ repoRoot: string; maxTasks: number; ws: string; active: () => boolean }> = {}) {
+  function goalPort(
+    over: Partial<{
+      repoRoot: string | null;
+      maxTasks: number;
+      ws: string;
+      active: () => boolean;
+      mode: 'auto' | 'acceptEdits' | 'bypassPermissions' | 'manual' | undefined;
+      remoteWoken: () => boolean;
+    }> = {},
+  ) {
     const st = { used: 0, max: over.maxTasks ?? 4, attached: [] as string[], released: 0 };
     const active = over.active ?? (() => true);
+    const mode = 'mode' in over ? over.mode : 'auto';
     const port: FanOutGoalPort = {
-      anchor: (ws) => (active() && ws === (over.ws ?? CALLER_WS) ? { goalId: 'G-abc123', repoRoot: over.repoRoot ?? SIBLING_REPO_ROOT } : null),
+      anchor: (ws) =>
+        active() && ws === (over.ws ?? CALLER_WS)
+          ? {
+              goalId: 'G-abc123',
+              repoRoot: 'repoRoot' in over ? (over.repoRoot ?? null) : SIBLING_REPO_ROOT,
+              ...(mode ? { workerPermissionMode: mode } : {}),
+            }
+          : null,
+      ...(over.remoteWoken ? { remoteWoken: over.remoteWoken } : {}),
       reserve: (n) => {
         if (st.used + n > st.max) return { ok: false, reason: `goal allows ${st.max}` };
         st.used += n;
@@ -1989,13 +2007,83 @@ describe('a commander under an approved Moa goal fans out over the goal reposito
     expect(res).toMatchObject({ ok: true, repoPath: CALLER_REPO_ROOT });
     expect(g.st.used).toBe(0);
   });
+
+  it('every task of a goal fan-out carries the goal worker profile', async () => {
+    const g = goalPort();
+    const h = setup({ goal: g.port, commanderAnchorPtyId: '' });
+    await h.call(brainParams(), COMMANDER);
+    await h.flush();
+    expect(h.request().goalWorker).toEqual({ goalId: 'G-abc123' });
+  });
+
+  it('a fan-out outside a goal carries no goal profile (defaults unchanged)', async () => {
+    const h = setup();
+    await h.call(brainParams(), COMMANDER);
+    await h.flush();
+    expect(h.request().goalWorker).toBeUndefined();
+  });
+
+  // W5: the remote-Moa rule is code, not a line in the prompt.
+  it('a turn another PC\'s Moa woke cannot fan out on the goal', async () => {
+    const g = goalPort({ remoteWoken: () => true });
+    const h = setup({ goal: g.port });
+    const res = await h.call(brainParams(), COMMANDER);
+    expect(errorOf(res)).toMatchObject({ code: 'FAILED_PRECONDITION' });
+    expect(errorOf(res).message).toMatch(/another PC's Moa/);
+    expect(g.st.used).toBe(0);
+    expect(h.approvalCount()).toBe(0);
+    expect(h.start).not.toHaveBeenCalled();
+  });
+
+  it('an unreadable wake origin refuses (fail closed)', async () => {
+    const g = goalPort({ remoteWoken: () => { throw new Error('gone'); } });
+    const h = setup({ goal: g.port });
+    const res = await h.call(brainParams(), COMMANDER);
+    expect(errorOf(res).message).toMatch(/another PC's Moa/);
+    expect(g.st.used).toBe(0);
+  });
+
+  it('a worker permission mode changed since approval is refused before the budget is touched', async () => {
+    const g = goalPort({ mode: 'acceptEdits' });
+    const h = setup({ goal: g.port });
+    const res = await h.call(brainParams(), COMMANDER);
+    expect(errorOf(res).message).toMatch(/is auto now, but goal G-abc123 was approved with acceptEdits/);
+    expect(g.st.used).toBe(0);
+    expect(h.start).not.toHaveBeenCalled();
+  });
+
+  it('a goal record with no pinned mode is refused', async () => {
+    const g = goalPort({ mode: undefined });
+    const h = setup({ goal: g.port });
+    const res = await h.call(brainParams(), COMMANDER);
+    expect(errorOf(res).message).toMatch(/no pinned worker permission mode/);
+  });
+
+  it('agy or codex workers are refused under a goal (no deny list to carry)', async () => {
+    for (const agent of ['agy', 'codex']) {
+      const g = goalPort();
+      const h = setup({ goal: g.port });
+      const res = await h.call(brainParams({ agents: [{ agent }, { agent: 'claude' }] }), COMMANDER);
+      expect(errorOf(res).message).toMatch(new RegExp(`task 1 asks for ${agent}`));
+      expect(g.st.used).toBe(0);
+      expect(h.start).not.toHaveBeenCalled();
+    }
+  });
+
+  it('a goal with no repository does not fall back to the HQ pane: it refuses', async () => {
+    const g = goalPort({ repoRoot: null });
+    const h = setup({ goal: g.port });
+    const res = await h.call(brainParams(), COMMANDER);
+    expect(errorOf(res).message).toMatch(/names no repository/);
+    expect(h.start).not.toHaveBeenCalled();
+  });
 });
 
 describe('the goal learns each task workspace as soon as it exists', () => {
   it('passes onTaskWorkspace to the service only under a goal, and it attaches', async () => {
     const attached: string[] = [];
     const port: FanOutGoalPort = {
-      anchor: () => ({ goalId: 'G-abc123', repoRoot: SIBLING_REPO_ROOT }),
+      anchor: () => ({ goalId: 'G-abc123', repoRoot: SIBLING_REPO_ROOT, workerPermissionMode: 'auto' }),
       reserve: () => ({ ok: true, goalId: 'G-abc123' }),
       release: () => undefined,
       attach: (_id, ids) => attached.push(...ids),

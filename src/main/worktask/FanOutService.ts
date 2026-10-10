@@ -54,6 +54,7 @@ import {
   type FanoutSetupSkipReason,
 } from './fanoutEnvironment';
 import { workerTempEnv } from './fanoutTempDir';
+import { goalWorkerEnv, goalWorkerPromptNote } from '../../shared/moaGoalWorker';
 import { inheritTaskAutonomy } from './taskAutonomy';
 import { getFanOutGuards, type FanOutGuards } from './fanoutGuards';
 import { loadFanoutWorkerPermissionMode } from './fanoutWorkerPolicy';
@@ -153,6 +154,10 @@ export interface FanOutRendererPort {
      *  task runs on. Data, not a command — the renderer re-validates it and
      *  turns it into a RoleBinding on the same rewrite path a role uses. */
     agentChoice?: FanoutAgentChoice;
+    /** The task runs under an approved Moa goal: the renderer adds the goal
+     *  deny rules to the worker flags and refuses a launcher other than
+     *  claude (shared/moaGoalWorker.ts). */
+    goalWorker?: boolean;
   }): Promise<
     | {
         workspaceId: string;
@@ -279,6 +284,11 @@ export interface FanOutRequest {
    *  returned), so a caller that scopes powers to these workspaces (the Moa
    *  goal contract) knows them before the task's first event can arrive. */
   onTaskWorkspace?: (workspaceId: string, index: number) => void;
+  /** Set when the fan-out runs under an approved Moa goal contract: every
+   *  task gets the goal worker profile (shared/moaGoalWorker.ts) — extra deny
+   *  rules, credential friction and a prompt note — and a task whose final
+   *  launcher is not claude is refused by the renderer. */
+  goalWorker?: { goalId: string };
 }
 
 /** How long a dependent task may wait before it is dropped. A dependency whose
@@ -692,6 +702,7 @@ export class FanOutService {
       ...(entries[k].role ? { role: entries[k].role } : {}),
       ...(entries[k].agent ? { agentChoice: entries[k].agent } : {}),
       ...(req.branches?.[k] ? { branch: req.branches[k] } : {}),
+      ...(req.goalWorker ? { goalWorker: req.goalWorker } : {}),
       workerMode,
       requester,
     });
@@ -972,6 +983,7 @@ export class FanOutService {
         output: { batchDir },
         ...(entries[k].role ? { role: entries[k].role } : {}),
         ...(entries[k].agent ? { agentChoice: entries[k].agent } : {}),
+        ...(req.goalWorker ? { goalWorker: req.goalWorker } : {}),
         workerMode,
         requester,
         taskNote: taskGraphNote(k, graph, done),
@@ -1081,6 +1093,8 @@ export class FanOutService {
     onLaunchFailed?: (task: FanOutTaskResult) => void;
     /** See FanOutRequest.onTaskWorkspace. */
     onWorkspace?: (workspaceId: string, index: number) => void;
+    /** See FanOutRequest.goalWorker. */
+    goalWorker?: { goalId: string };
   }): Promise<FanOutTaskResult> {
     const base: FanOutTaskResult = { index: ctx.index, title: ctx.title, ok: false };
     if (ctx.agentChoice) base.agent = ctx.agentChoice.agent;
@@ -1177,11 +1191,20 @@ export class FanOutService {
     };
 
     let promptPath: string | undefined;
+    // Goal worker profile: an empty gh config dir beside the task's metadata
+    // (outside the worktree). Failing to make it fails the task: the profile
+    // is part of what the operator approved, so no worker runs without it.
+    let goalGhConfigDir: string | undefined;
     try {
       fs.mkdirSync(metaDir, { recursive: true });
+      if (ctx.goalWorker) {
+        goalGhConfigDir = path.join(metaDir, 'goal-gh-config');
+        fs.mkdirSync(goalGhConfigDir, { recursive: true });
+      }
       // A declared scope or dependency is written even with no prompt: the
-      // worker must know what it may edit before it edits anything.
-      const taskNote = ctx.taskNote ?? '';
+      // worker must know what it may edit before it edits anything. So is a
+      // goal worker's note, which says what stays with the operator.
+      const taskNote = (ctx.taskNote ?? '') + (ctx.goalWorker ? goalWorkerPromptNote(ctx.goalWorker.goalId) : '');
       if (ctx.prompt.length > 0 || taskNote.length > 0) {
         promptPath = path.join(metaDir, 'prompt.md');
         // A3: the caller's prompt verbatim, then the delivery contract (see
@@ -1259,7 +1282,13 @@ export class FanOutService {
     // post-spawn watch below keys on the command that was actually launched.
     // A preset/agents choice names the real CLI; the command main sends still
     // starts with the default one (the renderer swaps it), so key on the choice.
-    const paneEnv = { ...taskEnv, ...firstRunEnvForAgent(ctx.agentChoice?.agent ?? ctx.agentCmd) };
+    // The goal worker's credential friction rides the PANE env only: the setup
+    // hook above ran with the plain task env and may legitimately need git.
+    const paneEnv = {
+      ...taskEnv,
+      ...firstRunEnvForAgent(ctx.agentChoice?.agent ?? ctx.agentCmd),
+      ...(ctx.goalWorker && goalGhConfigDir ? goalWorkerEnv(goalGhConfigDir) : {}),
+    };
     let workspaceId: string;
     // The renderer resolves the final launcher (a role binding may make it agy)
     // and asks main to pre-trust this folder for agy; main agrees only while
@@ -1277,6 +1306,7 @@ export class FanOutService {
         fanoutTaskOf: ctx.verifiedWorkspaceId,
         ...(ctx.requester ? { fanoutOrigin: ctx.requester } : {}),
         workerPermissionMode: ctx.workerMode,
+        ...(ctx.goalWorker ? { goalWorker: true } : {}),
       });
       if ('error' in spawned) {
         handOverTempDir(`task:${taskId}`);
