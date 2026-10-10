@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MoaGoalService, renderGoalBlock, type MoaGoalPorts } from '../moaGoalContract';
 import type { WorkspaceDecision } from '../deckDecisionStore';
 import type { MoaLevel } from '../../../shared/moa';
@@ -293,5 +293,128 @@ describe('moa goal — budget, kill switches, coverage', () => {
     const r = rig({}, file);
     expect(r.svc.current()).toBeNull();
     expect(r.svc.powers().ok).toBe(false);
+  });
+});
+
+describe('moa goal — approval and end are one at a time (dot review P1-3)', () => {
+  function gate(): { wait: Promise<void>; open: () => void } {
+    let open = (): void => undefined;
+    const wait = new Promise<void>((res) => {
+      open = res;
+    });
+    return { wait, open };
+  }
+
+  it('an End that lands while an approval awaits the card store is not undone by it', async () => {
+    const r = rig();
+    const p = await r.svc.propose(HQ, GOAL);
+    if (!p.ok) throw new Error(p.error);
+    const d = r.slots.get(HQ)!;
+    const g = gate();
+    const resolve = r.ports.decisions.resolve;
+    r.ports.decisions.resolve = async (ws, id, res) => {
+      const out = await resolve(ws, id, res);
+      await g.wait;
+      return out;
+    };
+    const approving = r.svc.resolveCard(HQ, d.id, 'Approve goal');
+    const ending = r.svc.end('operator', 'canceled', 'changed my mind');
+    await new Promise((res) => setTimeout(res, 0));
+    g.open();
+    await approving;
+    expect(await ending).toEqual({ ok: true, id: p.id });
+    expect(r.svc.get(p.id)?.status).toBe('canceled');
+    expect(r.svc.powers().ok).toBe(false);
+    expect(r.slots.size).toBe(0);
+  });
+
+  it('an approval that runs after an End finds nothing to approve', async () => {
+    const r = rig();
+    const p = await r.svc.propose(HQ, GOAL);
+    if (!p.ok) throw new Error(p.error);
+    const d = r.slots.get(HQ)!;
+    // The End cannot clear the card (store failure): the card stays up.
+    r.ports.decisions.clearPendingIfUnchanged = async () => false;
+    expect(await r.svc.end('operator', 'canceled', 'no')).toMatchObject({ ok: true });
+    r.ports.decisions.clearPendingIfUnchanged = async (ws, x) => {
+      if (r.slots.get(ws)?.id === x.id) r.slots.delete(ws);
+      return true;
+    };
+    expect(await r.svc.resolveCard(HQ, d.id, 'Approve goal')).toEqual({ ok: false, code: 'not_pending' });
+    expect(r.svc.get(p.id)?.status).toBe('canceled');
+    expect(r.svc.powers().ok).toBe(false);
+    // ...and the dead card is taken down.
+    expect(r.slots.size).toBe(0);
+  });
+});
+
+describe('moa goal — a stop between the card and the answer (dot review P2-6)', () => {
+  it('the answer is recorded before the card is cleared', async () => {
+    const r = rig();
+    const p = await r.svc.propose(HQ, GOAL);
+    if (!p.ok) throw new Error(p.error);
+    const d = r.slots.get(HQ)!;
+    // wmux stops while the card is being cleared: the card is gone and
+    // nothing after this point runs.
+    r.ports.decisions.clearResolved = async (ws) => {
+      r.slots.delete(ws);
+      await new Promise(() => undefined);
+    };
+    void r.svc.resolveCard(HQ, d.id, 'Approve goal');
+    await vi.waitFor(() => expect(r.slots.size).toBe(0));
+    // What the next start reads: the answer is on disk.
+    const again = rig({}, r.file);
+    expect(again.svc.current()).toMatchObject({ id: p.id, status: 'active' });
+    // Stopped one step earlier instead (card resolved, not cleared): the
+    // next start settles the card without applying anything twice.
+    again.slots.set(HQ, { ...d, status: 'resolved', resolution: 'Approve goal' });
+    // The leftover resolved card is settled without re-applying anything.
+    expect(await again.svc.settleResolved(HQ, again.slots.get(HQ)!)).toBeNull();
+    expect(again.slots.size).toBe(0);
+    expect(again.svc.current()).toMatchObject({ id: p.id, status: 'active' });
+  });
+
+  it('a pending goal whose card is gone is declined, and a new goal can be proposed', async () => {
+    const r = rig();
+    const p = await r.svc.propose(HQ, GOAL);
+    if (!p.ok) throw new Error(p.error);
+    await r.svc.save();
+    // What an older build left behind: the card cleared, the contract pending.
+    const again = rig({}, r.file);
+    expect(again.svc.get(p.id)?.status).toBe('pending');
+    expect(again.svc.current()).toBeNull();
+    expect(again.svc.get(p.id)).toMatchObject({ status: 'declined', endNote: expect.stringMatching(/approval card is gone/) });
+    const next = await again.svc.propose(HQ, GOAL);
+    expect(next).toMatchObject({ ok: true, status: 'pending' });
+  });
+
+  it('a card store that cannot be read declines nothing', async () => {
+    const r = rig();
+    const p = await r.svc.propose(HQ, GOAL);
+    if (!p.ok) throw new Error(p.error);
+    r.ports.decisions.load = () => {
+      throw new Error('unreadable');
+    };
+    expect(r.svc.current()).toMatchObject({ id: p.id, status: 'pending' });
+  });
+
+  it('an answer that cannot be saved grants nothing and stays to be settled', async () => {
+    const r = rig();
+    const p = await r.svc.propose(HQ, GOAL);
+    if (!p.ok) throw new Error(p.error);
+    const d = r.slots.get(HQ)!;
+    // Saving fails from here on (the file's directory becomes a file).
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.writeFileSync(dir, 'x');
+    try {
+      expect(await r.svc.resolveCard(HQ, d.id, 'Approve goal')).toEqual({ ok: false, code: 'error' });
+      expect(r.svc.get(p.id)?.status).toBe('pending');
+      expect(r.svc.powers().ok).toBe(false);
+      // The resolved card stays, for settleResolved on the next start.
+      expect(r.slots.get(HQ)?.status).toBe('resolved');
+    } finally {
+      fs.rmSync(dir, { force: true });
+      fs.mkdirSync(dir);
+    }
   });
 });
