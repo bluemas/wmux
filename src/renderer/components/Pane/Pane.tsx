@@ -710,6 +710,13 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
   const resumeHint = useStore((s) =>
     activeSurfacePtyId ? s.resumeHintByPtyId[activeSurfacePtyId] : undefined,
   );
+  // The pane's agent is running right now (process truth or OSC 133). A hint
+  // can outlive the resume it asked for when the daemon outlives an app quit;
+  // the pill must not offer a resume into that running agent.
+  const resumeAgentLive = useStore((s) =>
+    !!activeSurfacePtyId &&
+    (s.agentAliveByPtyId[activeSurfacePtyId] === true || s.commandRunningByPtyId[activeSurfacePtyId] === true),
+  );
   const resumeBinding = useStore((s) =>
     activeSurfacePtyId ? s.resumeBindingByPtyId[activeSurfacePtyId] : undefined,
   );
@@ -741,6 +748,8 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
       binding: resumeBinding,
       paneCwds: autoResumeCwds,
       roleBinding: paneRoleBinding,
+      commandRunning: useStore.getState().commandRunningByPtyId[ptyId],
+      agentAlive: useStore.getState().agentAliveByPtyId[ptyId],
     });
     if (!line) return;
     // A beat after the first output, so the prompt is up and reading input.
@@ -986,7 +995,7 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
           resumePtyReady: it then takes its height before the recovered pane's
           first fit instead of shrinking the terminal (a resize, a SIGWINCH)
           once the pane is live. Only the button waits for readiness. */}
-      {resumeHint && !supervision && activeSurfacePtyId && !chatV2OwnsPane && (() => {
+      {resumeHint && !resumeAgentLive && !supervision && activeSurfacePtyId && !chatV2OwnsPane && (() => {
         const ptyId = activeSurfacePtyId;
         const launcher = resumeHint; // slug doubles as the launcher stem ('claude'/'codex')
         const agentName = launcher.charAt(0).toUpperCase() + launcher.slice(1);

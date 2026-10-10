@@ -318,7 +318,13 @@ describe('planAutoResume — never types into a pane whose agent is already runn
 
   it('the Pane effect re-checks liveness right before writing', () => {
     const source = readFileSync(resolve(__dirname, '../Pane.tsx'), 'utf8');
-    expect(source).toMatch(/commandRunningByPtyId\[ptyId\] === true \|\| agentAliveByPtyId\[ptyId\] === true\) \{\s*\/\/[^\n]*\n\s*useStore\.getState\(\)\.clearResumeHint\(ptyId\);\s*return;/);
+    expect(source).toMatch(/commandRunningByPtyId\[ptyId\] === true \|\| agentAliveByPtyId\[ptyId\] === true\) \{[\s\S]{0,200}?clearResumeHint\(ptyId\);\s*return;/);
+  });
+
+  it('the planner gets the live signals, and the pill hides while the agent runs', () => {
+    const source = readFileSync(resolve(__dirname, '../Pane.tsx'), 'utf8');
+    expect(source).toMatch(/commandRunning: useStore\.getState\(\)\.commandRunningByPtyId\[ptyId\],\s*agentAlive: useStore\.getState\(\)\.agentAliveByPtyId\[ptyId\],/);
+    expect(source).toMatch(/\{resumeHint && !resumeAgentLive && /);
   });
 
   it('still resumes at an idle prompt, or when neither signal is known', () => {
