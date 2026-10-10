@@ -80,9 +80,12 @@ const SCREENED_TEXT_PARAMS: Readonly<Record<string, readonly string[]>> = {
   'task.fanout.start': ['prompt', 'titles', 'taskPrompts'],
 };
 
-/** Keys that submit (or discard) what is typed on a terminal's line. */
+/** Keys that submit (or discard) what is typed on a terminal's line. Only
+ *  ctrl+c discards: Escape is a meta prefix in bash and ctrl+d / ctrl+z do
+ *  not clear a line that holds text, so forgetting the line on them would let
+ *  `git pu`, Escape, `sh` through while the terminal still composes it. */
 const SUBMIT_KEYS: ReadonlySet<string> = new Set(['enter']);
-const DISCARD_KEYS: ReadonlySet<string> = new Set(['ctrl+c', 'escape', 'ctrl+d', 'ctrl+z']);
+const DISCARD_KEYS: ReadonlySet<string> = new Set(['ctrl+c']);
 /** Typed-but-unsubmitted text kept per target, and how much of it. */
 const TYPED_MAX_TARGETS = 64;
 const TYPED_MAX_CHARS = 4000;
@@ -164,8 +167,8 @@ export function moaLevelRefusal(
     if (hit) {
       // The refused text never reaches the pane, but what was typed before it
       // is still on the terminal's line: keep it, so retrying the same suffix
-      // is read as the same command again. Only a discard key (or Enter, which
-      // submits the harmless prefix) clears it. The gate never writes to the
+      // is read as the same command again. Only ctrl+c (or Enter, which submits
+      // the harmless prefix) clears it. The gate never writes to the
       // pane itself to clear the line: it only refuses, and no one key clears
       // a line in every shell.
       return `${refuse(hit)}${prior ? ' The line still holds unsubmitted text; send ctrl+c to discard it.' : ''}`;

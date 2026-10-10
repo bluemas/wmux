@@ -104,9 +104,18 @@ describe('moa level gate', () => {
     expect(moaLevelRefusal(g, 'input.send', HQ, { ptyId: 'p1', text: 'sh' })).toMatch(/remote/);
     // Enter would submit `git pu` alone: screened, and harmless.
     expect(moaLevelRefusal(g, 'input.send', HQ, { ptyId: 'p1', text: 'sh', submit: true })).toMatch(/remote/);
-    // A discard key clears the line; then the same text is just `sh`.
-    expect(moaLevelRefusal(g, 'input.sendKey', HQ, { ptyId: 'p1', key: 'escape' })).toBeNull();
+    // ctrl+c clears the line; then the same text is just `sh`.
+    expect(moaLevelRefusal(g, 'input.sendKey', HQ, { ptyId: 'p1', key: 'ctrl+c' })).toBeNull();
     expect(moaLevelRefusal(g, 'input.send', HQ, { ptyId: 'p1', text: 'sh' })).toBeNull();
+  });
+
+  // Owner decision 4: Escape does not clear a bash line (it is a meta prefix),
+  // so it must not make the gate forget what is still typed there.
+  it.each(['escape', 'ctrl+d', 'ctrl+z'])('%s does not discard the typed line: git pu, the key, then sh is refused', (key) => {
+    const g: MoaLevelGateDeps = { ...deps(2, { goalId: 'G-1', humanOnly: [] }), typed: new Map() };
+    expect(moaLevelRefusal(g, 'input.send', HQ, { ptyId: 'p1', text: 'git pu' })).toBeNull();
+    expect(moaLevelRefusal(g, 'input.sendKey', HQ, { ptyId: 'p1', key })).toBeNull();
+    expect(moaLevelRefusal(g, 'input.send', HQ, { ptyId: 'p1', text: 'sh' })).toMatch(/remote/);
   });
 
   it('the installed gate keeps its own typed-line memory', () => {
