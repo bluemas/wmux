@@ -1379,7 +1379,7 @@ function SplitSurfaceView({
 
   if (pane.surfaces.length === 0) {
     return (
-      <div className="flex-1 relative overflow-hidden flex items-center justify-center text-[var(--text-muted)] text-sm" {...tokenAttrs('textMuted', 'text')}>
+      <div className="flex-1 min-h-0 min-w-0 relative overflow-clip flex items-center justify-center text-[var(--text-muted)] text-sm" {...tokenAttrs('textMuted', 'text')}>
         {emptyMessage}
       </div>
     );
@@ -1388,7 +1388,7 @@ function SplitSurfaceView({
   // Only terminals or only browsers — no split needed
   if (!hasBoth) {
     return (
-      <div className="flex-1 relative overflow-hidden">
+      <div className="flex-1 min-h-0 min-w-0 relative overflow-clip">
         {pane.surfaces.map((surface) =>
           surface.surfaceType === 'editor' ? (
             <EditorPanel
@@ -1475,11 +1475,11 @@ function SplitSurfaceView({
   // — report it occluded so lightweight mode can throttle it.
   const overlayActive = others.some((s) => s.id === activeSurfaceId);
   return (
-    <div className="flex-1 relative overflow-hidden">
+    <div className="flex-1 min-h-0 min-w-0 relative overflow-clip">
       <Group orientation="horizontal" className="h-full w-full" resizeTargetMinimumSize={{ coarse: 37, fine: 16 }}>
         {/* Terminal panel */}
         <Panel defaultSize={50} minSize={20}>
-          <div className="h-full w-full relative overflow-hidden">
+          <div className="h-full w-full min-h-0 min-w-0 relative overflow-clip">
             {terminals.map((surface) => (
               <TerminalSurface
                 key={surface.id}
@@ -1500,7 +1500,7 @@ function SplitSurfaceView({
 
         {/* Browser panel */}
         <Panel defaultSize={50} minSize={20}>
-          <div className="h-full w-full relative overflow-hidden">
+          <div className="h-full w-full min-h-0 min-w-0 relative overflow-clip">
             {browsers.map((surface) => (
               <BrowserPanel
                 key={`${surface.id}:${surface.browserPartition || 'persist:wmux-default'}`}
