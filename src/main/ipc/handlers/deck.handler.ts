@@ -2714,6 +2714,7 @@ export function registerDeckHandler(
       live,
       ...(view && !view.effective.ok && c.status === 'active' ? { inertReason: view.effective.reason } : {}),
       ...(c.endNote ? { endNote: c.endNote } : {}),
+      ...(c.endedAt !== undefined ? { endedAt: c.endedAt } : {}),
       ...goalPanelDetail(c),
     };
   };

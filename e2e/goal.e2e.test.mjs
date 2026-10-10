@@ -64,6 +64,9 @@ async function proposeAndApprove(goal, doneCriteria, shotName) {
   const approve = win.getByRole('button', { name: 'Approve goal', exact: true });
   await approve.waitFor({ timeout: 15_000 });
   for (const c of doneCriteria) await win.getByText(c, { exact: false }).first().waitFor();
+  // The card is a structured list: one line per done criterion.
+  const ctx = await win.locator('[data-moa-decision-context]').first().innerText();
+  doneCriteria.forEach((c, i) => assert.match(ctx, new RegExp(`\\n\\s*\\(${i + 1}\\) ${c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`)));
   if (shotName) await shot(win, shotName);
   await approve.click();
   await waitFor(async () => (await brain('deck.goal', { action: 'status' })).goal?.status === 'active', { what: `goal ${p.id} active` });
@@ -81,6 +84,10 @@ async function fanOutOne(title) {
   }, { timeout: 60_000, what: 'fan-out' });
   const task = r.result.tasks[0];
   assert.equal(task.ok, true, JSON.stringify(task));
+  // Progress is on the main screen, not only in Settings.
+  const strip = win.getByTestId('moa-goal-strip');
+  await strip.waitFor({ timeout: 15_000 });
+  assert.equal(await strip.getAttribute('data-status'), 'active');
   await shot(win, `progress-${fanouts}-after-fanout`);
   await waitFor(() => git(['log', '-1', '--format=%s'], task.worktreePath).startsWith('e2e worker:'), { timeout: 60_000, what: 'worker commit' });
   return task;
@@ -160,6 +167,12 @@ describe('Moa goal evidence gate (Electron e2e)', () => {
     assert.equal(g.verification.gates[0].exitCode, 0);
     assert.match(fs.readFileSync(g.verification.gates[0].logPath, 'utf8'), /PASS 1 test/);
     assert.deepEqual(g.verification.criteria.map((c) => c.criterion), [1, 2]);
+    // Main screen strip: both criteria ✓ and the PR link.
+    await win.keyboard.press('Escape');
+    await win.getByTestId('moa-goal-strip-criterion-2').waitFor({ timeout: 15_000 });
+    assert.equal(await win.getByTestId('moa-goal-strip-criterion-1').getAttribute('data-state'), 'pass');
+    assert.equal(await win.getByTestId('moa-goal-strip-criterion-2').getAttribute('data-state'), 'pass');
+    await shot(win, '03a-main-screen-goal-strip-done');
     await showGoalRow();
     // Settings shows each criterion ✓ with its evidence, and the PR.
     await win.getByTestId('moa-goal-criterion-1').waitFor();
@@ -205,10 +218,26 @@ describe('Moa goal evidence gate (Electron e2e)', () => {
     assert.match(r.problems.join('\n'), /the gate failed \(npm test, exit 1\)/);
     assert.equal(goals()[id].status, 'active');
     assert.equal(goals()[id].verification, undefined);
+    // Main screen: the strip shows the failure as a summary with an openable
+    // log, not a raw temp path.
+    await win.getByTestId('moa-goal-strip-problem').waitFor({ timeout: 15_000 });
+    const stripProblem = await win.getByTestId('moa-goal-strip-problem').innerText();
+    assert.match(stripProblem, /gate failed \(npm test, exit 1\)/);
+    assert.doesNotMatch(stripProblem, /\.log\b/);
+    await win.getByTestId('moa-goal-strip-log').waitFor();
+    await shot(win, '04a-main-screen-goal-strip-failure');
     await showGoalRow();
     await win.getByTestId('moa-goal-end').waitFor(); // the goal is still open: "End goal" is offered
     // The refusal is visible: the gate failure is listed with ✗.
     assert.match(await win.getByTestId('moa-goal-problem').first().innerText(), /gate failed/);
+    await win.getByTestId('moa-goal-log').first().waitFor();
+    assert.match(await win.getByTestId('moa-goal-log-excerpt').first().innerText(), /not ok|fail|Error|expected/i);
+    // Task worktrees are grouped behind one toggle in Workspace modes.
+    const toggle = win.getByTestId('moa-modes-tasks-toggle');
+    await toggle.waitFor();
+    assert.equal(await win.locator('[data-testid="moa-modes"]').getByText('wtask:', { exact: false }).count(), 0);
+    await toggle.scrollIntoViewIfNeeded();
+    await shot(win, '04b-workspace-modes-tasks-collapsed');
     assert.equal(Object.keys(fakePrs(sb)).length, 1, 'nothing delivered for a refused goal');
     await win.getByTestId('moa-goal-detail').scrollIntoViewIfNeeded();
     await shot(win, '04-failing-test-goal-still-open');
