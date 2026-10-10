@@ -123,9 +123,16 @@ export interface MoaGoalPanel {
   };
 }
 
+/** Learning-loop drafts awaiting the operator, and the flake count. */
+export interface MoaLearningPanel {
+  drafts: { id: string; goal: string; summary: string; command: string; seen: number; doneCriteria: string[] }[];
+  flakes: number;
+}
+
 export interface MoaState {
   config: MoaConfig;
   goal?: MoaGoalPanel | null;
+  learning?: MoaLearningPanel;
   hq: { workspaceId: string | null; state: MoaHqState };
   /** Decisions the HQ migration archived; `unacked` drives the one-time notice. */
   archive: { unacked: number; total: number };

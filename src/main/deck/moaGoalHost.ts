@@ -11,6 +11,7 @@ import { getSharedTaskGateRunner } from '../worktask/TaskGateRunner';
 import { git } from '../git/git';
 import { getWmuxDir } from '../../daemon/config';
 import type { MoaGoalContract, MoaGoalDelivery, MoaGoalVerification } from '../../shared/moaGoal';
+import { getMoaGoalLearning } from './moaGoalLearning';
 import { deliverGoal, revertDelivery, type ExecResult, type MoaGoalDeliveryPorts } from './moaGoalDelivery';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -155,6 +156,7 @@ export function createMoaGoalService(opts: {
               runGate: (input) => runner.run(input),
               headSha: headShaOf,
               evidenceDir: (id) => goalEvidenceDir(id),
+              onGateOutcome: (o) => { getMoaGoalLearning()?.record(o); },
             });
           },
         }

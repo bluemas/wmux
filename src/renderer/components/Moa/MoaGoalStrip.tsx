@@ -5,6 +5,7 @@
 import { useStore } from '../../stores';
 import { useT } from '../../hooks/useT';
 import type { MoaGoalPanel } from '../../../shared/moa';
+import { MoaGoalDrafts } from './MoaGoalDrafts';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -20,7 +21,14 @@ const MARK = { pass: '✓', fail: '✗', open: '○' } as const;
 export function MoaGoalStrip() {
   const t = useT();
   const goal = useStore((s) => s.moa?.goal);
-  if (!goalStripVisible(goal, Date.now())) return null;
+  const drafts = useStore((s) => s.moa?.learning?.drafts.length ?? 0);
+  if (!goalStripVisible(goal, Date.now())) {
+    return drafts > 0 ? (
+      <div className="mx-3 mb-1 rounded-md border border-[var(--line)] px-2.5 py-1.5 text-[var(--text-sub)]" data-testid="moa-goal-strip" data-status="drafts">
+        <MoaGoalDrafts compact />
+      </div>
+    ) : null;
+  }
   const problem = goal.problems?.[0];
   const status = goal.status === 'active' && !goal.live ? 'inert' : goal.status;
   return (
@@ -61,6 +69,7 @@ export function MoaGoalStrip() {
           )}
         </div>
       )}
+      {drafts > 0 && <div className="mt-1"><MoaGoalDrafts compact /></div>}
       {goal.delivery?.items.filter((d) => d.prUrl).map((d) => (
         <div key={d.prUrl} className="mt-0.5">
           <a
