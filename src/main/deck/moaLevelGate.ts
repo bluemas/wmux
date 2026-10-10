@@ -32,6 +32,7 @@
 
 import type { MoaLevel } from '../../shared/moa';
 import { goalHardRuleHit, goalHardRuleHitAny } from '../../shared/moaGoal';
+import { AGENT_SLUG_SET } from '../../shared/agentIdentity';
 
 /** Methods that change something outside Moa's own records. Refused at level 0. */
 export const MOA_L0_REFUSED_METHODS: ReadonlySet<string> = new Set<string>([
@@ -97,6 +98,49 @@ function typedKey(params: Record<string, unknown> | undefined): string | null {
   return typeof ws === 'string' && ws.length > 0 ? `ws:${ws}` : null;
 }
 
+const PACKAGE_RUNNERS: ReadonlySet<string> = new Set(['npx', 'bunx', 'pnpx']);
+
+function stemOf(token: string): string {
+  return (token.split(/[\\/]/).pop() ?? '').replace(/\.(exe|cmd|bat|ps1)$/i, '');
+}
+
+/**
+ * The agent CLI a terminal line starts, or null. Each command on the line
+ * (split at newlines, `;`, `|` and `&`, which also drops PowerShell's call
+ * operator) is read by its first word. A bare word must be the slug as typed,
+ * so a follow-up that opens with "Claude, …" is prose; a quoted word or a path
+ * is matched without case (`'C:\…\claude.cmd'`). `npx`/`bunx` count by the
+ * package they run. A wrapper (`cmd /c`, `powershell -c`, a script) is not
+ * read: like the text screen, this is a tripwire.
+ */
+export function agentLaunchIn(line: string): string | null {
+  for (const segment of line.split(/[\r\n;|&]+/)) {
+    const words = segment.trim().match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+    const word = (k: number): { raw: string; quoted: boolean } | null => {
+      const w = words[k];
+      if (!w) return null;
+      const quoted = /^(".*"|'.*')$/.test(w);
+      return { raw: quoted ? w.slice(1, -1) : w, quoted };
+    };
+    let i = words[0] === '.' ? 1 : 0;
+    let w = word(i);
+    if (!w) continue;
+    if (PACKAGE_RUNNERS.has(stemOf(w.raw).toLowerCase())) {
+      w = word(++i);
+      if (!w) continue;
+      const pkg = w.raw.toLowerCase();
+      if (/(^|\/)claude-code(@|$)/.test(pkg)) return 'claude';
+      const stem = stemOf(pkg.replace(/@[^/]*$/, ''));
+      if (AGENT_SLUG_SET.has(stem)) return stem;
+      continue;
+    }
+    const stem = stemOf(w.raw);
+    const slug = w.quoted || stem !== w.raw ? stem.toLowerCase() : stem;
+    if (AGENT_SLUG_SET.has(slug)) return slug;
+  }
+  return null;
+}
+
 export interface MoaLevelGateDeps {
   hqWorkspaceId: () => string | null;
   level: () => MoaLevel;
@@ -139,7 +183,19 @@ export function moaLevelRefusal(
   const goal = deps.activeGoal();
   if (!goal) return null;
   const refuse = (hit: { rule: string; match: string }): string =>
-    `method ${method} is refused under goal ${goal.goalId}: the text asks for something that stays the operator's (${hit.rule}: "${hit.match}"). Leave that step out and raise it with deck_ask_decision.`;
+    hit.rule === 'agent-launch'
+      ? `method ${method} is refused under goal ${goal.goalId}: the line starts an agent CLI (${hit.match}) by hand, and an agent started that way runs without the goal's deny rules and credential friction. Start goal work with fanout_start; to restart a task's agent, ask the operator with deck_ask_decision.`
+      : `method ${method} is refused under goal ${goal.goalId}: the text asks for something that stays the operator's (${hit.rule}: "${hit.match}"). Leave that step out and raise it with deck_ask_decision.`;
+  // A submitted terminal line is screened for the hard rules and for an agent
+  // launch (live dogfood 2026-10-10: a goal worker's shell died, came back as
+  // a plain shell, and Moa typed `claude "…"` into it; that agent's push went
+  // through).
+  const lineHit = (line: string): { rule: string; match: string } | null => {
+    const hit = goalHardRuleHit(line, goal.humanOnly);
+    if (hit) return hit;
+    const agent = agentLaunchIn(line);
+    return agent ? { rule: 'agent-launch', match: agent } : null;
+  };
   const key = typedKey(params);
   const typed = deps.typed;
 
@@ -151,7 +207,7 @@ export function moaLevelRefusal(
     if (SUBMIT_KEYS.has(k)) {
       const line = typed.get(key) ?? '';
       typed.delete(key);
-      const hit = line ? goalHardRuleHit(line, goal.humanOnly) : null;
+      const hit = line ? lineHit(line) : null;
       return hit ? refuse(hit) : null;
     }
     if (DISCARD_KEYS.has(k)) typed.delete(key);
@@ -163,7 +219,10 @@ export function moaLevelRefusal(
   if (method === 'input.send') {
     const text = typeof params?.text === 'string' ? params.text : '';
     const prior = key && typed ? typed.get(key) ?? '' : '';
-    const hit = goalHardRuleHit(prior + text, goal.humanOnly);
+    const submitted = params?.submit === true || /[\r\n]/.test(text);
+    // A launch is read once the line is submitted: `codex` alone may still
+    // grow into prose before Enter, which then screens the whole line.
+    const hit = submitted ? lineHit(prior + text) : goalHardRuleHit(prior + text, goal.humanOnly);
     if (hit) {
       // The refused text never reaches the pane, but what was typed before it
       // is still on the terminal's line: keep it, so retrying the same suffix
@@ -174,7 +233,6 @@ export function moaLevelRefusal(
       return `${refuse(hit)}${prior ? ' The line still holds unsubmitted text; send ctrl+c to discard it.' : ''}`;
     }
     if (key && typed) {
-      const submitted = params?.submit === true || /[\r\n]/.test(text);
       if (submitted) {
         typed.delete(key);
       } else {

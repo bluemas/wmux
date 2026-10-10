@@ -118,6 +118,40 @@ describe('moa level gate', () => {
     expect(moaLevelRefusal(g, 'input.send', HQ, { ptyId: 'p1', text: 'sh' })).toMatch(/remote/);
   });
 
+  // Live dogfood 2026-10-10: a goal worker's shell died, the pane came back as
+  // a plain shell, and Moa typed `claude "…"` into it. That claude had no goal
+  // deny rules and the shell no goal env, so its `git push` went through.
+  it('under a goal, typing an agent CLI launch into a pane is refused', () => {
+    const g = () => ({ ...deps(2, { goalId: 'G-1', humanOnly: [] }), typed: new Map<string, string>() });
+    for (const text of [
+      'claude "run steps 1-6 of PROBE.md"',
+      'claude',
+      '  codex exec "fix it"',
+      '& claude --permission-mode auto',
+      String.raw`& 'C:\Users\x\AppData\Roaming\npm\claude.cmd' "go"`,
+      '/usr/local/bin/agy --prompt x',
+      'cd D:/w/task; claude "go"',
+      'git status && claude -c',
+    ]) {
+      expect(moaLevelRefusal(g(), 'input.send', HQ, { ptyId: 'p1', text, submit: true }), text).toMatch(/G-1.*agent/);
+    }
+    // Split across calls and submitted with Enter: still one launch line.
+    const split = g();
+    expect(moaLevelRefusal(split, 'input.send', HQ, { ptyId: 'p1', text: 'cla' })).toBeNull();
+    expect(moaLevelRefusal(split, 'input.send', HQ, { ptyId: 'p1', text: 'ude "go"', submit: true })).toMatch(/agent/);
+    const enter = g();
+    expect(moaLevelRefusal(enter, 'input.send', HQ, { ptyId: 'p1', text: 'codex' })).toBeNull();
+    expect(moaLevelRefusal(enter, 'input.sendKey', HQ, { ptyId: 'p1', key: 'enter' })).toMatch(/agent/);
+    expect(moaLevelRefusal(g(), 'input.send', HQ, { ptyId: 'p1', text: 'npx @anthropic-ai/claude-code "go"', submit: true })).toMatch(/agent/);
+    // A follow-up typed into a running agent's prompt is prose, not a launch.
+    for (const text of ['Claude, please run the tests again.', 'Please continue with step 2.', 'the claude CLI printed an error; read it']) {
+      expect(moaLevelRefusal(g(), 'input.send', HQ, { ptyId: 'p1', text, submit: true }), text).toBeNull();
+    }
+    // Without a goal, or below level 2: today's lane.
+    expect(moaLevelRefusal(deps(2), 'input.send', HQ, { ptyId: 'p1', text: 'claude "go"', submit: true })).toBeNull();
+    expect(moaLevelRefusal(deps(1, { goalId: 'G-1', humanOnly: [] }), 'input.send', HQ, { ptyId: 'p1', text: 'claude "go"' })).toBeNull();
+  });
+
   it('the installed gate keeps its own typed-line memory', () => {
     setMoaLevelGate(deps(2, { goalId: 'G-1', humanOnly: [] }));
     expect(commanderLevelRefusal('input.send', HQ, { ptyId: 'p1', text: 'git pu' })).toBeNull();
