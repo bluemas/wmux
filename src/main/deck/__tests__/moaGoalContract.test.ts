@@ -468,3 +468,63 @@ describe('moa goal — a stop between the card and the answer (dot review P2-6)'
     }
   });
 });
+
+describe('moa goal — an end whose save fails stays ended across a restart', () => {
+  const failingWrite = async (): Promise<void> => {
+    throw new Error('disk says no');
+  };
+
+  it('end, a failed save, then a reload: the goal is not active', async () => {
+    const r = rig();
+    const id = await approved(r);
+    await r.svc.save();
+    r.ports.writeJSON = failingWrite;
+    expect(await r.svc.end('operator', 'canceled', 'stop it')).toEqual({ ok: true, id });
+    // The store on disk still says active: its save never landed.
+    expect(JSON.parse(fs.readFileSync(r.file, 'utf8')).items[id].status).toBe('active');
+    const again = rig({}, r.file);
+    expect(again.svc.current()).toBeNull();
+    expect(again.svc.powers().ok).toBe(false);
+    expect(again.svc.get(id)).toMatchObject({ status: 'canceled', endNote: 'operator: stop it' });
+  });
+
+  it('a completed goal whose save failed comes back completed, not active', async () => {
+    const r = rig();
+    const id = await approved(r);
+    await r.svc.save();
+    r.ports.writeJSON = failingWrite;
+    await r.svc.end('moa', 'completed', 'done and verified');
+    expect(rig({}, r.file).svc.get(id)?.status).toBe('completed');
+  });
+
+  it('when the end log cannot be written either, the end reports an error and a reload still grants nothing', async () => {
+    const r = rig();
+    const id = await approved(r);
+    await r.svc.save();
+    r.ports.writeJSON = failingWrite;
+    fs.mkdirSync(`${r.file}.ended`); // appending to it fails
+    expect(await r.svc.end('operator', 'canceled', 'x')).toEqual({ ok: false, code: 'error' });
+    expect(r.svc.powers().ok).toBe(false);
+    // An end log that exists but cannot be read ends every open goal.
+    const again = rig({}, r.file);
+    expect(again.svc.powers().ok).toBe(false);
+    expect(again.svc.get(id)).toMatchObject({ status: 'canceled', endNote: 'the goal end log could not be read' });
+  });
+
+  it('the log only ends the goal it names, and goes once nothing is left to apply', async () => {
+    const r = rig();
+    const id = await approved(r);
+    await r.svc.end('operator', 'canceled', 'x'); // both writes land
+    const log = `${r.file}.ended`;
+    expect(fs.existsSync(log)).toBe(true);
+    // The store already says canceled: nothing to apply, so the log is removed.
+    expect(rig({}, r.file).svc.get(id)?.status).toBe('canceled');
+    expect(fs.existsSync(log)).toBe(false);
+    // A line for the same id but another goal (different createdAt) ends nothing.
+    const s = rig();
+    const next = await approved(s);
+    await s.svc.save();
+    fs.writeFileSync(`${s.file}.ended`, `${JSON.stringify({ id: next, createdAt: -1, status: 'canceled', endedAt: 1, endNote: 'old' })}\n{torn`);
+    expect(rig({}, s.file).svc.current()).toMatchObject({ id: next, status: 'active' });
+  });
+});

@@ -23,6 +23,7 @@
 // which is the safe direction: nothing is granted).
 
 import { randomBytes } from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
 import { getWmuxDir } from '../../daemon/config';
 import { atomicReadJSONSync, atomicWriteJSON } from '../../daemon/util/atomicWrite';
@@ -73,6 +74,8 @@ export interface MoaGoalPorts {
   notify?: () => void;
   now?: () => number;
   filePath?: string;
+  /** Tests: the store's write (default atomicWriteJSON). */
+  writeJSON?: (p: string, data: unknown) => Promise<void>;
 }
 
 interface GoalFile {
@@ -99,7 +102,60 @@ export function getMoaGoalsPath(dir: string = getWmuxDir()): string {
   return path.join(dir, 'moa-goals.json');
 }
 
+/** The end log beside the store (see MoaGoalService.end). */
+function endLogPath(p: string): string {
+  return `${p}.ended`;
+}
+
+type EndRecord = Pick<MoaGoalContract, 'id' | 'createdAt' | 'status' | 'endedAt' | 'endNote'>;
+
+/** Apply the end log: an end recorded there wins over an open record in the
+ *  store, whose own save may never have landed. A log that exists but cannot
+ *  be read ends every open contract (fail closed). A log with nothing left to
+ *  apply is removed, which is what keeps it short. */
+function applyEndLog(p: string, file: GoalFile): GoalFile {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(endLogPath(p), 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return file;
+    for (const c of Object.values(file.items)) {
+      if (OPEN.includes(c.status)) {
+        file.items[c.id] = { ...c, status: 'canceled', endedAt: Date.now(), endNote: 'the goal end log could not be read', decisionId: undefined };
+      }
+    }
+    return file;
+  }
+  let applied = 0;
+  for (const line of raw.split('\n')) {
+    let e: EndRecord;
+    try {
+      e = JSON.parse(line) as EndRecord;
+    } catch {
+      continue; // a torn last line: an end that was never confirmed to anyone
+    }
+    const c = e && typeof e === 'object' ? file.items[e.id] : undefined;
+    // Matched on the creation time too, so a reused id never ends a new goal.
+    if (!c || c.createdAt !== e.createdAt || !OPEN.includes(c.status)) continue;
+    if (e.status !== 'completed' && e.status !== 'canceled') continue;
+    file.items[c.id] = { ...c, status: e.status, endedAt: e.endedAt, endNote: e.endNote, decisionId: undefined };
+    applied++;
+  }
+  if (applied === 0) {
+    try {
+      fs.rmSync(endLogPath(p), { force: true });
+    } catch {
+      /* kept: it only ever ends goals */
+    }
+  }
+  return file;
+}
+
 function readFile(p: string): GoalFile {
+  return applyEndLog(p, readStore(p));
+}
+
+function readStore(p: string): GoalFile {
   try {
     const data = atomicReadJSONSync<unknown>(p);
     if (data && typeof data === 'object' && !Array.isArray(data)) {
@@ -163,7 +219,7 @@ export class MoaGoalService {
   save(): Promise<boolean> {
     return this.serialize(async () => {
       try {
-        await atomicWriteJSON(this.ports.filePath ?? getMoaGoalsPath(), this.file);
+        await (this.ports.writeJSON ?? atomicWriteJSON)(this.ports.filePath ?? getMoaGoalsPath(), this.file);
         return true;
       } catch (err) {
         console.warn(`[moa:goal] could not save: ${String(err)}`);
@@ -518,17 +574,39 @@ export class MoaGoalService {
     return { goalId: p.contract.id, humanOnly: [...p.contract.humanOnly], level: p.level, task };
   }
 
+  private logEnd(c: MoaGoalContract): boolean {
+    const rec: EndRecord = { id: c.id, createdAt: c.createdAt, status: c.status, endedAt: c.endedAt, endNote: c.endNote };
+    try {
+      fs.appendFileSync(endLogPath(this.ports.filePath ?? getMoaGoalsPath()), `${JSON.stringify(rec)}\n`);
+      return true;
+    } catch (err) {
+      console.warn(`[moa:goal] could not log the end of ${c.id}: ${String(err)}`);
+      return false;
+    }
+  }
+
   /** End the open contract. Moa may end its own (`completed`, `canceled`);
    *  the operator may cancel it from Settings. Ending only ever takes powers
-   *  away. A pending card is withdrawn, after the end is recorded. */
+   *  away. A pending card is withdrawn, after the end is recorded.
+   *
+   *  The end is first appended to a small end log beside the store, then the
+   *  store is saved. A store save that fails (atomicWriteJSON has already
+   *  retried the transient Windows rename by then) would otherwise leave the
+   *  goal open on disk, and a restart would bring it back; the log is read on
+   *  load and wins. It is an append, not a tmp-and-rename of the whole store,
+   *  so it does not share the store write's failure. Retrying the save
+   *  instead would not survive the restart that matters. Only when both
+   *  writes fail is the end in memory alone, and the caller is told. */
   end(by: 'moa' | 'operator', status: 'completed' | 'canceled', note: string): Promise<{ ok: boolean; id?: string; code?: string }> {
     return this.lifecycle(async () => {
       const c = this.current();
       if (!c) return { ok: false, code: 'no_goal' };
       const card = c.status === 'pending' ? c.decisionId : undefined;
       const trimmed = note.replace(/\s+/g, ' ').trim().slice(0, 300);
-      this.put({ ...c, status, endedAt: this.now(), endNote: `${by === 'operator' ? 'operator' : 'Moa'}: ${trimmed || status}`, decisionId: undefined });
-      const ok = await this.save();
+      const ended: MoaGoalContract = { ...c, status, endedAt: this.now(), endNote: `${by === 'operator' ? 'operator' : 'Moa'}: ${trimmed || status}`, decisionId: undefined };
+      const logged = this.logEnd(ended);
+      this.put(ended);
+      const ok = (await this.save()) || logged;
       this.notify();
       if (card) {
         const d = this.ports.decisions.load(c.hqWorkspaceId);
