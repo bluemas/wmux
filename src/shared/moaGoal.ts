@@ -30,8 +30,9 @@
 //   - DENY RULES (cheap first line): a worker a goal fans out runs Claude Code
 //     with `--disallowedTools` rules for push, PR, release, tag, publish and
 //     recursive-delete commands (shared/moaGoalWorker.ts). They match the
-//     command as written, so `git -C . push` or a wrapper script slips past;
-//     an argv-normalising PreToolUse hook is a listed follow-up.
+//     command as written, so a wrapper (`sh -c`, a script, an alias the list
+//     does not name) slips past; an argv-normalising PreToolUse hook is a
+//     listed follow-up.
 //   - FRICTION: the goal worker's environment withholds GitHub credentials
 //     (placeholder GH_TOKEN, empty GH_CONFIG_DIR, git credential helpers
 //     reset, an unusable push URL for `origin`). The launch is typed into a

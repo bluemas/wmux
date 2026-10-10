@@ -11,11 +11,16 @@
 //      leaves to the operator (push, PR, release, tag, publish, recursive
 //      delete, credential dumps). Claude Code applies deny rules in every
 //      permission mode, so they are the worker's first line. They match the
-//      command AS WRITTEN: `git -C . push`, `sh -c "git push"` or a script
-//      that pushes all slip past. An argv-normalising PreToolUse deny hook is
-//      the follow-up that closes that. Whether a deny rule holds inside a
-//      session started with --dangerously-skip-permissions is on the live
-//      dogfood list, not assumed.
+//      command AS WRITTEN. The 2026-10-10 Windows dogfood (claude 2.1.296,
+//      bypassPermissions and auto) saw `git push`, `git -C . push`,
+//      `cd . && git push`, `gh pr create` and `Remove-Item -Recurse` denied,
+//      and `ri <dir> -r -fo`, `cmd /c "rd /s /q <dir>"` and
+//      `sh -c "git push"` run past the list; rules for those forms were added
+//      after it and are not yet re-run live. Any other wrapper (a script,
+//      `env`, `xargs`, `Invoke-Expression`, another alias) still slips past,
+//      so for push the disabled push URL below is the real stop and for
+//      deletes there is none. An argv-normalising PreToolUse deny hook is the
+//      follow-up that closes that.
 //
 //   2. CREDENTIAL FRICTION — the worker pane's environment:
 //        - GH_TOKEN / GITHUB_TOKEN (and the enterprise pair) are set to a
@@ -91,6 +96,23 @@ export const GOAL_WORKER_DENIED_COMMANDS: readonly string[] = [
   'Remove-Item -Recurse*',
   'rmdir /s*',
   'rd /s*',
+  // Remove-Item under its aliases and with -Recurse abbreviated, which
+  // PowerShell accepts down to `-r` (`ri .\dir -r -fo` deleted a directory in
+  // the 2026-10-10 dogfood). Both cases of the dash word: a rule is matched
+  // as written. `rm -r*` also covers Bash's `rm -r`, `rm -R` and `rm -rf`.
+  ...['Remove-Item', 'ri', 'rm', 'rmdir', 'rd', 'del', 'erase'].flatMap((v) => [
+    `${v} -r*`,
+    `${v} -R*`,
+    `${v} * -r*`,
+    `${v} * -R*`,
+  ]),
+  // cmd's own recursive deletes run through `cmd /c "…"` (also `cmd.exe`):
+  // the leading `*` takes the `/c` and the quote.
+  ...['rd', 'rmdir', 'del', 'erase'].flatMap((v) => [`cmd*${v} */s*`, `cmd*${v} */S*`]),
+  // A push wrapped in a shell's -c (`sh -c "git push"` in the dogfood; the
+  // disabled push URL stopped it). Any other wrapper still slips past.
+  'sh -c*git*push*',
+  'bash -c*git*push*',
   // credentials
   'gh auth token*',
   'git credential*',
