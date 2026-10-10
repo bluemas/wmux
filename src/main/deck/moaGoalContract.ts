@@ -273,6 +273,7 @@ export class MoaGoalService {
       if (w === hq || !this.ports.workspaceExists(w)) return { ok: false, error: 'workspace_unknown', message: `workspace ${w} is not a workspace Moa can give work to` };
     }
     const now = this.now();
+    const workerMode = this.workerMode();
     const contract: MoaGoalContract = {
       id: newGoalId(),
       hqWorkspaceId: hq,
@@ -287,7 +288,7 @@ export class MoaGoalService {
       taskWorkspaceIds: [],
       tasksUsed: 0,
       turnsUsed: 0,
-      ...(this.workerMode() ? { workerPermissionMode: this.workerMode() } : {}),
+      ...(workerMode ? { workerPermissionMode: workerMode } : {}),
     };
     const card = buildMoaGoalCard(contract, (id) => this.ports.workspaceName(id));
     // The operator approves what the card shows: a contract that does not fit
