@@ -47,6 +47,24 @@ describe('endsWithQuestion', () => {
     expect(endsWithQuestion('테스트를 고쳤으니.')).toBe(false);
   });
 
+  // A checklist ending a report ("…제대로 나오는지") is items to verify, not an
+  // ask. Field report: a finished turn sat in Needs you on exactly this.
+  it('does not read a Korean -는지 checklist item as a question', () => {
+    const report = [
+      '발주처가 깔아 쓰면서 아래를 봐 주시면 됩니다.',
+      '- 9/29 물량 화면 맨 아래 합계 숫자가 한 줄로 나오는지',
+      '- 마스터 계정을 켰다면, 기사 고르기와 보기 전용 띠가 제대로 나오는지',
+    ].join('\n');
+    expect(endsWithQuestion(report)).toBe(false);
+    expect(endsWithQuestion('확인할 것:\n* 화면이 뜨는지')).toBe(false);
+    expect(endsWithQuestion('확인할 것:\n1. 화면이 뜨는지')).toBe(false);
+    expect(endsWithQuestion('확인할 것:\n• 화면이 뜨는지')).toBe(false);
+  });
+
+  it('still reads a list item that carries a question mark as a question', () => {
+    expect(endsWithQuestion('어느 쪽으로 할까요?\n- A로 진행할까요?')).toBe(true);
+  });
+
   it('catches the polite proposal form that plain 까 misses', () => {
     // `진행할까요` ends in 요, not 까 — the most common way an agent asks
     // permission in Korean, and the exact bug class this function exists for.

@@ -50,6 +50,9 @@ export function endsWithQuestion(text: string): boolean {
   // Strip trailing markdown emphasis/quotes so `**...할까?**` still matches.
   const tail = last.replace(/[*_`"')\]]+$/, '').trim();
   if (tail.endsWith('?') || tail.endsWith('？')) return true;
+  // A list item ending in `-는지` is a checklist entry ("…제대로 나오는지"),
+  // items for the human to verify, not an ask. Only a `?` makes one a question.
+  if (/^(?:[-*•]|\d+[.)])\s/.test(tail)) return false;
   // A Korean question may still be punctuated with a period; strip it before
   // testing the ending so `진행할까.` matches the same as `진행할까`.
   const bare = tail.replace(/[.!。]+$/, '');
