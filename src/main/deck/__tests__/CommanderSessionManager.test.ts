@@ -694,6 +694,22 @@ describe('CommanderSessionManager — local reads preserve provider authority', 
     expect(mgr.turnOrigin).toBe('human');
   });
 
+  // W5 (goal contract): the remote-Moa mark moves with the origin. A local
+  // answer leaves it alone; a local miss that reaches the provider clears it.
+  it('keeps the remote-Moa wake mark through a local answer and clears it on a fallback', async () => {
+    const adapter = new FakeAdapter();
+    adapter.setScript([{ type: 'turn-end', sessionId: 'existing' }]);
+    const mgr = new CommanderSessionManager({ adapter, sink: vi.fn() });
+    await mgr.send('remote wake', { origin: 'automation', remoteMoa: true });
+    expect(mgr.turnWokenByRemoteMoa).toBe(true);
+    expect(await mgr.send('Who needs me?', { origin: 'human' }, async () => ({ text: 'Nobody.' })))
+      .toEqual({ ok: true, localAnswer: { text: 'Nobody.' } });
+    expect(mgr.turnWokenByRemoteMoa).toBe(true);
+    expect(await mgr.send('Who needs me?', { origin: 'human' }, async () => ({ fallbackText: 'ctx' })))
+      .toEqual({ ok: true });
+    expect(mgr.turnWokenByRemoteMoa).toBe(false);
+  });
+
   it('sets fallback origin immediately before the first provider startup', async () => {
     const adapter = new FakeAdapter();
     adapter.setScript([{ type: 'turn-end', sessionId: null }]);
