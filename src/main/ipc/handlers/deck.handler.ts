@@ -1751,6 +1751,9 @@ export function registerDeckHandler(
     if (!token) {
       return { ok: false, code: 'busy' as const };
     }
+    // Set once this turn is counted against the HQ turn cap and an active
+    // goal's turn budget; the goal keeps its powers until the turn ends.
+    let counted = false;
     try {
       // The queued path may have waited up to 120s: the master switch, the HQ
       // or its presence may have changed meanwhile (turning the switch off is
@@ -1833,7 +1836,10 @@ export function registerDeckHandler(
       // event cannot relabel a turn the old brain produced.
       emit(workspaceId, { type: 'turn-start', prompt, vendor: vendorForWorkspace(workspaceId) });
       moaTranscript.notePrompt(workspaceId, prompt);
-      if (!runOpts.human) noteHqTurn(workspaceId);
+      if (!runOpts.human) {
+        noteHqTurn(workspaceId);
+        counted = true;
+      }
       // Every caller of runTurnForWorkspace is an ambient driver (heartbeat,
       // loop, scheduler, decision resume, startup reconcile) — never a human at
       // the composer. Marking the origin lets the terminal brain re-check for a
@@ -1901,6 +1907,8 @@ export function registerDeckHandler(
       // ended (round-5 review P1) — revoke BEFORE the slot release so no other
       // turn can observe a stale lease.
       if (runOpts.reExamine) revokeReExamineLease(workspaceId);
+      // The goal turn this counted is over: a goal whose last turn it was ends now.
+      if (counted) moaGoals.finishTurn(workspaceId);
       // Release the slot once the turn has fully settled (send resolved/rejected)
       // — never on the synchronous path only, or a long turn would free its slot
       // early and let the cap be exceeded. Release is by token: a slot already

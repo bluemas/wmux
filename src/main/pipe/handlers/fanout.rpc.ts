@@ -112,7 +112,7 @@ import {
   type FanoutPreset,
 } from '../../../shared/fanoutPreset';
 import { validateFanoutTaskGraph, type FanoutTaskGraph } from '../../../shared/fanoutTaskGraph';
-import { getMoaGoalService } from '../../deck/moaGoalContract';
+import { getMoaGoalService, type MoaGoalService } from '../../deck/moaGoalContract';
 import { goalFanoutRefusal, goalWorkerDenyRules } from '../../../shared/moaGoalWorker';
 
 type GetWindow = () => BrowserWindow | null;
@@ -633,11 +633,18 @@ export interface FanOutGoalPort {
   attach(goalId: string, workspaceIds: readonly string[]): void;
   /** The HQ's current turn was woken by another PC's Moa. Absent = no. */
   remoteWoken?(commanderWorkspaceId: string): boolean;
+  /** With no active goal: why the HQ's running turn, which started under a
+   *  goal that has since ended or gone inert, may not fan out at all. */
+  turnRefusal?(commanderWorkspaceId: string): string | null;
 }
 
 function defaultGoalPort(): FanOutGoalPort | null {
   const svc = getMoaGoalService();
-  if (!svc) return null;
+  return svc ? goalPortOf(svc) : null;
+}
+
+/** The fan-out port over a goal service. Exported for tests. */
+export function goalPortOf(svc: MoaGoalService): FanOutGoalPort {
   return {
     anchor: (ws) => {
       const p = svc.powers();
@@ -649,6 +656,12 @@ function defaultGoalPort(): FanOutGoalPort | null {
       };
     },
     remoteWoken: (ws) => svc.turnWokenByRemoteMoa(ws),
+    turnRefusal: (ws) => {
+      const r = svc.turnGoalRefusal(ws);
+      return r
+        ? `this turn started under goal ${r.goalId}, which grants nothing any more (${r.reason}). A goal's turn never falls back to an ordinary fan-out: report to the operator, or fan out in a later turn.`
+        : null;
+    },
     reserve: (n) => {
       const r = svc.reserveTasks(n);
       return r.ok ? { ok: true, goalId: r.contract.id } : r;
@@ -1072,6 +1085,21 @@ export function registerFanOutRpc(
     // passes the goal's checks (shared/moaGoalWorker.ts goalFanoutRefusal) or
     // it is refused. A goal never lets a fan-out run outside its profile.
     const activeGoal = goalAnchorOf();
+    if (!activeGoal && goalPort?.turnRefusal) {
+      // P1: the goal this turn started under ended (or went inert) mid-turn.
+      // Refused outright, never run over the HQ's own pane with its own agents.
+      let why: string | null;
+      try {
+        why = goalPort.turnRefusal(commanderWorkspaceId);
+      } catch (err) {
+        why = `the goal this turn started under could not be read (${String(err)})`;
+      }
+      if (why) {
+        pending.delete(key);
+        guards.release(key);
+        return deny('FAILED_PRECONDITION', why);
+      }
+    }
     if (activeGoal) {
       let remoteWoken = true; // unreadable = refuse (fail closed)
       try {
@@ -1138,6 +1166,21 @@ export function registerFanOutRpc(
       } catch {
         /* the budget only ever errs towards fewer tasks */
       }
+    };
+    const deferredGoalRefusal = (anchor: { goalId: string; repoRoot: string }): string | null => {
+      const now = goalAnchorOf();
+      if (!now || now.goalId !== anchor.goalId) return `goal ${anchor.goalId} is no longer active`;
+      if (now.repoRoot !== anchor.repoRoot) return `goal ${anchor.goalId} no longer covers ${anchor.repoRoot}`;
+      let modeNow: string;
+      try {
+        modeNow = (deps.workerPermissionMode ?? loadFanoutWorkerPermissionMode)();
+      } catch {
+        return `the fan-out worker permission mode could not be read for goal ${anchor.goalId}`;
+      }
+      if (!now.workerPermissionMode || now.workerPermissionMode !== modeNow) {
+        return `the fan-out worker permission mode is ${modeNow} now, but goal ${anchor.goalId} was approved with ${now.workerPermissionMode ?? 'none'}`;
+      }
+      return null;
     };
 
     // ── Build the request from SERVER-DERIVED values only ────────────────
@@ -1358,6 +1401,8 @@ export function registerFanOutRpc(
           }
         };
         let holdsDependents = false;
+        /** Dependent tasks whose goal reservation was given back. */
+        const goalReturned = new Set<number>();
         try {
           const result = await service.start({
             ...req,
@@ -1375,6 +1420,13 @@ export function registerFanOutRpc(
                 }
               : {}),
             beforeDeferredLaunch: (index) => {
+              // A dependent launches long after the approval: under a goal it
+              // launches only while that same goal is active over the same
+              // repository and the worker mode is still the one it pinned.
+              if (goalAnchor) {
+                const why = deferredGoalRefusal(goalAnchor);
+                if (why) return { ok: false, message: why };
+              }
               const r = guards.stampDeferredStart(key);
               if (r.ok) stamped.add(index);
               return r;
@@ -1384,6 +1436,12 @@ export function registerFanOutRpc(
             // before its start was never charged.
             onDeferredLaunch: (t, info) => {
               if (stamped.delete(t.index) && !t.workspaceId) guards.refundStart(key, 1);
+              // The goal reserved every task up front: one that never got a
+              // workspace (dropped, refused, failed) gives its task back, once.
+              if (!t.workspaceId && !goalReturned.has(t.index)) {
+                goalReturned.add(t.index);
+                releaseGoal(1);
+              }
               appendLaunched([t], info.outputBatchDir);
               if (info.remaining === 0) guards.settleStarted(key);
             },

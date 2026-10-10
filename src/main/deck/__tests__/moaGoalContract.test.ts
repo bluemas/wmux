@@ -248,16 +248,66 @@ describe('moa goal — budget, kill switches, coverage', () => {
     expect(r.svc.covers('ws-task')).not.toBeNull();
   });
 
-  it('the turn budget ends it as exhausted', async () => {
+  it('the turn budget ends it as exhausted once the last allowed turn has finished', async () => {
     const r = rig();
     const id = await approved(r);
     r.svc.noteTurn(HQ);
+    r.svc.finishTurn(HQ);
     r.svc.noteTurn('ws-a'); // not the HQ: not counted
     r.svc.noteTurn(HQ);
+    r.svc.finishTurn(HQ);
     expect(r.svc.powers().ok).toBe(true);
     r.svc.noteTurn(HQ);
+    // The third (last) turn runs under the goal...
+    expect(r.svc.powers()).toMatchObject({ ok: true });
+    expect(r.svc.get(id)?.turnsUsed).toBe(3);
+    // ...and the goal ends when it does.
+    r.svc.finishTurn(HQ);
     expect(r.svc.current()).toBeNull();
     expect(r.svc.get(id)?.status).toBe('exhausted');
+  });
+
+  // dot review P1-1: maxTurns=1, the turn is counted when it starts, and the
+  // goal used to end right then, so that turn's fan-out ran without it.
+  it('maxTurns=1: the one allowed turn keeps the goal until it finishes', async () => {
+    const r = rig();
+    const p = await r.svc.propose(HQ, { ...GOAL, budget: { maxTasks: 2, maxHours: 2, maxTurns: 1 } });
+    if (!p.ok) throw new Error(p.error);
+    await r.svc.resolveCard(HQ, r.slots.get(HQ)!.id, 'Approve goal');
+    r.svc.noteTurn(HQ);
+    expect(r.svc.powers()).toMatchObject({ ok: true, contract: { id: p.id } });
+    expect(r.svc.turnGoalRefusal(HQ)).toBeNull();
+    expect(r.svc.reserveTasks(1)).toMatchObject({ ok: true });
+    r.svc.finishTurn(HQ);
+    expect(r.svc.powers().ok).toBe(false);
+    expect(r.svc.get(p.id)?.status).toBe('exhausted');
+    // The next automatic turn is not counted and gets nothing.
+    r.svc.noteTurn(HQ);
+    expect(r.svc.powers().ok).toBe(false);
+    expect(r.svc.turnGoalRefusal(HQ)).toBeNull();
+  });
+
+  it('a goal ended while its turn runs is refused to that turn, not dropped silently', async () => {
+    const r = rig();
+    const id = await approved(r);
+    r.svc.noteTurn(HQ);
+    expect(r.svc.turnGoalRefusal(HQ)).toBeNull();
+    await r.svc.end('operator', 'canceled', 'stop');
+    expect(r.svc.turnGoalRefusal(HQ)).toEqual({ goalId: id, reason: 'canceled' });
+    expect(r.svc.turnGoalRefusal('ws-a')).toBeNull();
+    r.svc.finishTurn(HQ);
+    expect(r.svc.turnGoalRefusal(HQ)).toBeNull();
+  });
+
+  it('a goal that goes inert while its turn runs is refused to that turn too', async () => {
+    const r = rig();
+    const id = await approved(r);
+    r.svc.noteTurn(HQ);
+    r.state.level = 1;
+    expect(r.svc.turnGoalRefusal(HQ)).toEqual({ goalId: id, reason: 'level' });
+    r.state.level = 2;
+    r.state.now += 2 * HOUR;
+    expect(r.svc.turnGoalRefusal(HQ)).toEqual({ goalId: id, reason: 'expired' });
   });
 
   it('the clock ends it as expired', async () => {

@@ -137,6 +137,9 @@ export class MoaGoalService {
   /** propose, the operator's answer and end run one at a time: an answer that
    *  awaits the card store cannot bring back a goal that was ended meanwhile. */
   private readonly lifecycle = createSerialChain();
+  /** The automatic HQ turn noteTurn counted against a goal, until it ends. In
+   *  memory only: after a restart no turn is running. */
+  private openTurn: { hq: string; goalId: string } | null = null;
 
   constructor(private readonly ports: MoaGoalPorts) {}
 
@@ -186,7 +189,9 @@ export class MoaGoalService {
   }
 
   private powersOf(c: MoaGoalContract | null): ReturnType<typeof moaGoalPowers> {
-    return moaGoalPowers(c, { workspaceId: this.ports.hqWorkspaceId(), level: this.ports.hqLevel() }, this.now());
+    return moaGoalPowers(c, { workspaceId: this.ports.hqWorkspaceId(), level: this.ports.hqLevel() }, this.now(), {
+      turnOpen: c !== null && this.openTurn?.goalId === c.id,
+    });
   }
 
   /** A pending contract whose approval card is gone (wmux stopped between
@@ -467,15 +472,40 @@ export class MoaGoalService {
     this.notify();
   }
 
-  /** One automatic HQ turn ran: count it against the active contract. */
+  /** One automatic HQ turn starts: count it against the active contract. The
+   *  contract keeps its powers until that turn ends (finishTurn), so the last
+   *  turn of the budget runs under the goal it was counted against. */
   noteTurn(workspaceId: string): void {
     if (workspaceId !== this.ports.hqWorkspaceId()) return;
     const p = this.powers();
     if (!p.ok) return;
     this.put({ ...p.contract, turnsUsed: p.contract.turnsUsed + 1 });
+    this.openTurn = { hq: workspaceId, goalId: p.contract.id };
     void this.save();
+  }
+
+  /** The automatic turn noteTurn counted has ended (whatever its outcome). */
+  finishTurn(workspaceId: string): void {
+    if (this.openTurn?.hq !== workspaceId) return;
+    this.openTurn = null;
     // Ends it (lazily) when that was the last turn of the budget.
     this.current();
+  }
+
+  /** Why the HQ's running turn may not fan out without its goal, or null.
+   *  A turn that started under a goal works under that goal until it ends:
+   *  when the goal was ended (cancelled, completed, out of budget or time) or
+   *  went inert while the turn runs, its fan-out is refused, never run as an
+   *  ordinary fan-out over the HQ's own pane. Only automatic turns are
+   *  tracked; an operator's own turn has the operator present. */
+  turnGoalRefusal(workspaceId: string): { goalId: string; reason: string } | null {
+    const t = this.openTurn;
+    if (!t || t.hq !== workspaceId) return null;
+    const c = this.get(t.goalId);
+    if (!c) return { goalId: t.goalId, reason: 'gone' };
+    if (c.status !== 'active') return { goalId: c.id, reason: c.status };
+    const p = this.powersOf(c);
+    return p.ok ? null : { goalId: c.id, reason: p.reason };
   }
 
   /** The active contract covers `workspaceId` (a workspace it names or one of

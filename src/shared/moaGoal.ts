@@ -363,18 +363,23 @@ export function goalHardRuleHitAny(
 export type MoaGoalInertReason = 'none' | 'not-active' | 'level' | 'expired' | 'tasks' | 'turns' | 'hq-moved';
 
 /** The contract's effective level, or why it is inert. Pure: the caller passes
- *  the HQ's id and level and the clock. */
+ *  the HQ's id and level and the clock. `turnOpen`: the automatic turn that
+ *  used the last of the turn budget is still running. A turn is counted when
+ *  it starts, so without this the last allowed turn would run with no goal. */
 export function moaGoalPowers(
   c: MoaGoalContract | null,
   hq: { workspaceId: string | null; level: MoaLevel },
   now: number,
+  opts: { turnOpen?: boolean } = {},
 ): { ok: true; level: 2 | 3 } | { ok: false; reason: MoaGoalInertReason } {
   if (!c) return { ok: false, reason: 'none' };
   if (c.status !== 'active' || c.approvedAt === undefined) return { ok: false, reason: 'not-active' };
   if (c.hqWorkspaceId !== hq.workspaceId) return { ok: false, reason: 'hq-moved' };
   if (hq.level < 2) return { ok: false, reason: 'level' };
   if (now >= c.approvedAt + c.budget.maxHours * 3_600_000) return { ok: false, reason: 'expired' };
-  if (c.turnsUsed >= c.budget.maxTurns) return { ok: false, reason: 'turns' };
+  if (c.turnsUsed > c.budget.maxTurns || (c.turnsUsed === c.budget.maxTurns && !opts.turnOpen)) {
+    return { ok: false, reason: 'turns' };
+  }
   // tasksUsed may reach maxTasks: the contract still answers its tasks, it
   // only cannot create more (checked where a fan-out reserves).
   if (c.tasksUsed > c.budget.maxTasks) return { ok: false, reason: 'tasks' };
