@@ -267,8 +267,8 @@ export interface PaneSlice {
    * The pendingQuestion text the user dismissed (a question that needs no
    * answer), keyed by ptyId. setSurfacePendingQuestion ignores a later delivery
    * of the SAME text for that pty, so a reconnect or a repeated stop payload
-   * cannot bring it back; a different question, or a '' clear, drops the
-   * record. Only the pendingQuestion kind is dismissible: a live permission
+   * cannot bring it back; a different question, a '' clear, or the agent's
+   * next turn start (markSurfaceTurnOpen) drops the record. Only the pendingQuestion kind is dismissible: a live permission
    * dialog (surfaceAgent status awaiting_input) is not touched.
    */
   surfaceDismissedQuestion: Record<string, string>;
@@ -870,6 +870,12 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
     // turn, but the silence clock must run from the latest submission.
     state.surfaceTurnOpenAt[ptyId] = Date.now();
     delete state.surfaceTurnEndAt[ptyId];
+    // A dismissal covers one turn's question. A new prompt starts a new turn,
+    // so the same text asked at its end is a new question and must show. Only
+    // this hook-tagged turn start clears it: byte-rate 'running' and activity
+    // lines also fire on reconnect redraws and late transcript reads, which
+    // must not bring a dismissed question back.
+    delete state.surfaceDismissedQuestion[ptyId];
   }),
 
   clearSurfaceTurnOpen: (ptyId) => set((state: StoreState) => {

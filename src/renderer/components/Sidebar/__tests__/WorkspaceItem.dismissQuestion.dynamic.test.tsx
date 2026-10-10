@@ -109,4 +109,17 @@ describe('workspace row — Dismiss question', () => {
     act(() => { useStore.getState().setSurfacePendingQuestion('pty-q1', 'Shall I merge?'); });
     expect(useStore.getState().surfacePendingQuestion['pty-q1']).toBeUndefined();
   });
+
+  it('skips a pane whose agent reports a live prompt, even with a question text', async () => {
+    act(() => {
+      useStore.setState({ surfacePendingQuestion: { 'pty-q1': 'Shall I merge?', 'pty-dialog': 'Allow edit?' } });
+    });
+    await render();
+    openMenu();
+    act(() => { dismissItem()!.click(); });
+
+    const s = useStore.getState();
+    expect(s.surfacePendingQuestion).toEqual({ 'pty-dialog': 'Allow edit?' });
+    expect(s.surfaceDismissedQuestion).toEqual({ 'pty-q1': 'Shall I merge?' });
+  });
 });

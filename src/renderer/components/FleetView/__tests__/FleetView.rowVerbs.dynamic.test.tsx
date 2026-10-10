@@ -155,6 +155,19 @@ describe('FleetView — row verbs', () => {
     expect(items.map((el) => el.dataset.paneMenuAction)).not.toContain('dismiss-question');
   });
 
+  it('a live prompt with a question text has no Dismiss question', async () => {
+    act(() => {
+      useStore.setState((s) => ({
+        surfacePendingQuestion: { 'pty-1': 'Shall I merge?' },
+        surfaceAgent: { ...s.surfaceAgent, 'pty-1': { name: 'Claude Code', status: 'awaiting_input' } },
+      }));
+    });
+    mount();
+    await flushRaf();
+    const items = openMenu('pty-1');
+    expect(items.map((el) => el.dataset.paneMenuAction)).not.toContain('dismiss-question');
+  });
+
   it('a remote row shows Jump only, and the verb keys do nothing on it', async () => {
     mount();
     await flushRaf();

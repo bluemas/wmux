@@ -57,6 +57,9 @@ export interface FleetRowVerbContext {
   hasAgent?: boolean;
   /** The pane is its workspace's root (single-pane workspace). */
   isRootPane?: boolean;
+  /** The agent itself reports a live prompt (raw surfaceAgent status
+   *  awaiting_input), which waits for an answer and cannot be dismissed. */
+  livePrompt?: boolean;
 }
 
 export function fleetRowVerbs(pane: FleetPane, ctx: FleetRowVerbContext = {}): FleetRowVerbs {
@@ -73,7 +76,7 @@ export function fleetRowVerbs(pane: FleetPane, ctx: FleetRowVerbContext = {}): F
     stashed: !!pane.stashed,
     closeEnabled,
     ...(closeEnabled ? {} : { closeReason: 'fleet.verb.closeRoot' as const }),
-    dismissQuestion: !pane.remote && !!fleetTargetPtyId(pane) && !!ctx.pendingQuestion?.trim(),
+    dismissQuestion: !pane.remote && !!fleetTargetPtyId(pane) && !!ctx.pendingQuestion?.trim() && !ctx.livePrompt,
   };
 }
 
@@ -90,6 +93,7 @@ export function fleetRowVerbsFromState(pane: FleetPane, state: VerbStoreState): 
     commandRunning: state.commandRunningByPtyId[target] === true,
     hasAgent: !!state.surfaceAgent[target]?.name,
     isRootPane: !!ws && ws.rootPane.id === pane.paneId && findParent(ws.rootPane, pane.paneId) === null,
+    livePrompt: state.surfaceAgent[target]?.status === 'awaiting_input',
   });
 }
 

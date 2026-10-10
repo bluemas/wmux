@@ -549,7 +549,10 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumb
     if (!ws) return NO_PTY_IDS;
     const ids: string[] = [];
     for (const surf of collectWorkspaceTerminalSurfaces(ws)) {
-      if (surf.ptyId && s.surfacePendingQuestion?.[surf.ptyId]?.trim()) ids.push(surf.ptyId);
+      // A pane whose agent reports a live prompt is skipped even with a
+      // question text: dismissing would leave it needing you anyway.
+      if (surf.ptyId && s.surfacePendingQuestion?.[surf.ptyId]?.trim()
+        && s.surfaceAgent?.[surf.ptyId]?.status !== 'awaiting_input') ids.push(surf.ptyId);
     }
     return ids.length > 0 ? ids : NO_PTY_IDS;
   }));
