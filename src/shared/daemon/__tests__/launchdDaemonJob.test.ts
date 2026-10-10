@@ -5,8 +5,11 @@ import path from 'path';
 import {
   buildDaemonLaunchdPlist,
   filterEnvForLaunchd,
+  daemonJobCreatedAt,
   launchdBaseLabel,
+  newDaemonJobLabel,
   parseLaunchctlList,
+  PRUNE_GRACE_MS,
   pruneStaleDaemonJobs,
   startDaemonViaLaunchd,
   LaunchdUnavailableError,
@@ -144,6 +147,62 @@ describe('startDaemonViaLaunchd / pruneStaleDaemonJobs', () => {
     const bootouts = rt.calls.filter((c) => c[0] === 'bootout').map((c) => c[1]);
     expect(bootouts).toEqual([`gui/501/${base}.dead`]);
     expect(fs.readdirSync(dir).sort()).toEqual([`${base}.live.plist`]);
+  });
+
+  it('encodes the creation time in the label', () => {
+    const label = newDaemonJobLabel(base, 1_760_000_000_000);
+    expect(label.startsWith(`${base}.`)).toBe(true);
+    expect(daemonJobCreatedAt(label)).toBe(1_760_000_000_000);
+    expect(daemonJobCreatedAt(`${base}.dead`)).toBeNull();
+  });
+
+  it('never prunes a job younger than the grace window, even with no pid yet', async () => {
+    const young = newDaemonJobLabel(base, Date.now() - 1_000);
+    const old = newDaemonJobLabel(base, Date.now() - PRUNE_GRACE_MS - 1_000);
+    const rt = fakeRuntime({ listOutputs: [`-\t0\t${young}\n-\t0\t${old}\n`] });
+    await pruneStaleDaemonJobs(base, dir, rt);
+    expect(rt.calls.filter((c) => c[0] === 'bootout').map((c) => c[1])).toEqual([`gui/501/${old}`]);
+  });
+
+  it('serializes concurrent starts: one prune+bootstrap finishes before the next begins', async () => {
+    const loaded: string[] = [];
+    const order: string[] = [];
+    const rt = fakeRuntime({});
+    // Real sleeps so the second start actually waits on the lock.
+    rt.sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    rt.runLaunchctl = async (args) => {
+      order.push(args[0]);
+      // Yield between launchctl calls so the two starts could interleave.
+      await new Promise((r) => setTimeout(r, 5));
+      if (args[0] === 'bootstrap') loaded.push(path.basename(args[2], '.plist'));
+      if (args[0] === 'list') return loaded.map((l, i) => `${100 + i}\t0\t${l}\n`).join('');
+      return '';
+    };
+    const [a, b] = await Promise.all([startDaemonViaLaunchd(startOpts(), rt), startDaemonViaLaunchd(startOpts(), rt)]);
+    a.dispose();
+    b.dispose();
+    // Each start runs list (prune) then bootstrap under the lock; the other
+    // start's prune list never lands between them.
+    const pruneAndBoot = order.filter((c, i) => c === 'bootstrap' || (c === 'list' && order[i + 1] === 'bootstrap'));
+    expect(pruneAndBoot).toEqual(['list', 'bootstrap', 'list', 'bootstrap']);
+    expect(order.filter((c) => c === 'bootout')).toEqual([]);
+    expect(new Set([a.pid, b.pid]).size).toBe(2);
+    expect(fs.readdirSync(dir)).toEqual([]);
+  });
+
+  it('takes over a start lock left by a dead launcher', async () => {
+    fs.writeFileSync(path.join(dir, 'start.lock'), '999999');
+    let label = '';
+    const rt = fakeRuntime({ alive: (pid) => pid !== 999999 });
+    rt.runLaunchctl = async (args) => {
+      if (args[0] === 'bootstrap') label = path.basename(args[2], '.plist');
+      if (args[0] === 'list') return label ? `4321\t0\t${label}\n` : '';
+      return '';
+    };
+    const job = await startDaemonViaLaunchd(startOpts(), rt);
+    job.dispose();
+    expect(job.pid).toBe(4321);
+    expect(fs.existsSync(path.join(dir, 'start.lock'))).toBe(false);
   });
 
   it('bootstraps a plist in the gui domain and returns the job pid', async () => {

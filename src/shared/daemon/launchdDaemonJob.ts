@@ -29,11 +29,14 @@ import { execFile } from 'child_process';
  *   daemon never auto-starts at login, and only until bootstrap returns: the
  *   loaded job does not need it, and it carries the whole spawn env.
  *
- * Labels are unique per start (`<base>.<id>`): a fixed label could only be
- * re-used after `bootout`, and booting out a job whose daemon is still alive
- * (pid file lost, split-brain yield path) would SIGTERM that live daemon.
+ * Labels are unique per start (`<base>.<ms36>-<rand36>`): a fixed label could
+ * only be re-used after `bootout`, and booting out a job whose daemon is still
+ * alive (pid file lost, split-brain yield path) would SIGTERM that live daemon.
  * Jobs that are no longer running are pruned before each start; a running
- * one is never touched.
+ * one is never touched, and neither is one younger than PRUNE_GRACE_MS (its
+ * RunAtLoad process may not have appeared yet). Prune and bootstrap run under
+ * a lock file in the plist dir so two launchers starting at once cannot
+ * remove each other's plist or job mid-start.
  */
 
 /** Base label; the data suffix (`-dev`, test suffixes) keeps instances apart. */
@@ -175,12 +178,66 @@ export const defaultLaunchdRuntime = (log: (...args: unknown[]) => void): Launch
 });
 
 const PID_WAIT_MS = 5_000;
+/** Jobs younger than this are never pruned: well past PID_WAIT_MS. */
+export const PRUNE_GRACE_MS = 30_000;
+/** A start lock older than this is abandoned (its holder hung or died). */
+const START_LOCK_STALE_MS = 30_000;
+const START_LOCK_WAIT_MS = 45_000;
+const START_LOCK_POLL_MS = 50;
+
+export function newDaemonJobLabel(baseLabel: string, nowMs: number = Date.now()): string {
+  return `${baseLabel}.${nowMs.toString(36)}-${Math.floor(Math.random() * 1296).toString(36)}`;
+}
+
+/** Creation time encoded in a job label, or null for a label without one. */
+export function daemonJobCreatedAt(label: string): number | null {
+  const m = /\.([0-9a-z]+)-[0-9a-z]+$/.exec(label);
+  if (!m) return null;
+  const ms = parseInt(m[1], 36);
+  return Number.isSafeInteger(ms) ? ms : null;
+}
+
+/**
+ * Run fn while holding `<plistDir>/start.lock` (O_EXCL create). A lock whose
+ * owner pid is dead, or that is older than START_LOCK_STALE_MS, is taken over.
+ */
+export async function withDaemonStartLock<T>(plistDir: string, rt: LaunchdRuntime, fn: () => Promise<T>): Promise<T> {
+  const lock = path.join(plistDir, 'start.lock');
+  try {
+    fs.mkdirSync(plistDir, { recursive: true });
+  } catch (e) {
+    throw new LaunchdUnavailableError(`could not create ${plistDir}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  const deadline = Date.now() + START_LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      fs.writeFileSync(lock, String(process.pid), { flag: 'wx', mode: 0o600 });
+      break;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') {
+        throw new LaunchdUnavailableError(`could not take ${lock}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    try {
+      const owner = Number(fs.readFileSync(lock, 'utf-8').trim());
+      const ownerGone = Number.isInteger(owner) && owner > 0 && !rt.isPidAlive(owner);
+      if (ownerGone || Date.now() - fs.statSync(lock).mtimeMs > START_LOCK_STALE_MS) {
+        fs.unlinkSync(lock);
+        continue;
+      }
+    } catch { continue; /* released between our create and read */ }
+    if (Date.now() >= deadline) throw new LaunchdUnavailableError(`timed out waiting for ${lock}`);
+    await rt.sleep(START_LOCK_POLL_MS);
+  }
+  try { return await fn(); } finally { try { fs.unlinkSync(lock); } catch { /* already gone */ } }
+}
 const PID_POLL_MS = 25;
 const EXIT_POLL_MS = 250;
 
 /**
  * Boot out (and delete the plist of) every job of this instance that is not
- * running. Never touches a job with a live pid. Best-effort, never throws.
+ * running. Never touches a job with a live pid or one younger than
+ * PRUNE_GRACE_MS. Best-effort, never throws. Call it under the start lock.
  */
 export async function pruneStaleDaemonJobs(baseLabel: string, plistDir: string, rt: LaunchdRuntime): Promise<void> {
   const prefix = `${baseLabel}.`;
@@ -196,6 +253,8 @@ export async function pruneStaleDaemonJobs(baseLabel: string, plistDir: string, 
   for (const label of labels) {
     const job = jobs.get(label);
     if (job && job.pid !== null) continue;
+    const createdAt = daemonJobCreatedAt(label);
+    if (createdAt !== null && Date.now() - createdAt < PRUNE_GRACE_MS) continue;
     if (job) {
       try { await rt.runLaunchctl(['bootout', `gui/${rt.uid}/${label}`]); } catch { /* already gone */ }
     }
@@ -217,30 +276,30 @@ export async function startDaemonViaLaunchd(
   rt: LaunchdRuntime,
 ): Promise<LaunchdDaemonHandle> {
   if (rt.uid < 0) throw new LaunchdUnavailableError('no uid on this platform');
-  await pruneStaleDaemonJobs(opts.baseLabel, opts.plistDir, rt);
-
-  const label = `${opts.baseLabel}.${Date.now().toString(36)}${Math.floor(Math.random() * 1296).toString(36)}`;
+  const label = newDaemonJobLabel(opts.baseLabel);
   const plistPath = path.join(opts.plistDir, `${label}.plist`);
-  try {
-    fs.mkdirSync(opts.plistDir, { recursive: true });
-    fs.writeFileSync(
-      plistPath,
-      buildDaemonLaunchdPlist({ label, programArguments: opts.programArguments, env: filterEnvForLaunchd(opts.env) }),
-      { mode: 0o600 },
-    );
-  } catch (e) {
-    throw new LaunchdUnavailableError(`could not write ${plistPath}: ${e instanceof Error ? e.message : String(e)}`);
-  }
-  try {
-    await rt.runLaunchctl(['bootstrap', `gui/${rt.uid}`, plistPath]);
-  } catch (e) {
-    try { fs.unlinkSync(plistPath); } catch { /* ignore */ }
-    throw new LaunchdUnavailableError(e instanceof Error ? e.message : String(e));
-  }
-  // launchctl hands launchd the parsed plist, so the loaded job no longer
-  // needs the file (list, bootout and prune all go by label). Removing it
-  // keeps the spawn env, which may carry credentials, off disk.
-  try { fs.unlinkSync(plistPath); } catch { /* prune sweeps it */ }
+  await withDaemonStartLock(opts.plistDir, rt, async () => {
+    await pruneStaleDaemonJobs(opts.baseLabel, opts.plistDir, rt);
+    try {
+      fs.writeFileSync(
+        plistPath,
+        buildDaemonLaunchdPlist({ label, programArguments: opts.programArguments, env: filterEnvForLaunchd(opts.env) }),
+        { mode: 0o600 },
+      );
+    } catch (e) {
+      throw new LaunchdUnavailableError(`could not write ${plistPath}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    try {
+      await rt.runLaunchctl(['bootstrap', `gui/${rt.uid}`, plistPath]);
+    } catch (e) {
+      throw new LaunchdUnavailableError(e instanceof Error ? e.message : String(e));
+    } finally {
+      // launchctl hands launchd the parsed plist, so the loaded job no longer
+      // needs the file (list, bootout and prune all go by label). Removing it
+      // keeps the spawn env, which may carry credentials, off disk.
+      try { fs.unlinkSync(plistPath); } catch { /* not written / gone */ }
+    }
+  });
   rt.log(`[launcher] launchd job ${label} bootstrapped`);
 
   // RunAtLoad starts the process asynchronously; wait for its pid.
