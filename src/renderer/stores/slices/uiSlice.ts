@@ -209,6 +209,10 @@ export interface UISlice {
   // persisted, so a reload starts unfiltered.
   sidebarFilter: WorkspaceFilter;
   setSidebarFilter: (filter: WorkspaceFilter) => void;
+  // The sidebar's search text. Session-only like the facets, and in the
+  // store so Ctrl+N can number the same narrowed list the sidebar shows.
+  sidebarSearch: string;
+  setSidebarSearch: (search: string) => void;
 
   // The Git page's scope, tab, filter, selection and list scroll, kept here
   // so they survive leaving the page. Session-only.
@@ -1200,6 +1204,10 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
   sidebarFilter: EMPTY_FILTER,
   setSidebarFilter: (filter) => set((state) => {
     state.sidebarFilter = filter;
+  }),
+  sidebarSearch: '',
+  setSidebarSearch: (search) => set((state) => {
+    state.sidebarSearch = search;
   }),
   gitPage: initialGitPageState(),
   setGitPage: (patch) => set((state) => {
