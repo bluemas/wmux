@@ -7,6 +7,7 @@ import { createElement, act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import FileTreePanel, { fileTreeCwd, relativeTo } from '../FileTreePanel';
 import { toggleFileTreePanel } from '../fileTreeToggle';
+import { filterTree } from '../fileTreeFilter';
 import { fileTreeWidthForDrag } from '../FileTreeResizeHandle';
 import FileTreeToggle from '../../Titlebar/FileTreeToggle';
 import { useStore } from '../../../stores';
@@ -182,5 +183,77 @@ describe('file tree width', () => {
     });
     expect(useStore.getState().fileTreeVisible).toBe(true);
     expect(useStore.getState().fileTreeWidth).toBe(333);
+  });
+});
+
+describe('name filter', () => {
+  /** /r: src/{app.ts, util/{appHelper.ts, z.ts}}, docs/{guide.md}, App.md, link → (symlinked folder) */
+  const FS: Record<string, { name: string; isDirectory: boolean; isSymlink?: boolean }[]> = {
+    '/r': [
+      { name: 'src', isDirectory: true }, { name: 'docs', isDirectory: true },
+      { name: 'App.md', isDirectory: false }, { name: 'link', isDirectory: true, isSymlink: true },
+    ],
+    '/r/src': [{ name: 'app.ts', isDirectory: false }, { name: 'util', isDirectory: true }],
+    '/r/src/util': [{ name: 'appHelper.ts', isDirectory: false }, { name: 'z.ts', isDirectory: false }],
+    '/r/docs': [{ name: 'guide.md', isDirectory: false }],
+    '/r/link': [{ name: 'app-loop.ts', isDirectory: false }],
+  };
+  const fakeReadDir = async (dir: string) =>
+    (FS[dir] ?? []).map((e) => ({ name: e.name, path: `${dir}/${e.name}`, isDirectory: e.isDirectory, isSymlink: !!e.isSymlink }));
+  const names = (nodes: { name: string; children?: unknown[] }[]): unknown[] =>
+    nodes.map((n) => (n.children ? { [n.name]: names(n.children as never) } : n.name));
+
+  it('keeps matches in any folder, with the folders leading to them, case-insensitively', async () => {
+    const r = await filterTree('/r', 'APP', fakeReadDir);
+    expect(names(r!.nodes)).toEqual([{ src: [{ util: ['appHelper.ts'] }, 'app.ts'] }, 'App.md']);
+    expect(r!.matchCount).toBe(3);
+    expect(r!.truncated).toBe(false);
+  });
+
+  it('does not walk into a symlinked folder', async () => {
+    const r = await filterTree('/r', 'loop', fakeReadDir);
+    expect(r!.matchCount).toBe(0);
+  });
+
+  it('returns a matched folder collapsed, so it expands like any folder', async () => {
+    const r = await filterTree('/r', 'doc', fakeReadDir);
+    expect(r!.nodes).toHaveLength(1);
+    expect(r!.nodes[0]).toMatchObject({ name: 'docs', matched: true, isExpanded: false });
+    expect(r!.nodes[0].children).toBeUndefined();
+  });
+
+  it('stops at the entry cap and says so', async () => {
+    const r = await filterTree('/r', 'z', fakeReadDir, () => false, 5);
+    expect(r!.truncated).toBe(true);
+  });
+
+  it('abandons a walk a newer query cancelled', async () => {
+    expect(await filterTree('/r', 'app', fakeReadDir, () => true)).toBeNull();
+  });
+
+  it('the panel opens the field from its button, filters, and folds it away on Escape', async () => {
+    readDir.mockImplementation(fakeReadDir);
+    resolveRepo.mockResolvedValue({ ok: true, repoPath: '/r' });
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      act(() => root.render(createElement(FileTreePanel, { position: 'right' })));
+      await flush();
+      expect(container.querySelector('[data-file-tree-filter]')).toBeNull();
+      act(() => { (container.querySelector('[data-file-tree-filter-toggle]') as HTMLElement).click(); });
+      const input = container.querySelector('[data-file-tree-filter]') as HTMLInputElement;
+      expect(document.activeElement).toBe(input);
+      const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!;
+      act(() => { setValue.call(input, 'helper'); input.dispatchEvent(new Event('input', { bubbles: true })); });
+      await act(async () => { vi.advanceTimersByTime(200); });
+      await flush();
+      const rows = [...container.querySelectorAll('[data-file-tree-row]')].map((r) => r.textContent);
+      expect(rows).toEqual(['src', 'util', 'appHelper.ts']);
+      expect(container.querySelector('.wmux-filetree-match')?.textContent).toBe('Helper');
+      act(() => { input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); });
+      expect(container.querySelector('[data-file-tree-filter]')).toBeNull();
+      expect(container.querySelectorAll('[data-file-tree-row]')).toHaveLength(4);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

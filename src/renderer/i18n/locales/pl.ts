@@ -375,6 +375,12 @@ export const pl = {
   'filetree.menu.insertPath': 'Wstaw ścieżkę do terminala',
   'filetree.menu.copyPath': 'Kopiuj ścieżkę',
   'filetree.menu.copyRelativePath': 'Kopiuj ścieżkę względną',
+  'filetree.filter': 'Filtruj po nazwie',
+  'filetree.filterPlaceholder': 'Filtruj pliki i foldery',
+  'filetree.clearFilter': 'Wyczyść filtr',
+  'filetree.searching': 'Wyszukiwanie…',
+  'filetree.noMatches': 'Brak pasujących plików i folderów',
+  'filetree.filterTruncated': 'Przeszukano tylko pierwsze {count} pozycji',
   'error.crashed': 'Awaria: {message}',
   'error.retry': 'Spróbuj ponownie',
 

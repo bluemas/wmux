@@ -2153,6 +2153,9 @@ details[open] > .wmux-chatv2-tool-line .wmux-chatv2-chevron { transform: rotate(
 .wmux-filetree-chevron { display: inline-flex; flex-shrink: 0; color: var(--text-muted); transition: transform 120ms ease; }
 .wmux-filetree-icon { display: inline-flex; flex-shrink: 0; color: var(--text-muted); }
 .wmux-filetree-meta { color: var(--text-muted); font-size: 11px; }
+.wmux-filetree-filter { display: flex; align-items: center; gap: 4px; flex-shrink: 0; padding: 8px 8px 4px; }
+/* A matched part of a name: emphasis by weight and ink, no wash. */
+.wmux-filetree-match { background: transparent; color: var(--text-main); font-weight: 600; }
 .wmux-filetree-menu {
   background: var(--bg-surface); border: 1px solid var(--line, color-mix(in srgb, var(--bg-overlay) 70%, transparent));
   border-radius: 12px; box-shadow: var(--shadow-popover);
