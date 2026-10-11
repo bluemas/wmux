@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  agentSelectsOnDrag,
   installPlainDragSelect,
   isDrag,
   mouseOwnedHintApplies,
@@ -56,6 +57,17 @@ describe('shouldHoldHoverMove', () => {
     expect(shouldHoldHoverMove(hover, 'drag', true, true)).toBe(false);
     expect(shouldHoldHoverMove(hover, 'none', true, true)).toBe(false);
     expect(shouldHoldHoverMove({ buttons: 1 }, 'any', true, true)).toBe(false);
+  });
+});
+
+describe('agentSelectsOnDrag', () => {
+  it('leaves drags to Claude Code, which selects and copies on its own', () => {
+    expect(agentSelectsOnDrag('claude')).toBe(true);
+  });
+
+  it('keeps plain-drag select for apps without their own selection', () => {
+    expect(agentSelectsOnDrag('codex')).toBe(false);
+    expect(agentSelectsOnDrag(undefined)).toBe(false);
   });
 });
 
