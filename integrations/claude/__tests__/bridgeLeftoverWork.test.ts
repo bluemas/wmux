@@ -328,3 +328,50 @@ describe('countLeftoverBackgroundTasks — tasks the agent stopped itself', () =
     expect(count(fixture('live-notification-turn.jsonl', history))).toBe(0);
   });
 });
+
+function userPrompt(text: string, extra: Record<string, unknown> = {}) {
+  return { type: 'user', message: { role: 'user', content: text }, ...extra };
+}
+
+describe('countLeftoverBackgroundTasks — scoped to the turn that just ended', () => {
+  it('a server left running from an EARLIER turn is not leftover work (live CompareIt pane)', () => {
+    // 2026-10-11: the agent relaunched `npm run dev` in the background, then
+    // answered several more prompts. The server never ends, so counting it
+    // kept every later Stop `running` and the sidebar showed a live dot.
+    const p = fixture('earlier-turn-server.jsonl', [
+      userPrompt('relaunch the app'),
+      bgStart('call_dev'),
+      bgStartResultWithTaskId('call_dev', 'b8r7r8zur'),
+      userPrompt('commit and push'),
+    ]);
+    expect(count(p)).toBe(0);
+  });
+
+  it('a shell dispatched in the ending turn still counts', () => {
+    const p = fixture('this-turn-shell.jsonl', [
+      userPrompt('run the tests in the background'),
+      bgStart('call_t'),
+      bgStartResultWithTaskId('call_t', 'btest'),
+    ]);
+    expect(count(p)).toBe(1);
+  });
+
+  it('meta user records (skill bodies, caveats) do not open a new turn', () => {
+    const p = fixture('meta-user.jsonl', [
+      userPrompt('build it'),
+      bgStart('call_b'),
+      bgStartResultWithTaskId('call_b', 'bbuild'),
+      userPrompt('Base directory for this skill: …', { isMeta: true }),
+    ]);
+    expect(count(p)).toBe(1);
+  });
+
+  it('text-block prompts open a new turn too', () => {
+    const p = fixture('array-prompt.jsonl', [
+      bgStart('call_old'),
+      bgStartResultWithTaskId('call_old', 'bold'),
+      { type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'next' }] } },
+    ]);
+    expect(count(p)).toBe(0);
+  });
+});
