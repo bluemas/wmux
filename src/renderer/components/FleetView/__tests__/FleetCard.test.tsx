@@ -105,6 +105,12 @@ describe('FleetCard — task-first rows', () => {
     expect(fleetTitle(card({ title: 'Codex CLI' }))).toBe('alpha');
   });
 
+  it('reads a working Claude Code title (its ◐ / ◑ spinner) as the generic name it is', () => {
+    expect(fleetTitle(card({ title: '◐ Claude Code', agentName: 'Claude Code' }))).toBe('alpha');
+    expect(fleetTitle(card({ title: '◑ Claude Code', agentName: 'Claude Code' }))).toBe('alpha');
+    expect(fleetTitle(card({ title: '◑ 트리플 대체 앱 PRD', agentName: 'Claude Code' }))).toBe('트리플 대체 앱 PRD');
+  });
+
   it('preserves real terminal task titles instead of replacing them with the agent name', () => {
     expect(fleetTitle(card({ title: '✳ 침대 범퍼 영상 검수', agentName: 'Claude Code' }))).toBe('침대 범퍼 영상 검수');
     expect(fleetTitle(card({ paneLabel: '내 작업', title: 'Claude Code' }))).toBe('내 작업');
@@ -121,6 +127,7 @@ describe('FleetCard — one name, a short label', () => {
   it('names a known agent by its display name, whatever the title says', () => {
     expect(agentDisplayName('claude')).toBe('Claude Code');
     expect(agentDisplayName('✳ Claude Code')).toBe('Claude Code');
+    expect(agentDisplayName('◐ Claude Code')).toBe('Claude Code');
     expect(agentDisplayName('codex')).toBe('Codex CLI');
     expect(agentDisplayName('my build')).toBe('my build');
   });

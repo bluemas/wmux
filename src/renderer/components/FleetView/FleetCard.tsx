@@ -71,7 +71,7 @@ const AGENT_DISPLAY_BY_NAME = new Map<string, string>(
 /** One name per agent: a terminal title or detector name that is a known
  *  agent ("claude", "✳ Claude Code") reads as its display name. */
 export function agentDisplayName(raw: string): string {
-  const clean = raw.replace(/^[✳✻✽✶✢*]\s*/, '').trim();
+  const clean = raw.replace(/^[✳✻✽✶✢◐◑*]\s*/, '').trim();
   return AGENT_DISPLAY_BY_NAME.get(clean.toLowerCase()) ?? clean;
 }
 
