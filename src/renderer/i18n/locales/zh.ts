@@ -180,6 +180,12 @@ export const zh = {
   'filetree.menu.insertPath': '将路径插入终端',
   'filetree.menu.copyPath': '复制路径',
   'filetree.menu.copyRelativePath': '复制相对路径',
+  'filetree.filter': '按名称筛选',
+  'filetree.filterPlaceholder': '筛选文件和文件夹',
+  'filetree.clearFilter': '清除筛选',
+  'filetree.searching': '搜索中…',
+  'filetree.noMatches': '没有匹配的文件或文件夹',
+  'filetree.filterTruncated': '仅搜索了前 {count} 个条目',
   'error.crashed': '崩溃：{message}',
   'error.retry': '重试',
 

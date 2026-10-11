@@ -380,6 +380,12 @@ export const en = {
   'filetree.menu.insertPath': 'Insert path into terminal',
   'filetree.menu.copyPath': 'Copy path',
   'filetree.menu.copyRelativePath': 'Copy relative path',
+  'filetree.filter': 'Filter by name',
+  'filetree.filterPlaceholder': 'Filter files and folders',
+  'filetree.clearFilter': 'Clear filter',
+  'filetree.searching': 'Searching…',
+  'filetree.noMatches': 'No matching files or folders',
+  'filetree.filterTruncated': 'Only the first {count} entries were searched',
   'error.crashed': 'Crashed: {message}',
   'error.retry': 'Retry',
 

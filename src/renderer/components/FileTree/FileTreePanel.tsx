@@ -5,10 +5,11 @@ import { selectActiveWorkspace } from '../../stores/selectors/workspaceProjectio
 import { selectRemoteScopeName } from '../Git/thisComputerOnly';
 import { findLeaf } from '../../../shared/paneUtils';
 import type { Pane, Workspace } from '../../../shared/types';
-import { IconChevron, IconFile, IconFolder, IconRefresh } from '../icons';
+import { IconChevron, IconFile, IconFolder, IconRefresh, IconSearch, IconX } from '../icons';
 import { FOCUS_RING } from '../focusRing';
 import { injectText, quotePathsForPrompt } from '../AgentToolbar/inject';
 import FileTreeResizeHandle from './FileTreeResizeHandle';
+import { filterTree, FILTER_SCAN_LIMIT, type FilterResult } from './fileTreeFilter';
 
 interface FileTreePanelProps {
   /** The window edge the column sits on: the one opposite the sidebar. */
@@ -23,6 +24,8 @@ interface TreeNode {
   children?: TreeNode[];
   isExpanded?: boolean;
   isLoading?: boolean;
+  /** Set in a filtered tree on an entry whose own name matched. */
+  matched?: boolean;
 }
 
 async function readDir(dirPath: string): Promise<TreeNode[]> {
@@ -110,9 +113,23 @@ function fileManagerKey(): 'workspace.finder' | 'workspace.fileExplorer' | 'work
 
 const INDENT = 12;
 
+/** The name with the query's first occurrence emphasised. */
+function NameWithMatch({ name, query }: { name: string; query: string }) {
+  const i = query ? name.toLocaleLowerCase().indexOf(query.toLocaleLowerCase()) : -1;
+  if (i < 0) return <>{name}</>;
+  return (
+    <>
+      {name.slice(0, i)}
+      <mark className="wmux-filetree-match">{name.slice(i, i + query.length)}</mark>
+      {name.slice(i + query.length)}
+    </>
+  );
+}
+
 function TreeItem({
   node,
   depth,
+  query,
   selectedPath,
   onFileClick,
   onToggle,
@@ -120,6 +137,7 @@ function TreeItem({
 }: {
   node: TreeNode;
   depth: number;
+  query: string;
   selectedPath: string | null;
   onFileClick: (node: TreeNode) => void;
   onToggle: (node: TreeNode) => void;
@@ -161,7 +179,7 @@ function TreeItem({
         <span className="wmux-filetree-icon">
           {node.isDirectory ? <IconFolder size={14} /> : <IconFile size={14} />}
         </span>
-        <span className="truncate">{node.name}</span>
+        <span className="truncate">{node.matched ? <NameWithMatch name={node.name} query={query} /> : node.name}</span>
         {node.isSymlink && <span className="wmux-filetree-meta">&rarr;</span>}
       </button>
       {node.isDirectory && node.isExpanded && (
@@ -175,6 +193,7 @@ function TreeItem({
               key={child.path}
               node={child}
               depth={depth + 1}
+              query={query}
               selectedPath={selectedPath}
               onFileClick={onFileClick}
               onToggle={onToggle}
@@ -220,6 +239,35 @@ export default function FileTreePanel({ position }: FileTreePanelProps) {
   const treeRef = useRef<TreeNode[]>([]);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [menu, setMenu] = useState<{ node: TreeNode; x: number; y: number } | null>(null);
+
+  // Name filter. The field only exists while open; it opens from the header's
+  // search button and folds away on Escape or when it loses focus empty.
+  const [filterOpen, setFilterOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const filterQuery = query.trim();
+  const [filtered, setFiltered] = useState<FilterResult | null>(null);
+  const filteredRef = useRef<FilterResult | null>(null);
+  const filterInputRef = useRef<HTMLInputElement | null>(null);
+  useEffect(() => {
+    filteredRef.current = null;
+    setFiltered(null);
+    if (!root || !filterQuery) return;
+    let cancelled = false;
+    // Debounced: every keystroke would otherwise start a walk of the tree.
+    const timer = setTimeout(() => {
+      void filterTree(root, filterQuery, readDir, () => cancelled).then((result) => {
+        if (cancelled || !result) return;
+        filteredRef.current = result;
+        setFiltered(result);
+      });
+    }, 150);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [root, filterQuery, refreshKey]);
+
+  const closeFilter = useCallback(() => {
+    setQuery('');
+    setFilterOpen(false);
+  }, []);
 
   // Track the previous root to tell a directory change from a refresh.
   const prevRootRef = useRef<string | undefined>(undefined);
@@ -296,24 +344,32 @@ export default function FileTreePanel({ position }: FileTreePanelProps) {
     };
   }, [root]);
 
+  // Nodes are mutated in place (plain or filtered tree); a fresh top-level
+  // array re-renders whichever is on screen.
+  const rerender = () => {
+    setTree([...treeRef.current]);
+    const f = filteredRef.current;
+    if (f) setFiltered({ ...f, nodes: [...f.nodes] });
+  };
+
   const toggleNode = useCallback(async (target: TreeNode) => {
     setSelectedPath(target.path);
     if (target.isExpanded) {
       target.isExpanded = false;
       target.children = undefined;
-      setTree([...treeRef.current]);
+      rerender();
       return;
     }
 
     // Expand: children load lazily.
     target.isExpanded = true;
     target.isLoading = true;
-    setTree([...treeRef.current]);
+    rerender();
 
     const children = await readDir(target.path);
     target.children = children;
     target.isLoading = false;
-    setTree([...treeRef.current]);
+    rerender();
   }, []);
 
   const addEditorSurface = useStore((s) => s.addEditorSurface);
@@ -374,6 +430,24 @@ export default function FileTreePanel({ position }: FileTreePanelProps) {
         <button
           type="button"
           className={`wmux-filetree-action ${FOCUS_RING}`}
+          // Keep focus in the field: a blur on an empty field would fold it
+          // away first, and this click would then open it again.
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => {
+            if (filterOpen) { closeFilter(); return; }
+            setFilterOpen(true);
+          }}
+          title={t('filetree.filter')}
+          aria-label={t('filetree.filter')}
+          aria-pressed={filterOpen}
+          disabled={!root}
+          data-file-tree-filter-toggle
+        >
+          <IconSearch size={14} />
+        </button>
+        <button
+          type="button"
+          className={`wmux-filetree-action ${FOCUS_RING}`}
           onClick={() => setRefreshKey((k) => k + 1)}
           title={t('filetree.refresh')}
           aria-label={t('filetree.refresh')}
@@ -383,8 +457,47 @@ export default function FileTreePanel({ position }: FileTreePanelProps) {
         </button>
       </div>
 
+      {filterOpen && root && (
+        <div className="wmux-filetree-filter">
+          <input
+            ref={filterInputRef}
+            autoFocus
+            type="text"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') { e.preventDefault(); closeFilter(); }
+            }}
+            onBlur={() => { if (!query.trim()) setFilterOpen(false); }}
+            placeholder={t('filetree.filterPlaceholder')}
+            aria-label={t('filetree.filter')}
+            className="ui-input h-8 text-[13px] flex-1 min-w-0"
+            spellCheck={false}
+            data-file-tree-filter
+          />
+          {query && (
+            <button
+              type="button"
+              className={`wmux-filetree-action ${FOCUS_RING}`}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => { setQuery(''); filterInputRef.current?.focus(); }}
+              title={t('filetree.clearFilter')}
+              aria-label={t('filetree.clearFilter')}
+            >
+              <IconX size={12} />
+            </button>
+          )}
+        </div>
+      )}
+
       <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden py-1" role="tree" aria-label={header}>
-        {tree.length === 0 && root && (
+        {filterQuery && root && filtered === null && (
+          <div className="wmux-filetree-meta px-3 py-2" data-file-tree-searching>{t('filetree.searching')}</div>
+        )}
+        {filterQuery && filtered !== null && filtered.matchCount === 0 && (
+          <div className="wmux-filetree-meta px-3 py-2" data-file-tree-no-match>{t('filetree.noMatches')}</div>
+        )}
+        {!filterQuery && tree.length === 0 && root && (
           <div className="wmux-filetree-meta px-3 py-2">{t('filetree.empty')}</div>
         )}
         {!root && (
@@ -392,17 +505,23 @@ export default function FileTreePanel({ position }: FileTreePanelProps) {
             {remoteScope ? t('pcRail.filesNotShown', { name: remoteScope }) : t('filetree.noCwdDetected')}
           </div>
         )}
-        {tree.map((node) => (
+        {(filterQuery ? (filtered?.nodes ?? []) : tree).map((node) => (
           <TreeItem
             key={node.path}
             node={node}
             depth={0}
+            query={filterQuery}
             selectedPath={selectedPath}
             onFileClick={openFile}
             onToggle={toggleNode}
             onContextMenu={openMenu}
           />
         ))}
+        {filterQuery && filtered?.truncated && (
+          <div className="wmux-filetree-meta px-3 py-2" data-file-tree-truncated>
+            {t('filetree.filterTruncated', { count: FILTER_SCAN_LIMIT.toLocaleString() })}
+          </div>
+        )}
       </div>
 
       {menu && (

@@ -713,6 +713,12 @@ and a line icon; a selected row is a `--selection` fill. Click opens a file
 in an editor tab of the focused pane; drag drops its path into a terminal;
 the row menu has Open, Insert path into terminal, Copy path, Copy relative
 path, and Open in Finder / File Explorer.
+The header's search button opens a name filter field under it (the field
+exists only while open, and folds away on Escape or when it loses focus
+empty). Typing walks the folders below the root (up to 5,000 entries,
+symlinked folders not followed) and shows only the matching files and
+folders with the folders leading to them; the matched part of a name is
+emphasised by weight, not a wash.
 
 ## The one-boundary rule
 

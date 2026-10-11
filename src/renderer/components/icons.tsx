@@ -272,6 +272,11 @@ export function IconFolder({ size = 14 }: { size?: number }) {
   );
 }
 
+/** Search — a lens, for filter and search buttons. */
+export function IconSearch({ size = 14 }: { size?: number }) {
+  return <Icon size={size}><circle cx="6" cy="6" r="3.8" /><line x1="8.9" y1="8.9" x2="12" y2="12" /></Icon>;
+}
+
 /** File — a page with a folded corner, for file rows in the file tree. */
 export function IconFile({ size = 14 }: { size?: number }) {
   return (
