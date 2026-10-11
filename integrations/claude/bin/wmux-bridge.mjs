@@ -556,6 +556,13 @@ function extractPermissionModeFromTranscript(transcriptPath) {
 //    every stopped shell as running for the rest of the session: every later
 //    Stop reported leftover work, HookIngest projected it as `running`, and
 //    the pane's turn latch stayed open with the agent idle at its prompt.
+//  - TURN SCOPE: only shells dispatched in the turn that just ended count. A
+//    turn starts at a non-meta user record that carries no tool_result (a
+//    typed prompt, an interrupt marker, or a task-notification Claude Code
+//    answers). A shell from an earlier turn that is still alive is a server
+//    the agent left up on purpose (`npm run dev`, live transcript
+//    2026-10-11): it never ends, so counting it kept every later Stop
+//    `running` and the pane showed a live dot with the agent idle.
 //
 // Returns 0 on any failure (fail-open: the alarm then relies on the
 // provisional window alone). A 1MB tail — much wider than the usage/mode
@@ -593,7 +600,8 @@ function countLeftoverBackgroundTasks(transcriptPath) {
     for (const line of lines) {
       // Cheap pre-filter: only these marker substrings can contribute.
       if (!line.includes('"run_in_background"') && !line.includes('<task-notification>')
-          && !line.includes('"tool_result"') && !TASK_STOP_LINE_RE.test(line)) {
+          && !line.includes('"tool_result"') && !line.includes('"type":"user"')
+          && !TASK_STOP_LINE_RE.test(line)) {
         continue;
       }
       let entry;
@@ -606,6 +614,13 @@ function countLeftoverBackgroundTasks(transcriptPath) {
       const content = entry.message && Array.isArray(entry.message.content)
         ? entry.message.content
         : null;
+      // TURN SCOPE — a new turn drops the dispatches of the turns before it.
+      if (entry.type === 'user' && entry.isMeta !== true && entry.message
+        && (typeof entry.message.content === 'string'
+          || (content && !content.some((b) => b && b.type === 'tool_result')))
+      ) {
+        startedIds.clear();
+      }
       if (content) {
         for (const block of content) {
           if (!block || typeof block !== 'object') continue;
