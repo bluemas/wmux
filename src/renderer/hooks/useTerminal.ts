@@ -26,7 +26,7 @@ import { claimFit } from '../utils/fitGuard';
 import { createFitScheduler } from '../utils/layoutTransitionGate';
 import { installAltClickTrackingGuard } from '../utils/altClickUnderMouseTracking';
 import { createMouseOwnedHint } from '../utils/mouseOwnedHint';
-import { installPlainDragSelect, mouseOwnedHintApplies } from '../utils/plainDragSelect';
+import { agentSelectsOnDrag, installPlainDragSelect, mouseOwnedHintApplies } from '../utils/plainDragSelect';
 import { resizeOrderFor, runOrderedFit, type CancelOrderedFit } from '../utils/resizeOrder';
 import { createAutoSelectionCopy } from '../utils/autoSelectionCopy';
 import { createOsc52Handler } from '../utils/osc52Clipboard';
@@ -1484,8 +1484,13 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // (Codex enables ?1003 at startup); a plain click still reaches the app.
     // Installed after the alt-click guard so the guard still sees every press,
     // including the replayed Option+mousedown. The setting is read per press.
+    // An agent with its own drag selection (Claude Code) keeps the drag.
+    const paneAgentSelectsOnDrag = (): boolean => {
+      const id = ptyIdRef.current;
+      return agentSelectsOnDrag(id ? useStore.getState().surfaceAgent[id]?.slug : undefined);
+    };
     const detachPlainDragSelect = installPlainDragSelect(container, terminal, {
-      isEnabled: () => useStore.getState().plainDragSelectEnabled,
+      isEnabled: () => useStore.getState().plainDragSelectEnabled && !paneAgentSelectsOnDrag(),
       isMac,
     });
 
@@ -3264,7 +3269,9 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
           .modes?.mouseTrackingMode ?? 'none';
         // #1947: with plain-drag select on, a plain drag selects, so there is
         // nothing to teach (and on macOS Shift+drag is the way to the app).
-        return mouseOwnedHintApplies(mode, useStore.getState().plainDragSelectEnabled);
+        // Nor in an agent that selects on a drag itself.
+        return !paneAgentSelectsOnDrag()
+          && mouseOwnedHintApplies(mode, useStore.getState().plainDragSelectEnabled);
       },
       show: showMouseOwnedHintToast,
     });

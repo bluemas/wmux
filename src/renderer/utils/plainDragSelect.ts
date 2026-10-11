@@ -30,6 +30,22 @@
  * selects. The wheel is never touched.
  */
 
+import type { AgentSlug } from '../../shared/agentIdentity';
+
+/**
+ * Agents that select and copy on a drag themselves. Claude Code's fullscreen
+ * view tracks the mouse to run its own selection: it survives redraws and
+ * scrolling, copies on release (its `copyOnSelect`, on by default) and says
+ * "Copied". Turning that drag into an xterm selection took all of it away, so
+ * the drag reached neither the agent's copy nor a confirmation the user knew.
+ * A plain drag goes to these agents as it did before #1947.
+ */
+const AGENTS_WITH_OWN_SELECTION: ReadonlySet<AgentSlug> = new Set<AgentSlug>(['claude']);
+
+export function agentSelectsOnDrag(slug: AgentSlug | undefined): boolean {
+  return slug !== undefined && AGENTS_WITH_OWN_SELECTION.has(slug);
+}
+
 /** Movement (CSS px) that turns a held press into a drag. */
 export const PLAIN_DRAG_THRESHOLD_PX = 5;
 
