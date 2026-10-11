@@ -339,10 +339,11 @@ let bindFromAgentCommandLine: ((sessionId: string, slug: string, pid: number) =>
 // The agent process (`pid@start`) whose command line each pane last read; cleared on its death edge.
 const agentCommandLineRead = new Map<string, string>();
 // #1163 — registerRpcHandlers' canonical agent-state reader (readDaemonAgentState),
-// read by BOTH WebTerminalServer construction sites for /api/workspaces. Module-
+// read by BOTH WebTerminalServer construction sites for /api/workspaces (and
+// /api/sessions' `agentAlive`). Module-
 // scoped because the boot-restore site has no agent tracker in scope; a request
 // that arrives before registration simply reports no agent fields.
-let readAgentStateForWeb: ((id: string) => { agentName: string | null; agentStatus: AgentStatus }) | undefined;
+let readAgentStateForWeb: ((id: string) => { agentName: string | null; agentStatus: AgentStatus; agentVerified: boolean }) | undefined;
 // #1342 — registerRpcHandlers' resume-state reader, read by BOTH
 // WebTerminalServer construction sites for /api/workspaces. Module-scoped for
 // the same reason readAgentStateForWeb is: the boot-restore site has neither
@@ -6754,6 +6755,9 @@ function wireEvents(
       payload.sessionId,
       payload.reason === 'screen-cleared' ? 'screen-cleared' : 'answered-locally',
     ).catch((err: unknown) => log('warn', `[approvals] answered card sweep failed for ${payload.sessionId}: ${String(err)}`));
+    // An AskUserQuestion dismissed with Esc sends no hook: its record is
+    // retired once the screen shows the question gone.
+    approvalRegistry?.noteDialogKey(payload.sessionId);
     const managed = sessionManager.getSession(payload.sessionId);
     const screenAgent = managed?.bridge.getLastAgent() ?? null;
     const slug = (screenAgent ? agentDisplayToSlug(screenAgent) : undefined) ?? managed?.meta.lastDetectedAgent;

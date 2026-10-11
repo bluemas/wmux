@@ -364,6 +364,8 @@ async function generateInner(req: SnapshotRequest): Promise<SnapshotOutcome> {
     // snapshot so the renderer's byte stream stays contiguous.
     let utf8Carry: Buffer = Buffer.alloc(0);
     let bytesIn = 0;
+    // Bytes actually through the parser (bytesIn counts a chunk on arrival).
+    let parsedBytes = 0;
 
     const feed = async (raw: Buffer): Promise<boolean> => {
       bytesIn += raw.length;
@@ -399,6 +401,7 @@ async function generateInner(req: SnapshotRequest): Promise<SnapshotOutcome> {
         // Await the parse callback: backpressure AND an event-loop yield per
         // slice (xterm completes writes asynchronously).
         await new Promise<void>((resolve) => terminal.write(text, resolve));
+        parsedBytes += slice.length;
         if (Date.now() - started > budgetMs) return false;
       }
       return true;
@@ -409,7 +412,7 @@ async function generateInner(req: SnapshotRequest): Promise<SnapshotOutcome> {
     const overBudget = (): SnapshotOutcome => ({
       ok: false,
       reason: 'budget',
-      detail: `parsed=${bytesIn}/${req.initial.length} elapsedMs=${Date.now() - started}`,
+      detail: `parsed=${parsedBytes}/${req.initial.length} elapsedMs=${Date.now() - started}`,
     });
 
     if (!(await feedAtRecordedSizes(terminal, req, feed))) {

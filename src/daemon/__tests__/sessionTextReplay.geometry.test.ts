@@ -67,6 +67,18 @@ describe('readRingTailWithModesAndGeometry', () => {
     expect(tail.geometry?.changes).toEqual([{ offset: 51, cols: 40, rows: 24 }]);
   });
 
+  it('starts at an escape sequence when the tail has no line feed', () => {
+    // A TUI repainting by cursor addressing only: no LF anywhere.
+    const frame = (i: number) => `\x1b[1;1Hframe ${i}\x1b[2;1Hstatus\x1b[K`;
+    const ring = new RingBuffer(64 * 1024);
+    ring.write(Buffer.from(Array.from({ length: 200 }, (_, i) => frame(i)).join('')));
+
+    const tail = readRingTailWithModesAndGeometry(ring, null, 1000);
+    expect(tail.raw.length).toBeGreaterThan(900);
+    expect(tail.raw[0]).toBe(0x1b);
+    expect(tail.raw.toString().endsWith(frame(199))).toBe(true);
+  });
+
   it('returns the whole ring when it is smaller than the tail', () => {
     const ring = new RingBuffer(1024);
     ring.write(Buffer.from('short'));

@@ -53,8 +53,9 @@ export function readRingWithModesAndGeometry(
 }
 
 /**
- * The newest `maxBytes` of the ring, cut forward to the next line start, as a
- * replay of its own: the preamble is computed for where the tail starts (modes
+ * The newest `maxBytes` of the ring, cut forward to the next line start (or,
+ * when that stretch has no line feed at all, to the next escape sequence), as
+ * a replay of its own: the preamble is computed for where the tail starts (modes
  * set earlier in the ring are restored, modes the tail sets itself are left to
  * it) and the geometry starts at the size in force there.
  *
@@ -72,9 +73,13 @@ export function readRingTailWithModesAndGeometry(
   let cut = Math.max(0, data.length - maxBytes);
   if (cut > 0) {
     // Start on a line: a cut mid-sequence or mid-character would parse its
-    // remains as text.
+    // remains as text. A TUI that repaints by cursor addressing alone writes
+    // no line feeds, and cutting past all of its output would leave a blank
+    // screen, so it starts at an escape sequence instead (ESC is ASCII: never
+    // inside a UTF-8 character).
     const nl = data.indexOf(0x0a, cut);
-    cut = nl === -1 ? data.length : nl + 1;
+    const esc = nl === -1 ? data.indexOf(0x1b, cut) : -1;
+    cut = nl !== -1 ? nl + 1 : esc !== -1 ? esc : data.length;
   }
   const raw = data.subarray(cut);
   const preamble = outputModes?.preamble(writtenAt - raw.length) ?? '';

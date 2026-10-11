@@ -8,7 +8,7 @@
 // Never use generic patterns like "Done", "Failed", "?" that match
 // normal shell output. False positives are worse than missed detections.
 
-import { CRITICAL_PATTERNS } from '../../shared/criticalPatterns';
+import { CRITICAL_PATTERNS, matchesCriticalPattern } from '../../shared/criticalPatterns';
 import { CodexUsageLimitLineScanner } from '../../shared/usageLimit';
 import type { AgentStatus } from '../../shared/types';
 import type { AgentSlug } from '../../shared/agentIdentity';
@@ -1222,7 +1222,7 @@ export class AgentDetector {
     const searchOrPrint = isSearchOrPrintLine(clean);
     let criticalMatched = false;
     for (const cp of CRITICAL_PATTERNS) {
-      if (cp.regex.test(clean)) {
+      if (matchesCriticalPattern(cp, clean)) {
         criticalMatched = true;
         // The match is that command's argument: no other pattern on this line can run either.
         if (searchOrPrint) break;

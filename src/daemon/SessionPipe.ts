@@ -29,6 +29,10 @@ export const ATTACH_SNAPSHOT_MIN_BYTES = 256 * 1024;
  *  the budget on a busy daemon, large enough to hold many full redraws of an
  *  agent's screen. */
 export const ATTACH_TAIL_SNAPSHOT_BYTES = 1024 * 1024;
+/** The second try's budget. It runs in the same snapshot queue slot as the
+ *  first, so every other pane's attach and reveal waits behind both; 1 MB
+ *  parses in about 0.25 s at the measured ~4 MB/s. */
+export const ATTACH_TAIL_SNAPSHOT_BUDGET_MS = 1500;
 
 /**
  * Per-session data pipe for raw byte streaming.
@@ -299,14 +303,13 @@ export class SessionPipe {
           ATTACH_TAIL_SNAPSHOT_BYTES,
         );
         base = tail.writtenAt;
-        // Already inside this attach's queue slot: the queued entry point
-        // would wait on the slot it is running in.
         outcome = await generateSnapshotUnqueued({
           cols: dims.cols,
           rows: dims.rows,
           initial: tail.replay,
           geometry: tail.geometry,
           scrollback: MAX_SCROLLBACK,
+          budgetMs: ATTACH_TAIL_SNAPSHOT_BUDGET_MS,
         });
         if (socket.destroyed || this.client !== socket) return;
       }

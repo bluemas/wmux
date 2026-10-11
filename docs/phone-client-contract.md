@@ -383,7 +383,7 @@ GET /api/config    → {allowInput, allowUpload, allowTranscript, inlineImages?,
                       terminalPromptDecline?, protocolVersion, minProtocolVersion,
                       serverVersion, hostPlatform}
 GET /api/sessions  → {sessions: [{id, cwd, spawnCwd?, cols, rows, state, agent, lastActivity,
-                      workspace?, workspaceId?, shell?, lastDetectedAgent?, cwdLeaf?,
+                      workspace?, workspaceId?, shell?, lastDetectedAgent?, agentAlive?, cwdLeaf?,
                       liveness?, lastFailure?, lastAssistantText?, surfaceTitle?, paneName?, role?, deferred?}]}
 POST /api/input?session=<id>   body: raw bytes
 ```
@@ -404,8 +404,36 @@ from a plain shell, which is how every shell pane's chip collapsed to one word.
 Two rules: treat an unrecognised value as "some agent" (the set is not closed on
 the wire), and read it as **identity, not presence**. It is persisted, so it
 outlives the agent process and every reboot — a pane that ran Claude keeps
-saying so while the shell sits at a prompt. What is running *now* is `liveness`
-and the `agent.liveness` frames, never this.
+saying so while the shell sits at a prompt. What is running *now* is `agentAlive`,
+`liveness` and the `agent.liveness` frames, never this.
+
+`agentAlive` says whether the pane's agent process is running right now. Use it,
+not `agent` or `lastDetectedAgent`, to decide whether a pane "has an agent":
+both labels are sticky and keep naming an agent that has exited.
+
+- `true`: the daemon tracks a live process of the pane's agent.
+- `false`: the daemon names no agent for the pane. The shell is back at its
+  prompt, the agent exited, or nothing shows one ran. `agent` may still say
+  `claude` on such a row. An agent launched a moment ago reads `false` until
+  its first hook, banner or process check names it.
+- absent: the daemon cannot tell, or predates the field. An agent is named
+  (by its hook or on screen) but no live process proves it yet. Fall back to
+  what you did before the field existed.
+
+It is the same process reading a Claude or Codex transcript binding's `/turns`
+`chat.agentAlive` is built on, and `/turns` adds one condition: the live agent
+must be the one whose conversation the pane is bound to. So a row `false` means
+`/turns` says `false`, and a `/turns` `true` means the row says `true`. The
+reverse does not hold: a row `true` with a `/turns` `false` is a running agent
+the pane has no matching conversation for yet, such as a fresh Claude before its
+first prompt. The row answers "is an agent running", `/turns` answers "is this
+conversation's agent running". A desktop chat-v2 record (a `managed` binding
+on `/turns`) is the one source the row also reads: both report its driver's
+state. These implications hold for Claude and Codex transcript bindings only.
+An OpenCode plugin binding and a desktop-managed record answer `/turns` from
+their own connection, which a list row does not open, so the row can say
+`false` there while `/turns` says `true`. The row is read from state the
+daemon already holds; polling it costs no process scan.
 
 `spawnCwd` is the directory the daemon actually started the pane in. Unlike
 `cwd`, which follows OSC 7 and the prompt and can name a deleted worktree or a
@@ -1856,7 +1884,20 @@ form describes: the answer is 409 `prompt-changed` with nothing typed.
 - The picker must be untouched when the answer starts: the first question, no
   tab answered, the cursor on option 1, nothing ticked, no typed text. Anything
   else is 409 `prompt-changed` with `effect: 'none'` and nothing typed; a
-  question no longer on screen is 410 `prompt-gone`.
+  question no longer on screen is 410 `prompt-gone`. A pane too short for
+  the whole picker (one the phone sized to its own view) is still read while
+  its question and every option row are on screen: with the tab bar scrolled
+  off, for a single single-select question only. Once Claude scrolls the
+  option list itself (`↓` before a row) the answer is 409 `prompt-changed`
+  and the record stays pending; a taller view (about 17 rows at 44 columns
+  for two options) makes it answerable again. In a session named with
+  `/rename`, Claude draws the name in a rule under the picker's hint
+  (`───…─ <name> ─`); that row, exactly as wide as the picker's own rules, is
+  not part of the picker.
+- A question dismissed with Esc at the computer sends Claude Code no hook;
+  its record expires (`prompt-gone`) a couple of seconds later, once the
+  screen shows Claude's "User declined to answer questions", the question
+  gone and no picker up.
 - 200 `{state: 'resolved', effect: 'complete'}` only once the screen confirms
   the answer: this prompt's picker is gone and a new "User answered Claude's
   questions" block lists every question with exactly the answer given. When every key
@@ -2227,6 +2268,28 @@ requests with one id make one item.
 An `uncertain` item's receipt reads `uncertain` too, and its replay carries
 `effect:"uncertain"`: check the transcript before sending it again.
 
+**Why it waits (`holdReason`).** A `queued` item the daemon has tried and held
+carries `holdReason`, the hold its last try met (closed set; memory-only like
+`preview`, absent after a restart, before the item's first try, and on every
+other state). The daemon retries a held item at least every 5 seconds while
+anything waits in the queue, and sooner when the agent's status changes or
+its transcript grows; the hold is not final, and a later try may meet
+another one.
+
+| `holdReason` | The item waits because |
+| --- | --- |
+| `turn-running` | the turn runs (a `next-turn` item waits for its end) |
+| `turn-starting` | the turn the previous delivery started has not been seen yet (30 seconds at most) |
+| `busy` | another send is being typed into the pane, or someone is typing in it |
+| `cancel-check` | a Stop's check of the prompt Claude put back in its box runs first |
+| `approval` | an approval is pending on the pane (the item fails as `prompt-active` if its time runs out) |
+| `dialog` | a dialog owns the screen (fails as `blocked`) |
+| `no-composer` | the screen shows no composer to type into, such as a usage view (fails as `blocked`) |
+| `unavailable` | the agent or its conversation cannot be read right now |
+| `retry` | the daemon could not save the item's next state; it tries again shortly |
+
+Unknown values may appear in later daemons: show them as a generic wait.
+
 **Authorization at delivery.** The daemon re-checks the owner right before
 the first write and again before Enter: the device must still be paired and
 hold input, the server must still run with `--allow-input` and
@@ -2244,7 +2307,7 @@ item `uncertain` (`restart-uncertain`); nothing is delivered.
 
 **`/turns`.** For a `chat-queue` caller on a daemon whose queue loaded, the
 chat object carries `queue: [{clientMessageId, state, reason?, deliver?, queuedAt, at,
-preview?}]`: the caller's own items on the pane, most recent kept, in enqueue
+preview?, holdReason?}]`: the caller's own items on the pane, most recent kept, in enqueue
 order. `preview` is the first 80 characters, held in memory only (absent after
 a restart). `capabilities.queue` is `true` for a live Claude, Codex or
 OpenCode agent, and `capabilities.send` stays `true` while a turn runs. User
@@ -2270,11 +2333,13 @@ back. Needs the input grant (403 otherwise); only the owner's items are found.
 A 404 without one of these two `error` values means the route is missing (an
 older daemon).
 
-**SSE `chat.queue`.** `{sessionId, clientMessageId, state, reason?, deliver?, at}` on
+**SSE `chat.queue`.** `{sessionId, clientMessageId, state, reason?, deliver?, holdReason?, at}` on
 every state change, and once more (same `state`) when an item switches to
-`steer`. `delivering` is sent only once the first write
+`steer` or a `queued` item's `holdReason` changes (a try held for the same
+reason as the last one sends nothing). `delivering` is sent only once the first write
 is about to happen; an item the daemon holds back before that never shows
-`delivering` then `queued`. Live-only like `chat.blocked` (no `id:`, never replayed),
+`delivering` then `queued`, and one held back after it (an OpenCode plugin
+answering busy) is always sent as `queued` again, with its `holdReason`. Live-only like `chat.blocked` (no `id:`, never replayed),
 and only to the item's owner among the pane's `/turns` watchers. `/turns` is
 the authoritative state after a reconnect.
 

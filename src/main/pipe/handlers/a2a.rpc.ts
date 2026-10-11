@@ -15,7 +15,7 @@ import { getPidMapDir } from '../../../shared/constants';
 import { validateMessage } from '../../../shared/types';
 import { EXECUTE_SEND_MAIN_TIMEOUT_MS } from '../../../shared/executeApprovalBounds';
 import { GATED_DELIVERY_DEADLINE_MARGIN_MS, GATED_NEW_TASK_SEND_MAIN_TIMEOUT_MS, NEW_TASK_SEND_MAIN_TIMEOUT_MS } from '../../../shared/freshContext';
-import { flagOrphanedTask, isPagedTaskQuery, pagedTaskId, shapeTaskQueryResult, summarizeTask } from '../../../shared/a2aTaskQueryView';
+import { flagOrphanedTask, isPagedTaskQuery, pagedTaskId, shapeTaskQueryResult, summarizeTask, applyTaskQueryView } from '../../../shared/a2aTaskQueryView';
 import { defaultSnapshot } from '../../pty/portWatch';
 import { claimTokenForPane, claimTokenForRun } from '../../workspace/workspaceClaimTrust';
 import { isIdentityRunPty, liveIdentityRunAnchors } from '../../automation/runIdentity';
@@ -860,14 +860,21 @@ export function registerA2aRpc(
     // `page` is the only public view. `anchors` (#1680) is main's own
     // open-task read, sent straight to the daemon; a pipe caller cannot ask for
     // it, nor for any other value, which would reach both task sources as-is.
-    if (params.view !== 'page') delete params.view;
+    // 내부 operator만 단건 상태 view를 사용한다.
+    const stateOnly = params.view === 'state' && ctx?.operator === true;
+    if (stateOnly && (typeof params.taskId !== 'string' || !params.taskId.trim())) {
+      return { error: 'a2a.task.query: state view requires taskId' };
+    }
+    if (params.view !== 'page' && !stateOnly) delete params.view;
     if (paged && typeof params.workspaceId === 'string' && params.workspaceId) {
       const panes = await readWorkspacePanes(getWindow, params.workspaceId);
       if (panes) params.livePaneIds = panes.map((pane) => pane.id as string);
     }
     const taskId = pagedTaskId(params);
     const summaries = paged && !taskId;
-    const shape = (result: unknown): unknown => (paged
+    const shape = (result: unknown): unknown => stateOnly && isRecord(result) && Array.isArray(result.tasks)
+      ? { ...result, tasks: applyTaskQueryView(result.tasks, params) }
+      : (paged
       ? shapeTaskQueryResult(filterByStatus(result), {
         taskId,
         messageId: typeof params.messageId === 'string' && params.messageId ? params.messageId : undefined,
@@ -885,6 +892,13 @@ export function registerA2aRpc(
       statusFilter && isRecord(result) && Array.isArray(result.tasks)
         ? { ...result, tasks: (result.tasks as Array<Record<string, unknown>>).filter((t) => stateOf(t) === statusFilter) }
         : result);
+    // 상태 전용 조회는 독립된 두 저장소를 동시에 읽는다. 오류는 기존 폴백으로 처리한다.
+    const stateGate = stateOnly ? daemonTaskRpc(getDaemonClient, 'a2a.task.query', {
+      workspaceId: params.workspaceId, view: 'state', taskId: params.taskId,
+      ...(typeof params.role === 'string' ? { role: params.role } : {}),
+      ...(typeof params.updatedSince === 'string' && Number.isFinite(Date.parse(params.updatedSince))
+        ? { updatedSince: new Date(params.updatedSince).toISOString() } : {}),
+    }, { timeoutMs: PAGED_TASK_QUERY_DAEMON_TIMEOUT_MS }) : undefined;
     let rendererRes: unknown = null;
     try {
       rendererRes = await sendToRenderer(getWindow, 'a2a.task.query', params);
@@ -911,13 +925,13 @@ export function registerA2aRpc(
     // view answers with every full task, which can outgrow the 1 MiB control
     // line and be dropped, and waiting out the default 10 s would time out the
     // caller too. The renderer answer stands in, as for any unavailable daemon.
-    const gate = await daemonTaskRpc(getDaemonClient, 'a2a.task.query', {
+    const gate = await (stateGate ?? daemonTaskRpc(getDaemonClient, 'a2a.task.query', {
       workspaceId: params.workspaceId,
       ...(typeof params.role === 'string' ? { role: params.role } : {}),
       ...(updatedSince ? { updatedSince } : {}),
       ...(paged ? { view: 'page', ...(taskId ? { taskId } : {}) } : {}),
       ...(params.livePaneIds ? { livePaneIds: params.livePaneIds } : {}),
-    }, paged ? { timeoutMs: PAGED_TASK_QUERY_DAEMON_TIMEOUT_MS } : {});
+    }, paged ? { timeoutMs: PAGED_TASK_QUERY_DAEMON_TIMEOUT_MS } : {}));
     if (gate.kind !== 'ok') return shape(rendererRes);
     const rawDaemonTasks = Array.isArray(gate.result.tasks) ? (gate.result.tasks as Array<Record<string, unknown>>) : [];
     // A daemon from before the paged view ignores it and sends full tasks

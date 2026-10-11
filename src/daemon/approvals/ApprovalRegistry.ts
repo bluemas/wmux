@@ -130,7 +130,9 @@ import {
   answerListMatches,
   answersConfirmed,
   askAnswerSteps,
+  askDeclinedOnScreen,
   askOtherMaxWidth,
+  askPickerOnScreen,
   askPickerUntouched,
   askConfirmBaseline,
   askReviewOf,
@@ -155,6 +157,8 @@ export interface PromptScreenMark {
 
 /** No remote answer to a `terminal_prompt` this soon after it appeared (reflex / script guard). */
 export const TERMINAL_PROMPT_MIN_ANSWER_AGE_MS = 1_500;
+/** How long after a dialog key at the desk a dismissed question's record is looked for (see noteDialogKey). */
+export const QUESTION_DISMISS_CHECK_MS = 2_000;
 /** Renders an answer may take when the pane keeps moving under it. */
 export const TERMINAL_PROMPT_ANSWER_ATTEMPTS = 2;
 /** Creation-time screen reads (the hook can land before the dialog is drawn), and the gap between them. */
@@ -1418,14 +1422,19 @@ export class ApprovalRegistry implements ApprovalRegistryApi, ApprovalHookSink {
 
   /**
    * True only when a fresh screen read shows the record's question is NOT on
-   * screen (`questionOnScreen` → `absent`). Unreadable, unprovable, or still
-   * there → false: a live question is never retired on a guess.
+   * screen (`questionOnScreen` → `absent`) and no picker is up at all
+   * (askPickerOnScreen: a short pane can scroll the question's own rows off a
+   * live picker, and a review screen draws the questions differently).
+   * `declined`: the screen must also show Claude's report that a question was
+   * declined. Unreadable, unprovable, or still there → false: a live question
+   * is never retired on a guess.
    */
-  private async questionGone(sessionId: string, id: string): Promise<boolean> {
+  private async questionGone(sessionId: string, id: string, opts: { declined?: boolean } = {}): Promise<boolean> {
     const record = this.requests.find((r) => r.id === id);
     if (!record || record.state !== 'pending') return false;
     const rows = await this.safeReadScreen(sessionId);
-    return !!rows && rows.length > 0 && questionOnScreen(rows, record) === 'absent';
+    return !!rows && rows.length > 0 && questionOnScreen(rows, record) === 'absent' && !askPickerOnScreen(rows)
+      && (!opts.declined || askDeclinedOnScreen(rows));
   }
 
   /**
@@ -1444,6 +1453,46 @@ export class ApprovalRegistry implements ApprovalRegistryApi, ApprovalHookSink {
     } catch (err) {
       this.deps.log?.('warn', `[approvals] stale question check failed for ${sessionId}: ${String(err)}`);
     }
+  }
+
+  /**
+   * Retire question record `id` (pinned when the key arrived) once the screen
+   * shows it declined and gone. Only while nothing is answering it: a remote
+   * answer owns its record from its first key, also once every key is typed,
+   * and is checked again in the same synchronous block as the expiry.
+   */
+  private async retireDismissedQuestion(sessionId: string, id: string): Promise<void> {
+    const untouched = (r: ApprovalRequest): boolean => r.id === id && r.state === 'pending' && !r.step && r.pressedAt === undefined;
+    try {
+      const candidate = this.staleQuestionFor({ sessionId, agent: '', source: 'hook' });
+      if (!candidate || !untouched(candidate)) return;
+      if (!(await this.questionGone(sessionId, id, { declined: true }))) return;
+      await this.mutate(() => this.expirePendingWhere(untouched, 'prompt-gone'));
+    } catch (err) {
+      this.deps.log?.('warn', `[approvals] dismissed question check failed for ${sessionId}: ${String(err)}`);
+    }
+  }
+
+  /**
+   * A key that can close a dialog (a digit, Esc, Enter) reached the pane at the
+   * desk. Esc on an AskUserQuestion sends no hook at all (no PostToolUse, no
+   * Stop: measured on 2.1.283 and again on 2.1.296), so its record stayed
+   * pending until another tool started, a card every phone answer only learns
+   * is gone. A moment later (QUESTION_DISMISS_CHECK_MS), the question record
+   * that was pending when the key arrived is retired when the screen shows it
+   * declined and gone (retireDismissedQuestion). An answer at the desk draws
+   * "User answered" instead and is left to its own PostToolUse.
+   */
+  noteDialogKey(sessionId: string): void {
+    const pending = this.requests.find((r) => r.state === 'pending' && r.sessionId === sessionId && r.kind === 'awaiting_input');
+    if (!pending) return;
+    const id = pending.id;
+    const schedule = this.deps.schedule ?? ((fn: () => Promise<void>, ms: number) => {
+      const t = setTimeout(() => { void fn(); }, ms);
+      t.unref?.();
+      return () => clearTimeout(t);
+    });
+    schedule(() => this.retireDismissedQuestion(sessionId, id), QUESTION_DISMISS_CHECK_MS);
   }
 
   /** Screen-backed records only: a native decision does not hold the pane's screen. */
@@ -3250,12 +3299,17 @@ export class ApprovalRegistry implements ApprovalRegistryApi, ApprovalHookSink {
       return refusedEarly;
     }
     const first = await this.readQuestionScreen(record.sessionId);
-    if (!first) return refuse('prompt-changed');
+    if (!first) {
+      audit('prompt-changed:unreadable');
+      return { ok: false, reason: 'prompt-changed', request: copyRequest(record) };
+    }
     const picker = parseAskPicker(first.rows);
     if (!askPickerUntouched(picker, questions)) {
-      // Nothing of the question on screen: it was answered or dismissed at the
-      // terminal. Same outcome as a v1 answer.
-      if (!picker && questionOnScreen(first.rows, record) === 'absent') {
+      const hint = askPickerOnScreen(first.rows);
+      // Nothing of the question on screen, and no picker either: it was
+      // answered or dismissed at the terminal. Same outcome as a v1 answer.
+      // A picker whose rows a short pane scrolled is still up.
+      if (!picker && !hint && questionOnScreen(first.rows, record) === 'absent') {
         const gone = await this.mutate<ApprovalResolveResult>(() => {
           if (record.state !== 'pending' || record.step) return { result: changedResult(record) };
           return this.expireUnpressed(record, first.rows, 'prompt-gone', 'its question is not on screen');
@@ -3263,7 +3317,8 @@ export class ApprovalRegistry implements ApprovalRegistryApi, ApprovalHookSink {
         audit(gone.ok ? 'ok' : gone.reason);
         return gone;
       }
-      return refuse('prompt-changed');
+      audit(`prompt-changed:${picker ? 'picker-differs' : hint ? 'picker-unreadable' : 'no-picker'}`);
+      return { ok: false, reason: 'prompt-changed', request: copyRequest(record) };
     }
     // The echo check reads the whole text back off its row.
     const maxWidth = askOtherMaxWidth(first.cols);

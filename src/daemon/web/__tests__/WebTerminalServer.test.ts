@@ -522,7 +522,7 @@ describe('WebTerminalServer', () => {
 
   /** #1163 — the daemon's canonical agent state per session, as the server reads it. */
   let turnFailures: Record<string, { failure: TurnFailure; agentSessionId?: string }> = {};
-  let agentStates: Record<string, { agentName: string | null; agentStatus: 'idle' | 'running' | 'awaiting_input' }>;
+  let agentStates: Record<string, { agentName: string | null; agentStatus: 'idle' | 'running' | 'awaiting_input'; agentVerified?: boolean }>;
   /** #1342 — the daemon's resume state per session, as the server reads it. */
   let resumeStates: Record<string, { binding?: ResumeBinding; commandRunning?: boolean; agentProcessAlive?: boolean; resumeAgent?: string }>;
 
@@ -798,6 +798,35 @@ describe('WebTerminalServer', () => {
     // by the daemon instead of separately by every client.
     expect(sessions[0].cwdLeaf).toBe('x');
     expect(sessions[1].cwdLeaf).toBe('y');
+  });
+
+  it('says whether a pane\'s agent is still running, apart from the sticky agent label', async () => {
+    // s1: a live Claude the tracker proved. s2: Claude exited, the persisted
+    // slug (and so `agent`) still says claude. s3: named by a hook or the
+    // screen but no process proves it yet, so the daemon cannot tell.
+    live[0].lastDetectedAgent = 'claude';
+    live[1].lastDetectedAgent = 'claude';
+    agentStates.s1 = { agentName: 'Claude Code', agentStatus: 'running', agentVerified: true };
+    agentStates.s2 = { agentName: null, agentStatus: 'idle', agentVerified: false };
+    agentStates.s3 = { agentName: 'Claude Code', agentStatus: 'running', agentVerified: false };
+    const info = await startRO();
+    const read = async () => ((await (
+      await fetch(`${base()}/api/sessions`, { headers: bearer(info.token as string) })
+    ).json()) as { sessions: Array<Record<string, unknown>> }).sessions;
+
+    let sessions = await read();
+    expect(sessions[0]).toMatchObject({ agent: 'claude', agentAlive: true });
+    // The exited agent: `agent` is unchanged, `agentAlive` tells the truth.
+    expect(sessions[1]).toMatchObject({ agent: 'claude', agentAlive: false });
+    expect('agentAlive' in sessions[2]).toBe(false);
+
+    // No state for a session (reader not registered yet, or an old reader
+    // without `agentVerified`): omitted, never a guessed false.
+    agentStates.s1 = { agentName: 'Claude Code', agentStatus: 'running' };
+    delete agentStates.s2;
+    sessions = await read();
+    expect('agentAlive' in sessions[0]).toBe(false);
+    expect('agentAlive' in sessions[1]).toBe(false);
   });
 
   it('★ #1319 the cwd leaf survives both separators and a trailing one', async () => {
@@ -9615,9 +9644,9 @@ describe('WebTerminalServer', () => {
       // Named workspace sorts before the unnamed one.
       expect(body.workspaces.map((w) => w.id)).toEqual(['ws-1', 'ws-legacy']);
       expect(body.workspaces[0].name).toBe('Workspace 1');
-      expect(body.workspaces[0].panes).toEqual([{ sessionId: 's1', shell: 'pwsh', cwd: '/x', lastActivity: '2020-01-01T00:00:00.000Z' }]);
+      expect(body.workspaces[0].panes).toEqual([{ sessionId: 's1', shell: 'pwsh', cwd: '/x', lastActivity: '2020-01-01T00:00:00.000Z', hostPlatform: process.platform, wsl: false }]);
       expect(body.workspaces[1].name).toBe('');
-      expect(body.workspaces[1].panes).toEqual([{ sessionId: 's2', shell: 'pwsh', cwd: '/y', lastActivity: '2020-01-01T00:00:00.000Z' }]);
+      expect(body.workspaces[1].panes).toEqual([{ sessionId: 's2', shell: 'pwsh', cwd: '/y', lastActivity: '2020-01-01T00:00:00.000Z', hostPlatform: process.platform, wsl: false }]);
       // The env-less session (s3) is omitted entirely.
       expect(body.workspaces.flatMap((w) => w.panes).map((p) => p.sessionId)).not.toContain('s3');
     });
