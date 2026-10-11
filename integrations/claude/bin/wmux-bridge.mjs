@@ -1107,6 +1107,21 @@ async function main() {
     logEvent('unknown-entrypoint', { hook: hookName, entrypoint });
   }
 
+  // Claude Code's own forked agents — the prompt suggestion and the away recap,
+  // run after a turn ends — fire tool hooks in this session. Their payload has
+  // an `agent_id` and no `agent_type` (Claude Code sends `agent_type: ""` on
+  // their SubagentStop); a real subagent always carries both. Sent, a fork's
+  // PostToolUse stamped the pane's activity and lit the running dot for two
+  // minutes with the agent idle at its prompt (live, 2026-10-11: `cat` and Read
+  // calls missing from the transcript, seconds after Stop). The permission gate
+  // and PermissionRequest still go out: they answer or report a real dialog.
+  if (!permissionGateMode && hookName !== 'PermissionRequest' && payload
+      && typeof payload.agent_id === 'string' && payload.agent_id.length > 0
+      && !(typeof payload.agent_type === 'string' && payload.agent_type.length > 0)) {
+    logEvent('skip-internal-fork', { hook: hookName });
+    return;
+  }
+
   // PreToolUse fires per tool call; we only treat AskUserQuestion as
   // "awaiting input" UNLESS this is a permission-gate call (--permission-gate
   // mode handles ALL tool names and sends agent.awaiting_permission instead).
