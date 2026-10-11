@@ -8,6 +8,7 @@ import type { Pane, Workspace } from '../../../shared/types';
 import { IconChevron, IconFile, IconFolder, IconRefresh, IconSearch, IconX } from '../icons';
 import { FOCUS_RING } from '../focusRing';
 import { injectText, quotePathsForPrompt } from '../AgentToolbar/inject';
+import { tokenAttrs } from '../../themes';
 import FileTreeResizeHandle from './FileTreeResizeHandle';
 import { filterTree, FILTER_SCAN_LIMIT, type FilterResult } from './fileTreeFilter';
 
@@ -421,10 +422,11 @@ export default function FileTreePanel({ position }: FileTreePanelProps) {
       id="wmux-file-tree"
       data-file-tree
       data-file-tree-position={position}
+      {...tokenAttrs('bgBase', 'bg')}
     >
       <FileTreeResizeHandle position={position} />
-      <div className="wmux-filetree-header">
-        <span className="truncate flex-1" title={root ?? t('filetree.noDirectory')} data-file-tree-root>
+      <div className="wmux-filetree-header" {...tokenAttrs('bgMantle', 'bg')}>
+        <span className="truncate flex-1" title={root ?? t('filetree.noDirectory')} data-file-tree-root {...tokenAttrs('textMain', 'text')}>
           {header}
         </span>
         <button
@@ -442,6 +444,7 @@ export default function FileTreePanel({ position }: FileTreePanelProps) {
           aria-pressed={filterOpen}
           disabled={!root}
           data-file-tree-filter-toggle
+          {...tokenAttrs('textMuted', 'text')}
         >
           <IconSearch size={14} />
         </button>
