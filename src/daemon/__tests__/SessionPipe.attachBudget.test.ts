@@ -8,10 +8,11 @@ import crypto from 'node:crypto';
 import { Terminal } from '@xterm/headless';
 import { RingBuffer } from '../RingBuffer';
 // vi.mock below is hoisted above these imports, so SessionPipe gets the mock.
-import { SessionPipe, createSessionPipeMarkers, ATTACH_TAIL_SNAPSHOT_BYTES } from '../SessionPipe';
+import { SessionPipe, createSessionPipeMarkers, ATTACH_TAIL_SNAPSHOT_BYTES, ATTACH_TAIL_SNAPSHOT_BUDGET_MS } from '../SessionPipe';
 import { waitFor } from '../../test-utils/waitFor';
 
 const calls: number[] = [];
+const budgets: (number | undefined)[] = [];
 let failAll = false;
 
 vi.mock('../HeadlessSnapshot', async (importOriginal) => {
@@ -21,6 +22,7 @@ vi.mock('../HeadlessSnapshot', async (importOriginal) => {
     // Any parse bigger than the retry window runs out of budget.
     generateSnapshotUnqueued: async (req: Parameters<typeof real.generateSnapshotUnqueued>[0]) => {
       calls.push(req.initial.length);
+      budgets.push(req.budgetMs);
       if (failAll || req.initial.length > 1024 * 1024 + 64) {
         return { ok: false as const, reason: 'budget' as const, detail: 'parsed=0/0 elapsedMs=4001' };
       }
@@ -63,6 +65,7 @@ afterEach(async () => {
   for (const s of sockets.splice(0)) s.destroy();
   for (const p of pipes.splice(0)) await p.stop().catch(() => {});
   calls.length = 0;
+  budgets.length = 0;
   failAll = false;
 });
 
@@ -90,6 +93,8 @@ describe('attach snapshot over budget', () => {
     const replay = await attach(raw);
     expect(calls).toHaveLength(2);
     expect(calls[1]).toBeLessThanOrEqual(ATTACH_TAIL_SNAPSHOT_BYTES);
+    // The retry holds the same queue slot, so it gets a short budget of its own.
+    expect(budgets).toEqual([undefined, ATTACH_TAIL_SNAPSHOT_BUDGET_MS]);
     expect(replay.length).toBeLessThan(64 * 1024);
     expect(await screenOf(replay)).toEqual(await screenOf(raw));
   });
