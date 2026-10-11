@@ -23,6 +23,7 @@ import { isChatV2Covering } from '../components/ChatV2/coverage';
 import { showWorkspaces } from '../utils/showWorkspaces';
 import { toggleFileTreePanel } from '../components/FileTree/fileTreeToggle';
 import { listedWorkspaces, moaHqId, refuseWorkspaceClose } from '../components/Moa/moaHqGuard';
+import { selectShortcutWorkspaces } from '../components/Sidebar/workspaceFilter';
 import {
   openMultiTask,
   openWorktaskCleanup,
@@ -361,8 +362,8 @@ export function useKeyboard() {
     };
     // Ctrl+N counts the list the operator sees, which leaves out Moa's HQ.
     const jumpToWorkspace = (idx: number) => {
-      const state = store.getState();
-      const workspaces = listedWorkspaces(state.workspaces, moaHqId(state));
+      // The digits follow the sidebar's numbering: a filtered list's rows.
+      const workspaces = selectShortcutWorkspaces(store.getState());
       if (idx >= 0 && idx < workspaces.length) {
         store.getState().setActiveWorkspace(workspaces[idx].id);
         // Switching workspace means "show me that workspace", from any page.
@@ -486,8 +487,7 @@ export function useKeyboard() {
       workspace7: () => jumpToWorkspace(6),
       workspace8: () => jumpToWorkspace(7),
       workspace9: () => {
-        const state = store.getState();
-        jumpToWorkspace(listedWorkspaces(state.workspaces, moaHqId(state)).length - 1);
+        jumpToWorkspace(selectShortcutWorkspaces(store.getState()).length - 1);
       },
       closeWorkspace: () => {
         const state = store.getState();
