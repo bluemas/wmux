@@ -404,8 +404,16 @@ async function generateInner(req: SnapshotRequest): Promise<SnapshotOutcome> {
       return true;
     };
 
+    // Where the budget ran out: a parse that is merely slow fails near the end
+    // of `initial`, one starved by the event loop fails near the start.
+    const overBudget = (): SnapshotOutcome => ({
+      ok: false,
+      reason: 'budget',
+      detail: `parsed=${bytesIn}/${req.initial.length} elapsedMs=${Date.now() - started}`,
+    });
+
     if (!(await feedAtRecordedSizes(terminal, req, feed))) {
-      return { ok: false, reason: 'budget' };
+      return overBudget();
     }
     if (req.drainQueue) {
       // Drain the live tee until we observe it empty. The check and the
@@ -417,7 +425,7 @@ async function generateInner(req: SnapshotRequest): Promise<SnapshotOutcome> {
         if (chunks.length === 0) break;
         for (const chunk of chunks) {
           if (!(await feed(chunk))) {
-            return { ok: false, reason: 'budget' };
+            return overBudget();
           }
         }
       }

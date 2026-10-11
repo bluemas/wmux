@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import { getSessionSocketPath } from '../shared/constants';
 import type { RingBuffer, ReplayGeometry } from './RingBuffer';
 import type { OutputModeTracker } from './util/outputModeTracker';
-import { readRingWithModesAndGeometry } from './sessionTextReplay';
+import { readRingTailWithModesAndGeometry, readRingWithModesAndGeometry } from './sessionTextReplay';
 import { generateSnapshot, MAX_SCROLLBACK } from './HeadlessSnapshot';
 import {
   createSessionPipeMarkers,
@@ -24,6 +24,11 @@ export { createSessionPipeMarkers };
  * (The resync/reflush path has its own caller-side policy — see reflush.)
  */
 export const ATTACH_SNAPSHOT_MIN_BYTES = 256 * 1024;
+/** The attach snapshot's second try parses only this much of the ring's
+ *  newest output (see flushRingBuffer). Small enough to finish well inside
+ *  the budget on a busy daemon, large enough to hold many full redraws of an
+ *  agent's screen. */
+export const ATTACH_TAIL_SNAPSHOT_BYTES = 1024 * 1024;
 
 /**
  * Per-session data pipe for raw byte streaming.
@@ -233,7 +238,8 @@ export class SessionPipe {
       // handle at this layer, so bytes arriving DURING the parse are
       // recovered by re-reading the ring afterwards — writeToClient gates
       // on `flushed`, so nothing reaches the socket in between.
-      const outcome = await generateSnapshot({
+      let base = writtenBefore;
+      let outcome = await generateSnapshot({
         cols: dims.cols,
         rows: dims.rows,
         // Led by the mode preamble, so an alt screen or mouse / paste mode the
@@ -249,6 +255,31 @@ export class SessionPipe {
         scrollback: MAX_SCROLLBACK,
       });
       if (socket.destroyed || this.client !== socket) return; // client left mid-parse
+      if (!outcome.ok && outcome.reason === 'budget') {
+        // The whole ring did not parse in time (seen on a live agent pane
+        // while the daemon was busy). A raw replay of a cursor-addressed app's
+        // history at mixed widths paints its redraws over each other, so
+        // rebuild the screen from the newest output instead: older
+        // scrollback is lost, the screen comes out right.
+        // eslint-disable-next-line no-console
+        console.log(
+          `[SessionPipe.flush] sessionId=${this.sessionId} snapshot over budget (${outcome.detail ?? ''}), retrying on the newest ${ATTACH_TAIL_SNAPSHOT_BYTES} bytes`,
+        );
+        const tail = readRingTailWithModesAndGeometry(
+          this.ringBuffer,
+          this.getOutputModes?.() ?? null,
+          ATTACH_TAIL_SNAPSHOT_BYTES,
+        );
+        base = tail.writtenAt;
+        outcome = await generateSnapshot({
+          cols: dims.cols,
+          rows: dims.rows,
+          initial: tail.replay,
+          geometry: tail.geometry,
+          scrollback: MAX_SCROLLBACK,
+        });
+        if (socket.destroyed || this.client !== socket) return;
+      }
       // Size guard: when most of the history still fits inside the
       // serialized scrollback (buffers just past the threshold), the
       // cell-by-cell SGR reconstruction can come out BIGGER than the raw
@@ -276,7 +307,7 @@ export class SessionPipe {
         // The lifetime counter locates the delta whether or not the ring
         // dropped bytes; only a delta larger than the ring itself is lost.
         const { raw: after, replay: afterReplay } = this.readRing();
-        const written = this.ringBuffer.totalBytesWritten - writtenBefore;
+        const written = this.ringBuffer.totalBytesWritten - base;
         if (written > after.length) {
           payload = afterReplay;
           // eslint-disable-next-line no-console
