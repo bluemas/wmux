@@ -19,12 +19,12 @@ vi.mock('../HeadlessSnapshot', async (importOriginal) => {
   return {
     ...real,
     // Any parse bigger than the retry window runs out of budget.
-    generateSnapshot: async (req: Parameters<typeof real.generateSnapshot>[0]) => {
+    generateSnapshotUnqueued: async (req: Parameters<typeof real.generateSnapshotUnqueued>[0]) => {
       calls.push(req.initial.length);
       if (failAll || req.initial.length > 1024 * 1024 + 64) {
         return { ok: false as const, reason: 'budget' as const, detail: 'parsed=0/0 elapsedMs=4001' };
       }
-      return real.generateSnapshot(req);
+      return real.generateSnapshotUnqueued(req);
     },
   };
 });
