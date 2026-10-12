@@ -2740,6 +2740,15 @@ function adoptMainWindow(win: BrowserWindow): void {
   // is read from the OS when the request arrives; the input event is a second hint.
   let altF4At = 0;
   win.webContents.on('before-input-event', (event, input) => {
+    // F11 toggles fullscreen. A focused terminal cancels the key (xterm sends
+    // it to the shell), so the View menu's accelerator never fires and the
+    // window stays stuck in fullscreen. Take the key here, as for Alt+F4.
+    if (process.platform !== 'darwin' && input.type === 'keyDown' && input.key === 'F11' && !input.isAutoRepeat
+      && !input.control && !input.alt && !input.shift && !input.meta) {
+      event.preventDefault();
+      win.setFullScreen(!win.isFullScreen());
+      return;
+    }
     if (!isAltF4KeyDown(input)) return;
     altF4At = Date.now();
     // A focused terminal cancels Alt+F4 (xterm sends it to the shell), so no
