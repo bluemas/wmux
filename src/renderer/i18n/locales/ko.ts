@@ -1830,6 +1830,8 @@ export const ko = {
   'settings.sidebarSortManual': '수동',
   'settings.sidebarSortAttention': '주의',
   'settings.sidebarSortRecent': '최근 활동',
+  'settings.sidebarShowPorts': '포트 번호 표시',
+  'settings.sidebarShowPortsDesc': '사이드바의 워크스페이스에 실행 중인 포트 번호를 표시합니다.',
   'settings.sidebarShowPaneCoordinates': '판 좌표 표시',
   'settings.sidebarShowPaneCoordinatesDesc': '이름을 지정하지 않은 판에 대해 에이전트 목록에 자동 생성된 w1-2 형식의 좌표를 표시합니다. 기본은 켜짐. 이름을 바꾼 판은 이 설정과 무관하게 항상 자신의 이름을 표시합니다.',
   'settings.attentionBlink': '주의 깜빡임',

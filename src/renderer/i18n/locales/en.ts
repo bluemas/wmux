@@ -2363,6 +2363,8 @@ export const en = {
   'settings.sidebarSortManual': 'Manual',
   'settings.sidebarSortAttention': 'Attention',
   'settings.sidebarSortRecent': 'Recent activity',
+  'settings.sidebarShowPorts': 'Show port numbers',
+  'settings.sidebarShowPortsDesc': 'Show listening port numbers in sidebar workspace rows.',
   'settings.sidebarShowPaneCoordinates': 'Show pane coordinates',
   'settings.sidebarShowPaneCoordinatesDesc': 'Show the auto-generated w1-2 style coordinate in the agent roster for panes you have not labeled. On by default. A pane you rename always shows its label either way.',
   'settings.attentionBlink': 'Attention blink',

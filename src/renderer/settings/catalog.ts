@@ -115,6 +115,7 @@ export const SETTINGS_CATALOG: SettingsCatalogEntry[] = [
   { id: 'chrome', tab: 'appearance', labelKey: 'settings.chromePreset', descKey: 'settings.chromePresetDesc', synonyms: 'density compact comfortable' },
   { id: 'sidebarpos', tab: 'appearance', labelKey: 'settings.sidebarPosition', descKey: 'settings.sidebarPositionDesc', synonyms: 'sidebar left right dock' },
   { id: 'sidebarattention', tab: 'appearance', labelKey: 'settings.sidebarSort', descKey: 'settings.sidebarSortDesc', synonyms: 'needs you waiting attention sort order recent activity manual pin top 대기 정렬 순서 최근' },
+  { id: 'sidebarports', tab: 'appearance', labelKey: 'settings.sidebarShowPorts', descKey: 'settings.sidebarShowPortsDesc', synonyms: 'sidebar port ports localhost listening number 사이드바 포트 번호 표시' },
   { id: 'sidebarpanecoordinates', tab: 'appearance', labelKey: 'settings.sidebarShowPaneCoordinates', descKey: 'settings.sidebarShowPaneCoordinatesDesc', synonyms: 'roster coordinate w1-2 pane name label unnamed clutter agent' },
   { id: 'attentionblink', tab: 'appearance', labelKey: 'settings.attentionBlink', descKey: 'settings.attentionBlinkDesc', synonyms: 'blink pulse flash animate needs you waiting question approval remind 깜빡임 알림' },
   { id: 'attentionblinkfinished', tab: 'appearance', labelKey: 'settings.attentionBlinkFinished', descKey: 'settings.attentionBlinkFinishedDesc', synonyms: 'finished done dot turn complete pulse 완료 점' },

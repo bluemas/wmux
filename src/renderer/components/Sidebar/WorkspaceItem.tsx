@@ -247,7 +247,8 @@ function WorkspaceContextLine({ metadata, onPortClick, actions, metaHiddenOnHove
 }): React.ReactElement | null {
   const t = useT();
   const { lineRef, branchRef, tier } = useGitLineTier([metadata.gitBranch, metadata.gitSync, metadata.pr, question]);
-  const ports = metadata.listeningPorts ?? [];
+  const showPorts = useStore((s) => s.sidebarShowPorts);
+  const ports = showPorts ? (metadata.listeningPorts ?? []) : [];
   const hasContext = ports.length > 0;
   const note = metadata.lastNotificationText;
   if (!question && !metadata.gitBranch && !hasContext && !note) return null;

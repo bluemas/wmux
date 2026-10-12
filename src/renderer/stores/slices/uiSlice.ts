@@ -660,6 +660,9 @@ export interface UISlice {
    *  roster's muted trailer for panes that have no explicit label. On by
    *  default so nobody's roster changes without them touching the setting; a
    *  user-set pane label is unaffected either way and always shows. */
+  sidebarShowPorts: boolean;
+  setSidebarShowPorts: (enabled: boolean) => void;
+
   sidebarShowPaneCoordinates: boolean;
   setSidebarShowPaneCoordinates: (enabled: boolean) => void;
 
@@ -1831,6 +1834,12 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
   setSidebarTaskGroupExpanded: (ownerId, expanded) => set((state) => {
     if (!ownerId) return;
     state.sidebarTaskGroupExpanded[ownerId] = expanded;
+  }),
+
+  sidebarShowPorts: true,
+
+  setSidebarShowPorts: (enabled) => set((state) => {
+    state.sidebarShowPorts = enabled;
   }),
 
   sidebarShowPaneCoordinates: true,
