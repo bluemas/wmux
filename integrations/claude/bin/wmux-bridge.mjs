@@ -583,9 +583,12 @@ const TASK_STOP_LINE_RE = /"name"\s*:\s*"(?:TaskStop|KillShell|KillBash)"/;
 // timeout and was moved to the background, a Monitor watch, and an async
 // subagent. A named teammate agent ("Spawned successfully") gets no
 // task-notification, so it is not counted — it would never settle.
+// Every shape is anchored at the start of the result: a foreground result
+// that merely quotes one (a Read of a log, a `cat` of a transcript) started
+// nothing, and counting it would keep the pane running for the whole turn.
 const BACKGROUND_TASK_ID_RE = new RegExp([
-  /running in background with ID:\s*([\w-]+)/.source,
-  /moved to the background \(ID:\s*([\w-]+)\)/.source,
+  /^\s*Command running in background with ID:\s*([\w-]+)/.source,
+  /^\s*Command\b[^\n]*?moved to the background \(ID:\s*([\w-]+)\)/.source,
   /^\s*Monitor started \(task\s+([\w-]+)/.source,
   /^\s*Async agent launched successfully[\s\S]*?agentId:\s*([\w-]+)/.source,
 ].join('|'), 'i');
