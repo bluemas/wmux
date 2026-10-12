@@ -13,6 +13,11 @@
       "name": "wmux-claude-integration",
       "source": "./integrations/claude",
       "description": "Deterministic Claude Code → wmux notifications via PostToolUse / Stop / SubagentStop / SessionStart hooks. Replaces wmux's regex-based agent detector with 100%-accurate hook signals when installed."
+    },
+    {
+      "name": "wmux-turn-signals",
+      "source": "./integrations/claude-mod",
+      "description": "Claude Code mod (2.1.296+): reports an interrupted turn (Esc / Ctrl+C), which fires no classic Stop hook, so the wmux pane settles instead of staying 'running'. Use alongside the classic hooks."
     }
   ]
 }

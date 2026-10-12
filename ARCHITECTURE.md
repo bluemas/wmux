@@ -60,14 +60,13 @@ src/
 │   ├── ipc/           Electron IPC handlers (pty, fs, metadata)
 │   ├── mcp/           MCP auto-registration in ~/.claude.json
 │   ├── a2a/           ClaudeWorker (background task execution)
-│   ├── company/       Company templates + worktree management
 │   ├── security/      Navigation policy, SSRF validation
 │   └── browser-session/  CDP proxy, profile manager, port allocation
 ├── renderer/          React 19 UI
 │   ├── components/    Terminal, Browser, Pane, Sidebar, Palette
 │   ├── stores/        Zustand slices (workspace, surface, a2a, company, ui)
 │   ├── hooks/         useRpcBridge, useKeyboard, useTerminal
-│   └── company/       Agent persona, cost estimator, message queue
+│   └── company/       Company-mode message queue and templates
 ├── mcp/               MCP server (Claude Code integration)
 │   ├── playwright/    Browser automation tools (30+ Playwright tools)
 │   └── a2a/           wmux-a2a MCP server (company mode comms)

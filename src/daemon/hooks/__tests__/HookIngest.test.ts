@@ -652,6 +652,42 @@ describe('HookIngest', () => {
       });
     });
 
+    it('an interrupted-turn Stop settles the pane without a completion', () => {
+      ingest.handle(makeSignal({ ptyId: 'pty-a', kind: 'agent.user_prompt_submit' }));
+      ingest.handle(makeSignal({ ptyId: 'pty-a', kind: 'agent.activity', payload: { tool_name: 'Bash' } }));
+      fixture.advance(1_000);
+      ingest.handle(makeSignal({
+        ptyId: 'pty-a',
+        payload: { wmux_turn_reason: 'aborted', wmux_turn_ended_at: 10_500 },
+      }));
+      vi.advanceTimersByTime(DEFAULT_ALARM_WINDOW_MS * 2);
+      expect(fixture.emitted.at(-1)?.data).toMatchObject({
+        hookKind: 'agent.stop',
+        decision: 'internal',
+        status: 'complete',
+      });
+    });
+
+    it('an interrupted-turn Stop that lands after the next prompt is dropped', () => {
+      // The mod sends the Stop a second after the interrupt; the user typed a
+      // new prompt in between, so that prompt's turn owns the pane.
+      ingest.handle(makeSignal({ ptyId: 'pty-a', kind: 'agent.user_prompt_submit' }));
+      fixture.advance(1_000);
+      ingest.handle(makeSignal({ ptyId: 'pty-a', kind: 'agent.user_prompt_submit' }));
+      ingest.handle(makeSignal({ ptyId: 'pty-a', kind: 'agent.activity', payload: { tool_name: 'Bash' } }));
+      const before = fixture.emitted.length;
+      expect(ingest.handle(makeSignal({
+        ptyId: 'pty-a',
+        payload: { wmux_turn_reason: 'aborted', wmux_turn_ended_at: 10_500 },
+      }))).toEqual({ ok: true });
+      expect(fixture.emitted).toHaveLength(before);
+      // The new turn's own Stop still announces.
+      fixture.advance(100);
+      ingest.handle(makeSignal({ ptyId: 'pty-a' }));
+      vi.advanceTimersByTime(DEFAULT_ALARM_WINDOW_MS);
+      expect(fixture.emitted.at(-1)?.data).toMatchObject({ decision: 'emit', status: 'complete' });
+    });
+
     it('an answered cue cancels a pending attention window before its broadcast', () => {
       ingest.handle(makeSignal({ ptyId: 'pty-a', kind: 'agent.activity', payload: { tool_name: 'Bash' } }));
       ingest.handle(makeSignal({ ptyId: 'pty-a', kind: 'agent.awaiting_input' }));

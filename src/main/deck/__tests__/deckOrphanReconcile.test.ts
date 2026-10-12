@@ -6,16 +6,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 // windows-latest each fsync+rename cost 100-800 ms in the CI timeline, so the
 // case ran past 5 s. Same writes, same files and format, minus the fsync.
 vi.mock('../../../daemon/util/atomicWrite', async (importOriginal) => {
-  const real = await importOriginal<typeof import('../../../daemon/util/atomicWrite')>();
-  type SyncOpts = Parameters<typeof real.atomicWriteJSONSync>[2];
-  type AsyncOpts = Parameters<typeof real.atomicWriteJSON>[2];
-  return {
-    ...real,
-    atomicWriteJSONSync: (file: string, data: unknown, opts?: SyncOpts) =>
-      real.atomicWriteJSONSync(file, data, { ...(opts ?? {}), durable: false } as SyncOpts),
-    atomicWriteJSON: (file: string, data: unknown, opts?: AsyncOpts) =>
-      real.atomicWriteJSON(file, data, { ...(opts ?? {}), durable: false } as AsyncOpts),
-  };
+  const { withoutFsync } = await import('../../../test-utils/nonDurableAtomicWrite');
+  return withoutFsync(await importOriginal());
 });
 import fs from 'node:fs';
 import path from 'node:path';

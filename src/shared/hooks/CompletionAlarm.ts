@@ -50,7 +50,10 @@ const noop = (): void => undefined;
  *                  a lead-turn end). `leftoverWork` is the count of
  *                  background tasks still running at stop time, mined from
  *                  the transcript tail by the bridge (>0 → the turn has NOT
- *                  actually ended; treat as working).
+ *                  actually ended; treat as working). `interrupted` marks
+ *                  a turn the user cut short (Esc / Ctrl+C): it ends the
+ *                  turn but finished nothing, so it never opens the done
+ *                  window.
  * - `session`    — session boundary. Resets the turn gate.
  * - `answered`   — a pending question/approval was resolved. Cancels a
  *                  pending attention window.
@@ -58,7 +61,7 @@ const noop = (): void => undefined;
 export type AlarmCue =
   | { class: 'working' }
   | { class: 'attention'; firm?: boolean }
-  | { class: 'stop'; child: boolean; leftoverWork: number }
+  | { class: 'stop'; child: boolean; leftoverWork: number; interrupted?: boolean }
   | { class: 'session' }
   | { class: 'answered' };
 
@@ -233,6 +236,14 @@ export class CompletionAlarm {
           return 'drop';
         }
         this.cancelPending(state, key, 'superseded by stop');
+        if (cue.interrupted) {
+          // The user stopped the turn themselves; announcing it as finished
+          // would be wrong. Close the gate like a confirmed stop so a stray
+          // later stop for the same turn cannot announce it either.
+          state.seenWorking = false;
+          state.announced = true;
+          return 'drop';
+        }
         if (cue.leftoverWork > 0) {
           // The turn has not actually ended: background work is running.
           // Treat as working evidence so the eventual real stop (after the
@@ -354,6 +365,19 @@ export class CompletionAlarm {
  * `agent.stop_failure` is a turn END that is NOT a completion — see the case
  * below for why it rides `attention` rather than `stop`.
  */
+/**
+ * An interrupted-turn Stop (sent by the Claude Code mod a second or more after
+ * the interrupt, stamped `wmux_turn_ended_at`) that lost the race to the next
+ * prompt: `promptAt`, when the pane's latest UserPromptSubmit landed, is
+ * after the interrupt, so that prompt's turn owns the pane and the Stop must
+ * have no effect.
+ */
+export function isStaleInterruptedStop(signal: AgentSignal, promptAt: number | undefined): boolean {
+  if (signal.kind !== 'agent.stop' || signal.payload?.['wmux_turn_reason'] !== 'aborted') return false;
+  const endedAt = signal.payload['wmux_turn_ended_at'];
+  return typeof endedAt === 'number' && promptAt !== undefined && promptAt > endedAt;
+}
+
 export function normalizeHookCue(signal: AgentSignal): AlarmCue {
   switch (signal.kind) {
     case 'agent.activity':
@@ -389,7 +413,10 @@ export function normalizeHookCue(signal: AgentSignal): AlarmCue {
       const leftoverWork = typeof raw === 'number' && Number.isFinite(raw) && raw > 0
         ? Math.floor(raw)
         : 0;
-      return { class: 'stop', child: false, leftoverWork };
+      // Sent by the Claude Code mod (integrations/claude-mod) for an
+      // interrupted turn, which fires no classic Stop of its own.
+      const interrupted = signal.payload?.['wmux_turn_reason'] === 'aborted';
+      return { class: 'stop', child: false, leftoverWork, ...(interrupted ? { interrupted } : {}) };
     }
   }
 }

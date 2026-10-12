@@ -57,7 +57,7 @@ import { readLastAssistantMessage } from '../../claude/lastAssistantMessage';
 import { deliverBrainPtyHookSignal } from '../../deck/brainPtyHookBus';
 import { noteBrainHookSignal } from '../../deck/moaPaneFeed';
 import { getWorkspaceMirror, type WorkspaceMirror } from '../../workspace/WorkspaceMirror';
-import { normalizeHookCue, type CompletionAlarm } from '../../../shared/hooks/CompletionAlarm';
+import { isStaleInterruptedStop, normalizeHookCue, type CompletionAlarm } from '../../../shared/hooks/CompletionAlarm';
 import type { AgentLastMessage } from '../../../shared/events';
 import type { NotificationCategory } from '../../../shared/types';
 import os from 'node:os';
@@ -496,6 +496,8 @@ export function registerHooksRpc(
   // workspaceCache/floodMeter) so it lives for the handler's lifetime and is
   // cleared wholesale on the returned cleanup (see ACTIVITY_THROTTLE_MS).
   const activityThrottle = createLeadingEdgeThrottle(ACTIVITY_THROTTLE_MS);
+  // When each pane's latest UserPromptSubmit landed (see isStaleInterruptedStop).
+  const lastPromptAtByPty = new Map<string, number>();
   // Rate limit for the DEDUPED lifecycle tee, keyed `${ptyId}:${kind}`.
   //
   // A 'dedup' decision does not mean "already announced by the detector" — for
@@ -646,6 +648,11 @@ export function registerHooksRpc(
       // the per-pane notification. Signal health (above) still records.
       return { ok: false, reason: 'no-workspace-match' };
     }
+
+    // The daemon-unreachable twin of HookIngest's drop: an interrupted-turn
+    // Stop that lands after the next prompt has no effect at all.
+    if (signal.kind === 'agent.user_prompt_submit') lastPromptAtByPty.set(ptyId, Date.now());
+    if (isStaleInterruptedStop(signal, lastPromptAtByPty.get(ptyId))) return { ok: true };
 
     // Hook authority: EVERY resolved bridge signal (emit-class or not —
     // SessionStart and per-tool agent.activity count) marks this pane as

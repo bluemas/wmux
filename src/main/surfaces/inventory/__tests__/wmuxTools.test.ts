@@ -348,7 +348,9 @@ describe('provider inventory wmux tools', () => {
   });
 });
 
-describe('end to end with writers over fixture homes', () => {
+// Each case runs the real writers twice: 8-12 fsync'd writes (config, backup,
+// surfaces store); loaded Windows disks can exceed 5 s.
+describe('end to end with writers over fixture homes', { timeout: 30_000 }, () => {
   it('claude: disable two wmux tools, reload inventory, re-enable and restore', async () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-e2e-'));
     try {

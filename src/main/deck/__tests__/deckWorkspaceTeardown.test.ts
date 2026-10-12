@@ -1,4 +1,14 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+
+// Teardown, archive and race logic is what these cases check, not crash
+// durability. deckWorkStore writes with `durable: true`; on windows-latest each
+// fsync+rename cost 100-800 ms in the CI timeline, and the cases here ran past
+// their timeouts (5 s, and 30 s for the 205-write archive cap). Same writes,
+// same files and format, minus the fsync.
+vi.mock('../../../daemon/util/atomicWrite', async (importOriginal) => {
+  const { withoutFsync } = await import('../../../test-utils/nonDurableAtomicWrite');
+  return withoutFsync(await importOriginal());
+});
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -374,8 +384,8 @@ describe('deckWorkspaceTeardown — archive before clearing (workspace removal)'
     expect(ids).toHaveLength(MAX_ARCHIVED_DECK_WORKS);
     expect(ids[0]).toBe(`w-${extra}`);
     expect(ids[ids.length - 1]).toBe(`w-${MAX_ARCHIVED_DECK_WORKS + extra - 1}`);
-    // 200+ fsync'd atomic writes: ~0.3 s locally, but a loaded Windows CI
-    // runner has gone past vitest's 5 s default.
+    // 205 atomic writes, each re-reading the growing archive: the fsync is
+    // mocked out above, but a loaded Windows runner still needs headroom.
   }, 30_000);
 });
 

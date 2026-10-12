@@ -1,4 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+
+// The prune cases check what `wmux deck` reports and which records survive, not
+// crash durability. The Deck stores write with `durable: true`; on
+// windows-latest each fsync+rename cost 100-800 ms in the CI timeline, and a
+// prune case ran past 5 s. Same writes, same files and format, minus the fsync.
+vi.mock('../../../daemon/util/atomicWrite', async (importOriginal) => {
+  const { withoutFsync } = await import('../../../test-utils/nonDurableAtomicWrite');
+  return withoutFsync(await importOriginal());
+});
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';

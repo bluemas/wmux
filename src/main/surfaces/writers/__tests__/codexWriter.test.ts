@@ -281,7 +281,8 @@ describe('Codex surface writer', () => {
     expect(alpha3.enabled).toBe(true);
   });
 
-  it('maintains mcp-tool disabled_tools and enabled_tools correctly', async () => {
+  // 12 fsync'd writes (config, backup, surfaces store) on a loaded runner; Windows disks can exceed 5 s.
+  it('maintains mcp-tool disabled_tools and enabled_tools correctly', { timeout: 30_000 }, async () => {
     const inv = await readInventory('codex', fixture.deps);
     const oldTool = inv.items.find((i) => i.name === 'oldTool' && i.kind === 'mcp-tool')!;
     const activeTool = inv.items.find((i) => i.name === 'activeTool' && i.kind === 'mcp-tool')!;

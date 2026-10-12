@@ -311,7 +311,9 @@ describe('readClaudeInventory', () => {
     }
   });
 
-  it('runs end-to-end with Claude writer: disable, read disabled, enable, read enabled', async () => {
+  // 14 fsync'd writes across disable and enable (settings, backup, surfaces
+  // store); loaded Windows disks can exceed 5 s.
+  it('runs end-to-end with Claude writer: disable, read disabled, enable, read enabled', { timeout: 30_000 }, async () => {
     const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-e2e-home-'));
     const tempProj = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-e2e-proj-'));
     try {
