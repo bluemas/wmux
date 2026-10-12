@@ -529,14 +529,15 @@ function extractPermissionModeFromTranscript(transcriptPath) {
 // Leftover background-work mining for Stop-class envelopes.
 //
 // A Stop hook fires when the lead turn ends EVEN IF background tasks the
-// agent started (run_in_background Bash) are still running — and while they
+// agent started (shells, monitors, async subagents) are still running — and while they
 // run, no further hook events arrive to rebut a premature "finished"
 // alarm. The count below lets the daemon's verdict gate treat such a Stop
 // as "still working" instead of "done".
 //
 // Verified transcript shapes (live spike, 2026-08-15):
 //  - START: an assistant record whose message.content[] has a tool_use block
-//    with name "Bash" and input.run_in_background === true. NOTE: its
+//    whose immediate tool_result names a task left running (see
+//    BACKGROUND_TASK_ID_RE; first seen as a run_in_background Bash). NOTE: that
 //    tool_result ("Command running in background with ID: …") is written
 //    IMMEDIATELY at dispatch — it is NOT a completion signal, so plain
 //    tool_use↔tool_result pairing always balances to zero.
@@ -576,7 +577,22 @@ function extractPermissionModeFromTranscript(transcriptPath) {
 // verbose turn) reads as no leftover — the fail-open direction.
 const TASK_STOP_TOOLS = new Set(['TaskStop', 'KillShell', 'KillBash']);
 const TASK_STOP_LINE_RE = /"name"\s*:\s*"(?:TaskStop|KillShell|KillBash)"/;
-const BACKGROUND_TASK_ID_RE = /running in background with ID:\s*([\w-]+)/i;
+// The immediate tool_result of every dispatch that leaves a task running past
+// its own call, each settled by a task-notification naming the tool_use id:
+// a background shell (Bash or PowerShell), a foreground shell that outran its
+// timeout and was moved to the background, a Monitor watch, and an async
+// subagent. A named teammate agent ("Spawned successfully") gets no
+// task-notification, so it is not counted — it would never settle.
+const BACKGROUND_TASK_ID_RE = new RegExp([
+  /running in background with ID:\s*([\w-]+)/.source,
+  /moved to the background \(ID:\s*([\w-]+)\)/.source,
+  /^\s*Monitor started \(task\s+([\w-]+)/.source,
+  /^\s*Async agent launched successfully[\s\S]*?agentId:\s*([\w-]+)/.source,
+].join('|'), 'i');
+const backgroundTaskId = (text) => {
+  const m = text.match(BACKGROUND_TASK_ID_RE);
+  return m ? (m[1] ?? m[2] ?? m[3] ?? m[4]) : null;
+};
 function countLeftoverBackgroundTasks(transcriptPath) {
   try {
     if (!existsSync(transcriptPath)) return 0;
@@ -602,7 +618,7 @@ function countLeftoverBackgroundTasks(transcriptPath) {
     const stoppedTaskIds = new Set(); // TASK ids (not tool_use ids) the agent stopped
     for (const line of lines) {
       // Cheap pre-filter: only these marker substrings can contribute.
-      if (!line.includes('"run_in_background"') && !line.includes('<task-notification>')
+      if (!line.includes('"tool_use"') && !line.includes('<task-notification>')
           && !line.includes('"tool_result"') && !line.includes('"type":"user"')
           && !TASK_STOP_LINE_RE.test(line)) {
         continue;
@@ -629,11 +645,9 @@ function countLeftoverBackgroundTasks(transcriptPath) {
       if (content) {
         for (const block of content) {
           if (!block || typeof block !== 'object') continue;
-          // START shape — a run_in_background Bash dispatch.
-          if (block.type === 'tool_use'
-            && block.name === 'Bash' && block.input
-            && block.input.run_in_background === true && typeof block.id === 'string'
-          ) {
+          // START candidate — any dispatch; its immediate result decides
+          // below whether it left a background task running.
+          if (block.type === 'tool_use' && typeof block.id === 'string') {
             startedIds.add(block.id);
           }
           // STOPPED shape — the agent stopped a background task itself. The
@@ -688,10 +702,9 @@ function countLeftoverBackgroundTasks(transcriptPath) {
       // A rejected attempt (error tool_result) or a missing result never
       // settles — treating either as leftover would permanently suppress
       // the completion alarm.
-      const resultText = resultTexts.get(id) ?? '';
-      if (!/running in background/i.test(resultText)) continue;
-      const taskId = resultText.match(BACKGROUND_TASK_ID_RE)?.[1];
-      if (taskId && stoppedTaskIds.has(taskId)) continue;
+      const taskId = backgroundTaskId(resultTexts.get(id) ?? '');
+      if (!taskId) continue;
+      if (stoppedTaskIds.has(taskId)) continue;
       leftover++;
     }
     return leftover;

@@ -195,7 +195,7 @@ describe('countLeftoverBackgroundTasks', () => {
     expect(count(p)).toBe(0);
   });
 
-  it('non-Bash background tools are ignored', () => {
+  it('a background dispatch with no start result is not counted', () => {
     const p = fixture('other-tool.jsonl', [
       {
         type: 'assistant',
@@ -400,6 +400,75 @@ describe('countLeftoverBackgroundTasks — scoped to the turn that just ended', 
       bgStart('call_old'),
       bgStartResultWithTaskId('call_old', 'bold'),
       { type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'next' }] } },
+    ]);
+    expect(count(p)).toBe(0);
+  });
+});
+
+describe('countLeftoverBackgroundTasks — every task-notified background shape (live MDir pane)', () => {
+  const use = (id: string, name: string, input: Record<string, unknown>) => ({
+    type: 'assistant',
+    message: { role: 'assistant', content: [{ type: 'tool_use', id, name, input }] },
+  });
+  const result = (id: string, text: string) => ({
+    type: 'user',
+    message: { role: 'user', content: [{ tool_use_id: id, type: 'tool_result', content: text }] },
+  });
+  const prompt = { type: 'user', message: { role: 'user', content: 'fix the tree scroll' } };
+
+  it('a PowerShell background shell counts', () => {
+    const p = fixture('ps-bg.jsonl', [
+      prompt,
+      use('call_ps', 'PowerShell', { command: 'npm test', run_in_background: true }),
+      result('call_ps', 'Command running in background with ID: b0emveo1o. Output is being written to: C:/x'),
+    ]);
+    expect(count(p)).toBe(1);
+  });
+
+  it('a foreground shell moved to the background at its timeout counts until notified', () => {
+    const lines = [
+      prompt,
+      use('call_fg', 'PowerShell', { command: 'npx jest TreeView' }),
+      result('call_fg', 'Command did not complete within its 300s timeout and was moved to the background (ID: bn9u0okhm). Output is being written to: C:/x'),
+    ];
+    expect(count(fixture('fg-moved.jsonl', lines))).toBe(1);
+    expect(count(fixture('fg-moved-done.jsonl', [...lines, notificationRecord('call_fg', 'completed')]))).toBe(0);
+  });
+
+  it('a Monitor watch counts until notified', () => {
+    const lines = [
+      prompt,
+      use('call_mon', 'Monitor', { description: 'wait for jest', timeout_ms: 600000, command: 'until [ -s out ]; do sleep 5; done' }),
+      result('call_mon', 'Monitor started (task brmti50mx, expires in 10m unless the source ends first; you get one notice at expiry — re-arm if you still need the watch).'),
+    ];
+    expect(count(fixture('monitor.jsonl', lines))).toBe(1);
+    expect(count(fixture('monitor-done.jsonl', [...lines, notificationAttachment('call_mon', 'completed')]))).toBe(0);
+  });
+
+  it('an async subagent counts; a TaskStop on its agent id settles it', () => {
+    const lines = [
+      prompt,
+      use('call_ag', 'Agent', { description: 'review', prompt: 'x', run_in_background: true }),
+      result('call_ag', 'Async agent launched successfully. (This tool result is internal metadata.) agentId: a02ed4b4144157fa5 (internal ID)'),
+    ];
+    expect(count(fixture('agent.jsonl', lines))).toBe(1);
+    expect(count(fixture('agent-stopped.jsonl', [...lines, use('call_stop', 'TaskStop', { task_id: 'a02ed4b4144157fa5' })]))).toBe(0);
+  });
+
+  it('a named teammate agent is not counted: it never gets a task-notification', () => {
+    const p = fixture('teammate.jsonl', [
+      prompt,
+      use('call_tm', 'Agent', { name: 'fix-app', description: 'fix', prompt: 'x' }),
+      result('call_tm', 'Spawned successfully. (This tool result is internal metadata.) agent_id: afix-app-1646467c06862399 name: fix-app'),
+    ]);
+    expect(count(p)).toBe(0);
+  });
+
+  it('a foreground result that merely mentions a monitor is not a start', () => {
+    const p = fixture('mention.jsonl', [
+      prompt,
+      use('call_r', 'Read', { file_path: 'notes.md' }),
+      result('call_r', '1\tThe log said: Monitor started (task b1, expires in 10m)'),
     ]);
     expect(count(p)).toBe(0);
   });
