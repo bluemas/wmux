@@ -132,7 +132,8 @@ describe('claudeWriter', () => {
     );
   }
 
-  it('toggles user MCP server disable and re-enable with backup and round-trip equality', async () => {
+  // 12 fsync'd writes (config, backup, surfaces store) on a loaded runner; Windows disks can exceed 5 s.
+  it('toggles user MCP server disable and re-enable with backup and round-trip equality', { timeout: 30_000 }, async () => {
     seedFixtures();
     const deps = makeDeps(tempHome, tempProj);
     const inv = await readInventory('claude', { homeDir: tempHome, projectDir: tempProj, run: deps.run });

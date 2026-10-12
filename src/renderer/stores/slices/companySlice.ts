@@ -145,8 +145,8 @@ export const createCompanySlice: StateCreator<StoreState, [['zustand/immer', nev
     const lead: TeamMember = {
       id: generateId('member'),
       name: leadName,
-      // See src/company/renderer/store.ts — leadPreset ?? 'project-manager'
-      // keeps the historical default when templates don't supply a preset.
+      // leadPreset ?? 'project-manager' keeps the historical default when
+      // templates don't supply a preset.
       preset: leadPreset ?? 'project-manager',
       workspaceId: '',
       status: 'idle',

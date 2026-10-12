@@ -1,0 +1,17 @@
+{
+  "name": "wmux-turn-signals",
+  "version": "0.1.0",
+  "description": "Reports an interrupted Claude Code turn (Esc / Ctrl+C), which fires no classic Stop hook, to wmux so the pane settles instead of staying 'running'. Requires Claude Code 2.1.296+ and the classic wmux hooks.",
+  "author": {
+    "name": "wmux",
+    "url": "https://github.com/openwong2kim/wmux"
+  },
+  "homepage": "https://github.com/openwong2kim/wmux",
+  "license": "MIT",
+  "keywords": [
+    "wmux",
+    "terminal",
+    "hooks",
+    "mod"
+  ]
+}

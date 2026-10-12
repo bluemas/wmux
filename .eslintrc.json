@@ -34,6 +34,21 @@
   "overrides": [
     {
       "files": [
+        "integrations/claude-mod/**/*.ts"
+      ],
+      "rules": {
+        "import/no-unresolved": [
+          "error",
+          {
+            "ignore": [
+              "^claude-code(/|$)"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "files": [
         "src/renderer/**/*.ts",
         "src/renderer/**/*.tsx"
       ],
