@@ -89,7 +89,7 @@ import { useIpc } from '../../hooks/useIpc';
 import type { SessionData, PaneLeaf, Pane, StashedPane, Surface, Workspace } from '../../../shared/types';
 import { FIRST_RUN_REOPEN_EVENT } from '../../../shared/firstRun';
 import { isFileDrag } from '../../../shared/dragDrop';
-import { terminalRegistry } from '../../hooks/useTerminal';
+import { persistColdFramesNow, terminalRegistry } from '../../hooks/useTerminal';
 import { resolvePtyIdsToClear } from '../../hooks/reconcileWithReQuery';
 import { runWithProgressTimeout } from '../../hooks/reconcileProgressTimeout';
 import { createLateReconcileOnConnect } from '../../hooks/lateReconcileOnConnect';
@@ -2013,6 +2013,18 @@ export default function AppLayout() {
     return () => {
       window.removeEventListener('beforeunload', saveSessionGuarded);
       registerSessionSaver(null);
+    };
+  }, []);
+
+  // Each terminal's last screen, for the first reveal after a restart
+  // (coldFrame.ts). On quit, and every minute for an exit that skips
+  // beforeunload (an installer update, a crash).
+  useEffect(() => {
+    window.addEventListener('beforeunload', persistColdFramesNow);
+    const id = window.setInterval(persistColdFramesNow, 60_000);
+    return () => {
+      window.removeEventListener('beforeunload', persistColdFramesNow);
+      window.clearInterval(id);
     };
   }, []);
 
