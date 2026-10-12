@@ -26,11 +26,13 @@ import Button from '../../ui/Button';
 import { MoaDockContext, NEEDS_YOU_ROW } from './MoaWaitingOnYou';
 import { useDeckHeaderSlot } from '../../Deck/deckHeaderSlot';
 import { FOCUS_RING } from '../../focusRing';
-import type { ChatBridgeApi, TurnEvent } from '../../../../shared/transcript/turnEvents';
+import type { ChatBridgeApi } from '../../../../shared/transcript/turnEvents';
 import type { MoaApproval } from '../../../../shared/moa';
 import '../moa.css';
 import { mergeLocalFleetEvents } from './localFleetEvents';
 import { MoaGoalStrip } from '../MoaGoalStrip';
+import { claudeSetupScreen } from '../../../../shared/claudeFirstRun';
+import { MOA_WAKE_TEXT, WAKE_PREFIX, hideMoaWakes } from '../../../../shared/moaTranscriptRows';
 
 /** The preload's `deck.moa.transcript` (main reads the HQ brain; no pty id). */
 export type MoaTranscriptApi = NonNullable<NonNullable<NonNullable<Window['electronAPI']>['deck']>['moa']>['transcript'];
@@ -66,30 +68,7 @@ export function tidyMoaUserText<E extends { kind: string; text?: string }>(event
       : e);
 }
 
-/**
- * The prompts main types for Moa itself (pane events, a fleet snapshot, the
- * decision resume lines, Wake, a loop's kickoff, the startup reconcile) are not
- * the operator's words: they never draw as a user bubble. Each becomes an
- * invisible turn start, so the turn still begins there.
- */
-// Start-anchored, and only openings main itself writes: an operator prompt
-// (even one main prefixed with context blocks) never matches.
-const MOA_WAKE_TEXT = new RegExp('^\\s*(?:' + [
-  String.raw`\[pane-events\]`,
-  String.raw`\[fleet-snapshot\]`,
-  String.raw`The operator (?:just resolved|DISMISSED) the decision you raised`,
-  String.raw`A decision you (?:SELF-RESOLVED|raised has been pending too long)`,
-  String.raw`The operator pressed the Wake button`,
-  String.raw`The loop above has just started`,
-  String.raw`A human request is still active after wmux startup`,
-].join('|') + ')');
-const WAKE_PREFIX = 'moa-wake:';
-
-export function hideMoaWakes(events: readonly TurnEvent[]): TurnEvent[] {
-  return events.map((e) => (e.kind === 'user_text' && MOA_WAKE_TEXT.test(e.text)
-    ? { id: `${WAKE_PREFIX}${e.id}`, kind: 'meta' as const, subtype: 'turn_started' as const, label: '', ...(e.ts !== undefined ? { ts: e.ts } : {}) }
-    : e));
-}
+export { hideMoaWakes };
 
 export function moaTranscriptBridge(
   ptyId: string,
@@ -451,6 +430,43 @@ export default function MoaTranscriptChat({ ptyId, busy, onSend, onInterrupt, on
                 <UserText>{item.text}</UserText>
                 {item.failed === undefined
                   ? <p className="wmux-chat-pending-caption">{t('chat.pendingSent')}</p>
+                  : item.tuiDialog && claudeSetupScreen(item.tuiDialog.excerpt) === 'first-run'
+                  // Claude Code's one-time setup (theme, sign-in): the raw
+                  // screen means nothing here, so say plainly what to do.
+                  ? <div className="wmux-chat-pending-caption wmux-moa-setup-card flex flex-col items-start gap-1.5" role="alert" data-moa-chat-first-run>
+                      <strong>{t('moa.panel.firstRunTitle')}</strong>
+                      <span>{t('moa.panel.firstRunBody')}</span>
+                      <ol className="list-decimal pl-5">
+                        <li>{t('moa.panel.firstRunStep1')}</li>
+                        <li>{t('moa.panel.firstRunStep2')}</li>
+                        <li>{t('moa.panel.firstRunStep3')}</li>
+                      </ol>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Button variant="secondary" size="sm" onClick={onTerminal} data-moa-chat-dialog-terminal>{t('moa.panel.firstRunOpen')}</Button>
+                        <button type="button" className="underline underline-offset-2" disabled={busy} onClick={() => retrySend(item)} data-moa-chat-retry>
+                          {t('moa.panel.retrySend')}
+                        </button>
+                      </div>
+                    </div>
+                  : item.tuiDialog && claudeSetupScreen(item.tuiDialog.excerpt) === 'folder-trust'
+                  // Claude's folder-trust question. Trusting is the user's
+                  // decision, never answered for them: explain it and let them
+                  // choose in the terminal (its default is "No, exit").
+                  ? <div className="wmux-chat-pending-caption wmux-moa-setup-card flex flex-col items-start gap-1.5" role="alert" data-moa-chat-folder-trust>
+                      <strong>{t('moa.panel.trustTitle')}</strong>
+                      <span>{t('moa.panel.trustBody')}</span>
+                      <ol className="list-decimal pl-5">
+                        <li>{t('moa.panel.trustStep1')}</li>
+                        <li>{t('moa.panel.trustStep2')}</li>
+                        <li>{t('moa.panel.trustStep3')}</li>
+                      </ol>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Button variant="secondary" size="sm" onClick={onTerminal} data-moa-chat-dialog-terminal>{t('moa.panel.trustOpen')}</Button>
+                        <button type="button" className="underline underline-offset-2" disabled={busy} onClick={() => retrySend(item)} data-moa-chat-retry>
+                          {t('moa.panel.retrySend')}
+                        </button>
+                      </div>
+                    </div>
                   : item.tuiDialog
                   // A dialog only the TUI shows refused the send: say what it
                   // asks and offer the way to it, since the chat hides the

@@ -164,6 +164,8 @@ import { createMoaWakeHandler, setMoaWakeHandler } from '../../deck/moaWake';
 import { createMoaHandoffService } from '../../deck/moaHandoffHost';
 import { renderGoalBlock, setMoaGoalService } from '../../deck/moaGoalContract';
 import { createMoaGoalService, installMoaLevelGate } from '../../deck/moaGoalHost';
+import { reviewGuide } from '../../deck/moaGoalDelivery';
+import { ghPrService } from '../../github/GhPrService';
 import { setMoaLevelGate } from '../../deck/moaLevelGate';
 import { HANDOFF_NOTICE_OPTION, HANDOFF_OPTIONS, type MoaHandoffResolveResult } from '../../../shared/moaHandoff';
 import { MoaTranscript, type MoaTranscriptHint } from '../../deck/moaTranscript';
@@ -180,6 +182,7 @@ import { isRemoteTaskId } from '../../../shared/a2aRemote';
 import { brainReceiverReady, notifyBrainReceiverChanged, setBrainReceiver } from '../../a2a/brainReceiver';
 import {
   beginOrContinueDeckWork,
+  withdrawUndeliveredDeckWork,
   clearActiveDeckWork,
   isDeckWorkParked,
   loadActiveDeckWork,
@@ -381,6 +384,11 @@ export function modeToPermissionMode(
       return null;
   }
 }
+
+/** The startup card for a request that outlived the last shutdown. */
+export const PARKED_WORK_QUESTION =
+  'A request from before this wmux session is still on the books. Resume it, or drop it?';
+export const PARKED_WORK_DROP = 'Drop it';
 
 export function registerDeckHandler(
   getWindow: GetWindow,
@@ -840,6 +848,11 @@ export function registerDeckHandler(
     getDaemonClient: () => (opts.getDaemonClient?.() ?? null) as { rpc(method: string, params?: unknown): Promise<unknown> } | null,
   });
   setMoaGoalService(moaGoals);
+  // The Git page's review guide: only for PRs this computer's Moa delivered.
+  ghPrService.setMoaReviewGuideLookup((url) => {
+    const r = moaGoals.deliveredPr(url);
+    return r ? reviewGuide(r.contract, r.verification, r.item) : null;
+  });
   installMoaLevelGate(moaGoals, { getWindow, getDaemonClient: () => opts.getDaemonClient?.() ?? null });
 
   const moaHandoffs = opts.invokeOperatorRpc
@@ -944,7 +957,7 @@ export function registerDeckHandler(
 
   /** Persist request ownership without ever breaking a human turn. The store is
    *  synchronous so the DECK_SEND idle-check → send sequence does not yield. */
-  const beginTrackedWork = (workspaceId: string, text: string): void => {
+  const beginTrackedWork = (workspaceId: string, text: string): { workId: string; text: string } | null => {
     const humanText = text.trim();
     try {
       // A human turn re-arms a capped-out Stop gate (rule 5): whatever state
@@ -960,23 +973,25 @@ export function registerDeckHandler(
       // is — including parked, which is the fail-closed answer for a turn whose
       // content we cannot read.
       if (!humanText) {
-        if (loadActiveDeckWork(workspaceId)) return;
+        if (loadActiveDeckWork(workspaceId)) return null;
         beginOrContinueDeckWork(
           workspaceId,
           'Continue the request submitted directly in the commander terminal.',
         );
-        return;
+        return null;
       }
       // A thank-you or a greeting asks for nothing: it neither opens a request
       // Moa must finish and report, nor joins the one in flight as a follow-up.
-      if (isSmallTalk(humanText)) return;
+      if (isSmallTalk(humanText)) return null;
       const result = beginOrContinueDeckWork(workspaceId, humanText);
       if (result?.superseded) surfaceStrandedWork(workspaceId, result.superseded, 'superseded');
+      return result ? { workId: result.work.id, text: humanText } : null;
     } catch (err) {
       // A persistence failure costs autonomous follow-through, never the human's
       // immediate turn. Keep the failure visible for diagnosis.
       // eslint-disable-next-line no-console
       console.warn('[deck] failed to persist active work:', err);
+      return null;
     }
   };
 
@@ -1432,9 +1447,10 @@ export function registerDeckHandler(
     // visible to the brain. If this human turn carried a resolved decision's
     // block, it is consumed (id-scoped) below so it never re-injects.
     let injectedDecision: ReturnType<typeof loadBrainDecision> = null;
+    let tracked: { workId: string; text: string } | null = null;
     const prepareMoa = (): string => {
       if (idle) {
-        beginTrackedWork(workspaceId, text);
+        tracked = beginTrackedWork(workspaceId, text);
         coalescer?.notifyHumanSend(workspaceId);
       }
       injectedDecision = loadBrainDecision(workspaceId);
@@ -1446,7 +1462,18 @@ export function registerDeckHandler(
       }
       return withLoopContext(workspaceId, text);
     };
-    const tap = idle ? opts.onEvent : undefined;
+    // A turn the brain never received (claude missing, or a dialog refused
+    // the send before the prompt was typed) must not leave a request record
+    // behind: on the next launch it would come back as a Resume/Drop decision
+    // that blocks the composer for something Moa never saw.
+    let undelivered = false;
+    const callerTap = opts.onEvent;
+    const tap = idle
+      ? (event: BrainEvent): void => {
+          if (event.type === 'error' && (event.spawnFailed || event.tuiDialog)) undelivered = true;
+          callerTap?.(event);
+        }
+      : undefined;
     if (tap) turnTaps.set(workspaceId, tap);
     let verdict: CommanderSendResult;
     let usedMoa = false;
@@ -1471,6 +1498,15 @@ export function registerDeckHandler(
       }
     } finally {
       if (tap && turnTaps.get(workspaceId) === tap) turnTaps.delete(workspaceId);
+    }
+    const trackedWork = tracked as { workId: string; text: string } | null;
+    if (usedMoa && undelivered && trackedWork) {
+      try {
+        withdrawUndeliveredDeckWork(workspaceId, trackedWork.workId, trackedWork.text);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn('[deck] failed to withdraw undelivered work:', err);
+      }
     }
     if (usedMoa) {
       settleAmbient(workspaceId, verdict);
@@ -3985,6 +4021,15 @@ export function registerDeckHandler(
       // and wait" — at the exact moment the human has answered. The resolution
       // itself rides the prompt, so a "drop it" answer is the brain's to act on;
       // un-parking grants permission to act, not a decision about what to do.
+      // "Drop it" on the startup parked-request card is main's to act on, not
+      // the brain's: the brain may be exactly what cannot start (claude
+      // missing, setup unanswered), and a drop that waits on it leaves the
+      // request — and the card — in place. Clear the record here, no turn.
+      if (decision.question === PARKED_WORK_QUESTION && (decision.resolution ?? resolution).trim().toLowerCase() === PARKED_WORK_DROP.toLowerCase()) {
+        clearActiveDeckWork(workspaceId);
+        await clearResolvedDecision(workspaceId, decision.id).catch(() => undefined);
+        return { ok: true, decision };
+      }
       unparkDeckWork(workspaceId);
       // A human answering IS a human turn for the stop gate's purposes (rule
       // 5): the resume turn that carries this answer must meet an ARMED gate,
@@ -4200,9 +4245,8 @@ export function registerDeckHandler(
         // last-writer-wins: a real question raised before this timer fired must
         // never be clobbered by our bookkeeping.
         await raiseDecision(workspaceId, {
-          question:
-            'A request from before this wmux session is still on the books. Resume it, or drop it?',
-          options: ['Resume it', 'Drop it'],
+          question: PARKED_WORK_QUESTION,
+          options: ['Resume it', PARKED_WORK_DROP],
           context: renderActiveDeckWorkBlock(work),
         }).catch(() => {
           /* best-effort — the record stays parked either way */

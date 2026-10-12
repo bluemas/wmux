@@ -1302,6 +1302,15 @@ differently in the two places, and in the order `fleet_triage` returns.
   shows its last reply; a question shows in quotes and wraps to two lines;
   an error row shows the last `Error:` / stderr-shaped line of its terminal
   (mono), else its label; stopped and unconfirmed rows keep their label.
+- **Completion checks:** a finished pane's evidence badge reads its most
+  recently updated delegated task, only when that task completed. A newer
+  working, failed or canceled task suppresses older success evidence. Missing
+  evidence says "No verification reported"; failed checks use a red cross,
+  partial or unverified evidence stays neutral, and only an entirely verified
+  set gets a green check. Text names each state independently of colour. The
+  tooltip and accessible description identify the agent as the source and
+  list the reported checks, including failed commands. This does not change
+  the task completion gate or claim that wmux independently ran those checks.
 - **Filters and summary:** the line under the title leads with the filter
   chips — Needs you, Running, Finished, Idle, Tickets — each with its count,
   hidden at zero; pressing the pressed chip shows everything again. Then

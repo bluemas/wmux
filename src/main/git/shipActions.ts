@@ -8,8 +8,12 @@
 // refspec, so push.default / remote.*.push cannot publish other branches.
 // Each write is pinned to the branch and HEAD the user saw: it is refused if
 // either moved, checked again right before the write.
+import { describeScanFailure, describeSecretFindings, type SecretFinding } from '../../shared/secretGuard';
+import { reviewRange, scanCommits, scanDiff, spawnGitLines, type GitLines, type SecretScanResult } from './secretScan';
+import { secretGuardEnabled } from './secretGuardSetting';
 import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { getExecEnv } from '../../shared/execEnv';
@@ -48,7 +52,11 @@ export interface ShipExpect {
 }
 
 export type ShipStatusResult = { ok: true; status: ShipStatus } | { ok: false; error: string };
-export type ShipActionResult = { ok: true; url?: string } | { ok: false; error: string };
+export type ShipActionResult =
+  | { ok: true; url?: string }
+  /** `secrets`: refused because the change carries secret files or key-shaped
+   *  values (shared/secretGuard.ts); the UI words it from these. */
+  | { ok: false; error: string; secrets?: SecretFinding[]; secretScanFailed?: true };
 
 /** Longest commit message / PR title accepted. */
 export const SHIP_TEXT_MAX = 10_000;
@@ -115,6 +123,8 @@ export class ShipActions {
     private forgetPr: (cwd: string, branch: string) => void = (cwd, branch) => prStatusCache.invalidate(cwd, branch),
     private now: () => number = Date.now,
     private exists: (p: string) => boolean = existsSync,
+    /** Streams the secret check's git reads (shared/secretGuard.ts). */
+    private gitLines: (cwd: string, env?: NodeJS.ProcessEnv) => GitLines = spawnGitLines,
   ) {}
 
   private git(args: string[], cwd: string, timeout = 30_000, extraEnv: NodeJS.ProcessEnv = {}): Promise<{ stdout: string }> {
@@ -136,6 +146,14 @@ export class ShipActions {
     } catch { /* unreachable remote: unknown */ }
     this.defaultBranches.set(cwd, { value, at: this.now() });
     return value;
+  }
+
+  /** A refusal when the secret check found secret files or key-shaped values,
+   *  or could not run (fail closed); null when the change is clean. */
+  private secretRefusal(scan: SecretScanResult, action: string): ShipActionResult | null {
+    if (!scan.ok) return { ok: false, error: describeScanFailure(action), secretScanFailed: true };
+    if (scan.findings.length) return { ok: false, error: describeSecretFindings(scan.findings, action), secrets: scan.findings };
+    return null;
   }
 
   /** A merge or cherry-pick in progress in the worktree at `cwd`. */
@@ -167,6 +185,21 @@ export class ShipActions {
     };
   }
 
+  /** Runs `work` with GIT_INDEX_FILE pointing at a throwaway copy of the
+   *  worktree's index, removed afterwards. */
+  private async withIndexCopy<T>(cwd: string, work: (env: NodeJS.ProcessEnv) => Promise<T>): Promise<T> {
+    const { stdout } = await this.git(['rev-parse', '--git-path', 'index'], cwd);
+    const real = path.resolve(cwd, stdout.trim());
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'wmux-secret-index-'));
+    const copy = path.join(dir, 'index');
+    try {
+      if (existsSync(real)) copyFileSync(real, copy);
+      return await work({ GIT_INDEX_FILE: copy });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
   /** Throws Moved unless the worktree is still on `expect`'s branch at its HEAD. */
   private async verify(cwd: string, expect: ShipExpect): Promise<void> {
     const [head, branch] = await Promise.all([
@@ -183,6 +216,25 @@ export class ShipActions {
     if (msg.length > SHIP_TEXT_MAX) return { ok: false, error: 'the commit message is too long' };
     try {
       await this.verify(cwd, expect);
+      if (secretGuardEnabled()) {
+        // Staged and checked in a COPY of the index, then committed from that
+        // same copy: the commit is exactly the tree that was checked, and a
+        // refusal leaves the user's own staging as it was.
+        return await this.withIndexCopy(cwd, async (env) => {
+          await this.git(['add', '-A'], cwd, 30_000, env);
+          const refused = this.secretRefusal(await scanDiff(this.gitLines(cwd, env), ['--cached']), 'committed');
+          if (refused) return refused;
+          await this.verify(cwd, expect);
+          await this.git(['commit', '-m', msg], cwd, 60_000, env);
+          // The real index catches up with the commit, as `add -A` + `commit` leaves it.
+          try {
+            await this.git(['reset', '-q'], cwd);
+          } catch (err) {
+            return { ok: false, error: `committed, but the staging area could not be updated (${failure(err)}); run "git reset" in this repository` };
+          }
+          return { ok: true };
+        });
+      }
       await this.git(['add', '-A'], cwd);
       await this.verify(cwd, expect);
       await this.git(['commit', '-m', msg], cwd, 60_000);
@@ -200,6 +252,11 @@ export class ShipActions {
       const [remote, merge] = await Promise.all([cfg(`branch.${expect.branch}.remote`), cfg(`branch.${expect.branch}.merge`)]);
       if (!remote || remote === '.' || !merge.startsWith('refs/heads/')) return { ok: false, error: 'the branch has no upstream branch on a remote' };
       await this.verify(cwd, expect);
+      if (secretGuardEnabled()) {
+        // Every commit the destination remote's tracking refs lack, each commit's own change.
+        const refused = this.secretRefusal(await scanCommits(this.gitLines(cwd), [expect.head, '--not', `--remotes=${remote}`]), 'pushed');
+        if (refused) return refused;
+      }
       await this.git(['push', remote, `${expect.head}:${merge}`], cwd, 120_000, { GIT_TERMINAL_PROMPT: '0' });
       return { ok: true };
     } catch (err) {
@@ -214,6 +271,18 @@ export class ShipActions {
     if (t.length > SHIP_TEXT_MAX) return { ok: false, error: 'the title is too long' };
     try {
       await this.verify(cwd, expect);
+      if (secretGuardEnabled()) {
+        // The commits the PR shows: not on its base (gh's own per-branch
+        // gh-merge-base, else the default branch).
+        const pinned = await this.git(['config', '--get', `branch.${expect.branch}.gh-merge-base`], cwd).then(({ stdout }) => stdout.trim(), () => '');
+        const base = pinned || await this.defaultBranch(cwd);
+        const run = this.gitLines(cwd);
+        const refused = this.secretRefusal(
+          await scanCommits(run, await reviewRange(run, expect.head, base ? `refs/remotes/origin/${base}` : null)),
+          'sent in a pull request',
+        );
+        if (refused) return refused;
+      }
       const { stdout } = await this.run(process.platform === 'win32' ? 'gh.exe' : 'gh', ['pr', 'create', '--fill', '--head', expect.branch, '--title', t], {
         cwd,
         env: ghIssueEnv(),

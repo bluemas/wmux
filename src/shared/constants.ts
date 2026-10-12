@@ -563,6 +563,9 @@ export const IPC = {
   // no-renderer toast fallback in dispatchNotification can honor them.
   MUTED_NOTIFICATION_CATEGORIES: 'settings:muted-notification-categories',
   AUTO_UPDATE_ENABLED: 'settings:auto-update-enabled',
+  // Settings › General "Block passwords and keys in commits, pushes and PRs",
+  // mirrored to main, which runs those paths (main/git/secretGuardSetting.ts).
+  SECRET_GUARD_ENABLED: 'settings:secret-guard-enabled',
   // #1103 — the renderer's default-WSL-distro choice, pushed to main so
   // pty.create can inject `wsl.exe -d <distro>` at the shell-resolution
   // choke point without threading it through every create call.
@@ -685,6 +688,9 @@ export const IPC = {
   GIT_SHIP_COMMIT: 'gitShip:commit',
   GIT_SHIP_PUSH: 'gitShip:push',
   GIT_SHIP_CREATE_PR: 'gitShip:createPr',
+  // Settings: install the pre-commit secret check automatically (default on)
+  GIT_SECRET_HOOK_GET: 'gitShip:secretHookGet',
+  GIT_SECRET_HOOK_SET: 'gitShip:secretHookSet',
   // Git page hand-off: an issue / PR to an agent pane, or to a new worktree
   GIT_HANDOFF_SEND: 'gitHandoff:send',
   GIT_HANDOFF_START_WORKTREE: 'gitHandoff:startWorktree',

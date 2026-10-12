@@ -15,12 +15,7 @@ vi.mock('node:fs/promises', () => ({
 import { ClaudeDetector } from '../ClaudeDetector';
 
 const FAKE_HOME = process.platform === 'win32' ? 'C:\\Users\\test' : '/home/test';
-const EXPECTED_DIR = path.join(FAKE_HOME, '.claude');
 const EXPECTED_JSON = path.join(FAKE_HOME, '.claude.json');
-
-function makeDirStat(): { isDirectory: () => boolean } {
-  return { isDirectory: () => true };
-}
 
 function makeFsError(code: string): NodeJS.ErrnoException {
   const err = new Error(code) as NodeJS.ErrnoException;
@@ -36,29 +31,28 @@ describe('ClaudeDetector', () => {
   });
 
   it('returns claudeFound + mcpRegistered when ~/.claude exists and ~/.claude.json has mcpServers.wmux', async () => {
-    vi.mocked(fs.stat).mockResolvedValueOnce(makeDirStat() as unknown as Awaited<ReturnType<typeof fs.stat>>);
+    const detector = new ClaudeDetector(() => '/usr/local/bin/claude');
     vi.mocked(fs.readFile).mockResolvedValueOnce(
       JSON.stringify({ mcpServers: { wmux: { command: 'wmux', args: ['mcp'] } } }),
     );
 
-    const result = await new ClaudeDetector().detect();
+    const result = await detector.detect();
 
     expect(result).toEqual({
       claudeFound: true,
       mcpRegistered: true,
       claudeJsonPath: EXPECTED_JSON,
     });
-    expect(vi.mocked(fs.stat)).toHaveBeenCalledWith(EXPECTED_DIR);
     expect(vi.mocked(fs.readFile)).toHaveBeenCalledWith(EXPECTED_JSON, 'utf8');
   });
 
   it('returns mcpRegistered:false when ~/.claude.json parses but lacks mcpServers.wmux', async () => {
-    vi.mocked(fs.stat).mockResolvedValueOnce(makeDirStat() as unknown as Awaited<ReturnType<typeof fs.stat>>);
+    const detector = new ClaudeDetector(() => '/usr/local/bin/claude');
     vi.mocked(fs.readFile).mockResolvedValueOnce(
       JSON.stringify({ mcpServers: { other: { command: 'other' } }, theme: 'dark' }),
     );
 
-    const result = await new ClaudeDetector().detect();
+    const result = await detector.detect();
 
     expect(result).toEqual({
       claudeFound: true,
@@ -68,10 +62,10 @@ describe('ClaudeDetector', () => {
   });
 
   it('returns mcpRegistered:false when ~/.claude.json is missing (ENOENT)', async () => {
-    vi.mocked(fs.stat).mockResolvedValueOnce(makeDirStat() as unknown as Awaited<ReturnType<typeof fs.stat>>);
+    const detector = new ClaudeDetector(() => '/usr/local/bin/claude');
     vi.mocked(fs.readFile).mockRejectedValueOnce(makeFsError('ENOENT'));
 
-    const result = await new ClaudeDetector().detect();
+    const result = await detector.detect();
 
     expect(result).toEqual({
       claudeFound: true,
@@ -81,10 +75,10 @@ describe('ClaudeDetector', () => {
   });
 
   it('swallows SyntaxError when ~/.claude.json is malformed', async () => {
-    vi.mocked(fs.stat).mockResolvedValueOnce(makeDirStat() as unknown as Awaited<ReturnType<typeof fs.stat>>);
+    const detector = new ClaudeDetector(() => '/usr/local/bin/claude');
     vi.mocked(fs.readFile).mockResolvedValueOnce('{not valid json');
 
-    const result = await new ClaudeDetector().detect();
+    const result = await detector.detect();
 
     expect(result).toEqual({
       claudeFound: true,
@@ -94,10 +88,10 @@ describe('ClaudeDetector', () => {
   });
 
   it('returns mcpRegistered:false when ~/.claude.json read throws EACCES', async () => {
-    vi.mocked(fs.stat).mockResolvedValueOnce(makeDirStat() as unknown as Awaited<ReturnType<typeof fs.stat>>);
+    const detector = new ClaudeDetector(() => '/usr/local/bin/claude');
     vi.mocked(fs.readFile).mockRejectedValueOnce(makeFsError('EACCES'));
 
-    const result = await new ClaudeDetector().detect();
+    const result = await detector.detect();
 
     expect(result).toEqual({
       claudeFound: true,
@@ -106,24 +100,24 @@ describe('ClaudeDetector', () => {
     });
   });
 
-  it('returns claudeFound:false when ~/.claude is missing (ENOENT)', async () => {
-    vi.mocked(fs.stat).mockRejectedValueOnce(makeFsError('ENOENT'));
+  it('returns claudeFound:false when no claude executable resolves', async () => {
+    const detector = new ClaudeDetector(() => null);
 
-    const result = await new ClaudeDetector().detect();
+    const result = await detector.detect();
 
     expect(result).toEqual({
       claudeFound: false,
       mcpRegistered: false,
       claudeJsonPath: EXPECTED_JSON,
     });
-    // Must short-circuit — never opens the JSON when the dir is gone.
+    // Must short-circuit — never opens the JSON when claude is not installed.
     expect(vi.mocked(fs.readFile)).not.toHaveBeenCalled();
   });
 
-  it('returns claudeFound:false when stat throws EACCES (treat as not found, no crash)', async () => {
-    vi.mocked(fs.stat).mockRejectedValueOnce(makeFsError('EACCES'));
+  it('returns claudeFound:false when the resolver throws EACCES (treat as not found, no crash)', async () => {
+    const detector = new ClaudeDetector(() => { throw makeFsError('EACCES'); });
 
-    const result = await new ClaudeDetector().detect();
+    const result = await detector.detect();
 
     expect(result).toEqual({
       claudeFound: false,
@@ -131,5 +125,12 @@ describe('ClaudeDetector', () => {
       claudeJsonPath: EXPECTED_JSON,
     });
     expect(vi.mocked(fs.readFile)).not.toHaveBeenCalled();
+  });
+
+  it('reports claude found from the executable even before ~/.claude exists (first run)', async () => {
+    const detector = new ClaudeDetector(() => '/opt/homebrew/bin/claude');
+    vi.mocked(fs.readFile).mockRejectedValueOnce(makeFsError('ENOENT'));
+    const result = await detector.detect();
+    expect(result.claudeFound).toBe(true);
   });
 });

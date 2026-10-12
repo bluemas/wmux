@@ -23,7 +23,6 @@
 import * as fs from 'fs';
 import type { ClaudeEffort } from '../../shared/claudeModels';
 import * as path from 'path';
-import * as os from 'os';
 import { pathToFileURL } from 'url';
 import { app } from 'electron';
 import { getWmuxDir } from '../../daemon/config';
@@ -114,40 +113,11 @@ export async function loadSdkQueryFn(): Promise<SdkQueryFn> {
 
 // ─── claude executable resolution ────────────────────────────────────────────
 //
-// The SDK's platform package (claude-agent-sdk-win32-x64 et al.) vendors a
-// ~240 MB claude binary — far too heavy to ship inside the wmux installer. The
-// deck instead targets the USER'S OWN claude install (the zero-API premise
-// already assumes one: the fleet's worker panes run it). Verified end-to-end in
-// Phase 0 probe #4: `pathToClaudeCodeExecutable` pointed at the installed
-// claude.exe runs on subscription auth with no platform package present.
-//
-// NOTE: a `claude.cmd` npm shim is NOT spawnable (Node 20+ EINVAL without
-// shell:true) — only real executables or JS entrypoints (SDK runs .js via
-// node) may be returned here.
-export function resolveClaudeExecutable(): string | null {
-  const home = os.homedir();
-  const candidates: string[] = [
-    // Native installer (preferred — self-updating).
-    path.join(home, '.local', 'bin', 'claude.exe'),
-    path.join(home, '.local', 'bin', 'claude'),
-  ];
-  const appData = process.env.APPDATA;
-  if (appData) {
-    // npm global: modern versions ship a native exe; older ones a JS cli.
-    candidates.push(
-      path.join(appData, 'npm', 'node_modules', '@anthropic-ai', 'claude-code', 'bin', 'claude.exe'),
-      path.join(appData, 'npm', 'node_modules', '@anthropic-ai', 'claude-code', 'cli.js'),
-    );
-  }
-  for (const c of candidates) {
-    try {
-      if (fs.existsSync(c)) return c;
-    } catch {
-      /* inaccessible path — keep scanning */
-    }
-  }
-  return null;
-}
+// The deck targets the USER'S OWN claude install (the SDK platform package's
+// vendored binary is too heavy to ship). Resolution lives in one shared module
+// so Moa and the first-run wizard agree on whether claude is installed.
+import { resolveClaudeExecutable } from '../claude/resolveClaudeExecutable';
+export { resolveClaudeExecutable };
 
 /** GLM / Z.ai (or any Anthropic-compatible) endpoint profile. When set, the
  *  same adapter targets a different backend purely via env — the review-team

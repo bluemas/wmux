@@ -32,6 +32,10 @@ import {
   type MoaGoalVerification,
 } from '../../shared/moaGoal';
 import type { GoalTaskRef } from './moaGoalVerifier';
+import { describeScanFailure, describeSecretFindings } from '../../shared/secretGuard';
+import { reviewRange, scanCommits, spawnGitLines, type GitLines } from '../git/secretScan';
+import { secretGuardEnabled } from '../git/secretGuardSetting';
+import { formatReviewGuide, type ReviewGuide } from '../../shared/prReviewGuide';
 
 export interface ExecResult {
   code: number;
@@ -43,6 +47,8 @@ export interface MoaGoalDeliveryPorts {
   tasks: (contract: MoaGoalContract) => Promise<GoalTaskRef[] | null>;
   git: (args: string[], cwd: string) => Promise<ExecResult>;
   gh: (args: string[], cwd: string) => Promise<ExecResult>;
+  /** The secret check's streamed git reads (default: spawn git in `cwd`). */
+  gitLines?: (cwd: string) => GitLines;
   now?: () => number;
   /** Tests only: the auto-merge flag (default MOA_GOAL_AUTO_MERGE). */
   autoMerge?: boolean;
@@ -77,12 +83,36 @@ async function defaultBranch(repoRoot: string, ports: MoaGoalDeliveryPorts): Pro
   return b && b !== 'HEAD' ? b : 'main';
 }
 
-/** The PR body: what was asked, what "done" meant, and the proof. */
+/** Where a reviewer should look, in order: what was asked, the proof, the
+ *  code (optional). Built from the same verification the body reports; the
+ *  gate is 'missing' unless a result was recorded for this exact commit. */
+export function reviewGuide(contract: MoaGoalContract, verification: MoaGoalVerification, item: { taskId: string; headSha: string }): ReviewGuide {
+  const { doneCriteria } = goalTermsOf(contract);
+  const gate = verification.gates.find((g) => g.taskId === item.taskId && g.headSha === item.headSha);
+  const evidence: string[] = [];
+  for (const c of verification.criteria) {
+    for (const a of c.artifacts) evidence.push(`(${c.criterion}) \`${a.path}\` (sha256 ${a.sha256.slice(0, 12)})`);
+  }
+  if (gate) evidence.push(`\`${gate.command}\``);
+  return {
+    steps: [
+      { target: 'criteria', items: doneCriteria.map((c, i) => `(${i + 1}) ${c}`) },
+      { target: 'evidence', items: evidence },
+      { target: 'files', items: [] },
+    ],
+    gate: !gate ? 'missing' : gate.exitCode === 0 ? 'passed' : 'failed',
+    headSha: item.headSha,
+  };
+}
+
+/** The PR body: where to look first, what was asked, what "done" meant, and the proof. */
 export function prBody(contract: MoaGoalContract, verification: MoaGoalVerification, item: { taskId: string; headSha: string }): string {
   const { doneCriteria } = goalTermsOf(contract);
   const gate = verification.gates.find((g) => g.taskId === item.taskId);
   const lines = [
     `Delivered by Moa for goal **${contract.id}** (operator-approved): ${contract.goal}`,
+    '',
+    formatReviewGuide(reviewGuide(contract, verification, item)),
     '',
     '### Done criteria',
     ...(doneCriteria.length
@@ -137,6 +167,23 @@ export async function deliverGoal(
     if (head.code !== 0 || head.stdout.trim() !== gate.headSha) {
       item.error = `the branch moved after verification (${head.stdout.trim().slice(0, 12) || 'unknown'} ≠ ${gate.headSha.slice(0, 12)}); complete the goal again`;
       continue;
+    }
+    // Never deliver a secret: a .env file, a private key, a key-shaped value,
+    // in any commit the PR would show (each commit's own change).
+    if (secretGuardEnabled()) {
+      const run = (ports.gitLines ?? spawnGitLines)(wt);
+      const scan = await scanCommits(run, await reviewRange(run, gate.headSha, `refs/remotes/origin/${base}`));
+      if (!scan.ok) {
+        // Fail closed: a change nobody could check is not delivered.
+        item.error = `not delivered: ${describeScanFailure('pushed')}`;
+        item.secretScanFailed = true;
+        continue;
+      }
+      if (scan.findings.length) {
+        item.error = `not delivered: ${describeSecretFindings(scan.findings, 'pushed')}`;
+        item.secrets = scan.findings;
+        continue;
+      }
     }
     // Exactly the verified commit, by sha, to the same-named branch: a plain
     // push that the remote rejects unless it is a fast-forward.

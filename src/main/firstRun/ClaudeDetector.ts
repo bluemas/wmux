@@ -3,9 +3,11 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 
 import type { FirstRunStatus } from '../../shared/firstRun';
+import { resolveClaudeExecutable } from '../claude/resolveClaudeExecutable';
 
 /**
- * Read-only detector for Claude Code installation + wmux MCP registration.
+ * Read-only detector for Claude Code installation (via the shared
+ * executable resolver) + wmux MCP registration.
  *
  * Stateless and pure — no instance fields, no caching. Always returns a
  * fully-populated `FirstRunStatus`. All filesystem errors (ENOENT, EACCES,
@@ -22,28 +24,28 @@ import type { FirstRunStatus } from '../../shared/firstRun';
  * See: progress.md (T2), decisions.md (D1).
  */
 export class ClaudeDetector {
+  /** Same resolver Moa spawns with, so "detected" here means Moa can run it. */
+  constructor(private readonly resolveExecutable: () => string | null = resolveClaudeExecutable) {}
+
   async detect(): Promise<FirstRunStatus> {
     const home = os.homedir();
-    const claudeDir = path.join(home, '.claude');
     const claudeJsonPath = path.join(home, '.claude.json');
 
-    const claudeFound = await this.dirExists(claudeDir);
+    // Installed = an executable Moa can actually spawn. A leftover ~/.claude
+    // folder without a binary is not an install, and a binary that has never
+    // been run yet (no ~/.claude) still is one.
+    let claudeFound = false;
+    try {
+      claudeFound = this.resolveExecutable() !== null;
+    } catch {
+      claudeFound = false;
+    }
     if (!claudeFound) {
       return { claudeFound: false, mcpRegistered: false, claudeJsonPath };
     }
 
     const mcpRegistered = await this.checkMcpRegistered(claudeJsonPath);
     return { claudeFound: true, mcpRegistered, claudeJsonPath };
-  }
-
-  private async dirExists(dir: string): Promise<boolean> {
-    try {
-      const stats = await fs.stat(dir);
-      return stats.isDirectory();
-    } catch {
-      // ENOENT / EACCES / any other I/O error → treat as not found.
-      return false;
-    }
   }
 
   private async checkMcpRegistered(jsonPath: string): Promise<boolean> {

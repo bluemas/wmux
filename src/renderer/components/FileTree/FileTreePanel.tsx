@@ -4,10 +4,10 @@ import { useT } from '../../hooks/useT';
 import { selectActiveWorkspace } from '../../stores/selectors/workspaceProjections';
 import { selectRemoteScopeName } from '../Git/thisComputerOnly';
 import { findLeaf } from '../../../shared/paneUtils';
-import type { Pane, Workspace } from '../../../shared/types';
+import type { Pane, Surface, Workspace } from '../../../shared/types';
 import { IconChevron, IconFile, IconFolder, IconRefresh, IconSearch, IconX } from '../icons';
 import { FOCUS_RING } from '../focusRing';
-import { injectText, quotePathsForPrompt } from '../AgentToolbar/inject';
+import { insertPathsIntoPty } from '../AgentToolbar/inject';
 import { tokenAttrs } from '../../themes';
 import FileTreeResizeHandle from './FileTreeResizeHandle';
 import { filterTree, FILTER_SCAN_LIMIT, type FilterResult } from './fileTreeFilter';
@@ -74,9 +74,21 @@ export function relativeTo(base: string, target: string): string {
   return target.startsWith(prefix) ? target.slice(prefix.length) : target;
 }
 
-function surfaceCwd(pane: Pane | null): string | undefined {
+/**
+ * The surface of a pane the tree follows: the active one when it is a local
+ * terminal, otherwise (an editor, browser or diff tab, which has no cwd or
+ * PTY) the pane's first local terminal, so opening a file does not move the
+ * tree away from the pane's folder.
+ */
+function anchorSurface(pane: Pane | null): Surface | undefined {
   if (!pane || pane.type !== 'leaf') return undefined;
-  return pane.surfaces?.find((s) => s.id === pane.activeSurfaceId)?.cwd || undefined;
+  const active = pane.surfaces?.find((s) => s.id === pane.activeSurfaceId);
+  if (active?.ptyId) return active;
+  return pane.surfaces?.find((s) => s.ptyId) ?? active;
+}
+
+function surfaceCwd(pane: Pane | null): string | undefined {
+  return anchorSurface(pane)?.cwd || undefined;
 }
 
 function firstLeafCwd(pane: Pane): string | undefined {
@@ -100,8 +112,23 @@ export function fileTreeCwd(ws: Workspace | null | undefined): string | undefine
 
 function activePtyId(ws: Workspace | null | undefined): string | undefined {
   if (!ws) return undefined;
-  const leaf = findLeaf(ws.rootPane, ws.activePaneId);
-  return leaf?.surfaces.find((s) => s.id === leaf.activeSurfaceId)?.ptyId || undefined;
+  return anchorSurface(findLeaf(ws.rootPane, ws.activePaneId))?.ptyId || undefined;
+}
+
+/**
+ * Whether `target` is `base` itself or a path below it. Separators are unified
+ * and drive paths compared case-insensitively, since on Windows git reports
+ * `C:/repo` for a pane whose cwd reads `c:\repo\sub`.
+ */
+export function isAtOrUnder(base: string | undefined, target: string): boolean {
+  if (!base) return false;
+  const norm = (p: string) => {
+    const unified = p.replace(/\\/g, '/').replace(/\/+$/, '');
+    return /^[a-z]:/i.test(unified) ? unified.toLowerCase() : unified;
+  };
+  const b = norm(base);
+  const t = norm(target);
+  return t === b || t.startsWith(b + '/');
 }
 
 /** The OS's own word for its file manager (same vocabulary as the sidebar's menu). */
@@ -223,14 +250,16 @@ export default function FileTreePanel({ position }: FileTreePanelProps) {
   // pane that has cd'd into a subfolder still shows the whole project.
   const [root, setRoot] = useState<string | undefined>(cwd);
   useEffect(() => {
-    setRoot(cwd);
-    if (!cwd) return;
+    if (!cwd) { setRoot(undefined); return; }
+    // A cd within the current root keeps it until the repository is resolved,
+    // so a move inside the same repo does not reload the tree twice.
+    setRoot((prev) => (isAtOrUnder(prev, cwd) ? prev : cwd));
     const resolveRepo = window.electronAPI?.diff?.resolveRepo;
-    if (!resolveRepo) return;
+    if (!resolveRepo) { setRoot(cwd); return; }
     let cancelled = false;
     resolveRepo(cwd).then(
-      (r) => { if (!cancelled && r.ok) setRoot(r.repoPath); },
-      () => undefined,
+      (r) => { if (!cancelled) setRoot(r.ok ? r.repoPath : cwd); },
+      () => { if (!cancelled) setRoot(cwd); },
     );
     return () => { cancelled = true; };
   }, [cwd]);
@@ -544,7 +573,7 @@ export default function FileTreePanel({ position }: FileTreePanelProps) {
             <button
               type="button"
               role="menuitem"
-              onClick={() => runMenu(() => { void injectText(ptyId, quotePathsForPrompt([menu.node.path]), false); })}
+              onClick={() => runMenu(() => { void insertPathsIntoPty(ptyId, [menu.node.path]); })}
               data-file-tree-action="insert"
             >
               {t('filetree.menu.insertPath')}

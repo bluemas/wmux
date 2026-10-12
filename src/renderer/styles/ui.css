@@ -1828,6 +1828,8 @@ details[open] > .wmux-chatv2-tool-line .wmux-chatv2-chevron { transform: rotate(
 .wmux-chat-image-name { display: block; padding: 8px 12px; font-size: 12px; color: var(--text-sub); }
 .wmux-chat-pending .wmux-chat-user-text { color: var(--text-sub); }
 .wmux-chat-pending-caption { margin: 4px 8px 0; text-align: right; font-size: 12px; color: var(--text-sub); }
+/* Multi-line setup cards (Claude first run, folder trust) read as a block, not a right-aligned caption. */
+.wmux-chat-pending-caption.wmux-moa-setup-card { text-align: left; align-self: stretch; }
 .wmux-chat-stop { display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; height: 32px; margin-left: auto; padding: 0 12px; border: 1px solid var(--border-soft); border-radius: 999px; color: var(--text-main); font-size: 13px; transition: background-color 150ms; }
 .wmux-chat-stop:hover:not(:disabled) { background: var(--bg-surface); }
 .wmux-chat-stop:disabled { color: var(--text-sub); cursor: default; }
@@ -2823,3 +2825,8 @@ button.wmux-a2a-row:hover { background: var(--hover-fill); }
 .wmux-a2a-note { margin: 0; font-size: 12px; color: var(--text-sub); }
 .wmux-a2a-note[data-tone="warning"] { color: var(--accent-yellow); }
 .wmux-a2a-note[data-tone="danger"] { color: var(--accent-red); }
+/* Review order guide (PrReviewGuide.tsx) */
+.wmux-git-guide { list-style: decimal; padding-left: 20px; display: flex; flex-direction: column; gap: 6px; }
+.wmux-git-guide-current { outline: 1px solid var(--primary, currentColor); border-radius: 6px; padding: 4px 6px; }
+.wmux-git-guide-items { list-style: disc; padding-left: 18px; font-size: 12px; }
+.wmux-git-approve-ready { outline: 2px solid var(--primary, currentColor); outline-offset: 1px; }

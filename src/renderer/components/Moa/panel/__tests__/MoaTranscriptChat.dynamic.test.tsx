@@ -692,7 +692,36 @@ describe('MoaTranscriptChat — review fixes (#1808)', () => {
     } finally {
       useStore.setState({ moa: prev.moa, brainThreads: prev.brainThreads });
     }
+  });  it('a turn Moa never received (claude not found) gives the typed words back and leaves the composer open', async () => {
+    const { useStore } = await import('../../../../stores');
+    const prev = useStore.getState();
+    try {
+      useStore.setState({ moa: { ...(prev.moa ?? {}), hq: { workspaceId: 'ws-hq', state: 'ok' } } as never, brainThreads: {} });
+      const { api } = fakeApi();
+      // The composer's verdict window passed: the send reads as accepted.
+      const onSend = vi.fn(async () => ({ ok: true }));
+      await act(async () => root.render(<MoaTranscriptChat ptyId="pty-hq" busy={false} onSend={onSend} onInterrupt={vi.fn()} onTerminal={vi.fn()} api={api} />));
+      await type('Check the release');
+      await act(async () => input().dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })));
+      await act(async () => root.render(<MoaTranscriptChat ptyId="pty-hq" busy onSend={onSend} onInterrupt={vi.fn()} onTerminal={vi.fn()} api={api} />));
+      // Main refuses late: the store's open turn closes with an error.
+      await act(async () => {
+        useStore.setState({ brainThreads: { 'ws-hq': { status: 'idle', messages: [
+          { id: 'm1', role: 'user', text: 'Check the release', ts: Date.now() },
+          { id: 'm2', role: 'assistant', text: '', ts: Date.now(), status: 'error', errorText: 'Claude Code not found' },
+        ] } } as never });
+        root.render(<MoaTranscriptChat ptyId="pty-hq" busy={false} onSend={onSend} onInterrupt={vi.fn()} onTerminal={vi.fn()} api={api} />);
+      });
+      const bubble = host.querySelector('[data-moa-chat-pending]') as HTMLElement;
+      expect(bubble?.textContent).toContain('Check the release');
+      expect(bubble.querySelector('[data-moa-chat-not-sent]')?.textContent).toContain('moa.panel.notSentReason');
+      expect(input().value).toBe('Check the release');
+      expect(input().disabled).toBe(false);
+    } finally {
+      useStore.setState({ moa: prev.moa, brainThreads: prev.brainThreads });
+    }
   });
+
 
   it('a send refused by a dialog only the TUI shows says what it asks and opens the terminal view', async () => {
     const { useStore } = await import('../../../../stores');
@@ -711,16 +740,91 @@ describe('MoaTranscriptChat — review fixes (#1808)', () => {
           { id: 'm1', role: 'user', text: 'Check the release', ts: Date.now() },
           { id: 'm2', role: 'assistant', text: '', ts: Date.now(), status: 'error',
             errorText: 'Claude Code is waiting on a prompt of its own. Answer it in the terminal, then send your message again.',
-            tuiDialog: { excerpt: 'Do you trust the files in this folder?\n1. Yes, proceed\n2. No, exit' } },
+            tuiDialog: { excerpt: 'Allow Bash to run rm -rf build?\n1. Yes\n2. No' } },
         ] } } as never });
         root.render(<MoaTranscriptChat ptyId="pty-hq" busy={false} onSend={onSend} onInterrupt={vi.fn()} onTerminal={onTerminal} api={api} />);
       });
       const bubble = host.querySelector('[data-moa-chat-pending]') as HTMLElement;
       const dialog = bubble.querySelector('[data-moa-chat-dialog]') as HTMLElement;
       expect(dialog.textContent).toContain('moa.panel.terminalHint');
-      expect(dialog.querySelector('[data-moa-chat-dialog-excerpt]')?.textContent).toBe('Do you trust the files in this folder?\n1. Yes, proceed\n2. No, exit');
+      expect(dialog.querySelector('[data-moa-chat-dialog-excerpt]')?.textContent).toBe('Allow Bash to run rm -rf build?\n1. Yes\n2. No');
       const button = dialog.querySelector('[data-moa-chat-dialog-terminal]') as HTMLButtonElement;
       expect(button.textContent).toBe('moa.panel.answerInTerminal');
+      await act(async () => { button.click(); });
+      expect(onTerminal).toHaveBeenCalledTimes(1);
+      // Answering there is the user's job; nothing was sent again on the click.
+      expect(onSend).toHaveBeenCalledTimes(1);
+    } finally {
+      useStore.setState({ moa: prev.moa, brainThreads: prev.brainThreads });
+    }
+  });
+  it('a send refused by Claude Code first-run setup shows plain steps, not the raw theme picker', async () => {
+    const { useStore } = await import('../../../../stores');
+    const prev = useStore.getState();
+    try {
+      useStore.setState({ moa: { ...(prev.moa ?? {}), hq: { workspaceId: 'ws-hq', state: 'ok' } } as never, brainThreads: {} });
+      const { api } = fakeApi();
+      const onSend = vi.fn(async () => ({ ok: true }));
+      const onTerminal = vi.fn();
+      await act(async () => root.render(<MoaTranscriptChat ptyId="pty-hq" busy={false} onSend={onSend} onInterrupt={vi.fn()} onTerminal={onTerminal} api={api} />));
+      await type('Check the release');
+      await act(async () => input().dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })));
+      await act(async () => root.render(<MoaTranscriptChat ptyId="pty-hq" busy onSend={onSend} onInterrupt={vi.fn()} onTerminal={onTerminal} api={api} />));
+      await act(async () => {
+        useStore.setState({ brainThreads: { 'ws-hq': { status: 'idle', messages: [
+          { id: 'm1', role: 'user', text: 'Check the release', ts: Date.now() },
+          { id: 'm2', role: 'assistant', text: '', ts: Date.now(), status: 'error',
+            errorText: 'Claude Code is waiting on a prompt of its own. Answer it in the terminal, then send your message again.',
+            tuiDialog: { excerpt: '❯ ✔ Dark mode\nLight mode\nDark mode (colorblind-friendly)\nSyntax theme: Monokai Extended (ctrl+t to disable)' } },
+        ] } } as never });
+        root.render(<MoaTranscriptChat ptyId="pty-hq" busy={false} onSend={onSend} onInterrupt={vi.fn()} onTerminal={onTerminal} api={api} />);
+      });
+      const bubble = host.querySelector('[data-moa-chat-pending]') as HTMLElement;
+      expect(bubble.querySelector('[data-moa-chat-dialog]')).toBeNull();
+      const dialog = bubble.querySelector('[data-moa-chat-first-run]') as HTMLElement;
+      expect(dialog.textContent).toContain('moa.panel.firstRunTitle');
+      expect(dialog.querySelectorAll('li')).toHaveLength(3);
+      // The raw terminal screen is not shown.
+      expect(dialog.textContent).not.toContain('Syntax theme');
+      const button = dialog.querySelector('[data-moa-chat-dialog-terminal]') as HTMLButtonElement;
+      expect(button.textContent).toBe('moa.panel.firstRunOpen');
+      await act(async () => { button.click(); });
+      expect(onTerminal).toHaveBeenCalledTimes(1);
+      // Answering there is the user's job; nothing was sent again on the click.
+      expect(onSend).toHaveBeenCalledTimes(1);
+    } finally {
+      useStore.setState({ moa: prev.moa, brainThreads: prev.brainThreads });
+    }
+  });  it('a send refused by the folder-trust prompt explains trusting and leaves the choice to the user', async () => {
+    const { useStore } = await import('../../../../stores');
+    const prev = useStore.getState();
+    try {
+      useStore.setState({ moa: { ...(prev.moa ?? {}), hq: { workspaceId: 'ws-hq', state: 'ok' } } as never, brainThreads: {} });
+      const { api } = fakeApi();
+      const onSend = vi.fn(async () => ({ ok: true }));
+      const onTerminal = vi.fn();
+      await act(async () => root.render(<MoaTranscriptChat ptyId="pty-hq" busy={false} onSend={onSend} onInterrupt={vi.fn()} onTerminal={onTerminal} api={api} />));
+      await type('Check the release');
+      await act(async () => input().dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })));
+      await act(async () => root.render(<MoaTranscriptChat ptyId="pty-hq" busy onSend={onSend} onInterrupt={vi.fn()} onTerminal={onTerminal} api={api} />));
+      await act(async () => {
+        useStore.setState({ brainThreads: { 'ws-hq': { status: 'idle', messages: [
+          { id: 'm1', role: 'user', text: 'Check the release', ts: Date.now() },
+          { id: 'm2', role: 'assistant', text: '', ts: Date.now(), status: 'error',
+            errorText: 'Claude Code is waiting on a prompt of its own. Answer it in the terminal, then send your message again.',
+            tuiDialog: { excerpt: 'Do you trust the files in this folder?\n❯ No, exit\nYes, I trust this folder' } },
+        ] } } as never });
+        root.render(<MoaTranscriptChat ptyId="pty-hq" busy={false} onSend={onSend} onInterrupt={vi.fn()} onTerminal={onTerminal} api={api} />);
+      });
+      const bubble = host.querySelector('[data-moa-chat-pending]') as HTMLElement;
+      expect(bubble.querySelector('[data-moa-chat-dialog]')).toBeNull();
+      const dialog = bubble.querySelector('[data-moa-chat-folder-trust]') as HTMLElement;
+      expect(dialog.textContent).toContain('moa.panel.trustTitle');
+      expect(dialog.querySelectorAll('li')).toHaveLength(3);
+      // The raw terminal screen is not shown.
+      expect(dialog.textContent).not.toContain('Yes, I trust this folder');
+      const button = dialog.querySelector('[data-moa-chat-dialog-terminal]') as HTMLButtonElement;
+      expect(button.textContent).toBe('moa.panel.trustOpen');
       await act(async () => { button.click(); });
       expect(onTerminal).toHaveBeenCalledTimes(1);
       // Answering there is the user's job; nothing was sent again on the click.
