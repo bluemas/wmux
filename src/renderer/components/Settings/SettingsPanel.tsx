@@ -3608,6 +3608,8 @@ function TabAppearance() {
   const setSidebarShowExplorerButton = useStore((s) => s.setSidebarShowExplorerButton);
   const sidebarShowCopyInfoButton = useStore((s) => s.sidebarShowCopyInfoButton);
   const setSidebarShowCopyInfoButton = useStore((s) => s.setSidebarShowCopyInfoButton);
+  const sidebarShowPorts = useStore((s) => s.sidebarShowPorts);
+  const setSidebarShowPorts = useStore((s) => s.setSidebarShowPorts);
   const sidebarShowPaneCoordinates = useStore((s) => s.sidebarShowPaneCoordinates);
   const setSidebarShowPaneCoordinates = useStore((s) => s.setSidebarShowPaneCoordinates);
   const attentionBlink = useStore((s) => s.attentionBlink);
@@ -3783,6 +3785,13 @@ function TabAppearance() {
             checked={sidebarShowCopyInfoButton}
             onChange={setSidebarShowCopyInfoButton}
             label={t('settings.sidebarShowCopyInfoButton')}
+          />
+        </SettingRow>
+        <SettingRow id="sidebarports" label={t('settings.sidebarShowPorts')} description={t('settings.sidebarShowPortsDesc')}>
+          <Toggle
+            checked={sidebarShowPorts}
+            onChange={setSidebarShowPorts}
+            label={t('settings.sidebarShowPorts')}
           />
         </SettingRow>
         {/* #1326 — on by default: turning it off is an explicit opt-out, not a

@@ -664,6 +664,10 @@ export interface UISlice {
   sidebarShowCopyInfoButton: boolean;
   setSidebarShowCopyInfoButton: (enabled: boolean) => void;
 
+  /** Whether listening port numbers appear in sidebar workspace rows. Default true. */
+  sidebarShowPorts: boolean;
+  setSidebarShowPorts: (enabled: boolean) => void;
+
   /** #1326 — show the auto-generated `w<ws>-<pane>` coordinate in the agent
    *  roster's muted trailer for panes that have no explicit label. On by
    *  default so nobody's roster changes without them touching the setting; a
@@ -1856,6 +1860,12 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
 
   setSidebarShowCopyInfoButton: (enabled) => set((state) => {
     state.sidebarShowCopyInfoButton = enabled;
+  }),
+
+  sidebarShowPorts: true,
+
+  setSidebarShowPorts: (enabled) => set((state) => {
+    state.sidebarShowPorts = enabled;
   }),
 
   sidebarShowPaneCoordinates: true,

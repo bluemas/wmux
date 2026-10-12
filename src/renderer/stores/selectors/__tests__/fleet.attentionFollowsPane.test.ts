@@ -42,6 +42,32 @@ const CLAUDE = 'Claude Code';
 const paneA = leaf('pA', [surface('sA', 'pty-a')]);
 const paneB = leaf('pB', [surface('sB', 'pty-b')]);
 
+describe('workspace running indicator with an idle sibling', () => {
+  function mixedState(question?: string): FleetSelectorState {
+    return {
+      workspaces: [workspace(branch('root', [paneA, paneB]), 'pA')],
+      surfaceAgentStatus: { 'pty-a': 'waiting' },
+      surfaceActivity: {},
+      surfaceAgent: {
+        'pty-a': { name: 'Claude Code', status: 'waiting' },
+        'pty-b': { name: 'Codex CLI', status: 'running' },
+      },
+      surfaceTurnOpenAt: { 'pty-b': 1000 },
+      surfacePendingQuestion: question ? { 'pty-a': question } : {},
+    };
+  }
+
+  it('keeps the running dot when another agent stopped without a question', () => {
+    const input = mixedState();
+    expect(selectWorkspaceAgentStatus(input, 'ws-1')).toBe('running');
+    expect(selectAllWorkspaceAgentStatus(input)['ws-1']).toBe('running');
+  });
+
+  it('still prioritizes a pending question over the running sibling', () => {
+    expect(selectWorkspaceAgentStatus(mixedState('Continue?'), 'ws-1')).toBe('awaiting_input');
+  });
+});
+
 function state(overrides: Partial<FleetSelectorState> = {}): FleetSelectorState {
   return {
     workspaces: [workspace(paneA, 'pA', { agentName: CLAUDE, agentStatus: 'awaiting_input' })],

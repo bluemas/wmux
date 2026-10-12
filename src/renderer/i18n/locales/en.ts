@@ -2381,6 +2381,8 @@ export const en = {
   'settings.sidebarShowExplorerButtonDesc': "Show the folder button on sidebar workspace rows. The row's right-click menu keeps the action either way.",
   'settings.sidebarShowCopyInfoButton': 'Show "Copy session info" button',
   'settings.sidebarShowCopyInfoButtonDesc': "Show the button that copies a workspace's session info on sidebar workspace rows.",
+  'settings.sidebarShowPorts': 'Show port numbers',
+  'settings.sidebarShowPortsDesc': 'Show listening port numbers in sidebar workspace rows.',
   'settings.sidebarShowPaneCoordinates': 'Show pane coordinates',
   'settings.sidebarShowPaneCoordinatesDesc': 'Show the auto-generated w1-2 style coordinate in the agent roster for panes you have not labeled. On by default. A pane you rename always shows its label either way.',
   'settings.attentionBlink': 'Attention blink',
