@@ -1,0 +1,42 @@
+{
+  "corrupt": {
+    "provider": "claude",
+    "cliVersion": "2.1.0",
+    "versionSupported": true,
+    "writable": true,
+    "scannedAtMs": 1700000000000,
+    "wmuxToolRows": 0,
+    "wmuxCodexHookRows": 0,
+    "warnings": [
+      "Failed to read <home>/.claude/settings.json: EACCES: permission denied",
+      "The surfaces store file is corrupt and could not be read."
+    ],
+    "items": []
+  },
+  "newer": {
+    "provider": "claude",
+    "cliVersion": "2.1.0",
+    "versionSupported": true,
+    "writable": true,
+    "scannedAtMs": 1700000000000,
+    "wmuxToolRows": 0,
+    "wmuxCodexHookRows": 0,
+    "warnings": [
+      "The surfaces store has an unsupported or newer version."
+    ],
+    "items": []
+  },
+  "notArray": {
+    "provider": "claude",
+    "cliVersion": "2.1.0",
+    "versionSupported": true,
+    "writable": true,
+    "scannedAtMs": 1700000000000,
+    "wmuxToolRows": 0,
+    "wmuxCodexHookRows": 0,
+    "warnings": [
+      "The surfaces store could not be read."
+    ],
+    "items": []
+  }
+}

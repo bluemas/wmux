@@ -1,0 +1,48 @@
+{
+  "provider": "codex",
+  "cliVersion": "<newer>",
+  "versionSupported": true,
+  "writable": true,
+  "scannedAtMs": 1700000000000,
+  "wmuxToolRows": 0,
+  "wmuxCodexHookRows": 0,
+  "warnings": [
+    "codex <newer> is newer than the last version wmux tested (<tested-max>); changes are backed up before they are written."
+  ],
+  "items": [
+    {
+      "id": "codex:hook::codex-notify",
+      "provider": "codex",
+      "kind": "hook",
+      "name": "codex-notify",
+      "parent": null,
+      "source": "user",
+      "enabled": true,
+      "effect": "removes",
+      "toggleable": true,
+      "readOnlyReason": null,
+      "hookEvent": "TurnComplete",
+      "hookCost": "none",
+      "descriptionChars": null,
+      "originPath": "<home>/.codex/config.toml",
+      "wmuxRequired": false
+    },
+    {
+      "id": "codex:builtin-tool::web_search",
+      "provider": "codex",
+      "kind": "builtin-tool",
+      "name": "web_search",
+      "parent": null,
+      "source": "builtin",
+      "enabled": false,
+      "effect": "removes",
+      "toggleable": true,
+      "readOnlyReason": null,
+      "hookEvent": null,
+      "hookCost": null,
+      "descriptionChars": null,
+      "originPath": "<home>/.codex/config.toml",
+      "wmuxRequired": false
+    }
+  ]
+}
