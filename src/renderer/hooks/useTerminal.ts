@@ -82,7 +82,7 @@ import {
 } from '../terminal/terminalOutputScheduler';
 import { reconnectPtyWithRetry as reconnectPtyWithRetryImpl } from './reconnectPtyWithRetry';
 import { adoptTerminal, parkTerminal, restoreParkedViewport, type ParkedTerminal } from '../terminal/terminalPark';
-import { captureColdFrame, coldFrameFits, dropColdFrame, splitTrailingEscape, takeColdFrame, WarmFrameSwap, FULL_RESET, REPAINT_BEGIN, REPAINT_END, type ColdFrame } from '../terminal/coldFrame';
+import { captureColdFrame, coldFrameFits, dropColdFrame, persistColdFrames, restoreColdFrames, splitTrailingEscape, takeColdFrame, WarmFrameSwap, FULL_RESET, REPAINT_BEGIN, REPAINT_END, type ColdFrame } from '../terminal/coldFrame';
 
 // One detector for every pane in this renderer: the ESC-pair state is keyed by
 // ptyId, and a per-mount instance would lose a double-tap split across a remount.
@@ -96,6 +96,17 @@ const parkedKeyboardByTerminal = new WeakMap<Terminal, RemoteKeyboardState>();
 // Module-level terminal registry for scrollback persistence
 const terminalRegistry = new Map<string, Terminal>();
 export { terminalRegistry };
+
+// Frames the previous renderer saved (coldFrame.ts): a pane's first reveal
+// after a restart paints its last screen instead of sitting blank.
+restoreColdFrames();
+
+/** Save every live terminal's screen with the cold-frame cache, for the next
+ *  start. Daemon mode only: a local PTY does not survive the restart. */
+export function persistColdFramesNow(): void {
+  if (!isDaemonModeActive()) return;
+  persistColdFrames(terminalRegistry);
+}
 
 // Registration push channel. Restored terminals register only after their
 // async scrollback load completes — often far beyond useActivePaneFocus's
