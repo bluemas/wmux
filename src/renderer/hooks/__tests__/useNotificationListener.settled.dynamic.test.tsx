@@ -163,3 +163,21 @@ describe('useNotificationListener — a settled idle clears BOTH running carrier
     expect((ws.metadata as Record<string, unknown> | undefined)?.settled).toBeUndefined();
   });
 });
+
+describe('useNotificationListener — a turn that opens on a tool call', () => {
+  it('opens the latch on a running tagged agent.tool_started', () => {
+    // Claude Code answers a `!` shell command with a turn of its own and fires
+    // no UserPromptSubmit for it; main reopens the turn from its first tool.
+    seedActivePaneSurface('pty-tool');
+    act(() => { metaCb!({ ptyId: 'pty-tool', agentStatus: 'running', hookKind: 'agent.tool_started' }); });
+
+    expect(useStore.getState().surfaceTurnOpenAt['pty-tool']).toBeGreaterThan(0);
+  });
+
+  it('does not open the latch on an untagged running', () => {
+    seedActivePaneSurface('pty-bytes');
+    act(() => { metaCb!({ ptyId: 'pty-bytes', agentStatus: 'running' }); });
+
+    expect(useStore.getState().surfaceTurnOpenAt['pty-bytes']).toBeUndefined();
+  });
+});

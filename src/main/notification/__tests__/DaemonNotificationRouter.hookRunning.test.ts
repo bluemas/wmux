@@ -194,6 +194,70 @@ describe('DaemonNotificationRouter — turn start lights the pane', () => {
   });
 });
 
+/** Every agentStatus this pane was broadcast, in order. */
+function statusesBroadcast(): string[] {
+  return broadcastMetadataUpdateMock.mock.calls
+    .map(([, p]) => p as { ptyId?: string; agentStatus?: string })
+    .filter((p) => p.ptyId === PTY && p.agentStatus !== undefined)
+    .map((p) => p.agentStatus as string);
+}
+
+/** A tool-start envelope as HookIngest's gate path ships it. */
+function toolStartedEvent(payload: Record<string, unknown> = {}) {
+  const ev = metadataEvent('agent.tool_started');
+  ev.event.signal.payload = payload;
+  return ev;
+}
+
+describe('DaemonNotificationRouter — a tool call after a finished turn reopens it', () => {
+  beforeEach(() => {
+    broadcastMetadataUpdateMock.mockClear();
+    metadataHandlerMocks.lastBroadcastAgentStatus.delete(PTY);
+    metadataHandlerMocks.runningClaim.delete(PTY);
+  });
+
+  // Claude Code answers a `!` shell command with a turn of its own and fires no
+  // UserPromptSubmit for it (live, 2026-10-13: a 4-minute release build read
+  // as finished). Its tool calls are the only start evidence that turn has.
+  it('lights the pane and claims the latch on the first tool after a Stop', () => {
+    const hookRouter = stubHookRouter(true);
+    const { router, captured } = makeRouter(hookRouter);
+    metadataHandlerMocks.lastBroadcastAgentStatus.set(PTY, 'complete');
+
+    captured.agent?.(toolStartedEvent({ tool_name: 'Bash' }));
+
+    expect(statusesBroadcast()).toEqual(['running']);
+    const patch = broadcastMetadataUpdateMock.mock.calls.find(
+      ([, p]) => (p as { agentStatus?: string }).agentStatus === 'running',
+    )?.[1] as Record<string, unknown>;
+    expect(patch.hookKind).toBe('agent.tool_started');
+    expect(hookRouter.noteHookTurnStart).toHaveBeenCalledWith(PTY, expect.any(Number), 'claude');
+    router.stop();
+  });
+
+  it('writes no status for a tool inside a turn that is already running', () => {
+    const { router, captured } = makeRouter(stubHookRouter(true));
+    metadataHandlerMocks.lastBroadcastAgentStatus.set(PTY, 'running');
+
+    captured.agent?.(toolStartedEvent({ tool_name: 'Bash' }));
+
+    expect(statusesBroadcast()).toEqual([]);
+    router.stop();
+  });
+
+  it('ignores a tool from Claude Code\'s own forked agent after the Stop', () => {
+    // The prompt suggestion and away recap run after the turn ends; their
+    // payload carries an agent_id and no agent_type.
+    const { router, captured } = makeRouter(stubHookRouter(true));
+    metadataHandlerMocks.lastBroadcastAgentStatus.set(PTY, 'complete');
+
+    captured.agent?.(toolStartedEvent({ tool_name: 'Read', agent_id: 'a1', agent_type: '' }));
+
+    expect(statusesBroadcast()).toEqual([]);
+    router.stop();
+  });
+});
+
 describe('DaemonNotificationRouter — the byte heuristic stands down on a hook-governed pane', () => {
   beforeEach(() => {
     broadcastMetadataUpdateMock.mockClear();

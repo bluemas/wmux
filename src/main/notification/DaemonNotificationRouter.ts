@@ -39,6 +39,20 @@ import type { ChannelMessage } from '../../shared/channels';
 // daemon and local modes.
 const AGENT_EVENT_SUPPRESSION_MS = 10_000;
 
+/** Pane statuses a turn has ended on. A tool starting on one of these opens a
+ *  new turn; `awaiting_input` is left out because a subagent's tool can run
+ *  while the lead's question is still on screen. */
+const TURN_ENDED_STATUSES: ReadonlySet<string> = new Set(['complete', 'error', 'idle']);
+
+/** Claude Code's own forked agents carry an agent_id and no agent_type; a real
+ *  subagent always carries both. Mirrors the bridge's skip-internal-fork test. */
+function isInternalForkPayload(payload: Record<string, unknown> | undefined): boolean {
+  const agentId = payload?.['agent_id'];
+  const agentType = payload?.['agent_type'];
+  return typeof agentId === 'string' && agentId.length > 0
+    && !(typeof agentType === 'string' && agentType.length > 0);
+}
+
 /**
  * The OSC 133 markers that mean the pane's shell is back at its OWN prompt:
  * a foreground command ended (D), or a fresh prompt was drawn (A / B). Exactly
@@ -815,6 +829,27 @@ export class DaemonNotificationRouter {
               ...(ev.agent ? { agentName: ev.agent, agentSlug: promptSlug ?? null } : {}),
             });
           } else if (ev.signal) {
+            // A tool starting on a pane whose turn already ended is a turn the
+            // agent began without UserPromptSubmit: Claude Code answers a `!`
+            // shell command with a turn of its own and fires no prompt hook for
+            // it. Without this the latch stays shut, the byte heuristic stays
+            // muted by the previous turn's claim, and a long tool call reads as
+            // finished. Claude Code's own forked agents (prompt suggestion, away
+            // recap) run tools after the Stop; their payload has an agent_id
+            // and no agent_type, the same test the bridge applies.
+            if (metadataKind === 'agent.tool_started'
+                && TURN_ENDED_STATUSES.has(getLastBroadcastAgentStatus(payload.sessionId) ?? '')
+                && !isInternalForkPayload(ev.signal.payload)) {
+              const toolSlug = agentDisplayToSlug(ev.agent);
+              if (ev.agent) this.lastAgentNameByPty.set(payload.sessionId, ev.agent);
+              this.getHookRouter?.()?.noteHookTurnStart(payload.sessionId, this.now(), toolSlug ?? null);
+              broadcastMetadataUpdate(win, {
+                ptyId: payload.sessionId,
+                agentStatus: 'running',
+                hookKind: 'agent.tool_started',
+                ...(ev.agent ? { agentName: ev.agent, agentSlug: toolSlug ?? null } : {}),
+              });
+            }
             // agent.activity, or a kind this build does not know yet: the
             // throttled Fleet View line. Unknown kinds are safe here — the
             // branch can only ever write the activity metadata field. A tool
