@@ -116,6 +116,8 @@ export const SETTINGS_CATALOG: SettingsCatalogEntry[] = [
   { id: 'chrome', tab: 'appearance', labelKey: 'settings.chromePreset', descKey: 'settings.chromePresetDesc', synonyms: 'density compact comfortable' },
   { id: 'sidebarpos', tab: 'appearance', labelKey: 'settings.sidebarPosition', descKey: 'settings.sidebarPositionDesc', synonyms: 'sidebar left right dock' },
   { id: 'sidebarattention', tab: 'appearance', labelKey: 'settings.sidebarSort', descKey: 'settings.sidebarSortDesc', synonyms: 'needs you waiting attention sort order recent activity manual pin top 대기 정렬 순서 최근' },
+  { id: 'sidebarexplorerbutton', tab: 'appearance', labelKey: 'settings.sidebarShowExplorerButton', descKey: 'settings.sidebarShowExplorerButtonDesc', synonyms: 'sidebar folder file explorer finder open button hover 사이드바 폴더 탐색기 버튼' },
+  { id: 'sidebarcopyinfobutton', tab: 'appearance', labelKey: 'settings.sidebarShowCopyInfoButton', descKey: 'settings.sidebarShowCopyInfoButtonDesc', synonyms: 'sidebar copy session info clipboard button hover 사이드바 세션 정보 복사 버튼' },
   { id: 'sidebarports', tab: 'appearance', labelKey: 'settings.sidebarShowPorts', descKey: 'settings.sidebarShowPortsDesc', synonyms: 'sidebar port ports localhost listening number 사이드바 포트 번호 표시' },
   { id: 'sidebarpanecoordinates', tab: 'appearance', labelKey: 'settings.sidebarShowPaneCoordinates', descKey: 'settings.sidebarShowPaneCoordinatesDesc', synonyms: 'roster coordinate w1-2 pane name label unnamed clutter agent' },
   { id: 'attentionblink', tab: 'appearance', labelKey: 'settings.attentionBlink', descKey: 'settings.attentionBlinkDesc', synonyms: 'blink pulse flash animate needs you waiting question approval remind 깜빡임 알림' },

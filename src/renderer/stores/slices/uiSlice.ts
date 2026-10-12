@@ -663,6 +663,14 @@ export interface UISlice {
   sidebarShowPorts: boolean;
   setSidebarShowPorts: (enabled: boolean) => void;
 
+  /** Whether a workspace row's hover cluster carries the "Open in File
+   *  Explorer" and "Copy session info" buttons. On by default; the row's
+   *  context menu keeps its own "Open with" entry either way. */
+  sidebarShowExplorerButton: boolean;
+  setSidebarShowExplorerButton: (enabled: boolean) => void;
+  sidebarShowCopyInfoButton: boolean;
+  setSidebarShowCopyInfoButton: (enabled: boolean) => void;
+
   sidebarShowPaneCoordinates: boolean;
   setSidebarShowPaneCoordinates: (enabled: boolean) => void;
 
@@ -1845,6 +1853,18 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
 
   setSidebarShowPorts: (enabled) => set((state) => {
     state.sidebarShowPorts = enabled;
+  }),
+
+  sidebarShowExplorerButton: true,
+
+  setSidebarShowExplorerButton: (enabled) => set((state) => {
+    state.sidebarShowExplorerButton = enabled;
+  }),
+
+  sidebarShowCopyInfoButton: true,
+
+  setSidebarShowCopyInfoButton: (enabled) => set((state) => {
+    state.sidebarShowCopyInfoButton = enabled;
   }),
 
   sidebarShowPaneCoordinates: true,

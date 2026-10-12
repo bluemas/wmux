@@ -3606,6 +3606,10 @@ function TabAppearance() {
   const setSidebarSortMode = useStore((s) => s.setSidebarSortMode);
   const sidebarShowPorts = useStore((s) => s.sidebarShowPorts);
   const setSidebarShowPorts = useStore((s) => s.setSidebarShowPorts);
+  const sidebarShowExplorerButton = useStore((s) => s.sidebarShowExplorerButton);
+  const setSidebarShowExplorerButton = useStore((s) => s.setSidebarShowExplorerButton);
+  const sidebarShowCopyInfoButton = useStore((s) => s.sidebarShowCopyInfoButton);
+  const setSidebarShowCopyInfoButton = useStore((s) => s.setSidebarShowCopyInfoButton);
   const sidebarShowPaneCoordinates = useStore((s) => s.sidebarShowPaneCoordinates);
   const setSidebarShowPaneCoordinates = useStore((s) => s.setSidebarShowPaneCoordinates);
   const attentionBlink = useStore((s) => s.attentionBlink);
@@ -3774,6 +3778,20 @@ function TabAppearance() {
             checked={sidebarShowPorts}
             onChange={setSidebarShowPorts}
             label={t('settings.sidebarShowPorts')}
+          />
+        </SettingRow>
+        <SettingRow id="sidebarexplorerbutton" label={t('settings.sidebarShowExplorerButton')} description={t('settings.sidebarShowExplorerButtonDesc')}>
+          <Toggle
+            checked={sidebarShowExplorerButton}
+            onChange={setSidebarShowExplorerButton}
+            label={t('settings.sidebarShowExplorerButton')}
+          />
+        </SettingRow>
+        <SettingRow id="sidebarcopyinfobutton" label={t('settings.sidebarShowCopyInfoButton')} description={t('settings.sidebarShowCopyInfoButtonDesc')}>
+          <Toggle
+            checked={sidebarShowCopyInfoButton}
+            onChange={setSidebarShowCopyInfoButton}
+            label={t('settings.sidebarShowCopyInfoButton')}
           />
         </SettingRow>
         {/* #1326 — on by default: turning it off is an explicit opt-out, not a

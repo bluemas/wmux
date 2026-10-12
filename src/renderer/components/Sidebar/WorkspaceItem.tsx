@@ -1074,6 +1074,9 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumb
     };
   }, [closeConfirmPos]);
 
+  const showExplorerButton = useStore((s) => s.sidebarShowExplorerButton);
+  const showCopyInfoButton = useStore((s) => s.sidebarShowCopyInfoButton);
+
   // A1: 자기 ws가 (막 삭제되어) 없으면 렌더하지 않는다. 모든 훅 호출 이후에만
   // 반환해 훅 순서를 보존한다. Sidebar는 삭제와 동시에 이 항목을 map에서 제거
   // 하므로 이 창은 찰나다.
@@ -1170,7 +1173,7 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumb
         className={`${HIT_TARGET_24_CLUSTER} opacity-0 pointer-events-none transition-opacity duration-150 ${hover.cluster}`}
       >
         {/* Folder icon — reveals this workspace's cwd in the OS file manager. */}
-        <button
+        {showExplorerButton && <button
           data-workspace-action="explorer"
           tabIndex={innerTab}
           className={`${HIT_TARGET_24_IN_CLUSTER} rounded-md text-[color-mix(in_srgb,var(--text-main)_50%,transparent)] hover:bg-[var(--selection)] hover:text-[var(--text-main)] text-[10px] font-mono`}
@@ -1179,10 +1182,10 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumb
           aria-label={t('workspace.openInExplorer', { app: fileManagerName(t) })}
         >
           <IconFolder size={11} />
-        </button>
+        </button>}
 
         {/* Copy session info button */}
-        <button
+        {showCopyInfoButton && <button
           data-workspace-action="copy-info"
           tabIndex={innerTab}
           className={`${HIT_TARGET_24_IN_CLUSTER} rounded-md text-[color-mix(in_srgb,var(--text-main)_50%,transparent)] hover:bg-[var(--selection)] hover:text-[var(--text-main)] text-[10px] font-mono`}
@@ -1191,7 +1194,7 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumb
           aria-label={t('workspace.copyInfo')}
         >
           <IconCopy size={11} />
-        </button>
+        </button>}
 
         {/* Close button — asks for confirmation first (anti-misclick). Last in
             the cluster: a pointer overshooting it to the right leaves the

@@ -963,6 +963,10 @@ export interface SessionData {
   sidebarAttentionFirst?: boolean;
   /** Whether listening port numbers appear in the sidebar. Default true. */
   sidebarShowPorts?: boolean;
+  /** Whether workspace rows show the "Open in File Explorer" button. Default true. */
+  sidebarShowExplorerButton?: boolean;
+  /** Whether workspace rows show the "Copy session info" button. Default true. */
+  sidebarShowCopyInfoButton?: boolean;
   /** #1326 — whether the agent roster's muted trailer shows the auto `w<ws>-<pane>`
    *  coordinate for unlabeled panes. Default true. */
   sidebarShowPaneCoordinates?: boolean;

@@ -455,6 +455,8 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
     sidebarPosition: state.sidebarPosition,
     sidebarAttentionFirst: state.sidebarAttentionFirst,
     sidebarShowPorts: state.sidebarShowPorts,
+    sidebarShowExplorerButton: state.sidebarShowExplorerButton,
+    sidebarShowCopyInfoButton: state.sidebarShowCopyInfoButton,
     sidebarShowPaneCoordinates: state.sidebarShowPaneCoordinates,
     attentionBlink: state.attentionBlink,
     attentionBlinkRemindMs: state.attentionBlinkRemindMs,
