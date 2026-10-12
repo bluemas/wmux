@@ -836,8 +836,10 @@ export class DaemonNotificationRouter {
             // muted by the previous turn's claim, and a long tool call reads as
             // finished. Claude Code's own forked agents (prompt suggestion, away
             // recap) run tools after the Stop; their payload has an agent_id
-            // and no agent_type, the same test the bridge applies.
-            if (metadataKind === 'agent.tool_started'
+            // and no agent_type, the same test the bridge applies. A gated tool
+            // (Bash outside bypass mode) arrives as awaiting_permission instead
+            // of tool_started, and is the same start evidence.
+            if ((metadataKind === 'agent.tool_started' || metadataKind === 'agent.awaiting_permission')
                 && TURN_ENDED_STATUSES.has(getLastBroadcastAgentStatus(payload.sessionId) ?? '')
                 && !isInternalForkPayload(ev.signal.payload)) {
               const toolSlug = agentDisplayToSlug(ev.agent);

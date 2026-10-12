@@ -203,8 +203,8 @@ function statusesBroadcast(): string[] {
 }
 
 /** A tool-start envelope as HookIngest's gate path ships it. */
-function toolStartedEvent(payload: Record<string, unknown> = {}) {
-  const ev = metadataEvent('agent.tool_started');
+function toolStartedEvent(payload: Record<string, unknown> = {}, kind = 'agent.tool_started') {
+  const ev = metadataEvent(kind);
   ev.event.signal.payload = payload;
   return ev;
 }
@@ -231,6 +231,20 @@ describe('DaemonNotificationRouter — a tool call after a finished turn reopens
       ([, p]) => (p as { agentStatus?: string }).agentStatus === 'running',
     )?.[1] as Record<string, unknown>;
     expect(patch.hookKind).toBe('agent.tool_started');
+    expect(hookRouter.noteHookTurnStart).toHaveBeenCalledWith(PTY, expect.any(Number), 'claude');
+    router.stop();
+  });
+
+  it('reopens on a gated tool too, which arrives as awaiting_permission', () => {
+    // Outside bypass mode Bash is gated: the daemon ships awaiting_permission
+    // for it and never a tool_started.
+    const hookRouter = stubHookRouter(true);
+    const { router, captured } = makeRouter(hookRouter);
+    metadataHandlerMocks.lastBroadcastAgentStatus.set(PTY, 'complete');
+
+    captured.agent?.(toolStartedEvent({ tool_name: 'Bash' }, 'agent.awaiting_permission'));
+
+    expect(statusesBroadcast()).toEqual(['running']);
     expect(hookRouter.noteHookTurnStart).toHaveBeenCalledWith(PTY, expect.any(Number), 'claude');
     router.stop();
   });
