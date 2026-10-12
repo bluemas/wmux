@@ -2353,6 +2353,8 @@ export const pl = {
   'settings.sidebarShowExplorerButtonDesc': 'Pokazuj przycisk folderu w wierszach obszarów roboczych na pasku bocznym. Akcja pozostaje dostępna w menu kontekstowym wiersza.',
   'settings.sidebarShowCopyInfoButton': 'Pokaż przycisk "Kopiuj informacje o sesji"',
   'settings.sidebarShowCopyInfoButtonDesc': 'Pokazuj w wierszach obszarów roboczych na pasku bocznym przycisk kopiujący informacje o sesji.',
+  'settings.sidebarShowPorts': 'Pokaż numery portów',
+  'settings.sidebarShowPortsDesc': 'Pokazuj numery nasłuchujących portów w wierszach obszarów roboczych na pasku bocznym.',
   'settings.sidebarShowPaneCoordinates': 'Pokaż koordynaty pane\'ów',
   'settings.sidebarShowPaneCoordinatesDesc': 'Pokazuj w liście agentów wygenerowany koordynat w stylu w1-2 dla pane\'ów bez nadanej etykiety. Domyślnie włączone. Pane, który nazwałeś, zawsze pokazuje swoją etykietę niezależnie od tego ustawienia.',
   'settings.attentionBlink': 'Mruganie uwagi',
