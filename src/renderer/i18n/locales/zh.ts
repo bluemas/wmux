@@ -629,8 +629,6 @@ export const zh = {
   'settings.sidebarSortManual': '手动',
   'settings.sidebarSortAttention': '关注',
   'settings.sidebarSortRecent': '最近活动',
-  'settings.sidebarShowPorts': '显示端口号',
-  'settings.sidebarShowPortsDesc': '在侧边栏的工作区行中显示正在监听的端口号。',
   'settings.sidebarShowExplorerButton': '显示“在文件资源管理器中打开”按钮',
   'settings.sidebarShowExplorerButtonDesc': '在侧边栏的工作区行上显示文件夹按钮。关闭后仍可在该行的右键菜单中使用此操作。',
   'settings.sidebarShowCopyInfoButton': '显示“复制会话信息”按钮',

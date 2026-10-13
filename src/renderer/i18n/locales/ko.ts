@@ -1846,8 +1846,6 @@ export const ko = {
   'settings.sidebarSortManual': '수동',
   'settings.sidebarSortAttention': '주의',
   'settings.sidebarSortRecent': '최근 활동',
-  'settings.sidebarShowPorts': '포트 번호 표시',
-  'settings.sidebarShowPortsDesc': '사이드바의 워크스페이스에 실행 중인 포트 번호를 표시합니다.',
   'settings.sidebarShowExplorerButton': '"파일 탐색기에서 열기" 버튼 표시',
   'settings.sidebarShowExplorerButtonDesc': '사이드바 워크스페이스 행에 폴더 버튼을 표시합니다. 끄더라도 우클릭 메뉴에서는 계속 사용할 수 있습니다.',
   'settings.sidebarShowCopyInfoButton': '"세션 정보 복사" 버튼 표시',

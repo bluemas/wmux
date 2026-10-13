@@ -2351,8 +2351,6 @@ export const pl = {
   'settings.sidebarSortManual': 'Ręczna',
   'settings.sidebarSortAttention': 'Uwaga',
   'settings.sidebarSortRecent': 'Ostatnia aktywność',
-  'settings.sidebarShowPorts': 'Pokaż numery portów',
-  'settings.sidebarShowPortsDesc': 'Pokazuj numery nasłuchujących portów w wierszach obszarów roboczych na pasku bocznym.',
   'settings.sidebarShowExplorerButton': 'Pokaż przycisk "Otwórz w Eksploratorze plików"',
   'settings.sidebarShowExplorerButtonDesc': 'Pokazuj przycisk folderu w wierszach obszarów roboczych na pasku bocznym. Akcja pozostaje dostępna w menu kontekstowym wiersza.',
   'settings.sidebarShowCopyInfoButton': 'Pokaż przycisk "Kopiuj informacje o sesji"',

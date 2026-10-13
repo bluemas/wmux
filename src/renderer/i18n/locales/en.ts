@@ -2379,8 +2379,6 @@ export const en = {
   'settings.sidebarSortManual': 'Manual',
   'settings.sidebarSortAttention': 'Attention',
   'settings.sidebarSortRecent': 'Recent activity',
-  'settings.sidebarShowPorts': 'Show port numbers',
-  'settings.sidebarShowPortsDesc': 'Show listening port numbers in sidebar workspace rows.',
   'settings.sidebarShowExplorerButton': 'Show "Open in File Explorer" button',
   'settings.sidebarShowExplorerButtonDesc': "Show the folder button on sidebar workspace rows. The row's right-click menu keeps the action either way.",
   'settings.sidebarShowCopyInfoButton': 'Show "Copy session info" button',

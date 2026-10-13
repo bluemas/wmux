@@ -454,7 +454,6 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
     a2aAutoApproveExecute: state.a2aAutoApproveExecute,
     sidebarPosition: state.sidebarPosition,
     sidebarAttentionFirst: state.sidebarAttentionFirst,
-    sidebarShowPorts: state.sidebarShowPorts,
     sidebarShowExplorerButton: state.sidebarShowExplorerButton,
     sidebarShowCopyInfoButton: state.sidebarShowCopyInfoButton,
     sidebarShowPorts: state.sidebarShowPorts,
