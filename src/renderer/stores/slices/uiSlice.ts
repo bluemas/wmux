@@ -656,13 +656,6 @@ export interface UISlice {
   sidebarTaskGroupExpanded: Record<string, boolean>;
   setSidebarTaskGroupExpanded: (ownerId: string, expanded: boolean) => void;
 
-  /** #1326 — show the auto-generated `w<ws>-<pane>` coordinate in the agent
-   *  roster's muted trailer for panes that have no explicit label. On by
-   *  default so nobody's roster changes without them touching the setting; a
-   *  user-set pane label is unaffected either way and always shows. */
-  sidebarShowPorts: boolean;
-  setSidebarShowPorts: (enabled: boolean) => void;
-
   /** Whether a workspace row's hover cluster carries the "Open in File
    *  Explorer" and "Copy session info" buttons. On by default; the row's
    *  context menu keeps its own "Open with" entry either way. */
@@ -671,6 +664,14 @@ export interface UISlice {
   sidebarShowCopyInfoButton: boolean;
   setSidebarShowCopyInfoButton: (enabled: boolean) => void;
 
+  /** Whether listening port numbers appear in sidebar workspace rows. Default true. */
+  sidebarShowPorts: boolean;
+  setSidebarShowPorts: (enabled: boolean) => void;
+
+  /** #1326 — show the auto-generated `w<ws>-<pane>` coordinate in the agent
+   *  roster's muted trailer for panes that have no explicit label. On by
+   *  default so nobody's roster changes without them touching the setting; a
+   *  user-set pane label is unaffected either way and always shows. */
   sidebarShowPaneCoordinates: boolean;
   setSidebarShowPaneCoordinates: (enabled: boolean) => void;
 
@@ -1849,12 +1850,6 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
     state.sidebarTaskGroupExpanded[ownerId] = expanded;
   }),
 
-  sidebarShowPorts: true,
-
-  setSidebarShowPorts: (enabled) => set((state) => {
-    state.sidebarShowPorts = enabled;
-  }),
-
   sidebarShowExplorerButton: true,
 
   setSidebarShowExplorerButton: (enabled) => set((state) => {
@@ -1865,6 +1860,12 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
 
   setSidebarShowCopyInfoButton: (enabled) => set((state) => {
     state.sidebarShowCopyInfoButton = enabled;
+  }),
+
+  sidebarShowPorts: true,
+
+  setSidebarShowPorts: (enabled) => set((state) => {
+    state.sidebarShowPorts = enabled;
   }),
 
   sidebarShowPaneCoordinates: true,

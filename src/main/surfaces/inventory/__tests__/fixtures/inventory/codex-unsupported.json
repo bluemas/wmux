@@ -1,0 +1,31 @@
+{
+  "provider": "codex",
+  "cliVersion": "0.1.0",
+  "versionSupported": false,
+  "writable": false,
+  "scannedAtMs": 1700000000000,
+  "wmuxToolRows": 0,
+  "wmuxCodexHookRows": 0,
+  "warnings": [
+    "Failed to parse TOML at <home>/.codex/config.toml: <parse error>"
+  ],
+  "items": [
+    {
+      "id": "codex:hook::h",
+      "provider": "codex",
+      "kind": "hook",
+      "name": "h",
+      "parent": null,
+      "source": "user",
+      "enabled": true,
+      "effect": "removes",
+      "toggleable": false,
+      "readOnlyReason": "CLI version not supported (read-only)",
+      "hookEvent": "Stop",
+      "hookCost": "extra-turn",
+      "descriptionChars": null,
+      "originPath": "<home>/.codex/hooks.json",
+      "wmuxRequired": false
+    }
+  ]
+}

@@ -56,6 +56,23 @@ describe('useTerminal ctrl-letter encoding + keyboard-state lifecycle (source-le
     );
   });
 
+  it('Windows Ctrl+Alt+letter is written after every shortcut check (#2136)', () => {
+    // xterm drops the chord on Windows (AltGr rule), so wmux writes ESC + the
+    // control byte. Shortcuts, the prefix key and custom keybindings must win
+    // first, and the write runs the keystroke side effects.
+    const branch = HANDLER.indexOf('const ctrlAltBytes = resolveCtrlAltLetterBytes(e, xtermIsWindows);');
+    expect(branch).toBeGreaterThan(-1);
+    expect(branch).toBeGreaterThan(HANDLER.indexOf('resolveShortcut(e, bindings)'));
+    expect(branch).toBeGreaterThan(HANDLER.indexOf('isPrefixTrigger(e,'));
+    expect(branch).toBeGreaterThan(HANDLER.indexOf('customKeybindings.some((kb) => kb.key === combo)'));
+    // Ahead of the kitty step-aside: xterm would drop the chord even there.
+    expect(branch).toBeLessThan(HANDLER.lastIndexOf('if (xtermEncodesKey(e, kittyNegotiated())) return true;'));
+    expect(HANDLER).toMatch(
+      /if \(ctrlAltBytes\) \{\s*e\.preventDefault\(\);\s*window\.electronAPI\.pty\.write\(ptyId, ctrlAltBytes\);\s*noteUserKeystroke\(ctrlAltBytes\);\s*return false;/,
+    );
+    expect(SRC).toMatch(/const xtermIsWindows = navigator\.platform\.startsWith\('Win'\);/);
+  });
+
   it('released-shortcut branch encodes the logical ctrl byte before returning true', () => {
     // #1152 / #1455: a built-in switched off or moved in Settings must reach
     // the PTY as a control byte, not bubble dead. resolveCtrlLetterByte runs
@@ -68,12 +85,14 @@ describe('useTerminal ctrl-letter encoding + keyboard-state lifecycle (source-le
     expect(passThrough).toBeGreaterThan(encode);
   });
 
-  it('all five direct-write sites feed noteUserKeystroke (C2)', () => {
+  it('all six direct-write sites feed noteUserKeystroke (C2)', () => {
     // Helper definition lives before attachCustomKeyEventHandler, so exactly
-    // the five call sites (newline, Escape, released ctrl, ⌘Backspace line
-    // delete, catch-all ctrl) are inside the handler slice.
+    // the six call sites (newline, Escape, released ctrl, ⌘Backspace line
+    // delete, Windows Ctrl+Alt+letter, catch-all ctrl) are inside the handler
+    // slice.
     const calls = HANDLER.match(/noteUserKeystroke\(/g) ?? [];
-    expect(calls.length).toBe(5);
+    expect(calls.length).toBe(6);
+    expect(HANDLER).toMatch(/noteUserKeystroke\(ctrlAltBytes\);/);
     expect(HANDLER).toMatch(/noteUserKeystroke\(lineDeleteByte\);/);
     expect(HANDLER).toMatch(/noteUserKeystroke\(newlineByte\);/);
     expect(HANDLER).toMatch(/noteUserKeystroke\(escapeByte\);/);

@@ -2,22 +2,23 @@ import path from 'node:path';
 import type { HookCostHint, ProviderInventory, SurfaceItem, SurfaceSource } from '../../../shared/tokenUsage/surfaceTypes';
 import { SurfacesStore } from '../safeWrite';
 import {
+  addEffectiveWmuxTools,
+  finishInventory,
+  InventoryCollector,
+  LIVE_TOOLS_WARNING,
+  listSkills,
+} from './collector';
+import {
   hookFingerprint,
   hookItemId,
   normalizePath,
-  parseSkillFrontmatter,
   queryCliVersion,
   safeParseJson,
   safeReaddir,
   safeReadFile,
 } from './helpers';
-import {
-  allocateUniqueItemId,
-  LOCATION_SOURCE_ORDER,
-  makeItem,
-  type InventoryDeps,
-} from './types';
-import { resolveEffectiveWmuxServer, wmuxToolItems, type WmuxServerDeclaration } from './wmuxTools';
+import { makeItem, type InventoryDeps } from './types';
+import type { WmuxServerDeclaration } from './wmuxTools';
 
 function deepEqual(a: unknown, b: unknown): boolean {
   if (a === b) return true;
@@ -47,6 +48,17 @@ export function contextSettingEnabled(key: string, value: boolean): boolean {
   return key.startsWith('disable') ? !value : value;
 }
 
+const CONTEXT_KEYS = [
+  'autoMemoryEnabled',
+  'claudeMdExcludes',
+  'skillListingBudgetFraction',
+  'skillListingMaxDescChars',
+  'autoCompactEnabled',
+  'disableBundledSkills',
+];
+const INJECTS_CONTEXT_EVENTS = ['SessionStart', 'UserPromptSubmit', 'UserPromptExpansion'];
+const MANAGED_HOOK_REASON = 'Managed hooks cannot be toggled';
+
 interface LiveHookInfo {
   event: string;
   handler: Record<string, unknown>;
@@ -54,652 +66,570 @@ interface LiveHookInfo {
   originPath: string;
 }
 
+/** What the settings files say, read in order (user, user local, project, project local). */
+interface ClaudeSettings {
+  deniedMcpServers: Set<string>;
+  mcpToolDenies: Map<string, Set<string>>; // serverName -> Set<toolName>
+  skillOverrides: Map<string, string>;
+  // Which settings file holds each deny or override, so a change is written back to that file.
+  deniedServerFile: Map<string, string>;
+  toolDenyFile: Map<string, string>;
+  skillOverrideFile: Map<string, string>;
+  /** Set by the first file that disables all hooks; hooks read from that file on are listed as off. */
+  disableAllHooks: boolean;
+  liveHooks: LiveHookInfo[];
+}
+
 export async function readClaudeInventory(deps: InventoryDeps): Promise<ProviderInventory> {
-  const warnings: string[] = [];
-  const items: SurfaceItem[] = [];
-  const seenItemIds = new Set<string>();
-  const liveHooks: LiveHookInfo[] = [];
-
-  function addItem(item: SurfaceItem): void {
-    const uniqueId = allocateUniqueItemId(seenItemIds, item.id, item.source);
-    if (uniqueId !== item.id) {
-      items.push({ ...item, id: uniqueId });
-    } else {
-      items.push(item);
-    }
-  }
-
+  const c = new InventoryCollector();
   const cliVersion = await queryCliVersion('claude', deps.run);
   const versionSupported = cliVersion !== null;
-  const writable = versionSupported;
 
-  // 1. Settings files
-  const settingsPaths = [
+  const settings: ClaudeSettings = {
+    deniedMcpServers: new Set(),
+    mcpToolDenies: new Map(),
+    skillOverrides: new Map(),
+    deniedServerFile: new Map(),
+    toolDenyFile: new Map(),
+    skillOverrideFile: new Map(),
+    disableAllHooks: false,
+    liveHooks: [],
+  };
+  for (const sp of settingsPaths(deps)) {
+    const content = await safeReadFile(sp, deps, c.warnings);
+    if (!content) continue;
+    const parsed = safeParseJson<Record<string, unknown>>(sp, content, c.warnings);
+    if (!parsed || typeof parsed !== 'object') continue;
+    readSettingsFile(parsed, sp, settings, deps, c);
+  }
+
+  addRemovedHooks(deps, c, settings.liveHooks, versionSupported);
+  const hasMcpServers = await addMcpServers(deps, c, settings);
+  await addSkills(deps, c, settings.skillOverrides);
+  if (hasMcpServers) c.warnings.push(LIVE_TOOLS_WARNING);
+
+  for (const item of c.items) {
+    const file = settingsFileFor(item, settings);
+    if (file) item.settingsPath = file;
+  }
+  return finishInventory('claude', c, { cliVersion, versionSupported }, deps);
+}
+
+function settingsPaths(deps: InventoryDeps): string[] {
+  const paths = [
     path.join(deps.homeDir, '.claude', 'settings.json'),
     path.join(deps.homeDir, '.claude', 'settings.local.json'),
   ];
   if (deps.projectDir) {
-    settingsPaths.push(path.join(deps.projectDir, '.claude', 'settings.json'));
-    settingsPaths.push(path.join(deps.projectDir, '.claude', 'settings.local.json'));
+    paths.push(path.join(deps.projectDir, '.claude', 'settings.json'));
+    paths.push(path.join(deps.projectDir, '.claude', 'settings.local.json'));
   }
+  return paths;
+}
 
-  const deniedMcpServers = new Set<string>();
-  // Which settings file holds each deny or override, so a change is written back to that file.
-  const deniedServerFile = new Map<string, string>();
-  const toolDenyFile = new Map<string, string>();
-  const skillOverrideFile = new Map<string, string>();
-  const mcpToolDenies = new Map<string, Set<string>>(); // serverName -> Set<toolName>
-  const skillOverrides = new Map<string, string>();
-  let disableAllHooks = false;
-  let hasMcpServers = false;
+function readSettingsFile(
+  parsed: Record<string, unknown>,
+  sp: string,
+  s: ClaudeSettings,
+  deps: InventoryDeps,
+  c: InventoryCollector,
+): void {
+  if (parsed.disableAllHooks === true) s.disableAllHooks = true;
+  collectDeniedServers(parsed.deniedMcpServers, sp, s);
+  readPermissionDenies(parsed.permissions, sp, s, c);
+  addPlugins(parsed.enabledPlugins, sp, c);
+  collectSkillOverrides(parsed.skillOverrides, sp, s);
+  addContextSettings(parsed, sp, c);
+  addSettingsHooks(parsed.hooks, sp, s, deps, c);
+}
 
-  for (const sp of settingsPaths) {
-    const content = await safeReadFile(sp, deps, warnings);
-    if (!content) continue;
+function collectDeniedServers(denied: unknown, sp: string, s: ClaudeSettings): void {
+  if (!Array.isArray(denied)) return;
+  for (const d of denied) {
+    if (!d || typeof d !== 'object') continue;
+    const serverName = (d as { serverName?: unknown }).serverName;
+    if (typeof serverName !== 'string') continue;
+    s.deniedMcpServers.add(serverName);
+    s.deniedServerFile.set(serverName, sp);
+  }
+}
 
-    const parsed = safeParseJson<Record<string, unknown>>(sp, content, warnings);
-    if (!parsed || typeof parsed !== 'object') continue;
-
-    if (parsed.disableAllHooks === true) {
-      disableAllHooks = true;
-    }
-
-    // deniedMcpServers
-    if (Array.isArray(parsed.deniedMcpServers)) {
-      for (const d of parsed.deniedMcpServers) {
-        if (d && typeof d === 'object' && typeof (d as { serverName?: unknown }).serverName === 'string') {
-          deniedMcpServers.add((d as { serverName: string }).serverName);
-          deniedServerFile.set((d as { serverName: string }).serverName, sp);
-        }
-      }
-    }
-
-    // permissions.deny
-    const permissions = parsed.permissions;
-    if (permissions && typeof permissions === 'object') {
-      const deny = (permissions as { deny?: unknown }).deny;
-      if (Array.isArray(deny)) {
-        for (const item of deny) {
-          if (typeof item !== 'string') continue;
-          const mcpMatch = /^mcp__([a-zA-Z0-9_-]+)__(.+)$/.exec(item);
-          if (mcpMatch) {
-            const server = mcpMatch[1];
-            const tool = mcpMatch[2];
-            let set = mcpToolDenies.get(server);
-            if (!set) {
-              set = new Set<string>();
-              mcpToolDenies.set(server, set);
-            }
-            set.add(tool);
-            toolDenyFile.set(`${server}/${tool}`, sp);
-          } else {
-            // Bare tool denial
-            addItem(
-              makeItem({
-                provider: 'claude',
-                kind: 'builtin-tool',
-                name: item,
-                source: 'builtin',
-                enabled: false,
-                effect: 'removes',
-                toggleable: true,
-                originPath: sp,
-              }),
-            );
-          }
-        }
-      }
-    }
-
-    // enabledPlugins
-    const plugins = parsed.enabledPlugins;
-    if (plugins && typeof plugins === 'object' && !Array.isArray(plugins)) {
-      for (const [pluginName, val] of Object.entries(plugins)) {
-        addItem(
-          makeItem({
-            provider: 'claude',
-            kind: 'plugin',
-            name: pluginName,
-            source: 'user',
-            enabled: val !== false,
-            effect: 'removes',
-            toggleable: true,
-            originPath: sp,
-          }),
-        );
-      }
-    }
-
-    // skillOverrides
-    const so = parsed.skillOverrides;
-    if (so && typeof so === 'object' && !Array.isArray(so)) {
-      for (const [k, v] of Object.entries(so)) {
-        if (typeof v === 'string') {
-          skillOverrides.set(k, v);
-          skillOverrideFile.set(k, sp);
-        }
-      }
-    }
-
-    // Context settings
-    const contextKeys = [
-      'autoMemoryEnabled',
-      'claudeMdExcludes',
-      'skillListingBudgetFraction',
-      'skillListingMaxDescChars',
-      'autoCompactEnabled',
-      'disableBundledSkills',
-    ];
-    for (const ck of contextKeys) {
-      if (!(ck in parsed)) continue;
-      const value = parsed[ck];
-      // Only booleans can be switched: a number or list has no "off" value to write and restore.
-      const isBoolean = typeof value === 'boolean';
-      addItem(
+/** `permissions.deny`: `mcp__<server>__<tool>` entries switch a tool off, any other entry is a built-in tool. */
+function readPermissionDenies(permissions: unknown, sp: string, s: ClaudeSettings, c: InventoryCollector): void {
+  if (!permissions || typeof permissions !== 'object') return;
+  const deny = (permissions as { deny?: unknown }).deny;
+  if (!Array.isArray(deny)) return;
+  for (const item of deny) {
+    if (typeof item !== 'string') continue;
+    const mcpMatch = /^mcp__([a-zA-Z0-9_-]+)__(.+)$/.exec(item);
+    if (!mcpMatch) {
+      c.add(
         makeItem({
           provider: 'claude',
-          kind: 'context-setting',
-          name: ck,
-          source: 'user',
-          enabled: isBoolean ? contextSettingEnabled(ck, value) : null,
+          kind: 'builtin-tool',
+          name: item,
+          source: 'builtin',
+          enabled: false,
           effect: 'removes',
-          toggleable: isBoolean,
-          readOnlyReason: isBoolean ? null : 'Only on/off settings can be switched here; edit this value in settings.json.',
+          toggleable: true,
           originPath: sp,
         }),
       );
+      continue;
     }
-
-    // Hooks in settings.json
-    const hooks = parsed.hooks;
-    if (hooks && typeof hooks === 'object' && !Array.isArray(hooks)) {
-      for (const [event, eventHooks] of Object.entries(hooks)) {
-        const hookList: unknown[] = Array.isArray(eventHooks) ? eventHooks : [eventHooks];
-        for (const hookDef of hookList) {
-          if (!hookDef || typeof hookDef !== 'object') continue;
-          const groupOrHandler = hookDef as Record<string, unknown>;
-          if (Array.isArray(groupOrHandler.hooks)) {
-            const groupMeta: Record<string, unknown> = {};
-            for (const [k, v] of Object.entries(groupOrHandler)) {
-              if (k !== 'hooks') groupMeta[k] = v;
-            }
-            for (const item of groupOrHandler.hooks) {
-              if (!item || typeof item !== 'object') continue;
-              const h = item as Record<string, unknown>;
-              liveHooks.push({ event, handler: h, groupMeta, originPath: sp });
-              addLiveHookItem(event, h, sp, groupMeta);
-            }
-          } else {
-            const h = groupOrHandler;
-            liveHooks.push({ event, handler: h, originPath: sp });
-            addLiveHookItem(event, h, sp);
-          }
-        }
-      }
+    const [, server, tool] = mcpMatch;
+    let set = s.mcpToolDenies.get(server);
+    if (!set) {
+      set = new Set<string>();
+      s.mcpToolDenies.set(server, set);
     }
+    set.add(tool);
+    s.toolDenyFile.set(`${server}/${tool}`, sp);
   }
+}
 
-  function addLiveHookItem(
-    event: string,
-    h: Record<string, unknown>,
-    originPath: string,
-    groupMeta?: Record<string, unknown>,
-  ): void {
-    const type = typeof h.type === 'string' ? h.type : 'command';
-    let hookCost: HookCostHint = 'none';
-    if (type === 'prompt' || type === 'agent') {
-      hookCost = 'calls-model';
-    } else if (event === 'Stop' || event === 'SubagentStop') {
-      hookCost = 'extra-turn';
-    } else if (['SessionStart', 'UserPromptSubmit', 'UserPromptExpansion'].includes(event)) {
-      hookCost = 'injects-context';
-    }
-
-    const cmd = String(h.command ?? h.prompt ?? h.script ?? '');
-    const isWmux = cmd.includes('wmux') || cmd.includes('.wmux');
-    const isManaged = h.managed === true;
-    const hookName = (typeof h.name === 'string' && h.name) || `${event}-${type}`;
-    const isProject = deps.projectDir ? normalizePath(originPath).startsWith(normalizePath(deps.projectDir)) : false;
-    const source: SurfaceSource = isWmux ? 'wmux' : isManaged ? 'managed' : isProject ? 'project' : 'user';
-
-    const fingerprint = hookFingerprint(event, groupMeta, h);
-    addItem({
-      ...makeItem({
+function addPlugins(plugins: unknown, sp: string, c: InventoryCollector): void {
+  if (!plugins || typeof plugins !== 'object' || Array.isArray(plugins)) return;
+  for (const [pluginName, val] of Object.entries(plugins)) {
+    c.add(
+      makeItem({
         provider: 'claude',
-        kind: 'hook',
-        name: hookName,
-        source,
-        enabled: !disableAllHooks,
+        kind: 'plugin',
+        name: pluginName,
+        source: 'user',
+        enabled: val !== false,
         effect: 'removes',
-        toggleable: !isManaged,
-        readOnlyReason: isManaged ? 'Managed hooks cannot be toggled' : null,
-        hookEvent: event,
-        hookCost,
-        hookFingerprint: fingerprint,
-        originPath,
-        wmuxRequired: isWmux,
+        toggleable: true,
+        originPath: sp,
       }),
-      id: hookItemId(hookName, originPath, fingerprint),
-    });
+    );
   }
+}
 
-  // 1b. Load removed hooks from surfaces.json store read-only
-  const storePath = deps.surfacesStorePath ?? path.join(deps.homeDir, '.wmux', 'surfaces.json');
-  const store = new SurfacesStore(storePath);
+function collectSkillOverrides(overrides: unknown, sp: string, s: ClaudeSettings): void {
+  if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) return;
+  for (const [k, v] of Object.entries(overrides)) {
+    if (typeof v !== 'string') continue;
+    s.skillOverrides.set(k, v);
+    s.skillOverrideFile.set(k, sp);
+  }
+}
+
+function addContextSettings(parsed: Record<string, unknown>, sp: string, c: InventoryCollector): void {
+  for (const ck of CONTEXT_KEYS) {
+    if (!(ck in parsed)) continue;
+    const value = parsed[ck];
+    // Only booleans can be switched: a number or list has no "off" value to write and restore.
+    const isBoolean = typeof value === 'boolean';
+    c.add(
+      makeItem({
+        provider: 'claude',
+        kind: 'context-setting',
+        name: ck,
+        source: 'user',
+        enabled: isBoolean ? contextSettingEnabled(ck, value) : null,
+        effect: 'removes',
+        toggleable: isBoolean,
+        readOnlyReason: isBoolean ? null : 'Only on/off settings can be switched here; edit this value in settings.json.',
+        originPath: sp,
+      }),
+    );
+  }
+}
+
+/** `hooks.<event>`: a matcher group (`{ matcher, hooks: [...] }`) or a bare handler, alone or in a list. */
+function addSettingsHooks(
+  hooks: unknown,
+  sp: string,
+  s: ClaudeSettings,
+  deps: InventoryDeps,
+  c: InventoryCollector,
+): void {
+  if (!hooks || typeof hooks !== 'object' || Array.isArray(hooks)) return;
+  for (const [event, eventHooks] of Object.entries(hooks)) {
+    const hookList: unknown[] = Array.isArray(eventHooks) ? eventHooks : [eventHooks];
+    for (const hookDef of hookList) {
+      if (hookDef && typeof hookDef === 'object') addHookDefinition(event, hookDef as Record<string, unknown>, sp, s, deps, c);
+    }
+  }
+}
+
+function addHookDefinition(
+  event: string,
+  groupOrHandler: Record<string, unknown>,
+  sp: string,
+  s: ClaudeSettings,
+  deps: InventoryDeps,
+  c: InventoryCollector,
+): void {
+  if (!Array.isArray(groupOrHandler.hooks)) {
+    s.liveHooks.push({ event, handler: groupOrHandler, originPath: sp });
+    addLiveHook(event, groupOrHandler, sp, undefined, s.disableAllHooks, deps, c);
+    return;
+  }
+  const groupMeta: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(groupOrHandler)) {
+    if (k !== 'hooks') groupMeta[k] = v;
+  }
+  for (const item of groupOrHandler.hooks) {
+    if (!item || typeof item !== 'object') continue;
+    const h = item as Record<string, unknown>;
+    s.liveHooks.push({ event, handler: h, groupMeta, originPath: sp });
+    addLiveHook(event, h, sp, groupMeta, s.disableAllHooks, deps, c);
+  }
+}
+
+function claudeHookCost(type: string, event: string): HookCostHint {
+  if (type === 'prompt' || type === 'agent') return 'calls-model';
+  if (event === 'Stop' || event === 'SubagentStop') return 'extra-turn';
+  if (INJECTS_CONTEXT_EVENTS.includes(event)) return 'injects-context';
+  return 'none';
+}
+
+/** Name, source and cost of one hook handler, live or removed. */
+function describeHook(event: string, h: Record<string, unknown>, originPath: string | null, deps: InventoryDeps) {
+  const type = typeof h.type === 'string' ? h.type : 'command';
+  const cmd = String(h.command ?? h.prompt ?? h.script ?? '');
+  const isWmux = cmd.includes('wmux') || cmd.includes('.wmux');
+  const isManaged = h.managed === true;
+  const isProject = deps.projectDir && originPath
+    ? normalizePath(originPath).startsWith(normalizePath(deps.projectDir))
+    : false;
+  const source: SurfaceSource = isWmux ? 'wmux' : isManaged ? 'managed' : isProject ? 'project' : 'user';
+  return {
+    name: (typeof h.name === 'string' && h.name) || `${event}-${type}`,
+    source,
+    isWmux,
+    isManaged,
+    hookCost: claudeHookCost(type, event),
+  };
+}
+
+function addLiveHook(
+  event: string,
+  h: Record<string, unknown>,
+  originPath: string,
+  groupMeta: Record<string, unknown> | undefined,
+  disableAllHooks: boolean,
+  deps: InventoryDeps,
+  c: InventoryCollector,
+): void {
+  const d = describeHook(event, h, originPath, deps);
+  const fingerprint = hookFingerprint(event, groupMeta, h);
+  c.add({
+    ...makeItem({
+      provider: 'claude',
+      kind: 'hook',
+      name: d.name,
+      source: d.source,
+      enabled: !disableAllHooks,
+      effect: 'removes',
+      toggleable: !d.isManaged,
+      readOnlyReason: d.isManaged ? MANAGED_HOOK_REASON : null,
+      hookEvent: event,
+      hookCost: d.hookCost,
+      hookFingerprint: fingerprint,
+      originPath,
+      wmuxRequired: d.isWmux,
+    }),
+    id: hookItemId(d.name, originPath, fingerprint),
+  });
+}
+
+interface RemovedHook {
+  id: string;
+  event: string;
+  handler: Record<string, unknown>;
+  groupMeta: Record<string, unknown> | undefined;
+  originPath: string | null;
+}
+
+/**
+ * Hooks wmux removed from a settings file and keeps in surfaces.json, listed as off so they can be
+ * switched back on. Read-only use of the store: a store that cannot be read adds no removed hook.
+ */
+function addRemovedHooks(
+  deps: InventoryDeps,
+  c: InventoryCollector,
+  liveHooks: LiveHookInfo[],
+  versionSupported: boolean,
+): void {
+  const store = new SurfacesStore(deps.surfacesStorePath ?? path.join(deps.homeDir, '.wmux', 'surfaces.json'));
   try {
     store.load();
   } catch {
-    warnings.push('The surfaces store file is corrupt and could not be read.');
+    c.warnings.push('The surfaces store file is corrupt and could not be read.');
   }
+  for (const w of store.warnings) c.warnOnce(storeWarning(w));
 
-  for (const w of store.warnings) {
-    let msg: string;
-    if (w.startsWith('Corrupt surfaces store')) {
-      msg = 'The surfaces store file is corrupt and could not be read.';
-    } else if (w.startsWith('Unknown or unsupported surfaces store version')) {
-      msg = 'The surfaces store has an unsupported or newer version.';
-    } else {
-      msg = 'The surfaces store could not be read.';
-    }
-    if (!warnings.includes(msg)) {
-      warnings.push(msg);
-    }
-  }
-
-  const liveItemsCount = items.length;
+  const liveItemsCount = c.items.length;
   try {
-    const rawHooksStore = (store as unknown as { removedHooksStore?: Record<string, unknown> }).removedHooksStore;
-    const rawClaude = rawHooksStore?.claude;
+    const rawClaude = (store as unknown as { removedHooksStore?: Record<string, unknown> }).removedHooksStore?.claude;
     if (rawClaude !== undefined && !Array.isArray(rawClaude)) {
       throw new Error('removedHooks.claude is not an array');
     }
 
-    const removedHooks = store.removedHooks.list('claude');
     let hasInvalidEntries = false;
-
-    for (const rawEntry of removedHooks) {
-      if (!rawEntry || typeof rawEntry !== 'object' || Array.isArray(rawEntry)) {
+    for (const rawEntry of store.removedHooks.list('claude')) {
+      const removed = parseRemovedHook(rawEntry);
+      if (!removed) {
         hasInvalidEntries = true;
         continue;
       }
-
-      const entry = rawEntry as unknown as Record<string, unknown>;
-
-      if (typeof entry.id !== 'string' || entry.id.trim() === '') {
-        hasInvalidEntries = true;
-        continue;
-      }
-
-      if (entry.originPath !== undefined && entry.originPath !== null && typeof entry.originPath !== 'string') {
-        hasInvalidEntries = true;
-        continue;
-      }
-
-      if (!entry.definition || typeof entry.definition !== 'object' || Array.isArray(entry.definition)) {
-        hasInvalidEntries = true;
-        continue;
-      }
-
-      if (seenItemIds.has(entry.id) || items.some((i) => i.id === entry.id)) {
-        continue;
-      }
-
-      const def = entry.definition as Record<string, unknown>;
-      let cleanHandler: Record<string, unknown>;
-      if (def.handler && typeof def.handler === 'object' && !Array.isArray(def.handler)) {
-        cleanHandler = def.handler as Record<string, unknown>;
-      } else {
-        const fallback: Record<string, unknown> = {};
-        for (const [k, v] of Object.entries(def)) {
-          if (k !== 'event' && k !== 'groupMeta') {
-            fallback[k] = v;
-          }
-        }
-        cleanHandler = fallback;
-      }
-
-      const event = typeof def.event === 'string' ? def.event : 'PreToolUse';
-      const groupMeta = def.groupMeta && typeof def.groupMeta === 'object' && !Array.isArray(def.groupMeta)
-        ? (def.groupMeta as Record<string, unknown>)
-        : undefined;
-
-      const originPathStr = typeof entry.originPath === 'string' && entry.originPath.trim().length > 0
-        ? entry.originPath
-        : null;
-
-      const alreadyPresentInFile = liveHooks.some((live) => {
-        if (live.event !== event) return false;
-        if (originPathStr && normalizePath(live.originPath) !== normalizePath(originPathStr)) {
-          return false;
-        }
-        if (!deepEqual(live.handler, cleanHandler)) return false;
-        if (groupMeta !== undefined) {
-          if (!live.groupMeta || !deepEqual(live.groupMeta, groupMeta)) return false;
-        } else {
-          if (live.groupMeta !== undefined) return false;
-        }
-        return true;
-      });
-
-      if (alreadyPresentInFile) {
-        continue;
-      }
-
-      const type = typeof cleanHandler.type === 'string' ? cleanHandler.type : 'command';
-      let hookCost: HookCostHint = 'none';
-      if (type === 'prompt' || type === 'agent') {
-        hookCost = 'calls-model';
-      } else if (event === 'Stop' || event === 'SubagentStop') {
-        hookCost = 'extra-turn';
-      } else if (['SessionStart', 'UserPromptSubmit', 'UserPromptExpansion'].includes(event)) {
-        hookCost = 'injects-context';
-      }
-
-      const cmd = String(cleanHandler.command ?? cleanHandler.prompt ?? cleanHandler.script ?? '');
-      const isWmux = cmd.includes('wmux') || cmd.includes('.wmux');
-      const isManaged = cleanHandler.managed === true;
-      const hookName = (typeof cleanHandler.name === 'string' && cleanHandler.name) || `${event}-${type}`;
-      const isProject = deps.projectDir && originPathStr
-        ? normalizePath(originPathStr).startsWith(normalizePath(deps.projectDir))
-        : false;
-      const source: SurfaceSource = isWmux ? 'wmux' : isManaged ? 'managed' : isProject ? 'project' : 'user';
-
-      const toggleable = versionSupported && !isManaged;
-      const readOnlyReason = isManaged
-        ? 'Managed hooks cannot be toggled'
-        : (!versionSupported ? 'CLI version not supported (read-only)' : null);
-
-      seenItemIds.add(entry.id);
-      items.push({
-        id: entry.id,
-        provider: 'claude',
-        kind: 'hook',
-        name: hookName,
-        parent: null,
-        source,
-        enabled: false,
-        effect: 'removes',
-        toggleable,
-        readOnlyReason,
-        hookEvent: event,
-        hookCost,
-        hookFingerprint: hookFingerprint(event, groupMeta, cleanHandler),
-        descriptionChars: null,
-        originPath: originPathStr,
-        wmuxRequired: isWmux,
-      });
+      if (c.seenIds.has(removed.id) || c.items.some((i) => i.id === removed.id)) continue;
+      if (isStillLive(removed, liveHooks)) continue;
+      c.addExact(removedHookItem(removed, deps, versionSupported));
     }
-
-    if (hasInvalidEntries) {
-      const msg = 'One or more removed hooks in the surfaces store are invalid and were skipped.';
-      if (!warnings.includes(msg)) {
-        warnings.push(msg);
-      }
-    }
+    if (hasInvalidEntries) c.warnOnce('One or more removed hooks in the surfaces store are invalid and were skipped.');
   } catch {
-    items.length = liveItemsCount;
-    seenItemIds.clear();
-    for (const it of items) {
-      seenItemIds.add(it.id);
-    }
-    const msg = 'The surfaces store could not be read.';
-    if (!warnings.includes(msg)) {
-      warnings.push(msg);
-    }
+    c.truncate(liveItemsCount);
+    c.warnOnce('The surfaces store could not be read.');
   }
+}
 
-  // 2. ~/.claude.json for MCP servers
-  const claudeJsonPath = path.join(deps.homeDir, '.claude.json');
-  const claudeJsonContent = await safeReadFile(claudeJsonPath, deps, warnings);
-  const parsedClaudeJson = claudeJsonContent
-    ? safeParseJson<Record<string, unknown>>(claudeJsonPath, claudeJsonContent, warnings)
-    : null;
+function storeWarning(w: string): string {
+  if (w.startsWith('Corrupt surfaces store')) return 'The surfaces store file is corrupt and could not be read.';
+  if (w.startsWith('Unknown or unsupported surfaces store version')) return 'The surfaces store has an unsupported or newer version.';
+  return 'The surfaces store could not be read.';
+}
 
-  const projectDisabledMcpServers = new Set<string>();
-  if (parsedClaudeJson && deps.projectDir && parsedClaudeJson.projects && typeof parsedClaudeJson.projects === 'object') {
-    const normProjDir = normalizePath(deps.projectDir);
-    for (const [projPath, projConf] of Object.entries(parsedClaudeJson.projects as Record<string, unknown>)) {
-      if (normalizePath(projPath) === normProjDir && projConf && typeof projConf === 'object') {
-        const disabled = (projConf as { disabledMcpServers?: unknown }).disabledMcpServers;
-        if (Array.isArray(disabled)) {
-          for (const s of disabled) {
-            if (typeof s === 'string') projectDisabledMcpServers.add(s);
-          }
-        }
-      }
-    }
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return !!v && typeof v === 'object' && !Array.isArray(v);
+}
+
+/** A stored removed hook, or null when the entry is malformed. */
+function parseRemovedHook(rawEntry: unknown): RemovedHook | null {
+  if (!isPlainObject(rawEntry)) return null;
+  const { id, originPath, definition } = rawEntry;
+  if (typeof id !== 'string' || id.trim() === '') return null;
+  if (originPath !== undefined && originPath !== null && typeof originPath !== 'string') return null;
+  if (!isPlainObject(definition)) return null;
+
+  return {
+    id,
+    event: typeof definition.event === 'string' ? definition.event : 'PreToolUse',
+    handler: removedHandler(definition),
+    groupMeta: isPlainObject(definition.groupMeta) ? definition.groupMeta : undefined,
+    originPath: typeof originPath === 'string' && originPath.trim().length > 0 ? originPath : null,
+  };
+}
+
+function removedHandler(definition: Record<string, unknown>): Record<string, unknown> {
+  if (isPlainObject(definition.handler)) return definition.handler;
+  // Older entries stored the handler's fields next to `event` and `groupMeta`.
+  const handler: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(definition)) {
+    if (k !== 'event' && k !== 'groupMeta') handler[k] = v;
   }
+  return handler;
+}
 
-  const wmuxDeclarations: WmuxServerDeclaration[] = [];
-  const addMcpServerWithTools = (
-    serverName: string,
-    source: SurfaceSource,
-    originPath: string,
-    disabledByConfig = false,
-  ) => {
-    hasMcpServers = true;
-    const isWmux = serverName === 'wmux';
-    const isDenied = deniedMcpServers.has(serverName) || projectDisabledMcpServers.has(serverName) || disabledByConfig;
-    const finalSource: SurfaceSource = isWmux ? 'wmux' : source;
+/** The same handler is back in its settings file (same event, file and matcher group). */
+function isStillLive(removed: RemovedHook, liveHooks: LiveHookInfo[]): boolean {
+  return liveHooks.some((live) => {
+    if (live.event !== removed.event) return false;
+    if (removed.originPath && normalizePath(live.originPath) !== normalizePath(removed.originPath)) return false;
+    if (!deepEqual(live.handler, removed.handler)) return false;
+    if (removed.groupMeta === undefined) return live.groupMeta === undefined;
+    return !!live.groupMeta && deepEqual(live.groupMeta, removed.groupMeta);
+  });
+}
 
-    const serverItem = makeItem({
+function removedHookItem(removed: RemovedHook, deps: InventoryDeps, versionSupported: boolean): SurfaceItem {
+  const d = describeHook(removed.event, removed.handler, removed.originPath, deps);
+  const readOnlyReason = d.isManaged
+    ? MANAGED_HOOK_REASON
+    : (!versionSupported ? 'CLI version not supported (read-only)' : null);
+  return {
+    ...makeItem({
       provider: 'claude',
-      kind: 'mcp-server',
-      name: serverName,
-      source: finalSource,
-      enabled: !isDenied,
+      kind: 'hook',
+      name: d.name,
+      source: d.source,
+      enabled: false,
       effect: 'removes',
-      toggleable: true,
-      originPath,
-      wmuxRequired: isWmux,
-    });
-    addItem(serverItem);
+      toggleable: versionSupported && !d.isManaged,
+      readOnlyReason,
+      hookEvent: removed.event,
+      hookCost: d.hookCost,
+      hookFingerprint: hookFingerprint(removed.event, removed.groupMeta, removed.handler),
+      originPath: removed.originPath,
+      wmuxRequired: d.isWmux,
+    }),
+    id: removed.id,
+  };
+}
 
-    const deniedTools = mcpToolDenies.get(serverName);
-    if (!isWmux && deniedTools) {
-      for (const tool of deniedTools) {
-        addItem(
-          makeItem({
-            provider: 'claude',
-            kind: 'mcp-tool',
-            name: tool,
-            parent: serverName,
-            source: finalSource,
-            enabled: false,
-            effect: 'removes',
-            toggleable: true,
-            originPath,
-          }),
-        );
-      }
-    }
+/** Projects in ~/.claude.json whose path is this project. */
+function matchingProjects(parsedClaudeJson: Record<string, unknown> | null, projectDir: string | undefined): object[] {
+  const projects = parsedClaudeJson?.projects;
+  if (!projectDir || !projects || typeof projects !== 'object') return [];
+  const normProjDir = normalizePath(projectDir);
+  return Object.entries(projects as Record<string, unknown>)
+    .filter(([projPath, projConf]) => normalizePath(projPath) === normProjDir && projConf && typeof projConf === 'object')
+    .map(([, projConf]) => projConf as object);
+}
 
-    if (isWmux) {
-      wmuxDeclarations.push({
-        source: source as 'project' | 'user' | 'plugin',
-        serverItem,
-        disabledNames: deniedTools ?? new Set<string>(),
-        originPath,
-      });
+/** A JSON file's content, or null when it is missing, empty or does not parse (the reason is a warning). */
+async function readJson(filePath: string, deps: InventoryDeps, c: InventoryCollector): Promise<Record<string, unknown> | null> {
+  const content = await safeReadFile(filePath, deps, c.warnings);
+  return content ? safeParseJson<Record<string, unknown>>(filePath, content, c.warnings) : null;
+}
+
+function projectDisabledServers(projects: object[]): Set<string> {
+  const disabled = new Set<string>();
+  for (const projConf of projects) {
+    const list = (projConf as { disabledMcpServers?: unknown }).disabledMcpServers;
+    if (!Array.isArray(list)) continue;
+    for (const name of list) {
+      if (typeof name === 'string') disabled.add(name);
     }
+  }
+  return disabled;
+}
+
+function serverNames(servers: unknown): string[] {
+  return servers && typeof servers === 'object' && !Array.isArray(servers) ? Object.keys(servers) : [];
+}
+
+/** User and project servers from ~/.claude.json, then the project's .mcp.json. Returns whether any was listed. */
+async function addMcpServers(deps: InventoryDeps, c: InventoryCollector, s: ClaudeSettings): Promise<boolean> {
+  const claudeJsonPath = path.join(deps.homeDir, '.claude.json');
+  const parsedClaudeJson = await readJson(claudeJsonPath, deps, c);
+  const projects = matchingProjects(parsedClaudeJson, deps.projectDir);
+
+  const projectDisabled = projectDisabledServers(projects);
+
+  const declarations: WmuxServerDeclaration[] = [];
+  let hasMcpServers = false;
+  const add = (serverName: string, source: SurfaceSource, originPath: string) => {
+    hasMcpServers = true;
+    const isDenied = s.deniedMcpServers.has(serverName) || projectDisabled.has(serverName);
+    addMcpServer(serverName, source, originPath, isDenied, s, c, declarations);
   };
 
-  if (parsedClaudeJson && typeof parsedClaudeJson === 'object') {
-    const servers = parsedClaudeJson.mcpServers;
-    if (servers && typeof servers === 'object' && !Array.isArray(servers)) {
-      for (const serverName of Object.keys(servers)) {
-        addMcpServerWithTools(serverName, 'user', claudeJsonPath);
-      }
-    }
-
-    if (deps.projectDir && parsedClaudeJson.projects && typeof parsedClaudeJson.projects === 'object') {
-      const normProjDir = normalizePath(deps.projectDir);
-      for (const [projPath, projConf] of Object.entries(parsedClaudeJson.projects as Record<string, unknown>)) {
-        if (normalizePath(projPath) === normProjDir && projConf && typeof projConf === 'object') {
-          const projServers = (projConf as { mcpServers?: unknown }).mcpServers;
-          if (projServers && typeof projServers === 'object' && !Array.isArray(projServers)) {
-            for (const serverName of Object.keys(projServers)) {
-              addMcpServerWithTools(serverName, 'project', claudeJsonPath);
-            }
-          }
-        }
-      }
-    }
+  for (const name of serverNames(parsedClaudeJson?.mcpServers)) add(name, 'user', claudeJsonPath);
+  for (const projConf of projects) {
+    for (const name of serverNames((projConf as { mcpServers?: unknown }).mcpServers)) add(name, 'project', claudeJsonPath);
   }
-
-  // 3. Project .mcp.json
   if (deps.projectDir) {
     const projectMcpJsonPath = path.join(deps.projectDir, '.mcp.json');
-    const pcontent = await safeReadFile(projectMcpJsonPath, deps, warnings);
-    if (pcontent) {
-      const parsedPMcp = safeParseJson<Record<string, unknown>>(projectMcpJsonPath, pcontent, warnings);
-      if (parsedPMcp && parsedPMcp.mcpServers && typeof parsedPMcp.mcpServers === 'object' && !Array.isArray(parsedPMcp.mcpServers)) {
-        for (const serverName of Object.keys(parsedPMcp.mcpServers)) {
-          addMcpServerWithTools(serverName, 'project', projectMcpJsonPath);
-        }
-      }
-    }
+    const parsedPMcp = await readJson(projectMcpJsonPath, deps, c);
+    for (const name of serverNames(parsedPMcp?.mcpServers)) add(name, 'project', projectMcpJsonPath);
   }
 
-  const effectiveWmux = resolveEffectiveWmuxServer(wmuxDeclarations);
-  if (effectiveWmux) {
-    if (effectiveWmux.warning) {
-      warnings.push(effectiveWmux.warning);
-    }
-    const wmuxTools = wmuxToolItems('claude', effectiveWmux.effective.serverItem, effectiveWmux.effective.disabledNames, deps);
-    for (const toolItem of wmuxTools) {
-      if (!seenItemIds.has(toolItem.id)) {
-        addItem(toolItem);
-      }
-    }
+  addEffectiveWmuxTools(c, 'claude', declarations, deps);
+  return hasMcpServers;
+}
+
+function addMcpServer(
+  serverName: string,
+  source: SurfaceSource,
+  originPath: string,
+  isDenied: boolean,
+  s: ClaudeSettings,
+  c: InventoryCollector,
+  declarations: WmuxServerDeclaration[],
+): void {
+  const isWmux = serverName === 'wmux';
+  const finalSource: SurfaceSource = isWmux ? 'wmux' : source;
+  const serverItem = makeItem({
+    provider: 'claude',
+    kind: 'mcp-server',
+    name: serverName,
+    source: finalSource,
+    enabled: !isDenied,
+    effect: 'removes',
+    toggleable: true,
+    originPath,
+    wmuxRequired: isWmux,
+  });
+  c.add(serverItem);
+
+  const deniedTools = s.mcpToolDenies.get(serverName);
+  if (isWmux) {
+    declarations.push({
+      source: source as 'project' | 'user' | 'plugin',
+      serverItem,
+      disabledNames: deniedTools ?? new Set<string>(),
+      originPath,
+    });
+    return;
   }
-
-  // 4. Skills (user, project, plugin)
-  // 4a. User skills in ~/.claude/skills
-  const userSkillsDir = path.join(deps.homeDir, '.claude', 'skills');
-  const userSkillDirs = await safeReaddir(userSkillsDir, deps);
-  for (const sdir of userSkillDirs) {
-    const skillMdPath = path.join(userSkillsDir, sdir, 'SKILL.md');
-    const skillContent = await safeReadFile(skillMdPath, deps, warnings);
-    if (skillContent === null) continue;
-
-    const fm = parseSkillFrontmatter(skillContent);
-    const skillName = fm.name || sdir;
-    const desc = fm.description ?? '';
-    const descChars = skillName.length + desc.length;
-
-    const override = skillOverrides.get(skillName) ?? skillOverrides.get(sdir);
-    const enabled = override !== 'off';
-
-    addItem(
+  for (const tool of deniedTools ?? []) {
+    c.add(
       makeItem({
         provider: 'claude',
-        kind: 'skill',
-        name: skillName,
-        source: 'user',
-        enabled,
+        kind: 'mcp-tool',
+        name: tool,
+        parent: serverName,
+        source: finalSource,
+        enabled: false,
         effect: 'removes',
         toggleable: true,
-        descriptionChars: descChars,
-        originPath: skillMdPath,
+        originPath,
       }),
     );
   }
+}
 
-  // 4b. Project skills in <project>/.claude/skills
-  if (deps.projectDir) {
-    const projectSkillsDir = path.join(deps.projectDir, '.claude', 'skills');
-    const projectSkillDirs = await safeReaddir(projectSkillsDir, deps);
-    for (const sdir of projectSkillDirs) {
-      const skillMdPath = path.join(projectSkillsDir, sdir, 'SKILL.md');
-      const skillContent = await safeReadFile(skillMdPath, deps, warnings);
-      if (skillContent === null) continue;
-
-      const fm = parseSkillFrontmatter(skillContent);
-      const skillName = fm.name || sdir;
-      const desc = fm.description ?? '';
-      const descChars = skillName.length + desc.length;
-
-      const override = skillOverrides.get(skillName) ?? skillOverrides.get(sdir);
-      const enabled = override !== 'off';
-
-      addItem(
+/** User and project skills (switchable through skillOverrides), then plugin skills (read-only). */
+async function addSkills(deps: InventoryDeps, c: InventoryCollector, skillOverrides: Map<string, string>): Promise<void> {
+  const roots: Array<{ dirPath: string; source: SurfaceSource }> = [
+    { dirPath: path.join(deps.homeDir, '.claude', 'skills'), source: 'user' },
+  ];
+  if (deps.projectDir) roots.push({ dirPath: path.join(deps.projectDir, '.claude', 'skills'), source: 'project' });
+  for (const { dirPath, source } of roots) {
+    for (const s of await listSkills(dirPath, deps, c.warnings)) {
+      const override = skillOverrides.get(s.name) ?? skillOverrides.get(s.dir);
+      c.add(
         makeItem({
           provider: 'claude',
           kind: 'skill',
-          name: skillName,
-          source: 'project',
-          enabled,
+          name: s.name,
+          source,
+          enabled: override !== 'off',
           effect: 'removes',
           toggleable: true,
-          descriptionChars: descChars,
-          originPath: skillMdPath,
+          descriptionChars: s.descChars,
+          originPath: s.mdPath,
         }),
       );
     }
   }
 
-  // 4c. Plugin skills
-  const pluginSkillsBaseDir = path.join(deps.homeDir, '.claude', 'plugins');
-  const pluginDirs = await safeReaddir(pluginSkillsBaseDir, deps);
-  for (const pdir of pluginDirs) {
-    const pskillsDir = path.join(pluginSkillsBaseDir, pdir, 'skills');
-    const pskills = await safeReaddir(pskillsDir, deps);
-    for (const psdir of pskills) {
-      const skillMdPath = path.join(pskillsDir, psdir, 'SKILL.md');
-      const skillContent = await safeReadFile(skillMdPath, deps, warnings);
-      if (skillContent === null) continue;
-
-      const fm = parseSkillFrontmatter(skillContent);
-      const skillName = fm.name || psdir;
-      const desc = fm.description ?? '';
-      const descChars = skillName.length + desc.length;
-
-      addItem(
+  const pluginsDir = path.join(deps.homeDir, '.claude', 'plugins');
+  for (const pdir of await safeReaddir(pluginsDir, deps)) {
+    for (const s of await listSkills(path.join(pluginsDir, pdir, 'skills'), deps, c.warnings)) {
+      c.add(
         makeItem({
           provider: 'claude',
           kind: 'skill',
-          name: skillName,
+          name: s.name,
           source: 'plugin',
           enabled: true,
           effect: 'removes',
           toggleable: false,
           readOnlyReason: 'Plugin skills cannot be toggled in Claude Code',
-          descriptionChars: descChars,
-          originPath: skillMdPath,
+          descriptionChars: s.descChars,
+          originPath: s.mdPath,
         }),
       );
     }
   }
+}
 
-  if (hasMcpServers) {
-    warnings.push('Full MCP tool list requires live tools/list (config only records tool overrides).');
+/** The settings file holding the deny or override behind an item, so a change is written back there. */
+function settingsFileFor(item: SurfaceItem, s: ClaudeSettings): string | undefined {
+  switch (item.kind) {
+    case 'mcp-server':
+      return s.deniedServerFile.get(item.name);
+    case 'mcp-tool':
+      return s.toolDenyFile.get(`${item.parent}/${item.name}`);
+    case 'skill':
+      return s.skillOverrideFile.get(item.name)
+        ?? (item.originPath ? s.skillOverrideFile.get(path.basename(path.dirname(item.originPath))) : undefined);
+    default:
+      return undefined;
   }
-
-  if (!versionSupported) {
-    for (const item of items) {
-      if (item.toggleable) {
-        item.toggleable = false;
-        item.readOnlyReason = 'CLI version not supported (read-only)';
-      }
-    }
-  }
-
-  for (const item of items) {
-    const file = item.kind === 'mcp-server' ? deniedServerFile.get(item.name)
-      : item.kind === 'mcp-tool' ? toolDenyFile.get(`${item.parent}/${item.name}`)
-        : item.kind === 'skill' ? skillOverrideFile.get(item.name) ?? (item.originPath ? skillOverrideFile.get(path.basename(path.dirname(item.originPath))) : undefined)
-          : undefined;
-    if (file) item.settingsPath = file;
-  }
-
-  return {
-    provider: 'claude',
-    cliVersion,
-    versionSupported,
-    writable,
-    items,
-    warnings,
-    scannedAtMs: deps.now ? deps.now() : Date.now(),
-  };
 }

@@ -115,8 +115,10 @@ describe('hydrateWebState', () => {
       workspaces: state.workspaces, surfaceAgentStatus: state.surfaceAgentStatus, surfaceActivity: {},
       surfaceAgent: state.surfaceAgent, surfaceTurnOpenAt: state.surfaceTurnOpenAt, agentClockMs: 1000,
     } as Parameters<typeof selectAllWorkspaceAgentStatus>[0]);
+    // A plain `waiting` (no pending question) rolls up as idle, as the
+    // desktop sidebar draws it, so that workspace has no entry.
     expect(rolled).toEqual({
-      'w-running': 'running', 'w-waiting': 'waiting', 'w-complete': 'complete',
+      'w-running': 'running', 'w-complete': 'complete',
       'w-error': 'error', 'w-awaiting_input': 'awaiting_input',
     });
     // A pane that keeps running keeps its latch stamp across polls.

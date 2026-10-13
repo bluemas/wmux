@@ -1,0 +1,99 @@
+{
+  "newer": {
+    "provider": "agy",
+    "cliVersion": "<newer>",
+    "versionSupported": true,
+    "writable": true,
+    "scannedAtMs": 1700000000000,
+    "wmuxToolRows": 0,
+    "wmuxCodexHookRows": 0,
+    "warnings": [
+      "agy <newer> is newer than the last version wmux tested (<tested-max>); changes are backed up before they are written.",
+      "Full MCP tool list requires live tools/list (config only records tool overrides)."
+    ],
+    "items": [
+      {
+        "id": "agy:mcp-server::only",
+        "provider": "agy",
+        "kind": "mcp-server",
+        "name": "only",
+        "parent": null,
+        "source": "user",
+        "enabled": true,
+        "effect": "removes",
+        "toggleable": true,
+        "readOnlyReason": null,
+        "hookEvent": null,
+        "hookCost": null,
+        "descriptionChars": null,
+        "originPath": "<home>/.gemini/config/mcp_config.json",
+        "wmuxRequired": false
+      },
+      {
+        "id": "agy:hook::h",
+        "provider": "agy",
+        "kind": "hook",
+        "name": "h",
+        "parent": null,
+        "source": "user",
+        "enabled": true,
+        "effect": "removes",
+        "toggleable": true,
+        "readOnlyReason": null,
+        "hookEvent": "Stop",
+        "hookCost": "extra-turn",
+        "descriptionChars": null,
+        "originPath": "<home>/.gemini/config/hooks.json",
+        "wmuxRequired": false
+      }
+    ]
+  },
+  "unsupported": {
+    "provider": "agy",
+    "cliVersion": "0.0.1",
+    "versionSupported": false,
+    "writable": false,
+    "scannedAtMs": 1700000000000,
+    "wmuxToolRows": 0,
+    "wmuxCodexHookRows": 0,
+    "warnings": [
+      "Full MCP tool list requires live tools/list (config only records tool overrides)."
+    ],
+    "items": [
+      {
+        "id": "agy:mcp-server::only",
+        "provider": "agy",
+        "kind": "mcp-server",
+        "name": "only",
+        "parent": null,
+        "source": "user",
+        "enabled": true,
+        "effect": "removes",
+        "toggleable": false,
+        "readOnlyReason": "CLI version not supported (read-only)",
+        "hookEvent": null,
+        "hookCost": null,
+        "descriptionChars": null,
+        "originPath": "<home>/.gemini/config/mcp_config.json",
+        "wmuxRequired": false
+      },
+      {
+        "id": "agy:hook::h",
+        "provider": "agy",
+        "kind": "hook",
+        "name": "h",
+        "parent": null,
+        "source": "user",
+        "enabled": true,
+        "effect": "removes",
+        "toggleable": false,
+        "readOnlyReason": "CLI version not supported (read-only)",
+        "hookEvent": "Stop",
+        "hookCost": "extra-turn",
+        "descriptionChars": null,
+        "originPath": "<home>/.gemini/config/hooks.json",
+        "wmuxRequired": false
+      }
+    ]
+  }
+}

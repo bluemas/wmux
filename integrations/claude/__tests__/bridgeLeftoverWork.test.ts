@@ -472,4 +472,14 @@ describe('countLeftoverBackgroundTasks — every task-notified background shape 
     ]);
     expect(count(p)).toBe(0);
   });
+
+  it('a foreground result that merely quotes a shell start is not a start', () => {
+    const p = fixture('quote.jsonl', [
+      prompt,
+      use('call_cat', 'Bash', { command: 'cat run.log' }),
+      result('call_cat', 'step 1\nCommand running in background with ID: b2. Output is being written to: C:/x\n'
+        + 'Command did not complete within its 300s timeout and was moved to the background (ID: b3)'),
+    ]);
+    expect(count(p)).toBe(0);
+  });
 });

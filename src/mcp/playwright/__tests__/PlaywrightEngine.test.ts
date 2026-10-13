@@ -188,6 +188,65 @@ describe('PlaywrightEngine CDP session lifecycle', () => {
     expect(sessions[0].detach).toHaveBeenCalledTimes(1);
   });
 
+  it('attaches to a Chrome with no window through a blank tab, closed after the download deny', async () => {
+    resetProtectionMemoryForTests();
+    mockSendRpc.mockImplementation((method: string) =>
+      method === 'browser.cdp.info'
+        ? Promise.resolve({
+            cdpPort: 9222, workspaceBackend: 'chrome', targets: [], profile: 'pane-a', protected: true, policyEpoch: 1,
+          })
+        : Promise.resolve({}),
+    );
+    const order: string[] = [];
+    const sessions: FakeSession[] = [];
+    const browser = makeFakeBrowser(sessions);
+    browser.newBrowserCDPSession.mockImplementation(async () => {
+      const s = makeFakeSession();
+      s.send.mockImplementation(async (method: string) => {
+        order.push(method);
+        return { targetInfos: [] };
+      });
+      sessions.push(s);
+      return s;
+    });
+    mockConnectOverCDP
+      .mockRejectedValueOnce(new Error(
+        'browserType.connectOverCDP: Protocol error (Browser.setDownloadBehavior): Browser context management is not supported.',
+      ))
+      .mockResolvedValueOnce(browser);
+    const fetchMock = vi.fn(async (url: string) => {
+      order.push(url);
+      return { json: async () => (url.includes('/json/new') ? { id: 'BOOT' } : {}) };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      await PlaywrightEngine.getInstance().ensureConnected('ws-a');
+
+      expect(mockConnectOverCDP).toHaveBeenCalledTimes(2);
+      expect(fetchMock).toHaveBeenCalledWith('http://127.0.0.1:9222/json/new?about:blank', { method: 'PUT' });
+      // The deny needs the context the blank tab keeps alive, so it goes first.
+      expect(order.indexOf('Browser.setDownloadBehavior')).toBeGreaterThanOrEqual(0);
+      expect(order.indexOf('Browser.setDownloadBehavior'))
+        .toBeLessThan(order.indexOf('http://127.0.0.1:9222/json/close/BOOT'));
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('opens no tab in a live Chrome (ws endpoint) that refuses the attach', async () => {
+    mockConnectOverCDP.mockRejectedValue(new Error('Browser context management is not supported.'));
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      const engine = PlaywrightEngine.getInstance();
+      await expect(engine.connect('ws://127.0.0.1:9222/devtools/browser/x')).rejects.toThrow(/context management/);
+      expect(mockConnectOverCDP).toHaveBeenCalledTimes(1);
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it('detaches the prior auto-attach session when reconnecting to a new CDP port', async () => {
     const sessions: FakeSession[] = [];
     mockConnectOverCDP.mockImplementation(async () => makeFakeBrowser(sessions));
