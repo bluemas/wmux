@@ -55,5 +55,4 @@ Preconditions:
 - All labels are translated. After switching Language, English names stop matching; use `data-settings-tab` and test ids. Switch back to English before the next recipe.
 - The font-size slider is on Appearance, not Terminal.
 - Settings that write outside the profile: Claude Code tab installers (hooks, statusline), Accounts (CLI logins), Remote & phone and LAN pairing, Computer use permissions. Read them, do not toggle them.
-- On macOS the General tab still shows "Start on Windows startup" (observed in 4.3.0); report it as a product observation, not drift.
 - `~/.wmux<suffix>/config.json` is daemon config; the Settings UI does not write UI preferences there.

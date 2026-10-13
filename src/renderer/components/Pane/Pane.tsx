@@ -110,6 +110,24 @@ export function composePaneClassName(opts: {
 }
 
 /**
+ * #2140 — whether the browser side of the terminal+browser split fills the
+ * pane. Derived in render rather than reset in an effect: the commit that
+ * activates a terminal must already show it, or the pane focus driver focuses
+ * a display:none xterm and the keystrokes go nowhere.
+ */
+export function isSplitBrowserExpanded(
+  requested: boolean,
+  terminals: ReadonlyArray<{ id: string }>,
+  browsers: ReadonlyArray<{ id: string }>,
+  activeSurfaceId: string,
+): boolean {
+  return requested
+    && terminals.length > 0
+    && browsers.length > 0
+    && !terminals.some((s) => s.id === activeSurfaceId);
+}
+
+/**
  * Choose which terminal and which browser surface is SHOWN on each side of the
  * terminal+browser split (`SplitSurfaceView` hasBoth). Both sides are laid out
  * side by side and must stay visible, but a pane has a single `activeSurfaceId`,
@@ -1379,6 +1397,23 @@ function SplitSurfaceView({
 
   const hasBoth = terminals.length > 0 && browsers.length > 0;
 
+  // #2140 — the browser side of the split can take the whole pane without
+  // closing the terminal. The terminal panel is only hidden: it stays mounted
+  // and is treated like a background tab (no fit, so the PTY keeps its size),
+  // and the split widths come back unchanged on restore.
+  const setActiveSurface = useStore((s) => s.setActiveSurface);
+  const [expandRequested, setExpandRequested] = useState(false);
+  const browserExpanded = isSplitBrowserExpanded(expandRequested, terminals, browsers, activeSurfaceId);
+  useEffect(() => {
+    // Activating a terminal or losing a side ends the mode for good, so the
+    // next browser activation does not silently re-expand.
+    if (!browserExpanded) setExpandRequested(false);
+  }, [browserExpanded]);
+  const toggleBrowserExpanded = useCallback((browserSurfaceId: string) => {
+    if (!browserExpanded) setActiveSurface(pane.id, browserSurfaceId, workspaceId);
+    setExpandRequested(!browserExpanded);
+  }, [browserExpanded, setActiveSurface, pane.id, workspaceId]);
+
   if (pane.surfaces.length === 0) {
     return (
       <div className="flex-1 min-h-0 min-w-0 relative overflow-clip flex items-center justify-center text-[var(--text-muted)] text-sm" {...tokenAttrs('textMuted', 'text')}>
@@ -1479,9 +1514,15 @@ function SplitSurfaceView({
   const overlayActive = others.some((s) => s.id === activeSurfaceId);
   return (
     <div className="flex-1 min-h-0 min-w-0 relative overflow-clip">
-      <Group orientation="horizontal" className="h-full w-full" resizeTargetMinimumSize={{ coarse: 37, fine: 16 }}>
-        {/* Terminal panel */}
-        <Panel defaultSize={50} minSize={20}>
+      <Group
+        orientation="horizontal"
+        className={`h-full w-full${browserExpanded ? ' [&>[data-split-terminal]]:!hidden' : ''}`}
+        resizeTargetMinimumSize={{ coarse: 37, fine: 16 }}
+      >
+        {/* Terminal panel. Hidden through the Group's class while the browser
+            is expanded: the library writes display:flex inline, so only an
+            !important rule can override it. */}
+        <Panel defaultSize={50} minSize={20} data-split-terminal="">
           <div className="h-full w-full min-h-0 min-w-0 relative overflow-clip">
             {terminals.map((surface) => (
               <TerminalSurface
@@ -1490,7 +1531,7 @@ function SplitSurfaceView({
                 paneId={pane.id}
                 chatViewEnabled={chatViewEnabled}
                 isActive={surface.id === activeSurfaceId}
-                visible={surface.id === shownTerminalId}
+                visible={!browserExpanded && surface.id === shownTerminalId}
                 isWorkspaceVisible={isWorkspaceVisible}
                 onPtyCreated={(ptyId) => onPtyCreated(surface.id, ptyId)}
                 workspaceId={workspaceId}
@@ -1499,7 +1540,10 @@ function SplitSurfaceView({
           </div>
         </Panel>
 
-        <Separator className="w-px bg-[var(--border-soft)] hover:bg-[var(--accent-blue)] transition-colors cursor-col-resize" />
+        <Separator
+          disabled={browserExpanded}
+          className={`w-px bg-[var(--border-soft)] hover:bg-[var(--accent-blue)] transition-colors cursor-col-resize${browserExpanded ? ' hidden' : ''}`}
+        />
 
         {/* Browser panel */}
         <Panel defaultSize={50} minSize={20}>
@@ -1517,6 +1561,8 @@ function SplitSurfaceView({
                 isZoomHidden={isZoomHidden}
                 occluded={overlayActive}
                 onClose={() => onCloseSurface(surface.id)}
+                expanded={browserExpanded}
+                onToggleExpanded={() => toggleBrowserExpanded(surface.id)}
               />
             ))}
           </div>

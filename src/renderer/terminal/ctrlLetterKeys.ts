@@ -51,3 +51,28 @@ export function resolveCtrlLetterByte(e: CtrlLetterEventLike): string | null {
 
   return null;
 }
+
+/**
+ * Ctrl+Alt+<letter> on Windows (#2136).
+ *
+ * xterm treats every Ctrl+Alt keydown on Windows as AltGr (its
+ * `_isThirdLevelShift`): it returns before sending anything and waits for the
+ * `keypress` that carries the AltGr character. When the layout has no AltGr
+ * character for the key (Ctrl+Alt+D on most layouts), no keypress comes and
+ * the chord is lost. On Linux and macOS xterm sends `ESC` + the control byte,
+ * the usual Meta+Ctrl form; this returns the same bytes so Windows matches.
+ *
+ * A real AltGr character arrives with `key` set to that character (`@`, `€`,
+ * `ł`), so only an ASCII letter `key` is taken here. Everything else keeps
+ * going to xterm's keypress path, which is what its rule exists for.
+ *
+ * `isWindows` is the platform xterm itself tests (`navigator.platform`).
+ */
+export function resolveCtrlAltLetterBytes(e: CtrlLetterEventLike, isWindows: boolean): string | null {
+  if (!isWindows || !e.ctrlKey || !e.altKey || e.shiftKey || e.metaKey || e.isComposing) return null;
+
+  const latin = e.key.length === 1 ? e.key.toLowerCase() : '';
+  if (!LATIN.test(latin)) return null;
+
+  return '\x1b' + ctrlByteForLetter(latin);
+}

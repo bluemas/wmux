@@ -41,7 +41,7 @@ import { resolveNewlineKeyByte, wantsAltEnterNewline, foldAtPromptCarry, noteCod
 import { resolveMacLineDeleteByte } from '../terminal/macLineDeleteKey';
 import { isWslShell } from '../../shared/imagePaste';
 import { encodeEscape, isBareEscape } from '../terminal/escapeKeys';
-import { resolveCtrlLetterByte } from '../terminal/ctrlLetterKeys';
+import { resolveCtrlAltLetterBytes, resolveCtrlLetterByte } from '../terminal/ctrlLetterKeys';
 import { UnpairedReleaseFilter, imeKeyLeaksUnderKitty, installKittyPromptReset, kittyCtrlLetter, kittyKeyboardForHost, resetXtermKitty, xtermEncodesKey, xtermKittyFlags, type KittyHost } from '../terminal/kittyKeyboard';
 import { isComposeChord, composeOwnerHost, TERMINAL_PTY_ATTR, COMPOSE_OWNER_ATTR } from '../terminal/composeChord';
 import { foldRemoteKeyboardState, INITIAL_REMOTE_KEYBOARD_STATE, type RemoteKeyboardState } from '../components/Remote/keyboardProtocol';
@@ -1329,11 +1329,17 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       : new FitAddon();
     const searchAddon = new SearchAddon();
     // Smart link routing (X3): localhost URLs open in the embedded browser
-    // pane, external ones in the system browser; Ctrl/Cmd+click inverts. The
-    // ptyId identifies the owning workspace (multiview-safe reverse lookup).
+    // pane, external ones in the system browser; Ctrl/Cmd+click inverts, and
+    // Ctrl/Cmd+Shift+click opens a new browser tab (#2140). The ptyId
+    // identifies the owning workspace (multiview-safe reverse lookup).
     const activateTerminalUrl = (event: MouseEvent, uri: string) => {
+      const newTab = (event.ctrlKey || event.metaKey) && event.shiftKey;
+      // Shift also extends xterm's selection on that click. Drop it, which also
+      // cancels the debounced copy-on-select before it overwrites the clipboard.
+      if (newTab) terminal.clearSelection();
       openTerminalUrl(uri, {
         modifierHeld: event.ctrlKey || event.metaKey,
+        newTab,
         ptyId: ptyIdRef.current || undefined,
       });
     };
@@ -1471,6 +1477,9 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // 그 밖의 native paste는 그대로 흘려보내 xterm 자체 처리에 맡긴다. 윈도우 크기는 이
     // 파일의 기존 RIGHT_CLICK_PASTE_SUPPRESS_MS와 동일한 관례(최근 이벤트 판별용 300ms)를 따른다.
     const isMac = window.electronAPI?.platform === 'darwin';
+    // The platform xterm tests for its Windows AltGr rule (#2136): the
+    // browser's, which is also right for the browser build on a Windows PC.
+    const xtermIsWindows = navigator.platform.startsWith('Win');
     // The browser build (wmux web) pastes through the browser's own paste
     // event: its clipboard bridge cannot read the clipboard outside a secure
     // context, and xterm's paste handler already brackets the text. The
@@ -2480,6 +2489,19 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
             screenIsAlternate: terminal.buffer.active.type === 'alternate',
           });
         })().catch(() => {});
+        return false;
+      }
+
+      // #2136 — Ctrl+Alt+letter on Windows. xterm reads it as AltGr and sends
+      // nothing when the layout has no AltGr character for the key; write the
+      // ESC + control byte xterm sends on Linux and macOS. Shortcuts and custom
+      // keybindings already returned above. Kitty is off on Windows
+      // (kittyKeyboardForHost), so the legacy form is the pane's form.
+      const ctrlAltBytes = resolveCtrlAltLetterBytes(e, xtermIsWindows);
+      if (ctrlAltBytes) {
+        e.preventDefault();
+        window.electronAPI.pty.write(ptyId, ctrlAltBytes);
+        noteUserKeystroke(ctrlAltBytes);
         return false;
       }
 

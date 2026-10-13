@@ -1574,9 +1574,9 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       if (typeof data.sidebarAttentionFirst === 'boolean') {
         state.sidebarAttentionFirst = data.sidebarAttentionFirst;
       }
-      state.sidebarShowPorts = typeof data.sidebarShowPorts === 'boolean' ? data.sidebarShowPorts : true;
       state.sidebarShowExplorerButton = typeof data.sidebarShowExplorerButton === 'boolean' ? data.sidebarShowExplorerButton : true;
       state.sidebarShowCopyInfoButton = typeof data.sidebarShowCopyInfoButton === 'boolean' ? data.sidebarShowCopyInfoButton : true;
+      state.sidebarShowPorts = typeof data.sidebarShowPorts === 'boolean' ? data.sidebarShowPorts : true;
       if (typeof data.sidebarShowPaneCoordinates === 'boolean') {
         state.sidebarShowPaneCoordinates = data.sidebarShowPaneCoordinates;
       }

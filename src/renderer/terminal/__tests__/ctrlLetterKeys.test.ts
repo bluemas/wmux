@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { resolveCtrlLetterByte, type CtrlLetterEventLike } from '../ctrlLetterKeys';
+import { resolveCtrlAltLetterBytes, resolveCtrlLetterByte, type CtrlLetterEventLike } from '../ctrlLetterKeys';
 
 function ev(partial: Partial<CtrlLetterEventLike>): CtrlLetterEventLike {
   return {
@@ -53,5 +53,46 @@ describe('resolveCtrlLetterByte — guards', () => {
   it('ignores a bare C (no Ctrl) and non-letter keys', () => {
     expect(resolveCtrlLetterByte(ev({ key: 'c', code: 'KeyC' }))).toBeNull();
     expect(resolveCtrlLetterByte(ev({ key: 'Enter', code: 'Enter', ctrlKey: true }))).toBeNull();
+  });
+});
+
+describe('resolveCtrlAltLetterBytes — Ctrl+Alt+letter on Windows (#2136)', () => {
+  const ctrlAlt = (key: string, over: Partial<CtrlLetterEventLike> = {}) =>
+    ev({ key, code: `Key${key.toUpperCase()}`, ctrlKey: true, altKey: true, ...over });
+
+  it('writes ESC + the control byte, the form xterm sends on Linux and macOS', () => {
+    expect(resolveCtrlAltLetterBytes(ctrlAlt('d'), true)).toBe('\x1b\x04');
+    expect(resolveCtrlAltLetterBytes(ctrlAlt('a'), true)).toBe('\x1b\x01');
+    expect(resolveCtrlAltLetterBytes(ctrlAlt('z'), true)).toBe('\x1b\x1a');
+  });
+
+  it('takes the logical letter, so Dvorak gets the letter it typed', () => {
+    expect(resolveCtrlAltLetterBytes(ev({ key: 'd', code: 'KeyH', ctrlKey: true, altKey: true }), true)).toBe('\x1b\x04');
+  });
+
+  it('accepts an upper-case key (Caps Lock)', () => {
+    expect(resolveCtrlAltLetterBytes(ctrlAlt('D'), true)).toBe('\x1b\x04');
+  });
+
+  it('leaves an AltGr character to xterm', () => {
+    expect(resolveCtrlAltLetterBytes(ev({ key: '@', code: 'KeyQ', ctrlKey: true, altKey: true }), true)).toBeNull();
+    expect(resolveCtrlAltLetterBytes(ev({ key: '€', code: 'KeyE', ctrlKey: true, altKey: true }), true)).toBeNull();
+    expect(resolveCtrlAltLetterBytes(ev({ key: 'ł', code: 'KeyL', ctrlKey: true, altKey: true }), true)).toBeNull();
+  });
+
+  it('does not use the physical-key fallback (an IME or AltGr key is not a letter chord)', () => {
+    expect(resolveCtrlAltLetterBytes(ev({ key: 'Process', code: 'KeyD', ctrlKey: true, altKey: true }), true)).toBeNull();
+  });
+
+  it('only acts on Windows, where xterm drops the chord', () => {
+    expect(resolveCtrlAltLetterBytes(ctrlAlt('d'), false)).toBeNull();
+  });
+
+  it('declines other modifier sets and an active composition', () => {
+    expect(resolveCtrlAltLetterBytes(ctrlAlt('d', { shiftKey: true }), true)).toBeNull();
+    expect(resolveCtrlAltLetterBytes(ctrlAlt('d', { metaKey: true }), true)).toBeNull();
+    expect(resolveCtrlAltLetterBytes(ctrlAlt('d', { isComposing: true }), true)).toBeNull();
+    expect(resolveCtrlAltLetterBytes(ctrlAlt('d', { altKey: false }), true)).toBeNull();
+    expect(resolveCtrlAltLetterBytes(ctrlAlt('d', { ctrlKey: false }), true)).toBeNull();
   });
 });
