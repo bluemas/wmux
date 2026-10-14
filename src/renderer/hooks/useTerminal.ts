@@ -51,6 +51,7 @@ import { attachImeStormGuard } from '../terminal/imeStormGuard';
 import { attachCompositionCommitGate } from '../terminal/compositionCommitGate';
 import { webglContextPool } from '../terminal/webglContextPool';
 import { teardownWebglAddon } from '../terminal/webglTeardown';
+import { webglUpgradeQueue } from '../terminal/webglUpgradeQueue';
 import { syncInlineImages } from '../terminal/inlineImages';
 import { forceCharSizeMeasure, onCharSizeChange } from '../terminal/charSizeRefit';
 import { createGlyphRepaintScheduler, type GlyphRepaintScheduler } from '../terminal/glyphRepaint';
@@ -3743,12 +3744,27 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // budget; doing it a moment after the paint instead swapped renderers
       // under the reader's eyes, and the two lay glyphs out up to a pixel
       // apart. Such a pane takes a context on a later reveal once one is free.
+      //
+      // A pane that holds no context yet (a cold-parked workspace remounting,
+      // the first reveal after start) does not build one here either: that is
+      // the same ~0.5 s of synchronous GPU setup, per pane, before the switch
+      // can paint. It paints with the DOM renderer now and is upgraded from
+      // webglUpgradeQueue once reveals settle, one pane per idle period.
+      let cancelUpgrade: (() => void) | null = null;
       if (
         loadWebglRef.current &&
         disposeWebglRef.current &&
         !webglContextPool.acquireWouldEvict(token)
       ) {
-        webglContextPool.acquire(token, loadWebglRef.current, disposeWebglRef.current);
+        if (webglAddonRef.current) {
+          webglContextPool.acquire(token, loadWebglRef.current, disposeWebglRef.current);
+        } else {
+          cancelUpgrade = webglUpgradeQueue.enqueue(() => {
+            if (!isVisibleRef.current || !loadWebglRef.current || !disposeWebglRef.current) return;
+            if (webglContextPool.acquireWouldEvict(token)) return;
+            webglContextPool.acquire(token, loadWebglRef.current, disposeWebglRef.current);
+          });
+        }
       }
       // Defer fit to allow CSS display change to take effect before measuring.
       // Selection-preservation guard — workspace/tab switch then immediate
@@ -3769,7 +3785,10 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         }
         fit();
       });
-      return () => cancelAnimationFrame(id);
+      return () => {
+        cancelAnimationFrame(id);
+        cancelUpgrade?.();
+      };
     }
     // Hidden: keep the WebGL context ("A hidden terminal KEEPS its WebGL
     // context", near the top of this file). The pool evicts it if a visible
