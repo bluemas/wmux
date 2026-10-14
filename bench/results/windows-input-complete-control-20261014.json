@@ -1,0 +1,24 @@
+{
+  "backend": "node-pty",
+  "platform": "win32",
+  "release": "10.0.20348",
+  "node": "24.21.0",
+  "elapsedMs": 129437,
+  "timedOut": false,
+  "sent": true,
+  "event": {
+    "exitCode": 0
+  },
+  "expected": "baa7a6d36ffa957552df230235c2d51d735f28d49c58a5f3438a3a973a25a37d",
+  "matched": true,
+  "outputTail": "\u001b[1t\u001b[c\u001b[?1004h\u001b[?9001hREADY\r\nDIGEST:baa7a6d36ffa957552df230235c2d51d735f28d49c58a5f3438a3a973a25a37d\r\n",
+  "childProgress": {
+    "phase": "complete",
+    "received": 4194304,
+    "expected": 4194304,
+    "timestamp": 1791929657254
+  },
+  "sourceCommit": "a9a1864d522d2ebd484e3c6a28312505848b64ef",
+  "sourceRun": "https://github.com/openwong2kim/wmux/actions/runs/38475888757",
+  "scope": "Independent node-pty control. Child completed with matching input hash and exit 0; the separate native verifier remains the qualification gate."
+}

@@ -52,6 +52,8 @@ import { SerializeAddon } from '@xterm/addon-serialize';
 import { applyUnicodeWidthModel } from '../shared/terminalUnicode';
 import { XTERM_60_VT_EXTENSIONS } from '../shared/terminal/replyParity';
 import type { ReplayGeometry } from './RingBuffer';
+import { selectAnsiSnapshot } from './AnsiSnapshotBackend';
+import { selectTextSnapshot } from './TextSnapshotBackend';
 import {
   PartialSequenceTracker,
   MarginTracker,
@@ -67,6 +69,8 @@ export interface SnapshotRequest {
   scrollback?: number;
   /** Raw history captured at T0 (ring buffer readAll). */
   initial: Buffer;
+  /** Immutable native history; initial contains only its mode preamble. */
+  nativeSource?: import('../shared/nativeTerminalCore').NativeFrozenRing;
   /**
    * The sizes `initial` was written at (RingBuffer.readAllWithGeometry). Each
    * stretch is parsed at its own size and the terminal is then resized to
@@ -219,6 +223,10 @@ export function capTextRowsToFrameBudget(
 }
 
 async function generateTextInner(req: SnapshotRequest): Promise<TextSnapshotOutcome> {
+  return selectTextSnapshot(req, generateXtermTextInner);
+}
+
+async function generateXtermTextInner(req: SnapshotRequest): Promise<TextSnapshotOutcome> {
   const started = Date.now();
   const budgetMs = req.budgetMs ?? DEFAULT_BUDGET_MS;
   const scrollback = clamp(req.scrollback ?? DEFAULT_SCROLLBACK, 0, MAX_SCROLLBACK);
@@ -331,6 +339,10 @@ export function generateSnapshotUnqueued(req: SnapshotRequest): Promise<Snapshot
 }
 
 async function generateInner(req: SnapshotRequest): Promise<SnapshotOutcome> {
+  return selectAnsiSnapshot(req, generateXtermInner);
+}
+
+async function generateXtermInner(req: SnapshotRequest): Promise<SnapshotOutcome> {
   const started = Date.now();
   const budgetMs = req.budgetMs ?? DEFAULT_BUDGET_MS;
   const scrollback = clamp(req.scrollback ?? DEFAULT_SCROLLBACK, 0, MAX_SCROLLBACK);

@@ -1,7 +1,7 @@
 {
   "name": "wmux",
   "productName": "wmux",
-  "version": "4.3.1",
+  "version": "4.4.0",
   "description": "Workspace multiplexer for AI agents — run fleets of Claude Code, Codex & Gemini in parallel on Windows & macOS, with MCP browser automation built in",
   "private": true,
   "main": ".vite/build/index.js",
@@ -41,6 +41,8 @@
     "test:harness": "vitest run --config vitest.harness.config.ts",
     "test:e2e": "node e2e/run.mjs",
     "harness:gen-corpus": "vitest run --config vitest.harness.config.ts core/harness/__tests__/baseline-gate.harness.test.ts",
+    "build:terminal-core": "node scripts/build-native-terminal.mjs",
+    "test:terminal-core": "node scripts/native-core-verify.mjs",
     "spike:sa1:build": "bash core/wmux-term/build.sh",
     "spike:sa1:verify": "bash core/wmux-term/verify.sh"
   },

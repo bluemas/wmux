@@ -359,6 +359,8 @@ export function buildWslInjection(options: {
   integrationDir: string;
   bashInit: string;
   execCommand?: string;
+  /** Only account-login tabs opt into Windows account-home transport. */
+  wslAccountLoginEnvKey?: 'CLAUDE_CONFIG_DIR' | 'CODEX_HOME';
   runtimePath?: string;
   bridgePath?: string;
   codexBridgePath?: string;
@@ -421,6 +423,14 @@ fi
     'WMUX_WSL_CWD/u', 'WMUX_WSL_SETTINGS/p', 'WMUX_WSL_BIN/p', 'WMUX_WSL_BASHRC/p', 'WMUX_SHELL_INTEGRATION',
     ...(mcpEntry ? ['WMUX_WSL_MCP/u', 'WMUX_WSL_MCP_CONFIG/p'] : []),
   ];
+  // Ordinary WSL panes keep their Linux profiles: copied Windows config can
+  // contain Windows-only notify/MCP/hooks. Only forward the login's vendor.
+  const loginKey = options.wslAccountLoginEnvKey;
+  const home = loginKey ? env[loginKey] : undefined;
+  if ((loginKey === 'CODEX_HOME' || loginKey === 'CLAUDE_CONFIG_DIR') && home) {
+    const windowsPath = /^[a-z]:[\\/]/i.test(home) || home.startsWith('\\\\') || home.startsWith('//');
+    entries.push(`${loginKey}/${windowsPath ? 'pu' : 'u'}`);
+  }
   env.WSLENV = mergeWslEnv(env.WSLENV, entries);
   // WSL runs bash explicitly so --rcfile reaches Linux, never wsl.exe. The
   // interactive init sources ~/.bashrc first. Exec units avoid startup output.

@@ -10,6 +10,7 @@ import {
   getPendingAccountLogins,
   LOGIN_POLL_INTERVAL_MS,
   LOGIN_TIMEOUT_MS,
+  openTerminalTab,
 } from '../accountLogin';
 
 type Status = { loggedIn: boolean; stamp?: string | null };
@@ -66,6 +67,7 @@ describe('startAccountLogin', () => {
     const opts = (pty.create.mock.calls[0] as unknown[])[0] as { env: Record<string, string>; initialCommand: string };
     expect(opts.env).toEqual({ CLAUDE_CONFIG_DIR: '/acc/claude-1', FOO: 'bar' });
     expect(opts.initialCommand).toBe('claude auth login');
+    expect(pty.create).toHaveBeenCalledWith(expect.objectContaining({ wslAccountLoginEnvKey: 'CLAUDE_CONFIG_DIR' }));
     expect(state.updateSurfaceTitle).toHaveBeenCalledWith('surf-login', 'Log in: Work');
     expect(state.setSettingsPanelVisible).toHaveBeenCalledWith(false);
   });
@@ -76,6 +78,13 @@ describe('startAccountLogin', () => {
     const opts = (pty.create.mock.calls[0] as unknown[])[0] as { env: Record<string, string>; initialCommand: string };
     expect(opts.env).toEqual({ CODEX_HOME: '/acc/codex-1' });
     expect(opts.initialCommand).toBe('codex login');
+    expect(pty.create).toHaveBeenCalledWith(expect.objectContaining({ wslAccountLoginEnvKey: 'CODEX_HOME' }));
+  });
+
+  it('does not opt a generic sign-in terminal into account-home transport', async () => {
+    const { pty } = setup({ CODEX_HOME: 'C:\\accounts\\bound', CLAUDE_CONFIG_DIR: 'C:\\accounts\\claude' });
+    await openTerminalTab({ initialCommand: 'agy', title: 'Sign in' });
+    expect((pty.create.mock.calls[0] as unknown[])[0]).not.toHaveProperty('wslAccountLoginEnvKey');
   });
 
   it('registers a new account and closes the tab once the login lands', async () => {

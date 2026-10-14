@@ -28,6 +28,8 @@ export interface PtyCreateOptions {
   fanoutTaskOf?: string;
   /** Fan-out task pane: who asked, stamped on the lineage with the owner. */
   fanoutOrigin?: FanoutOrigin;
+  /** Fan-out task pane of a bot: its single-use secret grant (opaque). */
+  secretGrant?: string;
   /**
    * Workspace profile env overlay. Merged into the new PTY's environment AFTER
    * the safe-inherited baseline and BEFORE wmux identity vars are forced, so a
@@ -35,6 +37,8 @@ export interface PtyCreateOptions {
    * WMUX_WORKSPACE_ID / WMUX_SURFACE_ID / WMUX_SOCKET_PATH.
    */
   env?: Record<string, string>;
+  /** Account-login tabs only; ordinary WSL panes retain their Linux profiles. */
+  wslAccountLoginEnvKey?: 'CLAUDE_CONFIG_DIR' | 'CODEX_HOME';
   /**
    * Startup command written into the new pane's shell after creation (NOT
    * spawned as the executable — preserves shell-allowlist + quoting behavior).

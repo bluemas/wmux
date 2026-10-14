@@ -5,6 +5,7 @@ import { useStore } from '../../stores';
 import { selectWorkspaceIdName } from '../../stores/selectors/workspaceProjections';
 import { useGlanceBoardOrder } from './useGlanceBoardOrder';
 import { buildSidebarTree, ORPHAN_GROUP_KEY, type SidebarTreeNode } from './sidebarTree';
+import { selectBotTaskOwners, withoutBotTasks } from './botTasks';
 import { partitionWorkspaceSettle, workspaceSettleGroupOf } from './workspaceSettleGroups';
 import WorkspaceSettleGroup from './WorkspaceSettleGroup';
 import SidebarTaskGroup, { ClosedPaneTaskGroup } from './SidebarTaskGroup';
@@ -21,6 +22,7 @@ import { getWorkspacePtyIds } from '../../../shared/paneUtils';
 import { destroyWorkspaceRemoteSessions } from '../../utils/remoteSessionTeardown';
 import { LOCAL_PC_ID, isShadowWorkspaceId } from '../../../shared/pcRail';
 import { useT } from '../../hooks/useT';
+import { useRemoteWorkspaceCreate } from './useRemoteWorkspaceCreate';
 import { buildWorkspaceMarkdown } from '../../utils/sessionInfoMarkdown';
 import { tokenAttrs } from '../../themes';
 import { collapseDirection } from './sidebarGlyphs';
@@ -40,7 +42,7 @@ import {
 import PresetPicker from './PresetPicker';
 import { COMPANY_MODE_ENABLED } from '../../../shared/featureFlags';
 import { workspaceShortcutNumber } from '../../../shared/keymap';
-import { listedWorkspaces, moaHqId as selectMoaHqId, refuseWorkspaceClose } from '../Moa/moaHqGuard';
+import { listedWorkspaces, refuseWorkspaceClose } from '../Moa/moaHqGuard';
 
 
 
@@ -74,15 +76,14 @@ export default function Sidebar({ chrome = 'full' }: { chrome?: 'full' | 'sheet'
   // WorkspaceItem이 자기 ws를 self-subscribe한다. 배경 ws의 metadata/surface
   // churn은 이 컴포넌트를 리렌더하지 않는다(이름/추가/삭제/재정렬 시에만).
   const workspaces = useStore(useShallow(selectWorkspaceIdName));
-  // Moa's HQ is app-owned and never part of the list (nor its count, filter,
-  // or Ctrl+N numbering). While it is the active workspace it shows as its
-  // own row above the list, so the operator sees where they are.
-  const moaHqId = useStore(selectMoaHqId);
   // PC rail: shadow workspaces (another computer's, opened from the PC
   // switcher) are never this computer's rows, count or Ctrl+N numbers.
+  // Bot workers are listed on the Bots page instead (botTasks.ts), the
+  // active one too.
+  const botOwners = useStore(selectBotTaskOwners);
   const listed = useMemo(
-    () => listedWorkspaces(workspaces, moaHqId),
-    [workspaces, moaHqId],
+    () => withoutBotTasks(listedWorkspaces(workspaces), botOwners),
+    [workspaces, botOwners],
   );
   // PC rail: with a paired computer selected, the page lists that computer's
   // workspaces instead (HostWorkspaceList). Unknown ids read as this computer.
@@ -91,6 +92,8 @@ export default function Sidebar({ chrome = 'full' }: { chrome?: 'full' | 'sheet'
     return id !== LOCAL_PC_ID && s.pcRailHosts.some((h) => h.id === id) ? id : null;
   });
   const scopedRowCount = useStore((s) => (scopedHostId ? s.pcRailFeeds[scopedHostId]?.workspaces.length ?? 0 : 0));
+  const scopedHostLabel = useStore((s) => (scopedHostId ? s.pcRailHosts.find((h) => h.id === scopedHostId)?.label ?? '' : ''));
+  const remoteCreate = useRemoteWorkspaceCreate(useStore((s) => s.readOnly) ? null : scopedHostId);
   const wsSearch = useStore((s) => s.sidebarSearch);
   const setWsSearch = useStore((s) => s.setSidebarSearch);
   const wsSearchRef = useRef<HTMLInputElement>(null);
@@ -296,16 +299,16 @@ export default function Sidebar({ chrome = 'full' }: { chrome?: 'full' | 'sheet'
   }, [archiveWorkspace]);
 
   const workspaceById = useMemo(() => new Map(workspaces.map((w) => [w.id, w])), [workspaces]);
+  // The Ctrl+N digits number the rows shown (selectShortcutWorkspaces).
+  const numbered = filteredWorkspaces;
   // Filtering only changes what the list shows; the header counts what is left.
   const narrowed = filterOn || wsSearch.trim() !== '';
   const shownCount = filteredWorkspaces.length;
-  const hqActive = !!moaHqId && !activeRemoteKey && activeWorkspaceId === moaHqId
-    && workspaces.some((w) => w.id === moaHqId);
   // Bookmarked only, with nothing bookmarked: the empty list says how to
   // bookmark instead of "No workspaces match".
   const noBookmarks = useStore((s) => wsFilter.bookmarked
     && !listed.some((w) => s.sidebarBookmarkedIds.includes(w.id)));
-  const activeHidden = !activeRemoteKey && !hqActive && !isShadowWorkspaceId(activeWorkspaceId)
+  const activeHidden = !activeRemoteKey && !isShadowWorkspaceId(activeWorkspaceId)
     && !filteredWorkspaces.some((w) => w.id === activeWorkspaceId);
   const clearFilters = useCallback(() => {
     setWsSearch('');
@@ -370,7 +373,7 @@ export default function Sidebar({ chrome = 'full' }: { chrome?: 'full' | 'sheet'
       isActive={id === shownActiveId}
       isMultiview={multiviewIds.includes(id)}
       index={workspaces.findIndex((w) => w.id === id)}
-      shortcutNumber={workspaceShortcutNumber(filteredWorkspaces.findIndex((w) => w.id === id), filteredWorkspaces.length)}
+      shortcutNumber={workspaceShortcutNumber(numbered.findIndex((w) => w.id === id), numbered.length)}
       onSelect={setActiveWorkspace}
       onCtrlSelect={handleCtrlSelect}
       onRename={renameWorkspace}
@@ -382,7 +385,7 @@ export default function Sidebar({ chrome = 'full' }: { chrome?: 'full' | 'sheet'
       taskRow
       tabStop={id === tabStopId}
     />
-  ), [tabStopId, shownActiveId, multiviewIds, workspaces, filteredWorkspaces, setActiveWorkspace, handleCtrlSelect, renameWorkspace, handleClose, handleArchive, handleCopySessionInfo, duplicateWorkspace, reorderWorkspace]);
+  ), [tabStopId, shownActiveId, multiviewIds, workspaces, numbered, setActiveWorkspace, handleCtrlSelect, renameWorkspace, handleClose, handleArchive, handleCopySessionInfo, duplicateWorkspace, reorderWorkspace]);
 
   // One top-level node: a task row whose owner is filtered out, or a
   // workspace row with its nested tasks. `inSettleGroup` rows sit out of
@@ -400,7 +403,7 @@ export default function Sidebar({ chrome = 'full' }: { chrome?: 'full' | 'sheet'
           isActive={ws.id === shownActiveId}
           isMultiview={multiviewIds.includes(ws.id)}
           index={workspaces.indexOf(ws)}
-          shortcutNumber={workspaceShortcutNumber(filteredWorkspaces.indexOf(ws), filteredWorkspaces.length)}
+          shortcutNumber={workspaceShortcutNumber(numbered.findIndex((w) => w.id === ws.id), numbered.length)}
           onSelect={setActiveWorkspace}
           onCtrlSelect={handleCtrlSelect}
           onRename={renameWorkspace}
@@ -439,29 +442,21 @@ export default function Sidebar({ chrome = 'full' }: { chrome?: 'full' | 'sheet'
       {pickerOpen && <PresetPicker onClose={closePicker} anchorStyle={pickerAnchor} />}
       <SidebarResizeHandle />
       {!readOnly && chrome === 'full' && <SidebarNavigation />}
-      {hqActive && moaHqId && (
-        <div className="shrink-0 pt-1" data-moa-hq-row>
-          <WorkspaceItem
-            workspaceId={moaHqId}
-            isActive
-            isMultiview={multiviewIds.includes(moaHqId)}
-            index={workspaces.findIndex((w) => w.id === moaHqId)}
-            onSelect={setActiveWorkspace}
-            onCtrlSelect={handleCtrlSelect}
-            onRename={renameWorkspace}
-            onClose={handleClose}
-            onArchive={handleArchive}
-            onCopyInfo={handleCopySessionInfo}
-            onDuplicate={duplicateWorkspace}
-            onReorder={reorderWorkspace}
-            moaHq
-          />
-        </div>
-      )}
       {scopedHostId ? (
         <div className="wmux-sidebar-section" data-sidebar-scope={scopedHostId}>
           <PcSwitcherTitle title={t('sidebar.workspaces')} />
           <span className="wmux-sidebar-total" data-sidebar-total>{scopedRowCount}</span>
+          {/* Only a computer that granted this desktop workspace creation; the
+              workspace is made on that computer, never here. */}
+          {remoteCreate.canCreate && <button
+            type="button"
+            className={`ui-icon-btn ml-auto h-7 w-7 ${FOCUS_RING}`}
+            onClick={remoteCreate.create}
+            disabled={remoteCreate.creating || !remoteCreate.online}
+            title={t('sidebar.newRemoteWorkspace', { name: scopedHostLabel })}
+            aria-label={t('sidebar.newRemoteWorkspace', { name: scopedHostLabel })}
+            data-sidebar-add-remote-workspace
+          ><IconPlus size={15} /></button>}
         </div>
       ) : (
       <div className="wmux-sidebar-section">

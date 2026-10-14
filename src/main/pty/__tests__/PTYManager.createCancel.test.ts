@@ -2,9 +2,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Local-mode WSL create: the cwd probe is async, so a pane can be disposed
 // while it is still pending. dispose(id) in that window must cancel the spawn.
-const { spawn, resolveWslCwd } = vi.hoisted(() => ({
+const { spawn, resolveWslCwd, buildWslInjection } = vi.hoisted(() => ({
   spawn: vi.fn(() => ({ pid: 0, kill() {} })),
   resolveWslCwd: vi.fn(),
+  buildWslInjection: vi.fn(() => ({ args: [], env: {} })),
 }));
 vi.mock('node-pty', () => ({ spawn, default: { spawn } }));
 vi.mock('../../../shared/wsl', async (importOriginal) => ({
@@ -14,7 +15,7 @@ vi.mock('../../../shared/wsl', async (importOriginal) => ({
   resolveWslCwd,
 }));
 vi.mock('../../../shared/wslIntegration', () => ({
-  buildWslInjection: () => ({ args: [], env: {} }),
+  buildWslInjection,
 }));
 import { PTYManager } from '../PTYManager';
 
@@ -24,10 +25,23 @@ function deferredProbe() {
   return (cwd: string) => resolve({ cwd, target: { distribution: 'Ubuntu', user: 'dev' } });
 }
 
-describe('PTYManager.createAsync cancellation', () => {
+describe('PTYManager.createAsync WSL launches', () => {
   beforeEach(() => {
     spawn.mockClear();
     resolveWslCwd.mockReset();
+    buildWslInjection.mockClear();
+  });
+
+  it.each(['CLAUDE_CONFIG_DIR', 'CODEX_HOME'] as const)('carries only an explicit %s login opt-in through the async probe', async (vendor) => {
+    const manager = new PTYManager();
+    const env = { CODEX_HOME: 'C:\\accounts\\codex', CLAUDE_CONFIG_DIR: 'C:\\accounts\\claude' };
+    resolveWslCwd.mockResolvedValue({ cwd: '/home/dev', target: { distribution: 'Ubuntu', user: 'dev' } });
+    try {
+      await manager.createAsync({ shell: 'wsl.exe', env, wslAccountLoginEnvKey: vendor });
+      expect(buildWslInjection).toHaveBeenLastCalledWith(expect.objectContaining({ wslAccountLoginEnvKey: vendor }));
+      await manager.createAsync({ shell: 'wsl.exe', env });
+      expect(buildWslInjection).toHaveBeenLastCalledWith(expect.objectContaining({ wslAccountLoginEnvKey: undefined }));
+    } finally { manager.disposeAll(); }
   });
 
   it('does not spawn when the reserved id is disposed while the WSL probe is pending', async () => {

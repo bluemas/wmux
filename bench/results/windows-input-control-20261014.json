@@ -1,0 +1,21 @@
+{
+  "backend": "node-pty",
+  "platform": "win32",
+  "release": "10.0.20348",
+  "node": "24.21.0",
+  "elapsedMs": 120078,
+  "timedOut": true,
+  "sent": true,
+  "expected": "baa7a6d36ffa957552df230235c2d51d735f28d49c58a5f3438a3a973a25a37d",
+  "matched": false,
+  "outputTail": "\u001b[1t\u001b[c\u001b[?1004h\u001b[?9001hREADY\r\n",
+  "childProgress": {
+    "phase": "receiving",
+    "received": 3933184,
+    "expected": 4194304,
+    "timestamp": 1791929015210
+  },
+  "sourceCommit": "13799fed251762c44969c6f6badc56bc1d24b09f",
+  "sourceRun": "https://github.com/openwong2kim/wmux/actions/runs/38474625834",
+  "scope": "Independent node-pty control; native qualification remains a separate gate. Run cancelled after the diagnostic cleanup stalled; retained artifact captured the 120-second timeout before cancellation."
+}

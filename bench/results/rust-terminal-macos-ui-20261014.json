@@ -1,0 +1,174 @@
+{
+  "date": "2026-10-14",
+  "platform": "darwin-arm64",
+  "productCommit": "b0371f683",
+  "qualificationCheckout": "203cf9a34",
+  "appVersion": "4.3.1",
+  "electronVersion": "41.10.6",
+  "mode": "normal packaged Electron GUI",
+  "moduleSha256": "d142b4031c7a5eb3b340c886aeee091b6d645fea8dc592ad49d476f791634a1f",
+  "verdict": "VERIFIED",
+  "claim": "The isolated macOS package persists engine selection, applies it after daemon restart, runs six Rust shell panes, reconnects them across app restart, and returns to Node after daemon restart.",
+  "checks": {
+    "nodeDefault": true,
+    "rustSelectedThroughNativeSelect": true,
+    "persistedEngineFile": "rust",
+    "pendingRuntimeStayedNode": true,
+    "postDaemonRestartEffective": "rust",
+    "unicodeOutput": "rust-ui-42 한글 😀",
+    "rustPaneCount": 6,
+    "unicodeOutputVerifiedInEveryPane": true,
+    "appReconnect": {
+      "appPidBefore": 20036,
+      "appPidAfter": 26019,
+      "daemonPidBefore": 20045,
+      "daemonPidAfter": 20045,
+      "outputMarkersRestored": 6,
+      "postReconnectCommandOutput": "after-reconnect-42"
+    },
+    "nodeSelectedThroughNativeSelect": true,
+    "pendingRuntimeStayedRust": true,
+    "postRollbackDaemonPid": 28703,
+    "postRollbackEffective": "node",
+    "postRollbackCommandOutput": "node-rollback-42",
+    "remainingRecordedFixtureProcesses": 0,
+    "installedCliShimUnchanged": true
+  },
+  "skipped": [
+    "AI team/bot orchestration: COMPANY_MODE_ENABLED=false in this build; six ordinary shell panes are not a live AI team",
+    "Windows/Linux desktop packages and WSL",
+    "Signed/notarized distribution",
+    "Full repository CI",
+    "Other Settings entry points: only the keyboard entry was driven"
+  ],
+  "confidence": "high for the stated macOS shell/Settings claim; no real-team or cross-OS claim",
+  "setupIssue": "Initial macOS default temporary-home path exceeded Unix socket length; that attempt fell back to local host and was excluded. Repeated with a short /tmp home and live daemon.",
+  "evidence": [
+    {
+      "directory": ".claude/skills/verify-wmux/evidence/2026-10-13T22-49-07-verify-rust-ui-20261014",
+      "artifacts": [
+        {
+          "name": "001-initial.aria.yml",
+          "sha256": "e303e0e59e21ff4ec3883f97ddce35f92bf3ee36d30d9831d569bedeee15bb89"
+        },
+        {
+          "name": "002-node-settings.aria.yml",
+          "sha256": "690f59bd512423ffe21740c5d63550d79120aaedb474543d4a24952e6ce2161f"
+        },
+        {
+          "name": "doctor.json",
+          "sha256": "80c255e9a7910da8bebcf80989ca19ba9dab564dd99033b828b997e8dafa3688"
+        },
+        {
+          "name": "timeline.jsonl",
+          "sha256": "4c89f502bc65ec3933d1a037fb515a7f11ff5a21207868a805bd519526c88201"
+        }
+      ]
+    },
+    {
+      "directory": ".claude/skills/verify-wmux/evidence/2026-10-13T22-49-51-verify-rust-ui-20261014",
+      "artifacts": [
+        {
+          "name": "001-baseline.aria.yml",
+          "sha256": "eb831d0c6ca8190590dceeca1786c03d48bd80ea25ecb97863ce60be2dfc320b"
+        },
+        {
+          "name": "002-rust-pending-restart.aria.yml",
+          "sha256": "f78cdc511ac887afbe5e25eb5eed638423bffff7ad2e8d326a93352766d2c416"
+        },
+        {
+          "name": "003-rust-selected-node-running.aria.yml",
+          "sha256": "56d6882fa37e81cd8b0b8f31c5568418efaff11c7b8665dee2dae83dc82951e4"
+        },
+        {
+          "name": "004-rust-selected-node-running.png",
+          "sha256": "40e07fefbaa4a2db6f977f1bc1f80f60b203ec7d2332ed19b7b9cf9788007023"
+        },
+        {
+          "name": "doctor.json",
+          "sha256": "8c3a8898433a64d183a785df0b9a79790e3748db437c69160ce76ef0a5707a5f"
+        },
+        {
+          "name": "timeline.jsonl",
+          "sha256": "3a3b4bd34cfd2753eb0f0409af34c72dcbbadf076adb00e80b76b04d259038f1"
+        }
+      ]
+    },
+    {
+      "directory": ".claude/skills/verify-wmux/evidence/2026-10-13T22-51-09-verify-rust-ui-20261014",
+      "artifacts": [
+        {
+          "name": "001-rust-active.png",
+          "sha256": "c5ce3de12acc37fdfd29298cce940771efd656e0efd337aa319875931e0477df"
+        },
+        {
+          "name": "002-rust-active-settings.png",
+          "sha256": "128338b8c515f05f21a15029197a430f40f9326d779ae2ce56301561200c2efe"
+        },
+        {
+          "name": "003-rust-active-settings.aria.yml",
+          "sha256": "050127504ac322b80a4034a79a805fcb800f10fe6c793ca47a49f743613df178"
+        },
+        {
+          "name": "004-six-rust-panes.aria.yml",
+          "sha256": "ca5487e71d880c8eb2972945304aa208e8aaf7eea34abf899e529f1f9f12106b"
+        },
+        {
+          "name": "005-six-rust-panes.png",
+          "sha256": "c60a39c1d679a9a67103bdc1aa63633bf0d778dd9903c810d72db9732eefdc32"
+        },
+        {
+          "name": "doctor.json",
+          "sha256": "25fbed54c4d92e79d4c68addc93e590b5f75d264b1f7c3ed6aac6bc3057c5cf9"
+        },
+        {
+          "name": "timeline.jsonl",
+          "sha256": "236a5b78125dc6fe9b11954bf7d12ab7c8b3a5810e0cadc7136be229290c57e0"
+        }
+      ]
+    },
+    {
+      "directory": ".claude/skills/verify-wmux/evidence/2026-10-13T22-53-18-verify-rust-ui-20261014",
+      "artifacts": [
+        {
+          "name": "001-rust-engine-visible.png",
+          "sha256": "4d106ac99beed4173e9f1eb093ad7243904a61ccdb4a363012ddf1f0dbc0c1dd"
+        },
+        {
+          "name": "002-node-rollback-pending.aria.yml",
+          "sha256": "c4dc66fc3f42673d31c644dc0d690847ce5343344449b45ea64d33e59f848d30"
+        },
+        {
+          "name": "doctor.json",
+          "sha256": "1fde2ce9a7565711b99ea71781cba2e1a4fa8458c177bc81c4a4a22479208bf8"
+        },
+        {
+          "name": "timeline.jsonl",
+          "sha256": "ee518fe6361743a9baa8f0612b6fd386ac8520254405b5439fb304cf42f2842d"
+        }
+      ]
+    },
+    {
+      "directory": ".claude/skills/verify-wmux/evidence/2026-10-13T22-54-10-verify-rust-ui-20261014",
+      "artifacts": [
+        {
+          "name": "001-node-restored.png",
+          "sha256": "1b4988836d0da92a3a9f8b427c2c9f7971e9092783631731e6248e34a0cf1136"
+        },
+        {
+          "name": "002-node-restored.aria.yml",
+          "sha256": "702aa68228b7ba9073c715dab2739c7ca1439e20c4bbb68c6c56a3bd60394ae9"
+        },
+        {
+          "name": "doctor.json",
+          "sha256": "663126eb1bc41de2bd45200152a47de10f8a8b0da1795d9784ca8a12a34f9bdc"
+        },
+        {
+          "name": "timeline.jsonl",
+          "sha256": "956d7c0ad1ceb70524deee3847fa934cc485ee8404855f78a9b93f33bf00eca2"
+        }
+      ]
+    }
+  ],
+  "evidenceNote": "Raw local screenshots, ARIA, driver timelines and diagnostics remain git-ignored; these hashes identify the retained evidence."
+}

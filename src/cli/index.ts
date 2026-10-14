@@ -52,13 +52,18 @@ PANE COMMANDS
   split [--direction right|down]    Split the active pane (default: right)
 
 INPUT COMMANDS
-  send <text> [--submit]            Send text to your own pane (--submit presses Enter)
-  send-key <keystroke>              Send a key (e.g. Enter, ctrl-c, Tab)
-  read-screen [--tail <n>]          Read the current terminal screen content
+  send <text> [--submit] [--to <#pane|ptyId>]
+                                    Type text into a pane (--submit presses Enter)
+  send-key <keystroke> [--to <#pane|ptyId>]
+                                    Send a key (e.g. Enter, ctrl-c, Tab)
+  read-screen [--tail <n>] [--to <#pane|ptyId>]
+                                    Read the current terminal screen content
 
-  Inside a wmux pane these target the pane you ran the command from
-  (verified PID-map identity). Options: --pane <ptyId> to target another
-  pane explicitly, --active to target the UI-focused pane instead.
+  Without --to these target the pane you ran the command from (verified
+  PID-map identity). An agent running "wmux send" from its own shell types
+  into its OWN input that way: to reach another pane, name it with
+  --to (a quoted #name as "wmux list-panes" shows it, e.g. '#w1-2', or a ptyId).
+  --pane is the older spelling of --to; --active targets the UI-focused pane.
 
 BROWSER PANE
   open <url> [--new] [--workspace <id>]
@@ -68,6 +73,11 @@ DAEMON (headless lifecycle, no Electron/GUI required)
   daemon start                      Start the daemon if not already running
   daemon status                     Ping the daemon; reports whether it's up
   daemon stop                       Gracefully shut the daemon down
+  daemon run                        Run the daemon in the foreground, for a
+                                    service manager (never exits on idle)
+  daemon install-service            Linux: start the daemon at boot and keep it
+                                    after logout (systemd --user unit)
+  daemon uninstall-service          Remove that unit (the running daemon stays)
 
 WEB ACCESS (browser / PWA)
   web                               Serve wmux panes to a browser (read-only,
@@ -122,6 +132,10 @@ WEB ACCESS (browser / PWA)
         [--status]                  Show whether the web server is running
         [--stop]                    Stop the web server and revoke all web
                                     credentials
+  web pair --name <device>          Start a pairing on the RUNNING web server
+        [--kind desktop|phone]      and print its code (never restarts it, never
+                                    prints the access token). desktop also lets
+                                    that computer open new workspaces
 
 NOTIFICATION COMMANDS
   notify <title> [body]             Show a notification in wmux
@@ -209,6 +223,7 @@ EXAMPLES
   wmux list-workspaces
   wmux new-workspace --name dev
   wmux send "echo hello" --submit
+  wmux send "run the tests" --submit --to '#w1-2'
   wmux notify "Done" "Build finished"
   wmux open http://localhost:3000
   wmux identify --json

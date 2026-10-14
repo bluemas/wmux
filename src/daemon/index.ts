@@ -1,5 +1,6 @@
 // Must stay the first import: turns off working-directory executable lookup (Windows) before any module runs.
 import '../shared/exeSearchGuard';
+import { terminalCoreRuntime, terminalCoreSelection } from '../shared/terminalCoreSettings';
 import { collectDaemonMemoryDiagnostics } from './memoryDiagnostics';
 import { loadChatSkills } from './transcript/chatSkills';
 import { TerminalChatService } from './transcript/TerminalChatService';
@@ -51,6 +52,7 @@ import {
   getWmuxDir,
   readNotifySinks,
   readPushPresenceSuppression,
+  DAEMON_SUPERVISED_ENV,
 } from './config';
 import { createDaemonLogWriter } from './logWriter';
 import { DaemonSessionManager, type ManagedSession } from './DaemonSessionManager';
@@ -74,15 +76,17 @@ import { scheduleTokenFileReHarden } from '../shared/security';
 import { applyTaskQueryView } from '../shared/a2aTaskQueryView';
 import { normalizeLivePaneIds } from '../shared/a2aOrphanedTask';
 import type { WebTlsConfig } from '../shared/web';
-import { generateSnapshotUnqueued, enqueueSnapshotJob, generateTextSnapshot, generateTextSnapshotUnqueued, capTextRowsToFrameBudget, MAX_SCROLLBACK, type TextSnapshotOutcome } from './HeadlessSnapshot';
+import { generateSnapshotUnqueued, enqueueSnapshotJob, generateTextSnapshot, capTextRowsToFrameBudget, MAX_SCROLLBACK, type TextSnapshotOutcome } from './HeadlessSnapshot';
 import { readSessionTextReplay } from './sessionTextReplay';
+import type { TerminalPty } from '../shared/terminalPty';
 import { serializeSession } from './sessionSerialize';
 import { AwaitingScreenVerifier, questionInFlight, renderPaneScreen } from './AwaitingScreenVerifier';
+import { snapshotRingTextUnqueued } from './nativeRingSnapshot';
 import { screenShowsAgentDialog } from './transcript/chatScreenGate';
 import { ApprovalPushRouter } from './push/approvalPushRouter';
 import { readPendingToolUse } from './transcript/pendingToolUse';
 import { isClaudeFamilyAgent } from './approvals/terminalPrompt';
-import { StateWriter, scrubPersistedCredentials } from './StateWriter';
+import { StateWriter, scrubPersistedCredentials, detachedTtlHoursFor } from './StateWriter';
 import { stripCredentialValues } from '../shared/envFilter';
 import { LanLinkInbox } from './lanlink/inbox';
 import { LanLinkController } from './lanlink/controller';
@@ -205,6 +209,7 @@ import { LANLINK_SENTINEL_SESSION_ID } from '../shared/lanlink';
 import { classifyTasklistOutput, classifyKillOutcome, lockOwnerIsReclaimable, type ProcessLiveness } from '../shared/processLiveness';
 import { deliverScheduledPrompt, deliveryInputFence, type ScheduledPromptDeliveryDeps } from './sessionPromptDelivery';
 import { deliverCallerNudge } from './callerNudgeDelivery';
+import { stopAgentTree } from './agentStop';
 import { UsageLimitRegistry } from './usageLimit/UsageLimitRegistry';
 import type { SessionPromptScheduleResult } from '../shared/sessionPromptSchedule';
 import { USAGE_LIMIT_CONTINUE_PROMPT, type PaneUsageLimitPatch } from '../shared/usageLimit';
@@ -582,14 +587,13 @@ function queuedTextSnapshot(sessionManager: DaemonSessionManager, sessionId: str
   return enqueueSnapshotJob(async () => {
     const managed = sessionManager.getSession(sessionId);
     if (!managed) return null;
-    return generateTextSnapshotUnqueued({
+    return snapshotRingTextUnqueued(managed.ringBuffer, managed.bridge.outputModes, {
       // Dims backstop parity with the attach flush (?? 80 / ?? 24): a recovered
       // session may not have real dims yet, and a 0-wide headless terminal would
       // fail soft instead of reading.
       cols: managed.meta.cols ?? 80,
       rows: managed.meta.rows ?? 24,
       scrollback,
-      initial: readSessionTextReplay(managed.ringBuffer, managed.bridge.outputModes),
     });
   });
 }
@@ -860,8 +864,8 @@ async function restoreWebServer(sessionManager: DaemonSessionManager): Promise<v
         resumeState: (id) => readResumeStateForWeb?.(id),
         // The scrollback scope of GET /api/search.
         sessionText: sessionTextReader(sessionManager),
-        // M3 — without this, /pair degrades to handing out the shared operator
-        // token and nothing is individually revocable. Injected at BOTH
+        // M3 — without this, /pair refuses (503) and nothing can be paired
+        // with an individually revocable credential. Injected at BOTH
         // construction sites: a restored server serves paired phones on their
         // own credentials, exactly like one the operator just started.
         devices: getDeviceStore(),
@@ -1084,6 +1088,20 @@ initDaemonLogSink(wmuxDir);
 // as older; the gate falls back to the stale banner instead of destruction).
 const SPAWNED_BY_VERSION: string =
   process.env[ENV_KEYS.SPAWNED_BY_VERSION] || 'unknown';
+
+// The release this daemon's own code belongs to, for `wmux daemon status
+// --json`. The bundle sits at `<root>/daemon-bundle/index.js` in a dev checkout
+// and at `<ver>/resources/daemon-bundle/index.js` in the server runtime, so
+// `../../package.json` is the release's in both. Omitted when there is none
+// (the desktop app's resources carry no package.json): absent, never a guess.
+const DAEMON_VERSION: string | undefined = (() => {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf-8')) as { version?: unknown };
+    return typeof pkg.version === 'string' && pkg.version ? pkg.version : undefined;
+  } catch {
+    return undefined;
+  }
+})();
 
 // Recovery soft-cap ceiling. The hard PTY ceiling is now configurable
 // (config.session.maxSessions, default 200); recovery derives its own cap
@@ -1660,6 +1678,9 @@ async function isOurShellProcess(pid: number, expectedCmd: string): Promise<bool
   }
 }
 
+/** Set when acquireLock() refused because a daemon confirmed ALIVE holds the lock. */
+let lockHeldByLiveDaemon = false;
+
 async function acquireLock(): Promise<boolean> {
   const dir = getWmuxDir();
   if (!fs.existsSync(dir)) {
@@ -1685,6 +1706,7 @@ async function acquireLock(): Promise<boolean> {
           const liveness = await processLiveness(existingPid);
           if (!lockOwnerIsReclaimable(liveness)) {
             log('error', `Another daemon holds the lock (PID ${existingPid}, liveness=${liveness})`);
+            lockHeldByLiveDaemon = liveness === 'alive';
             return false;
           }
           // tasklist says not running — but could be a tasklist failure.
@@ -2182,6 +2204,7 @@ async function recoverSessions(
       }
       if (persisted.handoffFrom && !managed.meta.handoffFrom) managed.meta.handoffFrom = persisted.handoffFrom;
       if (persisted.paneAccount && !managed.meta.paneAccount) managed.meta.paneAccount = persisted.paneAccount;
+      if (persisted.remoteDurable) managed.meta.remoteDurable = true;
     }
     // Build combined state: recovered (live) sessions + everything we
     // intentionally left untouched (originally-dead within TTL, plus
@@ -2327,6 +2350,7 @@ async function restartSupervisedSession(
     if (meta.codexRelayResume && !fresh.meta.codexRelayResume) fresh.meta.codexRelayResume = meta.codexRelayResume;
     if (meta.handoffFrom && !fresh.meta.handoffFrom) fresh.meta.handoffFrom = meta.handoffFrom;
     if (meta.paneAccount && !fresh.meta.paneAccount) fresh.meta.paneAccount = meta.paneAccount;
+    if (meta.remoteDurable) fresh.meta.remoteDurable = true;
   }
 
   // Same external-death safety net as the create/recovery paths.
@@ -2399,7 +2423,7 @@ function registerRpcHandlers(
   // (see sessionLifecycle below). A phone-spawned pane must be the same kind of
   // object as a GUI-spawned one — process-monitored, supervised, persisted,
   // snapshotted — and the only way to guarantee that is for both to run this.
-  const createSessionRpc = async (params: Record<string, unknown>, local?: {execLaunchCommand?:string;handoffFrom?:StoredHandoffFrom;paneAccount?:{vendor:PaneAccountVendor}}): Promise<unknown> => {
+  const createSessionRpc = async (params: Record<string, unknown>, local?: {execLaunchCommand?:string;handoffFrom?:StoredHandoffFrom;paneAccount?:{vendor:PaneAccountVendor};remoteDurable?:true}): Promise<unknown> => {
     // B′ auto-replace (Codex #1): shutdown() snapshots the managed-session
     // list once, so a session created AFTER that snapshot would be disposed
     // without any durable suspended record — silent data loss. shutdown()
@@ -2428,6 +2452,9 @@ function registerRpcHandlers(
       args: p.args,
       cwd: p.cwd,
       env: p.env,
+      wslAccountLoginEnvKey: p.wslAccountLoginEnvKey,
+      // Spawn-only (see DaemonCreateSessionParams.secretEnv): never on meta.
+      ...(p.secretEnv !== undefined ? { secretEnv: p.secretEnv } : {}),
       cols: p.cols,
       rows: p.rows,
       agent: p.agent,
@@ -2437,6 +2464,7 @@ function registerRpcHandlers(
       execLaunchCommand: local?.execLaunchCommand,
       ...(local?.handoffFrom ? { handoffFrom: local.handoffFrom } : {}),
       ...(local?.paneAccount ? { paneAccount: local.paneAccount } : {}),
+      ...(local?.remoteDurable ? { remoteDurable: true as const } : {}),
       supervision: p.supervision
         ? {
             restart: p.supervision.restart,
@@ -2565,8 +2593,22 @@ function registerRpcHandlers(
    * than stamped into a child's environment on the caller's say-so. See
    * `rejectWorkspaceId` in WebTerminalServer for the trade-off that buys.
    */
-  sessionLifecycle = {
-    create: async ({ workspaceId, cwd, agentLaunch, authorized, account, handoffFrom }) => {
+  // A workspace's name is decided by the first create that starts it. Two
+  // creates racing for the same new id would otherwise each pass the "no pane
+  // there yet" check and stamp different names into the same workspace.
+  const startingWorkspaceNames = new Map<string, { name: string; holders: number }>();
+  const claimWorkspaceName = (workspaceId: string | undefined, requested: string | undefined) => {
+    if (!workspaceId || !requested) return { name: requested, release: () => undefined };
+    let entry = startingWorkspaceNames.get(workspaceId);
+    if (entry) entry.holders += 1;
+    else startingWorkspaceNames.set(workspaceId, entry = { name: requested, holders: 1 });
+    const held = entry;
+    return {
+      name: held.name,
+      release: () => { if (--held.holders === 0) startingWorkspaceNames.delete(workspaceId); },
+    };
+  };
+  const createWebPane: WebSessionLifecycle['create'] = async ({ workspaceId, cwd, agentLaunch, authorized, account, handoffFrom, workspaceName }) => {
       const id = `web-${randomUUID()}`;
       // The human-readable workspace NAME is copied from a live sibling pane;
       // the daemon has no workspace registry of its own to look one up in.
@@ -2575,13 +2617,18 @@ function registerRpcHandlers(
             .listLiveSessions()
             .find((s) => s.env?.[ENV_KEYS.WORKSPACE_ID] === workspaceId)
         : undefined;
+      // Any pane the daemon knows (suspended, dead, awaiting recovery too) makes
+      // the workspace an existing one: the caller's name only labels a new one.
+      const existing = !!workspaceId && (sibling !== undefined || sessionManager
+        .listSessions()
+        .some((s) => s.env?.[ENV_KEYS.WORKSPACE_ID] === workspaceId));
       let env = buildWebPaneEnv({
         id,
         parentEnv: process.env,
         ...(workspaceId ? { workspaceId } : {}),
         ...(sibling?.env?.[ENV_KEYS.WORKSPACE_NAME]
           ? { workspaceName: sibling.env[ENV_KEYS.WORKSPACE_NAME] }
-          : {}),
+          : !existing && workspaceName ? { workspaceName } : {}),
       });
       if (account && !workspaceId) throw new Error('A pane account needs a workspace');
       // A chosen account's vendor binding is not asked for: the account
@@ -2642,6 +2689,8 @@ function registerRpcHandlers(
           ...(handoffFrom ? {handoffFrom} : {}),
           // Which vendor's key is the pane's own choice: chat/launch re-applies it.
           ...(account ? {paneAccount:{vendor:account.vendor}} : {}),
+          // A remote client's pane outlives the ordinary detached TTL (bounded).
+          remoteDurable: true,
         });
         if (relay) {
           const managed = sessionManager.getSession(id);
@@ -2652,6 +2701,16 @@ function registerRpcHandlers(
         }
         return { id };
       } catch (error) { await relay?.close(); throw error; }
+  };
+
+  sessionLifecycle = {
+    create: async (params) => {
+      const claim = claimWorkspaceName(params.workspaceId, params.workspaceName);
+      try {
+        return await createWebPane({ ...params, ...(claim.name ? { workspaceName: claim.name } : {}) });
+      } finally {
+        claim.release();
+      }
     },
     destroy: async (id) => {
       await destroySessionRpc({ id });
@@ -2761,13 +2820,21 @@ function registerRpcHandlers(
       // bracketed-paste newlines; only the submitted CR/LF re-arms running.
       pipe.onInput((data: Buffer) => {
         const input = data.toString();
-        managed.ptyProcess.write(input);
+        try { managed.ptyProcess.write(data); }
+        catch (error) {
+          if (error instanceof Error && error.message.startsWith('PTY_BACKPRESSURE')) return false;
+          throw error;
+        }
         managed.bridge.noteInput(input);
+        if (((managed.ptyProcess as TerminalPty).pendingInputBytes ?? 0) >= 6 * 1024 * 1024) pipe.setInputPaused(true);
       });
+      const inputDrain = (managed.ptyProcess as TerminalPty).onInputDrain?.(() => pipe.setInputPaused(false));
+      if (inputDrain) pipe.setInputDrainSubscription(() => inputDrain.dispose());
 
       try {
         await pipe.start();
       } catch (err) {
+        inputDrain?.dispose();
         managed.bridge.removeListener('data', onData);
         sessionDataListeners.delete(p.id);
         sessionPipes.delete(p.id);
@@ -3139,6 +3206,7 @@ function registerRpcHandlers(
         // Lineage is where the pane came from, not a resume offer: kept either way.
         if (session.handoffFrom && !promotedSession.meta.handoffFrom) promotedSession.meta.handoffFrom = session.handoffFrom;
         if (session.paneAccount && !promotedSession.meta.paneAccount) promotedSession.meta.paneAccount = session.paneAccount;
+        if (session.remoteDurable) promotedSession.meta.remoteDurable = true;
         // A fresh start drops the binding outright. It names a conversation in
         // the directory that no longer exists, and the pane did not resume it —
         // keeping it would leave the pane advertising a resume offer for a
@@ -3490,6 +3558,8 @@ function registerRpcHandlers(
       name,
       flow,
       ...(typeof allowInput === 'boolean' ? { allowInput } : {}),
+      // `wmux web pair --kind desktop` only; the server ignores it on a phone pairing.
+      ...(params['grantCreateWorkspace'] === true ? { grantCreateWorkspace: true } : {}),
     });
   });
 
@@ -5311,11 +5381,16 @@ function registerRpcHandlers(
     // PR5 scope; exposing the value is PR5's part).
     return {
       status: 'ok',
+      ...(params?.includeTerminalCore === true ? { terminalCore: terminalCoreRuntime() } : {}),
       pid: process.pid,
       uptime,
       sessions: sessions.length,
+      // Sessions with a running PTY (attached or detached). An upgrade over SSH
+      // restarts the daemon only when this is 0.
+      liveSessions: sessionManager.listLiveSessions().length,
       eventLoopLagMs,
       bootTrace: { jsStartEpochMs: DAEMON_BOOT.jsStartEpochMs, marks: DAEMON_BOOT.marks },
+      ...(DAEMON_VERSION ? { version: DAEMON_VERSION } : {}),
       spawnedByVersion: SPAWNED_BY_VERSION,
       channelsEpoch: CHANNELS_EPOCH,
       ...pingFormatVersionField(activeEventLogFormatVersion),
@@ -7312,13 +7387,17 @@ function logExitHandoff(via: string): void {
 // === Main entry point ===
 
 async function main(): Promise<void> {
+  terminalCoreSelection();
   const startTime = Date.now();
   markDaemonBoot('main-start');
   log('info', `wmux-daemon starting (PID ${process.pid})`);
 
   // 1. Single-instance check
   if (!(await acquireLock())) {
-    process.exit(1);
+    // Under a service manager, a live daemon already running is not a crash:
+    // DAEMON_EXIT_ALREADY_RUNNING is the code the unit's restart policy skips.
+    // The desktop launcher's path keeps exit 1 here.
+    process.exit(lockHeldByLiveDaemon && process.env[DAEMON_SUPERVISED_ENV] === '1' ? DAEMON_EXIT_ALREADY_RUNNING : 1);
   }
   markDaemonBoot('lock-acquired');
 
@@ -8157,6 +8236,27 @@ async function main(): Promise<void> {
       && agentProcessTracker.hasLiveWslAgent(id);
     return { live };
   });
+  // main's stop of a factory worker whose task ended: the pane's verified
+  // claude and everything below it stop; the shell, the session and its
+  // resume binding stay (agentStop.ts). The app's own process only.
+  pipeServer.onRpc('session.stopAgent', async (rawParams, ctx) => {
+    if (!pipeServer.isFirstParty(ctx.clientId)) return { ok: false, code: 'not_authorized' };
+    const id = typeof (rawParams as { sessionId?: unknown }).sessionId === 'string'
+      ? (rawParams as { sessionId: string }).sessionId
+      : '';
+    const managed = id ? sessionManager.getSession(id) : undefined;
+    if (!managed) return { ok: false, code: 'no_session' };
+    if (managed.meta.wslTarget || managed.meta.exec) return { ok: false, code: 'unsupported' };
+    try {
+      return await stopAgentTree({
+        tree: () => agentProcessTracker.agentProcessTree(id, 'claude'),
+        stillRunning: (entries) => agentProcessTracker.stillRunning(entries),
+        kill: (pid, signal) => process.kill(pid, signal),
+      });
+    } catch {
+      return { ok: false, code: 'unknown' };
+    }
+  });
   // #919 — re-evaluate canonical identity OUTSIDE `session:agent`: the tier
   // inputs change (attribution completes; a watched process dies) while no
   // detector event is in flight, and a wrong label would otherwise sit in
@@ -8366,7 +8466,8 @@ async function main(): Promise<void> {
     ? configuredIdleMinutes * 60_000
     : 5 * 60_000;
   const idleConfig = {
-    idleTimeoutMs: idleEnvMs ?? safeConfigIdleMs,
+    // 0 = disabled: a supervised daemon (`wmux daemon run`) stays up for its service manager.
+    idleTimeoutMs: process.env[DAEMON_SUPERVISED_ENV] === '1' ? 0 : idleEnvMs ?? safeConfigIdleMs,
     graceMs: graceEnvMs ?? 60_000,
     startTime,
   };
@@ -8730,7 +8831,7 @@ async function main(): Promise<void> {
         // optional fields, so exempt on either.
         if (managed.meta.exec || managed.meta.supervision) continue;
         const idleSince = new Date(managed.meta.lastActivity).getTime();
-        const ttlMs = config.session.detachedTtlHours * 60 * 60 * 1000;
+        const ttlMs = detachedTtlHoursFor(managed.meta, config.session.detachedTtlHours) * 60 * 60 * 1000;
         if (Date.now() - idleSince >= ttlMs) {
           // Mirror the dead branch: drop any leftover buffer dump from a prior
           // suspend cycle before destroying, or it leaks until the next boot.

@@ -2,7 +2,7 @@ import { useMemo } from 'react';
 import type { SurfaceItem } from '../../../../../../shared/tokenUsage/surfaceTypes';
 import { useT } from '../../../../../hooks/useT';
 import Badge from '../../../../ui/Badge';
-import Switch from '../../../../ui/Switch';
+import { ItemToggle, itemState, McpToolRow } from './McpToolRow';
 
 export interface CustomMcpGroupProps {
   servers: SurfaceItem[];
@@ -72,10 +72,7 @@ export function CustomMcpGroup({
           const serverTools = tools.filter((t) => t.parent === server.name);
           const allServerTools = allTools ? allTools.filter((t) => t.parent === server.name) : serverTools;
           const stagedToolsCount = allServerTools.filter((t) => stagedChanges?.has(t.id)).length;
-          const isServerStaged = stagedChanges?.has(server.id) ?? false;
-          const isServerEnabled = isServerStaged
-            ? stagedChanges!.get(server.id)!
-            : server.enabled !== false;
+          const { staged: isServerStaged, enabled: isServerEnabled } = itemState(server, stagedChanges);
           const isWmux = server.wmuxRequired || server.source === 'wmux';
           const serverRejection = rejectedFlags?.get(server.id);
 
@@ -110,65 +107,26 @@ export function CustomMcpGroup({
                   )}
                 </div>
                 <div className="flex items-center gap-2">
-                  {server.toggleable && onToggle ? (
-                    <Switch
-                      checked={isServerEnabled}
-                      onCheckedChange={() => onToggle(server.id)}
-                      aria-label={t('settings.tokenUsage.toggleAria', { name: server.name })}
-                      data-testid={`toggle-mcp-server-${server.name}`}
-                    />
-                  ) : (
-                    <Badge tone={isServerEnabled ? 'success' : 'neutral'}>
-                      {isServerEnabled ? t('settings.tokenUsage.enabled') : t('settings.tokenUsage.disabled')}
-                    </Badge>
-                  )}
+                  <ItemToggle
+                    item={server}
+                    enabled={isServerEnabled}
+                    onToggle={onToggle}
+                    testId={`toggle-mcp-server-${server.name}`}
+                  />
                 </div>
               </div>
 
               {serverTools.length > 0 && (
                 <div className="pl-6 pr-3 pb-2 pt-0 flex flex-col gap-1">
-                  {serverTools.map((tool) => {
-                    const isToolStaged = stagedChanges?.has(tool.id) ?? false;
-                    const toolEnabled = isToolStaged
-                      ? stagedChanges!.get(tool.id)!
-                      : tool.enabled !== false;
-                    const toolRejection = rejectedFlags?.get(tool.id);
-
-                    return (
-                      <div
-                        key={tool.id}
-                        className="flex items-center justify-between text-[11px] py-1 border-t border-[var(--border-soft)]"
-                        data-testid={`mcp-tool-${tool.name}`}
-                        data-staged={isToolStaged ? 'true' : undefined}
-                      >
-                        <div className="flex items-center gap-2 flex-wrap">
-                          <span className="text-[var(--text-sub)]">↳</span>
-                          <span className="ui-code text-[var(--text-main)]">{tool.name}</span>
-                          {isToolStaged && <Badge tone="warning">{t('settings.tokenUsage.staged')}</Badge>}
-                          {toolRejection && (
-                            <Badge tone="danger">{toolRejection}</Badge>
-                          )}
-                          {tool.readOnlyReason && (
-                            <span className="text-[10px] text-[var(--text-sub)]">({tool.readOnlyReason})</span>
-                          )}
-                        </div>
-                        <div className="flex items-center gap-2">
-                          {tool.toggleable && onToggle ? (
-                            <Switch
-                              checked={toolEnabled}
-                              onCheckedChange={() => onToggle(tool.id)}
-                              aria-label={t('settings.tokenUsage.toggleAria', { name: tool.name })}
-                              data-testid={`toggle-mcp-tool-${tool.name}`}
-                            />
-                          ) : (
-                            <Badge tone={toolEnabled ? 'success' : 'neutral'}>
-                              {toolEnabled ? t('settings.tokenUsage.enabled') : t('settings.tokenUsage.disabled')}
-                            </Badge>
-                          )}
-                        </div>
-                      </div>
-                    );
-                  })}
+                  {serverTools.map((tool) => (
+                    <McpToolRow
+                      key={tool.id}
+                      tool={tool}
+                      onToggle={onToggle}
+                      stagedChanges={stagedChanges}
+                      rejectedFlags={rejectedFlags}
+                    />
+                  ))}
                 </div>
               )}
             </div>

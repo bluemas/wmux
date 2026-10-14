@@ -380,6 +380,36 @@ describe('TaskLedger — authz matrix', () => {
   }
 });
 
+describe('TaskLedger — a refusal reveals only a task the caller may see', () => {
+  const STRANGER_WORKER: LedgerActor = { kind: 'worker', workspaceId: 'ws-other' };
+  const STRANGER_BRAIN: LedgerActor = { kind: 'brain', workspaceId: 'ws-stranger' };
+
+  it('refuses a caller unrelated to the task before the rev, and returns no entry, whatever the rev or status', async () => {
+    const a = open();
+    await seed(a);
+    for (const actor of [STRANGER_WORKER, STRANGER_BRAIN]) {
+      for (const expectedRev of [1, 99]) {
+        for (const status of ['review_requested', 'bogus'] as LedgerStatus[]) {
+          const res = await a.update({ id: 'wtask-1', status, actor, expectedRev });
+          expect(res).toMatchObject({ ok: false, error: 'not_authorized' });
+          expect(res).not.toHaveProperty('entry');
+          expect(JSON.stringify(res)).not.toContain('lane');
+        }
+      }
+      expect(await a.recordGate('wtask-1', PASS, actor)).not.toHaveProperty('entry');
+      expect(await a.rebindTaskWorkspace({ id: 'wtask-1', taskWorkspaceId: 'ws-new', actor, expectedRev: 1 })).not.toHaveProperty('entry');
+    }
+  });
+
+  it('still hands its own task back to a caller that may see it', async () => {
+    const a = open();
+    await seed(a);
+    expect(await a.update({ id: 'wtask-1', status: 'review_requested', actor: WORKER, expectedRev: 99 })).toMatchObject({ ok: false, error: 'stale_rev', entry: { id: 'wtask-1' } });
+    expect(await a.update({ id: 'wtask-1', status: 'cancelled', actor: WORKER, expectedRev: 1 })).toMatchObject({ ok: false, error: 'not_authorized', entry: { id: 'wtask-1' } });
+    expect(await a.update({ id: 'wtask-1', status: 'failed', actor: BRAIN, expectedRev: 99 })).toMatchObject({ ok: false, error: 'stale_rev', entry: { id: 'wtask-1' } });
+  });
+});
+
 describe('TaskLedger — close, orphans, listeners', () => {
   it('closeTask forces cancelled unless already completed', async () => {
     const a = open();
@@ -439,5 +469,44 @@ describe('TaskLedger — close, orphans, listeners', () => {
     expect(seen[1].summary).toBe('gate green');
     expect(a.list({ ownerWorkspaceId: 'ws-owner', openOnly: true })).toHaveLength(1);
     expect(a.list({ taskWorkspaceId: 'ws-nope' })).toHaveLength(0);
+  });
+});
+
+describe('rebindTaskWorkspace', () => {
+  it('moves the task to the new workspace (persisted, rev bumped, no transition): the worker there owns the row', async () => {
+    const a = open();
+    const e = await seed(a);
+    const seen: LedgerTransition[] = [];
+    a.onTransition((t) => seen.push(t));
+    const r = await a.rebindTaskWorkspace({ id: 'wtask-1', taskWorkspaceId: 'ws-new', actor: SYSTEM, expectedRev: e.rev });
+    expect(r).toMatchObject({ ok: true, entry: { taskWorkspaceId: 'ws-new', rev: e.rev + 1, status: 'working' } });
+    expect(seen).toHaveLength(0);
+    expect(a.findByTaskWorkspace('ws-task')).toBeNull();
+    const moved = await a.update({ id: 'wtask-1', status: 'review_requested', actor: { kind: 'worker', workspaceId: 'ws-new' }, expectedRev: e.rev + 1 });
+    expect(moved.ok).toBe(true);
+    await a.flush();
+    expect(open().get('wtask-1')).toMatchObject({ taskWorkspaceId: 'ws-new' });
+  });
+
+  it('only the system may move it, and only at the rev it read', async () => {
+    const a = open();
+    const e = await seed(a);
+    expect(await a.rebindTaskWorkspace({ id: 'wtask-1', taskWorkspaceId: 'ws-new', actor: WORKER, expectedRev: e.rev })).toMatchObject({ ok: false, error: 'not_authorized' });
+    expect(await a.rebindTaskWorkspace({ id: 'wtask-1', taskWorkspaceId: 'ws-new', actor: BRAIN, expectedRev: e.rev })).toMatchObject({ ok: false, error: 'not_authorized' });
+    expect(await a.rebindTaskWorkspace({ id: 'wtask-1', taskWorkspaceId: 'ws-new', actor: SYSTEM, expectedRev: e.rev + 5 })).toMatchObject({ ok: false, error: 'stale_rev' });
+    expect(await a.rebindTaskWorkspace({ id: 'wtask-x', taskWorkspaceId: 'ws-new', actor: SYSTEM, expectedRev: 1 })).toMatchObject({ ok: false, error: 'not_found' });
+    expect(a.get('wtask-1')).toMatchObject({ taskWorkspaceId: 'ws-task', rev: e.rev });
+  });
+});
+
+describe('TaskLedger — dispatch', () => {
+  it('keeps a bot task\'s thread and handoff, and drops a malformed handoff id', async () => {
+    const ledger = open();
+    await ledger.register({ id: 'wtask-h', taskWorkspaceId: 'ws-task', ownerWorkspaceId: 'ws-owner', title: 't', dispatch: { origin: { kind: 'bot', botId: 'bot-00000001', tainted: false }, threadId: 'handoff:h-1', handoffId: 'h-1' } });
+    await ledger.register({ id: 'wtask-x', taskWorkspaceId: 'ws-task', ownerWorkspaceId: 'ws-owner', title: 't', dispatch: { origin: { kind: 'bot' }, handoffId: 'not a handoff id' } });
+    expect(ledger.get('wtask-h')?.dispatch).toEqual({ origin: { kind: 'bot', botId: 'bot-00000001', tainted: false }, threadId: 'handoff:h-1', handoffId: 'h-1' });
+    expect(ledger.get('wtask-x')?.dispatch).toEqual({ origin: { kind: 'bot' } });
+    // It survives a reload.
+    expect(open().get('wtask-h')?.dispatch?.handoffId).toBe('h-1');
   });
 });

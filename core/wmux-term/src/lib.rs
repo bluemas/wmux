@@ -18,3 +18,41 @@ mod wasm_binding;
 
 #[cfg(all(feature = "bindings", not(target_arch = "wasm32")))]
 mod napi_binding;
+
+#[cfg(all(
+    feature = "native-core",
+    feature = "bindings",
+    not(target_arch = "wasm32")
+))]
+mod native_core;
+
+#[cfg(all(
+    feature = "native-core",
+    feature = "bindings",
+    not(target_arch = "wasm32")
+))]
+mod native_serialize;
+
+#[cfg(all(
+    feature = "native-core",
+    feature = "bindings",
+    not(target_arch = "wasm32")
+))]
+mod native_transport;
+
+#[cfg(all(
+    feature = "native-core",
+    feature = "bindings",
+    not(target_arch = "wasm32")
+))]
+mod native_output;
+
+#[cfg(any(test, feature = "native-core"))]
+mod output_interpreter;
+
+#[cfg(all(
+    feature = "native-core",
+    feature = "bindings",
+    not(target_arch = "wasm32")
+))]
+mod native_interpreter;

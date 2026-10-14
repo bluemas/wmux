@@ -5,7 +5,7 @@ import type { SurfaceItem } from '../../../../../../shared/tokenUsage/surfaceTyp
 import { useT } from '../../../../../hooks/useT';
 import Badge from '../../../../ui/Badge';
 import Button from '../../../../ui/Button';
-import Switch from '../../../../ui/Switch';
+import { itemState, McpToolRow } from './McpToolRow';
 
 export interface CustomWmuxToolsGroupProps {
   tools: SurfaceItem[];
@@ -29,10 +29,7 @@ export function CustomWmuxToolsGroup({
   const fullToolList = allTools ?? tools;
 
   const enabledCount = useMemo(() => {
-    return fullToolList.filter((t) => {
-      const isStaged = stagedChanges?.has(t.id) ?? false;
-      return isStaged ? stagedChanges!.get(t.id)! : t.enabled !== false;
-    }).length;
+    return fullToolList.filter((t) => itemState(t, stagedChanges).enabled).length;
   }, [fullToolList, stagedChanges]);
 
   const totalCount = fullToolList.length;
@@ -184,50 +181,16 @@ export function CustomWmuxToolsGroup({
                 {t('settings.tokenUsage.noWmuxToolsMatching')}
               </div>
             ) : (
-              tools.map((tool) => {
-                const isToolStaged = stagedChanges?.has(tool.id) ?? false;
-                const toolEnabled = isToolStaged
-                  ? stagedChanges!.get(tool.id)!
-                  : tool.enabled !== false;
-                const toolRejection = rejectedFlags?.get(tool.id);
-
-                return (
-                  <div
-                    key={tool.id}
-                    className="flex items-center justify-between text-[11px] py-1 border-t border-[var(--border-soft)]"
-                    data-testid={`mcp-tool-${tool.name}`}
-                    data-staged={isToolStaged ? 'true' : undefined}
-                  >
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <span className="text-[var(--text-sub)]" aria-hidden="true">↳</span>
-                      <span className="ui-code text-[var(--text-main)]">{tool.name}</span>
-                      {isToolStaged && <Badge tone="warning">{t('settings.tokenUsage.staged')}</Badge>}
-                      {toolRejection && (
-                        <Badge tone="danger">{toolRejection}</Badge>
-                      )}
-                      {tool.readOnlyReason && (
-                        <span className="text-[10px] text-[var(--text-sub)]">
-                          ({tool.readOnlyReason})
-                        </span>
-                      )}
-                    </div>
-                    <div className="flex items-center gap-2">
-                      {tool.toggleable && onToggle ? (
-                        <Switch
-                          checked={toolEnabled}
-                          onCheckedChange={() => onToggle(tool.id)}
-                          aria-label={t('settings.tokenUsage.toggleAria', { name: tool.name })}
-                          data-testid={`toggle-mcp-tool-${tool.name}`}
-                        />
-                      ) : (
-                        <Badge tone={toolEnabled ? 'success' : 'neutral'}>
-                          {toolEnabled ? t('settings.tokenUsage.enabled') : t('settings.tokenUsage.disabled')}
-                        </Badge>
-                      )}
-                    </div>
-                  </div>
-                );
-              })
+              tools.map((tool) => (
+                <McpToolRow
+                  key={tool.id}
+                  tool={tool}
+                  onToggle={onToggle}
+                  stagedChanges={stagedChanges}
+                  rejectedFlags={rejectedFlags}
+                  arrowAriaHidden
+                />
+              ))
             )}
           </div>
         )}

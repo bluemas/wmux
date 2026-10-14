@@ -36,6 +36,9 @@ import { IncompleteEscapeSplitter } from '../../shared/incompleteEscape';
 // app quits and every minute (persistColdFrames), and read back at startup
 // (restoreColdFrames). Without that, every pane's first reveal after a restart
 // sat blank for the daemon's replay, since nothing had been disposed yet.
+// Only while "Restore on launch" (scrollbackRestoreEnabled) is on: with it
+// off the cache stays in memory and stored frames are cleared
+// (clearPersistedColdFrames), since a screen on disk is session output too.
 
 export interface ColdFrame {
   /** Serialized viewport: SGR + cursor positioning + text, no modes. */
@@ -183,6 +186,11 @@ export function persistColdFrames(
   } catch {
     try { storage.removeItem(COLD_FRAME_STORAGE_KEY); } catch { /* storage unavailable */ }
   }
+}
+
+/** Remove the stored frames ("Restore on launch" is off). Never throws. */
+export function clearPersistedColdFrames(storage: Storage | undefined = globalThis.localStorage): void {
+  try { storage?.removeItem(COLD_FRAME_STORAGE_KEY); } catch { /* storage unavailable */ }
 }
 
 /**

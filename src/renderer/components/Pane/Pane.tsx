@@ -8,6 +8,8 @@ import { destroyRemoteSessions, destroySurfaceRemoteSession } from '../../utils/
 import { getWorkspaceLeafPanes } from '../../../shared/paneUtils';
 import { MAX_PANES_PER_WORKSPACE } from '../../stores/slices/paneSlice';
 import { useIpc } from '../../hooks/useIpc';
+import { driveFocusToTerminal } from '../../hooks/useActivePaneFocus';
+import { onTerminalRegistered, terminalRegistry } from '../../hooks/useTerminal';
 import { useStore } from '../../stores';
 import { useT } from '../../hooks/useT';
 import TerminalComponent from '../Terminal/Terminal';
@@ -708,6 +710,31 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
     [pane.surfaces],
   );
   const splitMode = splitTerminals.length > 0 && splitWorks.length > 0;
+  // Entering or leaving the split moves the terminals to a new parent, which
+  // remounts them and drops the keyboard focus to <body>: an agent opening a
+  // browser tab while you type would swallow your next keystrokes. Note here,
+  // before the commit, which of this pane's terminals holds the focus, and
+  // hand it back once the new layout is drawn.
+  const prevSplitModeRef = useRef(splitMode);
+  const refocusPtyRef = useRef<string | null>(null);
+  if (prevSplitModeRef.current !== splitMode) {
+    prevSplitModeRef.current = splitMode;
+    const active = typeof document === 'undefined' ? null : document.activeElement;
+    refocusPtyRef.current = active
+      ? pane.surfaces.find((s) => s.ptyId && terminalRegistry.get(s.ptyId)?.element?.contains(active))?.ptyId ?? null
+      : null;
+  }
+  useEffect(() => {
+    const ptyId = refocusPtyRef.current;
+    refocusPtyRef.current = null;
+    if (!ptyId) return;
+    return driveFocusToTerminal(ptyId, {
+      getTerminal: (id) => terminalRegistry.get(id),
+      onRegistered: onTerminalRegistered,
+      raf: (cb) => requestAnimationFrame(cb),
+      caf: (handle) => cancelAnimationFrame(handle),
+    });
+  }, [splitMode]);
   const lastWorkIdRef = useRef<string | undefined>(undefined);
   const { shownTerminalId, shownWorkId } = pickSplitShownSurfaces(
     splitTerminals, splitWorks, pane.activeSurfaceId, lastWorkIdRef.current,
@@ -857,8 +884,12 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
         return;
       }
       if (!claimAutoResume(ptyId)) return; // resumed already, or the pill was clicked meanwhile
-      window.electronAPI.pty.write(ptyId, `${line}\r`);
-      useStore.getState().clearResumeHint(ptyId);
+      // Through main, which guards a bot worker's resume (botWorkerMergeGuard).
+      // A refused line keeps the pill, so the pane can still be resumed by hand.
+      window.electronAPI.pty.writeLaunch(ptyId, line, true).then(
+        () => useStore.getState().clearResumeHint(ptyId),
+        (err: unknown) => console.warn('[wmux:resume] the resume line was not typed', String(err)),
+      );
     }, 400);
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1066,6 +1097,7 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
           restores the split). */}
       <div
         ref={splitHeaderRef}
+        data-pane-header
         className="flex min-w-0 shrink-0"
         style={{ '--wmux-split-term': 50, '--wmux-split-work': 50 } as React.CSSProperties}
       >
@@ -1085,7 +1117,7 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
         paneActive={isActive}
         actionsMode={actionsMode}
         usageLimitCompact={usageLimitCompact}
-        onSelect={(surfaceId) => setActiveSurface(pane.id, surfaceId)}
+        onSelect={(surfaceId) => setActiveSurface(pane.id, surfaceId, workspace.id)}
         onClose={handleCloseSurfaceFromTab}
         onSplitHorizontal={handleSplitHorizontal}
         onSplitVertical={handleSplitVertical}
@@ -1177,11 +1209,20 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
 
         // Paste WITHOUT a trailing \r. The user presses Enter to run — so bypass
         // is re-granted only by an explicit keystroke, never automatically (D6).
-        const type = (text: string) => window.electronAPI.pty.write(ptyId, text);
-        const typeAndClear = (text: string) => {
-          type(text);
-          useStore.getState().clearResumeHint(ptyId);
-        };
+        // Resolves false when main refused the line: the pill then stays as it was.
+        const type = (text: string): Promise<boolean> =>
+          window.electronAPI.pty.writeLaunch(ptyId, text, false).then(
+            () => true,
+            (err: unknown) => {
+              console.warn('[wmux:resume] the resume line was not typed', String(err));
+              return false;
+            },
+          );
+        const typeAndClear = (text: string): Promise<boolean> =>
+          type(text).then((ok) => {
+            if (ok) useStore.getState().clearResumeHint(ptyId);
+            return ok;
+          });
 
         // Assemble the exact string the next click types — with the role's
         // bound model re-asserted on the launcher-prefixed variants (mirrors the
@@ -1215,9 +1256,8 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
               after: plan.text,
             });
           }
-          if (plan.clearHint) typeAndClear(plan.text);
-          else type(plan.text);
-          if (plan.advanceStage) setResumeStage(1);
+          const typed = plan.clearHint ? typeAndClear(plan.text) : type(plan.text);
+          if (plan.advanceStage) void typed.then((ok) => { if (ok) setResumeStage(1); });
         };
 
         // The two-stage progressive assembly only applies to the toggle-OFF
@@ -1541,6 +1581,7 @@ function SplitSurfaceView({
           key={surface.id}
           filePath={surface.previewFilePath || ''}
           isActive={drawn}
+          paneId={pane.id}
         />
       );
     }

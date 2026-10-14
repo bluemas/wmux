@@ -5,17 +5,18 @@ Settings is a full rail page (not a modal) with a searchable nav of 15 tabs grou
 ## Sub-features
 
 - `settings-open` / `settings-close`: open from the More menu or ⌘,; close with "Close" or Escape (⌘, toggles).
-- `settings-nav`: tabs General, Appearance, Terminal, Keyboard, Notifications, Claude Code, Accounts, Moa, Roles & fan-out, Token usage, Browser, Computer use, Remote & phone, LAN, About.
+- `settings-nav`: tabs General, Appearance, Terminal, Keyboard, Notifications, Claude Code, Accounts, Factory, Roles & fan-out, Token usage, Browser, Computer use, Remote & phone, LAN, About.
 - `settings-search`: "Search settings" with grouped results and an empty state.
 - `settings-theme`: Appearance › Theme radio cards (Tint, Paper, Mono, …).
 - `settings-language`: General › Language select (`en`, `ko`, `ja`, …).
 - `settings-persist`: values survive in `<userData>/session.json`.
+- `settings-terminal-engine`: Node/Rust selection, running-host read-back and restart guidance; requires a native-enabled build for Rust.
 
 ## How to get to it (user POV)
 
 - Rail "More" button › "Settings ⌘," ("Settings Ctrl+," on Windows/Linux).
 - Shortcut ⌘, (Ctrl+,), which toggles.
-- Other features link into tabs (More › "Turn on Moa…" opens the Moa tab).
+- Other features link into tabs (the room dock's factory-off view opens the Factory tab).
 
 ## Driving it with control-wmux
 
@@ -47,6 +48,7 @@ Preconditions:
   Restore with `control-wmux click --role radio --name Tint`.
 - **Search.** Run `control-wmux click --testid settings-search`, `control-wmux type --text theme --testid settings-search`. `control-wmux wait-settle --testid settings-search-results` passes. `type` appends, so clear first (`control-wmux press --key Meta+a --testid settings-search`, `press --key Backspace`); a nonsense query such as `zzzqqq` shows `settings-search-empty` ("No settings match “zzzqqq”.").
 - **Proof.** `control-wmux screenshot --as settings-general` shows the Settings page with the General tab.
+- **Terminal engine.** Open Terminal, then `control-wmux select --label "Terminal engine" --value rust` and `control-wmux wait-settle`. Inspect `window.electronAPI.settings.getTerminalCore()` (read-only): `selected` becomes `rust` while a running Node host stays `node` and `restartRequired` is true. Read `~/.wmux<suffix>/terminal-core.json` independently. `stop` without purge, then `launch` with the same executable and suffix restarts both hosts; verify `host: daemon`, effective `rust`, and no restart required. Repeat with `--value node` to prove rollback. `restart` alone retains the daemon, so it proves reconnect rather than engine application. Hover the engine control before a screenshot to bring it into view.
 
 ## Gotchas
 
@@ -55,4 +57,4 @@ Preconditions:
 - All labels are translated. After switching Language, English names stop matching; use `data-settings-tab` and test ids. Switch back to English before the next recipe.
 - The font-size slider is on Appearance, not Terminal.
 - Settings that write outside the profile: Claude Code tab installers (hooks, statusline), Accounts (CLI logins), Remote & phone and LAN pairing, Computer use permissions. Read them, do not toggle them.
-- `~/.wmux<suffix>/config.json` is daemon config; the Settings UI does not write UI preferences there.
+- `~/.wmux<suffix>/config.json` is daemon config; the Settings UI does not write UI preferences there. The terminal engine is a separate host setting in `terminal-core.json`, not `session.json`.

@@ -20,13 +20,13 @@ describe('settings catalog — Browser tab', () => {
   it('leaves the rest of the Terminal tab where it was', () => {
     const onTerminal = SETTINGS_CATALOG.filter((e) => e.tab === 'terminal').map((e) => e.id);
     expect(onTerminal).toEqual([
-      'shell', 'startdir', 'splitcwd', 'closeonexit', 'plaindragselect', 'ime', 'retention', 'coldpark', 'inlineimages', 'scrollback', 'restore', 'imagepaste',
+      'terminal-engine', 'shell', 'startdir', 'splitcwd', 'closeonexit', 'plaindragselect', 'ime', 'retention', 'coldpark', 'inlineimages', 'scrollback', 'restore', 'imagepaste',
     ]);
   });
 
   it('lists browser in the Agents nav group, followed only by computer use', () => {
     const agents = SETTINGS_NAV_GROUPS.find((g) => g.id === 'agents');
-    expect(agents?.tabs).toEqual(['claude-integration', 'accounts', 'moa', 'roles', 'tokens', 'browser', 'computer-use']);
+    expect(agents?.tabs).toEqual(['claude-integration', 'accounts', 'factory', 'roles', 'tokens', 'browser', 'computer-use']);
     const elsewhere = SETTINGS_NAV_GROUPS.filter((g) => g.id !== 'agents').flatMap((g) => g.tabs);
     expect(elsewhere).not.toContain('browser');
   });

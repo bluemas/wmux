@@ -14,8 +14,9 @@ class MockPty extends EventEmitter {
   resize(_cols: number, _rows: number): void { /* No real PTY geometry. */ }
   kill(): void { /* No child process to terminate. */ }
 }
-const { spawnMock, probeMock } = vi.hoisted(() => ({
+const { spawnMock, injectionMock, probeMock } = vi.hoisted(() => ({
   spawnMock: vi.fn(),
+  injectionMock: vi.fn(),
   probeMock: vi.fn((args: string[]): string | Promise<string> => {
     const distro = ['-d', '--distribution'].includes(args[0]) ? args[1] : 'DefaultDistro';
     const user = args.includes('--user') ? args[args.indexOf('--user') + 1] : 'developer';
@@ -34,9 +35,10 @@ vi.mock('../../shared/wsl', async (importOriginal) => {
 });
 vi.mock('../../shared/wslIntegration', async () => {
   const { wslTargetArgs } = await import('../../shared/wslTarget');
-  return { buildWslInjection: (opts: { target: Parameters<typeof wslTargetArgs>[0]; cwd: string; env: Record<string, string> }) => ({
-    args: [...wslTargetArgs(opts.target), '--cd', opts.cwd, '--exec', '/bin/bash'], env: opts.env,
-  }) };
+  return { buildWslInjection: (opts: { target: Parameters<typeof wslTargetArgs>[0]; cwd: string; env: Record<string, string> }) => {
+    injectionMock(opts);
+    return { args: [...wslTargetArgs(opts.target), '--cd', opts.cwd, '--exec', '/bin/bash'], env: opts.env };
+  } };
 });
 import { DaemonSessionManager } from '../DaemonSessionManager';
 import { StateWriter } from '../StateWriter';
@@ -45,11 +47,19 @@ import type { DaemonSession } from '../types';
 describe('createSession — WSL distro selection and recovery target', () => {
   let manager: DaemonSessionManager;
   beforeEach(() => {
-    spawnMock.mockReset(); probeMock.mockClear();
+    spawnMock.mockReset(); probeMock.mockClear(); injectionMock.mockClear();
     spawnMock.mockImplementation(() => new MockPty());
     manager = new DaemonSessionManager();
   });
   afterEach(() => manager.disposeAll());
+
+  it.each(['CLAUDE_CONFIG_DIR', 'CODEX_HOME'] as const)('carries the %s login opt-in, without inferring it for an ordinary session', async (vendor) => {
+    const env = { CODEX_HOME: 'C:\\accounts\\codex', CLAUDE_CONFIG_DIR: 'C:\\accounts\\claude' };
+    await manager.createSessionAsync({ id: 'login', cmd: 'wsl.exe', cwd: '~', env, wslAccountLoginEnvKey: vendor });
+    expect(injectionMock).toHaveBeenLastCalledWith(expect.objectContaining({ wslAccountLoginEnvKey: vendor }));
+    await manager.createSessionAsync({ id: 'ordinary', cmd: 'wsl.exe', cwd: '~', env });
+    expect(injectionMock).toHaveBeenLastCalledWith(expect.objectContaining({ wslAccountLoginEnvKey: undefined }));
+  });
 
   it('uses the picker selection to resolve the actual target and persisted args', async () => {
     await manager.createSessionAsync({ id: 'selected', cmd: 'wsl.exe', args: ['-d', 'My Ubuntu'], cwd: '~' });

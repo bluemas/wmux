@@ -1,0 +1,39 @@
+{
+  "date": "2026-10-14",
+  "platform": "darwin-arm64",
+  "nativeRawReadProbe": {
+    "cycle": 11,
+    "index": 363632,
+    "actualBytes": 530015,
+    "expectedBytes": 530014,
+    "actualWindow": "xxxxxxxxxxxxxxxxxxxxxxxxxx\r\nROW006860|한글🙂|xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\r\nROW006861|한글🙂|xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\nROW006862|한글🙂|xxxx",
+    "expectedWindow": "xxxxxxxxxxxxxxxxxxxxxxxxxx\r\nROW006860|한글🙂|xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\nROW006861|한글🙂|xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\nROW006862|한글🙂|xxxxx",
+    "decoderMatchesRaw": true
+  },
+  "pythonCookedControl": {
+    "backend": "Python os.openpty + subprocess; no Rust or node-pty",
+    "mode": "cooked",
+    "cycles": 1,
+    "elapsedSeconds": 0.8045181249617599,
+    "mismatch": {
+      "cycle": 1,
+      "index": 28725,
+      "actualBytes": 530034,
+      "expectedBytes": 530014,
+      "actualWindow": "xxxxxxxxxxxxxxxxxxxxxxxxxx\r\nROW000541|한글🙂|xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\r\nROW000542|한글🙂|xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\nROW000543|한글🙂|xxxx",
+      "expectedWindow": "xxxxxxxxxxxxxxxxxxxxxxxxxx\r\nROW000541|한글🙂|xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\nROW000542|한글🙂|xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\nROW000543|한글🙂|xxxxx"
+    }
+  },
+  "pythonRawControl": {
+    "backend": "Python os.openpty + subprocess; no Rust or node-pty",
+    "mode": "raw",
+    "cycles": 13,
+    "elapsedSeconds": 10.333382249984425,
+    "mismatch": null
+  },
+  "nodePtyCookedControl": {
+    "cycles": 30,
+    "observedMismatch": false
+  },
+  "interpretation": "The duplicate CR exists in raw PTY bytes before either decoder. An independent Python openpty control reproduces the same class of mismatch. Disabling OS output postprocessing only in the fixture restores exact-byte comparison; production output is not normalized. The original failed soak did not preserve its byte offset, so these are subsequent reproductions of the mismatch class."
+}

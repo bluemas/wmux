@@ -1,8 +1,10 @@
+import type { NativeOutputChunk } from '../shared/nativeTerminalCore';
+import type { TerminalPty } from '../shared/terminalPty';
 import { EventEmitter } from 'node:events';
 import { randomBytes } from 'node:crypto';
 import type { IPty } from 'node-pty';
 import type { AgentStatus } from '../shared/types';
-import { OscParser } from '../main/pty/OscParser';
+import { OutputInterpreter, type OutputModes } from './OutputInterpreter';
 import { TerminalNotificationParser } from '../main/pty/oscNotification';
 import { AgentDetector, drawsCodexBanner, type AgentEventStatus } from '../main/pty/AgentDetector';
 import { ActivityMonitor } from '../main/pty/ActivityMonitor';
@@ -10,7 +12,6 @@ import { parseOsc7Cwd, detectPromptCwd } from '../main/pty/cwdDetect';
 import { sanitizeTitle } from '../main/pty/titleDetect';
 import { RingBuffer } from './RingBuffer';
 import { PromptEventLog, parseOsc133Payload } from './PromptEventLog';
-import { OutputModeTracker } from './util/outputModeTracker';
 import { RESIZE_REDRAW_GUARD_MS } from '../main/notification/idleSuppression';
 import { stripReplayQuerySequences } from '../shared/replayQuerySanitizer';
 import { isFreshSessionSource } from '../shared/hooks/signal-types';
@@ -64,6 +65,7 @@ export function scanStartupDa1(text: string): 'answer' | 'more' | 'closed' {
  *
  * Events:
  *  - 'data'     → Buffer (raw PTY output)
+ *  - 'outputActivity' → no payload (unmuted output, no byte copy required)
  *  - 'cwd'      → { sessionId: string, cwd: string }
  *  - 'agent'    → { sessionId: string, event: AgentEvent }
  *  - 'notification' → { sessionId, event: TerminalNotification & { ts } }
@@ -89,8 +91,8 @@ export function scanStartupDa1(text: string): 'answer' | 'more' | 'closed' {
  *                 new size from the session's own meta.
  */
 export class DaemonPTYBridge extends EventEmitter {
-  private oscParser: OscParser | null = null;
-  private modeTracker: OutputModeTracker | null = null;
+  private outputInterpreter: OutputInterpreter | null = null;
+  private modeTracker: OutputModes | null = null;
   private agentDetector: AgentDetector | null = null;
   private activityMonitor: ActivityMonitor | null = null;
   private dataDisposable: (() => void) | null = null;
@@ -348,7 +350,7 @@ export class DaemonPTYBridge extends EventEmitter {
    * window that no longer contains the mode switches can still be replayed
    * faithfully — see util/outputModeTracker.ts.
    */
-  get outputModes(): OutputModeTracker | null {
+  get outputModes(): OutputModes | null {
     return this.modeTracker;
   }
 
@@ -1038,8 +1040,8 @@ export class DaemonPTYBridge extends EventEmitter {
     sessionId: string,
     promptLog?: PromptEventLog,
   ): void {
-    const oscParser = new OscParser();
-    this.oscParser = oscParser;
+    const interpreter = new OutputInterpreter((ptyProcess as TerminalPty).backend === 'rust' ? 'rust' : 'node');
+    this.outputInterpreter = interpreter;
 
     // Fed from the same place the ring is written, so the tracked modes always
     // describe exactly the bytes the ring holds.
@@ -1051,11 +1053,11 @@ export class DaemonPTYBridge extends EventEmitter {
     // started at power-on defaults here would report "no alt screen" for a pane
     // that has been inside vim since before the daemon restarted. One pass over
     // the ring, once per PTY lifetime.
-    const modeTracker = new OutputModeTracker();
+    const modeTracker = interpreter.modes;
     this.modeTracker = modeTracker;
     const prefilled = ringBuffer.readAll();
     if (prefilled.length > 0) {
-      modeTracker.feed(prefilled.toString('utf8'), ringBuffer.totalBytesWritten);
+      interpreter.seedModes(prefilled.toString('utf8'), ringBuffer.totalBytesWritten);
     }
 
     const agentDetector = new AgentDetector();
@@ -1178,7 +1180,7 @@ export class DaemonPTYBridge extends EventEmitter {
 
     // OSC events → cwd (OSC 7), prompt/command markers (OSC 133), and
     // desktop notifications (OSC 9/777/99)
-    oscParser.onOsc((event) => {
+    interpreter.onOsc((event) => {
       if (event.code === 0 || event.code === 2) {
         // OSC 0/2 window title (e.g. Claude Code `/rename`). OSC 1 (icon-only)
         // is ignored. Sanitized here so the daemon→main payload is already safe.
@@ -1263,13 +1265,23 @@ export class DaemonPTYBridge extends EventEmitter {
     let lastDetectedCwd = '';
     let promptBuffer = '';
 
-    const capture = (data: string, buf: Buffer): void => {
+    const capture = (data: string, buf?: Buffer, nativeChunk?: NativeOutputChunk): void => {
+      // Detached sessions need retention/analysis, but no JS byte copy. Snapshot
+      // tees and live clients subscribe to data and materialize exactly once.
+      let delivery = buf;
+      const forward = () => {
+        this.emit('outputActivity');
+        if (this.listenerCount('data') > 0) {
+          delivery ??= nativeChunk?.readBytes() ?? Buffer.from(data);
+          this.emit('data', delivery);
+        }
+      };
       try {
-        ringBuffer.write(buf);
+        if (nativeChunk) ringBuffer.writeNativeChunk(nativeChunk);
+        else ringBuffer.write(buf ?? Buffer.from(data));
         // AFTER the ring write: the tracker's offsets are in the ring's own
         // coordinate system, so it needs the counter this chunk already moved.
-        modeTracker.feed(data, ringBuffer.totalBytesWritten);
-        oscParser.process(data);
+        interpreter.feed(data, ringBuffer.totalBytesWritten, nativeChunk);
         // After the mode tracker and OSC 133 have seen this chunk (see noteCodexOutput).
         this.noteCodexOutput(data);
 
@@ -1292,24 +1304,25 @@ export class DaemonPTYBridge extends EventEmitter {
           }
         }
 
-        this.emit('data', buf);
+        forward();
         // Output on a pane blocked on a human may be the dialog closing (see
         // `clearAwaiting`); the daemon re-reads the screen off this.
         if (this.awaitingHuman) this.emit('awaitingActivity', { sessionId, cause: 'output' });
       } catch (err) {
         // Still forward raw data even if parsing failed
-        this.emit('data', buf);
+        forward();
       }
     };
     this.captureChunk = capture;
 
     // PTY data handler
-    const onDataDisposable = ptyProcess.onData((data: string) => {
+    const onOutput = (data: string, nativeChunk?: NativeOutputChunk) => {
       // Ahead of the mute check: a recovered session is muted at spawn, and
       // its startup query is exactly the one nobody else will answer.
       if (this.startupDa1) this.checkStartupDa1(data, ptyProcess);
 
-      const buf = Buffer.from(data);
+      const buf = nativeChunk ? undefined : Buffer.from(data);
+      const byteLength = nativeChunk ? nativeChunk.byteLength : (buf?.length ?? 0);
 
       // Byte activity is weaker than a detector/hook terminal edge. Process it
       // FIRST, so a waiting/complete pattern found in this same chunk is
@@ -1325,7 +1338,7 @@ export class DaemonPTYBridge extends EventEmitter {
       // names it directly instead of blocking every byte to be safe.
       if (!this.muted && (!this.explicitTerminalStatus || this.isInputQuiet())) {
         try {
-          activityMonitor.feed(sessionId, buf.length);
+          activityMonitor.feed(sessionId, byteLength);
         } catch {
           // activity heuristics must never block detection or data forwarding.
         }
@@ -1349,17 +1362,21 @@ export class DaemonPTYBridge extends EventEmitter {
       // at the geometry the renderer shows (#1464).
       if (this.muted) {
         if (this.heldWhileMuted && !this.heldFull) {
-          if (this.heldBytes + buf.length > DaemonPTYBridge.MAX_HELD_BYTES) {
+          if (this.heldBytes + byteLength > DaemonPTYBridge.MAX_HELD_BYTES) {
             this.heldFull = true;
           } else {
-            this.heldBytes += buf.length;
+            this.heldBytes += byteLength;
             this.heldWhileMuted.push(data);
           }
         }
         return;
       }
-      capture(data, buf);
-    });
+      capture(data, buf, nativeChunk);
+    };
+    const nativePty = ptyProcess as TerminalPty;
+    const onDataDisposable = nativePty.onNativeData
+      ? nativePty.onNativeData(chunk => onOutput(chunk.text, chunk))
+      : ptyProcess.onData(onOutput);
     this.dataDisposable = () => onDataDisposable.dispose();
 
     // PTY exit handler. Capture `signal` alongside exitCode: a clean shell
@@ -1564,7 +1581,8 @@ export class DaemonPTYBridge extends EventEmitter {
     this.lastTitle = '';
     this.lastTitleAt = 0;
     this.awaitingHuman = false;
-    this.oscParser = null;
+    this.outputInterpreter?.dispose();
+    this.outputInterpreter = null;
     this.modeTracker = null;
     this.agentDetector = null;
     this.activityMonitor = null;

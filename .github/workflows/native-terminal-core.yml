@@ -1,0 +1,97 @@
+name: Native terminal core
+on:
+  pull_request:
+    paths: ['core/wmux-term/**', 'src/daemon/**', 'src/shared/**', 'src/main/pty/**', 'src/main/ipc/handlers/*terminalCore*', 'src/renderer/components/Settings/**', 'bench/native-core-verify.ts', 'bench/native-interpreter-verify.ts', 'bench/fixtures/**', 'scripts/*native*', 'scripts/*rust*', 'scripts/__tests__/generateRustUnicode11.test.mjs', 'forge.config.ts', 'package.json', 'package-lock.json', '.github/workflows/native-terminal-core.yml']
+  workflow_dispatch:
+    inputs:
+      soak:
+        description: Run a four-hour PTY soak on each hosted OS
+        type: boolean
+        default: false
+jobs:
+  native-terminal:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-2022, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '>=24.21.0 <25'
+          cache: npm
+      - run: npm install -g npm@11
+      - run: npm ci
+      - name: Windows input baseline (diagnostic)
+        if: runner.os == 'Windows'
+        # Bound cleanup too: the diagnostic must not prevent native qualification
+        # or artifact retention if node-pty's ConPTY close itself blocks.
+        run: node -e "const r=require('node:child_process').spawnSync(process.execPath,['bench/fixtures/windows-input-control.cjs'],{stdio:'inherit',timeout:330000,killSignal:'SIGKILL'}); if(r.error) console.error(r.error.message);"
+      - name: Retain Windows input baseline
+        if: runner.os == 'Windows' && always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-input-control
+          path: |
+            out/windows-input-control.json
+            out/node-input-progress.json
+          if-no-files-found: ignore
+      - name: Generated Unicode table across checkout line endings
+        run: npx vitest run scripts/__tests__/generateRustUnicode11.test.mjs
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+      - name: Rust interpreter and grid unit tests
+        run: cargo test --manifest-path core/wmux-term/Cargo.toml --no-default-features --locked
+      - run: npm run test:terminal-core -- --report=native-terminal-report.json
+      - name: Electron main load and PTY
+        if: runner.os != 'Linux'
+        run: npx electron core/wmux-term/spike/native-transport-electron.cjs
+      - name: Electron main load and PTY (Linux)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a npx electron --no-sandbox core/wmux-term/spike/native-transport-electron.cjs
+      - name: Backend, snapshot, input and lifecycle contracts
+        run: npx vitest run src/shared/__tests__/terminalPty.test.ts src/shared/__tests__/terminalCoreSettings.test.ts src/daemon/__tests__/RingBuffer.test.ts src/daemon/__tests__/TextSnapshotBackend.test.ts src/daemon/__tests__/AnsiSnapshotBackend.test.ts src/daemon/__tests__/RustSnapshot.test.ts src/daemon/__tests__/DaemonPTYBridge.nativeOutput.test.ts src/daemon/__tests__/SessionPipe.inputBackpressure.test.ts src/main/pty/__tests__/PTYManager.wsl.test.ts src/main/ipc/handlers/__tests__/terminalCore.handler.test.ts src/renderer/components/Settings/__tests__/TerminalEngineSetting.test.tsx
+      - name: Output interpretation contracts
+        run: npx vitest run src/daemon/__tests__/OutputInterpreter.test.ts src/daemon/util/__tests__/outputModeTracker.test.ts src/main/pty/__tests__/OscParser.test.ts
+      - name: Retain native verification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-terminal-${{ matrix.os }}
+          path: |
+            native-terminal-report.json
+            out/native-soak-mismatch-*.json
+            out/native-input-progress.json
+          if-no-files-found: ignore
+  soak:
+    if: github.event_name == 'workflow_dispatch' && inputs.soak
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-2022, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    # This job is a four-hour screening run. The continuous eight-hour gate
+    # uses the documented local command; do not combine shorter runs as evidence.
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '>=24.21.0 <25'
+      - run: npm install -g npm@11
+      - run: npm ci
+      - run: rustup toolchain install stable --profile minimal
+      - run: npm run test:terminal-core -- --report=native-terminal-soak-report.json
+        env:
+          WMUX_NATIVE_SOAK_MS: '14400000'
+      - name: Retain soak evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-terminal-soak-${{ matrix.os }}
+          path: |
+            native-terminal-soak-report.json
+            out/native-soak-mismatch-*.json
+          if-no-files-found: ignore

@@ -1,3 +1,4 @@
+import { terminalCoreSelection } from '../shared/terminalCoreSettings';
 import { writeFile, rename, unlink } from 'node:fs/promises';
 import {
   readFileSync,
@@ -8,6 +9,7 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { loadNativeTerminalCore, reportNativeFallback, type NativeRingStorage, type NativeOutputChunk } from '../shared/nativeTerminalCore';
 
 // Pattern that identifies temporary buffer files produced by
 // dumpToFile / dumpToFileSyncAtomic. Recovery / dump-readers must skip
@@ -81,6 +83,9 @@ export interface ReplayGeometry {
 const MAX_GEOMETRY_MARKS = 256;
 
 export class RingBuffer {
+  private native?: NativeRingStorage;
+  private disposed = false;
+  readonly backend: 'node' | 'rust';
   private buffer: Buffer;
   private readonly capacity: number;  // logical ceiling — the max this ring will ever hold
   private physical: number;           // bytes currently allocated (<= capacity), grown on demand
@@ -89,13 +94,18 @@ export class RingBuffer {
   private totalWritten: number; // monotonic lifetime count (used as byte offset for PromptEventLog)
   private geometry: GeometryMark[] = []; // size changes, oldest first (see ReplayGeometry)
 
-  constructor(capacityBytes: number) {
+  constructor(capacityBytes: number, backend: 'node' | 'rust' = terminalCoreSelection() === 'rust' ? 'rust' : 'node') {
     if (capacityBytes <= 0 || !Number.isInteger(capacityBytes)) {
       throw new Error('capacityBytes must be a positive integer');
     }
     this.capacity = capacityBytes;
+    if (backend === 'rust') {
+      try { this.native = new (loadNativeTerminalCore('ring-v1').NativeRing)(capacityBytes); }
+      catch { reportNativeFallback('ring'); }
+    }
+    this.backend = this.native ? 'rust' : 'node';
     this.physical = Math.min(INITIAL_PHYSICAL_BYTES, capacityBytes);
-    this.buffer = Buffer.alloc(this.physical);
+    this.buffer = Buffer.alloc(this.native ? 0 : this.physical);
     this.writePos = 0;
     this.length = 0;
     this.totalWritten = 0;
@@ -116,13 +126,18 @@ export class RingBuffer {
     next = Math.min(next, this.capacity);
     if (next === this.physical) return;
 
-    const existing = this.readAll(); // oldest→newest, exactly `length` bytes
     const grown = Buffer.alloc(next);
-    existing.copy(grown, 0);
+    // Copy directly into the new allocation: readAll() would allocate and
+    // copy the entire history once more during every growth step.
+    const start = this.length < this.physical ? 0 : this.writePos;
+    const tailLength = Math.min(this.length, this.physical - start);
+    this.buffer.copy(grown, 0, start, start + tailLength);
+    if (tailLength < this.length) {
+      this.buffer.copy(grown, tailLength, 0, this.length - tailLength);
+    }
     this.buffer = grown;
     this.physical = next;
-    this.writePos = existing.length; // length < next, so no wrap
-    this.length = existing.length;
+    this.writePos = this.length; // length < next, so no wrap
   }
 
   /**
@@ -130,6 +145,8 @@ export class RingBuffer {
    * If data exceeds capacity, only the last `capacity` bytes are preserved.
    */
   write(data: Buffer): void {
+    if (this.disposed) throw new Error('Ring disposed');
+    if (this.native) { this.native.write(data); return; }
     const dataLen = data.length;
     if (dataLen === 0) return;
 
@@ -164,12 +181,32 @@ export class RingBuffer {
     this.length = Math.min(this.length + dataLen, this.physical);
   }
 
+  /** Retain a transport-owned chunk without sending its bytes back through JS. */
+  writeNativeChunk(chunk: NativeOutputChunk): void {
+    if (this.disposed) throw new Error('Ring disposed');
+    if (this.native?.writeChunk) this.native.writeChunk(chunk);
+    else this.write(chunk.readBytes());
+  }
+
   /**
    * Total bytes ever written to this buffer over its lifetime (monotonic).
    * Used by PromptEventLog as a stable offset even after the ring wraps.
    */
   get totalBytesWritten(): number {
+    if (this.native) return this.native.totalBytesWritten;
     return this.totalWritten;
+  }
+
+  /** Capture inside the shared snapshot slot; callers own the frozen copy. */
+  freezeNative() { return this.native?.freeze(); }
+
+  /** Release native storage on explicit session removal, independently of GC. */
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.native?.dispose();
+    this.buffer = Buffer.alloc(0); this.length = 0; this.physical = 0; this.writePos = 0;
+    this.geometry = [];
   }
 
   /**
@@ -177,6 +214,11 @@ export class RingBuffer {
    * on were produced at this size. Repeats of the current size are ignored.
    */
   noteGeometry(cols: number, rows: number): void {
+    if (this.disposed) throw new Error('Ring disposed');
+    if (this.native) {
+      if (cols > 0 && rows > 0) this.native.noteGeometry(cols, rows);
+      return;
+    }
     if (!(cols > 0 && rows > 0)) return;
     const last = this.geometry[this.geometry.length - 1];
     if (last && last.cols === cols && last.rows === rows) return;
@@ -196,6 +238,10 @@ export class RingBuffer {
    * ever recorded.
    */
   readAllWithGeometry(): { data: Buffer; geometry: ReplayGeometry | undefined; writtenAt: number } {
+    if (this.native) {
+      const snapshot = this.native.readAllWithGeometry();
+      return { ...snapshot, geometry: snapshot.geometry ?? undefined };
+    }
     const data = this.readAll();
     const writtenAt = this.totalWritten;
     this.pruneGeometry();
@@ -231,6 +277,7 @@ export class RingBuffer {
    * Returns a new Buffer copy; the internal buffer is not modified.
    */
   readAll(): Buffer {
+    if (this.native) return this.native.readAll();
     if (this.length === 0) {
       return Buffer.alloc(0);
     }
@@ -250,6 +297,8 @@ export class RingBuffer {
 
   /** Clear the buffer, resetting all pointers and zeroing sensitive data. */
   clear(): void {
+    if (this.disposed) throw new Error('Ring disposed');
+    if (this.native) { this.native.clear(); return; }
     this.buffer.fill(0);
     this.writePos = 0;
     this.length = 0;
@@ -260,6 +309,7 @@ export class RingBuffer {
 
   /** Number of bytes currently stored. */
   get size(): number {
+    if (this.native) return this.native.size;
     return this.length;
   }
 
@@ -270,11 +320,13 @@ export class RingBuffer {
 
   /** Bytes currently committed for backing storage (grows on demand toward the ceiling). */
   get allocatedBytes(): number {
+    if (this.native) return this.native.allocatedBytes;
     return this.physical;
   }
 
   /** Whether replay needs resize-aware parsing, without copying the byte buffer. */
   get hasGeometryChanges(): boolean {
+    if (this.native) return this.native.hasGeometryChanges;
     this.pruneGeometry();
     return this.geometry.length > 1;
   }
@@ -313,6 +365,9 @@ export class RingBuffer {
 
   /** The actual tmp-write + atomic-rename, run inside the per-path chain. */
   private async doDumpToFile(filePath: string): Promise<void> {
+    // A queued dump can outlive explicit session removal. Never replace a
+    // valid dump with the now-disposed ring's empty storage.
+    if (this.disposed) return;
     // Captured here (inside the chain) rather than at enqueue time: a slightly
     // fresher snapshot is never wrong for recovery, and the snapshotRunner's
     // dirty-tracking captures totalBytesWritten BEFORE calling us, so a fresher
@@ -361,6 +416,7 @@ export class RingBuffer {
    * the async path. Same tmp + rename invariants as {@link dumpToFile}.
    */
   dumpToFileSyncAtomic(filePath: string): void {
+    if (this.disposed) return;
     const data = this.readAll();
     const tmpPath = `${filePath}.tmp.${crypto.randomBytes(6).toString('hex')}`;
     try {

@@ -60,6 +60,85 @@ describe('WSL per-launch Claude integration', () => {
     expect(fs.readFileSync(path.join(dir, 'wsl', 'bin', 'claude'), 'utf8')).toContain('"$real" --settings "$WMUX_WSL_SETTINGS" ${WMUX_WSL_MCP_CONFIG:+--mcp-config="$WMUX_WSL_MCP_CONFIG"} "$@"');
   });
 
+  describe('account homes across the Windows/WSL boundary', () => {
+    function inject(env: Record<string, string>, wslAccountLoginEnvKey?: 'CLAUDE_CONFIG_DIR' | 'CODEX_HOME') {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-wsl-account-')); dirs.push(dir);
+      return buildWslInjection({
+        target: { distribution: 'Ubuntu', user: 'developer' }, cwd: '/home/developer',
+        env, integrationDir: dir, bashInit: '', mcpEntryPath: null, wslAccountLoginEnvKey,
+      });
+    }
+
+    it.each(['CODEX_HOME', 'CLAUDE_CONFIG_DIR'])('transports a selected Windows %s and translates its path', (key) => {
+      const home = "C:\\account profiles\\it's selected";
+      const env = { [key]: home, WSLENV: `MY_VAR/p:${key}/w` };
+      const injected = inject(env, key === 'CODEX_HOME' ? 'CODEX_HOME' : 'CLAUDE_CONFIG_DIR');
+      expect(injected.env[key]).toBe(home);
+      expect(injected.env.WSLENV.split(':')).toContain(`${key}/pu`);
+      expect(injected.env.WSLENV.split(':')).not.toContain(`${key}/w`);
+      expect(injected.env.WSLENV.split(':')).toContain('MY_VAR/p');
+      expect(env.WSLENV).toBe(`MY_VAR/p:${key}/w`);
+    });
+
+    it.each(['CODEX_HOME', 'CLAUDE_CONFIG_DIR'])('preserves an explicit Linux %s without path translation', (key) => {
+      const home = "/home/developer/account profiles/it's selected";
+      const injected = inject({ [key]: home, WSLENV: `${key}/p:OTHER/u` }, key === 'CODEX_HOME' ? 'CODEX_HOME' : 'CLAUDE_CONFIG_DIR');
+      expect(injected.env[key]).toBe(home);
+      expect(injected.env.WSLENV.split(':')).toContain(`${key}/u`);
+      expect(injected.env.WSLENV.split(':')).not.toContain(`${key}/p`);
+      expect(injected.env.WSLENV.split(':')).toContain('OTHER/u');
+    });
+
+    it.each(['D:/account profiles/selected', '\\\\server\\share\\selected', '//server/share/selected'])(
+      'translates the Windows path %s', (home) => {
+        expect(inject({ CODEX_HOME: home }, 'CODEX_HOME').env.WSLENV.split(':')).toContain('CODEX_HOME/pu');
+      },
+    );
+
+    it.each(['claude', 'codex'] as const)('keeps two %s logins on their selected accounts without transferring the other vendor', (vendor) => {
+      const first = inject({ CODEX_HOME: 'C:\\accounts\\one', CLAUDE_CONFIG_DIR: '/home/developer/claude-one' }, vendor === 'codex' ? 'CODEX_HOME' : 'CLAUDE_CONFIG_DIR');
+      const second = inject({ CODEX_HOME: 'C:\\accounts\\two', CLAUDE_CONFIG_DIR: '/home/developer/claude-two' }, vendor === 'codex' ? 'CODEX_HOME' : 'CLAUDE_CONFIG_DIR');
+      expect(first.env.CODEX_HOME).toBe('C:\\accounts\\one');
+      expect(second.env.CODEX_HOME).toBe('C:\\accounts\\two');
+      expect(first.env.CLAUDE_CONFIG_DIR).toBe('/home/developer/claude-one');
+      expect(second.env.CLAUDE_CONFIG_DIR).toBe('/home/developer/claude-two');
+      for (const launched of [first, second]) {
+        expect(launched.env.WSLENV.split(':')).toContain(vendor === 'codex' ? 'CODEX_HOME/pu' : 'CLAUDE_CONFIG_DIR/u');
+        expect(launched.env.WSLENV.split(':')).not.toContain(vendor === 'codex' ? 'CLAUDE_CONFIG_DIR/u' : 'CODEX_HOME/pu');
+      }
+    });
+
+    it.each<Record<string, string>>([{}, { CODEX_HOME: '', CLAUDE_CONFIG_DIR: '' }])('does not introduce absent or empty account homes', (env) => {
+      for (const vendor of ['claude', 'codex'] as const) {
+        const injected = inject(env, vendor === 'codex' ? 'CODEX_HOME' : 'CLAUDE_CONFIG_DIR');
+        expect(injected.env.WSLENV.split(':').some((entry) => ['CODEX_HOME', 'CLAUDE_CONFIG_DIR'].includes(entry.split('/')[0]))).toBe(false);
+      }
+    });
+
+    it.each(['C:\\accounts\\windows', '/home/developer/linux-profile'])(
+      'does not opt an ordinary pane into either account home (%s)', (home) => {
+        const env = { CODEX_HOME: home, CLAUDE_CONFIG_DIR: home, WSLENV: 'MY_VAR/p' };
+        const injected = inject(env);
+        expect(injected.env.WSLENV.split(':').some((entry) => /^(CODEX_HOME|CLAUDE_CONFIG_DIR)(\/|$)/.test(entry))).toBe(false);
+        expect(injected.env.CODEX_HOME).toBe(home);
+        expect(injected.env.CLAUDE_CONFIG_DIR).toBe(home);
+        expect(injected.env.WSLENV.split(':')).toContain('MY_VAR/p');
+        expect(env.WSLENV).toBe('MY_VAR/p');
+      },
+    );
+
+    it('retains a user-supplied account WSLENV entry without opting in another vendor', () => {
+      const injected = inject({ CODEX_HOME: 'C:\\accounts\\manual', CLAUDE_CONFIG_DIR: 'C:\\accounts\\inherited', WSLENV: 'CODEX_HOME/p:MY_VAR/u' });
+      expect(injected.env.WSLENV.split(':')).toContain('CODEX_HOME/p');
+      expect(injected.env.WSLENV.split(':').some((entry) => entry.startsWith('CLAUDE_CONFIG_DIR/'))).toBe(false);
+    });
+
+    it('ignores an unsupported account key from an untyped IPC caller', () => {
+      const injected = inject({ CODEX_HOME: 'C:\\accounts\\bound', OTHER_CONFIG_DIR: 'C:\\accounts\\other' }, 'OTHER_CONFIG_DIR' as 'CODEX_HOME');
+      expect(injected.env.WSLENV.split(':').some((entry) => /^(CODEX_HOME|OTHER_CONFIG_DIR)(\/|$)/.test(entry))).toBe(false);
+    });
+  });
+
   it('mounts the Windows wmux MCP server per launch, and skips it without a bundle', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-wsl-mcp-')); dirs.push(dir);
     const base = { target: { distribution: 'Ubuntu', user: 'developer' }, cwd: '/home/developer',

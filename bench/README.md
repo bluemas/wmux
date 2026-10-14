@@ -1,5 +1,25 @@
 # A1 Performance Bench
 
+For the combined opt-in Rust PTY/ring backend, packaging, runtime checks and
+remaining qualification gates, see [Rust terminal integration](rust-terminal-integration.md).
+
+For a cross-platform, isolated baseline of the production ring buffer and
+on-demand headless snapshot path, see [Terminal core baseline](terminal-core.md).
+This complements the packaged-app measurements below; it does not measure UI
+input latency or live PTYs.
+
+For real SDK bots, fan-out worker processes and post-response memory retention,
+see [Bot and worker memory measurement](bot-memory.md).
+
+For the opt-in Alacritty/portable-pty N-API prototype, measured text-snapshot
+speed and remaining compatibility blockers, see [Rust terminal core C experiment](rust-terminal-core.md).
+
+For the real-daemon RPC comparison with one and six synthetic PTY sessions,
+see [Rust daemon memory measurement](rust-daemon-memory.md).
+
+For the experimental text delivery flag, fallback policy and validation,
+see [Rust text backend](rust-text-backend.md).
+
 The A1 bench measures three things that users actually feel in wmux, captures
 them as a versioned JSON result, and gates regressions against a blessed
 baseline. Baselines are **descriptive measurements, never aspirational

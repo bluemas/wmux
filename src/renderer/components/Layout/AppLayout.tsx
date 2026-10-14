@@ -45,12 +45,10 @@ import OnboardingOverlay from '../Onboarding/OnboardingOverlay';
 import FirstRunWizard from '../FirstRunWizard';
 import KeyboardCheatSheet from '../KeyboardCheatSheet';
 import ToastContainer from '../Toast/ToastContainer';
-import MoaHqMissingNotice from '../Moa/MoaHqMissingNotice';
 import { HooksInstallPromptContainer } from '../Deck/HooksInstallPrompt';
 import FloatingPane from '../Terminal/FloatingPane';
 import SearchResultsPanel from '../Search/SearchResultsPanel';
-import ChannelDock from '../Channels/ChannelDock';
-import { useDockMode } from './dockLayout';
+import { useRoomSync } from '../../hooks/useRoomSync';
 import { ErrorBoundary } from '../ErrorBoundary';
 import { useKeyboard } from '../../hooks/useKeyboard';
 import { FocusManager } from './LayoutLogicMounts';
@@ -65,7 +63,6 @@ import AgentMentionPicker from '../Palette/AgentMentionPicker';
 import HandoffPopover from '../Git/HandoffPopover';
 import { useWorkspaceMirrorPush } from '../../hooks/useWorkspaceMirrorPush';
 import { usePrivateBrowserCleanup } from '../../hooks/usePrivateBrowserCleanup';
-import { useMoaSync } from '../../hooks/useMoaSync';
 import { useResizeGuard } from '../../hooks/useResizeGuard';
 import { useApprovalInboxBridge } from '../../hooks/useApprovalInboxBridge';
 import { useBrowserHelpBridge } from '../../hooks/useBrowserHelpBridge';
@@ -89,7 +86,8 @@ import { useIpc } from '../../hooks/useIpc';
 import type { SessionData, PaneLeaf, Pane, StashedPane, Surface, Workspace } from '../../../shared/types';
 import { FIRST_RUN_REOPEN_EVENT } from '../../../shared/firstRun';
 import { isFileDrag } from '../../../shared/dragDrop';
-import { persistColdFramesNow, terminalRegistry } from '../../hooks/useTerminal';
+import { terminalRegistry, watchColdFramePersistence } from '../../hooks/useTerminal';
+import { clearPersistedColdFrames, restoreColdFrames } from '../../terminal/coldFrame';
 import { resolvePtyIdsToClear } from '../../hooks/reconcileWithReQuery';
 import { runWithProgressTimeout } from '../../hooks/reconcileProgressTimeout';
 import { createLateReconcileOnConnect } from '../../hooks/lateReconcileOnConnect';
@@ -111,8 +109,6 @@ import {
 } from '../../../shared/ptyRecovery';
 import { isChatV2Covering } from '../ChatV2/coverage';
 import { overlayColors } from '../../utils/titlebarOverlay';
-import { dockShownOn } from './pagesBesideDock';
-import { selectDockOpen, selectMoaOn, useMoaDockGate } from './moaDockGate';
 
 interface ReconcilePtySession extends DeadPaneSessionSnapshot {
   id: string;
@@ -788,38 +784,10 @@ export default function AppLayout() {
   // theme (overlay colors) does — see useUiScaleSync below.
   useUiScaleSync(uiScale);
   const sidebarVisible = useStore((s) => s.sidebarVisible);
-  // The right panel renders only while Moa is on (moaDockGate); with Moa off
-  // the persisted open flag is kept but nothing is drawn.
-  const dockOpen = useStore(selectDockOpen);
-  useMoaDockGate();
+  useRoomSync();
   const sidebarPosition = useStore((s) => s.sidebarPosition);
-  // The dock never pushes the sheet past the window: when inline would leave
-  // the panes under their floor, it collapses and reopens as an overlay
-  // (dockLayout.ts). Re-opened when the window is wide enough again, if it
-  // was open when it collapsed.
   const sidebarWidth = useStore((s) => s.sidebarWidth);
-  const sidebarWidthPx = sidebarVisible ? sidebarWidth : 0;
-  // The file tree column takes its width from the panes too, so it counts
-  // toward the floor the inline dock must leave them.
   const fileTreeVisible = useStore((s) => s.fileTreeVisible);
-  const fileTreeWidth = useStore((s) => s.fileTreeWidth);
-  const [dockMode, shellRef] = useDockMode(sidebarWidthPx + (fileTreeVisible ? fileTreeWidth : 0));
-  const dockAutoCollapsed = useRef(false);
-  useEffect(() => {
-    const st = useStore.getState();
-    // With Moa off there is no panel to collapse or restore: leave its flag,
-    // and forget a collapse from before, so it cannot reopen the panel later.
-    if (!selectMoaOn(st)) { dockAutoCollapsed.current = false; return; }
-    if (dockMode === 'overlay' && st.channelDockVisible) {
-      dockAutoCollapsed.current = true;
-      st.setChannelDockVisible(false);
-    } else if (dockMode === 'inline' && dockAutoCollapsed.current) {
-      dockAutoCollapsed.current = false;
-      if (!st.channelDockVisible) st.setChannelDockVisible(true);
-    }
-    // Only a mode change collapses or restores; opening the overlay later
-    // must not be undone.
-  }, [dockMode]);
   const companyViewVisible = useStore((s) => s.companyViewVisible);
   const setCompanyViewVisible = useStore((s) => s.setCompanyViewVisible);
   // PERF (2026-07-13): AppLayout does NOT subscribe to the whole `workspaces`
@@ -843,7 +811,7 @@ export default function AppLayout() {
   const remoteRepairHostId = useStore((s) => s.remoteRepairHostId);
   const requestRemoteRepair = useStore((s) => s.requestRemoteRepair);
   // The rail page shown in the sheet. Anything but Workspaces covers the
-  // sidebar, panes and dock, which stay mounted and inert underneath.
+  // sidebar and the panes, which stay mounted and inert underneath.
   const fleetViewVisible = useStore((s) => s.fleetViewVisible);
   const appRoute = useStore((s) => s.appRoute);
   // TASK-2: render gates for the lazy overlays. Lift each component's own
@@ -941,7 +909,6 @@ export default function AppLayout() {
   useWorkspaceMirrorPush();
   // Wipe the private-tab session when the last private browser tab closes.
   usePrivateBrowserCleanup();
-  useMoaSync();
   // S-C2 Approval Inbox bridge: the SINGLE owner of permissionPrompt.onOpen /
   // onClosed (guard #2). Always-on (not gated on fleetViewVisible) so MCP
   // prompts accumulate in the store before the cockpit's Approvals tab opens.
@@ -1541,6 +1508,10 @@ export default function AppLayout() {
         // .buf files on the next launch. Done renderer-side so the daemon
         // contract stays simple and no extra RPC is needed.
         const restoreEnabled = useStore.getState().scrollbackRestoreEnabled !== false;
+        // The screens the previous run saved (coldFrame.ts), before any pane
+        // mounts; with restore off they are cleared instead of read.
+        if (restoreEnabled) restoreColdFrames();
+        else clearPersistedColdFrames();
         if (!restoreEnabled) {
           console.log('[AppLayout] scrollbackRestoreEnabled=false — clearing pty state for fresh start');
           clearAllPtyState();
@@ -1653,31 +1624,6 @@ export default function AppLayout() {
     return () => window.removeEventListener(FIRST_RUN_REOPEN_EVENT, handler);
   }, []);
 
-  // Sync the orchestrator full-power toggle to MAIN, which is the authority
-  // every brain-turn path consults (typed, scheduled, event-woken). Fires on
-  // change AND once after session hydration flips the persisted value in, so
-  // a restart restores the mode for autonomous turns without a typed command.
-  // Fire-and-forget: a failed sync leaves main on the safe default (raw).
-  const deckBrainFullPowerLive = useStore((s) => s.deckBrainFullPower);
-  useEffect(() => {
-    void window.electronAPI?.deck?.fullPowerSet?.(deckBrainFullPowerLive);
-  }, [deckBrainFullPowerLive]);
-
-  // Same main-authority sync for the brain vendor (BYOB M0).
-  const deckBrainVendorLive = useStore((s) => s.deckBrainVendor);
-  useEffect(() => {
-    void window.electronAPI?.deck?.brainVendorSet?.(deckBrainVendorLive);
-  }, [deckBrainVendorLive]);
-
-  // …and for the orchestrator model. The composer still rides it on each send,
-  // but that path does not exist for the terminal brain (no composer — the TUI
-  // is the input) and never covered scheduled / event-woken turns.
-  const deckBrainModelLive = useStore((s) => s.deckBrainModel);
-  const deckBrainEffortLive = useStore((s) => s.deckBrainEffort);
-  useEffect(() => {
-    void window.electronAPI?.deck?.modelSet?.(deckBrainModelLive, deckBrainEffortLive);
-  }, [deckBrainModelLive, deckBrainEffortLive]);
-
   // An upgrader may answer the update question in Settings › General before
   // the queue reaches the prompt: any change after hydration answers it.
   const autoUpdateEnabled = useStore((s) => s.autoUpdateEnabled);
@@ -1695,7 +1641,7 @@ export default function AppLayout() {
   // The wizard owns the first impression; after it, the legacy update
   // question (upgraders only), the one-time "New: …" toast (upgraders only),
   // the spotlight tour (first visit to the Fleet page) and the keyboard cheat
-  // sheet (once, after the tour) each wait until nothing else is open — no
+  // sheet (once, after the tour, on Fleet) each wait until nothing else is open — no
   // dialog, no Settings panel, no other queued surface. Each start is latched
   // here: the surface's own modal layer must not count against itself.
   const firstBootNext = nextFirstBootSurface({
@@ -2018,15 +1964,9 @@ export default function AppLayout() {
 
   // Each terminal's last screen, for the first reveal after a restart
   // (coldFrame.ts). On quit, and every minute for an exit that skips
-  // beforeunload (an installer update, a crash).
-  useEffect(() => {
-    window.addEventListener('beforeunload', persistColdFramesNow);
-    const id = window.setInterval(persistColdFramesNow, 60_000);
-    return () => {
-      window.removeEventListener('beforeunload', persistColdFramesNow);
-      window.clearInterval(id);
-    };
-  }, []);
+  // beforeunload (an installer update, a crash). Only while "Restore on
+  // launch" is on; turning it off clears the stored frames.
+  useEffect(() => watchColdFramePersistence(), []);
 
   // Periodic session save — protects against crashes.
   // Awaits scrollback dump completion before saving session.json to guarantee
@@ -2117,14 +2057,14 @@ export default function AppLayout() {
       }}
     >
       {/* Bridge redesign — custom 40px titlebar spans the FULL window width,
-          above the sidebar|main|dock row. The BrowserWindow is frameless
+          above the sidebar|main row. The BrowserWindow is frameless
           (titleBarStyle:'hidden'), so this bar owns window dragging. */}
       <ErrorBoundary name="Titlebar">
         <Titlebar />
       </ErrorBoundary>
       {/* The icon rail sits on the window frame beside the floating sheet and
           stays when the sidebar collapses (MiniSidebar `rail`); the sheet holds
-          the sidebar, the panes and the dock. */}
+          the sidebar and the panes. */}
       <div className={`wmux-frame-row flex flex-1 min-h-0 ${sidebarPosition === 'right' ? 'flex-row-reverse' : ''}`}>
       <ErrorBoundary name="PcRail">
         {/* Host roster, feeds and attention for the sidebar's PC switcher.
@@ -2137,7 +2077,7 @@ export default function AppLayout() {
       <ErrorBoundary name="SidebarRail">
         <MiniSidebar rail collapsed={!sidebarVisible} />
       </ErrorBoundary>
-      <div ref={shellRef} className={`wmux-shell-body relative flex flex-1 min-h-0 min-w-0 ${sidebarPosition === 'right' ? 'flex-row-reverse' : ''}`}>
+      <div className={`wmux-shell-body relative flex flex-1 min-h-0 min-w-0 ${sidebarPosition === 'right' ? 'flex-row-reverse' : ''}`}>
       {/* The Workspaces page. Another rail page covers it (RailPage) while it
           stays mounted, full size and inert, so no PTY is resized or lost. */}
       <div className="contents" inert={appRoute !== 'workspaces' && !inspectModeActive} data-workspaces-page>
@@ -2192,51 +2132,16 @@ export default function AppLayout() {
         </div>
       </div>
       </ErrorBoundary>
-      {/* A2A channel dock (Approach A). A flex sibling on the OPPOSITE edge
-          from the workspace sidebar — the root row's flex-row-reverse (when
-          the sidebar is docked right) puts this on the correct edge, so it
-          reflows the panes instead of the old fixed overlay that covered them.
-          Holds the channel list + active conversation; collapsible. */}
-      {/* Collapsed, the deck renders NOTHING here — the terminals take the
-          whole width. The way back is Moa's titlebar button; with Moa off
-          there is no panel at all (owner decision 2026-08-18, replacing the 36px glyph rail).
-          The rail spent a full-height column on four glyphs and an expand
-          chevron, ~85% of it empty; one button on a row that already exists
-          costs the terminals nothing. */}
       </div>
-      {/* The file tree column: Workspaces-page chrome between the panes and
-          Moa's dock, so a rail page (which stops at the dock) covers it with
-          the panes. */}
+      {/* Nothing docks opposite the sidebar (owner decision 2026-10-14: the
+          Bots page is the one place for bot conversations). The file tree
+          column is the only opt-in column on that edge: Workspaces-page
+          chrome, so a rail page covers it with the panes. */}
       <div className="contents" inert={appRoute !== 'workspaces' && !inspectModeActive} data-workspaces-page>
       {fileTreeVisible && (
         <ErrorBoundary name="FileTree">
           <FileTreePanel position={sidebarPosition === 'left' ? 'right' : 'left'} />
         </ErrorBoundary>
-      )}
-      </div>
-      {/* The dock stays interactive beside every rail page but Settings (they
-          cover only the sidebar and the panes, so Moa is in reach); Settings
-          covers it, inert, like the rest of the Workspaces page. Both dock
-          modes live in this region: `contents` keeps the inline dock the same
-          flex item it always was, and the overlay still positions against
-          the sheet. */}
-      <div className="contents" inert={!dockShownOn(appRoute) && !inspectModeActive} data-dock-region>
-      {dockOpen && dockMode === 'inline' && (
-        <ErrorBoundary name="ChannelDock">
-          <ChannelDock />
-        </ErrorBoundary>
-      )}
-      {/* Too narrow for the dock beside the panes: it floats over them on the
-          far edge instead, and never reflows a PTY. */}
-      {dockOpen && dockMode === 'overlay' && (
-        <div
-          data-dock-overlay
-          className={`absolute inset-y-0 z-30 flex max-w-full ${sidebarPosition === 'right' ? 'left-0' : 'right-0'}`}
-        >
-          <ErrorBoundary name="ChannelDock">
-            <ChannelDock />
-          </ErrorBoundary>
-        </div>
       )}
       </div>
       {/* Fleet, Schedules, Remote or Settings, swapped in by the rail. */}
@@ -2346,7 +2251,6 @@ export default function AppLayout() {
       )}
       <FloatingPane />
       <ToastContainer />
-      <MoaHqMissingNotice />
       <HooksInstallPromptContainer
         t={t}
         launchCheck={hooksLaunchCheck({ firstRunSettled: firstRunProbeSettled, firstRunWizardRanThisBoot })}

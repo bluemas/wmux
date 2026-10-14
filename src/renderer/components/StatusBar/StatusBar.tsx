@@ -9,10 +9,10 @@ import { selectActiveWorkspaceSummary } from '../../stores/selectors/workspacePr
 import { tokenAttrs } from '../../themes';
 import { HIT_TARGET_24 } from '../hitArea';
 import { IconGear, IconCornerUpLeft } from '../icons';
-import { selectFleetPanes, sortFleetPanes, selectFleetSectionCounts, fleetHqId, type FleetPane } from '../../stores/selectors/fleet';
+import { selectFleetPanes, sortFleetPanes, selectFleetSectionCounts, type FleetPane } from '../../stores/selectors/fleet';
+import { ownerFleetState, selectOwnerWorkspaces } from '../Sidebar/botTasks';
 import PluginStatusBarWidgets from '../../plugins/PluginStatusBarWidgets';
 import { COMPANY_MODE_ENABLED } from '../../../shared/featureFlags';
-import MoaTitlebarButton from '../Moa/MoaTitlebarButton';
 import FileTreeToggle from '../Titlebar/FileTreeToggle';
 import { FOCUS_RING } from '../focusRing';
 import type { StoreState } from '../../stores';
@@ -157,17 +157,15 @@ export default function StatusBar() {
   // re-render only when a count actually changes.
   const fleetVitals = useStore(
     useShallow((s) => {
-      // Moa's HQ is the main bot, not a worker: off the vitals as off Fleet.
-      const hqId = fleetHqId(s);
       const panes = selectFleetPanes({
-        workspaces: s.workspaces,
+        workspaces: selectOwnerWorkspaces(s),
         surfaceAgentStatus: s.surfaceAgentStatus,
         surfaceActivity: s.surfaceActivity,
         surfaceAgent: s.surfaceAgent,
         surfacePendingQuestion: s.surfacePendingQuestion,
         remoteWorkspaces: s.remoteWorkspaces,
         usageLimitWaiting: s.usageLimitWaiting,
-      }).filter((p) => isFleetAgentRow(p) && p.workspaceId !== hqId);
+      }).filter((p) => isFleetAgentRow(p));
       return {
         running: panes.filter((p) => p.agentStatus === 'running').length,
       };
@@ -176,21 +174,21 @@ export default function StatusBar() {
   // One Needs you count everywhere: the same rows the rail badge and Fleet's
   // chip count (selectFleetSectionCounts) — questions, errors, stopped
   // supervision and unconfirmed panes — so the three numbers never differ.
-  const needsYouCount = useStore((s) => selectFleetSectionCounts(s).needsYou);
+  // Bot workers are the Bots page's, never counted here (botTasks.ts).
+  const needsYouCount = useStore((s) => selectFleetSectionCounts(ownerFleetState(s)).needsYou);
   // Jump to the most urgent pane — computed at click time (no subscription).
   const jumpToUrgent = () => {
     const s = useStore.getState();
-    const hqId = fleetHqId(s);
     const panes = sortFleetPanes(
       selectFleetPanes({
-        workspaces: s.workspaces,
+        workspaces: selectOwnerWorkspaces(s),
         surfaceAgentStatus: s.surfaceAgentStatus,
         surfaceActivity: s.surfaceActivity,
         surfaceAgent: s.surfaceAgent,
         surfacePendingQuestion: s.surfacePendingQuestion,
         remoteWorkspaces: s.remoteWorkspaces,
         usageLimitWaiting: s.usageLimitWaiting,
-      }).filter((p) => isFleetAgentRow(p) && p.workspaceId !== hqId),
+      }).filter((p) => isFleetAgentRow(p)),
       'attention',
     );
     const target = panes[0];
@@ -333,13 +331,12 @@ export default function StatusBar() {
         <NotificationBellBadgeView unreadCount={unreadCount} onActivate={toggleNotificationPanel} />
         {/* A5: 메모리 + 시각(시계 커서 의존) — 분리된 소형 컴포넌트. */}
         <StatusClockTime />
-        {/* The titlebar's right end: the file tree toggle, then Moa's button
-            while Moa is on (the dock's only toggle), left of the Windows
-            window controls (the titlebar reserves their strip). Settings
-            lives in the rail's More menu. */}
+        {/* The titlebar's right end: the file tree toggle, left of the
+            Windows window controls (the titlebar reserves their strip).
+            Settings lives in the rail's More menu; bot conversations live on
+            the Bots page only (owner decision 2026-10-14). */}
         <span className="flex items-center gap-1">
           <FileTreeToggle />
-          <MoaTitlebarButton />
         </span>
       </div>
     </div>

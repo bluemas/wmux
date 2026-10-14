@@ -48,7 +48,9 @@ export const ATTACH_TAIL_SNAPSHOT_BUDGET_MS = 1500;
 export class SessionPipe {
   private server: net.Server | null = null;
   private client: net.Socket | null = null;
-  private inputCallback: ((data: Buffer) => void) | null = null;
+  private inputCallback: ((data: Buffer) => unknown) | null = null;
+  private pendingInput: Buffer | null = null;
+  private inputDrainDispose?: () => void;
   private flushed = false;
   private reflushInFlight = false;
   private socketPeakQueuedBytes = 0;
@@ -187,6 +189,7 @@ export class SessionPipe {
           socket.destroy();
           return;
         }
+        this.pendingInput = null;
         this.client = socket;
         this.flushed = false;
         this.handleClient(socket);
@@ -383,12 +386,46 @@ export class SessionPipe {
   }
 
   /** Register callback for client input (forwarded to PTY stdin). */
-  onInput(callback: (data: Buffer) => void): void {
+  onInput(callback: (data: Buffer) => unknown): void {
     this.inputCallback = callback;
+  }
+
+  /** Pause only the incoming stream; output and reconnect keep their contracts. */
+  setInputPaused(paused: boolean): void {
+    if (paused) { this.client?.pause(); return; }
+    if (this.pendingInput) {
+      const pending = this.pendingInput;
+      this.pendingInput = null;
+      this.forwardInput(pending);
+      if (this.pendingInput) return;
+    }
+    this.client?.resume();
+  }
+
+  private forwardInput(data: Buffer): void {
+    try {
+      if (this.inputCallback?.(data) === false) {
+        // A paused socket has at most one unread callback in flight. Keep its
+        // exact bytes for retry; do not acknowledge or drop a partial write.
+        if (this.pendingInput || data.length > 256 * 1024) throw new Error('PTY input retry capacity exceeded');
+        this.pendingInput = data;
+        this.client?.pause();
+      }
+    } catch (error) {
+      console.error('[SessionPipe] PTY input failed; closing input connection', error instanceof Error ? error.message : 'unknown error');
+      this.pendingInput = null;
+      this.client?.destroy();
+    }
+  }
+
+  setInputDrainSubscription(dispose: () => void): void {
+    this.inputDrainDispose?.(); this.inputDrainDispose = dispose;
   }
 
   /** Stop the session pipe and clean up. */
   async stop(): Promise<void> {
+    this.pendingInput = null;
+    this.inputDrainDispose?.(); this.inputDrainDispose = undefined;
     if (this.client) {
       this.client.destroy();
       this.client = null;
@@ -674,12 +711,10 @@ export class SessionPipe {
       // input is independent of output-flush state, and wiring it here means
       // keystrokes arriving while a large snapshot builds are never dropped.
       socket.on('data', (inputData: Buffer) => {
-        if (this.inputCallback) {
-          this.inputCallback(Buffer.isBuffer(inputData) ? inputData : Buffer.from(inputData));
-        }
+        this.forwardInput(Buffer.isBuffer(inputData) ? inputData : Buffer.from(inputData));
       });
       if (leftover.length > 0 && this.inputCallback) {
-        this.inputCallback(leftover);
+        this.forwardInput(leftover);
       }
 
       // Flush the ring buffer (snapshot path may await); errors fail open to
