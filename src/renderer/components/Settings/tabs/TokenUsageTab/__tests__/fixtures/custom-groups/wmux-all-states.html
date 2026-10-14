@@ -1,0 +1,119 @@
+<div class="flex flex-col gap-2 my-4" data-testid="token-custom-wmux-group">
+<div class="rounded-[12px] border border-[var(--border-soft)] bg-[var(--bg-surface)] overflow-hidden">
+<div class="flex items-center justify-between px-3 py-2 text-[13px] border-b border-[var(--border-soft)] bg-[var(--bg-surface)] flex-wrap gap-2">
+<button type="button" aria-expanded="true" class="flex items-center gap-2 cursor-pointer bg-transparent border-none p-0 text-left focus:outline-none" data-testid="token-custom-wmux-collapse-btn">
+<svg width="12" height="12" viewBox="0 0 12 12" fill="none" class="transition-transform duration-150 text-[var(--text-sub)] rotate-0" aria-hidden="true">
+<path d="M3 4.5L6 7.5L9 4.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+</path>
+</svg>
+<span class="font-medium text-[var(--text-main)]">wmux core tools</span>
+<span class="text-[11px] text-[var(--text-sub)]" data-testid="token-custom-wmux-count">5 of 8 enabled</span>
+<span class="ui-badge" data-tone="warning">2 staged</span>
+</button>
+<div class="flex items-center gap-1.5 flex-wrap">
+<button type="button" class="ui-btn ui-btn-secondary ui-btn-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--accent-blue)] focus-visible:ring-offset-1 focus-visible:ring-offset-[color:var(--bg-base)]" data-testid="wmux-preset-core">Core</button>
+<button type="button" class="ui-btn ui-btn-secondary ui-btn-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--accent-blue)] focus-visible:ring-offset-1 focus-visible:ring-offset-[color:var(--bg-base)]" data-testid="wmux-preset-planner">Planner</button>
+<button type="button" class="ui-btn ui-btn-secondary ui-btn-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--accent-blue)] focus-visible:ring-offset-1 focus-visible:ring-offset-[color:var(--bg-base)]" data-testid="wmux-preset-reviewer">Reviewer</button>
+<button type="button" class="ui-btn ui-btn-secondary ui-btn-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--accent-blue)] focus-visible:ring-offset-1 focus-visible:ring-offset-[color:var(--bg-base)]" data-testid="wmux-preset-none">None</button>
+<button type="button" class="ui-btn ui-btn-secondary ui-btn-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--accent-blue)] focus-visible:ring-offset-1 focus-visible:ring-offset-[color:var(--bg-base)]" data-testid="wmux-preset-all-core">All core</button>
+</div>
+</div>
+<div class="px-3 py-2 text-[12px] text-[var(--text-sub)] border-b border-[var(--border-soft)] bg-[var(--bg-mantle)]" data-testid="token-custom-wmux-note">Applies to every pane of this CLI; roles are still narrowed per pane at launch. browser_* and company_* tools are not listed here.</div>
+<div class="pl-6 pr-3 pb-2 pt-0 flex flex-col gap-1 divide-y divide-[var(--border-soft)]" data-testid="wmux-tools-list">
+<div class="flex items-center justify-between text-[11px] py-1 border-t border-[var(--border-soft)]" data-testid="mcp-tool-plain">
+<div class="flex items-center gap-2 flex-wrap">
+<span class="text-[var(--text-sub)]" aria-hidden="true">↳</span>
+<span class="ui-code text-[var(--text-main)]">plain</span>
+</div>
+<div class="flex items-center gap-2">
+<button aria-label="Toggle plain" data-testid="toggle-mcp-tool-plain" type="button" role="switch" aria-checked="true" class="ui-switch focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--accent-blue)] focus-visible:ring-offset-1 focus-visible:ring-offset-[color:var(--bg-base)]">
+<span class="ui-switch-knob" aria-hidden="true">
+</span>
+</button>
+</div>
+</div>
+<div class="flex items-center justify-between text-[11px] py-1 border-t border-[var(--border-soft)]" data-testid="mcp-tool-disabled">
+<div class="flex items-center gap-2 flex-wrap">
+<span class="text-[var(--text-sub)]" aria-hidden="true">↳</span>
+<span class="ui-code text-[var(--text-main)]">disabled</span>
+</div>
+<div class="flex items-center gap-2">
+<button aria-label="Toggle disabled" data-testid="toggle-mcp-tool-disabled" type="button" role="switch" aria-checked="false" class="ui-switch focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--accent-blue)] focus-visible:ring-offset-1 focus-visible:ring-offset-[color:var(--bg-base)]">
+<span class="ui-switch-knob" aria-hidden="true">
+</span>
+</button>
+</div>
+</div>
+<div class="flex items-center justify-between text-[11px] py-1 border-t border-[var(--border-soft)]" data-testid="mcp-tool-unknown-state">
+<div class="flex items-center gap-2 flex-wrap">
+<span class="text-[var(--text-sub)]" aria-hidden="true">↳</span>
+<span class="ui-code text-[var(--text-main)]">unknown-state</span>
+</div>
+<div class="flex items-center gap-2">
+<button aria-label="Toggle unknown-state" data-testid="toggle-mcp-tool-unknown-state" type="button" role="switch" aria-checked="true" class="ui-switch focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--accent-blue)] focus-visible:ring-offset-1 focus-visible:ring-offset-[color:var(--bg-base)]">
+<span class="ui-switch-knob" aria-hidden="true">
+</span>
+</button>
+</div>
+</div>
+<div class="flex items-center justify-between text-[11px] py-1 border-t border-[var(--border-soft)]" data-testid="mcp-tool-staged-off" data-staged="true">
+<div class="flex items-center gap-2 flex-wrap">
+<span class="text-[var(--text-sub)]" aria-hidden="true">↳</span>
+<span class="ui-code text-[var(--text-main)]">staged-off</span>
+<span class="ui-badge" data-tone="warning">staged</span>
+</div>
+<div class="flex items-center gap-2">
+<button aria-label="Toggle staged-off" data-testid="toggle-mcp-tool-staged-off" type="button" role="switch" aria-checked="false" class="ui-switch focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--accent-blue)] focus-visible:ring-offset-1 focus-visible:ring-offset-[color:var(--bg-base)]">
+<span class="ui-switch-knob" aria-hidden="true">
+</span>
+</button>
+</div>
+</div>
+<div class="flex items-center justify-between text-[11px] py-1 border-t border-[var(--border-soft)]" data-testid="mcp-tool-staged-on" data-staged="true">
+<div class="flex items-center gap-2 flex-wrap">
+<span class="text-[var(--text-sub)]" aria-hidden="true">↳</span>
+<span class="ui-code text-[var(--text-main)]">staged-on</span>
+<span class="ui-badge" data-tone="warning">staged</span>
+</div>
+<div class="flex items-center gap-2">
+<button aria-label="Toggle staged-on" data-testid="toggle-mcp-tool-staged-on" type="button" role="switch" aria-checked="true" class="ui-switch focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--accent-blue)] focus-visible:ring-offset-1 focus-visible:ring-offset-[color:var(--bg-base)]">
+<span class="ui-switch-knob" aria-hidden="true">
+</span>
+</button>
+</div>
+</div>
+<div class="flex items-center justify-between text-[11px] py-1 border-t border-[var(--border-soft)]" data-testid="mcp-tool-rejected">
+<div class="flex items-center gap-2 flex-wrap">
+<span class="text-[var(--text-sub)]" aria-hidden="true">↳</span>
+<span class="ui-code text-[var(--text-main)]">rejected</span>
+<span class="ui-badge" data-tone="danger">Already in the requested state.</span>
+</div>
+<div class="flex items-center gap-2">
+<button aria-label="Toggle rejected" data-testid="toggle-mcp-tool-rejected" type="button" role="switch" aria-checked="true" class="ui-switch focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--accent-blue)] focus-visible:ring-offset-1 focus-visible:ring-offset-[color:var(--bg-base)]">
+<span class="ui-switch-knob" aria-hidden="true">
+</span>
+</button>
+</div>
+</div>
+<div class="flex items-center justify-between text-[11px] py-1 border-t border-[var(--border-soft)]" data-testid="mcp-tool-read-only">
+<div class="flex items-center gap-2 flex-wrap">
+<span class="text-[var(--text-sub)]" aria-hidden="true">↳</span>
+<span class="ui-code text-[var(--text-main)]">read-only</span>
+<span class="text-[10px] text-[var(--text-sub)]">(Managed by policy)</span>
+</div>
+<div class="flex items-center gap-2">
+<span class="ui-badge" data-tone="success">Enabled</span>
+</div>
+</div>
+<div class="flex items-center justify-between text-[11px] py-1 border-t border-[var(--border-soft)]" data-testid="mcp-tool-read-only-off">
+<div class="flex items-center gap-2 flex-wrap">
+<span class="text-[var(--text-sub)]" aria-hidden="true">↳</span>
+<span class="ui-code text-[var(--text-main)]">read-only-off</span>
+</div>
+<div class="flex items-center gap-2">
+<span class="ui-badge" data-tone="neutral">Disabled</span>
+</div>
+</div>
+</div>
+</div>
+</div>

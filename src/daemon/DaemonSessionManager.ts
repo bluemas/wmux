@@ -1,10 +1,11 @@
-import { isWslShell, resolveWslCwd, type WslTarget, type ResolvedWslCwd } from '../shared/wsl';
+import { isWslShell, mergeWslEnv, resolveWslCwd, type WslTarget, type ResolvedWslCwd } from '../shared/wsl';
 import { buildWslInjection } from '../shared/wslIntegration';
 import { getWmuxDir } from './config';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import * as pty from 'node-pty';
 import type { IPty } from 'node-pty';
+import { spawnTerminalPty, ptyBackend, type TerminalPty } from '../shared/terminalPty';
 import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -22,6 +23,7 @@ import { buildExecArgs } from './execWrapper';
 import { dropMissingAccountDirs, pinAccountEnv } from './phone/paneAccountSpawn';
 import { windowsPowerShellPolicyArgs } from '../shared/pwshExecutionPolicy';
 import { buildSafeChildEnv, isNestingMarker } from '../shared/envFilter';
+import { sanitizeSecretEnv } from '../shared/botSecret';
 import { withoutExeSearchGuard } from '../shared/exeSearch';
 import { CLAUDE_SANDBOXED_ENV } from '../shared/agentFirstRun';
 import { isMac, parseWindowsBuildNumber } from '../shared/platform';
@@ -66,6 +68,19 @@ const RESERVED_PREFIX = /^WMUX_/i;
  * None of these can be an intentional user/profile key, so this cannot strip
  * one; CLAUDE_CONFIG_DIR and other CLAUDE_* config are untouched.
  */
+/**
+ * The spawn env of a worker that carries secrets: `env` plus the secrets, and
+ * for a WSL spawn each secret NAME appended to WSLENV with no path flag, so
+ * the distro sees the values verbatim. The user's own WSLENV entries stay.
+ * Only names go into WSLENV; values are never written anywhere but the
+ * process env. Exported for tests.
+ */
+export function withSecretEnv(env: Record<string, string>, secretEnv: Record<string, string>, wsl: boolean): Record<string, string> {
+  const out = { ...env, ...secretEnv };
+  if (wsl) out.WSLENV = mergeWslEnv(env.WSLENV, Object.keys(secretEnv));
+  return out;
+}
+
 function stripReservedSuppliedEnv(env: Record<string, string>): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(env)) {
@@ -341,6 +356,7 @@ export class DaemonSessionManager extends EventEmitter {
   }
 
   private spawnSession(params: {
+    wslAccountLoginEnvKey?: 'CLAUDE_CONFIG_DIR' | 'CODEX_HOME';
     id: string;
     /**
      * The command to run as the pane's root process. OPTIONAL: absent means
@@ -385,6 +401,16 @@ export class DaemonSessionManager extends EventEmitter {
      * meta.env) reproduce the exact create-time environment.
      */
     env?: Record<string, string>;
+    /**
+     * A bot worker's named secrets: added to the spawned process's
+     * environment ONLY — never to `meta.env`, so they are not persisted by
+     * buildState, not returned by a session read and not replayed by a
+     * recovery or a supervised restart (which never pass this). Validated
+     * again here (sanitizeSecretEnv). For a WSL shell each NAME is added to
+     * that spawn's WSLENV (no path flag, so values cross verbatim), again in
+     * the spawn env only.
+     */
+    secretEnv?: Record<string, string>;
     cols?: number;
     rows?: number;
     agent?: { role: string; teamId: string; displayName: string };
@@ -437,6 +463,8 @@ export class DaemonSessionManager extends EventEmitter {
     handoffFrom?: StoredHandoffFrom;
     /** Vendor of the account chosen for this phone pane (its directory is in `env`). */
     paneAccount?: { vendor: PaneAccountVendor };
+    /** Created through the web API: the longer detached retention applies. */
+    remoteDurable?: true;
     /**
      * X8 supervision policy + sticky status. Fresh creates pass
      * status:'armed'; recovery replays the persisted value so a
@@ -495,6 +523,14 @@ export class DaemonSessionManager extends EventEmitter {
     let cmd = this.resolveShellPath(params.cmd) || this.getDefaultShell();
     const cwd = wsl?.cwd ?? (params.cwd ? expandTilde(params.cwd) : os.homedir());
     const hostCwd = wsl ? os.homedir() : cwd;
+    // A bot worker's secrets: validated again here. A WSL spawn also names
+    // them in WSLENV (below), since the Windows env reaches the distro only
+    // through it.
+    let secretEnv: Record<string, string> | null = null;
+    if (params.secretEnv !== undefined) {
+      secretEnv = sanitizeSecretEnv(params.secretEnv);
+      if (!secretEnv) throw new Error('Invalid session secretEnv');
+    }
 
     // Resolve the child environment. A caller-supplied env is AUTHORITATIVE —
     // main already ran buildSafeChildEnv + the workspace-profile overlay +
@@ -577,6 +613,7 @@ export class DaemonSessionManager extends EventEmitter {
     if (wsl) {
       const injection = buildWslInjection({ target: wsl.target, cwd, env,
         integrationDir: getWmuxDir(), bashInit: BASH_INIT,
+        wslAccountLoginEnvKey: params.wslAccountLoginEnvKey,
         execCommand: params.exec ? (params.execLaunchCommand ?? params.exec.command) : undefined,
       });
       spawnArgs = injection.args;
@@ -656,15 +693,17 @@ export class DaemonSessionManager extends EventEmitter {
       // broken" report diagnosable — they say which backend actually started,
       // on every spawn, and name any demotion.
       ptyProcess = spawnWithConptyPolicy(
-        (useBundled) => pty.spawn(cmd, spawnArgs, {
+        (useBundled) => spawnTerminalPty(cmd, spawnArgs, {
           name: 'xterm-256color',
           cols,
           rows,
           cwd: hostCwd,
-          env,
+          // A worker's secrets reach the process only; meta.env below is
+          // `env` itself, without them (and without their WSLENV names).
+          env: secretEnv ? withSecretEnv(env, secretEnv, !!wsl || isWslShell(cmd)) : env,
           useConpty: true,
           ...(useBundled ? { useConptyDll: true } : {}),
-        }),
+        }, pty.spawn),
         useConptyDll,
         (level, message) => {
           const line = `[DaemonSessionManager] session ${params.id}: ${message}`;
@@ -729,6 +768,7 @@ export class DaemonSessionManager extends EventEmitter {
     }
     if (params.handoffFrom) meta.handoffFrom = { ...params.handoffFrom };
     if (params.paneAccount) meta.paneAccount = { vendor: params.paneAccount.vendor };
+    if (params.remoteDurable) meta.remoteDurable = true;
     if (params.supervision) {
       // Own copy — meta is persisted via buildState and must not alias
       // caller-held objects (recovery replays the persisted blob verbatim).
@@ -747,7 +787,7 @@ export class DaemonSessionManager extends EventEmitter {
     const bufferSize = this.config
       ? this.config.session.bufferSizeMb * 1024 * 1024
       : DEFAULT_BUFFER_SIZE;
-    const ringBuffer = new RingBuffer(bufferSize);
+    const ringBuffer = new RingBuffer(bufferSize, ptyBackend(ptyProcess));
     // Replays parse each stretch of the ring at the size it was written at.
     // Recovered scrollback below is assumed to be at the spawn size.
     ringBuffer.noteGeometry(cols, rows);
@@ -889,7 +929,7 @@ export class DaemonSessionManager extends EventEmitter {
       this.emit('session:title', payload);
     });
 
-    bridge.on('data', () => {
+    bridge.on('outputActivity', () => {
       meta.lastActivity = new Date().toISOString();
     });
 
@@ -1001,6 +1041,8 @@ export class DaemonSessionManager extends EventEmitter {
     } catch {
       /* already dead */
     }
+    (managed.ptyProcess as TerminalPty).dispose?.();
+    managed.ringBuffer.dispose();
     this.sessions.delete(id);
     this.emit('session:destroyed', { id });
   }
@@ -1021,6 +1063,7 @@ export class DaemonSessionManager extends EventEmitter {
     if (managed.meta.state !== 'dead') {
       throw new Error(`removeTombstone('${id}'): session is '${managed.meta.state}', not 'dead'`);
     }
+    managed.ringBuffer.dispose();
     this.sessions.delete(id);
     return true;
   }

@@ -19,6 +19,33 @@ afterEach(() => {
 });
 
 describe('RingBuffer', () => {
+  it('does not overwrite a persisted buffer after a queued ring is disposed', async () => {
+    const file = path.join(os.tmpdir(), `wmux-rb-dispose-${Date.now()}.bin`);
+    tempFiles.push(file); fs.writeFileSync(file, 'persisted');
+    const ring = new RingBuffer(1024, 'node'); ring.write(Buffer.from('queued'));
+    const pending = ring.dumpToFile(file); ring.dispose(); ring.dispose();
+    await pending; ring.dumpToFileSyncAtomic(file);
+    expect(fs.readFileSync(file, 'utf8')).toBe('persisted');
+    expect(ring.allocatedBytes).toBe(0); expect(() => ring.write(Buffer.from('late'))).toThrow('disposed');
+  });
+  it('matches a byte-history oracle through growth, exact fills and repeated wraps', () => {
+    const capacity = 300_001; // A non-power-of-two ceiling exercises the last growth.
+    const rb = new RingBuffer(capacity);
+    let expected = Buffer.alloc(0);
+    let written = 0;
+    for (const size of [65536, 1, 65535, 131072, 37857, 19, 400003, 70001]) {
+      const chunk = Buffer.alloc(size);
+      for (let i = 0; i < size; i++) chunk[i] = (written + i) % 251;
+      rb.write(chunk);
+      written += size;
+      expected = Buffer.concat([expected, chunk]).subarray(-capacity);
+      // Compare bytes directly; deep object equality walks every Buffer index.
+      expect(rb.readAll().equals(expected)).toBe(true);
+      expect(rb.totalBytesWritten).toBe(written);
+      expect(rb.size).toBe(expected.length);
+    }
+  });
+
   // 1. Basic write + readAll
   it('stores data and returns it via readAll', () => {
     const rb = new RingBuffer(16);

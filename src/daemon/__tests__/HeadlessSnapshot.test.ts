@@ -131,6 +131,21 @@ describe('HeadlessSnapshot — fidelity round-trips', () => {
     expect(res.payload.toString('utf8')).toContain('\x1b[?1006h');
   });
 
+  it('re-emits the SGR encoding when it shared a sequence with the tracking mode (#1843)', async () => {
+    // What the bundled OpenConsole writes when a console app (Codex on
+    // Windows) turns on mouse input.
+    const res = await generateSnapshot({
+      cols: 80,
+      rows: 24,
+      initial: Buffer.from('\x1b[?1049h\x1b[?1003;1006happ ready\r\n'),
+    });
+    expect(res.ok).toBe(true);
+    if (!res.ok) return;
+    const restored = await restoredTerminal(res.payload, 80, 24);
+    expect(restored.modes.mouseTrackingMode).toBe('any');
+    expect(res.payload.toString('utf8')).toContain('\x1b[?1006h');
+  });
+
   it('round-trips the alternate screen buffer, with the normal buffer behind it', async () => {
     const bytes = Buffer.from('shell history line\r\n\x1b[?1049h\x1b[H\x1b[2JFULL SCREEN FRAME\r\nrow two');
     const res = await generateSnapshot({ cols: 80, rows: 24, initial: bytes });

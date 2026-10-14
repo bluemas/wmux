@@ -1,3 +1,4 @@
+import { TerminalEngineSetting } from './TerminalEngineSetting';
 import { QuickCommandsSection } from './QuickCommandsSection';
 import { SecretHookSetting } from './SecretHookSetting';
 import { createContext, useContext, useEffect, useMemo, useRef, useState, useCallback, type ReactNode } from 'react';
@@ -5,7 +6,6 @@ import { BROWSER_BACKENDS, isBrowserBackend } from '../../../shared/browserBacke
 import { isWslShellPath } from '../../../shared/wslDistro';
 import type { ImagePasteMode } from '../../../shared/imagePaste';
 import { useShallow } from 'zustand/react/shallow';
-import { isMoaHqWorkspace } from '../../stores/slices/moaSlice';
 import { workspaceCloseRefusal } from '../Moa/moaHqGuard';
 import { useStore } from '../../stores';
 import { selectWorkspaceMuteRows } from '../../stores/selectors/workspaceProjections';
@@ -107,7 +107,7 @@ import './settings.css';
 import { SettingsSection, SettingRow, SettingNote } from './SettingsLayout';
 import { MAX_WORKSPACE_IDLE_DAYS, MIN_WORKSPACE_IDLE_DAYS } from '../../../shared/workspaceSettle';
 import { sendWorkspaceSettleIdleDays } from '../../hooks/useWorkspaceSettleBridge';
-import { TabMoa } from './MoaTab';
+import { FactoryTab } from './FactoryTab';
 import { matchesShortcutQuery } from './shortcutSearch';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -589,9 +589,7 @@ function ResetSection() {
   const { invoke: ipcInvoke } = useIpc();
 
   const handleReset = useCallback(async () => {
-    // Moa's HQ workspace is app-owned and survives a reset (the store refuses
-    // to remove it), so its sessions are left alone too.
-    const workspaces = useStore.getState().workspaces.filter((w) => !isMoaHqWorkspace(useStore.getState(), w.id));
+    const workspaces = useStore.getState().workspaces;
     // Add a fresh workspace first, so every old one passes the shared close
     // check (the operator always keeps one workspace of their own).
     addWorkspace('Workspace 1');
@@ -2062,6 +2060,7 @@ function TabTerminal() {
         </SettingRow>
       </SettingsSection>
       <SettingsSection title={t('settings.sectionPerformance')}>
+        <TerminalEngineSetting />
         <SettingRow id="retention" label={t('settings.hiddenPaneRetention')} description={t('settings.hiddenPaneRetentionDesc')}>
           <Toggle
             checked={hiddenPaneRetentionEnabled}
@@ -5339,7 +5338,7 @@ export default function SettingsPanel({ initialTab }: { initialTab?: string }) {
     notifications:        { label: t('settings.tabNotifications'), icon: <IconNotifications /> },
     'claude-integration': { label: t('settings.tabClaudeCode'),    icon: <IconClaude /> },
     accounts:             { label: t('settings.tabAccounts'),      icon: <IconUsers /> },
-    moa:                  { label: t('settings.tabMoa'),           icon: <IconAgents /> },
+    factory:              { label: t('settings.tabFactory'),       icon: <IconRobot /> },
     roles:                { label: t('settings.tabRoles'),         icon: <IconRobot /> },
     tokens:               { label: t('settings.tabTokens'),        icon: <IconAgents /> },
     browser:              { label: t('settings.tabBrowser'),       icon: <IconBrowser /> },
@@ -5526,7 +5525,7 @@ export default function SettingsPanel({ initialTab }: { initialTab?: string }) {
                     {activeTab === 'notifications'      && <TabNotifications />}
                     {activeTab === 'claude-integration' && <TabClaudeCode />}
                     {activeTab === 'accounts'           && <><AccountsSection /><AgyAccountsSection /></>}
-                    {activeTab === 'moa'                && <TabMoa registerDialog={registerOwnedDialog} />}
+                    {activeTab === 'factory'            && <FactoryTab />}
                     {activeTab === 'roles'              && <TabRoles />}
           {activeTab === 'tokens'             && <TokenUsageTab onOpenTab={setActiveTab} />}
                     {activeTab === 'browser'            && <TabBrowser />}

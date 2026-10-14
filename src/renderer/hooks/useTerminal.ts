@@ -83,7 +83,7 @@ import {
 } from '../terminal/terminalOutputScheduler';
 import { reconnectPtyWithRetry as reconnectPtyWithRetryImpl } from './reconnectPtyWithRetry';
 import { adoptTerminal, parkTerminal, restoreParkedViewport, type ParkedTerminal } from '../terminal/terminalPark';
-import { captureColdFrame, coldFrameFits, dropColdFrame, persistColdFrames, restoreColdFrames, splitTrailingEscape, takeColdFrame, WarmFrameSwap, FULL_RESET, REPAINT_BEGIN, REPAINT_END, type ColdFrame } from '../terminal/coldFrame';
+import { captureColdFrame, clearPersistedColdFrames, coldFrameFits, dropColdFrame, persistColdFrames, splitTrailingEscape, takeColdFrame, WarmFrameSwap, COLD_FRAME_MAX_ENTRIES, FULL_RESET, REPAINT_BEGIN, REPAINT_END, type ColdFrame } from '../terminal/coldFrame';
 
 // One detector for every pane in this renderer: the ESC-pair state is keyed by
 // ptyId, and a per-mount instance would lose a double-tap split across a remount.
@@ -98,15 +98,43 @@ const parkedKeyboardByTerminal = new WeakMap<Terminal, RemoteKeyboardState>();
 const terminalRegistry = new Map<string, Terminal>();
 export { terminalRegistry };
 
-// Frames the previous renderer saved (coldFrame.ts): a pane's first reveal
-// after a restart paints its last screen instead of sitting blank.
-restoreColdFrames();
+// When each pane was last revealed (epoch ms), so a save serializes only the
+// terminals the cache can keep instead of every live one.
+const lastShownAt = new Map<string, number>();
 
-/** Save every live terminal's screen with the cold-frame cache, for the next
- *  start. Daemon mode only: a local PTY does not survive the restart. */
+/** Save the screens of the most recently shown live terminals with the
+ *  cold-frame cache, for the next start (coldFrame.ts; read back at startup by
+ *  AppLayout). Daemon mode only: a local PTY does not survive the restart.
+ *  With "Restore on launch" off nothing is written, and stored frames go. */
 export function persistColdFramesNow(): void {
+  if (useStore.getState().scrollbackRestoreEnabled === false) {
+    clearPersistedColdFrames();
+    return;
+  }
   if (!isDaemonModeActive()) return;
-  persistColdFrames(terminalRegistry);
+  // Least recently shown first: persistColdFrames keeps the last entries.
+  const live = [...terminalRegistry]
+    .sort(([a], [b]) => (lastShownAt.get(a) ?? 0) - (lastShownAt.get(b) ?? 0))
+    .slice(-COLD_FRAME_MAX_ENTRIES);
+  persistColdFrames(live);
+}
+
+/** Save on quit and every minute (for an exit that skips beforeunload: an
+ *  installer update, a crash), and drop the stored frames as soon as
+ *  "Restore on launch" is turned off. Returns the teardown. */
+export function watchColdFramePersistence(): () => void {
+  window.addEventListener('beforeunload', persistColdFramesNow);
+  const id = window.setInterval(persistColdFramesNow, 60_000);
+  const unsubscribe = useStore.subscribe((state, prev) => {
+    if (prev.scrollbackRestoreEnabled !== false && state.scrollbackRestoreEnabled === false) {
+      clearPersistedColdFrames();
+    }
+  });
+  return () => {
+    window.removeEventListener('beforeunload', persistColdFramesNow);
+    window.clearInterval(id);
+    unsubscribe();
+  };
 }
 
 // Registration push channel. Restored terminals register only after their
@@ -213,6 +241,7 @@ const ptyExitDispatcher = createPtyDispatcher<number>((cb) =>
     // An exited PTY is never reattached, so its cold frame (if its pane was
     // unmounted) would only ever paint a dead screen. Dropped here because a
     // parked pane has no per-mount exit listener left to do it.
+    lastShownAt.delete(ptyId);
     dropColdFrame(ptyId);
     cb(ptyId, exitCode);
   }));
@@ -838,6 +867,9 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
   // Glyph-corruption repair scheduler (issue #166) — created by the main
   // effect, also poked by the visibility effect on regain.
   const glyphRepaintRef = useRef<GlyphRepaintScheduler | null>(null);
+  // Cold frame of a pane mounted hidden — set by the main effect, armed and
+  // painted by the visibility effect on the pane's first reveal.
+  const coldFrameRevealRef = useRef<{ arm: () => void; paint: () => void } | null>(null);
   const { ptyId, isVisible = true, scrollbackFile, onFirstData, onContextMenu, ownsComposeShortcut = false } = options;
   const ptyIdRef = useRef(ptyId);
   ptyIdRef.current = ptyId;
@@ -2760,6 +2792,11 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // A cold frame taken at mount whose width the first fit did not match yet
     // (see the paint below); null once painted, given up, or overtaken by output.
     let deferredColdFrame: ColdFrame | null = null;
+    // The deferred frame was taken at the first reveal of a dirty pane: the
+    // reveal resync, not warmSwap, swaps the replay in over it.
+    let deferredOverDirty = false;
+    // A flush marker reached this mount: too late to arm a frame at reveal.
+    let attachSettled = false;
     // Phase 3: settle an in-flight resync when its replay flush completes.
     // The reset goes FIRST, in the stream: the replay bytes were held in the
     // resync buffer (never handed to xterm), so nothing can parse between the
@@ -2962,7 +2999,11 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // empty frame (coldFrame.ts). Only after a real fit at the cached width:
     // a frame written at another width wraps (see coldFrameFits). Viewer
     // panes (fixedGeometry) mirror another pane's grid and are left alone.
-    const coldFrame = !adopted && !fixedGeometryRef.current && isDaemonModeActive()
+    // Taken only by a mount that can paint it now or defer it to a resize. A
+    // hidden mount (every background workspace at startup) has no fit and
+    // leaves it in the cache for its first reveal (coldFrameRevealRef below).
+    const coldFrameEligible = !adopted && !fixedGeometryRef.current && isDaemonModeActive();
+    const coldFrame = coldFrameEligible && initialFitRan
       ? takeColdFrame(ptyId)
       : null;
     const paintColdFrame = coldFrame !== null && initialFitRan && coldFrameFits(coldFrame, terminal.cols);
@@ -2981,20 +3022,49 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // match and paint it at the first resize to its width, unless PTY output
     // was routed to this mount first (revealFirstDataLogged) or the attach
     // settled (the flush listeners drop it).
-    deferredColdFrame = coldFrame !== null && !paintColdFrame && initialFitRan ? coldFrame : null;
-    const deferredColdFrameResize = deferredColdFrame ? terminal.onResize(({ cols }) => {
+    const paintDeferredColdFrame = (cols: number) => {
       const frame = deferredColdFrame;
-      if (!frame || revealFirstDataLogged || !coldFrameFits(frame, cols)) return;
+      if (!frame || !coldFrameFits(frame, cols)) return;
+      // Over a dirty pane, too late once the reveal resync settled or gave up
+      // (its replay owns the screen); elsewhere once output was routed here.
+      if (deferredOverDirty ? !resyncRef.current.pending : revealFirstDataLogged) return;
       deferredColdFrame = null;
       terminal.write(frame.frame);
-      warmSwap.painted();
+      // The resync's own RIS + 2026 hold swaps its replay in over the frame
+      // (completeResyncFromFlush).
+      if (!deferredOverDirty) warmSwap.painted();
       fireFirstData();
       revealTiming(ptyId, 'cold-frame-painted', `${cols}x${terminal.rows}`);
-    }) : null;
+    };
+    let deferredColdFrameResize: { dispose(): void } | null = null;
+    const deferColdFrame = (frame: ColdFrame, overDirty: boolean) => {
+      deferredColdFrame = frame;
+      deferredOverDirty = overDirty;
+      deferredColdFrameResize ??= terminal.onResize(({ cols }) => paintDeferredColdFrame(cols));
+    };
+    if (coldFrame !== null && !paintColdFrame && initialFitRan) deferColdFrame(coldFrame, false);
+    // First reveal of a pane mounted hidden: the workspace switch shows it
+    // without a remount, so the visibility effect takes its frame here and
+    // paints it after the reveal fit, like a frame the first fit missed.
+    let coldFrameAwaitsReveal = coldFrameEligible && !initialFitRan;
+    coldFrameRevealRef.current = {
+      arm: () => {
+        if (!coldFrameAwaitsReveal) return;
+        coldFrameAwaitsReveal = false;
+        // Taken either way: this mount owns the pane's screen from here. Only
+        // painted over a screen nothing real reached: a boot replay retained
+        // while hidden and discarded (dirty; the reveal resync repaints from
+        // RIS), or no output and no flush marker yet.
+        const frame = takeColdFrame(ptyId);
+        const dirty = isTerminalDirty(terminal);
+        if (frame && (dirty || (!revealFirstDataLogged && !attachSettled))) deferColdFrame(frame, dirty);
+      },
+      paint: () => paintDeferredColdFrame(terminal.cols),
+    };
     if (isVisibleRef.current) {
       if (!adopted) revealTimingT0.set(ptyId, performance.now());
       else revealTimingT0.delete(ptyId);
-      console.log(`[wmux:reveal-timing] ptyId=${ptyId} stage=mount +0.0ms mode=${adopted ? 'adopted' : 'fresh'} cachedFrame=${paintColdFrame ? 'yes' : coldFrame ? `${deferredColdFrame ? 'deferred' : 'skipped'}(${coldFrame.cols}x${coldFrame.rows}->${initialFitRan ? `${terminal.cols}x${terminal.rows}` : 'unfitted'})` : 'no'}`);
+      console.log(`[wmux:reveal-timing] ptyId=${ptyId} stage=mount +0.0ms mode=${adopted ? 'adopted' : 'fresh'} cachedFrame=${paintColdFrame ? 'yes' : coldFrame ? `deferred(${coldFrame.cols}x${coldFrame.rows}->${terminal.cols}x${terminal.rows})` : coldFrameAwaitsReveal ? 'unfitted' : 'no'}`);
     }
 
     // #1002: an adopted terminal carries its own buffer across the restructure,
@@ -3040,6 +3110,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         revealTiming(ptyId, 'flush-complete', `recoveredBytes=${recoveredBytes} swap=${warmSwap.phase}`);
         revealTimingT0.delete(ptyId);
         deferredColdFrame = null; // the attach is settled: too late for a cosmetic frame
+        attachSettled = true;
         if (completeResyncFromFlush(recoveredBytes)) return;
         // Cold-park reveal: close the swap opened in front of the replay
         // (or drop the cached frame when nothing was replayed).
@@ -3215,6 +3286,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         revealTiming(ptyId, 'flush-complete', `recoveredBytes=${recoveredBytes} swap=${warmSwap.phase}`);
         revealTimingT0.delete(ptyId);
         deferredColdFrame = null; // the attach is settled: too late for a cosmetic frame
+        attachSettled = true;
         if (completeResyncFromFlush(recoveredBytes)) return;
         // Cold-park reveal: close the swap opened in front of the replay
         // (or drop the cached frame when nothing was replayed).
@@ -3467,6 +3539,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       warmSwap.cancel();
       deferredColdFrameResize?.dispose();
       deferredColdFrame = null;
+      coldFrameRevealRef.current = null;
       revealTimingT0.delete(ptyId);
       // Drop any output still queued in the shared scheduler — the terminal
       // is being disposed, parsing the backlog would be wasted work and a
@@ -3715,7 +3788,11 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // has nothing valid to flush — re-synchronize the full screen from the
       // daemon instead. The stale frame stays up until the resync's reset +
       // replay lands (sub-second), which beats parsing a discarded backlog.
+      if (ptyIdRef.current) lastShownAt.set(ptyIdRef.current, Date.now());
       if (terminalRef.current) {
+        // A pane mounted hidden takes its cold frame now, before a dirty
+        // pane's resync starts below; painted after the fit.
+        coldFrameRevealRef.current?.arm();
         if (isTerminalDirty(terminalRef.current)) {
           void startResync('dirty-reveal');
         } else {
@@ -3762,6 +3839,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // can paint. It paints with the DOM renderer now and is upgraded from
       // webglUpgradeQueue once reveals settle, one pane per idle period.
       let cancelUpgrade: (() => void) | null = null;
+      let upgradeFitRaf: number | null = null;
       if (
         loadWebglRef.current &&
         disposeWebglRef.current &&
@@ -3773,7 +3851,19 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
           cancelUpgrade = webglUpgradeQueue.enqueue(() => {
             if (!isVisibleRef.current || !loadWebglRef.current || !disposeWebglRef.current) return;
             if (webglContextPool.acquireWouldEvict(token)) return;
+            const hadAddon = webglAddonRef.current !== null;
             webglContextPool.acquire(token, loadWebglRef.current, disposeWebglRef.current);
+            if (hadAddon || !webglAddonRef.current) return;
+            // The reveal's fit measured the DOM renderer's cell. WebGL rounds
+            // the cell down to whole device pixels, so at a fractional cell
+            // width the grid now holds too few columns (a blank strip, and a
+            // narrower PTY) until something refits. Refit through the same
+            // guard as the reveal: a live selection defers it, and a fit that
+            // lands on the same size sends nothing.
+            upgradeFitRaf = requestAnimationFrame(() => {
+              upgradeFitRaf = null;
+              if (claimFit(terminalRef.current, pendingFitRef)) fit();
+            });
           });
         }
       }
@@ -3795,10 +3885,13 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
           return;
         }
         fit();
+        // A fit that kept the width fires no resize to paint on.
+        coldFrameRevealRef.current?.paint();
       });
       return () => {
         cancelAnimationFrame(id);
         cancelUpgrade?.();
+        if (upgradeFitRaf !== null) cancelAnimationFrame(upgradeFitRaf);
       };
     }
     // Hidden: keep the WebGL context ("A hidden terminal KEEPS its WebGL

@@ -6,6 +6,7 @@ import { selectWorkspaceRailSummary } from '../../stores/selectors/workspaceProj
 import { formatStaleMinutes, selectAllWorkspaceAgentStatus, selectAllWorkspaceUnverifiableMinutes, selectWorkspaceAttentionClasses } from '../../stores/selectors/fleet';
 import { StatusMarkView } from './AgentMarks';
 import { useT } from '../../hooks/useT';
+import { useRemoteWorkspaceCreate } from './useRemoteWorkspaceCreate';
 import { AGENT_STATUS_ICON } from './agentStatusIcon';
 import { useGlanceBoardOrder } from './useGlanceBoardOrder';
 import { partitionWorkspaceSettle, workspaceSettleGroupOf } from './workspaceSettleGroups';
@@ -21,7 +22,8 @@ import RailMoreMenu from './RailMoreMenu';
 import { PcSwitcherRailItem } from './PcSwitcher';
 import { HostRailAvatars } from './HostWorkspaceList';
 import { LOCAL_PC_ID } from '../../../shared/pcRail';
-import { listedWorkspaces, moaHqId as selectMoaHqId } from '../Moa/moaHqGuard';
+import { listedWorkspaces } from '../Moa/moaHqGuard';
+import { selectBotTaskOwners, withoutBotTasks } from './botTasks';
 import { workspaceShortcutNumber } from '../../../shared/keymap';
 
 /** PresetPicker width (w-52), used to keep the flyout on-screen. */
@@ -44,14 +46,12 @@ export default function MiniSidebar({ rail = false, collapsed = true }: { rail?:
   // A1: 레일은 id/name + 에이전트 상태만 그린다 — 요약 투영만 구독해 cwd/git/
   // port 변경에는 리렌더되지 않게 한다.
   const allWorkspaces = useStore(useShallow(selectWorkspaceRailSummary));
-  // Moa's HQ is not one of the operator's workspaces: the rail lists (and
-  // numbers) the same rows as the full sidebar. It is reached from its own
-  // rail entry instead.
-  const moaHqId = useStore(selectMoaHqId);
   // PC rail: another computer's shadow workspaces are never rail avatars.
+  // Bot workers are the Bots page's (botTasks.ts), the active one too.
+  const botOwners = useStore(selectBotTaskOwners);
   const workspaces = useMemo(
-    () => listedWorkspaces(allWorkspaces, moaHqId),
-    [allWorkspaces, moaHqId],
+    () => withoutBotTasks(listedWorkspaces(allWorkspaces), botOwners),
+    [allWorkspaces, botOwners],
   );
   // Dot source (agent-status-dot fix): whole-workspace roll-up, same derivation
   // as WorkspaceItem — not the active-pane-only `ws.agentStatus` projection.
@@ -115,6 +115,8 @@ export default function MiniSidebar({ rail = false, collapsed = true }: { rail?:
     const id = s.pcRail.activePcId;
     return id !== LOCAL_PC_ID && s.pcRailHosts.some((h) => h.id === id) ? id : null;
   });
+  const remoteCreate = useRemoteWorkspaceCreate(railHostId);
+  const railHostLabel = useStore((s) => (railHostId ? s.pcRailHosts.find((h) => h.id === railHostId)?.label ?? '' : ''));
   // Arrow keys move between the rail's buttons; Tab still walks them in order.
   const onRailKeyDown = useCallback((e: KeyboardEvent<HTMLDivElement>) => {
     if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp' && e.key !== 'Home' && e.key !== 'End') return;
@@ -186,6 +188,21 @@ export default function MiniSidebar({ rail = false, collapsed = true }: { rail?:
         title={t('sidebar.newWorkspaceTooltip')}
         aria-label={t('sidebar.newWorkspaceTooltip')}
         data-onboarding-target="add-workspace"
+        {...tokenAttrs('textSub', 'text')}
+        {...tokenAttrs('success', 'accent')}
+        data-derived="textSubtle"
+      >
+        <IconPlus size={14} />
+      </button>}
+      {/* A paired computer that granted this desktop workspace creation: + opens one there. */}
+      {railHostId && remoteCreate.canCreate && <button
+        className={`flex items-center justify-center h-10 text-[var(--text-subtle)] hover:text-[var(--accent-green)] transition-colors duration-150 border-b border-[var(--bg-surface)] font-mono text-lg leading-none ${FOCUS_RING}`}
+        style={{ borderColor: 'var(--border-soft)' }}
+        onClick={remoteCreate.create}
+        disabled={remoteCreate.creating || !remoteCreate.online}
+        data-mini-add-remote-workspace
+        title={t('sidebar.newRemoteWorkspace', { name: railHostLabel })}
+        aria-label={t('sidebar.newRemoteWorkspace', { name: railHostLabel })}
         {...tokenAttrs('textSub', 'text')}
         {...tokenAttrs('success', 'accent')}
         data-derived="textSubtle"

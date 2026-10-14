@@ -21,6 +21,23 @@ import * as path from 'path';
 // runs with continue-on-error.
 const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf-8')) as { version: string };
 const SQUIRREL_SETUP_EXE = `wmux-${pkg.version}.Setup.exe`;
+const shipsTerminalCore = process.env.WMUX_PACKAGE_TERMINAL_CORE === '1';
+const TERMINAL_CORE_STAGE = './dist/wmux-native';
+if (shipsTerminalCore && !fs.existsSync(path.join(__dirname, TERMINAL_CORE_STAGE, 'manifest.json'))) {
+  throw new Error('Build the opt-in terminal module with node scripts/build-native-terminal.mjs before packaging');
+}
+// The release job writes the wmux-server manifest (scripts/build-server-artifact.mjs)
+// before packaging; it ships as resources/server-manifest.json so "Add PC over
+// SSH" knows each artifact's sha256 without fetching it from the release.
+// Local and dev builds have none and ship without it.
+const SERVER_MANIFEST_STAGE = './dist/server-manifest.json';
+const shipsServerManifest = fs.existsSync(path.join(__dirname, SERVER_MANIFEST_STAGE));
+if (shipsServerManifest) {
+  const serverVersion = JSON.parse(fs.readFileSync(path.join(__dirname, SERVER_MANIFEST_STAGE), 'utf-8')).version;
+  if (serverVersion !== pkg.version) {
+    throw new Error(`${SERVER_MANIFEST_STAGE} is for ${serverVersion}, not ${pkg.version}; delete it or rewrite it with scripts/build-server-artifact.mjs manifest`);
+  }
+}
 
 function copyDirSync(src: string, dest: string, skipFile?: (name: string) => boolean): void {
   fs.mkdirSync(dest, { recursive: true });
@@ -241,7 +258,7 @@ const config: ForgeConfig = {
     // targets the user's own claude install via pathToClaudeCodeExecutable).
     // ./dist/daemon-web ships as a sibling of daemon-bundle so the detached
     // daemon resolves terminal.html at `__dirname/../daemon-web` (wmux web).
-    extraResource: ['./dist/mcp-bundle', './dist/daemon-bundle', './dist/daemon-web', './dist/cli-bundle', './node_modules/@anthropic-ai/claude-agent-sdk', './assets/icon.ico', './assets/icon.icns', './assets/icon.png', './assets/trayTemplate.png', './assets/trayTemplate@2x.png', './LICENSE', './THIRD_PARTY_NOTICES', './src/main/pty/shell-hooks', ...(shipsComputerUseMac ? [COMPUTER_USE_MAC_STAGE] : []), ...(shipsComputerUseWin ? [COMPUTER_USE_WIN_STAGE] : [])],
+    extraResource: [...(shipsTerminalCore ? [TERMINAL_CORE_STAGE] : []), './dist/mcp-bundle', './dist/daemon-bundle', './dist/daemon-web', './dist/cli-bundle', './node_modules/@anthropic-ai/claude-agent-sdk', './assets/icon.ico', './assets/icon.icns', './assets/icon.png', './assets/trayTemplate.png', './assets/trayTemplate@2x.png', './LICENSE', './THIRD_PARTY_NOTICES', './src/main/pty/shell-hooks', ...(shipsComputerUseMac ? [COMPUTER_USE_MAC_STAGE] : []), ...(shipsComputerUseWin ? [COMPUTER_USE_WIN_STAGE] : []), ...(shipsServerManifest ? [SERVER_MANIFEST_STAGE] : [])],
     // macOS 서명/노타라이즈는 packagerConfig가 아니라 postPackage hook 끝에서
     // 수행한다(signMacAppIfConfigured 주석 참고). 여기서 서명하면 postPackage의
     // node-pty 복사가 서명을 깨뜨리기 때문이다.
@@ -302,6 +319,12 @@ const config: ForgeConfig = {
       const resourcesDir = appBundle
         ? path.join(outputPath, appBundle, 'Contents', 'Resources')
         : path.join(outputPath, 'resources');
+      if (shipsTerminalCore) {
+        // Check the actual copied resource before signing changes Mach-O bytes.
+        require('./scripts/verify-native-terminal-package.cjs').verifyIntegrity(
+          path.join(resourcesDir, 'wmux-native'), targetPlatform, targetArch,
+        );
+      }
       const asarPath = path.join(resourcesDir, 'app.asar');
       const tempDir = path.join(resourcesDir, '_app_tmp');
       const unpackedDir = asarPath + '.unpacked';
@@ -417,6 +440,20 @@ const config: ForgeConfig = {
       //    수행해야 서명이 깨지지 않는다. darwin이 아니거나 자격증명 없으면 no-op.
       if (appBundle) {
         await signMacAppIfConfigured(path.join(outputPath, appBundle));
+      }
+      if (shipsTerminalCore) {
+        // Use the same Electron-as-Node runtime as the detached daemon, after
+        // signing, and only the module/DLLs from this package. No running app or
+        // user settings are touched. A broken native option must fail the build.
+        const executable = appBundle
+          ? path.join(outputPath, appBundle, 'Contents', 'MacOS', 'wmux')
+          : path.join(outputPath, targetPlatform === 'win32' ? 'wmux.exe' : 'wmux');
+        require('node:child_process').execFileSync(executable, [
+          path.join(__dirname, 'scripts/verify-native-terminal-package.cjs'), resourcesDir,
+        ], {
+          cwd: outputPath, stdio: 'inherit', timeout: 30000,
+          env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+        });
       }
     },
 

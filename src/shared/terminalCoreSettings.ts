@@ -1,0 +1,79 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { assertNotLiveWmuxDataDir, dataSuffix } from './constants';
+import { writeJsonAtomic } from './settingsFile';
+import { loadNativeTerminalCore } from './nativeTerminalCore';
+
+export type TerminalEngine = 'node' | 'rust';
+export interface TerminalCoreRuntime {
+  requested: TerminalEngine;
+  effective: TerminalEngine;
+  rustAvailable: boolean;
+  environmentOverride: boolean;
+}
+export interface TerminalCoreSettings {
+  selected: TerminalEngine;
+  runtime: TerminalCoreRuntime | null;
+  rustAvailable: boolean;
+  environmentOverride: boolean;
+  restartRequired: boolean;
+  host: 'daemon' | 'app';
+  stopCommand: string;
+}
+
+export function terminalCoreSettingsPath(): string {
+  assertNotLiveWmuxDataDir(os.homedir());
+  return path.join(os.homedir(), `.wmux${dataSuffix()}`, 'terminal-core.json');
+}
+
+export function readTerminalEngine(file = terminalCoreSettingsPath()): TerminalEngine {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'))?.engine === 'rust' ? 'rust' : 'node';
+  } catch {
+    return 'node';
+  }
+}
+
+export function writeTerminalEngine(engine: unknown, file = terminalCoreSettingsPath()): void {
+  if (engine !== 'node' && engine !== 'rust') throw new Error('Invalid terminal engine');
+  writeJsonAtomic(file, { engine });
+}
+
+let startupEngine: TerminalEngine | undefined;
+/** Called at startup, after the instance suffix is set. Settings writes never
+ * change a live host's PTY, buffer or snapshot backend. Environment flags keep
+ * their explicit precedence and are not injected into child daemon launches. */
+export function terminalCoreSelection(): TerminalEngine {
+  startupEngine ??= readTerminalEngine();
+  const override = process.env.WMUX_TERMINAL_CORE;
+  return override !== undefined ? (override === 'rust' ? 'rust' : 'node') : startupEngine;
+}
+
+export function rustTerminalCoreAvailable(): boolean {
+  try {
+    loadNativeTerminalCore('pty-v1');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function terminalCoreRuntime(): TerminalCoreRuntime {
+  const requested = terminalCoreSelection();
+  const rustAvailable = rustTerminalCoreAvailable();
+  return {
+    requested,
+    effective: requested === 'rust' && rustAvailable ? 'rust' : 'node',
+    rustAvailable,
+    environmentOverride: process.env.WMUX_TERMINAL_CORE !== undefined,
+  };
+}
+
+/** Scope the manual stop to this instance, including an explicitly empty suffix. */
+export function terminalCoreStopCommand(): string {
+  const suffix = dataSuffix();
+  return process.platform === 'win32'
+    ? `$env:WMUX_DATA_SUFFIX='${suffix.replace(/'/g, "''")}'; wmux daemon stop`
+    : `WMUX_DATA_SUFFIX='${suffix.replace(/'/g, "'\"'\"'")}' wmux daemon stop`;
+}

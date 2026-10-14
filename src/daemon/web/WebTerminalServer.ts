@@ -110,6 +110,7 @@ import {
   type WebTlsConfig,
 } from '../../shared/web';
 import type { RemotePaneSummary, RemoteResumeInfo } from '../../shared/remoteHosts';
+import { HOST_CAPABILITIES, type HostCapability } from '../../shared/sshPcContract';
 import { agentDisplayToSlug } from '../../shared/agentIdentity';
 import { isWslShell } from '../../shared/imagePaste';
 import { normalizeResumeCwd, type ResumeBinding } from '../../shared/agentResume';
@@ -179,8 +180,11 @@ import {
   type WireResponse,
 } from './chatWire';
 import { MOA_WAKE_RETRY_AFTER, type MoaWakeService, type MoaWakeWire } from '../phone/MoaWakeService';
-import { MOA_WAKE_COMMAND } from '../../shared/moaWake';
+import { FACTORY_PHONE_MESSAGE_CAPABILITY, MOA_WAKE_COMMAND } from '../../shared/moaWake';
 import { FLEET_TICKET_ROUTE_PREFIX, fleetTicketDetailResponse, fleetTicketsFields } from './fleetTickets';
+import { factoryOn, moaConfigFields } from './factoryConfig';
+import { ROOMS_ROUTE, roomsResponse, roomsSupported } from './rooms';
+import { BOT_APPROVALS_ROUTE, botApprovalDecisionRefusal, botApprovalsResponse, botApprovalsSupported, type BotApprovalsCaller } from './botApprovals';
 import type { ChatV2Binding } from '../../shared/chatv2/ipc';
 import { buildWebCsp, WEB_APP_FONT_FILE } from './webCsp';
 // Type only — the channel service implementation stays out of this module.
@@ -440,12 +444,11 @@ export interface WebTerminalInfo {
    * Whether per-device credentials are armed, i.e. whether a device store was
    * wired in.
    *
-   * False means pairing still works but hands out the SHARED token exactly as
-   * 3.34.0 shipped it — not a downgrade from that release, but not the upgrade
-   * either, and critically there is nothing to revoke one device at a time. An
-   * operator who believes revocation is available when it is not would keep a
-   * lost phone's access alive while thinking they had cut it, so this is
-   * surfaced rather than left to a daemon log nobody reads.
+   * False means pairing is refused (`/api/pair` answers 503): without a
+   * roster there is nothing to revoke one device at a time, and handing out
+   * the SHARED token instead would give every paired device a credential only
+   * a full rotation can take back. Surfaced rather than left to a daemon log
+   * nobody reads.
    */
   deviceCredentials?: boolean;
   /**
@@ -492,7 +495,7 @@ export type DeviceAuthResult =
    * The daemon injects the real store here, which is where the two shapes are
    * checked against each other.
    */
-  | { ok: true; deviceId: string; name?: string; allowInput: boolean }
+  | { ok: true; deviceId: string; name?: string; allowInput: boolean; canCreateWorkspace?: true }
   | { ok: false; reason: 'unknown' | 'revoked' };
 
 /**
@@ -516,7 +519,7 @@ export type DeviceAuthResult =
  */
 export interface WebDeviceResolver {
   resolve(deviceId: string, secret: string): Promise<DeviceAuthResult> | DeviceAuthResult;
-  mint(params: { name?: string; allowInput?: boolean; kind?: DeviceKind }): Promise<{ deviceId: string; deviceSecret: string }>;
+  mint(params: { name?: string; allowInput?: boolean; kind?: DeviceKind; canCreateWorkspace?: boolean }): Promise<{ deviceId: string; deviceSecret: string }>;
   /**
    * Record a successful auth. Optional because it is bookkeeping, not
    * authorization: a store that does not track `lastSeenAt` is still a valid
@@ -638,7 +641,7 @@ export type WebPrincipal =
    * A paired device. `allowInput` is ITS grant, not the server's — the server
    * flag remains the ceiling and is applied on top by `mayInput`.
    */
-  | { kind: 'device'; deviceId: string; name?: string; allowInput: boolean };
+  | { kind: 'device'; deviceId: string; name?: string; allowInput: boolean; canCreateWorkspace?: true };
 
 /** Authenticated identity, or why the credential was refused. */
 type AuthOutcome = { ok: true; principal: WebPrincipal } | { ok: false; reason: 'unknown' | 'revoked' };
@@ -695,6 +698,8 @@ export interface WebSessionLifecycle {
     account?: ResolvedPaneAccount;
     /** Lineage to store on the new pane. */
     handoffFrom?: StoredHandoffFrom;
+    /** Name for a workspace this create starts. Ignored when a live pane already runs under `workspaceId`. */
+    workspaceName?: string;
   }): Promise<{ id: string }>;
   /** Close a pane and dispose its PTY. Called only for an id already resolved. */
   destroy(id: string): Promise<void>;
@@ -732,9 +737,9 @@ interface WebTerminalServerDeps {
   log: (level: 'info' | 'warn' | 'error', msg: string) => void;
   /**
    * Per-device credential store (M3). Optional, like `approvals`: a daemon that
-   * could not build one still serves every route on the operator token, and
-   * `/api/pair` degrades to the pre-M3 shared-token response with a warning
-   * rather than leaving the operator unable to pair anything at all.
+   * could not build one still serves every route on the operator token, but
+   * `/api/pair` refuses (503). Handing out the shared operator token instead
+   * would give a remote client a credential nobody can revoke per device.
    */
   devices?: WebDeviceResolver;
   /**
@@ -986,6 +991,9 @@ const MAX_UPLOAD_DIR_BYTES = 200 * 1024 * 1024;
  * from one phone, and caps the exposure at 40 MB.
  */
 const MAX_CONCURRENT_UPLOADS = 4;
+/** What `/api/config` advertises as `capabilities`. */
+const HOST_CAPABILITY_LIST: readonly HostCapability[] = Object.values(HOST_CAPABILITIES);
+
 /** Pairing code lifetime — long enough to walk to the phone, short enough to matter. */
 const PAIR_TTL_MS = 10 * 60 * 1000;
 /** Wrong-code attempts before the pairing code is burned. */
@@ -1608,6 +1616,13 @@ export class WebTerminalServer {
    */
   private pendingDeviceAllowInput = false;
   /**
+   * DEVICE_GRANT_CREATE_WORKSPACE for the device the CURRENT code will
+   * register. Decided by the operator at pairStart (the computer card only,
+   * and only when asked for), never by the redeeming request: its kind header
+   * is caller-written. Held, replaced and cleared with the name and grant above.
+   */
+  private pendingDeviceCanCreateWorkspace = false;
+  /**
    * Which card the pending name and grant belong to. Held, replaced and
    * cleared together with them, so a re-mint on expiry or a burned attempt
    * budget can never carry the phone card's name onto a computer link (or the
@@ -1846,6 +1861,7 @@ export class WebTerminalServer {
     this.pendingPairFlow = undefined;
     // AFTER `this.opts` is set — the default reads the flag from it.
     this.pendingDeviceAllowInput = this.defaultPendingGrant();
+    this.pendingDeviceCanCreateWorkspace = false;
     this.generatePairCode();
 
     // A malformed request or a client that drops mid-handshake must not crash
@@ -1870,6 +1886,7 @@ export class WebTerminalServer {
         this.pendingDeviceName = undefined;
         this.pendingPairFlow = undefined;
         this.pendingDeviceAllowInput = false;
+        this.pendingDeviceCanCreateWorkspace = false;
         reject(err);
       };
       const onListening = () => {
@@ -1967,6 +1984,7 @@ export class WebTerminalServer {
     this.pendingDeviceName = undefined;
     this.pendingPairFlow = undefined;
     this.pendingDeviceAllowInput = false;
+    this.pendingDeviceCanCreateWorkspace = false;
     // Capabilities against a server that is going away. Nothing to preserve.
     this.streamTickets.clear();
 
@@ -2078,9 +2096,11 @@ export class WebTerminalServer {
    * have minted anything.
    */
   startPairing(
-    params: { name?: string; allowInput?: boolean; flow?: PairFlow } = {},
+    params: { name?: string; allowInput?: boolean; flow?: PairFlow; grantCreateWorkspace?: boolean } = {},
   ): WebPairStartResult {
     if (!this.server) return { ok: false, error: 'the web server is not running — start it first' };
+    // Same refusal as /api/pair, said before the operator reads a code that cannot be redeemed.
+    if (!this.deps.devices) return { ok: false, error: 'pairing is unavailable — the device roster could not be loaded; check the daemon log' };
     const refusal = this.mintRefusal();
     if (refusal) return { ok: false, error: refusal };
     // A caller that predates flows is the phone card, which is all there was.
@@ -2103,6 +2123,9 @@ export class WebTerminalServer {
     // `false` stays false. Collapsing those two would either mute the GUI's
     // unticked box or mute every headless pairing.
     this.pendingDeviceAllowInput = params.allowInput ?? this.defaultPendingGrant();
+    // A phone never gets it, whatever the caller asked for; and a nameless
+    // pairing has no flow to hold it.
+    this.pendingDeviceCanCreateWorkspace = !!label && flow === 'computer' && params.grantCreateWorkspace === true;
     return { ok: true, code: this.pairCode, expiresAt: this.pairExpiresAt };
   }
 
@@ -2676,6 +2699,9 @@ export class WebTerminalServer {
         // Contract v-next item 1: `failure` on /turns, the session rows,
         // agent.liveness and history. Always, on every daemon that serves it.
         turnFailure: true,
+        // Host features gated per capability (sshPcContract), not by protocol
+        // version. Every one listed is implemented by this daemon and CLI.
+        capabilities: HOST_CAPABILITY_LIST,
         agentLaunch: this.mayInput(principal) && this.deps.agentLaunchOptions !== undefined,
         // Contract v-next item 4. OMITTED, not false: `paneAccount` needs both
         // grants and a desktop that announced the account command on this connection.
@@ -2750,29 +2776,39 @@ export class WebTerminalServer {
         // Moa (the desktop's HQ main bot) is on and its HQ workspace exists.
         // OMITTED, not false, otherwise — Moa off, no HQ, no desktop attached,
         // or an older desktop or daemon: the phone reads all of them as "no Moa".
-        ...(sidebar?.moa === true ? { moa: true } : {}),
-        // The Moa pane's session id, for its turns, chat and input routes.
-        // Only beside `moa` and only while main vouches for a live HQ brain
-        // TUI (see moaSession): omitted with Moa off, the HQ missing or
-        // changed, or before the brain's first turn has started its TUI.
-        ...(sidebar?.moa === true ? this.moaSessionIdField() : {}),
-        // `POST /api/moa/messages` can start Moa's brain: Moa on, no Moa pane
-        // yet, an attached desktop that announced `moa.wake`, and a caller
-        // the chat write gates admit. Omitted otherwise.
         //
-        // Where every one of those holds but the desktop says the HQ's agent
-        // mode is off, the wake would only end 409 `moa-mode-off`: serve
-        // `moaWakeBlocked` with that reason INSTEAD of `moaWake`, so the phone
-        // can say why rather than offer a send that fails. Never both.
-        ...(sidebar?.moa === true && this.moaSessionIdField().moaSessionId === undefined &&
-          this.deps.moaWake && this.availableDesktop()?.supports(MOA_WAKE_COMMAND) &&
-          this.chatWriteRefusal(principal) === null
-          ? (sidebar.moaWakeBlocked === 'moa-mode-off' ? { moaWakeBlocked: 'moa-mode-off' } : { moaWake: true })
-          : {}),
+        // `moaSessionId`: the Moa pane's session id, for its turns, chat and
+        // input routes. Only beside `moa` and only while main vouches for a
+        // live HQ brain TUI (see moaSession): omitted with Moa off, the HQ
+        // missing or changed, or before the brain's first turn has started
+        // its TUI.
+        //
+        // `moaWake`: `POST /api/moa/messages` can start Moa's brain: Moa on,
+        // no Moa pane yet, an attached desktop that announced `moa.wake`, and
+        // a caller the chat write gates admit. Omitted otherwise. Where every
+        // one of those holds but the desktop says the HQ's agent mode is off,
+        // the wake would only end 409 `moa-mode-off`: serve `moaWakeBlocked`
+        // with that reason INSTEAD of `moaWake`. Never both.
+        //
+        // With the desktop's agent factory on, Moa is its HQ bot and these
+        // keys follow the factory instead (`factory`, `rooms`; see
+        // factoryConfig.ts).
+        ...moaConfigFields({
+          sidebar,
+          legacySessionId: () => this.moaSessionIdField().moaSessionId,
+          writable: !!this.deps.moaWake && this.chatWriteRefusal(principal) === null,
+          supportsWake: this.availableDesktop()?.supports(MOA_WAKE_COMMAND) === true,
+          supportsFactory: this.availableDesktop()?.supports(FACTORY_PHONE_MESSAGE_CAPABILITY) === true,
+          roomsReadable: this.opts?.allowTranscript === true && roomsSupported(this.availableDesktop()),
+          roomsClient: clientCaps(req).roomsV1 === true,
+        }),
         // Phone channel Inbox (§9): the four `/api/channels*` routes answer
         // here. OMITTED, not false, exactly when they would answer 503
         // `channels-unavailable` — the shape a pre-channels daemon serves.
         ...(this.deps.channels ? { channels: true } : {}),
+        // `/api/bot-approvals/*` answer here: a desktop that announced both
+        // commands. OMITTED otherwise. A decision still needs the grant.
+        ...(botApprovalsSupported(this.availableDesktop()) ? { botApprovals: true } : {}),
         // Whether `/api/devices` answers here, and how much of the roster this
         // caller may see and act on (see handleDeviceList). OMITTED, not
         // false, when the device store cannot list, revoke and set grants —
@@ -2965,6 +3001,31 @@ export class WebTerminalServer {
     if (req.method === 'GET' && p.startsWith(FLEET_TICKET_ROUTE_PREFIX)) {
       void fleetTicketDetailResponse(p.slice(FLEET_TICKET_ROUTE_PREFIX.length), { allowTranscript: this.opts?.allowTranscript === true, desktop: this.availableDesktop() })
         .then(r => this.json(res,r.status,r.body,{'Cache-Control':'no-store'}));
+      return;
+    }
+    const roomsRoute = req.method === 'GET' ? ROOMS_ROUTE.exec(p) : null;
+    if (roomsRoute) {
+      void roomsResponse(roomsRoute[1], roomsRoute[2] as 'threads' | 'cards', url.searchParams, { allowTranscript: this.opts?.allowTranscript === true, desktop: this.availableDesktop() })
+        .then(r => this.json(res,r.status,r.body,{'Cache-Control':'no-store'}));
+      return;
+    }
+    // A bot's approval request: read by any caller, decided by the operator
+    // or a device with an explicit input grant (botApprovals.ts).
+    const botApprovalRoute = BOT_APPROVALS_ROUTE.exec(p);
+    if (botApprovalRoute && ((req.method === 'GET' && !botApprovalRoute[2]) || (req.method === 'POST' && botApprovalRoute[2]))) {
+      const caller = this.botApprovalsCaller(principal);
+      const readOnly = this.opts?.allowInput !== true;
+      const reauthorize = async () => {
+        const fresh = await this.authenticate(req,url,false).catch(() => ({ok:false as const}));
+        return fresh.ok && sameCaller(principal, fresh.principal) ? this.botApprovalsCaller(fresh.principal) : null;
+      };
+      const answer = (body: unknown) => void botApprovalsResponse(botApprovalRoute[1], botApprovalRoute[2] ? 'decision' : 'get', body, { caller, desktop: this.availableDesktop(), readOnly, reauthorize })
+        .then(r => this.json(res,r.status,r.body,{'Cache-Control':'no-store'}));
+      if (req.method === 'GET') { answer(undefined); return; }
+      // Refused before the body is read; checked again once it is in.
+      const refused = botApprovalDecisionRefusal(caller, readOnly);
+      if (refused) this.json(res,refused.status,refused.body,{'Cache-Control':'no-store'});
+      else this.readJsonBody(req,res,answer);
       return;
     }
     if ((req.method === 'GET' && p === '/api/desktop-workspaces') || (req.method === 'POST' && p === '/api/workspaces')) return this.handlePhoneWorkspaces(req,res,url,principal);
@@ -3654,8 +3715,12 @@ export class WebTerminalServer {
           if (!value && raw !== undefined) drops.report('sidebar.notSnapshot');
           this.warnDesktopSidebar(drops.summary());
           if (value) {
+            const wasFactory = factoryOn(this.desktopSidebarCache?.value ?? null);
             this.desktopSidebarCache = { at: this.now(), value };
             this.desktopSidebarFailedAt = 0;
+            // The `moa` event names no pane while the factory is on: a switch
+            // either way re-sends it.
+            if (factoryOn(value) !== wasFactory) this.emitMoaChanged();
           } else {
             // The desktop answered and has no sidebar to give (an older build,
             // or a renderer still starting): nothing to keep serving.
@@ -5433,6 +5498,22 @@ export class WebTerminalServer {
         // since gone away — replays; it never becomes a wake or a second send.
         const prior = this.moaPriorSend(owner, cmid, text);
         if (prior) return this.json(res, prior.status, prior.body);
+        // A desktop whose agent factory is on takes the message as a queued
+        // wake for its HQ bot (a room card answers it). Off: main says so,
+        // the receipt is released, and the Moa path below runs unchanged.
+        if (wake && this.availableDesktop()?.supports(FACTORY_PHONE_MESSAGE_CAPABILITY)) {
+          const queued = await wake.factoryMessage({
+            owner, clientMessageId: cmid, text, ...(caller.kind === 'device' ? { deviceId: caller.deviceId } : {}),
+          });
+          if (queued) {
+            if (caller.kind === 'device') {
+              try { this.deps.auditMoaSend?.({ deviceId: caller.deviceId, sessionId: 'moa-wake', route: 'wake' }); } catch { /* best-effort */ }
+            } else {
+              this.deps.log('info', '[web] Moa message queued for the factory by the operator');
+            }
+            return this.moaWire(res, queued);
+          }
+        }
         const sessionId = this.moaSessionIdField().moaSessionId;
         if (sessionId !== undefined) return this.moaDelegateSend(req, res, url, principal, caller, sessionId, cmid, text);
         if (!wake) return this.json(res, 503, { error: 'desktop-unavailable', clientMessageId: cmid });
@@ -5518,7 +5599,8 @@ export class WebTerminalServer {
     if (this.opts?.allowTranscript !== true) return this.refuseTranscript(res);
     const clientMessageId = decodePathSegment(rawMessageId) ?? '';
     const owner = chatOwner(principal);
-    const sessionId = this.moaSessionIdField().moaSessionId;
+    // With the factory on, Moa is a bot with no pane: no pane id rides along.
+    const sessionId = factoryOn(this.desktopSidebarCache?.value ?? null) ? undefined : this.moaSessionIdField().moaSessionId;
     const withPane = sessionId !== undefined ? { moaSessionId: sessionId } : {};
     const view = this.deps.moaWake?.().view(owner, clientMessageId) ?? null;
     if (view) {
@@ -5547,10 +5629,12 @@ export class WebTerminalServer {
    * every Moa pane push; it fires only when the resolved id changed.
    */
   emitMoaChanged(): void {
-    const sessionId = this.moaSessionIdField().moaSessionId ?? null;
+    const paneId = this.moaSessionIdField().moaSessionId ?? null;
+    if (paneId !== null) this.deps.moaWake?.().paneAppeared();
+    // With the factory on, Moa is a bot with no pane: the event names none.
+    const sessionId = factoryOn(this.desktopSidebarCache?.value ?? null) ? null : paneId;
     if (sessionId === this.lastMoaEventId) return;
     this.lastMoaEventId = sessionId;
-    if (sessionId !== null) this.deps.moaWake?.().paneAppeared();
     const body = JSON.stringify({ moaSessionId: sessionId });
     for (const client of this.eventClients) {
       try {
@@ -6702,8 +6786,15 @@ export class WebTerminalServer {
       if (!fresh.ok) return this.json(res,401,{error:'authorization-expired'});
       if (!this.mayInput(fresh.principal)) return this.refuseInput(res,fresh.principal,'Input permission changed');
       const caller = fresh.principal;
-      const b = (body ?? {}) as { workspaceId?: unknown; cwd?: unknown; agentLaunch?: unknown; accountId?: unknown; handoffFrom?: unknown };
+      const b = (body ?? {}) as { workspaceId?: unknown; cwd?: unknown; agentLaunch?: unknown; accountId?: unknown; handoffFrom?: unknown; workspaceName?: unknown };
       const workspaceId = typeof b.workspaceId === 'string' ? b.workspaceId.trim() : '';
+      // Additive: a name for a workspace this pane STARTS. A workspace any pane
+      // the daemon knows (live, suspended, dead or awaiting recovery) runs under
+      // keeps its name; the field never renames one.
+      const workspaceName = workspaceId && b.workspaceName !== undefined && !this.deps.sessionManager.listSessions()
+        .some((s) => s.env?.[ENV_KEYS.WORKSPACE_ID] === workspaceId)
+        ? newWorkspaceName(b.workspaceName)
+        : undefined;
       const cwd = typeof b.cwd === 'string' ? b.cwd.trim() : '';
       // Contract v-next item 4. The account list needs transcript access, so
       // naming one does too; checked before the shape so a caller without the
@@ -6770,6 +6861,7 @@ export class WebTerminalServer {
         .create({
           ...(workspaceId ? { workspaceId } : {}), ...(cwd ? { cwd } : {}), ...(agentLaunch ? {agentLaunch} : {}),
           ...(account ? { account } : {}), ...(handoffFrom ? { handoffFrom } : {}),
+          ...(workspaceName ? { workspaceName } : {}),
           authorized: stillAuthorized,
         })
         .then(({ id }) => {
@@ -6852,7 +6944,11 @@ export class WebTerminalServer {
    * that argument is about `mayInput`, which a device already has. The operator
    * is the thing that owns the workspace registry (the renderer mints and files
    * these ids today), so it is the thing allowed to extend it; a paired device
-   * still cannot claim an id nothing is running under. Stated limitation so
+   * still cannot claim an id nothing is running under — unless it holds
+   * DEVICE_GRANT_CREATE_WORKSPACE, which the operator gives a computer it
+   * pairs with `wmux web pair --kind desktop` so that computer can open new
+   * workspaces on a headless host. `caller` is the post-body re-authentication,
+   * so a revoked device has lost the grant by the time this runs. Stated limitation so
    * this is not mistaken for a hard boundary: it is an audit-and-revocability
    * one — a shell on the daemon's own host can already read the operator
    * token, and a phone-only headless bootstrap still needs that operator
@@ -6869,6 +6965,7 @@ export class WebTerminalServer {
       };
     }
     if (principal.kind === 'operator') return null;
+    if (principal.canCreateWorkspace === true) return null;
     const known = this.deps.sessionManager
       .listLiveSessions()
       .some((s) => s.env?.[ENV_KEYS.WORKSPACE_ID] === workspaceId);
@@ -9477,6 +9574,10 @@ export class WebTerminalServer {
     this.pairExpiresAt = Date.now() + PAIR_TTL_MS;
     this.pairAttempts = PAIR_MAX_ATTEMPTS;
     this.pairGeneration += 1;
+    // The workspace-create grant belongs to the ONE code pairStart returned:
+    // a refreshed or lazily re-minted code may be read off the GUI's phone card,
+    // so it never inherits it. startPairing sets it again after minting.
+    this.pendingDeviceCanCreateWorkspace = false;
     // Deliberately does NOT clear `pendingDeviceName`. A replacement minted
     // after a burned attempt budget is still the same operator pairing the same
     // device, so the name has to survive it — see the test that burns five
@@ -9541,13 +9642,16 @@ export class WebTerminalServer {
 
     const devices = this.deps.devices;
     if (!devices) {
-      // No identity core wired (a daemon that failed to build one). Falling
-      // back to the shared token keeps pairing possible instead of bricking it,
-      // but it is a real downgrade — per-device revocation does not exist on
-      // this server — so say so out loud rather than degrading silently.
-      this.deps.log('warn', '[web] pairing without a device store — issuing the shared operator token');
-      this.burnPairCode();
-      return this.json(res, 200, { token: this.token });
+      // No identity core wired (a daemon that failed to build one). Fail
+      // closed: the shared operator token is not revocable per device, and a
+      // remote pairing (an SSH-added PC) would hold it for good. 503 because
+      // this is the server's condition, not the caller's. The code is NOT
+      // burned, for the same reason as the transport refusal above.
+      this.deps.log('error', '[web] pairing refused — no device store on this server');
+      return this.json(res, 503, {
+        error: 'pairing-unavailable',
+        detail: 'this server has no device roster, so it cannot issue a revocable credential',
+      });
     }
 
     // Claim the slot BEFORE the await: the mint is async, and in that window
@@ -9560,6 +9664,7 @@ export class WebTerminalServer {
       attempts: this.pairAttempts,
       name: this.pendingDeviceName,
       allowInput: this.pendingDeviceAllowInput,
+      canCreateWorkspace: this.pendingDeviceCanCreateWorkspace,
       flow: this.pendingPairFlow,
       kind: this.redeemingDeviceKind(req),
     };
@@ -9568,7 +9673,10 @@ export class WebTerminalServer {
 
     let minted: { deviceId: string; deviceSecret: string };
     try {
-      minted = await devices.mint({ name: claimed.name, allowInput: claimed.allowInput, kind: claimed.kind });
+      minted = await devices.mint({
+        name: claimed.name, allowInput: claimed.allowInput, kind: claimed.kind,
+        ...(claimed.canCreateWorkspace ? { canCreateWorkspace: true } : {}),
+      });
     } catch (err) {
       // The roster could not be persisted. Do NOT fall back to the shared
       // token: a credential the daemon cannot remember is one the operator
@@ -9581,6 +9689,7 @@ export class WebTerminalServer {
         this.pairAttempts = claimed.attempts;
         this.pendingDeviceName = claimed.name;
         this.pendingDeviceAllowInput = claimed.allowInput;
+        this.pendingDeviceCanCreateWorkspace = claimed.canCreateWorkspace;
         this.pendingPairFlow = claimed.flow;
         this.pairGeneration += 1;
       }
@@ -9622,6 +9731,7 @@ export class WebTerminalServer {
     // Back to the server's default rather than to `false`: a redeemed code
     // must not leave the NEXT device on this host worse off than the first.
     this.pendingDeviceAllowInput = this.defaultPendingGrant();
+    this.pendingDeviceCanCreateWorkspace = false;
   }
 
   // --- helpers ------------------------------------------------------------
@@ -9759,6 +9869,7 @@ export class WebTerminalServer {
         deviceId: result.deviceId,
         ...(result.name ? { name: result.name } : {}),
         allowInput: result.allowInput,
+        ...(result.canCreateWorkspace === true ? { canCreateWorkspace: true as const } : {}),
       },
     };
   }
@@ -9795,6 +9906,15 @@ export class WebTerminalServer {
   private mayInput(principal: WebPrincipal): boolean {
     if (this.opts?.allowInput !== true) return false;
     return principal.kind === 'operator' || principal.allowInput;
+  }
+
+  /** A principal as the bot approval routes see it: a device's grant under
+   *  the ceiling and whether the roster holds one set explicitly. */
+  private botApprovalsCaller(principal: WebPrincipal): BotApprovalsCaller {
+    if (principal.kind === 'operator') return { kind: 'operator' };
+    let explicitInputGrant = false;
+    try { explicitInputGrant = this.deps.devices?.hasExplicitInputGrant?.(principal.deviceId) === true; } catch { explicitInputGrant = false; }
+    return { kind: 'device', deviceId: principal.deviceId, mayInput: this.mayInput(principal), explicitInputGrant };
   }
 
   /** The 403 for a caller the grant above refused, worded for whichever gate said no. */
@@ -10076,6 +10196,8 @@ function sidebarWorkspaceFields(
     ...(row.gitIsWorktree !== undefined ? { gitIsWorktree: row.gitIsWorktree } : {}),
     ...(row.gitSync !== undefined ? { gitSync: row.gitSync } : {}),
     ...(row.moaHandoff !== undefined ? { moaHandoff: row.moaHandoff } : {}),
+    ...(row.bots !== undefined ? { bots: row.bots } : {}),
+    ...(row.openQuestions !== undefined ? { openQuestions: row.openQuestions } : {}),
     ...(taskSummary !== undefined ? { taskSummary } : {}),
     ...(task
       ? {
@@ -10108,6 +10230,28 @@ function hqRole(sidebar: PhoneSidebarSnapshot | null, workspaceId: unknown): { r
 /** A pane's extracted scrollback is current while nothing was written and the geometry held. */
 function scrollbackKey(managed: ManagedSession): string {
   return `${managed.meta.incarnationId ?? ''}\0${managed.ringBuffer.totalBytesWritten}\0${managed.meta.cols}x${managed.meta.rows}`;
+}
+
+/** Longest workspace name a create may set: the remote rename's own cap (RemoteWorkspaceItem). */
+export const MAX_NEW_WORKSPACE_NAME_CHARS = 64;
+
+// C0/C1 controls, DEL, the Unicode line/paragraph separators, zero-width and
+// directional marks, and the bidi embedding/override/isolate characters: the
+// set cleanRemoteText strips from remote display text, plus U+200B–U+200F.
+// eslint-disable-next-line no-control-regex
+const WORKSPACE_NAME_CONTROLS = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g;
+
+/**
+ * POST /api/sessions `workspaceName`: control and invisible formatting
+ * characters removed (it becomes WMUX_WORKSPACE_NAME in the child's env and a
+ * sidebar label), trimmed, and cut to MAX_NEW_WORKSPACE_NAME_CHARS code
+ * points. Anything else is no name.
+ */
+export function newWorkspaceName(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const clean = value.replace(WORKSPACE_NAME_CONTROLS, '').trim();
+  const name = Array.from(clean).slice(0, MAX_NEW_WORKSPACE_NAME_CHARS).join('').trim();
+  return name || undefined;
 }
 
 /** The pane's workspace id from its spawn env, bounded like every id on the wire. */
@@ -10219,6 +10363,8 @@ export interface ClientCaps {
   chatCancel?: boolean;
   /** Uses the daemon-held chat queue: a send carrying it is queued during a turn; `/turns` adds `chat.turn` and `chat.queue`. */
   chatQueue?: boolean;
+  /** Reads Moa's replies as room cards (`/api/rooms`): with the agent factory on, `/api/config` offers `moaWake` only to such a client. */
+  roomsV1?: boolean;
 }
 
 export const CLIENT_CAPS_HEADER = 'x-wmux-client-caps';
@@ -10227,6 +10373,7 @@ export const CLIENT_CAP_TERMINAL_PROMPT_DECLINE = 'terminal-prompt-decline';
 export const CLIENT_CAP_DECISION_V2 = 'decision-v2';
 export const CLIENT_CAP_CHAT_CANCEL = 'chat-cancel';
 export const CLIENT_CAP_CHAT_QUEUE = 'chat-queue';
+export const CLIENT_CAP_ROOMS_V1 = 'rooms-v1';
 
 export function clientCaps(req: http.IncomingMessage): ClientCaps {
   const raw = req.headers[CLIENT_CAPS_HEADER];
@@ -10238,6 +10385,7 @@ export function clientCaps(req: http.IncomingMessage): ClientCaps {
     decisionV2: tokens.has(CLIENT_CAP_DECISION_V2),
     chatCancel: tokens.has(CLIENT_CAP_CHAT_CANCEL),
     chatQueue: tokens.has(CLIENT_CAP_CHAT_QUEUE),
+    roomsV1: tokens.has(CLIENT_CAP_ROOMS_V1),
   };
 }
 

@@ -17,10 +17,12 @@
 //   node scripts/control-wmux.mjs hover (same targets as click)   (reveals hover-only controls)
 //   node scripts/control-wmux.mjs press --key Meta+Comma [--testid ID to focus first]
 //   node scripts/control-wmux.mjs type --text "echo hi" [--label "Terminal input" to focus first]
+//   node scripts/control-wmux.mjs select --label "Terminal engine" --value rust
 //   node scripts/control-wmux.mjs eval --js "<read-only expression>"   (alias: inspect)
 //   node scripts/control-wmux.mjs wait-settle [--testid ID|--label ARIA|--selector CSS] [--state visible|hidden] [--quiet ms] [--timeout ms]
 //   node scripts/control-wmux.mjs console [--errors] [--tail N]
 //   node scripts/control-wmux.mjs stop [--purge]
+//   node scripts/control-wmux.mjs restart  (app only; keep its daemon and sessions)
 import { spawn, spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -251,7 +253,7 @@ async function cdpScreenshot(page, timeoutMs = 8000) {
 }
 
 // ---------------------------------------------------------------- commands
-async function cmdLaunch(opts) {
+async function cmdLaunch(opts, reconnectState = null) {
   const existing = readState();
   if (existing && pidAlive(existing.pid)) {
     fail(`an instance launched by this driver is still running (pid ${existing.pid}, suffix ${existing.suffix}); run \`stop\` first`);
@@ -265,10 +267,12 @@ async function cmdLaunch(opts) {
   const home = os.homedir();
   const sock = path.join(home, `.wmux${suffix}.sock`);
   const daemonPid = readPidFile(path.join(home, `.wmux${suffix}`, 'daemon.pid'));
-  if (fs.existsSync(sock) || pidAlive(daemonPid)) {
+  const ownedReconnect = reconnectState && reconnectState.suffix === suffix && reconnectState.app === app
+    && daemonPid && pidAlive(daemonPid) && envHasSuffix(processEnvText(daemonPid), suffix);
+  if ((fs.existsSync(sock) || pidAlive(daemonPid)) && !ownedReconnect) {
     fail(`suffix ${suffix} already has a live socket or daemon (${sock}); pick another --suffix — refusing to share someone else's instance`);
   }
-  const preExisting = suffixedPaths(home, suffix).filter((p) => fs.existsSync(p));
+  const preExisting = reconnectState?.preExisting ?? suffixedPaths(home, suffix).filter((p) => fs.existsSync(p));
 
   const runId = `${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}${suffix}`;
   const state = { runId, suffix, app, pid: null, cdpPort: null, startedAt: new Date().toISOString(), preExisting };
@@ -471,6 +475,18 @@ async function cmdType(opts) {
   });
 }
 
+async function cmdSelect(opts) {
+  const state = requireState();
+  if (typeof opts.value !== 'string') fail('select needs --value "<option value>"');
+  return withPage(state, async (page) => {
+    const loc = locatorFor(page, opts);
+    if (!loc) fail('select needs --testid, --label, --role [--name] or --selector');
+    const selected = await loc.selectOption(opts.value, { timeout: Number(opts.timeout || 5000) });
+    timeline(state, { cmd: 'select', target: describeTarget(opts), selected });
+    return { ok: true, selected };
+  });
+}
+
 async function cmdEval(opts) {
   const state = requireState();
   if (!opts.js || opts.js === true) fail('eval needs --js "<expression>" (read-only inspection; never use it to put the app into a state)');
@@ -568,6 +584,20 @@ async function waitDead(pid, ms) {
   return !pidAlive(pid);
 }
 
+async function cmdRestart(opts) {
+  const state = requireState();
+  const daemonPid = readPidFile(path.join(os.homedir(), `.wmux${state.suffix}`, 'daemon.pid'));
+  if (!daemonPid || !pidAlive(daemonPid) || !envHasSuffix(processEnvText(daemonPid), state.suffix)) {
+    fail('restart needs a live daemon owned by the recorded isolated instance');
+  }
+  // Use the same graceful detach as stop, but deliberately retain the daemon.
+  signal(state.pid, 'SIGTERM');
+  if (!(await waitDead(state.pid, 10_000))) fail('app did not exit; run doctor then stop');
+  timeline(state, { cmd: 'restart', previousPid: state.pid, retainedDaemonPid: daemonPid });
+  const result = await cmdLaunch({ app: state.app, suffix: state.suffix, timeout: opts.timeout }, state);
+  return { ...result, previousPid: state.pid, retainedDaemonPid: daemonPid };
+}
+
 async function cmdStop(opts) {
   const state = requireState({ alive: false });
   const home = os.homedir();
@@ -660,9 +690,11 @@ const COMMANDS = {
   eval: cmdEval,
   // Same command; some agent sandboxes refuse any shell line containing `eval`.
   inspect: cmdEval,
+  select: cmdSelect,
   'wait-settle': cmdWaitSettle,
   console: cmdConsole,
   stop: cmdStop,
+  restart: cmdRestart,
 };
 
 async function main() {

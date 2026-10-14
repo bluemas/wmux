@@ -149,3 +149,6 @@ EPIPE_ROOT_CAUSE.md
 
 # Locally built installers copied to the project root
 /*.exe
+
+# Temporary native terminal verifier bundles
+.native-core-verify-*/

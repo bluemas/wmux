@@ -3,6 +3,7 @@ import { buildWslInjection } from '../../shared/wslIntegration';
 import { BASH_INIT } from '../../daemon/shell-integration';
 import { getWmuxDir } from '../../daemon/config';
 import * as pty from 'node-pty';
+import { spawnTerminalPty, type TerminalPty } from '../../shared/terminalPty';
 import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -211,6 +212,7 @@ export class PTYManager {
   private pendingCreatesBySurface = new Map<string, Set<string>>();
 
   private spawnPrepared(options?: {
+    wslAccountLoginEnvKey?: 'CLAUDE_CONFIG_DIR' | 'CODEX_HOME';
     shell?: string;
     /**
      * #1103 — validated WSL distro selection (`['-d', '<name>']`), prepended
@@ -304,7 +306,7 @@ export class PTYManager {
     // Detect shell type and inject hook
     const shellType = this.detectShellType(shell);
     const hookInjection = wsl
-      ? buildWslInjection({ target: wsl.target, cwd, env, integrationDir: getWmuxDir(), bashInit: BASH_INIT })
+      ? buildWslInjection({ target: wsl.target, cwd, env, integrationDir: getWmuxDir(), bashInit: BASH_INIT, wslAccountLoginEnvKey: options?.wslAccountLoginEnvKey })
       : this.buildHookInjection(shellType, env, shell);
     const spawnArgs = wsl ? hookInjection.args : [...(options?.shellArgs ?? []), ...hookInjection.args];
 
@@ -326,7 +328,7 @@ export class PTYManager {
     );
     try {
       ptyProcess = spawnWithConptyPolicy(
-        (useBundled) => pty.spawn(shell, spawnArgs, {
+        (useBundled) => spawnTerminalPty(shell, spawnArgs, {
           name: 'xterm-256color',
           cols: options?.cols || 80,
           rows: options?.rows || 24,
@@ -334,7 +336,7 @@ export class PTYManager {
           env: hookInjection.env,
           useConpty: true,
           ...(useBundled ? { useConptyDll: true } : {}),
-        }),
+        }, pty.spawn),
         useConptyDll,
         (level, message) => {
           if (level === 'warn') console.error(`[PTYManager] pane ${id}: ${message}`);
@@ -412,6 +414,7 @@ export class PTYManager {
     if (instance) {
       this.removePidMap(instance.process.pid);
       try { instance.process.kill(); } catch { /* already dead */ }
+      (instance.process as TerminalPty).dispose?.();
       this.onDisposeCallback?.(id);
       this.instances.delete(id);
       forgetPtyShell(id);

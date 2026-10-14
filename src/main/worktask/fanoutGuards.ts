@@ -33,7 +33,8 @@ import { getWmuxDir } from '../../daemon/config';
 import { atomicWriteJSONSync } from '../../daemon/util/atomicWrite';
 import { getTaskLedger } from '../deck/taskLedgerHost';
 import { getWorkspaceMirror } from '../workspace/WorkspaceMirror';
-import { sanitizeFanoutOrigin, type FanoutOrigin } from '../../shared/fanoutOrigin';
+import { sanitizeFanoutOrigin, type FanoutLineageEntry, type FanoutOrigin } from '../../shared/fanoutOrigin';
+import { BOT_ID_RE } from '../../shared/bot';
 
 export const FANOUT_LIVE_TASK_CAP = 8;
 export const FANOUT_HOURLY_TASK_CAP = 24;
@@ -119,6 +120,16 @@ export interface FanOutGuardsOptions {
   /** Owner of `workspaceId` if the ledger knows it as a task workspace (any
    *  status). Defaults to the hosted ledger. */
   ledgerTaskOwner?: (workspaceId: string) => string | null;
+  /** The ledger row of `workspaceId`'s task when a factory bot dispatched it
+   *  (dispatch origin `bot`), else null. Defaults to the hosted ledger. */
+  ledgerBotTask?: (workspaceId: string) => { owner: string; botId: string; at: number } | null;
+}
+
+function hostedLedgerBotTask(workspaceId: string): { owner: string; botId: string; at: number } | null {
+  const row = getTaskLedger().findByTaskWorkspace(workspaceId);
+  const origin = row?.dispatch?.origin;
+  if (!row || origin?.kind !== 'bot' || typeof origin.botId !== 'string' || !BOT_ID_RE.test(origin.botId)) return null;
+  return { owner: row.ownerWorkspaceId, botId: origin.botId, at: row.updatedAt };
 }
 
 /** sha256 hex of a prompt body — what the audit log records instead of it. */
@@ -136,6 +147,7 @@ export class FanOutGuards {
   private readonly openWorkspaceIds: () => string[] | null;
   private readonly countLiveOverride?: () => number;
   private readonly ledgerTaskOwner: (workspaceId: string) => string | null;
+  private readonly ledgerBotTask: (workspaceId: string) => { owner: string; botId: string; at: number } | null;
 
   /** null until first read. */
   private lineage: Map<string, LineageStamp> | null = null;
@@ -159,6 +171,7 @@ export class FanOutGuards {
     this.ledgerTaskOwner =
       opts.ledgerTaskOwner ??
       ((ws) => getTaskLedger().findByTaskWorkspace(ws)?.ownerWorkspaceId ?? null);
+    this.ledgerBotTask = opts.ledgerBotTask ?? hostedLedgerBotTask;
   }
 
   /** Rename a torn store out of the way, so the next write starts clean and
@@ -285,8 +298,9 @@ export class FanOutGuards {
     const open = this.openWorkspaceIds();
     if (!open) throw new Error('the open workspace list is not available yet');
     const stamps = this.loadLineage();
+    const dormant = dormantTaskWorkspaces();
     let n = 0;
-    for (const ws of open) if (stamps.has(ws)) n++;
+    for (const ws of open) if (stamps.has(ws) && !dormant.has(ws)) n++;
     return n;
   }
 
@@ -566,18 +580,40 @@ export class FanOutGuards {
    * fan-out nesting. Read-only and non-throwing: an unreadable store yields
    * no stamps (the sidebar then falls back to the task ledger), unlike
    * fanoutOwnerOf, whose depth-1 check must refuse on doubt.
+   *
+   * A bot's worker is told apart even when its stamp is missing or carries
+   * no origin (an unreadable store set aside, a stamp written without one):
+   * the task ledger's dispatch record names the bot, and the answer then
+   * carries `origin: {kind:'bot', botId}` from it. `botId` is set on every
+   * entry whose origin is a bot.
    */
-  lineageFor(workspaceIds: readonly string[]): Record<string, { owner: string; at: number; origin?: FanoutOrigin }> {
-    const out: Record<string, { owner: string; at: number; origin?: FanoutOrigin }> = {};
+  lineageFor(workspaceIds: readonly string[]): Record<string, FanoutLineageEntry> {
+    const out: Record<string, FanoutLineageEntry> = {};
     let map: Map<string, LineageStamp>;
     try {
       map = this.loadLineage();
     } catch {
-      return out;
+      map = new Map();
     }
     for (const id of workspaceIds) {
       const stamp = map.get(id);
-      if (stamp) out[id] = { owner: stamp.owner, at: stamp.at, ...(stamp.origin ? { origin: { ...stamp.origin } } : {}) };
+      let entry: FanoutLineageEntry | null = stamp
+        ? { owner: stamp.owner, at: stamp.at, ...(stamp.origin ? { origin: { ...stamp.origin } } : {}) }
+        : null;
+      if (!entry?.origin) {
+        let bot: { owner: string; botId: string; at: number } | null = null;
+        try {
+          bot = this.ledgerBotTask(id);
+        } catch {
+          bot = null;
+        }
+        if (bot && (!entry || entry.owner === bot.owner)) {
+          entry = { owner: bot.owner, at: entry?.at ?? bot.at, origin: { kind: 'bot', botId: bot.botId } };
+        }
+      }
+      if (!entry) continue;
+      if (entry.origin?.kind === 'bot' && entry.origin.botId) entry.botId = entry.origin.botId;
+      out[id] = entry;
     }
     return out;
   }
@@ -627,6 +663,24 @@ export function stampFanoutTaskPane(
   const origin = sanitizeFanoutOrigin(options?.fanoutOrigin);
   if (origin) guards.markTask(ws, owner, origin);
   else guards.markTask(ws, owner);
+}
+
+/** Task workspaces kept open after their task ended and their agent was
+ *  stopped (factory worker reclaim): no agent runs there, so they hold no
+ *  live slot. A resumed worker is live again and is not in this set. */
+let dormantSource: () => ReadonlySet<string> = () => new Set();
+
+function dormantTaskWorkspaces(): ReadonlySet<string> {
+  try {
+    return dormantSource();
+  } catch {
+    return new Set();
+  }
+}
+
+/** Install (or clear, with null) the dormant task-workspace source. */
+export function setDormantTaskWorkspaces(source: (() => ReadonlySet<string>) | null): void {
+  dormantSource = source ?? (() => new Set());
 }
 
 let hosted: FanOutGuards | null = null;

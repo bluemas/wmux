@@ -36,7 +36,7 @@ The MCP host hosts these as tools (see [MCP tools](#mcp-tools) below). An *in-pa
 | Method | Params | Tier | Notes |
 |---|---|---|---|
 | `perf.status` | `{ includeMemory?: boolean }` | internal | Reveal counters; explicit `includeMemory: true` additionally returns Electron process IDs, types and working-set byte counters. |
-| `daemon.ping` | `{ includeMemory?: boolean }` | internal | Daemon control pipe only. Explicit `includeMemory: true` adds process memory and per-session ring/output queue counters. Ordinary health probes retain the existing lightweight response. See [memory diagnostics](../performance.md#memory-diagnostics). |
+| `daemon.ping` | `{ includeMemory?: boolean, includeTerminalCore?: boolean }` | internal | Daemon control pipe only. Explicit `includeMemory: true` adds process memory and per-session ring/output queue counters. Explicit `includeTerminalCore: true` adds the requested/effective terminal engine, native availability and environment-override status; older daemons may omit this diagnostic. Ordinary health probes retain the existing lightweight response. See [memory diagnostics](../performance.md#memory-diagnostics) and [experimental terminal engine](../../bench/rust-terminal-integration.md). |
 
 ### Workspace surface
 
@@ -159,6 +159,12 @@ The full list lives in `src/shared/rpc.ts` (`ALL_RPC_METHODS`). For the MCP-faci
 | Method | Tier | Notes |
 |---|---|---|
 | `daemon.createSession`, `daemon.destroySession`, `daemon.attachSession`, `daemon.detachSession`, `daemon.resizeSession`, `daemon.listSessions`, `daemon.getAgentName`, `daemon.getAgentState`, `daemon.deliverScheduledPromptV2`, `daemon.readPromptEvents`, `daemon.ping`, `daemon.shutdown`, `daemon.compact` | **internal** | Used by the wmux Electron client to manage PTYs and perform incarnation/identity/input-atomic scheduled delivery. `daemon.getAgentState` exposes the daemon-minted session incarnation to the trusted client; the versioned delivery method requires it to match before PTY input and makes mixed-version clients fail closed instead of reaching the legacy unbound method. External tooling should not call these — use the pane/terminal surfaces instead. |
+
+`daemon.createSession` also accepts the internal `wslAccountLoginEnvKey` hint (`CLAUDE_CONFIG_DIR`
+or `CODEX_HOME`). Settings login tabs set it to transfer only that vendor's selected
+account home through WSLENV. Ordinary workspace/account-bound panes omit it and
+retain their existing Linux profile selection and user WSLENV entries. Login
+tabs normalize flags only for the selected account key. This is not a workspace/profile setting.
 
 ### Company Mode (deferred to Phase 4 gate)
 

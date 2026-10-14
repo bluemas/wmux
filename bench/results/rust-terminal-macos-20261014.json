@@ -1,0 +1,936 @@
+{
+  "measuredAt": "2026-10-14",
+  "platform": "darwin-arm64",
+  "node": "24.15.0",
+  "sourceBaseCommit": "dc81f30a9974de700c427cb3df58e9a195670859",
+  "sourceState": "Uncommitted Rust prototype on this base; measured before transplanting the changes onto the PR base. These are historical measurements, not performance qualification of the rebased PR head.",
+  "scope": "Detached synthetic terminal workloads. Daemon-only RSS; no renderer or AI CLI/MCP processes. Three repetitions per backend and workload, alternating backend order.",
+  "combined": {
+    "report": "out/rust-validation-combined-20261014.json",
+    "sha256": "2f113f1ffb1866e51acad282fc666f7893341cca01f248d13b00be0195eb2193",
+    "ok": true,
+    "runs": 18,
+    "readRPCs": 780,
+    "allDaemonsExitZero": true,
+    "allFixtureTreesGone": true,
+    "groups": [
+      {
+        "sessions": 1,
+        "mibPerSession": 1,
+        "backend": "xterm",
+        "metrics": {
+          "peakRssMiB": {
+            "median": 241.828125,
+            "min": 196.09375,
+            "max": 250.21875,
+            "runs": [
+              196.09375,
+              250.21875,
+              241.828125
+            ]
+          },
+          "readBatchMs": {
+            "median": 31.92493750000176,
+            "min": 31.128062499999942,
+            "max": 31.974833499999477,
+            "runs": [
+              31.974833499999477,
+              31.92493750000176,
+              31.128062499999942
+            ]
+          },
+          "emptyRssMiB": {
+            "median": 120.984375,
+            "min": 120.921875,
+            "max": 121.0859375,
+            "runs": [
+              120.921875,
+              121.0859375,
+              120.984375
+            ]
+          },
+          "buffered-idleRssMiB": {
+            "median": 143.015625,
+            "min": 126.28125,
+            "max": 143.40625,
+            "runs": [
+              126.28125,
+              143.40625,
+              143.015625
+            ]
+          },
+          "settledRssMiB": {
+            "median": 235.453125,
+            "min": 195.859375,
+            "max": 250.171875,
+            "runs": [
+              195.859375,
+              250.171875,
+              235.453125
+            ]
+          },
+          "destroyedRssMiB": {
+            "median": 235.5,
+            "min": 196.015625,
+            "max": 250.171875,
+            "runs": [
+              196.015625,
+              250.171875,
+              235.5
+            ]
+          }
+        }
+      },
+      {
+        "sessions": 1,
+        "mibPerSession": 1,
+        "backend": "rust",
+        "metrics": {
+          "peakRssMiB": {
+            "median": 163.03125,
+            "min": 162.953125,
+            "max": 163.0625,
+            "runs": [
+              163.0625,
+              163.03125,
+              162.953125
+            ]
+          },
+          "readBatchMs": {
+            "median": 19.62322899999981,
+            "min": 16.644062999999733,
+            "max": 20.559312499999578,
+            "runs": [
+              19.62322899999981,
+              20.559312499999578,
+              16.644062999999733
+            ]
+          },
+          "emptyRssMiB": {
+            "median": 121.03125,
+            "min": 120.96875,
+            "max": 121.125,
+            "runs": [
+              120.96875,
+              121.125,
+              121.03125
+            ]
+          },
+          "buffered-idleRssMiB": {
+            "median": 146.765625,
+            "min": 146.6875,
+            "max": 146.8125,
+            "runs": [
+              146.765625,
+              146.8125,
+              146.6875
+            ]
+          },
+          "settledRssMiB": {
+            "median": 158.15625,
+            "min": 157.046875,
+            "max": 158.265625,
+            "runs": [
+              157.046875,
+              158.265625,
+              158.15625
+            ]
+          },
+          "destroyedRssMiB": {
+            "median": 158.171875,
+            "min": 157.0625,
+            "max": 158.28125,
+            "runs": [
+              157.0625,
+              158.28125,
+              158.171875
+            ]
+          }
+        }
+      },
+      {
+        "sessions": 6,
+        "mibPerSession": 1,
+        "backend": "xterm",
+        "metrics": {
+          "peakRssMiB": {
+            "median": 361.71875,
+            "min": 353.75,
+            "max": 372.328125,
+            "runs": [
+              372.328125,
+              353.75,
+              361.71875
+            ]
+          },
+          "readBatchMs": {
+            "median": 119.53831250000076,
+            "min": 119.21233300000313,
+            "max": 119.80889549999847,
+            "runs": [
+              119.53831250000076,
+              119.21233300000313,
+              119.80889549999847
+            ]
+          },
+          "emptyRssMiB": {
+            "median": 120.984375,
+            "min": 120.875,
+            "max": 121.0625,
+            "runs": [
+              120.875,
+              120.984375,
+              121.0625
+            ]
+          },
+          "buffered-idleRssMiB": {
+            "median": 155.46875,
+            "min": 154.828125,
+            "max": 155.5625,
+            "runs": [
+              155.46875,
+              154.828125,
+              155.5625
+            ]
+          },
+          "settledRssMiB": {
+            "median": 354.5,
+            "min": 347.078125,
+            "max": 362.3125,
+            "runs": [
+              362.3125,
+              347.078125,
+              354.5
+            ]
+          },
+          "destroyedRssMiB": {
+            "median": 354.546875,
+            "min": 347.359375,
+            "max": 362.421875,
+            "runs": [
+              362.421875,
+              347.359375,
+              354.546875
+            ]
+          }
+        }
+      },
+      {
+        "sessions": 6,
+        "mibPerSession": 1,
+        "backend": "rust",
+        "metrics": {
+          "peakRssMiB": {
+            "median": 200.53125,
+            "min": 199.265625,
+            "max": 205.203125,
+            "runs": [
+              200.53125,
+              205.203125,
+              199.265625
+            ]
+          },
+          "readBatchMs": {
+            "median": 84.36308350000036,
+            "min": 83.33327099999588,
+            "max": 85.55641700000706,
+            "runs": [
+              84.36308350000036,
+              85.55641700000706,
+              83.33327099999588
+            ]
+          },
+          "emptyRssMiB": {
+            "median": 120.921875,
+            "min": 120.8359375,
+            "max": 121.0625,
+            "runs": [
+              120.921875,
+              121.0625,
+              120.8359375
+            ]
+          },
+          "buffered-idleRssMiB": {
+            "median": 157.8125,
+            "min": 157.71875,
+            "max": 157.84375,
+            "runs": [
+              157.8125,
+              157.71875,
+              157.84375
+            ]
+          },
+          "settledRssMiB": {
+            "median": 200.25,
+            "min": 190.296875,
+            "max": 205.1875,
+            "runs": [
+              200.25,
+              205.1875,
+              190.296875
+            ]
+          },
+          "destroyedRssMiB": {
+            "median": 200.375,
+            "min": 190.03125,
+            "max": 205.0,
+            "runs": [
+              200.375,
+              205.0,
+              190.03125
+            ]
+          }
+        }
+      },
+      {
+        "sessions": 6,
+        "mibPerSession": 8,
+        "backend": "xterm",
+        "metrics": {
+          "peakRssMiB": {
+            "median": 395.46875,
+            "min": 391.328125,
+            "max": 418.84375,
+            "runs": [
+              391.328125,
+              418.84375,
+              395.46875
+            ]
+          },
+          "readBatchMs": {
+            "median": 694.8123750000086,
+            "min": 694.1116044999944,
+            "max": 695.0452084999997,
+            "runs": [
+              694.1116044999944,
+              695.0452084999997,
+              694.8123750000086
+            ]
+          },
+          "emptyRssMiB": {
+            "median": 121.078125,
+            "min": 120.921875,
+            "max": 121.125,
+            "runs": [
+              121.078125,
+              120.921875,
+              121.125
+            ]
+          },
+          "buffered-idleRssMiB": {
+            "median": 218.78125,
+            "min": 210.40625,
+            "max": 219.21875,
+            "runs": [
+              210.40625,
+              218.78125,
+              219.21875
+            ]
+          },
+          "settledRssMiB": {
+            "median": 373.296875,
+            "min": 370.484375,
+            "max": 413.390625,
+            "runs": [
+              370.484375,
+              413.390625,
+              373.296875
+            ]
+          },
+          "destroyedRssMiB": {
+            "median": 373.296875,
+            "min": 370.484375,
+            "max": 413.453125,
+            "runs": [
+              370.484375,
+              413.453125,
+              373.296875
+            ]
+          }
+        }
+      },
+      {
+        "sessions": 6,
+        "mibPerSession": 8,
+        "backend": "rust",
+        "metrics": {
+          "peakRssMiB": {
+            "median": 296.65625,
+            "min": 281.421875,
+            "max": 297.71875,
+            "runs": [
+              297.71875,
+              296.65625,
+              281.421875
+            ]
+          },
+          "readBatchMs": {
+            "median": 293.5327499999985,
+            "min": 288.88216699998884,
+            "max": 299.8744579999984,
+            "runs": [
+              299.8744579999984,
+              293.5327499999985,
+              288.88216699998884
+            ]
+          },
+          "emptyRssMiB": {
+            "median": 120.890625,
+            "min": 120.84375,
+            "max": 120.953125,
+            "runs": [
+              120.953125,
+              120.84375,
+              120.890625
+            ]
+          },
+          "buffered-idleRssMiB": {
+            "median": 231.171875,
+            "min": 222.8125,
+            "max": 231.359375,
+            "runs": [
+              231.171875,
+              231.359375,
+              222.8125
+            ]
+          },
+          "settledRssMiB": {
+            "median": 275.765625,
+            "min": 274.71875,
+            "max": 277.15625,
+            "runs": [
+              275.765625,
+              274.71875,
+              277.15625
+            ]
+          },
+          "destroyedRssMiB": {
+            "median": 275.5625,
+            "min": 274.578125,
+            "max": 277.015625,
+            "runs": [
+              275.5625,
+              274.578125,
+              277.015625
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "outputPath": {
+    "report": "out/rust-validation-output-ab-20261014.json",
+    "sha256": "6d88ec0cc1a3a8c61f92f45e6a0b2fc77ee39b73ba20240520db395922469597",
+    "ok": true,
+    "runs": 18,
+    "readRPCs": 780,
+    "allDaemonsExitZero": true,
+    "allFixtureTreesGone": true,
+    "groups": [
+      {
+        "sessions": 1,
+        "mibPerSession": 1,
+        "backend": "rust-legacy-output",
+        "metrics": {
+          "peakRssMiB": {
+            "median": 162.875,
+            "min": 145.421875,
+            "max": 163.71875,
+            "runs": [
+              145.421875,
+              163.71875,
+              162.875
+            ]
+          },
+          "readBatchMs": {
+            "median": 20.066687999999886,
+            "min": 19.545686999997997,
+            "max": 20.53716650000024,
+            "runs": [
+              20.066687999999886,
+              20.53716650000024,
+              19.545686999997997
+            ]
+          },
+          "emptyRssMiB": {
+            "median": 121.421875,
+            "min": 94.203125,
+            "max": 121.671875,
+            "runs": [
+              94.203125,
+              121.671875,
+              121.421875
+            ]
+          },
+          "buffered-idleRssMiB": {
+            "median": 146.640625,
+            "min": 121.546875,
+            "max": 147.46875,
+            "runs": [
+              121.546875,
+              147.46875,
+              146.640625
+            ]
+          },
+          "settledRssMiB": {
+            "median": 159.46875,
+            "min": 145.171875,
+            "max": 160.3125,
+            "runs": [
+              145.171875,
+              160.3125,
+              159.46875
+            ]
+          },
+          "destroyedRssMiB": {
+            "median": 159.515625,
+            "min": 145.3125,
+            "max": 160.3125,
+            "runs": [
+              145.3125,
+              160.3125,
+              159.515625
+            ]
+          }
+        },
+        "outputCopies": [
+          {
+            "retainedViaJsBytes": 1059862,
+            "retainedNativeBytes": 0,
+            "deliveredJsBytes": 0
+          },
+          {
+            "retainedViaJsBytes": 1059862,
+            "retainedNativeBytes": 0,
+            "deliveredJsBytes": 0
+          },
+          {
+            "retainedViaJsBytes": 1059862,
+            "retainedNativeBytes": 0,
+            "deliveredJsBytes": 0
+          }
+        ]
+      },
+      {
+        "sessions": 1,
+        "mibPerSession": 1,
+        "backend": "rust",
+        "metrics": {
+          "peakRssMiB": {
+            "median": 162.890625,
+            "min": 162.78125,
+            "max": 162.890625,
+            "runs": [
+              162.890625,
+              162.890625,
+              162.78125
+            ]
+          },
+          "readBatchMs": {
+            "median": 19.86860400000296,
+            "min": 19.638021000000663,
+            "max": 20.248812499999985,
+            "runs": [
+              20.248812499999985,
+              19.638021000000663,
+              19.86860400000296
+            ]
+          },
+          "emptyRssMiB": {
+            "median": 121.625,
+            "min": 121.609375,
+            "max": 121.703125,
+            "runs": [
+              121.703125,
+              121.609375,
+              121.625
+            ]
+          },
+          "buffered-idleRssMiB": {
+            "median": 146.59375,
+            "min": 146.5,
+            "max": 146.671875,
+            "runs": [
+              146.671875,
+              146.59375,
+              146.5
+            ]
+          },
+          "settledRssMiB": {
+            "median": 158.109375,
+            "min": 158.03125,
+            "max": 159.484375,
+            "runs": [
+              158.109375,
+              159.484375,
+              158.03125
+            ]
+          },
+          "destroyedRssMiB": {
+            "median": 158.09375,
+            "min": 158.046875,
+            "max": 159.53125,
+            "runs": [
+              158.09375,
+              159.53125,
+              158.046875
+            ]
+          }
+        },
+        "outputCopies": [
+          {
+            "retainedViaJsBytes": 0,
+            "retainedNativeBytes": 1059862,
+            "deliveredJsBytes": 0
+          },
+          {
+            "retainedViaJsBytes": 0,
+            "retainedNativeBytes": 1059862,
+            "deliveredJsBytes": 0
+          },
+          {
+            "retainedViaJsBytes": 0,
+            "retainedNativeBytes": 1059862,
+            "deliveredJsBytes": 0
+          }
+        ]
+      },
+      {
+        "sessions": 6,
+        "mibPerSession": 1,
+        "backend": "rust-legacy-output",
+        "metrics": {
+          "peakRssMiB": {
+            "median": 202.046875,
+            "min": 201.03125,
+            "max": 202.4375,
+            "runs": [
+              202.046875,
+              202.4375,
+              201.03125
+            ]
+          },
+          "readBatchMs": {
+            "median": 85.76295850000315,
+            "min": 83.35214550000092,
+            "max": 88.73468750000029,
+            "runs": [
+              88.73468750000029,
+              85.76295850000315,
+              83.35214550000092
+            ]
+          },
+          "emptyRssMiB": {
+            "median": 121.5625,
+            "min": 121.53125,
+            "max": 121.640625,
+            "runs": [
+              121.640625,
+              121.5625,
+              121.53125
+            ]
+          },
+          "buffered-idleRssMiB": {
+            "median": 159.03125,
+            "min": 158.546875,
+            "max": 159.296875,
+            "runs": [
+              159.03125,
+              159.296875,
+              158.546875
+            ]
+          },
+          "settledRssMiB": {
+            "median": 201.625,
+            "min": 191.578125,
+            "max": 202.109375,
+            "runs": [
+              201.625,
+              202.109375,
+              191.578125
+            ]
+          },
+          "destroyedRssMiB": {
+            "median": 201.875,
+            "min": 191.3125,
+            "max": 202.265625,
+            "runs": [
+              201.875,
+              202.265625,
+              191.3125
+            ]
+          }
+        },
+        "outputCopies": [
+          {
+            "retainedViaJsBytes": 6359172,
+            "retainedNativeBytes": 0,
+            "deliveredJsBytes": 0
+          },
+          {
+            "retainedViaJsBytes": 6359172,
+            "retainedNativeBytes": 0,
+            "deliveredJsBytes": 0
+          },
+          {
+            "retainedViaJsBytes": 6359172,
+            "retainedNativeBytes": 0,
+            "deliveredJsBytes": 0
+          }
+        ]
+      },
+      {
+        "sessions": 6,
+        "mibPerSession": 1,
+        "backend": "rust",
+        "metrics": {
+          "peakRssMiB": {
+            "median": 201.96875,
+            "min": 199.46875,
+            "max": 208.78125,
+            "runs": [
+              199.46875,
+              208.78125,
+              201.96875
+            ]
+          },
+          "readBatchMs": {
+            "median": 85.91708300000028,
+            "min": 84.7905000000028,
+            "max": 87.61329150000165,
+            "runs": [
+              85.91708300000028,
+              87.61329150000165,
+              84.7905000000028
+            ]
+          },
+          "emptyRssMiB": {
+            "median": 121.625,
+            "min": 121.4375,
+            "max": 121.65625,
+            "runs": [
+              121.65625,
+              121.4375,
+              121.625
+            ]
+          },
+          "buffered-idleRssMiB": {
+            "median": 157.71875,
+            "min": 157.65625,
+            "max": 157.890625,
+            "runs": [
+              157.890625,
+              157.65625,
+              157.71875
+            ]
+          },
+          "settledRssMiB": {
+            "median": 201.640625,
+            "min": 198.59375,
+            "max": 208.4296875,
+            "runs": [
+              198.59375,
+              208.4296875,
+              201.640625
+            ]
+          },
+          "destroyedRssMiB": {
+            "median": 201.796875,
+            "min": 198.515625,
+            "max": 208.609375,
+            "runs": [
+              198.515625,
+              208.609375,
+              201.796875
+            ]
+          }
+        },
+        "outputCopies": [
+          {
+            "retainedViaJsBytes": 0,
+            "retainedNativeBytes": 6359172,
+            "deliveredJsBytes": 0
+          },
+          {
+            "retainedViaJsBytes": 0,
+            "retainedNativeBytes": 6359172,
+            "deliveredJsBytes": 0
+          },
+          {
+            "retainedViaJsBytes": 0,
+            "retainedNativeBytes": 6359172,
+            "deliveredJsBytes": 0
+          }
+        ]
+      },
+      {
+        "sessions": 6,
+        "mibPerSession": 8,
+        "backend": "rust-legacy-output",
+        "metrics": {
+          "peakRssMiB": {
+            "median": 284.96875,
+            "min": 271.234375,
+            "max": 298.109375,
+            "runs": [
+              271.234375,
+              284.96875,
+              298.109375
+            ]
+          },
+          "readBatchMs": {
+            "median": 298.7553334999975,
+            "min": 298.4588545000006,
+            "max": 299.0871455000015,
+            "runs": [
+              298.7553334999975,
+              299.0871455000015,
+              298.4588545000006
+            ]
+          },
+          "emptyRssMiB": {
+            "median": 121.515625,
+            "min": 121.4765625,
+            "max": 121.7265625,
+            "runs": [
+              121.515625,
+              121.7265625,
+              121.4765625
+            ]
+          },
+          "buffered-idleRssMiB": {
+            "median": 224.484375,
+            "min": 224.140625,
+            "max": 232.21875,
+            "runs": [
+              224.140625,
+              224.484375,
+              232.21875
+            ]
+          },
+          "settledRssMiB": {
+            "median": 272.046875,
+            "min": 251.5625,
+            "max": 276.109375,
+            "runs": [
+              251.5625,
+              272.046875,
+              276.109375
+            ]
+          },
+          "destroyedRssMiB": {
+            "median": 251.421875,
+            "min": 181.328125,
+            "max": 272.015625,
+            "runs": [
+              251.421875,
+              272.015625,
+              181.328125
+            ]
+          }
+        },
+        "outputCopies": [
+          {
+            "retainedViaJsBytes": 51148932,
+            "retainedNativeBytes": 0,
+            "deliveredJsBytes": 0
+          },
+          {
+            "retainedViaJsBytes": 51148932,
+            "retainedNativeBytes": 0,
+            "deliveredJsBytes": 0
+          },
+          {
+            "retainedViaJsBytes": 51148932,
+            "retainedNativeBytes": 0,
+            "deliveredJsBytes": 0
+          }
+        ]
+      },
+      {
+        "sessions": 6,
+        "mibPerSession": 8,
+        "backend": "rust",
+        "metrics": {
+          "peakRssMiB": {
+            "median": 292.046875,
+            "min": 234.375,
+            "max": 293.8125,
+            "runs": [
+              292.046875,
+              293.8125,
+              234.375
+            ]
+          },
+          "readBatchMs": {
+            "median": 302.0316254999998,
+            "min": 297.06037499999366,
+            "max": 327.97283349999634,
+            "runs": [
+              297.06037499999366,
+              302.0316254999998,
+              327.97283349999634
+            ]
+          },
+          "emptyRssMiB": {
+            "median": 121.65625,
+            "min": 121.5625,
+            "max": 121.8125,
+            "runs": [
+              121.65625,
+              121.8125,
+              121.5625
+            ]
+          },
+          "buffered-idleRssMiB": {
+            "median": 231.28125,
+            "min": 178.375,
+            "max": 239.15625,
+            "runs": [
+              239.15625,
+              231.28125,
+              178.375
+            ]
+          },
+          "settledRssMiB": {
+            "median": 270.796875,
+            "min": 179.25,
+            "max": 271.875,
+            "runs": [
+              270.796875,
+              271.875,
+              179.25
+            ]
+          },
+          "destroyedRssMiB": {
+            "median": 270.671875,
+            "min": 148.6796875,
+            "max": 271.703125,
+            "runs": [
+              270.671875,
+              271.703125,
+              148.6796875
+            ]
+          }
+        },
+        "outputCopies": [
+          {
+            "retainedViaJsBytes": 0,
+            "retainedNativeBytes": 51148932,
+            "deliveredJsBytes": 0
+          },
+          {
+            "retainedViaJsBytes": 0,
+            "retainedNativeBytes": 51148932,
+            "deliveredJsBytes": 0
+          },
+          {
+            "retainedViaJsBytes": 0,
+            "retainedNativeBytes": 51148932,
+            "deliveredJsBytes": 0
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,215 @@
+<div class="flex flex-col gap-2 my-4" data-testid="token-custom-mcp-group">
+<span class="text-[10px] font-semibold tracking-wider uppercase text-[var(--text-sub)]">MCP Servers &amp; Tools (6)</span>
+<div class="rounded-[12px] border border-[var(--border-soft)] bg-[var(--bg-surface)] overflow-hidden divide-y divide-[var(--border-soft)]">
+<div class="flex flex-col" data-testid="mcp-server-srv">
+<div class="flex items-center justify-between px-3 py-2 text-[13px] " data-testid="mcp-server-header-srv">
+<div class="flex items-center gap-2 flex-wrap">
+<span class="font-medium text-[var(--text-main)]">srv</span>
+<span class="ui-badge" data-tone="neutral">user</span>
+<span class="text-[11px] text-[var(--text-sub)]">2 staged tools</span>
+</div>
+<div class="flex items-center gap-2">
+<button aria-label="Toggle srv" data-testid="toggle-mcp-server-srv" type="button" role="switch" aria-checked="true" class="ui-switch focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--accent-blue)] focus-visible:ring-offset-1 focus-visible:ring-offset-[color:var(--bg-base)]">
+<span class="ui-switch-knob" aria-hidden="true">
+</span>
+</button>
+</div>
+</div>
+<div class="pl-6 pr-3 pb-2 pt-0 flex flex-col gap-1">
+<div class="flex items-center justify-between text-[11px] py-1 border-t border-[var(--border-soft)]" data-testid="mcp-tool-plain">
+<div class="flex items-center gap-2 flex-wrap">
+<span class="text-[var(--text-sub)]">↳</span>
+<span class="ui-code text-[var(--text-main)]">plain</span>
+</div>
+<div class="flex items-center gap-2">
+<button aria-label="Toggle plain" data-testid="toggle-mcp-tool-plain" type="button" role="switch" aria-checked="true" class="ui-switch focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--accent-blue)] focus-visible:ring-offset-1 focus-visible:ring-offset-[color:var(--bg-base)]">
+<span class="ui-switch-knob" aria-hidden="true">
+</span>
+</button>
+</div>
+</div>
+<div class="flex items-center justify-between text-[11px] py-1 border-t border-[var(--border-soft)]" data-testid="mcp-tool-disabled">
+<div class="flex items-center gap-2 flex-wrap">
+<span class="text-[var(--text-sub)]">↳</span>
+<span class="ui-code text-[var(--text-main)]">disabled</span>
+</div>
+<div class="flex items-center gap-2">
+<button aria-label="Toggle disabled" data-testid="toggle-mcp-tool-disabled" type="button" role="switch" aria-checked="false" class="ui-switch focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--accent-blue)] focus-visible:ring-offset-1 focus-visible:ring-offset-[color:var(--bg-base)]">
+<span class="ui-switch-knob" aria-hidden="true">
+</span>
+</button>
+</div>
+</div>
+<div class="flex items-center justify-between text-[11px] py-1 border-t border-[var(--border-soft)]" data-testid="mcp-tool-unknown-state">
+<div class="flex items-center gap-2 flex-wrap">
+<span class="text-[var(--text-sub)]">↳</span>
+<span class="ui-code text-[var(--text-main)]">unknown-state</span>
+</div>
+<div class="flex items-center gap-2">
+<button aria-label="Toggle unknown-state" data-testid="toggle-mcp-tool-unknown-state" type="button" role="switch" aria-checked="true" class="ui-switch focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--accent-blue)] focus-visible:ring-offset-1 focus-visible:ring-offset-[color:var(--bg-base)]">
+<span class="ui-switch-knob" aria-hidden="true">
+</span>
+</button>
+</div>
+</div>
+<div class="flex items-center justify-between text-[11px] py-1 border-t border-[var(--border-soft)]" data-testid="mcp-tool-staged-off" data-staged="true">
+<div class="flex items-center gap-2 flex-wrap">
+<span class="text-[var(--text-sub)]">↳</span>
+<span class="ui-code text-[var(--text-main)]">staged-off</span>
+<span class="ui-badge" data-tone="warning">staged</span>
+</div>
+<div class="flex items-center gap-2">
+<button aria-label="Toggle staged-off" data-testid="toggle-mcp-tool-staged-off" type="button" role="switch" aria-checked="false" class="ui-switch focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--accent-blue)] focus-visible:ring-offset-1 focus-visible:ring-offset-[color:var(--bg-base)]">
+<span class="ui-switch-knob" aria-hidden="true">
+</span>
+</button>
+</div>
+</div>
+<div class="flex items-center justify-between text-[11px] py-1 border-t border-[var(--border-soft)]" data-testid="mcp-tool-staged-on" data-staged="true">
+<div class="flex items-center gap-2 flex-wrap">
+<span class="text-[var(--text-sub)]">↳</span>
+<span class="ui-code text-[var(--text-main)]">staged-on</span>
+<span class="ui-badge" data-tone="warning">staged</span>
+</div>
+<div class="flex items-center gap-2">
+<button aria-label="Toggle staged-on" data-testid="toggle-mcp-tool-staged-on" type="button" role="switch" aria-checked="true" class="ui-switch focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--accent-blue)] focus-visible:ring-offset-1 focus-visible:ring-offset-[color:var(--bg-base)]">
+<span class="ui-switch-knob" aria-hidden="true">
+</span>
+</button>
+</div>
+</div>
+<div class="flex items-center justify-between text-[11px] py-1 border-t border-[var(--border-soft)]" data-testid="mcp-tool-rejected">
+<div class="flex items-center gap-2 flex-wrap">
+<span class="text-[var(--text-sub)]">↳</span>
+<span class="ui-code text-[var(--text-main)]">rejected</span>
+<span class="ui-badge" data-tone="danger">Already in the requested state.</span>
+</div>
+<div class="flex items-center gap-2">
+<button aria-label="Toggle rejected" data-testid="toggle-mcp-tool-rejected" type="button" role="switch" aria-checked="true" class="ui-switch focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--accent-blue)] focus-visible:ring-offset-1 focus-visible:ring-offset-[color:var(--bg-base)]">
+<span class="ui-switch-knob" aria-hidden="true">
+</span>
+</button>
+</div>
+</div>
+<div class="flex items-center justify-between text-[11px] py-1 border-t border-[var(--border-soft)]" data-testid="mcp-tool-read-only">
+<div class="flex items-center gap-2 flex-wrap">
+<span class="text-[var(--text-sub)]">↳</span>
+<span class="ui-code text-[var(--text-main)]">read-only</span>
+<span class="text-[10px] text-[var(--text-sub)]">(Managed by policy)</span>
+</div>
+<div class="flex items-center gap-2">
+<span class="ui-badge" data-tone="success">Enabled</span>
+</div>
+</div>
+<div class="flex items-center justify-between text-[11px] py-1 border-t border-[var(--border-soft)]" data-testid="mcp-tool-read-only-off">
+<div class="flex items-center gap-2 flex-wrap">
+<span class="text-[var(--text-sub)]">↳</span>
+<span class="ui-code text-[var(--text-main)]">read-only-off</span>
+</div>
+<div class="flex items-center gap-2">
+<span class="ui-badge" data-tone="neutral">Disabled</span>
+</div>
+</div>
+</div>
+</div>
+<div class="flex flex-col" data-testid="mcp-server-srv-off">
+<div class="flex items-center justify-between px-3 py-2 text-[13px] " data-testid="mcp-server-header-srv-off">
+<div class="flex items-center gap-2 flex-wrap">
+<span class="font-medium text-[var(--text-main)]">srv-off</span>
+<span class="ui-badge" data-tone="neutral">user</span>
+</div>
+<div class="flex items-center gap-2">
+<button aria-label="Toggle srv-off" data-testid="toggle-mcp-server-srv-off" type="button" role="switch" aria-checked="false" class="ui-switch focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--accent-blue)] focus-visible:ring-offset-1 focus-visible:ring-offset-[color:var(--bg-base)]">
+<span class="ui-switch-knob" aria-hidden="true">
+</span>
+</button>
+</div>
+</div>
+<div class="pl-6 pr-3 pb-2 pt-0 flex flex-col gap-1">
+<div class="flex items-center justify-between text-[11px] py-1 border-t border-[var(--border-soft)]" data-testid="mcp-tool-one">
+<div class="flex items-center gap-2 flex-wrap">
+<span class="text-[var(--text-sub)]">↳</span>
+<span class="ui-code text-[var(--text-main)]">one</span>
+</div>
+<div class="flex items-center gap-2">
+<button aria-label="Toggle one" data-testid="toggle-mcp-tool-one" type="button" role="switch" aria-checked="true" class="ui-switch focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--accent-blue)] focus-visible:ring-offset-1 focus-visible:ring-offset-[color:var(--bg-base)]">
+<span class="ui-switch-knob" aria-hidden="true">
+</span>
+</button>
+</div>
+</div>
+</div>
+</div>
+<div class="flex flex-col" data-testid="mcp-server-srv-staged" data-staged="true">
+<div class="flex items-center justify-between px-3 py-2 text-[13px] " data-testid="mcp-server-header-srv-staged">
+<div class="flex items-center gap-2 flex-wrap">
+<span class="font-medium text-[var(--text-main)]">srv-staged</span>
+<span class="ui-badge" data-tone="neutral">user</span>
+<span class="ui-badge" data-tone="warning">staged</span>
+</div>
+<div class="flex items-center gap-2">
+<button aria-label="Toggle srv-staged" data-testid="toggle-mcp-server-srv-staged" type="button" role="switch" aria-checked="false" class="ui-switch focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--accent-blue)] focus-visible:ring-offset-1 focus-visible:ring-offset-[color:var(--bg-base)]">
+<span class="ui-switch-knob" aria-hidden="true">
+</span>
+</button>
+</div>
+</div>
+</div>
+<div class="flex flex-col" data-testid="mcp-server-srv-rejected">
+<div class="flex items-center justify-between px-3 py-2 text-[13px] " data-testid="mcp-server-header-srv-rejected">
+<div class="flex items-center gap-2 flex-wrap">
+<span class="font-medium text-[var(--text-main)]">srv-rejected</span>
+<span class="ui-badge" data-tone="neutral">project</span>
+<span class="ui-badge" data-tone="danger">Item not found; the configuration changed since it was listed.</span>
+</div>
+<div class="flex items-center gap-2">
+<button aria-label="Toggle srv-rejected" data-testid="toggle-mcp-server-srv-rejected" type="button" role="switch" aria-checked="true" class="ui-switch focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--accent-blue)] focus-visible:ring-offset-1 focus-visible:ring-offset-[color:var(--bg-base)]">
+<span class="ui-switch-knob" aria-hidden="true">
+</span>
+</button>
+</div>
+</div>
+</div>
+<div class="flex flex-col" data-testid="mcp-server-srv-ro">
+<div class="flex items-center justify-between px-3 py-2 text-[13px] " data-testid="mcp-server-header-srv-ro">
+<div class="flex items-center gap-2 flex-wrap">
+<span class="font-medium text-[var(--text-main)]">srv-ro</span>
+<span class="ui-badge" data-tone="neutral">user</span>
+<span class="text-[11px] text-[var(--text-sub)]">(Set by your organization)</span>
+</div>
+<div class="flex items-center gap-2">
+<span class="ui-badge" data-tone="success">Enabled</span>
+</div>
+</div>
+</div>
+<div class="flex flex-col" data-testid="mcp-server-wmux">
+<div class="flex items-center justify-between px-3 py-2 text-[13px] " data-testid="mcp-server-header-wmux">
+<div class="flex items-center gap-2 flex-wrap">
+<span class="font-medium text-[var(--text-main)]">wmux</span>
+<span class="ui-badge" data-tone="neutral">wmux</span>
+<span class="ui-badge" data-tone="warning">needed by wmux</span>
+</div>
+<div class="flex items-center gap-2">
+<button aria-label="Toggle wmux" data-testid="toggle-mcp-server-wmux" type="button" role="switch" aria-checked="true" class="ui-switch focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--accent-blue)] focus-visible:ring-offset-1 focus-visible:ring-offset-[color:var(--bg-base)]">
+<span class="ui-switch-knob" aria-hidden="true">
+</span>
+</button>
+</div>
+</div>
+<div class="pl-6 pr-3 pb-2 pt-0 flex flex-col gap-1">
+<div class="flex items-center justify-between text-[11px] py-1 border-t border-[var(--border-soft)]" data-testid="mcp-tool-terminal_read">
+<div class="flex items-center gap-2 flex-wrap">
+<span class="text-[var(--text-sub)]">↳</span>
+<span class="ui-code text-[var(--text-main)]">terminal_read</span>
+</div>
+<div class="flex items-center gap-2">
+<button aria-label="Toggle terminal_read" data-testid="toggle-mcp-tool-terminal_read" type="button" role="switch" aria-checked="true" class="ui-switch focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[color:var(--accent-blue)] focus-visible:ring-offset-1 focus-visible:ring-offset-[color:var(--bg-base)]">
+<span class="ui-switch-knob" aria-hidden="true">
+</span>
+</button>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>

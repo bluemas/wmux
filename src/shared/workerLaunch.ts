@@ -159,7 +159,8 @@ export function isFanoutWorkerPermissionMode(v: unknown): v is FanoutWorkerPermi
 
 /**
  * The wmux tools a worker may call without a prompt: record its ledger row,
- * READ its mission channel, and ask who it is / what it was asked. Nothing
+ * publish its own task branch (main pushes it), READ its mission channel,
+ * and ask who it is / what it was asked. Nothing
  * that writes into another agent's prompt: `channel_post` is left out because
  * a post can pin a mention to any pane and land in that agent's prompt, and
  * `send_message` / `terminal_send` type into panes outright. Never `mcp__wmux`
@@ -167,6 +168,7 @@ export function isFanoutWorkerPermissionMode(v: unknown): v is FanoutWorkerPermi
  */
 export const FANOUT_WORKER_ALLOWED_TOOLS: readonly string[] = [
   'mcp__wmux__ledger_update',
+  'mcp__wmux__task_push',
   'mcp__wmux__channel_read',
   'mcp__wmux__channel_unread',
   'mcp__wmux__channel_ack',
@@ -183,6 +185,8 @@ export const FANOUT_WORKER_DISALLOWED_TOOLS: readonly string[] = [
   'mcp__wmux__terminal_send',
   'mcp__wmux__terminal_send_key',
   'mcp__wmux__send_message',
+  // send_message under its older name (same handler).
+  'mcp__wmux__a2a_task_send',
   'mcp__wmux__surface_new',
   'mcp__wmux__pane_split',
   'mcp__wmux__browser_*',
@@ -197,9 +201,8 @@ const PERMISSION_FLAG_FOR_WORKER: Readonly<Record<FanoutWorkerPermissionMode, st
 
 /** The flags wmux appends for `mode`, as they appear on the line. */
 export function workerLaunchFlags(mode: FanoutWorkerPermissionMode, extraDisallowed: readonly string[] = []): string {
-  // Extra rules (the goal worker profile, shared/moaGoalWorker.ts) join the
-  // SAME quoted list: claude splits it on commas and spaces outside
-  // parentheses, so `Bash(git push*)` stays one rule.
+  // Extra rules join the SAME quoted list: claude splits it on commas and
+  // spaces outside parentheses, so `Bash(git push*)` stays one rule.
   return [
     PERMISSION_FLAG_FOR_WORKER[mode],
     `--allowedTools "${FANOUT_WORKER_ALLOWED_TOOLS.join(',')}"`,

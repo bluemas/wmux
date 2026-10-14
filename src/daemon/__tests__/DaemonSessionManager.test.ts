@@ -799,6 +799,16 @@ describe('DaemonSessionManager', () => {
     expect(s.lastActivity).toBe(persisted);
   });
 
+  it('updates detached activity without subscribing to byte delivery', () => {
+    const persisted = '2026-01-01T00:00:00.000Z';
+    manager.createSession({ id: 'native-activity', cmd: 'cmd.exe', cwd: '.', lastActivity: persisted });
+    const managed = manager.getSession('native-activity');
+    expect(managed?.bridge.listenerCount('data')).toBe(0);
+    lastMockPty?.simulateData('working');
+    expect(managed?.meta.lastActivity).not.toBe(persisted);
+    expect(managed?.ringBuffer.readAll().toString()).toContain('working');
+  });
+
   it('stamps lastActivity to ~now for brand-new sessions (no lastActivity passed)', () => {
     const before = Date.now();
     const s = manager.createSession({ id: 'new-activity', cmd: 'cmd.exe', cwd: '.' });

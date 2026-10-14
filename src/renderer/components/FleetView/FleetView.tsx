@@ -4,7 +4,6 @@ import { useShallow } from 'zustand/react/shallow';
 import { useT } from '../../hooks/useT';
 import {
   selectFleetBoard,
-  fleetHqId,
   selectHookRunningByPtyId,
   selectUnverifiablePaneMinutes,
   fleetTargetPtyId,
@@ -44,13 +43,14 @@ import { findMission } from '../../stores/selectors/missions';
 import { fleetTitle, matchesFleetFilter, type FleetFilter } from './fleetPresentation';
 import { formatIdle, IDLE_SHOW_AFTER_MS, IDLE_TICK_MS } from '../../utils/idleTime';
 import { IconCheck, IconChevron, IconPlus } from '../icons';
-// Read-only: Moa's own readers of delegated work and pending decisions.
-import { useMoaDecisions, useWorkLinks } from '../Moa/panel/useMoaPanelData';
+// Read-only: the readers of delegated work and pending decisions.
+import { useMoaDecisions, useWorkLinks } from './useFleetSources';
 import { buildFleetTickets, loadSeenReports, openTicketFor, saveSeenReports, ticketAttention, type FleetTicket } from './fleetTickets';
 import { TicketDetail, TicketRow, ticketKey } from './TicketList';
 import FleetRequestPanel from './FleetRequestPanel';
 import { flattenAgentText } from '../../../shared/assistantPreview';
 import { fleetAskOf, lastErrorLine, lastErrorLineIndex, promptChoices } from './nowDoing';
+import { isBotTask, selectBotTaskOwners, selectOwnerWorkspaces } from '../Sidebar/botTasks';
 
 /** True when a key event comes from a text-entry control. */
 function isEditableTarget(target: EventTarget | null): boolean {
@@ -87,7 +87,9 @@ const FINISHED_TOGGLE_KEY = 'fleet:finished-toggle';
 export default function FleetView() {
   const t = useT();
   const setVisible = useStore((s) => s.setFleetViewVisible);
-  const workspaces = useStore((s) => s.workspaces);
+  // Bot workers are the Bots page's: Fleet never lists them (botTasks.ts).
+  const workspaces = useStore(selectOwnerWorkspaces);
+  const botOwners = useStore(selectBotTaskOwners);
   const surfaceAgentStatus = useStore((s) => s.surfaceAgentStatus);
   // Hook-driven per-pane activity line (fleet-activity-line-hook). Subscribed
   // here so the selector re-runs when an agent's PostToolUse activity changes.
@@ -102,9 +104,6 @@ export default function FleetView() {
   const commandRunningByPtyId = useStore((s) => s.commandRunningByPtyId);
   const agentAliveByPtyId = useStore((s) => s.agentAliveByPtyId);
   const usageLimitWaiting = useStore((s) => s.usageLimitWaiting);
-  // Moa's HQ is left off the board (it is the main bot, not a worker). Only
-  // the id is subscribed, so Moa's other state changes never re-derive it.
-  const hqId = useStore(fleetHqId);
   const hookRunningByPtyId = useStore(useShallow(selectHookRunningByPtyId));
   const unverifiableMinutes = useStore(useShallow(selectUnverifiablePaneMinutes));
   const missions = useStore((s) => s.missionByPaneGroup);
@@ -184,9 +183,7 @@ export default function FleetView() {
       commandRunningByPtyId, agentAliveByPtyId, hookRunningByPtyId, remoteWorkspaces,
       surfaceLastMessage, surfaceOutputAt: useStore.getState().surfaceOutputAt,
       unverifiablePaneMinutes: unverifiableMinutes, usageLimitWaiting,
-      // fleetHqId reads the seed while `moa` is null: hand it the id resolved above.
-      moa: null, moaHqSeed: hqId,
-    }, { now, sortMode: fleetSortMode }), [usageLimitWaiting, hqId, workspaces, surfaceAgentStatus, surfaceActivity, paneLabel, supervisionByPtyId,
+    }, { now, sortMode: fleetSortMode }), [usageLimitWaiting, workspaces, surfaceAgentStatus, surfaceActivity, paneLabel, supervisionByPtyId,
     surfaceAgent, surfacePendingQuestion, surfaceActivityAt, surfaceTurnOpenAt,
     commandRunningByPtyId, agentAliveByPtyId, hookRunningByPtyId, remoteWorkspaces, unverifiableMinutes,
     surfaceLastMessage, now, fleetSortMode]);
@@ -232,8 +229,8 @@ export default function FleetView() {
   // output stamp (fallback for panes finished before stamping existed) is read
   // on the minute tick, as for the board. Membership comes from reviewIds.
   const reviewQueue = useMemo(
-    () => (reviewIds.length === 0 ? [] : selectReviewQueue(useStore.getState())),
-    [reviewIds, workspaces, missions, surfaceTurnEndAt, now],
+    () => (reviewIds.length === 0 ? [] : selectReviewQueue(useStore.getState()).filter((entry) => !isBotTask(entry.workspaceId, botOwners))),
+    [reviewIds, workspaces, botOwners, missions, surfaceTurnEndAt, now],
   );
   // Cached change counts for tasks that left the queue are dropped.
   useEffect(() => {
