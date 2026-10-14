@@ -3751,6 +3751,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // can paint. It paints with the DOM renderer now and is upgraded from
       // webglUpgradeQueue once reveals settle, one pane per idle period.
       let cancelUpgrade: (() => void) | null = null;
+      let upgradeFitRaf: number | null = null;
       if (
         loadWebglRef.current &&
         disposeWebglRef.current &&
@@ -3762,7 +3763,19 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
           cancelUpgrade = webglUpgradeQueue.enqueue(() => {
             if (!isVisibleRef.current || !loadWebglRef.current || !disposeWebglRef.current) return;
             if (webglContextPool.acquireWouldEvict(token)) return;
+            const hadAddon = webglAddonRef.current !== null;
             webglContextPool.acquire(token, loadWebglRef.current, disposeWebglRef.current);
+            if (hadAddon || !webglAddonRef.current) return;
+            // The reveal's fit measured the DOM renderer's cell. WebGL rounds
+            // the cell down to whole device pixels, so at a fractional cell
+            // width the grid now holds too few columns (a blank strip, and a
+            // narrower PTY) until something refits. Refit through the same
+            // guard as the reveal: a live selection defers it, and a fit that
+            // lands on the same size sends nothing.
+            upgradeFitRaf = requestAnimationFrame(() => {
+              upgradeFitRaf = null;
+              if (claimFit(terminalRef.current, pendingFitRef)) fit();
+            });
           });
         }
       }
@@ -3788,6 +3801,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       return () => {
         cancelAnimationFrame(id);
         cancelUpgrade?.();
+        if (upgradeFitRaf !== null) cancelAnimationFrame(upgradeFitRaf);
       };
     }
     // Hidden: keep the WebGL context ("A hidden terminal KEEPS its WebGL
