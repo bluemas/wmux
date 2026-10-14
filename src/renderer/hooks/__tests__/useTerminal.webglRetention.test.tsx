@@ -89,9 +89,10 @@ describe('useTerminal WebGL retention', { timeout: 60_000 }, () => {
     document.body.appendChild(host);
     root = createRoot(host);
     await act(async () => { root!.render(<Harness visible />); });
-    await act(async () => { await new Promise((r) => setTimeout(r, 30)); });
-    // Mount builds the addon, then fonts.ready rebuilds it once for the atlas.
-    // Count from that settled state.
+    // A pane shown without a context paints with the DOM renderer and is
+    // upgraded once reveals settle (webglUpgradeQueue). Then fonts.ready may
+    // rebuild it once for the atlas. Count from that settled state.
+    await act(async () => { await new Promise((r) => setTimeout(r, 900)); });
     const created = webgl.created;
     const disposed = webgl.disposed;
     expect(created).toBeGreaterThan(0);
@@ -168,8 +169,11 @@ describe('useTerminal WebGL grant when the pool is full', { timeout: 60_000 }, (
     await act(async () => { await new Promise((r) => setTimeout(r, 300)); });
     expect(webgl.created).toBe(before);
 
+    // The next reveal takes it, after the reveal has painted.
     await act(async () => { root!.render(<Harness visible={false} />); });
     await act(async () => { root!.render(<Harness visible />); });
+    expect(webgl.created).toBe(before);
+    await act(async () => { await new Promise((r) => setTimeout(r, 900)); });
     expect(webgl.created).toBe(before + 1);
   });
 });
