@@ -37,7 +37,7 @@ import { PTYBridge } from '../PTYBridge';
 import type { PTYManager, PTYInstance } from '../PTYManager';
 import { HookSignalRouter } from '../../hooks/HookSignalRouter';
 import { SignalLatencyMeter } from '../../../shared/hooks/SignalLatencyMeter';
-import { clearPty as clearSuppression, SETTLE_REDRAW_GUARD_MS } from '../../notification/idleSuppression';
+import { clearPty as clearSuppression, recentlyEscaped, SETTLE_REDRAW_GUARD_MS } from '../../notification/idleSuppression';
 
 interface MockProcess {
   onData: (cb: (data: string) => void) => void;
@@ -113,6 +113,25 @@ describe('PTYBridge interrupt edge (Ctrl+C / ESC ESC settles a latched pane)', (
 
     expect(router.governsRunningState('p1')).toBe(true);
     expect(mocks.broadcastMetadataUpdate).not.toHaveBeenCalled();
+  });
+
+  it('records a lone ESC for the agent\'s "Interrupted" row to confirm', () => {
+    const { bridge } = makeBridge();
+    clearSuppression('p1');
+    expect(recentlyEscaped('p1')).toBe(false);
+
+    bridge.noteInterruptInput('p1', '\x1b[A');
+    expect(recentlyEscaped('p1')).toBe(false);
+    bridge.noteInterruptInput('p1', '\x1b');
+    expect(recentlyEscaped('p1')).toBe(true);
+  });
+
+  it('records a kitty Escape that arrives glued to its release', () => {
+    const { bridge } = makeBridge();
+    clearSuppression('p1');
+
+    bridge.noteInterruptInput('p1', '\x1b[27u\x1b[27;1:3u');
+    expect(recentlyEscaped('p1')).toBe(true);
   });
 
   it('releases the latch on ESC ESC', () => {

@@ -6817,6 +6817,17 @@ function wireEvents(
     pipeServer.broadcast(event);
   });
 
+  // The agent printed its own "turn interrupted" row. No Stop hook follows an
+  // interrupt, so main settles the pane's turn latch on this.
+  sessionManager.on('session:turnInterrupted', (payload: { sessionId: string; agent: string }) => {
+    const event: DaemonEvent = {
+      type: 'agent.interrupted',
+      sessionId: payload.sessionId,
+      data: { agent: payload.agent },
+    };
+    pipeServer.broadcast(event);
+  });
+
   // A human answered the dialog a pane was blocked on (DaemonPTYBridge
   // noteInput: an option digit, ESC or Enter). The bridge has already dropped
   // its awaiting state. Tell main the pane is running again — on a

@@ -1041,6 +1041,9 @@ export class DaemonClient extends EventEmitter {
         case 'agent.critical':
           this.emit('session:critical', { sessionId: event.sessionId, event: event.data });
           break;
+        case 'agent.interrupted':
+          this.emit('session:agentInterrupted', { sessionId: event.sessionId });
+          break;
         case 'agent.processExit': {
           // The pane's agent process died with the shell still alive. The one
           // release path for a pane the hook lit and never settled (killed

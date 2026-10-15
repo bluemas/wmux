@@ -103,6 +103,15 @@ export interface UsageLimitLineEvent {
   message?: string;
 }
 type UsageLimitLineCallback = (event: UsageLimitLineEvent) => void;
+type InterruptedCallback = (event: { agent: string }) => void;
+
+/**
+ * Claude Code's answer to an interrupted turn, as its own tool-result row:
+ * `  ⎿  Interrupted · What should Claude do instead?`. Anchored on the `⎿`
+ * gutter so a reply that quotes the sentence (this file's own review, say)
+ * does not match.
+ */
+const CLAUDE_INTERRUPTED_LINE = /^⎿\s*Interrupted\s*·\s*What\s+should\s+Claude\s+do\s+instead\?\s*$/;
 
 interface AgentPattern {
   /** Display name. Surfaced in UI ("Claude Code", "Codex CLI"). */
@@ -765,6 +774,11 @@ export class AgentDetector {
   private callbacks: AgentEventCallback[] = [];
   private criticalCallbacks: CriticalEventCallback[] = [];
   private usageLimitCallbacks: UsageLimitLineCallback[] = [];
+  // Reported on every sighting: the row stays in the transcript, so a redraw
+  // prints it again, and consumers tell a fresh one apart by the Escape that
+  // must precede it (idleSuppression.recentlyEscaped). A dedup here would let a
+  // redrawn old row use up the report the real interrupt needs.
+  private interruptedCallbacks: InterruptedCallback[] = [];
   private readonly codexLimitScanner = new CodexUsageLimitLineScanner();
   private lineBuffer = '';
   // Per (agent:status) dedup: stores the last matched string for each key.
@@ -850,6 +864,19 @@ export class AgentDetector {
     return () => {
       const idx = this.usageLimitCallbacks.indexOf(callback);
       if (idx >= 0) this.usageLimitCallbacks.splice(idx, 1);
+    };
+  }
+
+  /**
+   * Subscribe to the agent's own "turn interrupted" row. Claude Code fires no
+   * Stop hook for an interrupted turn, so this row and the keystroke that
+   * caused it are the only evidence the turn is over.
+   */
+  onInterrupted(callback: InterruptedCallback): () => void {
+    this.interruptedCallbacks.push(callback);
+    return () => {
+      const idx = this.interruptedCallbacks.indexOf(callback);
+      if (idx >= 0) this.interruptedCallbacks.splice(idx, 1);
     };
   }
 
@@ -1216,6 +1243,12 @@ export class AgentDetector {
       (this.lastAgent === 'Codex CLI' || (this.lastAgent === null && this.activeAgents.has('Codex CLI')))) {
       const hit = this.codexLimitScanner.feed(clean);
       if (hit) for (const cb of this.usageLimitCallbacks) cb({ provider: 'codex', ...hit });
+    }
+
+    if (this.lastAgent === 'Claude Code'
+      && this.interruptedCallbacks.length > 0 && CLAUDE_INTERRUPTED_LINE.test(clean)) {
+      for (const cb of this.interruptedCallbacks) cb({ agent: 'Claude Code' });
+      return;
     }
 
     // Check critical patterns first

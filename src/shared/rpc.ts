@@ -1065,6 +1065,9 @@ export interface DaemonEvent {
     | 'phone.request'
     | 'agent.event'
     | 'agent.critical'
+    // The agent printed its own "turn interrupted" row (Claude Code fires no
+    // Stop hook for an interrupted turn). `data` is `{ agent: string }`.
+    | 'agent.interrupted'
     | 'activity.idle'
     | 'activity.active'
     // The agent process inside an interactive pane died (AgentProcessTracker's

@@ -860,6 +860,10 @@ export class DaemonSessionManager extends EventEmitter {
       this.emit('session:usageLimit', payload);
     });
 
+    bridge.on('turnInterrupted', (payload) => {
+      this.emit('session:turnInterrupted', payload);
+    });
+
     bridge.on('inputSubmitted', (payload) => {
       this.emit('session:inputSubmitted', payload);
     });

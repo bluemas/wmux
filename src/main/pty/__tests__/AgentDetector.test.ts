@@ -269,6 +269,37 @@ describe('AgentDetector', () => {
     });
   });
 
+  describe('interrupted-turn row', () => {
+    const ROW = '  \x1b[2m⎿\x1b[0m  Interrupted · What should Claude do instead?\n';
+
+    it('reports Claude Code\'s interrupt row on every sighting', () => {
+      const { det } = claudeGated();
+      const cb = vi.fn();
+      det.onInterrupted(cb);
+      det.feed(ROW);
+      expect(cb).toHaveBeenCalledTimes(1);
+      expect(cb.mock.calls[0][0]).toEqual({ agent: 'Claude Code' });
+      // A redraw prints it again; consumers filter on the preceding Escape.
+      det.feed(ROW);
+      expect(cb).toHaveBeenCalledTimes(2);
+    });
+
+    it('ignores the sentence quoted in a reply, and on a pane Claude does not own', () => {
+      const { det } = claudeGated();
+      const cb = vi.fn();
+      det.onInterrupted(cb);
+      det.feed('⏺ Claude printed "Interrupted · What should Claude do instead?" there.\n');
+      det.feed('  Interrupted · What should Claude do instead?\n');
+      expect(cb).not.toHaveBeenCalled();
+
+      const bare = new AgentDetector();
+      const bareCb = vi.fn();
+      bare.onInterrupted(bareCb);
+      bare.feed(ROW);
+      expect(bareCb).not.toHaveBeenCalled();
+    });
+  });
+
   describe('Codex approval prompts (Phase 2 — clean-room transcribed from Codex CLI 0.145.0)', () => {
     const gated = () => {
       const det = new AgentDetector();

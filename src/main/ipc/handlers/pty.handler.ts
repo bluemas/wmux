@@ -906,7 +906,8 @@ export function registerPTYHandlers(
       }
       // The interrupt edge: Ctrl+C / ESC ESC ends the agent's turn without any
       // Stop hook, and `claude` stays the foreground command so OSC 133 cannot
-      // see it either. Runs before the write so the settle is not gated on
+      // see it either. A lone ESC is recorded, and settles the turn once the
+      // agent prints its "Interrupted" row. Runs before the write so the settle is not gated on
       // delivery — the operator's intent is the same either way.
       ptyBridge.noteInterruptInput(id, data);
       const segments = segmentOversize(data);

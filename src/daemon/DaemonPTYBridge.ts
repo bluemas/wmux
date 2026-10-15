@@ -71,6 +71,9 @@ export function scanStartupDa1(text: string): 'answer' | 'more' | 'closed' {
  *  - 'notification' → { sessionId, event: TerminalNotification & { ts } }
  *  - 'critical' → { sessionId: string, event: CriticalEvent }
  *  - 'usageLimit' → { sessionId: string, event: UsageLimitLineEvent }
+ *  - 'turnInterrupted' → { sessionId: string, agent: string } — the agent
+ *                 printed its own "turn interrupted" row (not inside a
+ *                 resize redraw or a muted replay)
  *  - 'inputSubmitted' → { sessionId: string } (input with a submit boundary)
  *  - 'active'   → { sessionId, agentName?, likelyRepaint? } — onActive cycle
  *                 start; likelyRepaint marks a passive burst inside the
@@ -102,6 +105,7 @@ export class DaemonPTYBridge extends EventEmitter {
   private agentUnsubscribe: (() => void) | null = null;
   private criticalUnsubscribe: (() => void) | null = null;
   private usageLimitUnsubscribe: (() => void) | null = null;
+  private interruptedUnsubscribe: (() => void) | null = null;
   /** See noteInput: typed or pasted composer text not yet submitted. */
   private draftPending = false;
   private resizeGuardTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1260,6 +1264,12 @@ export class DaemonPTYBridge extends EventEmitter {
     this.usageLimitUnsubscribe = agentDetector.onUsageLimit((event) => {
       this.emit('usageLimit', { sessionId, event });
     });
+    // The interrupt row stays in the transcript: a resize redraw or a muted
+    // recovery replay prints it again for a turn that is long over.
+    this.interruptedUnsubscribe = agentDetector.onInterrupted(({ agent }) => {
+      if (this.muted || Date.now() - this.lastResizeAtMs < RESIZE_REDRAW_GUARD_MS) return;
+      this.emit('turnInterrupted', { sessionId, agent });
+    });
 
     // Prompt-based CWD detection state
     let lastDetectedCwd = '';
@@ -1551,6 +1561,8 @@ export class DaemonPTYBridge extends EventEmitter {
     this.criticalUnsubscribe = null;
     this.usageLimitUnsubscribe?.();
     this.usageLimitUnsubscribe = null;
+    this.interruptedUnsubscribe?.();
+    this.interruptedUnsubscribe = null;
 
     // Stop activity monitor to clear timers and state
     if (this.activityMonitor && this.sessionId) {

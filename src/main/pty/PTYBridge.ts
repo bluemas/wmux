@@ -19,10 +19,13 @@ import {
 import { dispatchNotification } from '../notification/dispatchNotification';
 import { createLeadingEdgeThrottle, VETO_TRACE_THROTTLE_MS } from '../pipe/handlers/hooks.rpc';
 import { settleHookTurnToIdle } from '../notification/turnSettle';
-import { InterruptKeystrokeDetector } from '../../shared/hooks/interruptKeystroke';
+import { InterruptKeystrokeDetector, isEscapeChunk } from '../../shared/hooks/interruptKeystroke';
+import { kittyChunkAsLegacy } from '../../shared/kittyKeyEvents';
 import {
   recentlyResized,
   RESIZE_REDRAW_GUARD_MS,
+  markEscapeKey,
+  recentlyEscaped,
   recentlySettled,
   SETTLE_REDRAW_GUARD_MS,
   clearPty as clearSuppression,
@@ -277,13 +280,19 @@ export class PTYBridge {
    *
    * Live finding (Claude Code 2.1.236): an interrupted turn fires NO Stop hook,
    * and `claude` stays the foreground command so OSC 133 cannot see it either —
-   * the keystroke is the pane's only evidence that the turn ended.
+   * the keystroke, and the agent's "Interrupted" row after it, are the pane's
+   * only evidence that the turn ended.
    *
    * A pane with no open latch is left alone: a Ctrl+C in a plain shell is not a
    * turn end, and broadcasting there would be the byte heuristic's job anyway.
+   *
+   * A lone Escape (Claude Code's own interrupt key) is only recorded here: it
+   * settles the pane once the agent confirms with its "Interrupted" row (see
+   * recentlyEscaped and the onInterrupted handlers).
    */
   noteInterruptInput(ptyId: string, data: string): void {
     try {
+      if (isEscapeChunk(kittyChunkAsLegacy(data))) markEscapeKey(ptyId);
       if (!this.interruptKeystrokes.observe(ptyId, data)) return;
       settleHookTurnToIdle(ptyId, this.getHookRouter?.() ?? null, this.getWindow());
     } catch (err) {
@@ -782,9 +791,22 @@ export class PTYBridge {
       }
     });
 
+    // The agent's "Interrupted" row confirms a lone Escape as an interrupt.
+    // Without a recent Escape the row is an old turn's, reprinted by a redraw
+    // (or the turn was already settled by Ctrl+C / ESC ESC).
+    const unsubInterrupted = agentDetector.onInterrupted(() => {
+      try {
+        if (!recentlyEscaped(ptyId) || recentlyResized(ptyId, RESIZE_REDRAW_GUARD_MS)) return;
+        settleHookTurnToIdle(ptyId, this.getHookRouter?.() ?? null, this.getWindow());
+      } catch (err) {
+        console.warn('[PTYBridge] onInterrupted callback error:', err);
+      }
+    });
+
     this.agentDetectorCleanups.set(ptyId, [
       unsubAgent,
       unsubActive,
+      unsubInterrupted,
       () => { if (resizeGuardTimer) clearTimeout(resizeGuardTimer); },
     ]);
 

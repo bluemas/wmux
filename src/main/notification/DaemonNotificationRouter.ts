@@ -8,6 +8,8 @@ import { dispatchNotification } from './dispatchNotification';
 import { toastManager } from './ToastManager';
 import {
   clearPty as clearSuppression,
+  ESC_INTERRUPT_CONFIRM_MS,
+  recentlyEscaped,
   recentlySettled,
   SETTLE_REDRAW_GUARD_MS,
 } from './idleSuppression';
@@ -1381,6 +1383,18 @@ export class DaemonNotificationRouter {
       }
     };
 
+    // The agent printed its own "turn interrupted" row. It confirms a lone
+    // Escape (recorded by PTYBridge.noteInterruptInput) as an interrupt; with
+    // no recent Escape it is an old turn's row, reprinted by a redraw.
+    const onAgentInterrupted = (payload: { sessionId: string }) => {
+      try {
+        if (!recentlyEscaped(payload.sessionId, ESC_INTERRUPT_CONFIRM_MS, this.now())) return;
+        settleHookTurnToIdle(payload.sessionId, this.getHookRouter?.() ?? null, this.getWindow(), this.now());
+      } catch (err) {
+        console.warn('[DaemonNotificationRouter] agent interrupted error:', err);
+      }
+    };
+
     // session:died (natural PTY exit) and session:destroyed (pty:dispose)
     // both clear agentStatus. Only listening to session:died left a stale
     // sidebar dot when the user closed a terminal intentionally (Codex P2).
@@ -1480,6 +1494,7 @@ export class DaemonNotificationRouter {
     this.daemonClient.on('session:died', onSessionEnd);
     this.daemonClient.on('session:destroyed', onSessionEnd);
     this.daemonClient.on('session:agentProcessExit', onAgentProcessExit);
+    this.daemonClient.on('session:agentInterrupted', onAgentInterrupted);
     this.daemonClient.on('session:transcriptActivity', onTranscriptActivity);
     this.daemonClient.on('session:restarted', onRestarted);
     this.daemonClient.on('supervision:changed', onSupervisionChanged);
@@ -1514,6 +1529,7 @@ export class DaemonNotificationRouter {
       () => this.daemonClient.off('session:died', onSessionEnd),
       () => this.daemonClient.off('session:destroyed', onSessionEnd),
       () => this.daemonClient.off('session:agentProcessExit', onAgentProcessExit),
+      () => this.daemonClient.off('session:agentInterrupted', onAgentInterrupted),
       () => this.daemonClient.off('session:transcriptActivity', onTranscriptActivity),
       () => this.daemonClient.off('session:restarted', onRestarted),
       () => this.daemonClient.off('supervision:changed', onSupervisionChanged),
