@@ -5388,7 +5388,7 @@ function registerRpcHandlers(
   }
 
   // daemon.ping
-  pipeServer.onRpc('daemon.ping', async (params) => {
+  pipeServer.onRpc('daemon.ping', async (params, ctx) => {
     const sessions = sessionManager.listSessions();
     const uptime = Math.floor((Date.now() - startTime) / 1000);
     // RCA A4 — report event-loop lag (ms) so the controller distinguishes a
@@ -5427,6 +5427,12 @@ function registerRpcHandlers(
       spawnedByVersion: SPAWNED_BY_VERSION,
       channelsEpoch: CHANNELS_EPOCH,
       ...pingFormatVersionField(activeEventLogFormatVersion),
+      // Whether THIS caller still receives pushed events. broadcast() drops a
+      // subscriber whose socket buffer passes the backpressure cap but leaves
+      // the connection up, so the app could not tell it had gone deaf: no
+      // agent status, titles or notifications until it restarted. Its health
+      // probe reads this and subscribes again.
+      eventsSubscribed: pipeServer.isEventSubscriber(ctx.clientId),
       // Explicitly requested diagnostics only: routine health probes stay cheap.
       ...(params?.includeMemory === true ? {
         memory: collectDaemonMemoryDiagnostics(sessionManager.listManagedSessions(), sessionPipes),

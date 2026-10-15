@@ -169,6 +169,16 @@ export class DaemonClient extends EventEmitter {
   // already gone.
   private eventHandshakeGeneration = 0;
 
+  /**
+   * Subscribe to pushed events again on the live connection. The daemon drops
+   * a subscriber whose socket buffer passes its backpressure cap without
+   * closing the socket, so the health probe calls this when a ping reports
+   * `eventsSubscribed: false`.
+   */
+  resubscribeEvents(): Promise<void> {
+    return this.startEventHandshake();
+  }
+
   private startEventHandshake(): Promise<void> {
     const generation = ++this.eventHandshakeGeneration;
     return new Promise<void>((resolve) => {

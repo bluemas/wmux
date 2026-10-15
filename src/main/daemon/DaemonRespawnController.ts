@@ -524,9 +524,17 @@ export class DaemonRespawnController {
     if (!client || !client.isConnected) return;
     try {
       const pong = (await client.rpc('daemon.ping', {}, { timeoutMs: this.cfg.healthTimeoutMs })) as
-        | { eventLoopLagMs?: number }
+        | { eventLoopLagMs?: number; eventsSubscribed?: boolean }
         | undefined;
       this.healthFailureCount = 0;
+      // The daemon dropped this connection's event subscription (it fell
+      // behind past the backpressure cap) but kept the socket. Without this the
+      // app stays deaf to agent status, titles and notifications until it is
+      // restarted. An older daemon omits the field.
+      if (pong?.eventsSubscribed === false && this.client === client) {
+        this.deps.logger.warn('daemon dropped our event subscription — subscribing again');
+        void client.resubscribeEvents();
+      }
       // RCA A4 — a ping that SUCCEEDS proves the daemon is alive even if its
       // event loop is lagging under load. Never escalate on a successful ping;
       // just surface the busy state for observability.
