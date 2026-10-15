@@ -3836,10 +3836,15 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // A pane that holds no context yet (a cold-parked workspace remounting,
       // the first reveal after start) does not build one here either: that is
       // the same ~0.5 s of synchronous GPU setup, per pane, before the switch
-      // can paint. It paints with the DOM renderer now and is upgraded from
-      // webglUpgradeQueue once reveals settle, one pane per idle period.
+      // can paint. The switch paints first, and webglUpgradeQueue builds the
+      // context right after, one pane per frame. The pane stays hidden until
+      // then rather than showing its DOM frame: at a fractional device pixel
+      // ratio the DOM renderer keeps fractional cell sizes while WebGL floors
+      // them to device pixels, so the swap visibly tightened letter and line
+      // spacing on screen, and the refit below re-wrapped the grid.
       let cancelUpgrade: (() => void) | null = null;
       let upgradeFitRaf: number | null = null;
+      let showAfterUpgrade: (() => void) | null = null;
       if (
         loadWebglRef.current &&
         disposeWebglRef.current &&
@@ -3848,12 +3853,28 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         if (webglAddonRef.current) {
           webglContextPool.acquire(token, loadWebglRef.current, disposeWebglRef.current);
         } else {
+          const el = terminalRef.current?.element;
+          if (el) el.style.visibility = 'hidden';
+          showAfterUpgrade = () => {
+            if (el) el.style.visibility = '';
+          };
+          const show = showAfterUpgrade;
           cancelUpgrade = webglUpgradeQueue.enqueue(() => {
-            if (!isVisibleRef.current || !loadWebglRef.current || !disposeWebglRef.current) return;
-            if (webglContextPool.acquireWouldEvict(token)) return;
+            if (
+              !isVisibleRef.current ||
+              !loadWebglRef.current ||
+              !disposeWebglRef.current ||
+              webglContextPool.acquireWouldEvict(token)
+            ) {
+              show();
+              return;
+            }
             const hadAddon = webglAddonRef.current !== null;
             webglContextPool.acquire(token, loadWebglRef.current, disposeWebglRef.current);
-            if (hadAddon || !webglAddonRef.current) return;
+            if (hadAddon || !webglAddonRef.current) {
+              show();
+              return;
+            }
             // The reveal's fit measured the DOM renderer's cell. WebGL rounds
             // the cell down to whole device pixels, so at a fractional cell
             // width the grid now holds too few columns (a blank strip, and a
@@ -3863,6 +3884,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
             upgradeFitRaf = requestAnimationFrame(() => {
               upgradeFitRaf = null;
               if (claimFit(terminalRef.current, pendingFitRef)) fit();
+              show();
             });
           });
         }
@@ -3892,6 +3914,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         cancelAnimationFrame(id);
         cancelUpgrade?.();
         if (upgradeFitRaf !== null) cancelAnimationFrame(upgradeFitRaf);
+        showAfterUpgrade?.();
       };
     }
     // Hidden: keep the WebGL context ("A hidden terminal KEEPS its WebGL
