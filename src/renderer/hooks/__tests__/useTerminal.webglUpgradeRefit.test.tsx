@@ -160,3 +160,33 @@ describe('useTerminal WebGL upgrade refit', { timeout: 60_000 }, () => {
     expect(fitSpy).not.toHaveBeenCalled();
   });
 });
+
+describe('useTerminal WebGL upgrade keeps the DOM frame off screen', { timeout: 60_000 }, () => {
+  // At a fractional device pixel ratio the DOM cell is wider and taller than
+  // the WebGL one, so showing the DOM frame first made the text visibly
+  // tighten when the renderer swapped. The pane stays hidden until then.
+  const xtermEl = () => host!.querySelector('.xterm') as HTMLElement;
+
+  it('hides the pane until the upgraded renderer has refit', async () => {
+    const { jobs } = await setup('p-upgrade-hidden-until-refit');
+    expect(xtermEl().style.visibility).toBe('hidden');
+    await act(async () => { jobs.at(-1)!(); });
+    expect(xtermEl().style.visibility).toBe('hidden');
+    await settle();
+    expect(xtermEl().style.visibility).toBe('');
+  });
+
+  it('shows the pane when building the renderer failed', async () => {
+    const { jobs } = await setup('p-upgrade-fail-shows');
+    webgl.fail = true;
+    await act(async () => { jobs.at(-1)!(); });
+    expect(xtermEl().style.visibility).toBe('');
+  });
+
+  it('shows the pane again when it hides before the upgrade ran', async () => {
+    const { Harness } = await setup('p-upgrade-hide-shows');
+    expect(xtermEl().style.visibility).toBe('hidden');
+    await act(async () => { root!.render(<Harness visible={false} />); });
+    expect(xtermEl().style.visibility).toBe('');
+  });
+});
