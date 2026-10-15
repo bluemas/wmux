@@ -271,6 +271,20 @@ describe('planAutoResume — Codex panes resume themselves on app start', () => 
     expect(line).toBe(`codex resume ${SID}`);
   });
 
+  it('never types the bypass flag for a role with skipPermissions', () => {
+    expect(planAutoResume({
+      enabled: true, agent: 'codex', binding, paneCwds: ['C:/git/Heartbound'],
+      roleBinding: { agent: 'codex', skipPermissions: true },
+    })).toBe(`codex resume ${SID}`);
+  });
+
+  it('drops the bypass flag from the role args', () => {
+    expect(planAutoResume({
+      enabled: true, agent: 'codex', binding, paneCwds: ['C:/git/Heartbound'],
+      roleBinding: { agent: 'codex', args: '--dangerously-bypass-approvals-and-sandbox' },
+    })).toBe(`codex resume ${SID}`);
+  });
+
   it('types nothing when the binding belongs to another agent or folder, or the setting is off', () => {
     expect(planAutoResume({ enabled: true, agent: 'codex', binding: { ...binding, agent: 'claude' }, paneCwds: ['C:/git/Heartbound'], roleBinding: undefined }))
       .toBeNull();
