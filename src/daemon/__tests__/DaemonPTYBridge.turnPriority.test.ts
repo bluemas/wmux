@@ -472,20 +472,35 @@ describe('DaemonPTYBridge turn priority', () => {
     // review-team [2-MODEL] catch: the alarm's working feed consumes
     // session:active, so a TUI repaint right after a resize would rebut a
     // pending completion window and silently kill a real "finished" alarm.
-    // The flag lets daemon/index.ts skip ONLY the alarm feed — the loose
-    // status dot still updates.
-    it('flags a passive burst inside the guard window, clears it after', () => {
+    // A passive burst inside the guard window is not emitted at all: it also
+    // lit the status dot, so revealing a workspace (which refits its panes)
+    // showed an idle Codex pane as running.
+    it('does not emit a passive burst inside the guard window', () => {
       const payloads: Array<{ sessionId: string; likelyRepaint?: boolean }> = [];
       bridge.on('active', (e: { sessionId: string; likelyRepaint?: boolean }) => payloads.push(e));
 
       bridge.noteResize();
       feed(BIG);
-      expect(payloads).toEqual([{ sessionId: 'sess-1', agentName: undefined, likelyRepaint: true }]);
+      expect(payloads).toEqual([]);
 
-      // Idle out, then a burst AFTER the guard window is real output.
+      // A burst AFTER the guard window is real output.
       vi.advanceTimersByTime(5_000 + 100);
       feed(BIG);
-      expect(payloads[1]).toMatchObject({ sessionId: 'sess-1', likelyRepaint: false });
+      expect(payloads).toEqual([{ sessionId: 'sess-1', agentName: undefined, likelyRepaint: false }]);
+    });
+
+    it('a turn that keeps writing past the guard window still reports running', () => {
+      const payloads: Array<{ sessionId: string; likelyRepaint?: boolean }> = [];
+      bridge.on('active', (e: { sessionId: string; likelyRepaint?: boolean }) => payloads.push(e));
+
+      bridge.noteResize();
+      feed(BIG);
+      expect(payloads).toEqual([]);
+      // No idle gap: the rejected burst handed its cycle back, so output
+      // right after the guard window opens a new one.
+      vi.advanceTimersByTime(3_100);
+      feed(BIG);
+      expect(payloads).toEqual([{ sessionId: 'sess-1', agentName: undefined, likelyRepaint: false }]);
     });
 
     it('never flags a burst started by submitted input', () => {
