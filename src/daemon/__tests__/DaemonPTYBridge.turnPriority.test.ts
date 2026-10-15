@@ -503,6 +503,21 @@ describe('DaemonPTYBridge turn priority', () => {
       expect(payloads).toEqual([{ sessionId: 'sess-1', agentName: undefined, likelyRepaint: false }]);
     });
 
+    it('a hook running edge inside the guard window still reports running', () => {
+      // The hook's running edge armed the cycle; the first output byte is its
+      // proof even inside the resize window, and a sparse turn after it must
+      // not fall back to the byte threshold.
+      bridge.noteResize();
+      bridge.noteAgentStatus('running', true);
+      feed('tick');
+      for (let i = 0; i < 10; i++) {
+        vi.advanceTimersByTime(1_000);
+        feed('tick');
+      }
+      expect(active).toEqual(['sess-1']);
+      expect(idle).toEqual([]);
+    });
+
     it('never flags a burst started by submitted input', () => {
       const payloads: Array<{ sessionId: string; likelyRepaint?: boolean }> = [];
       bridge.on('active', (e: { sessionId: string; likelyRepaint?: boolean }) => payloads.push(e));

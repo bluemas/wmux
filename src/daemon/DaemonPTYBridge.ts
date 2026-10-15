@@ -1157,8 +1157,13 @@ export class DaemonPTYBridge extends EventEmitter {
             // two-minute activity window. Like the settled rejections above,
             // hand the cycle back instead of consuming it, so a real turn that
             // keeps writing past the guard window still reports running.
-            activityMonitor.endTurn(ptyId);
-            return;
+            // A turn a hook already opened is exempt: its running edge armed
+            // this cycle, and handing it back would drop that signal to the
+            // byte threshold for the rest of a sparse-output turn.
+            if (!this.turnOpen) {
+              activityMonitor.endTurn(ptyId);
+              return;
+            }
           } else {
             this.agentDetector?.resetEmissionState();
             this.openTurn(true);
