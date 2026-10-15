@@ -231,3 +231,38 @@ describe('PTYBridge settle-redraw guard (the burst that follows a settle)', () =
     expect(runningBroadcasts('p1')).toBe(1);
   });
 });
+
+describe('PTYBridge lone Escape confirmed by the agent\'s "Interrupted" row', () => {
+  const ROW = '  \u001b[2m⎿\u001b[0m  Interrupted · What should Claude do instead?\r\n';
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    mocks.broadcastMetadataUpdate.mockClear();
+    mocks.lastBroadcastAgentStatus.clear();
+    clearSuppression('p1');
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('settles the interrupted turn once, and not the next one when the row is redrawn', () => {
+    const { bridge, router, proc } = makeBridge();
+    bridge.setupDataForwarding('p1');
+    proc.emitData('Claude Code v2.1.172\r\n  bypass permissions on\r\n');
+    vi.advanceTimersByTime(50);
+
+    router.noteHookTurnStart('p1', Date.now(), 'claude');
+    bridge.noteInterruptInput('p1', '\x1b');
+    proc.emitData(ROW);
+    vi.advanceTimersByTime(50);
+    expect(router.governsRunningState('p1')).toBe(false);
+    expect(recentlyEscaped('p1')).toBe(false);
+
+    // The next turn starts inside the Escape window; a repaint prints the row again.
+    vi.advanceTimersByTime(1_500);
+    router.noteHookTurnStart('p1', Date.now(), 'claude');
+    proc.emitData(ROW);
+    vi.advanceTimersByTime(50);
+    expect(router.governsRunningState('p1')).toBe(true);
+  });
+});
