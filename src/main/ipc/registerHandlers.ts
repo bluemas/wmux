@@ -2,7 +2,7 @@ import { registerTerminalCoreHandlers } from './handlers/terminalCore.handler';
 import { registerQuickCommandHandlers } from './handlers/quickCommand.handler';
 import { registerUsageLimitHandlers } from '../usageLimit/usageLimit.handler';
 import { registerWorkspaceSettle } from '../workspace/settle/workspaceSettleHost';
-import { ipcMain, type BrowserWindow } from 'electron';
+import { ipcMain, nativeTheme, type BrowserWindow } from 'electron';
 import { PTYManager } from '../pty/PTYManager';
 import { PTYBridge } from '../pty/PTYBridge';
 import { DaemonClient } from '../DaemonClient';
@@ -225,8 +225,10 @@ export function registerAllHandlers(
   // the daemon). Without a DaemonClient there is no control pipe to forward to, so
   // the handlers stay unregistered and the Settings section hides itself.
   const cleanupLanLink = daemonClient ? registerLanLinkHandlers(daemonClient) : null;
-  // Cross-host A2A control plane — daemon-mode only, same reason as LanLink.
-  const cleanupA2aRemote = daemonClient ? registerA2aRemoteHandlers(daemonClient) : null;
+  // Cross-host A2A control plane — daemon-mode only (its state lives in the
+  // daemon), but registered before the daemon connects too: the renderer
+  // reads the Remote feed at start, and its reads wait for the client.
+  const cleanupA2aRemote = registerA2aRemoteHandlers(daemonClient ?? null);
 
   // TASK-6 Fleet View resource attribution — daemon-mode only (the shell PIDs
   // live in the daemon session list). Renderer polls this ONLY while Fleet View
@@ -399,6 +401,18 @@ export function registerAllHandlers(
   };
   ipcMain.removeAllListeners(IPC.WINDOW_SET_TITLEBAR_OVERLAY);
   ipcMain.on(IPC.WINDOW_SET_TITLEBAR_OVERLAY, onSetTitleBarOverlay);
+
+  // macOS window glass: the vibrancy material follows the app's appearance,
+  // so the renderer sets it from the theme (a dark theme gets the dark
+  // material on a light Mac). App-wide by design: native menus and the
+  // in-app browser's prefers-color-scheme follow the theme too.
+  const onSetAppearance = (_event: Electron.IpcMainEvent, appearance: unknown): void => {
+    if (process.platform !== 'darwin') return;
+    if (appearance !== 'dark' && appearance !== 'light' && appearance !== 'system') return;
+    if (nativeTheme.themeSource !== appearance) nativeTheme.themeSource = appearance;
+  };
+  ipcMain.removeAllListeners(IPC.WINDOW_SET_APPEARANCE);
+  ipcMain.on(IPC.WINDOW_SET_APPEARANCE, onSetAppearance);
 
   // Whole-interface zoom (#822). The renderer owns the persisted factor and
   // pushes it here whenever it changes (Settings slider, session hydration).

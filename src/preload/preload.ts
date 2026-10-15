@@ -8,6 +8,8 @@ import { ROOM_EVENT } from '../shared/room';
 import { BOT_EVENT } from '../shared/bot';
 import { BOT_APPROVAL_IPC } from '../shared/botApproval';
 import { BOT_SECRET_IPC } from '../shared/botSecret';
+import { CONNECTOR_IPC } from '../shared/botConnector';
+import { BOT_GROUP_IPC } from '../shared/botGroup';
 import type { PaneLabelRejection } from '../shared/paneLabelRules';
 import { CHROME_PANE_IPC, type ChromePaneBindings } from '../shared/chromePaneBinding';
 import {
@@ -16,6 +18,7 @@ import {
   type BrowserPolicyWritePayload,
   type BrowserPolicyGrantsPayload,
   type BrowserPolicyWriteResult,
+  type BrowserPolicyBlockedResult,
 } from '../shared/browserPolicy';
 import type {
   AgySensorInstallResult,
@@ -140,12 +143,18 @@ export interface McpRegisterTargetResult {
 
 
 /** A bot.* call as the operator, with the router's envelope and the
- *  handler's refusal flattened to {ok, message?}. */
-async function factoryBotCall(method: string, params: Record<string, unknown>): Promise<{ ok: boolean; message?: string }> {
+ *  handler's refusal flattened to {ok, message?, code?}: the refusal's code
+ *  (repo_mismatch, no_remote…) lets the renderer tell refusals apart. */
+async function factoryBotCall(method: string, params: Record<string, unknown>): Promise<{ ok: boolean; message?: string; code?: string }> {
   const resp = (await ipcRenderer.invoke(IPC.RPC_INVOKE, method, params)) as { ok?: unknown; result?: unknown; error?: unknown } | null;
   if (!resp || resp.ok !== true) return { ok: false, message: typeof resp?.error === 'string' ? resp.error : 'the bot call failed' };
-  const result = (resp.result ?? {}) as { ok?: unknown; message?: unknown };
-  return result.ok === false ? { ok: false, message: typeof result.message === 'string' ? result.message : 'refused' } : { ok: true };
+  const result = (resp.result ?? {}) as { ok?: unknown; message?: unknown; code?: unknown };
+  if (result.ok !== false) return { ok: true };
+  return {
+    ok: false,
+    message: typeof result.message === 'string' ? result.message : 'refused',
+    ...(typeof result.code === 'string' && result.code ? { code: result.code } : {}),
+  };
 }
 
 const chat: ChatBridgeApi = {
@@ -462,6 +471,9 @@ const electronAPI = {
       ipcRenderer.on(IPC.SYSTEM_RESUMED, listener);
       return () => { ipcRenderer.removeListener(IPC.SYSTEM_RESUMED, listener); };
     },
+    /** Windows: the system asks for reduced motion (Animation effects off).
+     *  False elsewhere, where the media query already says it. */
+    getReducedMotion: () => ipcRenderer.invoke(IPC.SYSTEM_REDUCED_MOTION) as Promise<boolean>,
   },
   settings: {
     getTerminalCore: () => ipcRenderer.invoke(IPC.TERMINAL_CORE_SETTINGS_GET) as Promise<TerminalCoreSettings>,
@@ -1010,6 +1022,9 @@ const electronAPI = {
       // Revoke standing consent ("Always on this pane"); revocation only.
       grants: (payload: BrowserPolicyGrantsPayload): Promise<BrowserPolicyWriteResult> =>
         ipcRenderer.invoke(BROWSER_POLICY_IPC.grants, payload),
+      // Hosts the pane's protected proxy refused recently (#2063); read only.
+      blocked: (workspaceId: string, paneId: string): Promise<BrowserPolicyBlockedResult> =>
+        ipcRenderer.invoke(BROWSER_POLICY_IPC.blocked, { workspaceId, paneId }),
     },
     onDiscarded: (callback: (surfaceId: string) => void) => {
       const listener = (_e: Electron.IpcRendererEvent, surfaceId: string) => callback(surfaceId);
@@ -1182,6 +1197,10 @@ const electronAPI = {
       factoryBotCall(`bot.${action}`, { botId }),
     updateBot: (botId: string, patch: Record<string, unknown>) =>
       factoryBotCall('bot.update', { botId, patch }),
+    // Remove a bot: its work is stopped, its routines go, its history stays
+    // (`hue`: its colour slot, kept for the cards it wrote).
+    removeBot: (botId: string, hue?: number) =>
+      factoryBotCall('bot.remove', { botId, ...(hue !== undefined ? { hue } : {}) }),
     createBot: (req: import('../shared/botCreate').FactoryBotCreateRequest) =>
       ipcRenderer.invoke(IPC.FACTORY_BOT_CREATE, req) as Promise<import('../shared/botCreate').FactoryBotCreateResult>,
     createBotTeam: (req: import('../shared/botCreate').FactoryBotCreateTeamRequest) =>
@@ -1209,6 +1228,13 @@ const electronAPI = {
     // active workspace); rejects when no tab could be opened. Poll
     // factoryEngineReadiness to see it land.
     factoryEngineLogin: () => ipcRenderer.invoke(IPC.FACTORY_ENGINE_LOGIN) as Promise<void>,
+    // The engines a bot's workers may run on, and which are installed here.
+    workerAgents: () =>
+      ipcRenderer.invoke(IPC.FACTORY_WORKER_AGENTS) as Promise<import('../shared/botWorkerAgent').BotWorkerAgentOption[]>,
+    taskFolderUsage: () =>
+      ipcRenderer.invoke(IPC.FACTORY_TASK_FOLDERS_USAGE) as Promise<import('../shared/botTask').FactoryTaskFolderUsage | null>,
+    cleanTaskFolders: () =>
+      ipcRenderer.invoke(IPC.FACTORY_TASK_FOLDERS_CLEAN) as Promise<import('../shared/botTask').FactoryTaskFolderCleanResult>,
     // Every bot's routines, read-only (routine.list as the operator).
     listRoutines: async (): Promise<import('../shared/botRoutine').BotRoutine[]> => {
       const resp = (await ipcRenderer.invoke(IPC.RPC_INVOKE, 'routine.list', {})) as { ok?: unknown; result?: { ok?: unknown; routines?: unknown } } | null;
@@ -1225,6 +1251,31 @@ const electronAPI = {
       delete: (name: string) => ipcRenderer.invoke(BOT_SECRET_IPC.delete, { name }) as Promise<{ ok: boolean }>,
       login: (req: { workspaceId: string; cardId: string; done?: boolean }) =>
         ipcRenderer.invoke(BOT_SECRET_IPC.login, req) as Promise<import('../renderer/components/Room/botSecrets').LoginResult>,
+    },
+    // The connection library (renderer/components/Room/botConnectors.ts):
+    // a key's value goes out once, in save; nothing reads one back.
+    connectors: {
+      list: () => ipcRenderer.invoke(CONNECTOR_IPC.list) as Promise<import('../shared/botConnector').ConnectorListResult>,
+      save: (req: import('../shared/botConnector').ConnectorSaveRequest) =>
+        ipcRenderer.invoke(CONNECTOR_IPC.save, req) as Promise<import('../shared/botConnector').ConnectorSaveResult>,
+      remove: (req: import('../shared/botConnector').ConnectorRemoveRequest) =>
+        ipcRenderer.invoke(CONNECTOR_IPC.remove, req) as Promise<import('../shared/botConnector').ConnectorRemoveResult>,
+      setOffForBot: (req: { id: string; botId: string; off: boolean }) =>
+        ipcRenderer.invoke(CONNECTOR_IPC.setOffForBot, req) as Promise<import('../shared/botConnector').ConnectorSimpleResult>,
+      setEnabled: (req: { id: string; enabled: boolean }) =>
+        ipcRenderer.invoke(CONNECTOR_IPC.setEnabled, req) as Promise<import('../shared/botConnector').ConnectorSimpleResult>,
+    },
+    // The owner's group chats (shared/botGroup.ts); changes arrive as
+    // BOT_EVENT {type:'groups-changed'}.
+    groups: {
+      list: (req?: { workspaceId?: string }) =>
+        ipcRenderer.invoke(BOT_GROUP_IPC.list, req ?? {}) as Promise<import('../shared/botGroup').BotGroupListResult>,
+      create: (req: import('../shared/botGroup').BotGroupCreateRequest) =>
+        ipcRenderer.invoke(BOT_GROUP_IPC.create, req) as Promise<import('../shared/botGroup').BotGroupResult>,
+      update: (req: import('../shared/botGroup').BotGroupUpdateRequest) =>
+        ipcRenderer.invoke(BOT_GROUP_IPC.update, req) as Promise<import('../shared/botGroup').BotGroupResult>,
+      remove: (id: string) =>
+        ipcRenderer.invoke(BOT_GROUP_IPC.remove, { id }) as Promise<import('../shared/botGroup').BotGroupRemoveResult>,
     },
   },
   // Owner approvals of what bots ask for (main/ipc/handlers/approval.handler.ts:
@@ -1363,7 +1414,6 @@ const electronAPI = {
       ipcRenderer.invoke(IPC.WORKTASK_DELETE_PHONE_BRANCH, { repo, branch }) as Promise<{ ok: boolean; error?: string }>,
   },
   dialog: {
-    pickFile: () => ipcRenderer.invoke(IPC.DIALOG_PICK_FILE) as Promise<string[]>,
     pickFolder: () => ipcRenderer.invoke(IPC.DIALOG_PICK_FOLDER) as Promise<string[]>,
   },
   // Project config (X5 wmux.json). `get` resolves a workspace cwd to the
@@ -1655,6 +1705,12 @@ const electronAPI = {
     // Main validates the payload and no-ops on non-Windows platforms.
     setTitleBarOverlay: (opts: { color: string; symbolColor: string }) => {
       ipcRenderer.send(IPC.WINDOW_SET_TITLEBAR_OVERLAY, opts);
+    },
+    // macOS window glass: match the app's appearance to the theme so the
+    // material behind the window has the theme's tone, or 'system' with glass
+    // off. Main validates it.
+    setAppearance: (appearance: 'dark' | 'light' | 'system') => {
+      ipcRenderer.send(IPC.WINDOW_SET_APPEARANCE, appearance);
     },
     // Whole-interface zoom (#822): push the persisted factor to main, which
     // scales the renderer and re-places the native chrome. The overlay color

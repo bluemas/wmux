@@ -24,7 +24,9 @@
 //     the gate runner); `update` ignores a caller-supplied gate.
 //   - `completed`: only by a `brain`, only from `review_requested` (table),
 //     only with a SYSTEM-recorded gate whose exitCode is exactly 0 — unless
-//     `force: true` with a non-empty `reason`, which is logged on the entry.
+//     `force: true` with a non-empty `reason`, which is logged on the entry,
+//     or the row is a bot's research task (`isResearchDispatch`: main wrote
+//     its dispatch; it changes no code, so there is no gate to run).
 //   - CAS: every update names the `expectedRev` it read; a stale one is
 //     refused.
 //   - WorkTask closed/detached → `closeTask` forces `cancelled` unless the
@@ -38,6 +40,7 @@
 // boots and acknowledged only once a wake actually delivered it.
 
 import * as fs from 'node:fs';
+import { assertNotLiveWmuxPath } from '../../shared/constants';
 import * as path from 'node:path';
 import {
   LEDGER_GATE_TAIL_MAX_BYTES,
@@ -48,6 +51,7 @@ import {
   canActorSet,
   canTransition,
   isLedgerStatus,
+  isResearchDispatch,
   type LedgerActor,
   type LedgerDispatch,
   type LedgerEntry,
@@ -233,6 +237,9 @@ function copyDispatch(d: LedgerDispatch): LedgerDispatch {
     ...(d.checkout ? { checkout: { sha: d.checkout.sha, detached: true as const } } : {}),
     ...(d.threadId ? { threadId: d.threadId } : {}),
     ...(typeof d.handoffId === 'string' && /^[A-Za-z0-9_.:-]{1,100}$/.test(d.handoffId) ? { handoffId: d.handoffId } : {}),
+    ...(Array.isArray(d.connectors) && d.connectors.length > 0 && d.connectors.length <= 8 && d.connectors.every((n) => typeof n === 'string' && /^[a-z][a-z0-9-]{0,30}[a-z0-9]$/.test(n))
+      ? { connectors: [...d.connectors] }
+      : {}),
   };
 }
 
@@ -268,6 +275,7 @@ export class TaskLedger {
   readonly recoveredFromRotated: boolean;
 
   constructor(opts: TaskLedgerOptions) {
+    assertNotLiveWmuxPath(opts.dir);
     this.dir = opts.dir;
     this.filePath = getTaskLedgerPath(opts.dir);
     this.now = opts.now ?? Date.now;
@@ -438,7 +446,7 @@ export class TaskLedger {
       // gate runner (system). A gate that arrived on the wire never counts.
       const gate = entry.gate;
       const gatePassed = gate !== undefined && gate.recordedBy === 'system' && gate.exitCode === 0;
-      if (!gatePassed) {
+      if (!gatePassed && !isResearchDispatch(entry.dispatch)) {
         if (input.force !== true) {
           return {
             ok: false,

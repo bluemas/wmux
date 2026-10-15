@@ -26,6 +26,8 @@ import { useT } from '../../hooks/useT';
 import { BOT_JOB_MAX, BOT_NAME_MAX, TEMPLATE_LEGACY_ROLE, isCoordinatorBot, normalizeBotJob, normalizeBotName, type BotProfile, type BotRole, type BotTemplate } from '../../../shared/bot';
 import { TEAM_TEMPLATES, type FactoryBotAvatarPickResult, type FactoryBotRepoSuggestion } from '../../../shared/botCreate';
 import { FACTORY_LANE_DAILY_CAP_MAX } from '../../../shared/factorySettings';
+import type { FactoryTaskFolderUsage } from '../../../shared/botTask';
+import { getLocale } from '../../i18n';
 import { refreshRoomStatus } from '../../hooks/useRoomSync';
 import {
   getFactoryBotPort,
@@ -48,10 +50,13 @@ import Select from '../ui/Select';
 import Input from '../ui/Input';
 import { FOCUS_RING } from '../focusRing';
 import { BotSecretsSection, PhoneBotSelect } from './BotSecretsSection';
+import { BotConnectionsSection } from './BotConnectionsSection';
 import { InlineConfirm } from '../Bots/InlineConfirm';
 import { selectBotTaskOwners, withoutBotTasks } from '../Sidebar/botTasks';
 import { listedWorkspaces } from '../../stores/slices/moaSlice';
-import { createBot, turnBotsOn } from '../Bots/botsAddBot';
+import { createBot, turnBotsOn, type TurnBotsOnResult } from '../Bots/botsAddBot';
+import { botsOnPatch, useBotsPlanConsent } from '../Bots/BotsPlanConsent';
+import { botsStopPort, toastStoppedWork } from '../Bots/botsStop';
 
 type T = (key: string, vars?: Record<string, string | number>) => string;
 
@@ -319,8 +324,9 @@ type Workspaces = readonly { id: string; name: string }[];
 const NO_LIST_PORT: FactoryBotPort = { available: false, list: async () => [], subscribe: () => () => undefined, act: async () => ({ ok: false }) };
 
 export interface AddBotFormProps {
-  /** Called with the new bot after it was added, and with nothing on Cancel. */
-  onDone: (bot?: BotProfile) => void;
+  /** Called with the new bot after it was added (a team: its lead, and the
+   *  whole team), and with nothing on Cancel. */
+  onDone: (bot?: BotProfile, team?: readonly BotProfile[]) => void;
   /** The rest default to the app's own: the bot port, its bots, the store's
    *  workspaces (the active one first picked) and the folder dialog. */
   t?: T;
@@ -331,9 +337,9 @@ export interface AddBotFormProps {
   pickFolder?: () => Promise<string | null>;
   /** The bots are off: Add asks once, in place, then turns them on. */
   botsOff?: boolean;
-  /** Turns the bots on (default: the factory settings port). False: main
-   *  did not take it. */
-  turnOn?: () => Promise<boolean>;
+  /** Turns the bots on, asking the plan consent when needed (default: the
+   *  factory settings port, which turns them on only with consent stored). */
+  turnOn?: () => Promise<TurnBotsOnResult>;
 }
 
 /** Why Add cannot be pressed, as one line's key, or null. Pure. */
@@ -481,8 +487,10 @@ export function AddBotForm(props: AddBotFormProps): React.ReactElement {
     setError(null);
     try {
       if (turnOnFirst) {
-        const turnOn = props.turnOn ?? (() => turnBotsOn(getFactorySettingsPort()));
-        if (!(await turnOn())) { setError(t('settings.factory.notStarted')); return; }
+        const turnOn = props.turnOn ?? (() => turnBotsOn(getFactorySettingsPort(), async () => false));
+        const on = await turnOn();
+        if (on === 'declined') return;
+        if (on !== 'on') { setError(t('settings.factory.notStarted')); return; }
       }
       const r = await createBot(port, {
         workspaceId,
@@ -507,12 +515,14 @@ export function AddBotForm(props: AddBotFormProps): React.ReactElement {
     setError(null);
     try {
       if (turnOnFirst) {
-        const turnOn = props.turnOn ?? (() => turnBotsOn(getFactorySettingsPort()));
-        if (!(await turnOn())) { setError(t('settings.factory.notStarted')); return; }
+        const turnOn = props.turnOn ?? (() => turnBotsOn(getFactorySettingsPort(), async () => false));
+        const on = await turnOn();
+        if (on === 'declined') return;
+        if (on !== 'on') { setError(t('settings.factory.notStarted')); return; }
       }
       const r = await port.createTeam({ workspaceId, names: teamNames(t), ...(repo.repoFolder ? { repoFolder: repo.repoFolder } : {}) });
       // The team's lead is the one to talk to: its chat opens.
-      if (r.ok) onDone(r.bots[0]);
+      if (r.ok) onDone(r.bots[0], r.bots);
       else setError(r.message || t('settings.factory.addTeamFailed'));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -651,7 +661,7 @@ function BotsList({ t, port, workspaceName, workspaces, defaultWorkspaceId, pick
   defaultWorkspaceId: string;
   pickFolder: () => Promise<string | null>;
   botsOff: boolean;
-  turnOn: () => Promise<boolean>;
+  turnOn: () => Promise<TurnBotsOnResult>;
 }) {
   const rows = useFactoryBots(null, port);
   const [editing, setEditing] = useState<string | null>(null);
@@ -722,6 +732,76 @@ function BotsList({ t, port, workspaceName, workspaces, defaultWorkspaceId, pick
   );
 }
 
+/** A folder size in the reader's language: MB, or GB from 1 GB. Pure. */
+export function taskFolderSize(bytes: number, locale?: string): string {
+  const gb = bytes >= 1024 ** 3;
+  const value = gb ? bytes / 1024 ** 3 : bytes / 1024 ** 2;
+  return new Intl.NumberFormat(locale, { style: 'unit', unit: gb ? 'gigabyte' : 'megabyte', maximumFractionDigits: value < 10 ? 1 : 0 }).format(value);
+}
+
+/** Settings › Bots: the space bot task folders use, and Clean up now (the
+ *  task-end rules over every ended bot task; main/factory/taskFolderCleanup.ts). */
+function TaskFoldersRow({ port, t, disabled }: { port: FactorySettingsPort; t: T; disabled: boolean }) {
+  const [usage, setUsage] = useState<FactoryTaskFolderUsage | null | undefined>(undefined);
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState<{ text: string; tone: 'muted' | 'danger' } | null>(null);
+  const readUsage = port.taskFolderUsage;
+  const live = useRef(true);
+  useEffect(() => () => { live.current = false; }, []);
+  const read = useCallback(() => {
+    if (!readUsage) return;
+    readUsage().then((u) => { if (live.current) setUsage(u); }, () => { if (live.current) setUsage(null); });
+  }, [readUsage]);
+  useEffect(() => { read(); }, [read]);
+  if (!readUsage) return null;
+  const clean = port.cleanTaskFolders;
+  const text = usage === undefined
+    ? t('settings.factory.taskFolders.reading')
+    : usage === null
+      ? t('settings.factory.taskFolders.unknown')
+      : [
+        t('settings.factory.taskFolders.usage', { size: taskFolderSize(usage.bytes, getLocale()), count: usage.folders }),
+        ...(usage.dirty > 0 ? [t('settings.factory.taskFolders.kept', { count: usage.dirty })] : []),
+      ].join(' · ');
+  return (
+    <>
+      <SettingRow id="factorytaskfolders" label={t('settings.factory.taskFolders')} description={t('settings.factory.taskFoldersDesc')}>
+        <div className="flex items-center gap-2">
+          <span data-testid="factory-task-folders-usage" className="text-[13px] text-[var(--text-sub)] tabular-nums">{text}</span>
+          {clean && (
+            <Button
+              size="sm"
+              variant="secondary"
+              data-testid="factory-task-folders-clean"
+              disabled={disabled || busy}
+              onClick={() => {
+                setBusy(true);
+                setNote(null);
+                void clean()
+                  .then((r) => {
+                    if (!live.current) return;
+                    setNote(r.ok
+                      ? { text: t('settings.factory.taskFolders.cleaned', { removed: r.removed, kept: r.keptDirty, busy: r.busy }), tone: 'muted' }
+                      : { text: t('settings.factory.taskFolders.cleanFailed', { message: r.message }), tone: 'danger' });
+                  })
+                  .catch((err: unknown) => { if (live.current) setNote({ text: t('settings.factory.taskFolders.cleanFailed', { message: String(err) }), tone: 'danger' }); })
+                  .finally(() => {
+                    if (!live.current) return;
+                    setBusy(false);
+                    read();
+                  });
+              }}
+            >
+              {t('settings.factory.taskFolders.clean')}
+            </Button>
+          )}
+        </div>
+      </SettingRow>
+      {note && <SettingNote tone={note.tone} data-testid="factory-task-folders-note" role={note.tone === 'danger' ? 'alert' : 'status'}>{note.text}</SettingNote>}
+    </>
+  );
+}
+
 export interface FactoryTabProps {
   /** Tests: the ports (default: the preload's factory bridge). */
   settingsPort?: FactorySettingsPort;
@@ -762,17 +842,28 @@ export function FactoryTab({ settingsPort, botPort, pickFolder }: FactoryTabProp
       const next = await sPort.set(p);
       if (next) setSettings(next);
       else setError(t('settings.factory.notStarted'));
+      // Off stops the bots' running work too: main says what it stopped.
+      if (p.enabled === false) toastStoppedWork(next, t, useStore.getState(), botsStopPort(bPort));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
     if ('enabled' in p) void refreshRoomStatus();
   };
+  // Turning the bots on asks the plan consent first when it is not stored.
+  const consent = useBotsPlanConsent(t);
+  const setEnabled = async (on: boolean) => {
+    if (!on) return patch({ enabled: false });
+    const p = await botsOnPatch(settings, consent.confirmOn);
+    if (p) await patch(p);
+  };
   // "Add bot" while the bots are off turns them on (after its confirm).
-  const turnOn = async (): Promise<boolean> => {
-    const next = await sPort.set({ enabled: true });
+  const turnOn = async (): Promise<TurnBotsOnResult> => {
+    const p = await botsOnPatch(settings, consent.confirmOn);
+    if (!p) return 'declined';
+    const next = await sPort.set(p);
     if (next) setSettings(next);
     void refreshRoomStatus();
-    return !!next?.enabled;
+    return next?.enabled ? 'on' : 'failed';
   };
 
   const off = !sPort.available || !settings;
@@ -786,7 +877,7 @@ export function FactoryTab({ settingsPort, botPort, pickFolder }: FactoryTabProp
       )}
       <SettingsSection title={t('settings.factory.section')}>
         <SettingRow id="factoryswitch" label={t('settings.factory.enabled')} description={t('settings.factory.enabledDesc')}>
-          <Switch checked={settings?.enabled === true} disabled={off} onCheckedChange={(v) => void patch({ enabled: v })} data-testid="factory-enabled" />
+          <Switch checked={settings?.enabled === true} disabled={off} onCheckedChange={(v) => void setEnabled(v)} data-testid="factory-enabled" />
         </SettingRow>
         <SettingRow id="factorytrustedauthors" label={t('settings.factory.trustedAuthors')} description={t('settings.factory.trustedAuthorsDesc')}>
           <Input
@@ -882,6 +973,7 @@ export function FactoryTab({ settingsPort, botPort, pickFolder }: FactoryTabProp
         <SettingRow id="factoryphonebot" label={t('settings.factory.phoneBot')} description={t('settings.factory.phoneBotDesc')}>
           <PhoneBotSelect t={t} disabled={off} value={settings?.phoneBotId ?? undefined} onChange={(id) => void patch({ phoneBotId: id })} />
         </SettingRow>
+        <TaskFoldersRow port={sPort} t={t} disabled={off} />
         {error && <SettingNote tone="danger" role="alert">{error}</SettingNote>}
       </SettingsSection>
       <SettingsSection id="factorybots" title={t('settings.factory.bots')} description={t('settings.factory.botsDesc')}>
@@ -896,8 +988,10 @@ export function FactoryTab({ settingsPort, botPort, pickFolder }: FactoryTabProp
           turnOn={turnOn}
         />
       </SettingsSection>
+      <BotConnectionsSection t={t} />
       <ApprovalRules t={t} botName={botName} workspaceName={workspaceName} />
       <BotSecretsSection t={t} />
+      {consent.dialog}
     </div>
   );
 }

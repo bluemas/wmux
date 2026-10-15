@@ -386,7 +386,8 @@ describe('Add team', () => {
         issue: 'botsPage.teamName.issue', reviewer: 'botsPage.teamName.reviewer',
       },
     });
-    expect(onDone).toHaveBeenCalledWith(lead);
+    // The lead opens; the whole team goes along (the page offers a group chat with it).
+    expect(onDone).toHaveBeenCalledWith(lead, [lead]);
   });
 
   it('is not offered in a workspace that already has a coordinator; with the bots off it asks first', async () => {
@@ -395,7 +396,7 @@ describe('Add team', () => {
     await render(createElement(AddBotForm, { port, t, rows: withLead, workspaces: [{ id: WS, name: 'App' }], defaultWorkspaceId: WS, onDone: () => undefined }));
     expect(q('factory-add-team')).toBeNull();
     const off = teamPort([]);
-    const turnOn = vi.fn(async () => true);
+    const turnOn = vi.fn(async () => 'on' as const);
     await render(createElement(AddBotForm, { port: off.port, t, rows: [], workspaces: [{ id: WS, name: 'App' }], defaultWorkspaceId: WS, onDone: () => undefined, botsOff: true, turnOn }));
     await act(async () => q<HTMLButtonElement>('factory-add-team')!.click());
     expect(off.createTeam).not.toHaveBeenCalled();

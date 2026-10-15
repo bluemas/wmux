@@ -21,6 +21,7 @@ import { decUnread } from './notificationSlice';
 import { mergeDeadPaneRecovery, type DeadPaneRecovery } from '../../../shared/ptyRecovery';
 import { stashedPaneLiveness } from '../../../shared/paneStash';
 import { resolveAttentionBlink, resolveAttentionBlinkFinished, resolveAttentionRemindMs } from '../../components/Sidebar/attentionBlink';
+import { resolveWindowGlass } from '../../utils/windowGlass';
 import { restorePcRail } from './pcRailSlice';
 import { LOCAL_PC_ID, isShadowWorkspaceId } from '../../../shared/pcRail';
 import {
@@ -1576,6 +1577,10 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       state.attentionBlink = resolveAttentionBlink(data.attentionBlink);
       state.attentionBlinkRemindMs = resolveAttentionRemindMs(data.attentionBlinkRemindMs);
       state.attentionBlinkFinished = resolveAttentionBlinkFinished(data.attentionBlinkFinished);
+      if (data.windowGlass !== undefined) {
+        state.windowGlass = resolveWindowGlass(data.windowGlass);
+        document.documentElement.setAttribute('data-glass-level', state.windowGlass);
+      }
       // #1481 — the sort mode supersedes the attention flag; a session that
       // predates it carries only the flag, which maps onto 'attention'.
       state.sidebarSortMode = resolveSidebarSortMode(data);
@@ -1739,7 +1744,6 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
         state.agentToolbarPinned = data.agentToolbarPinned;
       }
       if (data.agentToolbarSnippets != null) state.toolbarSnippets = data.agentToolbarSnippets;
-      if (data.agentToolbarNewCommand != null) state.newConversationCommand = data.agentToolbarNewCommand;
       if (data.prefixConfig) {
         // Merge the saved bindings ON TOP of DEFAULT_PREFIX_CONFIG instead of
         // wholesale replacement (mirrors the layoutTemplates merge above). A

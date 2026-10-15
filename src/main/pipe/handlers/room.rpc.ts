@@ -11,7 +11,8 @@
 //                 card into the named workspace's room, which is also a
 //                 `human.message` fact and a priority-0 wake for each bot it is
 //                 for (humanMessage.ts: the `mentions`, else the `to` role,
-//                 else every bot of the room). Addressing is a field, never
+//                 else every bot of the room; in a group chat's thread, its
+//                 members or those it names). Addressing is a field, never
 //                 text: an `@name` in a card wakes nobody. Posts are
 //                 idempotent by clientPostId.
 //   room.read     a bot: its own room (a Coordinator-template bot, by its live
@@ -33,6 +34,7 @@ import {
   ROOM_EVENT,
   ROOM_LIMITS,
   ROOM_RPC,
+  dmThreadBot,
   parseThreadId,
   type CardKind,
   type RoomCard,
@@ -53,6 +55,7 @@ import {
   getRoomWriter,
   isClientId,
   isRoomWorkspaceId,
+  namesOthersGroup,
   oneLine,
   resolveRoomPorts,
   runningWake,
@@ -155,8 +158,14 @@ export async function handleRoomPost(raw: unknown, ctx: RpcContext | undefined, 
     if (p.workspaceId !== undefined && p.workspaceId !== bot.workspaceId) {
       return refusal('cross_workspace', 'a bot posts into its own workspace\'s room');
     }
-    // Main pins the thread: the one named, else the running wake's.
-    const threadId = namedThread ?? runningWakeThread(ports, bot.botId) ?? GENERAL_THREAD;
+    // Main pins the thread: the one named, else the running wake's. Another
+    // bot's 1:1 is named only from the wake running in it; a group chat's
+    // thread by its members, or from the wake running in it.
+    const wakeThread = runningWakeThread(ports, bot.botId);
+    const dmOf = dmThreadBot(namedThread);
+    if (dmOf && dmOf !== bot.botId && namedThread !== wakeThread) return refusal('invalid', 'a bot posts in its own 1:1 thread only');
+    if (namesOthersGroup(ports, bot, namedThread)) return refusal('invalid', 'a bot posts in a group chat it is in');
+    const threadId = namedThread ?? wakeThread ?? GENERAL_THREAD;
     const wake = runningWake(ports, bot.botId);
     const clientPostId = p.clientPostId ?? wakeOrdinals.next(wake, 'post');
     // A card the bot names no parent for answers the owner message its wake

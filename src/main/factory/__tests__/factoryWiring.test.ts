@@ -28,6 +28,7 @@ import {
   resolveFactsFrom,
   routedFactLog,
   runningWakeOf,
+  stopTaskWorker,
   taskWakeHandoff,
   threadTail,
 } from '../factoryWiring';
@@ -295,6 +296,8 @@ describe('runtime hooks', () => {
     const at = 5_000_000;
     expect(factFromBotHook({ type: 'bot.budget_exhausted', botId: 'bot-1', workspaceId: 'ws-1', reason: 'turns_hour', wakeId: 'w-1', at }))
       .toMatchObject({ kind: 'bot.budget_exhausted', workspaceId: 'ws-1', ref: { botId: 'bot-1' }, actor: { kind: 'bot', id: 'bot-1' }, payload: { reason: 'turns_hour', wakeId: 'w-1' } });
+    expect(factFromBotHook({ type: 'bot.budget_exhausted', botId: 'bot-1', workspaceId: 'ws-1', reason: 'turns_hour', until: at + 60_000, at })?.payload)
+      .toEqual({ reason: 'turns_hour', until: at + 60_000 });
     expect(factFromBotHook({ type: 'bot.error', botId: 'bot-1', workspaceId: 'ws-1', message: 'x'.repeat(900), at })?.payload.message).toHaveLength(500);
     expect(factFromBotHook({ type: 'wake.interrupted', botId: 'bot-1', workspaceId: 'ws-1', wakeId: 'w-1', at })).toBeNull();
     expect(log.append(factFromBotHook({ type: 'bot.error', botId: 'bot-1', workspaceId: 'ws-1', message: 'boom', at }) as never)).not.toBeNull();
@@ -463,12 +466,12 @@ describe('phone → HQ bot', () => {
     expect(factoryPhoneMessage(payload, deps({ bots: [] }).d)).toEqual({ ok: false, code: 'hq_missing' });
   });
 
-  it('on: a human card in the HQ room, a directed fact and one priority-0 phone wake; a retry queues nothing more', () => {
+  it('on: a human card in the HQ bot\'s 1:1 thread, a directed fact and one priority-0 phone wake pinned there; a retry queues nothing more', () => {
     const { d, writer, queue } = deps();
     expect(factoryPhoneMessage(payload, d)).toEqual({ ok: true, accepted: true, queued: true });
     const cards = writer.read('ws-hq').cards;
-    expect(cards).toMatchObject([{ kind: 'human', title: 'What is blocked today?', refs: { botId: moa.id } }]);
-    expect(queue.list({ states: ['queued'] })).toMatchObject([{ botId: moa.id, priority: 0, reason: { kind: 'human', source: 'phone' } }]);
+    expect(cards).toMatchObject([{ kind: 'human', threadId: `dm:${moa.id}`, title: 'What is blocked today?', refs: { botId: moa.id } }]);
+    expect(queue.list({ states: ['queued'] })).toMatchObject([{ botId: moa.id, priority: 0, threadId: `dm:${moa.id}`, reason: { kind: 'human', source: 'phone' } }]);
     expect(log.readSince('0').facts).toMatchObject([{ kind: 'human.message', ref: { botId: moa.id }, payload: { source: 'phone' } }]);
     // A retry is the same queued wake, not a second one.
     expect(factoryPhoneMessage(payload, d)).toEqual({ ok: true, accepted: true, queued: true });
@@ -618,5 +621,53 @@ describe('a bot task that stops waiting for input (A5)', () => {
     expect(botTaskStoppedWaiting({ from: 'working', to: 'input_required', entry: bot })).toBe(false);
     expect(botTaskStoppedWaiting({ from: 'input_required', to: 'working', entry: { dispatch: { origin: { kind: 'orchestrator' } } } })).toBe(false);
     expect(botTaskStoppedWaiting({ from: null, to: 'working', entry: bot })).toBe(false);
+  });
+});
+
+describe('stopTaskWorker (a stop of a bot task\'s worker)', () => {
+  const entry = { id: 'wtask-1', ownerWorkspaceId: 'ws-owner', taskWorkspaceId: 'ws-task' } as LedgerEntry;
+  function daemon(stopAgent: (id: string) => unknown = () => ({ ok: true, stopped: true })) {
+    const wt = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-stop-worker-'));
+    const calls: string[] = [];
+    let sessions = [
+      { id: 'own', spawnCwd: wt },
+      { id: 'owner-terminal', spawnCwd: wt },
+      { id: 'elsewhere', spawnCwd: os.tmpdir() },
+    ];
+    const rpc = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'task.mission.list') return { ok: true, tasks: [{ id: 'wtask-1', worktreePath: wt }] };
+      if (method === 'daemon.listSessions') return sessions;
+      if (method === 'session.stopAgent') {
+        calls.push(`stopAgent:${String(params?.sessionId)}`);
+        return stopAgent(String(params?.sessionId));
+      }
+      if (method === 'daemon.destroySession') {
+        calls.push(`destroy:${String(params?.id)}`);
+        sessions = sessions.filter((x) => x.id !== params?.id);
+        return { ok: true };
+      }
+      throw new Error(method);
+    });
+    return { client: () => ({ rpc }) as never, calls, wt };
+  }
+
+  it('stops the agent tree first, then the pane, and only the task workspace\'s own panes', async () => {
+    const d = daemon();
+    try {
+      expect(await stopTaskWorker(entry, d.client, (ws) => (ws === 'ws-task' ? ['own'] : []))).toBe(1);
+      expect(d.calls).toEqual(['stopAgent:own', 'destroy:own']);
+    } finally {
+      fs.rmSync(d.wt, { recursive: true, force: true });
+    }
+  });
+
+  it('an agent the daemon could not stop fails the stop and destroys nothing', async () => {
+    const d = daemon(() => ({ ok: false, code: 'still_running' }));
+    try {
+      await expect(stopTaskWorker(entry, d.client, () => ['own'])).rejects.toThrow(/still_running/);
+      expect(d.calls).toEqual(['stopAgent:own']);
+    } finally {
+      fs.rmSync(d.wt, { recursive: true, force: true });
+    }
   });
 });

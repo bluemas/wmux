@@ -32,6 +32,7 @@ import { TEAM_TEMPLATES, type FactoryBotCreateResult, type FactoryBotCreateTeamR
 import { BOTS_MAX } from './botStore';
 import type { WakeItem } from '../../shared/wake';
 import { normalizeRepoKey } from '../../shared/repoKey';
+import { dmThreadId } from '../../shared/room';
 import { git as runGit, type GitResult } from '../git/git';
 import { parseRemoteKey } from '../github/PrProvider';
 import type { WorkspaceListEntry } from '../../shared/workspaceMirror';
@@ -121,6 +122,33 @@ export async function createBotFromFolder(
   return created.ok ? { ok: true, bot: created.bot } : created;
 }
 
+/** The repo patch for an existing bot's "Change" (the Bots page profile):
+ *  the folder resolved exactly as "Add bot" resolves it (git root, origin's
+ *  owner/repo, never a local-path origin), refused when another bot of its
+ *  workspace works on another repository (a workspace works on one). */
+export async function botRepoFromFolder(
+  store: BotStore,
+  botId: string,
+  folder: unknown,
+  deps: BotRepoDeps = {},
+): Promise<BotRepoResult | { ok: false; code: 'not_found' | 'repo_mismatch'; message: string }> {
+  const bot = store.get(botId);
+  if (!bot) return { ok: false, code: 'not_found', message: `no bot ${botId}` };
+  const resolved = await resolveBotRepo(folder, deps);
+  if (!resolved.ok) return resolved;
+  // Read after the await: a bot changed meanwhile counts.
+  const others = store.list({ workspaceId: bot.workspaceId }).filter((b) => b.id !== botId && b.repo).sort((a, b) => a.createdAt - b.createdAt);
+  const current = others[0]?.repo;
+  if (current && current.repoKey !== resolved.repo.repoKey) {
+    return {
+      ok: false,
+      code: 'repo_mismatch',
+      message: `This workspace's other bots work on ${current.repoKey} (${current.repoPath}); ${resolved.repo.repoPath} is ${resolved.repo.repoKey}. A workspace works on one repository.`,
+    };
+  }
+  return resolved;
+}
+
 /** "Add team": the five team bots, coordinator first, one repository. */
 export async function createTeamFromFolder(
   store: BotStore | null,
@@ -186,14 +214,16 @@ export async function createTeamFromFolder(
 }
 
 /** Queue a new bot's first wake (`intro`: greet the owner, ask what to do
- *  with choices). Deduped by its reason key, so it runs once. Returns the
- *  item, or null when nothing was queued (no queue yet, bot disabled). */
+ *  with choices), pinned to the bot's 1:1 thread: the greeting is said to
+ *  the owner there, never in the room's General. Deduped by its reason key,
+ *  so it runs once. Returns the item, or null when nothing was queued (no
+ *  queue yet, bot disabled). */
 export function greetNewBot(
   bot: Pick<BotProfile, 'id' | 'workspaceId' | 'enabled'>,
   enqueue: ((input: WakeEnqueueInput) => WakeItem | null) | null,
 ): WakeItem | null {
   if (!bot.enabled || !enqueue) return null;
-  return enqueue({ botId: bot.id, workspaceId: bot.workspaceId, reason: { kind: 'intro' }, priority: 0 });
+  return enqueue({ botId: bot.id, workspaceId: bot.workspaceId, reason: { kind: 'intro' }, priority: 0, threadId: dmThreadId(bot.id) });
 }
 
 export interface BotRepoSuggestDeps extends BotRepoDeps {

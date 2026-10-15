@@ -16,8 +16,10 @@
 //         // BOT_EVENT (shared/bot.ts) pushes; payload not read, the list is re-read
 //     botAction(action: BotAction, botId: string): Promise<{ ok: boolean; message?: string }>
 //         // bot.wake | bot.park | bot.resume | bot.interrupt (shared/bot.ts BOT_RPC), as the operator
-//     updateBot(botId: string, patch: BotProfilePatch): Promise<{ ok: boolean; message?: string }>
+//     updateBot(botId: string, patch: BotProfilePatch): Promise<{ ok: boolean; message?: string; code?: string }>
 //         // bot.update, as the operator (optional: without it the profile rows are read-only)
+//     removeBot(botId: string, hue?: number): Promise<{ ok: boolean; message?: string; code?: string }>
+//         // bot.remove, as the operator (optional: without it the profile has no Delete bot)
 //     createBot(req: FactoryBotCreateRequest): Promise<FactoryBotCreateResult>
 //         // IPC.FACTORY_BOT_CREATE (optional: without it Settings › Factory cannot add a bot)
 //     createBotTeam(req: FactoryBotCreateTeamRequest): Promise<FactoryBotCreateTeamResult>
@@ -42,8 +44,10 @@
 // `setFactoryBotPort` / `setFactorySettingsPort` replace a port outright
 // (tests, or a host that wires it another way).
 
-import type { BotEngine, BotProfile, BotStatus } from '../../../shared/bot';
-import type { BotTaskView } from '../../../shared/botTask';
+import type { BotEngine, BotProfile, BotStatus, BotWorkerAgent } from '../../../shared/bot';
+import type { BotWorkerAgentOption } from '../../../shared/botWorkerAgent';
+import type { BotTaskView, FactoryTaskFolderCleanResult, FactoryTaskFolderUsage } from '../../../shared/botTask';
+import type { BotsPlanConsent } from '../../../shared/factorySettings';
 import type {
   FactoryBotAvatarPickResult,
   FactoryBotAvatarSetResult,
@@ -81,6 +85,10 @@ export type BotAction = 'wake' | 'park' | 'resume' | 'interrupt';
  *  `budget.maxTurnsPerHour: null` removes the hourly cap. */
 export type BotProfilePatch = Partial<Pick<BotProfile, 'name' | 'enabled' | 'template'>> & {
   job?: string | null;
+  /** What the bot's workers run on; null puts them back on the default. */
+  workerAgent?: BotWorkerAgent | null;
+  /** A picked folder: main makes it the bot's repository as Add bot does. */
+  repoFolder?: string;
   budget?: Partial<Omit<BotProfile['budget'], 'maxTurnsPerHour'>> & { maxTurnsPerHour?: number | null };
 };
 
@@ -91,9 +99,13 @@ export interface FactoryBotPort {
   list(workspaceId?: string): Promise<FactoryBotRow[]>;
   /** Told on any bot change; returns the unsubscribe. */
   subscribe(onChange: () => void): () => void;
-  act(action: BotAction, botId: string): Promise<{ ok: boolean; message?: string }>;
+  /** A refusal carries the handler's code (repo_mismatch, no_remote…). */
+  act(action: BotAction, botId: string): Promise<{ ok: boolean; message?: string; code?: string }>;
   /** Absent: profiles are read-only here. */
-  update?(botId: string, patch: BotProfilePatch): Promise<{ ok: boolean; message?: string }>;
+  update?(botId: string, patch: BotProfilePatch): Promise<{ ok: boolean; message?: string; code?: string }>;
+  /** Absent: no bot can be removed here. Stops its work, removes its
+   *  routines, keeps its history (`hue`: its colour slot, for its cards). */
+  remove?(botId: string, hue?: number): Promise<{ ok: boolean; message?: string; code?: string }>;
   /** Absent: no bot can be added here. */
   create?(req: FactoryBotCreateRequest): Promise<FactoryBotCreateResult>;
   /** Absent: no team can be added here. */
@@ -112,6 +124,9 @@ export interface FactoryBotPort {
   /** Absent: no resume here. Relaunch the stopped worker of an ended task
    *  with the same conversation (main/factory/workerReclaim.ts). */
   resumeWorker?(taskId: string): Promise<{ ok: boolean; message?: string; workspaceId?: string }>;
+  /** Absent: no engine choice here. The engines a bot's workers may run on,
+   *  and which are installed. */
+  workerAgents?(): Promise<BotWorkerAgentOption[]>;
 }
 
 /** The factory settings the tab shows (main/factory/factorySettings.ts). */
@@ -133,6 +148,9 @@ export interface FactorySettingsView {
   laneDailyCap: number;
   /** The bot the phone talks to (absent: automatic); null in a patch clears it. */
   phoneBotId?: string | null;
+  /** The owner's consent that bots run on their own Claude plan
+   *  (Bots/BotsPlanConsent.tsx); turning bots on needs it. */
+  planConsent?: BotsPlanConsent;
 }
 
 export interface FactorySettingsPort {
@@ -140,13 +158,19 @@ export interface FactorySettingsPort {
   readonly available: boolean;
   get(): Promise<FactorySettingsView | null>;
   set(patch: Partial<FactorySettingsView>): Promise<FactorySettingsView | null>;
+  /** Absent: no task folder line. The space bot task folders use (null:
+   *  the factory is not running). */
+  taskFolderUsage?(): Promise<FactoryTaskFolderUsage | null>;
+  /** Absent: no Clean up now. The task-end rules over every ended bot task. */
+  cleanTaskFolders?(): Promise<FactoryTaskFolderCleanResult>;
 }
 
 interface FactoryBridge {
   listBots?: (req?: { workspaceId?: string }) => Promise<{ bots: FactoryBotRow[] }>;
   onBotEvent?: (cb: () => void) => () => void;
-  botAction?: (action: BotAction, botId: string) => Promise<{ ok: boolean; message?: string }>;
-  updateBot?: (botId: string, patch: BotProfilePatch) => Promise<{ ok: boolean; message?: string }>;
+  botAction?: (action: BotAction, botId: string) => Promise<{ ok: boolean; message?: string; code?: string }>;
+  updateBot?: (botId: string, patch: BotProfilePatch) => Promise<{ ok: boolean; message?: string; code?: string }>;
+  removeBot?: (botId: string, hue?: number) => Promise<{ ok: boolean; message?: string; code?: string }>;
   createBot?: (req: FactoryBotCreateRequest) => Promise<FactoryBotCreateResult>;
   createBotTeam?: (req: FactoryBotCreateTeamRequest) => Promise<FactoryBotCreateTeamResult>;
   pickBotAvatar?: () => Promise<FactoryBotAvatarPickResult>;
@@ -157,6 +181,9 @@ interface FactoryBridge {
   stopAll?: () => Promise<FactoryStopResult>;
   stopBot?: (botId: string) => Promise<FactoryStopResult>;
   resumeWorker?: (taskId: string) => Promise<{ ok: boolean; message?: string; workspaceId?: string }>;
+  workerAgents?: () => Promise<BotWorkerAgentOption[]>;
+  taskFolderUsage?: () => Promise<FactoryTaskFolderUsage | null>;
+  cleanTaskFolders?: () => Promise<FactoryTaskFolderCleanResult>;
 }
 
 function bridge(): FactoryBridge | null {
@@ -189,6 +216,7 @@ export function bridgeBotPort(): FactoryBotPort {
     subscribe: (fn) => b.onBotEvent?.(fn) ?? (() => undefined),
     act: (action, botId) => b.botAction?.(action, botId) ?? Promise.resolve({ ok: false, message: 'no bot runtime' }),
     ...(b.updateBot ? { update: b.updateBot } : {}),
+    ...(b.removeBot ? { remove: b.removeBot } : {}),
     ...(b.createBot ? { create: b.createBot } : {}),
     ...(b.createBotTeam ? { createTeam: b.createBotTeam } : {}),
     ...(b.pickBotAvatar ? { pickAvatar: b.pickBotAvatar } : {}),
@@ -197,6 +225,7 @@ export function bridgeBotPort(): FactoryBotPort {
     ...(b.stopAll ? { stopAll: b.stopAll } : {}),
     ...(b.stopBot ? { stopBot: b.stopBot } : {}),
     ...(b.resumeWorker ? { resumeWorker: b.resumeWorker } : {}),
+    ...(b.workerAgents ? { workerAgents: b.workerAgents } : {}),
   };
 }
 
@@ -205,7 +234,13 @@ export function bridgeSettingsPort(): FactorySettingsPort {
   const b = bridge();
   if (!b?.getSettings || !b.setSettings) return NO_SETTINGS;
   const { getSettings, setSettings } = b;
-  return { available: true, get: () => getSettings(), set: (patch) => setSettings(patch) };
+  return {
+    available: true,
+    get: () => getSettings(),
+    set: (patch) => setSettings(patch),
+    ...(b.taskFolderUsage ? { taskFolderUsage: b.taskFolderUsage } : {}),
+    ...(b.cleanTaskFolders ? { cleanTaskFolders: b.cleanTaskFolders } : {}),
+  };
 }
 
 let botPort: FactoryBotPort | null = null;

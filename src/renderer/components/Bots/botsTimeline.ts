@@ -2,7 +2,7 @@
 //
 // Messages are bubbles in runs, as the reference messenger draws them: the
 // history becomes a list of items — a date and time separator, the
-// session's "New" divider, a bot's "joined" line, a system line
+// session's "New" divider, a system line
 // (consecutive system cards of one thread merged into one), and messages. A
 // message continues the run above it when the same author wrote it less
 // than ten minutes after the previous one with nothing between them; a run
@@ -20,8 +20,7 @@
 // owner reads a finished task's answer without opening the thread.
 //
 // Pure; times are local.
-import type { RoomCard, ThreadId } from '../../../shared/room';
-import type { FactoryBotRow } from '../Room/factoryPorts';
+import { dmThreadBot, groupThreadGroup, type RoomCard, type ThreadId } from '../../../shared/room';
 import type { RoomEntry } from './botsModel';
 
 type T = (key: string, vars?: Record<string, string | number>) => string;
@@ -48,7 +47,6 @@ export interface ThreadView {
 export type TimelineItem =
   | { kind: 'day'; key: string; at: number }
   | { kind: 'new'; key: string }
-  | { kind: 'joined'; key: string; row: FactoryBotRow }
   | { kind: 'system'; key: string; cards: RoomCard[]; thread?: ThreadView }
   | { kind: 'message'; key: string; card: RoomCard; continuation: boolean; runEnd: boolean; waiting: boolean; thread?: ThreadView; inThread?: boolean };
 
@@ -58,23 +56,26 @@ export function threadKey(workspaceId: string, threadId: ThreadId): string {
   return `${workspaceId}\u0000${threadId}`;
 }
 
-/** The main timeline's cards and the threads behind them: General cards,
- *  each thread's root (first card) with its summary, any thread card that
- *  waits on the owner, and each thread's newest bot reply (`surfaced`). */
+/** The main timeline's cards and the threads behind them: General cards
+ *  (and a 1:1's or a group chat's thread: the conversation itself), each
+ *  thread's root (first
+ *  card) with its summary, any thread card that waits on the owner, and
+ *  each thread's newest bot reply (`surfaced`). */
 export function splitThreads(cards: readonly RoomCard[], waits: (card: RoomCard) => boolean): { main: RoomCard[]; threads: Map<string, ThreadView>; surfaced: Set<string> } {
   const main: RoomCard[] = [];
   const byKey = new Map<string, ThreadView>();
   const rootOf = new Map<string, string>();
   const lastBotReply = new Map<string, string>();
+  const inMain = (card: RoomCard) => card.threadId === 'general' || dmThreadBot(card.threadId) !== null || groupThreadGroup(card.threadId) !== null;
   for (const card of cards) {
-    if (card.threadId === 'general') continue;
+    if (inMain(card)) continue;
     const key = threadKey(card.workspaceId, card.threadId);
     if (!rootOf.has(key)) rootOf.set(key, card.id);
     else if (card.actor.kind === 'bot') lastBotReply.set(key, card.id);
   }
   const surfaced = new Set(lastBotReply.values());
   for (const card of cards) {
-    if (card.threadId === 'general') {
+    if (inMain(card)) {
       main.push(card);
       continue;
     }
@@ -112,7 +113,7 @@ export function dayKey(at: number): string {
 }
 
 function entryAt(entry: RoomEntry): number {
-  return entry.kind === 'card' ? entry.card.at : entry.row.bot.createdAt;
+  return entry.card.at;
 }
 
 /**
@@ -143,10 +144,6 @@ export function buildTimeline(entries: readonly RoomEntry[], opts: {
     if (!newPlaced && entry.kind === 'card' && entry.card.actor.kind !== 'human' && at > (opts.newAfter as number)) {
       newPlaced = true;
       out.push({ kind: 'new', key: 'new' });
-    }
-    if (entry.kind === 'joined') {
-      out.push({ kind: 'joined', key: `joined:${entry.row.bot.id}`, row: entry.row });
-      continue;
     }
     const card = entry.card;
     const prev = out[out.length - 1];
@@ -220,4 +217,23 @@ export function unreadCount(cards: readonly RoomCard[], since: number): number {
   let n = 0;
   for (const c of cards) if (c.actor.kind === 'bot' && c.at > since) n += 1;
   return n;
+}
+
+/** A card counts as arriving live only this soon after it was written: a
+ *  page of history or a catch-up read brings older cards. */
+export const LIVE_ARRIVAL_MS = 60_000;
+
+/** The "New" divider's boundary after cards arrive in an open chat (`before`:
+ *  the newest card's time before they came). A card that lands live (newer
+ *  than `before`, written within LIVE_ARRIVAL_MS of `now`) while the owner
+ *  has the chat in view is read as it arrives: when nothing else is new, the
+ *  boundary moves past it, so no divider is drawn above a live reply. Out of
+ *  view it stays new; history and catch-up reads (older cards) stay new; and
+ *  a divider already drawn for what was unread when the chat opened stays
+ *  where it is. Pure. */
+export function liveNewAfter(cards: readonly RoomCard[], newAfter: number, before: number, inView: boolean, now: number): number {
+  if (!inView) return newAfter;
+  const live = (c: RoomCard): boolean => c.at > before && now - c.at <= LIVE_ARRIVAL_MS;
+  if (cards.some((c) => c.actor.kind !== 'human' && c.at > newAfter && !live(c))) return newAfter;
+  return cards.reduce((m, c) => Math.max(m, c.at), newAfter);
 }

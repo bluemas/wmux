@@ -3,8 +3,9 @@
 // Every bot turn runs its own agent process, and every fan-out worker keeps an
 // interactive CLI with its MCP servers resident while its task is open. The
 // factory caps how many of those run at once (`maxConcurrentAgents`, Settings
-// › Bots): in use = bots running a turn + live workers (open fan-out tasks and
-// resumed workers) + launches already granted that have not registered yet.
+// › Bots): in use = bots running a turn + live bot workers (open bot tasks
+// whose worker still runs, see rowHoldsAgentSlot, and resumed workers) +
+// launches already granted that have not registered yet.
 //
 // What the cap holds back is a NEW worker a bot starts: the task gets its
 // worktree, then waits for a slot before its pane is spawned, first come first
@@ -13,14 +14,73 @@
 // for a slot") and the Bots page lists it; it starts as soon as a slot frees,
 // or is not launched after SLOT_WAIT_MAX_MS. Bot turns themselves are not
 // held here (globalConcurrentBots governs them), and work the owner starts
-// (a pane's or the window's fan-out, an owner resume) is never held: it runs
-// and counts.
+// (a pane's or the window's fan-out, an owner resume) is neither held nor
+// counted: the cap is the bots' budget, and the owner's own sessions never
+// starve it. A task row whose workspace is gone, or whose panes run no agent
+// any more, holds no slot either (an open row can outlive its worker).
+
+import type { LedgerEntry } from '../../shared/ledger';
 
 export const SLOT_WAIT_MAX_MS = 30 * 60_000;
 /** A granted slot neither released nor held by then (its launch ended on a
  *  path that did neither) stops counting: the cap never shrinks for good. */
 export const SLOT_GRANT_MAX_MS = 15 * 60_000;
 const POLL_MS = 2_000;
+/** A task row this recent counts even when its workspace or its agent is
+ *  not seen yet: a worker's pane and agent come up after its row. */
+export const SLOT_ROW_GRACE_MS = 2 * 60_000;
+
+/** What is known of the workers' panes now. */
+export interface SlotLiveness {
+  /** Open workspace ids, or null when not known yet (every row counts). */
+  workspaces: ReadonlySet<string> | null;
+  /** Open workspaces whose panes all run no agent process any more. */
+  idleWorkspaces: ReadonlySet<string>;
+  now: number;
+}
+
+/** Holders a slot-wait card names, at most, per kind. */
+export const SLOT_HOLDERS_SHOWN_MAX = 6;
+
+/** What holds the agent slots, for a slot-wait card: the English words
+ *  (`holders`, kept for a reader that cannot word the rest) and the same as
+ *  values the reader's language words (roomFormat.ts): the bots in a turn
+ *  and the workers by title, each list newline-joined and cut at
+ *  SLOT_HOLDERS_SHOWN_MAX, with their full counts. Pure. */
+export function slotHolderArgs(bots: readonly string[], workers: readonly string[], inUse: number): {
+  holders: string; bots: string; botCount: number; workers: string; workerCount: number;
+} {
+  const shown = (names: readonly string[]): string[] => names.slice(0, SLOT_HOLDERS_SHOWN_MAX);
+  const list = (names: readonly string[]): string => names.length <= SLOT_HOLDERS_SHOWN_MAX
+    ? names.join(', ')
+    : `${shown(names).join(', ')} and ${names.length - SLOT_HOLDERS_SHOWN_MAX} more`;
+  const quoted = workers.map((w) => `"${w}"`);
+  const parts: string[] = [];
+  if (bots.length > 0) parts.push(`${bots.length === 1 ? 'bot' : 'bots'} in a turn ${list(bots)}`);
+  if (workers.length > 0) parts.push(`${workers.length === 1 ? 'worker' : 'workers'} ${list(quoted)}`);
+  const rest = inUse - bots.length - workers.length;
+  if (rest > 0) parts.push(`${rest} other ${rest === 1 ? 'worker' : 'workers'} starting, resumed or not yet reclaimed`);
+  return {
+    holders: parts.length > 0 ? parts.join('; ') : 'nothing the factory can name',
+    bots: shown(bots).join('\n'),
+    botCount: bots.length,
+    workers: shown(workers).join('\n'),
+    workerCount: workers.length,
+  };
+}
+
+/** Whether a ledger row holds an agent slot: a bot's task (the owner's own
+ *  fan-outs do not count), whose workspace is open and whose agent still
+ *  runs — or recent enough that its worker may still be coming up. Pure. */
+export function rowHoldsAgentSlot(
+  row: Pick<LedgerEntry, 'dispatch' | 'taskWorkspaceId' | 'updatedAt'>,
+  live: SlotLiveness | null,
+): boolean {
+  if (row.dispatch?.origin?.kind !== 'bot') return false;
+  if (!live || live.now - row.updatedAt < SLOT_ROW_GRACE_MS) return true;
+  if (live.workspaces && !live.workspaces.has(row.taskWorkspaceId)) return false;
+  return !live.idleWorkspaces.has(row.taskWorkspaceId);
+}
 
 export interface WaitingWorker {
   taskId: string;
@@ -229,6 +289,21 @@ export class AgentSlots {
 }
 
 let current: AgentSlots | null = null;
+let liveness: (() => SlotLiveness) | null = null;
+
+/** Set by the worker lifecycle host: what is known of the workers' panes. */
+export function setSlotLiveness(next: (() => SlotLiveness) | null): void {
+  liveness = next;
+}
+
+/** What is known of the workers' panes now, or null (every bot row counts). */
+export function getSlotLiveness(): SlotLiveness | null {
+  try {
+    return liveness?.() ?? null;
+  } catch {
+    return null;
+  }
+}
 
 export function setAgentSlots(next: AgentSlots | null): void {
   current = next;

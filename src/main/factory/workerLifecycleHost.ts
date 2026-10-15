@@ -5,32 +5,36 @@
 // the wiring module once every factory module is up; kept apart so that
 // module's imports stay free of the event bus and the pane status handler.
 
+import { getConnectorStore } from './connectorStore';
 import type { BrowserWindow } from 'electron';
 import type { DaemonClient } from '../DaemonClient';
-import type { ThreadId } from '../../shared/room';
+import type { CardNotice, ThreadId } from '../../shared/room';
 import { BOT_EVENT } from '../../shared/bot';
 import { sanitizePtyText } from '../../shared/types';
 import { eventBus } from '../events/EventBus';
 import { getLastBroadcastAgentStatus, hasOutstandingRunningClaim } from '../ipc/handlers/metadata.handler';
+import { holdsUnsettledRunningClaim } from '../notification/turnSettle';
 import { guardSessionLaunch } from '../agents/botWorkerMergeGuard';
 import { getTaskLedger } from '../deck/taskLedgerHost';
 import { getBotRuntime } from './BotRuntime';
 import { getBotStore } from './botStore';
 import { getFactorySettings } from './factorySettings';
 import { getRoomWriter } from './roomWriter';
-import { worktreeFromMissions } from './verifyPreset';
-import { AgentSlots, setAgentSlots } from './agentSlots';
+import { taskFolderFromMissions } from './verifyPreset';
+import { AgentSlots, rowHoldsAgentSlot, setAgentSlots, setSlotLiveness, slotHolderArgs, type SlotLiveness } from './agentSlots';
 import { checkWorkers, recordWorkerEnd, recordWorkerStart } from './budget';
 import { runningWakeTainted } from './wakeTaint';
 import { installReportNudge, submitToWorkerPane } from './workerReportNudge';
 import { setWorkerLivePane } from './workerMessage';
 import {
+  REPORTED_UNSEEN_IDLE_MS,
   ReclaimedWorkers,
   createWorkerClear,
   installWorkerReclaim,
   isReclaimedSince,
   isTaskWorkspaceOf,
   noteWorkerAgentExit,
+  paneTurnEnded,
   setResumedLiveCount,
   setWorkerResumePorts,
   type WorkerRespawnInput,
@@ -39,6 +43,12 @@ import {
   workerWorkspaceOf,
 } from './workerReclaim';
 import { getWorkspaceMirror } from '../workspace/WorkspaceMirror';
+import path from 'node:path';
+import { getWmuxHomeDir } from '../../shared/constants';
+import { TaskWorktreeManager } from '../worktask/TaskWorktreeManager';
+import { TaskFolders, gitRepoInfo, holdTaskFolder, installTaskFolderCleanup, restoreTaskFolder, setTaskFolderPorts, type TaskMission } from './taskFolderCleanup';
+import { getSharedTaskGateRunner } from '../worktask/TaskGateRunner';
+import { STOPPED_BY_OWNER } from './factoryStop';
 import { getFanOutGuards, setDormantTaskWorkspaces } from '../worktask/fanoutGuards';
 import type { FanOutService } from '../worktask/FanOutService';
 import { sendToRenderer } from '../pipe/handlers/_bridge';
@@ -58,11 +68,24 @@ export interface WorkerLifecycleDeps {
   fanOutService?: Pick<FanOutService, 'spawnBotTaskPane'>;
 }
 
+/** Which open workspaces run no agent any more is read at most this often. */
+const LIVENESS_REFRESH_MS = 10_000;
+
+/** A workspace tree push looks for freed task folders at most this often. */
+const FOLDER_KICK_MIN_MS = 10_000;
+/** The task folder cleanup's worktree manager (its per-repository lock
+ *  orders its own removals and restores). */
+const folderWorktrees = new TaskWorktreeManager();
+
 /** The renderer's workspace.close answers this fast or not at all. */
 const CLOSE_TIMEOUT_MS = 10_000;
 
-function note(workspaceId: string, threadId: ThreadId, title: string, body: string): void {
-  getRoomWriter()?.append({ workspaceId, threadId, kind: 'fact', actor: { kind: 'system' }, title, body });
+function note(workspaceId: string, threadId: ThreadId, title: string, body: string, notice?: CardNotice, taskId?: string): void {
+  getRoomWriter()?.append({
+    workspaceId, threadId, kind: 'fact', actor: { kind: 'system' }, title, body,
+    ...(notice ? { notice } : {}),
+    ...(taskId ? { refs: { taskId } } : {}),
+  });
 }
 
 /** Start everything; returns the stop. */
@@ -87,6 +110,42 @@ export function startWorkerLifecycle(deps: WorkerLifecycleDeps): () => void {
     const s = await rpc('daemon.listSessions', {});
     return Array.isArray(s) ? (s as WorkerSessionInfo[]) : [];
   };
+  // What the agent budget knows of the workers' panes: the open workspaces
+  // (the mirror, read now) and those whose panes all run no agent any more
+  // (the daemon's sessions, read in the background at most every
+  // LIVENESS_REFRESH_MS; until the first read, none).
+  let idleWorkspaces: ReadonlySet<string> = new Set();
+  let idleReadAt = 0;
+  let idleReading = false;
+  const refreshIdle = (): void => {
+    if (idleReading || Date.now() - idleReadAt < LIVENESS_REFRESH_MS) return;
+    idleReading = true;
+    void listSessions().then((sessions) => {
+      const byId = new Map(sessions.map((x) => [x.id, x]));
+      const next = new Set<string>();
+      for (const e of getWorkspaceMirror().getEntries() ?? []) {
+        const ptys = Array.isArray(e.ptyIds) ? e.ptyIds : [];
+        // Gone, or seen to exit; an agent never attributed is not known dead.
+        if (ptys.length > 0 && ptys.every((id) => { const x = byId.get(id); return !x || x.agentProcessAlive === false; })) next.add(e.id);
+      }
+      idleWorkspaces = next;
+      idleReadAt = Date.now();
+    }).catch(() => undefined).finally(() => {
+      idleReading = false;
+    });
+  };
+  const liveness = (): SlotLiveness => {
+    refreshIdle();
+    const entries = getWorkspaceMirror().getEntries();
+    return { workspaces: entries ? new Set(entries.map((e) => e.id)) : null, idleWorkspaces, now: Date.now() };
+  };
+  /** Open bot task rows whose worker holds an agent slot. */
+  const slotRows = (): ReturnType<typeof ledger.list> => {
+    const live = liveness();
+    return ledger.list({ openOnly: true }).filter((r) => rowHoldsAgentSlot(r, live));
+  };
+  setSlotLiveness(liveness);
+  offs.push(() => setSlotLiveness(null));
   /** Whether a task's row is open (a reclaimed task can reopen: failed → working). */
   const taskOpen = (taskId: string): boolean => {
     const st = ledger.get(taskId)?.status;
@@ -147,7 +206,7 @@ export function startWorkerLifecycle(deps: WorkerLifecycleDeps): () => void {
       allRows: () => ledger.list({}),
       row: (taskId) => ledger.get(taskId),
       store: reclaimed,
-      worktreeOf: (entry) => worktreeFromMissions((m, p) => rpc(m, (p ?? {}) as Record<string, unknown>), entry),
+      worktreeOf: (entry) => taskFolderFromMissions((m, p) => rpc(m, (p ?? {}) as Record<string, unknown>), entry),
       listSessions,
       stopAgent: async (sessionId) => (await rpc('session.stopAgent', { sessionId })) as { ok?: boolean; stopped?: boolean; code?: string },
       note,
@@ -156,13 +215,82 @@ export function startWorkerLifecycle(deps: WorkerLifecycleDeps): () => void {
         reconcile();
       },
       retryMs: RESUMED_SWEEP_MS,
+      // A reported task's worker is stopped once every pane of its
+      // workspace was seen to end its turn, and only those panes are
+      // stopped. A status main has not seen yet (right after a restart) is
+      // taken as idle only for a task reported long ago.
+      turnEnded: (entry) => {
+        const ws = mirror.getEntries()?.find((e) => e.id === entry.taskWorkspaceId);
+        const ptys = ws && Array.isArray(ws.ptyIds) ? ws.ptyIds : [];
+        const longAgo = Date.now() - entry.updatedAt >= REPORTED_UNSEEN_IDLE_MS;
+        return ptys.length > 0 && ptys.every((id) => paneTurnEnded(getLastBroadcastAgentStatus(id), holdsUnsettledRunningClaim(id), longAgo));
+      },
+      workspacePanes: (workspaceId) => {
+        const entries = mirror.getEntries();
+        if (!entries) return null;
+        const ws = entries.find((e) => e.id === workspaceId);
+        return ws && Array.isArray(ws.ptyIds) ? ws.ptyIds : [];
+      },
     }));
     // The viewed workspace moving (and every other tree push) may make a
     // deferred clear due; a pass with nothing due reads nothing.
     offs.push(mirror.onSnapshot(reconcile));
+    // An ended bot task's folder goes once nothing runs in it and nothing in
+    // it is uncommitted (taskFolderCleanup.ts); a resume puts it back. A
+    // record file this version cannot read leaves the cleanup off.
+    const folders = TaskFolders.at(deps.wmuxDir());
+    let foldersOn = true;
+    try {
+      folders.load();
+    } catch (err) {
+      foldersOn = false;
+      console.warn(`[factory] task folder cleanup off: ${String(err)}`);
+    }
+    const folderPorts = foldersOn ? {
+      store: folders,
+      roots: { worktrees: path.join(getWmuxHomeDir(), 'worktrees'), wmuxDir: deps.wmuxDir() },
+      missions: async (owner: string) => {
+        const reply = (await rpc('task.mission.list', { verifiedWorkspaceId: owner })) as { ok?: unknown; tasks?: unknown } | null;
+        if (!reply || reply.ok !== true || !Array.isArray(reply.tasks)) return null;
+        const out = new Map<string, TaskMission>();
+        for (const t of reply.tasks as Array<Record<string, unknown>>) {
+          const folder = typeof t?.worktreePath === 'string' && t.worktreePath ? t.worktreePath : typeof t?.outputDir === 'string' && t.outputDir ? t.outputDir : '';
+          if (typeof t?.id === 'string' && folder) {
+            out.set(t.id, {
+              folder,
+              ...(typeof t.branch === 'string' && t.branch ? { branch: t.branch } : {}),
+              // A detached task's worktree is the owner's now.
+              ...(typeof t.detachedAt === 'number' ? { detached: true } : {}),
+            });
+          }
+        }
+        return out;
+      },
+      listSessions,
+      workerState: (taskId: string) => reclaimed.get(taskId)?.state ?? null,
+      worktrees: folderWorktrees,
+      repoInfo: gitRepoInfo,
+      gateRunning: (taskId: string) => getSharedTaskGateRunner()?.isRunning(taskId) === true,
+      changed,
+      allRows: () => ledger.list({}),
+    } : null;
+    if (folderPorts) {
+      const cleanup = installTaskFolderCleanup({ ...folderPorts, onTransition: (fn) => ledger.onTransition(fn), retryMs: RESUMED_SWEEP_MS });
+      offs.push(cleanup.dispose);
+      // A workspace closing may free a folder (at most every 10 s).
+      let kickedAt = 0;
+      offs.push(mirror.onSnapshot(() => {
+        if (Date.now() - kickedAt < FOLDER_KICK_MIN_MS) return;
+        kickedAt = Date.now();
+        cleanup.kick();
+      }));
+      setTaskFolderPorts(folderPorts);
+      offs.push(() => setTaskFolderPorts(null));
+    }
     setWorkerResumePorts({
       store: reclaimed,
       listSessions,
+      ...(folderPorts ? { restoreFolder: (taskId: string, folder: string) => restoreTaskFolder(folderPorts, taskId, folder), holdFolder: holdTaskFolder } : {}),
       // The same stage a resume typed from the pane takes (pty:write-launch):
       // a bot worker's line carries its settings file, or this throws.
       typeLine: (sessionId, line) => {
@@ -179,6 +307,14 @@ export function startWorkerLifecycle(deps: WorkerLifecycleDeps): () => void {
         respawn: async (input: WorkerRespawnInput) => {
           const svc = deps.fanOutService;
           if (!svc) return { ok: false as const, message: 'fan-out is not running' };
+          // The task's connections that are still this bot's (the library
+          // as it is now; one gone or out of scope since is left out).
+          const named = ledger.get(input.taskId)?.dispatch?.connectors ?? [];
+          const current = named.length > 0 ? getConnectorStore()?.forBot(input.botId) ?? [] : [];
+          const connectors = current.filter((c) => named.includes(c.name));
+          if (connectors.length < named.length) {
+            console.log('[factory] resume: connections left out (gone or no longer this bot\'s)', { taskId: input.taskId, names: named.filter((n) => !connectors.some((c) => c.name === n)) });
+          }
           const r = await svc.spawnBotTaskPane({
             ownerWorkspaceId: input.ownerWorkspaceId,
             botId: input.botId,
@@ -189,6 +325,7 @@ export function startWorkerLifecycle(deps: WorkerLifecycleDeps): () => void {
             workerPermissionMode: isFanoutWorkerPermissionMode(input.permissionMode) ? input.permissionMode : 'manual',
             // Unknown taint counts as tainted.
             tainted: ledger.get(input.taskId)?.dispatch?.origin.tainted !== false,
+            ...(connectors.length > 0 ? { connectors } : {}),
           });
           return 'error' in r ? { ok: false as const, message: r.error } : { ok: true as const, workspaceId: r.workspaceId, sessionId: r.ptyId };
         },
@@ -209,12 +346,16 @@ export function startWorkerLifecycle(deps: WorkerLifecycleDeps): () => void {
       // task started from outside text (unknown counts as outside text).
       taskTainted: (taskId) => ledger.get(taskId)?.dispatch?.origin.tainted !== false,
       senderTainted: runningWakeTainted,
+      stoppedByOwner: (taskId) => {
+        const row = ledger.get(taskId);
+        return !!row && row.status === 'cancelled' && row.summary === STOPPED_BY_OWNER && row.updatedBy.kind === 'system';
+      },
       // A bot's resume starts a worker: its own worker budget applies.
       botWorkerRefusal: (botId, starting) => {
         const store = getBotStore();
         const profile = store?.get(botId);
         if (!store || !profile) return 'the bot was removed';
-        const open = ledger.list({ openOnly: true }).filter((r) => r.dispatch?.origin.kind === 'bot' && r.dispatch.origin.botId === botId).length;
+        const open = slotRows().filter((r) => r.dispatch?.origin.botId === botId).length;
         const c = checkWorkers(profile.budget, store.usageOf(botId), open + resumedLive(botId) + starting, 1, Date.now());
         return c.ok ? null : `this bot's worker budget refuses another worker now (${c.reason})`;
       },
@@ -224,7 +365,9 @@ export function startWorkerLifecycle(deps: WorkerLifecycleDeps): () => void {
     // A reclaimed worker's workspace still open (a failed task the owner has
     // not looked at, one they are viewing, one with a busy pane) runs no
     // agent: it holds no live fan-out slot (unless its task reopened).
-    setDormantTaskWorkspaces(() => new Set(reclaimed.all().filter((r) => r.state === 'stopped' && !taskOpen(r.taskId)).map((r) => workerWorkspaceOf(r))));
+    // So does a reported task's stopped worker while its task waits for review.
+    setDormantTaskWorkspaces(() => new Set(reclaimed.all().filter((r) => r.state === 'stopped'
+      && (!taskOpen(r.taskId) || (r.ended === 'reported' && ledger.get(r.taskId)?.status === 'review_requested'))).map((r) => workerWorkspaceOf(r))));
     offs.push(() => setDormantTaskWorkspaces(null));
     offs.push(() => setWorkerResumePorts(null));
     // A resumed worker runs on its bot's worker budget: counted live by the
@@ -260,26 +403,34 @@ export function startWorkerLifecycle(deps: WorkerLifecycleDeps): () => void {
   }
 
   // The agent budget.
+  const runningBotNames = (): string[] => {
+    const rt = getBotRuntime();
+    return rt ? (getBotStore()?.list({}) ?? []).filter((b) => rt.currentTurn(b.id) !== null).map((b) => b.name) : [];
+  };
   const slots = new AgentSlots({
     cap: () => getFactorySettings().maxConcurrentAgents,
-    runningBots: () => {
-      const rt = getBotRuntime();
-      return rt ? (getBotStore()?.list({}) ?? []).filter((b) => rt.currentTurn(b.id) !== null).length : 0;
-    },
-    // Open tasks, ended bot tasks whose worker is not reclaimed yet, resumed
-    // workers.
-    liveWorkers: () => ledger.list({ openOnly: true }).length
+    runningBots: () => runningBotNames().length,
+    // Open bot tasks whose worker still runs, ended bot tasks whose worker
+    // is not reclaimed yet, resumed workers. The owner's own fan-outs and a
+    // row whose worker is gone do not count (rowHoldsAgentSlot).
+    liveWorkers: () => slotRows().length
       + (reclaimOn ? unreclaimedEndedWorkers(ledger.list({}), reclaimed, Date.now()) + resumedLive() : 0),
     // A spawned worker whose row was not written: while its workspace lives
     // and still no row names it.
     stillHeld: (workspaceId) => !ledger.findByTaskWorkspace(workspaceId)
       && (getWorkspaceMirror().getEntries()?.some((e) => e.id === workspaceId) ?? true),
-    onWaiting: (w, inUse, cap) => note(
-      w.ownerWorkspaceId,
-      (w.threadId ?? `task:${w.taskId}`) as ThreadId,
-      'Worker waiting for a slot',
-      `"${w.title}" starts when an agent slot frees (${inUse} of ${cap} in use: bots in a turn and live workers).`,
-    ),
+    onWaiting: (w, inUse, cap) => {
+      // What holds the slots: bots in a turn, then workers by title — in
+      // English, and as values the reader's language words.
+      const held = slotHolderArgs(runningBotNames(), slotRows().map((r) => r.title), inUse);
+      note(
+        w.ownerWorkspaceId,
+        (w.threadId ?? `task:${w.taskId}`) as ThreadId,
+        'Worker waiting, not started',
+        `"${w.title}" is waiting for an agent slot and has not started; it starts when one frees. ${inUse} of ${cap} in use: ${held.holders}.`,
+        { code: 'worker.waiting', args: { title: w.title, inUse, cap, ...held } },
+      );
+    },
     changed,
   });
   setAgentSlots(slots);

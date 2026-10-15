@@ -100,6 +100,16 @@ export type BotEngine =
 
 export const DEFAULT_BOT_ENGINE: BotEngine = { kind: 'claude-sdk' };
 
+/** The agent CLI a bot's fan-out workers run on (shared/botWorkerAgent.ts):
+ *  a slug from fan-out's closed agent table that has a bot-worker guard, plus
+ *  an optional model and effort. Set only by the owner; absent = the bot
+ *  presets' own engine (Claude Code). */
+export interface BotWorkerAgent {
+  agent: string;
+  model?: string;
+  effort?: string;
+}
+
 export interface BotBudget {
   /** Turns per rolling hour. Absent = no hourly cap (never 0: a stored 0 is
    *  read as absent and refused on write). */
@@ -147,6 +157,8 @@ export interface BotProfile {
    *  itself (job_set → bot.setJob, during a wake on the owner's words). */
   job?: string;
   engine: BotEngine;
+  /** What its fan-out workers run on (absent: the presets' own engine). */
+  workerAgent?: BotWorkerAgent;
   triggers: BotTrigger[];
   budget: BotBudget;
   /** The repo the bot acts on (fan-out needs it: a bot has no pane cwd). */
@@ -162,6 +174,26 @@ export interface BotProfile {
 }
 
 export const BOT_ID_RE = /^bot-[0-9a-f]{8}$/;
+
+/** How many identity colour slots a bot's face takes from (the renderer's
+ *  BOT_IDENTITY_HUES). */
+export const BOT_IDENTITY_SLOTS = 8;
+
+/** What is kept of a removed bot (bots.json `removed`): enough for the cards
+ *  it wrote to keep its name and face, marked as removed. */
+export interface RemovedBot {
+  id: string;
+  workspaceId: string;
+  role: BotRole;
+  template?: BotTemplate;
+  name: string;
+  /** Its picture, when it had one (BotProfile.avatar). */
+  avatar?: string;
+  /** Its identity colour slot, 0..BOT_IDENTITY_SLOTS-1, when the remover
+   *  knew it (the Bots page does). */
+  hue?: number;
+  removedAt: number;
+}
 
 /** Edge of the stored avatar PNG, in pixels. */
 export const BOT_AVATAR_PX = 128;
@@ -202,7 +234,9 @@ export interface BotStatus {
   botId: string;
   presence: BotPresence;
   sessionId?: string;
-  currentTurn?: { wakeId: string; startedAt: number };
+  /** `threadId`: the room thread the running turn answers in (absent: none,
+   *  or `general`), so a busy line shows in that conversation only. */
+  currentTurn?: { wakeId: string; startedAt: number; threadId?: string };
   queueDepth: number;
   /** turnsHour is null when the bot has no hourly cap. */
   budgetLeft: { turnsHour: number | null; turnsDay: number; workerHoursDay: number };
@@ -279,13 +313,18 @@ export interface BotSetJobParams {
  *    remembered rules changed (shared/botApproval.ts);
  *  - `routines-changed`: a bot's routines changed (shared/botRoutine.ts);
  *  - `secrets-changed`: the stored secret names or their use changed
- *    (shared/botSecret.ts). */
+ *    (shared/botSecret.ts);
+ *  - `connectors-changed`: the connection library changed
+ *    (shared/botConnector.ts);
+ *  - `groups-changed`: the owner's group chats changed (shared/botGroup.ts). */
 export type BotEventPayload =
   | { type: 'bot.status'; status: BotStatus }
   | { type: 'bots-changed' }
   | { type: 'approvals-changed'; workspaceId?: string }
   | { type: 'routines-changed'; botId?: string }
-  | { type: 'secrets-changed' };
+  | { type: 'secrets-changed' }
+  | { type: 'connectors-changed' }
+  | { type: 'groups-changed' };
 
 export const BOT_EVENT = 'bot.event';
 

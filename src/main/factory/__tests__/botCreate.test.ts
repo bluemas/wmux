@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('electron', () => ({ ipcMain: { handle: vi.fn(), removeHandler: vi.fn() } }));
 
 import { BotStore, botsFilePath } from '../botStore';
-import { createBotFromFolder, createTeamFromFolder, greetNewBot, homeShortPath, resolveBotRepo, suggestBotRepo, workspaceFolder, workspaceRepo } from '../botCreate';
+import { botRepoFromFolder, createBotFromFolder, createTeamFromFolder, greetNewBot, homeShortPath, resolveBotRepo, suggestBotRepo, workspaceFolder, workspaceRepo } from '../botCreate';
 import { DEFAULT_FACTORY_SETTINGS, type FactorySettings } from '../factorySettings';
 import { factoryBotCreateHandler, factoryBotCreateTeamHandler, factoryBotSuggestRepoHandler, factorySettingsSetHandler } from '../../ipc/handlers/factory.handler';
 import type { WorkspaceListEntry } from '../../../shared/workspaceMirror';
@@ -52,8 +52,11 @@ describe('resolveBotRepo', () => {
     const top = ok('/src/app\n');
     expect(await resolveBotRepo('/src/app', { git: fakeGit(top, fail), realpath: (p) => p })).toMatchObject({ ok: false, code: 'no_remote' });
     expect(await resolveBotRepo('/src/app', { git: fakeGit(top, ok('/srv/git/app.git\n')), realpath: (p) => p })).toMatchObject({ ok: false, code: 'no_remote' });
-    expect(await resolveBotRepo('/src/app', { git: fakeGit(top, ok('https://gitlab.example.com/group/sub/app.git\n')), realpath: (p) => p }))
+    expect(await resolveBotRepo('/src/app', { git: fakeGit(top, ok('https://gitlab.example.com/app.git\n')), realpath: (p) => p }))
       .toMatchObject({ ok: false, code: 'no_remote' });
+    // A GitLab subgroup project is a repository, keyed by its whole path.
+    expect(await resolveBotRepo('/src/app', { git: fakeGit(top, ok('ssh://git@gitlab.example.com:2222/group/sub/app.git\n')), realpath: (p) => p }))
+      .toMatchObject({ ok: true, repo: { repoKey: 'gitlab.example.com/group/sub/app' } });
   });
 
   it('refuses a relative or missing folder before running git', async () => {
@@ -133,6 +136,32 @@ describe('createBotFromFolder', () => {
 
   it('answers not_started before the factory runs', async () => {
     expect(await createBotFromFolder(null, { workspaceId: 'ws-1', role: 'lead' }, deps)).toMatchObject({ ok: false, code: 'not_started' });
+  });
+});
+
+describe('botRepoFromFolder: an existing bot\'s repository', () => {
+  const app = { git: fakeGit(ok('/src/app\n'), ok('https://github.com/acme/app.git\n')), realpath: (p: string) => p };
+  const api = { git: fakeGit(ok('/src/api\n'), ok('git@github.com:acme/api.git\n')), realpath: (p: string) => p };
+
+  it('resolves the folder as Add bot does, local-path origins refused', async () => {
+    const made = await createBotFromFolder(store, { workspaceId: 'ws-1', role: 'lead' }, app);
+    if (!made.ok) throw new Error('not made');
+    expect(await botRepoFromFolder(store, made.bot.id, '/src/app', app)).toEqual({ ok: true, repo: { repoKey: 'github.com/acme/app', repoPath: '/src/app' } });
+    const local = { git: fakeGit(ok('/src/app\n'), ok('/srv/git/app.git\n')), realpath: (p: string) => p };
+    expect(await botRepoFromFolder(store, made.bot.id, '/src/app', local)).toMatchObject({ ok: false, code: 'no_remote' });
+    expect(await botRepoFromFolder(store, made.bot.id, 'relative/dir', app)).toMatchObject({ ok: false, code: 'invalid_argument' });
+    expect(await botRepoFromFolder(store, 'bot-00000fff', '/src/app', app)).toMatchObject({ ok: false, code: 'not_found' });
+  });
+
+  it('a bot alone on its repository may move to another; one sharing the workspace\'s may not', async () => {
+    const lead = await createBotFromFolder(store, { workspaceId: 'ws-1', role: 'lead', repoFolder: '/src/app' }, app);
+    if (!lead.ok) throw new Error('not made');
+    expect(await botRepoFromFolder(store, lead.bot.id, '/src/api', api)).toMatchObject({ ok: true, repo: { repoKey: 'github.com/acme/api' } });
+    const dev = await createBotFromFolder(store, { workspaceId: 'ws-1', template: 'developer' }, app);
+    if (!dev.ok) throw new Error('not made');
+    const r = await botRepoFromFolder(store, dev.bot.id, '/src/api', api);
+    expect(r).toMatchObject({ ok: false, code: 'repo_mismatch' });
+    if (!r.ok) expect(r.message).toContain('github.com/acme/app');
   });
 });
 
@@ -325,7 +354,7 @@ describe('factorySettingsSetHandler (IPC guard)', () => {
     const webContents = { mainFrame };
     const win = { isDestroyed: () => false, webContents } as unknown as Electron.BrowserWindow;
     const update = vi.fn(async (p: unknown) => ({ ...settings(), ...(p as object) }));
-    const handler = factorySettingsSetHandler(() => win, () => ({ update }) as unknown as FactorySettingsStore);
+    const handler = factorySettingsSetHandler(() => win, () => ({ update, get: () => settings() }) as unknown as FactorySettingsStore);
     expect(await handler({ sender: {}, senderFrame: mainFrame }, { enabled: true })).toBeNull();
     expect(await handler({ sender: webContents, senderFrame: { id: 'sub' } }, { enabled: true })).toBeNull();
     expect(update).not.toHaveBeenCalled();
@@ -335,11 +364,11 @@ describe('factorySettingsSetHandler (IPC guard)', () => {
 });
 
 describe('greetNewBot', () => {
-  it('queues one intro wake for an enabled bot, and none for a disabled bot or without a queue', () => {
+  it('queues one intro wake for an enabled bot, pinned to its 1:1 thread, and none for a disabled bot or without a queue', () => {
     const enqueue = vi.fn((input: unknown) => ({ id: 'w-1', ...(input as object) }) as never);
     const bot = { id: 'bot-0a1b2c3d', workspaceId: 'ws-1', enabled: true };
     expect(greetNewBot(bot, enqueue)).toMatchObject({ id: 'w-1' });
-    expect(enqueue).toHaveBeenCalledWith({ botId: 'bot-0a1b2c3d', workspaceId: 'ws-1', reason: { kind: 'intro' }, priority: 0 });
+    expect(enqueue).toHaveBeenCalledWith({ botId: 'bot-0a1b2c3d', workspaceId: 'ws-1', reason: { kind: 'intro' }, priority: 0, threadId: 'dm:bot-0a1b2c3d' });
     expect(greetNewBot({ ...bot, enabled: false }, enqueue)).toBeNull();
     expect(greetNewBot(bot, null)).toBeNull();
     expect(enqueue).toHaveBeenCalledTimes(1);

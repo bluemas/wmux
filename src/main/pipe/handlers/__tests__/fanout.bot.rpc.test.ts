@@ -17,7 +17,7 @@ vi.mock('../../../deck/deckDecisionStore', () => ({ loadWorkspaceDecision: vi.fn
 
 import { sendToRenderer } from '../_bridge';
 import { git } from '../../../git/git';
-import { BOT_FANOUT_STARTING_NOTE, botLaunchRefusal, countOpenBotWorkers, registerFanOutRpc, verdictedTaskIds, type FanOutBotPort } from '../fanout.rpc';
+import { BOT_FANOUT_STARTING_NOTE, botLaunchRefusal, countOpenBotWorkers, registerFanOutRpc, verdictedTaskIds, workersHeldNote, type FanOutBotPort } from '../fanout.rpc';
 import type { FanOutRequest, FanOutResult, FanOutService, FanOutStatus } from '../../../worktask/FanOutService';
 import type { RpcRouter } from '../../RpcRouter';
 import { FanOutGuards } from '../../../worktask/fanoutGuards';
@@ -26,8 +26,12 @@ import { DEFAULT_BOT_BUDGETS, type BotProfile, type BotRole } from '../../../../
 import { emptyUsage } from '../../../factory/budget';
 import type { ThreadId } from '../../../../shared/room';
 import type { BotWorkerStartOutcome } from '../../../factory/botNotices';
+import { SecretStore, setSecretStore } from '../../../factory/secretStore';
+import { ConnectorStore } from '../../../factory/connectorStore';
+import { setSecretGrantSource } from '../../../factory/secretGrants';
 
 const REPO = nodePath.resolve('/repo');
+const WMUX_DIR = nodePath.resolve('/wmux-data');
 const SHA = 'a'.repeat(40);
 const BOT_ID = 'bot-0a1b2c3d';
 type Handler = (params: Record<string, unknown>, ctx?: RpcContext) => Promise<unknown>;
@@ -66,7 +70,7 @@ interface Rig {
   setDefaultBranchNote: (n: { name: string | null; recorded: boolean }) => void;
 }
 
-function rig(role: BotRole, over: Partial<BotProfile> = {}, opts: { builtinPresets?: boolean } = {}): Rig {
+function rig(role: BotRole, over: Partial<BotProfile> = {}, opts: { builtinPresets?: boolean; connectors?: () => ConnectorStore | null; platform?: NodeJS.Platform; presets?: FanoutPreset[] } = {}): Rig {
   const handlers = new Map<string, Handler>();
   const router = { register: (m: string, h: Handler) => handlers.set(m, h) } as unknown as RpcRouter;
   const state = new Map<string, FanOutStatus>();
@@ -135,8 +139,11 @@ function rig(role: BotRole, over: Partial<BotProfile> = {}, opts: { builtinPrese
     workerPermissionMode: () => 'auto',
     requireApproval: () => false,
     presets: () => PRESETS,
-    ...(opts.builtinPresets ? {} : { botPresets: () => PRESETS }),
+    ...(opts.builtinPresets ? {} : { botPresets: () => opts.presets ?? PRESETS }),
+    ...(opts.connectors ? { connectors: opts.connectors } : {}),
+    ...(opts.platform ? { workerPlatform: opts.platform } : {}),
     bot: () => port,
+    wmuxDir: () => WMUX_DIR,
     botDefaultBranch: async (root) => {
       defaultBranchReads.push({ root, startedBefore: start.mock.calls.length });
       return defaultBranchNote;
@@ -194,6 +201,88 @@ describe('task.fanout.start — bot origin', () => {
     expect(await r.call({ idempotencyKey: 'wake:w-2:1', titles: ['fix it'], prompt: 'fix', preset: 'repro' }, botCtx('lead'))).toMatchObject({ ok: true });
     await r.flush();
     expect((r.start.mock.calls[1][0] as FanOutRequest).caller).toEqual({ kind: 'bot', botId: BOT_ID, tainted: false });
+  });
+
+  it('a connection\'s key is refused as a plain secretNames entry, before anything starts', async () => {
+    const secrets = new SecretStore({
+      file: nodePath.join(fs.mkdtempSync(nodePath.join(os.tmpdir(), 'wp2-fanout-conn-')), 'secrets.json'),
+      crypto: { state: () => 'ok', encrypt: (p) => Buffer.from(p), decrypt: (c) => c.toString() },
+    });
+    secrets.load();
+    expect(secrets.set('GH_MCP_TOKEN', 'ghp_connection_value_123', { connectorId: 'con-00000001' }).ok).toBe(true);
+    expect(secrets.set('NPM_TOKEN', 'npm_plain_value_123456').ok).toBe(true);
+    setSecretStore(secrets);
+    setSecretGrantSource(() => secrets);
+    try {
+      const r = rig('lead');
+      const refused = errorOf(await r.call({ idempotencyKey: 'wake:w-1:1', titles: ['x'], prompt: 'x', preset: 'repro', secretNames: ['NPM_TOKEN', 'GH_MCP_TOKEN'] }, botCtx('lead')));
+      expect(refused.code).toBe('INVALID_ARGUMENT');
+      expect(refused.message).toContain('GH_MCP_TOKEN');
+      expect(r.start).not.toHaveBeenCalled();
+      expect(await r.call({ idempotencyKey: 'wake:w-1:1', titles: ['x'], prompt: 'x', preset: 'repro', secretNames: ['NPM_TOKEN'] }, botCtx('lead'))).toMatchObject({ ok: true });
+    } finally {
+      setSecretGrantSource(null);
+      setSecretStore(null);
+    }
+  });
+
+  describe('connections', () => {
+    function library(dir: string): ConnectorStore {
+      const lib = new ConnectorStore(nodePath.join(dir, 'connectors.json'), { botIds: () => new Set([BOT_ID]) });
+      lib.load();
+      const base = { transport: 'http' as const, remote: { url: 'https://x.dev/mcp', headers: {} }, secrets: [], tools: { mode: 'all' as const, blocked: [] }, enabled: true };
+      lib.save({ ...base, name: 'shared', scope: { kind: 'all' } });
+      lib.save({ ...base, name: 'mine', scope: { kind: 'bots', botIds: [BOT_ID] } });
+      lib.save({ ...base, name: 'keyed', scope: { kind: 'all' }, secrets: [{ secret: 'KEYED_MCP_TOKEN', as: 'header', header: 'Authorization', scheme: 'bearer' }] });
+      const off = lib.save({ ...base, name: 'turned-off', scope: { kind: 'all' } });
+      if (off.ok) lib.setOffForBot(off.connector.id, BOT_ID, true);
+      return lib;
+    }
+    const call = (r: Rig, connectors: unknown, ctx = botCtx('lead')) =>
+      r.call({ idempotencyKey: 'wake:w-1:1', titles: ['x'], prompt: 'x', preset: 'repro', connectors }, ctx);
+
+    it('a bot names connections from its own set: the request carries the records and the task is tainted, even from a clean wake', async () => {
+      const lib = library(fs.mkdtempSync(nodePath.join(os.tmpdir(), 'wp2-conn-')));
+      const r = rig('lead', {}, { connectors: () => lib, platform: 'darwin' });
+      r.setTainted(false);
+      expect(await call(r, ['shared', 'mine'])).toMatchObject({ ok: true });
+      await r.flush();
+      const req = r.start.mock.calls[0][0] as FanOutRequest;
+      expect(req.connectors?.map((c) => c.name)).toEqual(['shared', 'mine']);
+      expect(req.caller).toEqual({ kind: 'bot', botId: BOT_ID, tainted: true });
+      await lib.flush();
+    });
+
+    it('refuses a name outside its set, one switched off for it, a missing key, a pane caller, Windows and a worker other than claude or codex', async () => {
+      const lib = library(fs.mkdtempSync(nodePath.join(os.tmpdir(), 'wp2-conn-')));
+      const r = rig('lead', {}, { connectors: () => lib, platform: 'darwin' });
+      expect(errorOf(await call(r, ['nope'])).message).toMatch(/not one of your connections: nope/);
+      expect(errorOf(await call(r, ['turned-off'])).message).toMatch(/not one of your connections: turned-off/);
+      expect(errorOf(await call(r, ['Bad_Name'])).code).toBe('INVALID_ARGUMENT');
+      expect(errorOf(await call(r, ['keyed'])).code).toBe('FAILED_PRECONDITION');
+      const brain = await r.call({ idempotencyKey: 'k', titles: ['x'], connectors: ['shared'] }, { origin: 'local', commanderWorkspace: 'ws-hq' } as RpcContext);
+      expect(errorOf(brain).message).toMatch(/connectors only from a factory bot/);
+      const win = rig('lead', {}, { connectors: () => lib, platform: 'win32' });
+      expect(errorOf(await call(win, ['shared'])).message).toMatch(/Windows/);
+      const gemini = rig('lead', {}, { connectors: () => lib, platform: 'darwin', presets: [{ name: 'repro', items: [{ agent: 'gemini' }], worktree: true }] });
+      expect(errorOf(await call(gemini, ['shared'])).message).toMatch(/claude and codex workers only/);
+      expect(r.start).not.toHaveBeenCalled();
+      expect(gemini.start).not.toHaveBeenCalled();
+      await lib.flush();
+    });
+
+    it('a codex worker takes connections, but not an SSE one (codexConnectorRefusal)', async () => {
+      const lib = library(fs.mkdtempSync(nodePath.join(os.tmpdir(), 'wp2-conn-')));
+      const remote = { remote: { url: 'https://x.dev/mcp', headers: {} }, tools: { mode: 'all' as const, blocked: [] }, enabled: true, scope: { kind: 'all' as const } };
+      lib.save({ ...remote, name: 'streamed', transport: 'sse', secrets: [] });
+      const codex = rig('lead', {}, { connectors: () => lib, platform: 'darwin', presets: [{ name: 'repro', items: [{ agent: 'codex' }], worktree: true }] });
+      expect(errorOf(await call(codex, ['streamed'])).message).toMatch(/do not connect to SSE servers/);
+      expect(codex.start).not.toHaveBeenCalled();
+      expect(await call(codex, ['shared'])).toMatchObject({ ok: true });
+      await codex.flush();
+      expect((codex.start.mock.calls[0][0] as FanOutRequest).connectors?.map((c) => c.name)).toEqual(['shared']);
+      await lib.flush();
+    });
   });
 
   it('records the handoff the asking wake delivers on its tasks', async () => {
@@ -454,6 +543,73 @@ describe('task.fanout.start — bot origin', () => {
       expect(req.checkout).toBeUndefined();
     });
 
+    it('a bot without a repository runs a research task in a scratch folder under its own data folder', async () => {
+      const r = rig('lead', { repo: undefined, template: 'researcher' }, { builtinPresets: true });
+      const res = await r.call({ idempotencyKey: 'wake:w-1:1', titles: ['who else does this'], prompt: 'compare the competitors', preset: 'research' }, botCtx('lead'));
+      expect(res.status).toBe('accepted');
+      await r.flush();
+      const req = r.start.mock.calls[0][0] as FanOutRequest;
+      const root = nodePath.join(WMUX_DIR, 'factory', 'bots', BOT_ID, 'research');
+      expect(req).toMatchObject({ worktree: false, outputRoot: root, repoPath: root, preset: 'research' });
+      expect(req.prompt.startsWith('# Research worker')).toBe(true);
+      expect(req.prompt.endsWith('compare the competitors')).toBe(true);
+      // No repository: no default branch to read, no git at all.
+      expect(r.defaultBranchReads).toEqual([]);
+      expect(git).not.toHaveBeenCalled();
+    });
+
+    it('every preset that changes code still needs the repository, and says research does not', async () => {
+      const r = rig('lead', { repo: undefined }, { builtinPresets: true });
+      for (const preset of ['default', 'repro', 'maintain']) {
+        const err = errorOf(await r.call({ idempotencyKey: 'wake:w-1:1', titles: ['x'], prompt: 'p', preset }, botCtx('lead')));
+        expect(err.code).toBe('FAILED_PRECONDITION');
+        expect(err.message).toMatch(/no repository[\s\S]*preset "research"/);
+      }
+      expect(r.start).not.toHaveBeenCalled();
+    });
+
+    it('a research task is tainted even from a clean wake (its worker reads the web)', async () => {
+      const r = rig('lead', {}, { builtinPresets: true });
+      r.setTainted(false);
+      expect((await r.call({ idempotencyKey: 'wake:w-1:1', titles: ['q'], prompt: 'q', preset: 'research' }, botCtx('lead'))).status).toBe('accepted');
+      await r.flush();
+      expect((r.start.mock.calls[0][0] as FanOutRequest).caller).toEqual({ kind: 'bot', botId: BOT_ID, tainted: true });
+    });
+
+    it('a bot whose workers run on codex is told research needs claude workers', async () => {
+      const r = rig('lead', { repo: undefined, workerAgent: { agent: 'codex', model: 'gpt-6.1-sol', effort: 'low' } }, { builtinPresets: true });
+      const err = errorOf(await r.call({ idempotencyKey: 'wake:w-1:1', titles: ['q'], prompt: 'q', preset: 'research' }, botCtx('lead')));
+      expect(err.code).toBe('FAILED_PRECONDITION');
+      expect(err.message).toMatch(/claude workers only[\s\S]*codex/);
+      expect(r.start).not.toHaveBeenCalled();
+    });
+
+    it('a bot with a repository runs research outside it too', async () => {
+      const r = rig('lead', {}, { builtinPresets: true });
+      expect((await r.call({ idempotencyKey: 'wake:w-1:1', titles: ['q'], prompt: 'q', preset: 'research' }, botCtx('lead'))).status).toBe('accepted');
+      await r.flush();
+      const req = r.start.mock.calls[0][0] as FanOutRequest;
+      expect(req.worktree).toBe(false);
+      expect(req.repoPath).not.toBe(REPO);
+      expect(r.defaultBranchReads).toEqual([]);
+    });
+
+    it('every task runs on the engine the owner picked for the bot; the preset\'s own engine otherwise', async () => {
+      const codex = rig('lead', { workerAgent: { agent: 'codex', model: 'gpt-6.1-sol', effort: 'low' } }, { builtinPresets: true });
+      expect((await codex.call({ idempotencyKey: 'wake:w-1:1', titles: ['a', 'b'], prompt: 'build it', preset: 'default' }, botCtx('lead'))).status).toBe('accepted');
+      await codex.flush();
+      expect((codex.start.mock.calls[0][0] as FanOutRequest).agents).toEqual([
+        { agent: 'codex', model: 'gpt-6.1-sol', effort: 'low' },
+        { agent: 'codex', model: 'gpt-6.1-sol', effort: 'low' },
+      ]);
+      const plain = rig('lead', {}, { builtinPresets: true });
+      expect((await plain.call({ idempotencyKey: 'wake:w-1:1', titles: ['a'], prompt: 'build it', preset: 'default' }, botCtx('lead'))).status).toBe('accepted');
+      await plain.flush();
+      expect((plain.start.mock.calls[0][0] as FanOutRequest).agents).toEqual([{ agent: 'claude' }]);
+      // The bot still cannot name an engine itself.
+      expect((await codex.call({ idempotencyKey: 'wake:w-1:2', titles: ['x'], agents: [{ agent: 'claude' }] }, botCtx('lead'))).status).not.toBe('accepted');
+    });
+
     it('verify refuses a fan-out without a checkout; the other presets refuse one', async () => {
       const v = rig('verifier', {}, { builtinPresets: true });
       const err = errorOf(await v.call({ idempotencyKey: 'wake:w-1:1', titles: ['x'], preset: 'verify' }, botCtx('verifier')));
@@ -571,5 +727,13 @@ describe('task.fanout.start — a bot hears whether its workers started (A2)', (
     r.port.refusal = 'the owner stopped this bot';
     await r.flush();
     expect(r.port.outcomes).toEqual([]);
+  });
+});
+
+describe('workersHeldNote', () => {
+  it('says a worker waiting for a slot has not started', () => {
+    expect(workersHeldNote(0, 1, 1)).toBe(': 1 is waiting for an agent slot, not started');
+    expect(workersHeldNote(1, 2, 1)).toBe(': 1 of your workers is open, 1 is starting, 1 is waiting for an agent slot, not started');
+    expect(workersHeldNote(0, 0, 0)).toBe('');
   });
 });

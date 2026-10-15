@@ -9,9 +9,9 @@
 // pure over the usage record they are given.
 //
 // A refusal is never retried in a loop: the runtime parks the bot, emits a
-// `bot.budget_exhausted` hook, and drops the wake with code `budget` — unless
-// the wake carries the owner's words, which wait queued until the window
-// allows a turn again (`nextTurnAllowedAt`) or the owner resumes the bot.
+// `bot.budget_exhausted` hook, and keeps the wake queued until the window
+// allows a turn again (`nextTurnAllowedAt`), a profile edit raises the cap,
+// or the owner resumes the bot.
 
 import type { BotBudget } from '../../shared/bot';
 
@@ -131,6 +131,15 @@ export function nextTurnAllowedAt(budget: BotBudget, usage: BotUsage, now: numbe
 export function recordTurn(usage: BotUsage, now: number): void {
   pruneUsage(usage, now);
   usage.turns.push(now);
+}
+
+/** Give back the turn recorded at `at` (a turn that never reached the model:
+ *  the network failed). Returns false when none was recorded then. */
+export function unrecordTurn(usage: BotUsage, at: number): boolean {
+  const i = usage.turns.lastIndexOf(at);
+  if (i < 0) return false;
+  usage.turns.splice(i, 1);
+  return true;
 }
 
 /** A task's worker starts once: a second start of the same task records
