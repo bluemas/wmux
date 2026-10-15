@@ -180,6 +180,48 @@ async function render(node: React.ReactNode) {
 }
 
 describe('Bots page', () => {
+  it('a deleted bot\'s 1:1 stays reachable at the bottom, muted and marked (removed), read-only with no composer', async () => {
+    const GONE = 'bot-0000000d';
+    const gone = { role: 'lead' as BotRole, name: 'Old', removed: true as const, workspaceId: 'w1', hue: 2 };
+    cards.push(
+      card({ workspaceId: 'w1', actor: { kind: 'human' }, kind: 'human', title: 'Old, are you there?', threadId: `dm:${GONE}`, refs: { botId: GONE }, at: 500 }),
+      card({ workspaceId: 'w1', actor: by('w1', GONE), title: 'Here, wrapping up', threadId: `dm:${GONE}`, at: 510 }),
+    );
+    const withActors = api();
+    withActors.actors = vi.fn(async () => ({ actors: { [GONE]: gone } })) as unknown as RoomsApi['actors'];
+    setRoomsApiForTests(withActors);
+    seedRooms(true);
+    act(() => useStore.setState({ roomActors: { [GONE]: gone } } as never));
+    await render(<BotsPage />);
+    expect(rowIds().at(-1)).toBe(`bot:${GONE}`);
+    const row = q(`[data-bots-row="bot:${GONE}"]`)!;
+    expect(row.getAttribute('data-bots-removed')).toBe('true');
+    expect(row.textContent).toContain('Old (removed)');
+    act(() => row.click());
+    expect(q('[data-bots-chat]')?.getAttribute('data-bots-chat')).toBe(`bot:${GONE}`);
+    expect(q('[data-bots-messages]')?.textContent).toContain('Here, wrapping up');
+    // Nothing to send or change: no composer, no profile.
+    expect(q('[data-testid="bots-composer-send"]')).toBeNull();
+    expect(q('[data-bots-removed-note]')?.textContent).toContain('This bot was deleted');
+    expect(q<HTMLButtonElement>('[data-bots-pill]')!.disabled).toBe(true);
+  });
+
+  it('with every bot deleted, a kept 1:1 still lists (no first-bot screen), its room read from the actors', async () => {
+    const GONE = 'bot-0000000d';
+    const gone = { role: 'lead' as BotRole, name: 'Old', removed: true as const, workspaceId: 'w1', hue: 2 };
+    bots = [];
+    cards.push(card({ workspaceId: 'w1', actor: by('w1', GONE), title: 'Last words', threadId: `dm:${GONE}`, at: 510 }));
+    const withActors = api();
+    withActors.actors = vi.fn(async () => ({ actors: { [GONE]: gone } })) as unknown as RoomsApi['actors'];
+    setRoomsApiForTests(withActors);
+    seedRooms(true);
+    await render(<BotsPage />);
+    for (let i = 0; i < 5 && !q(`[data-bots-row="bot:${GONE}"]`); i++) await act(async () => { await Promise.resolve(); });
+    expect(withActors.actors).toHaveBeenCalled();
+    expect(rowIds()).toContain(`bot:${GONE}`);
+    expect(q('[data-bots-chat]')).not.toBeNull();
+  });
+
   it('bots off: the conversations and live workers stay, read-only, under a banner whose Turn bots on turns them on', async () => {
     // Opening the page asks main for the factory's state again.
     const off = api();
@@ -950,6 +992,36 @@ describe('Bots page', () => {
     act(() => q('[data-bots-row="group:grp-000000a1"]')!.click());
     expect(useStore.getState().botsWorkerPanel).toBeNull();
     expect(q('[data-bots-worker-panel]')).toBeNull();
+  });
+
+  it('the chat header opens the bot\'s worker tree, so the narrow layout reaches a worker without the list (#2231)', async () => {
+    seedRooms();
+    act(() => useStore.setState({
+      workspaces: [ws('hq', 'Headquarters'), ws('w1', 'api'), {
+        ...ws('t1', 'wtask: fix login'),
+        rootPane: { id: 't1-p', type: 'leaf', ordinal: 1, surfaces: [{ id: 's', ptyId: 'pty-t1', title: '', shell: 'zsh', cwd: '/', surfaceType: 'terminal' }], activeSurfaceId: 's' },
+      } as Workspace],
+      surfaceAgent: { 'pty-t1': { name: 'Claude Code', status: 'running' } },
+      surfaceAgentStatus: { 'pty-t1': 'running' },
+    } as never));
+    await render(<BotsPage />);
+    // A group has no workers button; a bot with workers has one, with the count.
+    act(() => q('[data-bots-row="group:grp-000000a1"]')!.click());
+    expect(q('[data-bots-chat] [data-bots-head-workers]')).toBeNull();
+    act(() => q(`[data-bots-row="bot:${LEAD}"]`)!.click());
+    const button = q(`[data-bots-chat="bot:${LEAD}"] [data-bots-head-workers]`)!;
+    expect(button.textContent).toBe('1');
+    expect(button.getAttribute('aria-expanded')).toBe('false');
+    act(() => button.click());
+    expect(button.getAttribute('aria-expanded')).toBe('true');
+    const row = q(`[data-bots-chat="bot:${LEAD}"] [data-bots-tree] [data-bots-worker="t1"]`)!;
+    expect(row.textContent).toContain('fix login');
+    // A worker picked there shows its terminal beside the chat, and the popover closes.
+    act(() => row.click());
+    expect(useStore.getState().botsWorkerPanel).toEqual({ workspaceId: 't1', conversationId: `bot:${LEAD}` });
+    expect(q('[data-bots-worker-panel="t1"]')).not.toBeNull();
+    expect(q(`[data-bots-chat="bot:${LEAD}"] [data-bots-tree]`)).toBeNull();
+    expect(useStore.getState().activeWorkspaceId).toBe('hq');
   });
 
   it('a done task is a tree row while its pane is open (Resume in the panel\'s menu); a cleared one offers Resume in the rail, which shows the new pane', async () => {

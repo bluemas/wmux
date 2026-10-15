@@ -27,6 +27,7 @@ import { withRoleBinding } from '../../../renderer/utils/ptyCreateOptions';
 import { workerLaunchCommand } from '../../worktask/FanOutService';
 import { TaskLedger } from '../../../daemon/ledger/TaskLedger';
 import { setTaskLedgerForTests } from '../../deck/taskLedgerHost';
+import { toWslPath } from '../../../shared/imagePaste';
 
 let dir: string;
 beforeEach(() => {
@@ -41,7 +42,7 @@ afterEach(() => {
 const BOT = { kind: 'bot', botId: 'bot-lead-1' };
 const ENTRY = '/opt/wmux/mcp/index.js';
 /** The guard's resolvers as pty.handler sets them. */
-const mcp = () => ({ mcpEntry: () => ENTRY, registeredLevel: () => null });
+const mcp = () => ({ mcpEntry: () => ENTRY, registeredLevel: () => null, isolatedBridge: () => null });
 /** The three words a strict claude launch carries, read back from a line. */
 function strictFiles(line: string): { settings: string; mcp: string } {
   const m = /--settings="([^"]+)" --mcp-config="([^"]+)" --strict-mcp-config/.exec(line);
@@ -195,7 +196,11 @@ describe('which creates are a bot\'s workers: main\'s records, never the rendere
       expect(JSON.parse(fs.readFileSync(files.settings, 'utf8')).permissions.deny).toEqual([...BOT_WORKER_DENY]);
       expect(JSON.parse(fs.readFileSync(files.mcp, 'utf8'))).toEqual({ mcpServers: { wmux: { type: 'stdio', command: 'node', args: [ENTRY] } } });
       // A WSL shell keeps the worker settings file alone, as before.
-      expect(withBotWorkerMergeGuard(opts, worker, { dir, ...mcp() }, { wsl: true })!.initialCommand).toBe(`claude --settings="${botWorkerSettingsPath(dir)}" --dangerously-skip-permissions "$(cat '/w/.wtask/prompt.md')"`);
+      expect(withBotWorkerMergeGuard(opts, worker, { dir, ...mcp() }, { wsl: true })!.initialCommand).toBe(`claude --settings="${toWslPath(botWorkerSettingsPath(dir)) ?? botWorkerSettingsPath(dir)}" --dangerously-skip-permissions "$(cat '/w/.wtask/prompt.md')"`);
+      // On Windows the file is handed to Linux claude by its /mnt path.
+      const winSettings = 'C:\\Users\\me\\.wmux-e2e\\factory\\worker-settings.json';
+      expect(withBotWorkerMergeGuard(opts, worker, { dir, ...mcp(), writeSettings: () => winSettings }, { wsl: true })!.initialCommand)
+        .toBe(`claude --settings="/mnt/c/Users/me/.wmux-e2e/factory/worker-settings.json" --dangerously-skip-permissions "$(cat '/w/.wtask/prompt.md')"`);
       // Another owner, or another folder, is not that spawn.
       expect(botWorkerForCreate({ ...opts, fanoutTaskOf: 'ws-other' }, NOT_BOT)).toBeNull();
       expect(botWorkerForCreate({ ...opts, cwd: '/w/other' }, NOT_BOT)).toBeNull();
@@ -334,7 +339,8 @@ describe('pty:create applies the guard (source-level lock)', () => {
     // The stages, in order: quota, the tool level (or, for a bot worker's
     // claude line, the guard's own wmux server), codex guard, merge guard, pin.
     expect(src).toContain('let staged = await withAccountQuota(options);');
-    expect(src).toMatch(/withBotWorkerMergeGuard\(await guardCodexBotWorker\(staged, botWorker\), botWorker, \{\}, \{ wsl: isWslShell\(createShell\(options\)\)/);
+    expect(src).toContain('const wsl = isWslShell(createShell(options));');
+    expect(src).toMatch(/withBotWorkerMergeGuard\(await guardCodexBotWorker\(staged, botWorker\), botWorker, \{\}, \{ wsl,/);
     expect(src).toContain('return { options: withLaunchSessionPin(guarded), launch: { ...launchOfCodex(guarded), ...guardedLaunchOf(guarded) } };');
     expect(src.split('stampFanoutTaskPane(options);').length - 1).toBe(2);
     for (let at = src.indexOf('stampFanoutTaskPane(options);'); at !== -1; at = src.indexOf('stampFanoutTaskPane(options);', at + 1)) {
@@ -347,7 +353,7 @@ describe('pty:create applies the guard (source-level lock)', () => {
     expect(src).toContain('launch: { ...launchOfCodex(guarded), ...guardedLaunchOf(guarded) }');
     expect(src.split('forgetBotWorkerSession(id);').length - 1).toBe(2);
     // A resume line typed through main gets the session guard.
-    expect(src).toMatch(/IPC\.PTY_WRITE_LAUNCH[\s\S]{0,1200}guardBotWorkerSessionText\(id, text, 'write-launch', folders/);
+    expect(src).toMatch(/IPC\.PTY_WRITE_LAUNCH[\s\S]{0,1400}const shaped = promptFileArgumentForShell\(text, \{ wsl: isWslShell\(getPtyShell\(id\)\) \}\);\s+const line = sanitizePtyText\(await guardBotWorkerSessionText\(id, shaped, 'write-launch', folders/);
   });
 
   it('the resume writers type through main, and fan-out marks a bot\'s spawn around the renderer round trip', () => {

@@ -45,7 +45,7 @@ import { getHandoffRouter } from '../../factory/handoffRouter';
 import { getRoomWriter, resolveRoomPorts, runningWake, runningWakeThread, wakeReplyTo } from '../../factory/roomWriter';
 import { getFactoryStopPorts, stopFactoryWork, type FactoryStopPorts, type FactoryStopResult } from '../../factory/factoryStop';
 
-type Refusal = FactoryRefusal<'not_authorized' | 'not_started' | 'invalid_argument' | 'not_found' | 'not_running' | 'too_many_bots' | 'dropped' | 'not_owner_words' | 'not_a_repo' | 'no_remote' | 'repo_mismatch' | 'stop_failed'>;
+type Refusal = FactoryRefusal<'not_authorized' | 'not_started' | 'invalid_argument' | 'not_found' | 'not_running' | 'too_many_bots' | 'dropped' | 'not_owner_words' | 'not_a_repo' | 'repo_untrusted' | 'no_remote' | 'repo_mismatch' | 'stop_failed'>;
 
 function refuse(code: Refusal['code'], message: string): Refusal {
   return { ok: false, code, message };
