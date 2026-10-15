@@ -105,13 +105,6 @@ export interface UsageLimitLineEvent {
 type UsageLimitLineCallback = (event: UsageLimitLineEvent) => void;
 type InterruptedCallback = (event: { agent: string }) => void;
 
-/**
- * Claude Code's answer to an interrupted turn, as its own tool-result row:
- * `  ⎿  Interrupted · What should Claude do instead?`. Anchored on the `⎿`
- * gutter so a reply that quotes the sentence (this file's own review, say)
- * does not match.
- */
-const CLAUDE_INTERRUPTED_LINE = /^⎿\s*Interrupted\s*·\s*What\s+should\s+Claude\s+do\s+instead\?\s*$/;
 
 interface AgentPattern {
   /** Display name. Surfaced in UI ("Claude Code", "Codex CLI"). */
@@ -651,6 +644,24 @@ function isDialogOption(row: string): boolean {
   if (!g) return false;
   return 5 - drawnLength(`${g.cursor}${g.one}${g.yes}`) <= MAX_SKIPPED_OPTION_CELLS;
 }
+/**
+ * Claude Code's answer to an interrupted turn, as its own tool-result row:
+ * `  ⎿  Interrupted · What should Claude do instead?`. Read as a row by
+ * scanDialog, the same way as the dialog question: live, the row usually
+ * replaces a tool row that already showed `⎿`, so the diff skips the gutter
+ * with `CSI n C` and only the sentence is written (Claude Code 2.1.301). The
+ * gutter therefore counts drawn or skipped, but something must stand before
+ * the sentence, so a reply row that starts with it does not match.
+ */
+const INTERRUPTED_SENTENCE = 'Interrupted · What should Claude do instead?';
+const CLAUDE_INTERRUPTED_ROW = new RegExp(
+  `^[\\s${SKIPPED_CELL}]*[⎿${SKIPPED_CELL}]${DIALOG_GAP}(${skippable(INTERRUPTED_SENTENCE)})[\\s${SKIPPED_CELL}]*$`,
+);
+/** Whether a dialogRowText row is the interrupted-turn row. */
+function isInterruptedRow(row: string): boolean {
+  const m = CLAUDE_INTERRUPTED_ROW.exec(row);
+  return m !== null && drawnLength(INTERRUPTED_SENTENCE) - drawnLength(m[1]) <= MAX_SKIPPED_QUESTION_LETTERS;
+}
 const ROW_BREAK_G = new RegExp(ROW_BREAK_RE.source, 'g');
 /** Longest incomplete row the dialog scan carries between chunks. */
 const MAX_DIALOG_ROW = 4096;
@@ -971,6 +982,13 @@ export class AgentDetector {
     const tail = rows.pop() ?? '';
     this.dialogRow = tail.length > MAX_DIALOG_ROW ? tail.slice(-MAX_DIALOG_ROW) : tail;
     for (const row of rows) {
+      // Reported on every sighting; see interruptedCallbacks.
+      if (this.interruptedCallbacks.length > 0
+        && (row.includes('Interrupted') || row.includes('instead'))
+        && isInterruptedRow(dialogRowText(row).trim())) {
+        for (const cb of this.interruptedCallbacks) cb({ agent: 'Claude Code' });
+        continue;
+      }
       if (!this.dialogQuestion && !mayHoldDialogQuestion(row)) continue;
       const clean = dialogRowText(row).trim();
       // Nothing drawn (or only skipped cells): a pending question waits on.
@@ -1243,12 +1261,6 @@ export class AgentDetector {
       (this.lastAgent === 'Codex CLI' || (this.lastAgent === null && this.activeAgents.has('Codex CLI')))) {
       const hit = this.codexLimitScanner.feed(clean);
       if (hit) for (const cb of this.usageLimitCallbacks) cb({ provider: 'codex', ...hit });
-    }
-
-    if (this.lastAgent === 'Claude Code'
-      && this.interruptedCallbacks.length > 0 && CLAUDE_INTERRUPTED_LINE.test(clean)) {
-      for (const cb of this.interruptedCallbacks) cb({ agent: 'Claude Code' });
-      return;
     }
 
     // Check critical patterns first
