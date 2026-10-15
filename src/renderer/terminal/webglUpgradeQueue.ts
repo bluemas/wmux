@@ -27,6 +27,10 @@ export interface WebglUpgradeQueueOptions {
 /** No settle wait by default: the first build runs right after the paint. */
 export const WEBGL_UPGRADE_SETTLE_MS = 0;
 
+/** Longest a pane stays hidden waiting for its build; past it the pane shows
+ *  on whatever renderer it has. */
+export const WEBGL_UPGRADE_HIDE_MAX_MS = 1000;
+
 /** Runs `cb` in a task after the next paint. */
 function afterNextPaint(cb: () => void): void {
   if (typeof requestAnimationFrame === 'function') {

@@ -51,7 +51,7 @@ import { attachImeStormGuard } from '../terminal/imeStormGuard';
 import { attachCompositionCommitGate } from '../terminal/compositionCommitGate';
 import { webglContextPool } from '../terminal/webglContextPool';
 import { teardownWebglAddon } from '../terminal/webglTeardown';
-import { webglUpgradeQueue } from '../terminal/webglUpgradeQueue';
+import { WEBGL_UPGRADE_HIDE_MAX_MS, webglUpgradeQueue } from '../terminal/webglUpgradeQueue';
 import { syncInlineImages } from '../terminal/inlineImages';
 import { forceCharSizeMeasure, onCharSizeChange } from '../terminal/charSizeRefit';
 import { createGlyphRepaintScheduler, type GlyphRepaintScheduler } from '../terminal/glyphRepaint';
@@ -3855,10 +3855,16 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         } else {
           const el = terminalRef.current?.element;
           if (el) el.style.visibility = 'hidden';
+          // A window that is not painting (occluded, headless) runs no frame
+          // callbacks, so the queued build may never run: show the pane after
+          // a bounded wait whatever happens.
+          let hideTimer: ReturnType<typeof setTimeout> | null = null;
           showAfterUpgrade = () => {
+            if (hideTimer !== null) { clearTimeout(hideTimer); hideTimer = null; }
             if (el) el.style.visibility = '';
           };
           const show = showAfterUpgrade;
+          hideTimer = setTimeout(show, WEBGL_UPGRADE_HIDE_MAX_MS);
           cancelUpgrade = webglUpgradeQueue.enqueue(() => {
             if (
               !isVisibleRef.current ||
@@ -3870,7 +3876,12 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
               return;
             }
             const hadAddon = webglAddonRef.current !== null;
-            webglContextPool.acquire(token, loadWebglRef.current, disposeWebglRef.current);
+            try {
+              webglContextPool.acquire(token, loadWebglRef.current, disposeWebglRef.current);
+            } catch (err) {
+              show();
+              throw err;
+            }
             if (hadAddon || !webglAddonRef.current) {
               show();
               return;

@@ -15,7 +15,7 @@ import { installCanvas2dStub } from '../../../test-utils/canvas2dStub';
 import { act, useRef } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { FitAddon } from '@xterm/addon-fit';
-import { webglUpgradeQueue } from '../../terminal/webglUpgradeQueue';
+import { WEBGL_UPGRADE_HIDE_MAX_MS, webglUpgradeQueue } from '../../terminal/webglUpgradeQueue';
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -180,6 +180,13 @@ describe('useTerminal WebGL upgrade keeps the DOM frame off screen', { timeout: 
     const { jobs } = await setup('p-upgrade-fail-shows');
     webgl.fail = true;
     await act(async () => { jobs.at(-1)!(); });
+    expect(xtermEl().style.visibility).toBe('');
+  });
+
+  it('shows the pane after a bounded wait when the build never runs', async () => {
+    await setup('p-upgrade-never-runs');
+    expect(xtermEl().style.visibility).toBe('hidden');
+    await act(async () => { await new Promise((r) => setTimeout(r, WEBGL_UPGRADE_HIDE_MAX_MS + 50)); });
     expect(xtermEl().style.visibility).toBe('');
   });
 
