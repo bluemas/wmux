@@ -3854,14 +3854,17 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
           webglContextPool.acquire(token, loadWebglRef.current, disposeWebglRef.current);
         } else {
           const el = terminalRef.current?.element;
-          if (el) el.style.visibility = 'hidden';
+          // opacity, not visibility: Chromium never focuses an element in a
+          // visibility:hidden subtree, so the reveal's term.focus() would miss
+          // and keys typed before the upgrade would reach <body> and be lost.
+          if (el) el.style.opacity = '0';
           // A window that is not painting (occluded, headless) runs no frame
           // callbacks, so the queued build may never run: show the pane after
           // a bounded wait whatever happens.
           let hideTimer: ReturnType<typeof setTimeout> | null = null;
           showAfterUpgrade = () => {
             if (hideTimer !== null) { clearTimeout(hideTimer); hideTimer = null; }
-            if (el) el.style.visibility = '';
+            if (el) el.style.opacity = '';
           };
           const show = showAfterUpgrade;
           hideTimer = setTimeout(show, WEBGL_UPGRADE_HIDE_MAX_MS);
@@ -3894,8 +3897,13 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
             // lands on the same size sends nothing.
             upgradeFitRaf = requestAnimationFrame(() => {
               upgradeFitRaf = null;
-              if (claimFit(terminalRef.current, pendingFitRef)) fit();
-              show();
+              // Outside the queue's try/catch: a throwing fit must not leave the
+              // pane invisible.
+              try {
+                if (claimFit(terminalRef.current, pendingFitRef)) fit();
+              } finally {
+                show();
+              }
             });
           });
         }
