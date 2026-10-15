@@ -288,6 +288,9 @@ export const IPC = {
   // state that sleep may have invalidated (shared glyph atlas — see
   // terminal/atlasWakeRecovery.ts).
   SYSTEM_RESUMED: 'system:resumed',
+  /** Windows' "Animation effects" off, which Chromium's
+   *  prefers-reduced-motion misses there (main/reducedMotion.ts). */
+  SYSTEM_REDUCED_MOTION: 'system:reduced-motion',
   // Phase 4: Auto updater
   UPDATE_CHECK: 'update:check',
   UPDATE_AVAILABLE: 'update:available',
@@ -461,6 +464,10 @@ export const IPC = {
   // The engines a bot's workers may run on that are installed here
   // (shared/botWorkerAgent.ts); main window only.
   FACTORY_WORKER_AGENTS: 'factory:worker:agents',
+  // The space ended and running bot tasks' folders use, and Clean up now
+  // (main/factory/taskFolderCleanup.ts); main window only.
+  FACTORY_TASK_FOLDERS_USAGE: 'factory:taskFolders:usage',
+  FACTORY_TASK_FOLDERS_CLEAN: 'factory:taskFolders:clean',
   TRACK_RECORD_CHANGED: 'trackRecord:changed',
   // Git page ship button: the branch's status, commit / push / create PR
   GIT_SHIP_STATUS: 'gitShip:status',
@@ -486,7 +493,6 @@ export const IPC = {
   ROOM_RESOLVE: 'room:resolve',
   ROOM_DECISION: 'room:decision',
   ROOM_ACTORS: 'room:actors',
-  DIALOG_PICK_FILE: 'dialog:pick-file',
   DIALOG_PICK_FOLDER: 'dialog:pick-folder',
   // File system
   FS_READ_DIR: 'fs:read-dir',
@@ -586,6 +592,10 @@ export const IPC = {
   // native min/max/close) so the controls never clash with the theme.
   // Windows-only no-op elsewhere (see registerHandlers).
   WINDOW_SET_TITLEBAR_OVERLAY: 'window:setTitleBarOverlay',
+  // macOS window glass: the renderer asks main to set the app's appearance
+  // ('dark' | 'light') from the theme, so the vibrancy material behind the
+  // window matches it. macOS-only no-op elsewhere (see registerHandlers).
+  WINDOW_SET_APPEARANCE: 'window:setAppearance',
   // Whole-interface zoom (#822): the renderer asks main to scale the
   // BrowserWindow with setZoomFactor and re-place the native chrome to match.
   // One-way send — the persisted factor lives in the renderer store.
@@ -960,6 +970,24 @@ export function assertNotLiveWmuxDataDir(home: string): void {
     if (home && norm(home) === norm(process.env.WMUX_TEST_REAL_HOME)) {
       throw new Error('Refusing to touch the live wmux data dir from a test');
     }
+  }
+}
+
+/**
+ * The same refusal for a store handed its directory or file whole (the task
+ * ledger, the factory's files): under vitest, a path inside the real user's
+ * `~/.wmux` is refused. Before the isolate setup existed, fan-out tests wrote
+ * their fixture tasks into the owner's real task ledger, where they stayed
+ * open for good.
+ */
+export function assertNotLiveWmuxPath(p: string): void {
+  const realHome = process.env.WMUX_TEST_REAL_HOME;
+  if (!process.env.VITEST || !realHome || !p) return;
+  const norm = (x: string) => x.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+  const live = `${norm(realHome)}/.wmux`;
+  const target = norm(p);
+  if (target === live || target.startsWith(`${live}/`)) {
+    throw new Error('Refusing to touch the live wmux data dir from a test');
   }
 }
 

@@ -31,7 +31,8 @@ import type {
 import { getWorkspaceMirror } from '../../workspace/WorkspaceMirror';
 import { BOT_AVATAR_EXTENSIONS, pickBotAvatar, type BotAvatarPickerDeps } from '../../factory/botAvatar';
 import { isMainWindowSender } from '../mainWindowSender';
-import type { BotTaskView } from '../../../shared/botTask';
+import type { BotTaskView, FactoryTaskFolderCleanResult, FactoryTaskFolderUsage } from '../../../shared/botTask';
+import { cleanTaskFolders, getTaskFolderPorts, taskFolderUsage } from '../../factory/taskFolderCleanup';
 import { botTaskViews, getBotTaskSources, type BotTaskSources } from '../../factory/botTasks';
 import { getFactoryStopPorts, stopFactoryWork, type FactoryStopPorts, type FactoryStopResult } from '../../factory/factoryStop';
 import { getWorkerResumePorts, resumeWorker, type WorkerResumePorts, type WorkerResumeResult } from '../../factory/workerReclaim';
@@ -83,7 +84,7 @@ export async function factoryBotRowsWithTasks(
   }
 }
 
-const STOP_NONE = { botsInterrupted: 0, workersStopped: 0, gatesCancelled: 0 } as const;
+const STOP_NONE = { botsInterrupted: 0, workersStopped: 0, tasksCancelled: 0, gatesCancelled: 0 } as const;
 
 /** FACTORY_STOP_ALL / FACTORY_STOP_BOT's body: the sender check, the bot id
  *  (stop-bot only), then factoryStop. A stop of a bot the store no longer
@@ -158,6 +159,37 @@ export function factoryWorkerAgentsHandler(
     const resolve = deps.resolve ?? ((cmd: string, en: NodeJS.ProcessEnv) => resolveOnPath(cmd, en));
     const platform = deps.platform ?? process.platform;
     return BOT_WORKER_AGENTS.map((agent) => ({ agent, label: botWorkerAgentLabel(agent), installed: resolve(agent, env) !== null, supported: botWorkerAgentSupported(agent, platform) }));
+  };
+}
+
+/** FACTORY_TASK_FOLDERS_USAGE: the space bot task folders use; null for
+ *  another sender or before the factory runs. */
+export function factoryTaskFoldersUsageHandler(
+  getWindow: () => BrowserWindow | null,
+  ports: () => ReturnType<typeof getTaskFolderPorts> = getTaskFolderPorts,
+): (e: { sender?: unknown; senderFrame?: unknown }) => Promise<FactoryTaskFolderUsage | null> {
+  return async (e) => {
+    if (!isMainWindowSender(e, getWindow())) return null;
+    const p = ports();
+    return p ? taskFolderUsage(p, p.allRows()) : null;
+  };
+}
+
+/** FACTORY_TASK_FOLDERS_CLEAN: Clean up now — the task-end rules applied to
+ *  every ended bot task (a folder kept dirty is looked at again). */
+export function factoryTaskFoldersCleanHandler(
+  getWindow: () => BrowserWindow | null,
+  ports: () => ReturnType<typeof getTaskFolderPorts> = getTaskFolderPorts,
+): (e: { sender?: unknown; senderFrame?: unknown }) => Promise<FactoryTaskFolderCleanResult> {
+  return async (e) => {
+    if (!isMainWindowSender(e, getWindow())) return { ok: false, code: 'operator_only', message: 'only the main window may clean up task folders' };
+    const p = ports();
+    if (!p) return { ok: false, code: 'not_started', message: 'The factory is not running.' };
+    try {
+      return { ok: true, ...(await cleanTaskFolders(p, p.allRows(), { force: true })) };
+    } catch (err) {
+      return { ok: false, code: 'unavailable', message: `The daemon could not be read: ${String(err)}` };
+    }
   };
 }
 
@@ -288,19 +320,54 @@ export function factoryBotSetAvatarHandler(
   };
 }
 
+/** What switching "Run bots" off stopped (FACTORY_SETTINGS_SET's answer,
+ *  present when it stopped something or could not stop everything). */
+export interface FactoryOffStopped {
+  /** Workers whose processes were confirmed gone. */
+  workers: number;
+  /** Open bot tasks cancelled ("stopped by owner"). */
+  tasks: number;
+  ok: boolean;
+}
+
 /** FACTORY_SETTINGS_SET's body: the sender check, then the settings store.
- *  null = not written. */
+ *  null = not written. Switching "Run bots" off stops the bots' running
+ *  work (factoryStop.ts, `off`): the switch is written first, so nothing new
+ *  launches, then the same stop as Stop all runs. */
 export function factorySettingsSetHandler(
   getWindow: () => BrowserWindow | null,
   store: typeof getFactorySettingsStore = getFactorySettingsStore,
-): (e: { sender?: unknown; senderFrame?: unknown }, patch: unknown) => Promise<FactorySettings | null> {
+  stopPorts: () => FactoryStopPorts | null = getFactoryStopPorts,
+): (e: { sender?: unknown; senderFrame?: unknown }, patch: unknown) => Promise<(FactorySettings & { stoppedWork?: FactoryOffStopped }) | null> {
   return async (e, patch) => {
     if (!isMainWindowSender(e, getWindow())) return null;
     const s = store();
     if (!s) return null;
-    const next = await s.update(patch);
+    const wasOn = s.get().enabled;
+    // The store applies a patch before its write lands, so the switch is
+    // live once update() is called. The stop starts in the same tick and
+    // reads what it stops right away: a switch-on that lands while it runs
+    // (or while the write is pending) keeps the work started after it.
+    const writing = s.update(patch);
+    const switchingOff = wasOn && !s.get().enabled;
     getBotRuntime()?.kick();
-    return next;
+    const ports = switchingOff ? stopPorts() : null;
+    const stopping = ports ? stopFactoryWork(ports, { off: true }) : null;
+    let next: FactorySettings | null = null;
+    let failure: unknown = null;
+    try {
+      next = await writing;
+    } catch (err) {
+      // A write that failed after switching off still stops the work.
+      failure = err;
+    }
+    let stoppedWork: FactoryOffStopped | undefined;
+    if (stopping) {
+      const r = await stopping;
+      if (r.workersStopped > 0 || r.tasksCancelled > 0 || !r.ok) stoppedWork = { workers: r.workersStopped, tasks: r.tasksCancelled, ok: r.ok };
+    }
+    if (!next) throw failure;
+    return stoppedWork ? { ...next, stoppedWork } : next;
   };
 }
 
@@ -324,6 +391,8 @@ export function registerFactoryHandlers(
     IPC.FACTORY_ENGINE_READINESS,
     IPC.FACTORY_ENGINE_LOGIN,
     IPC.FACTORY_WORKER_AGENTS,
+    IPC.FACTORY_TASK_FOLDERS_USAGE,
+    IPC.FACTORY_TASK_FOLDERS_CLEAN,
   ];
   for (const c of channels) ipcMain.removeHandler(c);
 
@@ -370,6 +439,10 @@ export function registerFactoryHandlers(
   ipcMain.handle(IPC.FACTORY_ENGINE_LOGIN, wrapHandler(IPC.FACTORY_ENGINE_LOGIN, factoryEngineLoginHandler(getWindow, defaultEngineLoginDeps(getWindow))));
 
   ipcMain.handle(IPC.FACTORY_WORKER_AGENTS, wrapHandler(IPC.FACTORY_WORKER_AGENTS, factoryWorkerAgentsHandler(getWindow)));
+
+  ipcMain.handle(IPC.FACTORY_TASK_FOLDERS_USAGE, wrapHandler(IPC.FACTORY_TASK_FOLDERS_USAGE, factoryTaskFoldersUsageHandler(getWindow)));
+
+  ipcMain.handle(IPC.FACTORY_TASK_FOLDERS_CLEAN, wrapHandler(IPC.FACTORY_TASK_FOLDERS_CLEAN, factoryTaskFoldersCleanHandler(getWindow)));
 
   return () => {
     for (const c of channels) ipcMain.removeHandler(c);

@@ -41,10 +41,10 @@ for a session that never chose a theme; a saved choice is always kept.
 | Theme | Polarity | Accent | UI face | Chip radius | Selection | Active tab | Glass |
 |---|---|---|---|---|---|---|---|
 | Tint | dark, faint violet | `#9B8CFF` | Geist | 7px | fill (text 9%) | fill | yes |
-| Zinc | dark, neutral | `#FAFAFA` | Geist | 6px | fill + 1px ring | fill | no |
-| Graphite | dark, cool | `#4C8DFF` | IBM Plex Sans | full round | fill (`#1B2433`) | fill + 2px accent underline | no |
-| Paper | light | `#5B5BD6` | Figtree | 7px | fill (`#E4E4EA`) | fill | no |
-| Amber Line | dark, warm | `#E8A33D` | Geist | 6px | 2px accent left bar | fill + 2px accent underline | no |
+| Zinc | dark, neutral | `#FAFAFA` | Geist | 6px | fill + 1px ring | fill | yes |
+| Graphite | dark, cool | `#4C8DFF` | IBM Plex Sans | full round | fill (`#1B2433`) | fill + 2px accent underline | yes |
+| Paper | light | `#5B5BD6` | Figtree | 7px | fill (`#E4E4EA`) | fill | yes |
+| Amber Line | dark, warm | `#E8A33D` | Geist | 6px | 2px accent left bar | fill + 2px accent underline | yes |
 
 Two neutral themes ship beside them, Mono and Mono Light (zero-saturation
 greys, one blue accent). The other themes (Amber, Catppuccin, Stars &
@@ -93,7 +93,11 @@ and `--sheet-edge`. A new knob is added to `ThemeStyle`, emitted by
 
 **Terminal content owns its palette.** Each look has its own opaque
 terminal palette (`BUILTIN_XTERM_PALETTE`); diffs are green and errors red
-in the terminal whatever the chrome accent.
+in the terminal whatever the chrome accent. A theme that borrows another
+theme's palette with a visibly different background (Stars & Stripes, Red
+Dynasty, Nightowl) keeps its ANSI
+colours but puts the terminal on its own `--bg-base`, so the terminal never
+reads as a second, differently tinted panel.
 
 ## Window: frame and sheet
 
@@ -107,35 +111,52 @@ in the terminal whatever the chrome accent.
 │i │ (mantle)  │  terminal grid (THE HERO)                           │ │
 │l │           │                                                     │ │
 │48│           │  [agent bar — overlay, on approach]                 │ │
-│  │╰───────────────────────────────────────────────────────────────╯ │
-└──┴── 8px frame margin ───────────────────────────────────────────────┘
+│  │╰───────────────────────────────────────────────────────────────────┤
+└──┴── sheet flush with the window's edges on macOS (8px elsewhere) ───┘
 ```
 
-- **Frame:** the titlebar row, the 48px rail and an 8px margin
-  (`--sheet-inset`) on the left, right and bottom, painted `--frame-bg` — a
-  step darker than the sheet in the dark looks, a soft grey in Paper.
+- **Frame:** the titlebar row and the 48px rail, painted `--frame-bg` — a
+  step darker than the sheet in the dark looks, a soft grey in Paper. On
+  macOS, whose windows have rounded corners, the sheet has no margin: it
+  meets the window's edges, its own rounded corners kept. Windows and Linux
+  keep an 8px margin (`--sheet-inset`) on the sides away from the rail and
+  the bottom, so no frame notch shows in a square window corner.
 - **Sheet:** one rounded panel (`--sheet-radius` 12px) flush under the
   titlebar, holding the sidebar and the panes (and the file tree column
   when it is shown). Nothing docks opposite the sidebar (the Bots page's
   right split — a worker's terminal or a thread beside the chat — is part of
   that page's body, not a dock). It is set
   off by a 1px `--sheet-edge` hairline and a faint `--sheet-shadow`, nothing
-  else. Inside, the sidebar keeps its mantle tone and meets the body at a
-  single seam.
+  else. Inside, the sidebar keeps its mantle tone; the pane column rounds
+  off where it meets the sidebar (`--sheet-radius` on its two inner
+  corners) with a 1px `--sheet-edge` hairline along the curve, and that
+  line is the one seam. With the sidebar hidden the pane column drops both,
+  leaving the sheet's own edge as the only boundary.
 - **Native fullscreen** (any platform): the sheet drops its margins and
   radius. The rail stays.
 - **Terminal geometry is untouched** by the frame: margin changes, a sidebar
   collapse and fullscreen each refit the terminals once, never per frame.
-- **Window glass (macOS, dark looks, `--theme-glass: 1`):** the window gets
-  an under-window vibrancy material behind a transparent background, and
-  `data-glass` on `<html>` makes the **frame only** paint at 85% over it. The
-  sheet, the panes and every terminal stay opaque, so the hero never changes
-  with the wallpaper. Glass needs macOS itself to be dark too: the material
-  follows the system appearance, and changing that is app-wide (it would
-  flip browser surfaces' `prefers-color-scheme` and the native menus), so a
-  dark look on a light Mac keeps an opaque frame. Light looks, looks with
-  `glass: false`, and Windows and Linux are opaque. The page fades through `color-mix(… 0%, transparent)`, never the
-  `transparent` keyword (which interpolates through black).
+- **Window glass (macOS, every theme, `--theme-glass: 1`):** the window gets
+  the `sidebar` vibrancy material behind a transparent background. The
+  renderer sets the app's appearance from the theme (a dark theme, the dark
+  material; a light theme, the light one — app-wide, so native menus and the
+  in-app browser's `prefers-color-scheme` follow the theme), and `data-glass`
+  on `<html>` is set once the two agree. The frame then paints
+  `--glass-frame` of `--frame-bg` over the material and the sheet adds
+  `--glass-sheet` of the mantle under the sidebar; the panes and every
+  terminal stay opaque, so the hero never changes with the wallpaper. The
+  user picks Off, Soft (default) or Clear in Settings › Appearance ›
+  Interface. Coverage of the sidebar, frame and sheet stacked: dark themes
+  about 29% Soft / 14% Clear; strongly hued themes (Stars & Stripes, Red
+  Dynasty, Catppuccin) about 64% / 43% so their colour survives the grey
+  material; light themes, whose material is milkier, about 14% / 3%.
+  Windows and Linux are opaque. The page fades through
+  `color-mix(… 0%, transparent)`, never the `transparent` keyword (which
+  interpolates through black). `data-glass` carries the material's
+  appearance (`dark` or `light`), which is how the light tuning applies to
+  any light theme, custom ones included. With glass Off the app returns to
+  the system appearance, and glass is only installed once the saved theme
+  and level are loaded, so a launch never flips the appearance twice.
 - `BrowserWindow.backgroundColor` follows the default look so the first
   frame never flashes white; no native menu bar is visible
   (`autoHideMenuBar`; accelerators keep working).
@@ -178,9 +199,9 @@ bar is a drag region; each interactive child opts out with `no-drag`.
   More menu lists it so it stays discoverable.
 - **Right:** Fleet vitals as appearing chips (`N running`, `N need you`; only
   when nonzero, and dropped while Fleet is the page), the account usage when
-  it matters, then the **file tree toggle** (a bare icon like the sidebar's,
-  ⌘⇧E / Ctrl+Shift+E), the bar's last icon (see File tree column). There
-  is no room or bot panel toggle: bot conversations live on the Bots page.
+  it matters. The file tree toggle is not here: it is the agent bar's Files
+  button (see File tree column). There is no room or bot panel toggle: bot
+  conversations live on the Bots page.
   Settings is not here: it lives in the rail's More menu (and ⌘,).
 - **Windows:** the native window controls sit at the right edge in the
   `titleBarOverlay` strip, drawn in the colour the frame actually paints
@@ -203,7 +224,9 @@ commands, sidebar links, toast and notification jumps, schedule deep links —
 navigates through it.
 
 - **Pages, in order:** Workspaces (home: the sidebar and the panes)
-  · Bots · Fleet · Schedules · Remote · Git. Settings is a page too,
+  · Bots · Fleet · Schedules · Remote · Git. Bots is listed only while the
+  bots are on (Settings › Bots); off, its shortcut and palette command open
+  Settings › Bots instead. Settings is a page too,
   opened from the rail's More menu or ⌘,.
 - **The rail's foot** holds one `⋯` **More** button (named "More",
   `aria-haspopup="menu"`). Its menu, beside the rail and level with the
@@ -318,15 +341,25 @@ status bar badges, `fleet_triage` or the phone's sidebar.
   ~860px window) it is one column: the list first; choosing a conversation opens the chat over
   it, with a round back button left of the name pill.
 - **List:** the 16px title with Search, `⋯` (the page menu: Stop all
-  bots, when main offers it) and `+` (Add bot: the Settings add form in a
-  dialog; the bot it adds is selected) as 28px icon buttons, in every state
+  bots, when main offers it) and `+` (a menu: Add bot — the Settings add
+  form in a dialog; the bot it adds is selected — and New group chat) as
+  28px icon buttons, in every state
   of the page; Search opens a filter field under the header (Escape closes
   and clears it). One row per conversation (8px 10px padding, inset 8px): a 32px avatar, the 13px/500 name
   with the newest message's time, and one 12px muted preview line (the
-  owner's own as "You: …", a room's prefixed with who spoke). Every
-  workspace room is a group conversation and every bot a 1:1. Rooms and
-  bots follow by latest activity; nothing is pinned (the workspace an
-  earlier version made the HQ is a room like any other). The selected row is the `--selection` pill
+  owner's own as "You: …", a group's prefixed with who spoke; a bot whose
+  newest post is in a group, "In <group>: …"). Every bot is
+  a 1:1, and the rest are the **group chats the owner made** (owner
+  decision 2026-10-15, the reference messenger's model): no workspace has a
+  room by itself, however many bots it has, and no bot ever makes one. A
+  1:1 and a group are separate conversations, never mirrors: a 1:1 is its
+  own thread of the bot's room — what the owner and the bot say there, and
+  the work it starts there — and a group is its own thread too
+  (`group:<id>`) with the work started from it; neither shows the other. A
+  workspace whose General is no group's shows what its bots say there in
+  their 1:1s. Groups and bots follow by latest activity; nothing is pinned
+  (the workspace an earlier version made the HQ is a workspace like any
+  other). The selected row is the `--selection` pill
   (10px radius), hover `--hover-fill`. A row with unread bot messages
   (this session) carries a neutral count — a 16px `--selection-emphasis`
   pill — and its preview in `--text-sub`; when the row needs the owner the
@@ -335,10 +368,11 @@ status bar badges, `fleet_triage` or the phone's sidebar.
   under its row the way the Sidebar nests a workspace's fan-out tasks: an
   indented row each on a `--stroke` guide under the avatar — the Sidebar's
   status mark (running a muted dot, waiting on the owner the attention
-  ring, an error a cross, done a check), the fan-out mark and the task's
+  ring, an error a cross, done a check, a task the owner stopped no mark
+  and the neutral word "Cancelled"), the fan-out mark and the task's
   title in 12px, what a worker waiting on input asks in the needs-you text,
   and under it the branch with its `+N −N` diff counts. Live workers come
-  first, then ended tasks (done or failed) while their workspace is still
+  first, then ended tasks (done, failed or cancelled) while their workspace is still
   open; a row drops off when its workspace is cleared. A fold toggle — the
   count and a chevron — sits inside the bot row's right edge, under its
   time. **The open conversation is one group** (the Sidebar's selected
@@ -349,36 +383,73 @@ status bar badges, `fleet_triage` or the phone's sidebar.
   worker shown there reads in the title weight beside its state mark — no
   second fill. The panel never opens by itself — a new row with its running
   dot is the signal. A worker row carries one dot, its state mark: the git
-  line shows the diff counts, not its clean dot. A room row lists none
+  line shows the diff counts, not its clean dot. A group row lists none
   (each worker sits under its bot once).
-- **Avatars (owner decision 2026-10-14, replaces the initials tiles):** a
-  bot's avatar is the picture the owner set for it, else the bot's own
-  mark: its **identity colour** and one of four shapes (circle, rounded
-  square, hexagon, rounded diamond). The shape comes from the bot's id; the
-  colour is per room, oldest bot first, in a fixed spread order (teal,
-  violet, magenta, blue, slate, then the rest) so a room's bots never share
-  one while the eight last and its first five read apart; a bot keeps its
-  colour while it exists. The mark carries a small friendly face (two dot
-  eyes and a smile in `--bg-base`) — the shared `BotAvatar`, the same mark
-  everywhere. A room stacks two of its
+- **Group chats (owner decision 2026-10-15):** the owner makes them — `+` ›
+  New group chat opens a dialog: the workspace (those with bots), a name
+  and a checkbox per bot of that workspace, with one muted line saying a
+  group's bots are that workspace's only (they share it and its
+  repository); a workspace with fewer than two bots says so and Create stays off,
+  as it does with no name or fewer than two bots ticked. The group made
+  opens. A group's name pill opens the same dialog to rename it, change its
+  bots, or Delete group (asked in place: its messages stay saved, the row
+  goes). A group with nothing said yet reads "Write the first message:
+  every bot here answers and introduces itself." Nobody greets first in a
+  group and no "joined" line is drawn: each bot the owner's first message
+  reaches introduces itself in its answer (its wake asks it to; no canned
+  card), and a bot's greeting stays in its 1:1. A room the owner had
+  written in before group chats became a group named after its workspace,
+  with that workspace's bots, reading on in General; a room the owner never
+  wrote in is just no longer listed.
+- **Avatars (owner decision 2026-10-16, the Mochi crew; replaces the
+  2026-10-14 shapes):** a bot's avatar is the picture the owner set for it —
+  the picture always wins — else its **Mochi character**, one of eight
+  (Loaf, Nova, Plume, Wink, Momo, Pip, Koa, Nub; "Mochi Orb Crew v2", drawn
+  by Grok). The character is the bot's **identity colour slot**: slot *i* of
+  `BOT_IDENTITY_HUES` is character *i*, whose body wears that colour, so each
+  character keeps its designed colour. The slot is per room, oldest bot
+  first, in a fixed spread order (teal, violet, magenta, blue, slate, then
+  the rest), so a room's bots never share a character while the eight last
+  and its first five read apart; a bot keeps its character while it exists.
+  The characters' own colours are the same on light and dark looks; the
+  bot's name keeps the identity colour mixed toward `--text-main`. The add
+  form's not-yet-made bot is a still, neutral grey mochi (`--text-muted`),
+  never an identity. One shared `BotAvatar`, the same character everywhere;
+  each instance owns its gradient ids, so repeats and hidden panels never
+  share one. **Motion** (the one perpetual avatar motion, owner-approved
+  with the art): at rest a character breathes, blinks on its own stagger and
+  makes one signature twitch every few seconds; while its bot is running
+  (`working`, passed only where it reads as "busy now": the list row and an
+  empty 1:1's intro) it hops and twitches quicker. Transform only. At 24px
+  and under it only blinks, working or not, so pills and stacks stay still.
+  An avatar off screen or in a hidden panel is paused, and
+  `prefers-reduced-motion` stops all of it. A room stacks two of its
   bots' avatars and "+N" for the rest (the chat's centred pill shows up to
-  three overlapping in a row). A bot's presence dot (the room's presence
+  three overlapping in a row) — a group chat's, its bots'. A bot's presence dot (the room's presence
   grammar; not reported is a hollow ring) sits on its avatar's corner.
 - **Needs you:** the one coloured mark is the attention badge on a bot's
   row: its open questions, its open plan (its newest; an older plan left
   open is superseded) and open proposals, plus its workers waiting on the
   owner — a waiting worker its bot's open question already asks about (the
-  question's task) counts once. Rooms carry none (every question has a bot that asked it), and the
+  question's task) counts once. What a bot asks in a group counts on that
+  bot's row too, and while nothing it waits on is in its 1:1 the row leads
+  to it: a click opens that group with the newest waiting card's thread
+  beside the chat. Group rows carry none (every question has a bot that asked it), and the
   rail badge is the sum of the bot rows — one count, read from one model.
   While the bots are paused nothing on the page can be answered, so
   nothing is counted (rows and rail alike).
-- **Chat:** a centred name pill (avatar, name, presence; a room's bot
+- **Chat:** a centred name pill (avatar, name, presence; a group's bot
   count) in the chat's 44px header row, the messages under it with no rule
-  between. The pill opens
+  between. A group's pill opens its settings (Group chats, above); a bot's
+  pill opens
   the bot's profile (template, job — the owner's words, with Edit —
-  workspace, repository, what its workers run on — a native Select:
+  workspace, repository — with Change, Add bot's folder picker, checked
+  as at creation (a refusal says why in one line) — what its workers run on — a native Select:
   Default (the presets' engine) or an installed engine that has a worker
-  guard, one not installed listed but disabled — on/off and presence, turns used and left today,
+  guard, one not installed listed but disabled — on/off and presence (a
+  parked bot adds one muted line under it saying why — out of turns,
+  stopped after errors, paused by the owner — with a secondary Resume),
+  turns used and left today,
   its routines, its connections — each library connection that applies to
   it, an every-bot one with a switch that turns it off for this bot alone,
   a picked one with Edit and Remove from this bot, then Add connection and
@@ -387,7 +458,9 @@ status bar badges, `fleet_triage` or the phone's sidebar.
   per-bot settings — whom it reports to (You), and its workers now; last,
   Stop — the bot's turn and its workers — a
   destructive secondary that asks in place, the solid red only on its
-  final confirm, never a window dialog) as a popover that fits the chat: on a
+  final confirm, never a window dialog; under it Delete bot, the same
+  destructive secondary asking in place, its confirm saying what happens:
+  its messages stay, its running workers stop, its routines go) as a popover that fits the chat: on a
   short window it scrolls inside (16px off the chat's foot), so Stop at its
   end stays reachable. A stop's result is a
   toast naming what stopped (counts at zero left out). The pill floats
@@ -405,7 +478,8 @@ status bar badges, `fleet_triage` or the phone's sidebar.
   12px above its first bubble, and the bot's 28px avatar once, beside its
   last bubble (bottom-left); bubbles of a run sit 4px apart, runs 12px, a
   bubble at most 78% of the column (density, owner decision 2026-10-14). A 1:1
-  shows no name (the pill names the bot). The full date and time is the
+  shows no name for its own bot (the pill names it); another bot speaking
+  in it (work its 1:1 started) is named as in a room. The full date and time is the
   bubble's tooltip. A bot's kind word (Verdict, Report; a refusal's red, a
   budget's yellow, a waiting card's needs-you text) and a verdict's word
   sit in 11px muted at the top of its bubble; the title and body read as one
@@ -432,7 +506,8 @@ status bar badges, `fleet_triage` or the phone's sidebar.
   11일 (일) 오후 8:37"; the year only when it is not this one) at each new
   day and after an hour's quiet; the label alone divides, no rule. A chat
   opened again marks what arrived since it was last read to its end with a
-  muted "New" label and one `--stroke` hairline. Scrolled up when
+  muted "New" label and one `--stroke` hairline; what arrives while the
+  chat is in view is read as it lands and gets none. Scrolled up when
   something arrives, a floating "N new" pill (the name pill's look) above
   the composer goes back to the end. The read position is kept for the
   session only.
@@ -443,8 +518,9 @@ status bar badges, `fleet_triage` or the phone's sidebar.
   (header, body and chip), one alignment per line. Consecutive system cards of one thread merge
   into one line naming the first three and "N events", the red and yellow
   words kept; it opens into the lines themselves. A 1:1 holds the system
-  cards about the bot's own work: those naming the bot or its task, or
-  written in a thread it wrote in.
+  cards of its own thread and of the work it started; from before 1:1
+  threads (and, for a lone bot, from the room too) those naming the bot or
+  its task, or written in a thread it wrote in.
 - **Threads (owner decision 2026-10-14):** a thread other than General shows
   in the timeline as its first card (its root) — a system line (a task's
   start) as much as a message — carrying the thread's chip when its name
@@ -483,7 +559,8 @@ status bar badges, `fleet_triage` or the phone's sidebar.
   resumable with their pane cleared — one 28px row each with Resume; three
   rows, then "+N more". No spinner or shimmer. With nothing working it is
   not drawn.
-- **Worker panel:** a worker row in the list (and a Resume that started)
+- **Worker panel:** a worker row in the list (and a Resume that started,
+  or a notification about a bot's worker opened while the page is up)
   shows the worker's terminal in a panel beside the chat, on the Bots page,
   and never switches the active workspace (owner decision 2026-10-14): a
   44px header on one line — the worker's name in 13px/500, "· its state" in
@@ -509,31 +586,40 @@ status bar badges, `fleet_triage` or the phone's sidebar.
   chip style) that fill the composer (they never send by themselves).
 - **Composer:** one rounded pill at the foot (22px radius, a `--line`
   hairline, `--line-strong` while focused): "+" on the left — a menu of
-  first messages to put in the box and, in a room, the bots to address —
+  first messages to put in the box and, in a group, the bots to address —
   the text ("Message <name>"; "Reply in thread" in a thread), and the
   round primary send on the right. No microphone. A 1:1
-  message is addressed to that bot alone. A room's message goes to every bot
-  of the room (they may answer each other) — or, in a room with a
-  coordinator, to the coordinator alone, which hands the work on — unless
-  bots are picked: a row of `@name` chips under the box (the room's bots,
-  26px, the selection fills; pressed = `--selection-emphasis`), with a muted
-  "To everyone here" ("To <lead>" in a room with a coordinator) while none
-  is picked; starting the message with `@` and
-  a bot's name (or a run of them, `@A @B …`) picks those chips, and an
-  `@name` inside a sentence is plain text that addresses nobody. A bot that
+  message is addressed to that bot alone. A group's message goes to every
+  bot of the group (they may answer each other; a coordinator is a bot like
+  any other, its job saying it leads — owner decision 2026-10-15) unless
+  bots are picked: the **recipients control** right above the pill, a 24px
+  chip "To: everyone ▾" ("받는 봇: 모두 ▾"; "To: <names>" in the
+  `--selection-emphasis` fill once some are picked) that opens a checkbox
+  per bot of the group (the "+" menu's popover place) with one muted line:
+  none ticked goes to everyone, and the picks reset after each send. An `@`
+  and a group bot's name anywhere in the message ticks that bot too, and an
+  `@` naming no bot of the group is plain text (owner decision
+  2026-10-15). A reply in a thread the group started goes to the picked
+  bots or the whole group. Typing `@` and the start
+  of a name lists the group's bots that match in a popover over the box
+  (the "+" menu's place and rows, the caret staying in the box): the
+  arrows move, Enter, Tab or a click puts `@Name ` in, Escape closes. A bot that
   is off says so under the box and sends nothing. While a bot's approval
-  request waits and its card is in the conversation — a room's whole view,
-  or the asking bot's 1:1 — an "Approve N pending" chip sits above the box,
+  request waits and its card is in the conversation — a group's view, or
+  the asking bot's 1:1 — an "Approve N pending" chip sits above the box,
   whatever thread the card is in.
-- **Bots off:** one wording for the switch everywhere — "Bots on" in
-  Settings, "Bots are off" and "Turn bots on" on the page and in the
-  composer (ko: 봇 켜기 / 봇이 꺼져 있어요). With the bots off the page
-  stays — the list and every conversation, live workers included,
-  read-only (no answers; the composer says why and sends nothing) — under
-  a notice row across the page on the header band's `--selection-subtle`
-  fill: "Bots are off", one muted line, and Turn bots on (the primary; it
-  writes the same setting Settings does). Stop stays: it ends work still
-  running. The empty page (no bot yet) shows no notice row.
+- **Bots off (owner decision 2026-10-15):** the page and its rail item
+  exist only while the bots are on. They are turned on in Settings › Bots
+  (the "Bots on" switch, whose description says it adds Bots to the
+  sidebar); the rail item appears at once and Settings stays open. Turned
+  off while the page is open (in Settings, or Turn bots off in the plan
+  consent), the page leaves for Workspaces and the item goes. One wording
+  for the switch everywhere — "Bots on" in Settings, "Bots are off" and
+  "Turn bots on" (ko: 봇 켜기 / 봇이 꺼져 있어요). Should the page still
+  meet the bots off for a moment, it is read-only (the composer says why
+  and sends nothing) under a notice row on the header band's
+  `--selection-subtle` fill: "Bots are off", one muted line, and Turn bots
+  on (the primary; it writes the same setting Settings does).
 - **Add bot (2026-10-13):** a name is all a bot needs. The form: workspace,
   name (required), picture, "Start from" template chips (the composer's
   chip style; one pressed at most) that prefill the job — a chip replaces
@@ -541,32 +627,38 @@ status bar badges, `fleet_triage` or the phone's sidebar.
   plain textarea) and the repository, always shown as one line — "Works on
   owner/repo" with Change and None (inherited, suggested, or a picked
   folder; None works on no repository), never attached silently. No role
-  picker. `+` and Add are there whether the bots are on or off; while they
-  are off Add asks once in place ("Bots are off. Adding <name> turns bots
-  on.", Turn bots on and add) instead of sending the owner to Settings. A
+  picker. In Settings › Bots, Add is there whether the bots are on or off;
+  while they are off it asks once in place ("Bots are off. Adding <name>
+  turns bots on.", Turn bots on and add). A
   disabled Add says why in one muted line (no name, an invalid name, no
   workspace). After Add the new bot's chat opens at once with "Starting
   <name>…" until its greeting arrives. The new bot greets the owner and asks
-  what to do, with choices, in its 1:1; its room shows, at the time it was
-  added, one centred muted line, "<name> joined", with Open chat (to that
-  1:1), instead of the greeting (the question main marks as the bot's
-  greeting). A bot's `job_changed` card carries
+  what to do, with choices, in its 1:1 (the question main marks as the
+  bot's greeting); no group shows it, and no group draws a "joined" line.
+  A bot's `job_changed` card carries
   Undo (secondary). **Add team** (a ghost button beside Cancel, while the
   chosen workspace has no coordinator) adds five bots at once to that
   workspace and repository — the lead (a coordinator) first, then research,
   developer, issues and reviewer, named in the owner's language — with no
-  name field needed; only the lead greets, and its chat opens. Its tooltip
-  names the five and says the owner talks to the lead.
+  name field needed; only the lead greets, in its 1:1, and its chat opens.
+  Its tooltip names the five and says the owner talks to the lead. Add
+  team makes the bots only, never a group (owner decision 2026-10-15):
+  then one notice under the list header, on the `--selection-subtle` fill,
+  says the team was added (that line and its × on the first row) and offers
+  **Make a group chat with this team** on its own row below
+  ("이 팀으로 그룹 채팅 만들기", secondary; × dismisses it), which opens New
+  group chat filled in — the workspace's name and the five ticked.
 - **First run (owner decision 2026-10-14):** with no bot yet the page is
   one centred panel: "Name your first bot", one muted line (it works in
   <the current workspace>, greets you and asks what to do), a name field
-  and Start (the primary). Start turns the bots on when they are off, adds
-  the bot to the current workspace and opens its 1:1, where its greeting
-  arrives. When the Claude engine cannot sign in the panel says why in
+  and Start (the primary). The page is reached with the bots on, so Start
+  adds the bot to the current workspace and opens its 1:1, where its
+  greeting arrives. When the Claude engine cannot sign in the panel says why in
   one line and offers Log in to Claude (and Check again); Start waits until
   it can. A build that cannot tell never blocks Start. Beside Start, a
   secondary **Add a team (lead + 4 roles)** does the same for the five-bot
-  team (no name to type) and opens the lead's chat.
+  team (no name to type), opens the lead's chat and offers the group chat
+  row (Add bot, above).
 
 ### Fleet
 
@@ -977,11 +1069,12 @@ worker's terminal or a thread opens in the page's own body, right of the
 chat (owner decision 2026-10-14, layout A).
 
 **File tree column.** The one opt-in column on that edge, beside the
-panes. Its titlebar
-toggle (or ⌘⇧E / Ctrl+Shift+E, or the palette) shows it; open state and
+panes. The agent bar's
+Files button (or ⌘⇧E / Ctrl+Shift+E, or the palette) shows it; open state and
 width (200–480px, drag the inner seam) persist. It is Workspaces-page
-chrome: a rail page covers it with the panes, and the toggle pressed from a
-rail page brings Workspaces forward. It lists the focused pane's folder, or
+chrome: a rail page covers it with the panes, and the shortcut or palette
+used from a rail page brings Workspaces forward. Its header ends in a close
+button, so it can be hidden while the agent bar is off. It lists the focused pane's folder, or
 that folder's git repository root when it is inside one. One seam on its
 pane side, a 40px header on the pane tab strip's line, 24px rows with a chevron
 and a line icon; a selected row is a `--selection` fill. Click opens a file
@@ -1078,16 +1171,17 @@ Colour carries **state only**. Surfaces, controls, selection and hover are
 always neutral (the fill ladder).
 
 - **The one exception: bot identity colours** (owner decision 2026-10-14).
-  On the Bots page a bot's avatar mark, its name above its run and its
+  On the Bots page a bot's Mochi character, its name above its run and its
   `@name` mentions wear the bot's own colour, so bots are told apart at a
   glance as in the reference messenger. The identity palette
   (`BOT_IDENTITY_HUES`) holds blues, indigo, violets, purple, magenta, cyan
   and a slate — never red, orange, yellow or green, which keep error,
   needs you, caution and done — and each hue is mixed 72% with the look's
   `--text-main`, so it darkens on light looks and lightens on dark ones
-  and reads as text on the page and as a fill under the `--bg-base` face.
-  Identity colour never fills a surface, a row or a control, and never
-  marks a state.
+  and reads as text on the page; a Mochi character's body wears its slot's
+  hue unmixed (2026-10-16). Identity colour never fills a surface, a row or a control, and never
+  marks a state. A removed bot keeps its colour, picture and name on the
+  messages it wrote, its name followed by "(removed)".
 - **Sidebar and pane marks** — shape first, colour second, one shared helper
   (`AGENT_STATUS_ICON.mark`): running = filled muted dot · needs input =
   `--attention` ring · error = red ✕ (SVG) · complete = muted check ·
@@ -1150,7 +1244,8 @@ always neutral (the fill ladder).
   (Graphite's sidebar group heads, via `--group-case` / `--group-track`).
 - **Scale:** 11px metadata, chips and footers · 12px Fleet detail and
   secondary controls · 13px rows, tabs, menus, body · 14px chat prose and
-  composer input · 16px page and dialog titles (`--text-display-size`).
+  composer input · 16px page and dialog titles (`--text-display-size`);
+  Settings has its own calmer scale (see Settings under Component rules).
   Tabular figures for counts, durations and diff stats.
 - **Icons** cap at 16px in chrome (19px on the rail); wmux's own icon set
   (`icons.tsx`), never emoji.
@@ -1199,7 +1294,7 @@ always neutral (the fill ladder).
 - **Chips** (composer pickers, Schedules composer, model, and, outside
   Moa's panel, the orchestrator mode): 26px, `--chip-radius`, no border, `--selection` fill,
   `--selection-hover` on hover, a chevron that turns when open. AI-directed
-  actions (fan-out, broadcast) stay neutral at rest.
+  actions (fan-out) stay neutral at rest.
 - **Composer:** one box with a `--line` hairline (`--line-strong` focused)
   and no fill; input on top, a toolbar row under it with chips and a solid
   26px send. The chat, channel and orchestrator composers share it. Moa's
@@ -1214,7 +1309,9 @@ always neutral (the fill ladder).
 - No emoji glyphs in chrome; status marks are icons, not text glyphs.
 - **Agent verbs** stay one workspace-spanning bar overlaid on the grid's
   bottom edge and revealed on approach (2026-08-18); it takes no layout row,
-  so no PTY is resized when it appears.
+  so no PTY is resized when it appears. It holds Files (the file tree
+  column's toggle) · Snippets · Rich Input · Schedule, then Multi Task and the
+  pin (2026-10-15); a verb that duplicates another home does not get a button.
 
 ### Dialogs & forms
 
@@ -1245,7 +1342,8 @@ one soft floating shadow on the panel only, no bevel.
   action on the right, where a status needs an action.
 - **Field row:** 13px/500 label + 11px `--text-sub` description on the left,
   control on the right (`inline`) or underneath (`stacked`). The row wires
-  the label and `aria-describedby` into its control.
+  the label and `aria-describedby` into its control. Settings overrides this
+  recipe on its own page only (below); dialogs keep it everywhere.
 - **Controls:** switches and checkboxes are neutral (dim when off, a light
   track with a dark knob when on); segmented controls are a `--chip-radius`
   track with the active segment on `--selection`; inputs use a `--line`
@@ -1274,21 +1372,43 @@ primitives plus `Settings/SettingsLayout.tsx` (`SettingsSection`,
   open Factory, the agent factory's tab).
 - **Theme picker:** visual cards whose thumbnails show the look's face,
   chip shape and selection style; selected by a neutral outline + check.
-- **Nav:** 13px icon + label rows; group headings muted sentence case; the
-  selected row uses the selection grammar above.
-- **Page:** one centred column (720px max); the tab's name as the 16px
-  title; sections 28px apart, each a muted sentence-case heading over ONE
+  wmux's own looks (Tint, Zinc, Graphite, Paper, Amber Line) come first;
+  every other built-in theme and Custom follow under a "More themes"
+  heading in the section-heading style, each group in its usual order, all
+  in one radio group and never collapsed.
+- **Type scale** (2026-10-15, calmer than the chrome scale). Quietness
+  comes from weight and size, not a dimmer colour: descriptions, notes,
+  inactive nav labels and every heading below the page title are
+  `--text-sub`, the look's secondary-text token, and labels are regular
+  weight.
+- **Nav:** 14px/400 icon + label rows, 32px tall, 14px `--text-muted` icons,
+  `--text-sub` labels; group headings 12px/400 `--text-sub`, sentence case.
+  Hover is `--hover-fill`. The selected row follows the look's own
+  selection treatment (`--selection` fill plus `--select-ring`) in
+  `--text-main`: a selection fill on most looks, and Amber Line keeps its
+  2px accent bar.
+- **Page:** one centred column (680px max, 32px top padding); the tab's
+  name as a 22px/500 title, 24px above the first section; sections 32px
+  apart, each a 13px/400 `--text-sub` sentence-case heading over ONE
   rounded container of rows.
-- **Row:** label + one-line muted description on the left, control on the
-  right; overflowing copy collapses behind Learn more. Status words are
+- **Row:** a 14px/400 label over a 12px `--text-sub` description line on the
+  left, control on the right; rows are 48px minimum with 8px × 14px padding.
+  Overflowing copy collapses behind a 12px Learn more. Status words are
   Badges. At most one primary per tab.
+- **Controls:** a 30×18 switch (12px knob) with a 36×24 hit area, a select
+  at least 140px wide with a 6px radius; buttons keep their shared sizes
+  (26px `sm`, 32px `md`). These sizes apply only to the page's own rows,
+  never inside a dialog, popover or listbox opened from it.
 
 ## Motion
 
-- Minimal-functional. Spinners and the blinking cursor are the only
-  perpetual motion; the welcome dialog and onboarding tour clips loop only
+- Minimal-functional. Spinners, the blinking cursor and bot avatars are the
+  only perpetual motion; the welcome dialog and onboarding tour clips loop only
   while on screen and never under reduced motion. The one opt-in exception is
   the Attention blink setting's Continuous option (below): the user chose it.
+- **Bot avatars** (owner decision 2026-10-16; Bots page, Avatars): a Mochi
+  character breathes and blinks at rest and hops while its bot works; it is
+  paused off screen, and `prefers-reduced-motion` turns it off.
 - **Attention blink** (Settings → Appearance → Sidebar, per user). A sidebar
   row that waits on you (an open dialog, or a turn that ended on a question)
   pulses: Off
@@ -1406,6 +1526,14 @@ primitives plus `Settings/SettingsLayout.tsx` (`SettingsSection`,
 | 2026-10-14 | Owner decision: + creates a workspace on a granted remote PC. With a paired computer selected, the sidebar header and the collapsed rail show `+` only when that host advertises workspace-create-grant and this desktop holds the grant (added over SSH); it opens a shell there and the new workspace in its list. Hosts without the grant keep no `+`. Amends the collapsed sidebar's "no new-workspace button" | The smoke showed a server added over SSH could only get a first workspace through a local pane's right-click "— remote". The grant already lets this desktop create there, and a `+` that made a local workspace instead would misstate which computer the work runs on |
 | 2026-10-15 | Orchestrator decision (team workflow track): in a room with an enabled coordinator, an owner message that names no bot goes to the coordinator alone, and the composer's muted line says "To <lead>"; Add team in the add form makes the five-bot team (lead first) in one action, a ghost button with no new chrome | The owner talks to the team's lead, who decides who works on each request; a room-wide wake of every bot would start five parallel answers to one request |
 | 2026-10-15 | Owner decision (bot connections): MCP servers for bots' workers live in one library, Settings › Bots › Connections (one row each: name, purpose, who gets it, Key missing in the needs-you text, on/off, Edit, Remove asked in place), scoped to every bot by default or to the bots picked; a bot's profile lists the ones that apply to it with a per-bot off switch for every-bot ones. Amends the profile's item list only | Grok-Bot-style connectors without a per-bot settings page: defined once, the owner sees every connection in one place, and a bot's profile answers what its workers can reach |
+| 2026-10-15 | Owner decision (dogfood of 4.5.0): in a room, an `@Name` of one of its bots anywhere in the message addresses that bot (with any chips picked), and typing `@` suggests the room's bots. Amends the Composer's "an `@name` inside a sentence is plain text" | The owner typed `@대장` in the workspace room and the message did not reach that bot: a mention that works only at the very start of the message reads as broken |
+| 2026-10-15 | Owner decision (dogfood of 4.5.0, recommended option): a bot's 1:1 and its workspace room are separate conversations. The 1:1 is its own thread of the room (`dm:<botId>`): the owner's messages there, the bot's answers, its greeting and the work it starts there (a coordinator's request thread); the room never shows them, and a bot's room posts never show in its 1:1. The room is listed once the workspace has two or more bots; a lone bot has only its 1:1, which also keeps what it says in the room. Cards from before 1:1 threads keep the old 1:1 filter. Amends List and System lines | The 1:1 was a filter of the room, so the coordinator's greeting showed in both and every 1:1 message showed in the room: the owner read them as mirrors, and a room appeared for a single bot on its own |
+| 2026-10-15 | Owner decision (modelled on the reference messenger the owner uses): group chats are the owner's. No workspace has a room by itself and no bot makes one; `+` › New group chat takes a name and two or more bots of one workspace (they share its repository and room), and a group's pill renames it, changes its bots or deletes it (its messages stay saved). A group lives in its own thread (`group:<id>`) with the work started from it. A group message goes to every bot in it unless bots are picked in the recipients control above the composer ("To: everyone ▾", a checkbox per bot; a typed `@Name` ticks its bot; the picks reset after each send); the coordinator-only routing of an untagged room message is gone. Nobody greets first in a group and no "joined" line is drawn: a bot new to the group introduces itself in its first answer. Add team makes the bots only, then offers Make a group chat with this team. A room the owner had written in became a group named after its workspace, reading on in General. Amends List, Avatars, Needs you, Chat, Composer, Add bot and First run, and the same day's 1:1-and-room row; supersedes the same day's coordinator-only routing and its "To <lead>" line | The owner asked how they would even know who the coordinator is: a hidden rule that sent untagged room messages to one bot read as the room ignoring the rest, and a room that appeared on its own for every team was not a conversation the owner had chosen |
+| 2026-10-15 | Owner decision: the Bots rail item is listed only while the bots are on; they are turned on in Settings › Bots, whose switch description says so, and the item appears at once without leaving Settings. Turning them off while the Bots page is open returns to Workspaces; the Toggle Bots shortcut and the palette's Open Bots open Settings › Bots while they are off. The first-run panel is reached only with the bots on. Amends Rail and pages, Bots off, Add bot and First run | A Bots item on the rail from the first launch advertised a feature the owner had not chosen, and opened a page that could do nothing until the bots were on. Settings stays open after the switch because Settings › Bots has its own add form and the plan and connection settings the owner may be setting up |
+| 2026-10-15 | Owner decision: settings type and spacing were too large and loud. Settings gets its own calmer scale: regular-weight 14px row labels over quiet 12px descriptions, a 22px/500 page title, 12px nav group labels and 13px section headings in `--text-sub`, the selected nav row in the look's own selection treatment instead of a fixed accent edge, hover on `--hover-fill`, a 30×18 switch with a 24px-tall hit area, a narrower 6px select and a 680px column. Scoped to the Settings page's own rows; the shared Field recipe, dialogs, popovers and listboxes are unchanged | Bold 13px labels over 11px descriptions made every row shout at the same volume, and a fixed accent edge on the nav added a second mark for one selection. Weight and size carry the hierarchy now, with the secondary colour kept at body contrast, so a long settings page reads calmly |
+| 2026-10-15 | Owner decision: the agent bar drops Attach, Broadcast and New chat, and its Files button now toggles the file tree column (its own path-picker popover is gone); the titlebar's file tree icon is removed | The owner barely used them, and each duplicated a better home: dropping a file on a terminal or the tree's Insert path covers Attach, Multi Task covers fan-out work without pasting into plain shells, typing `/clear` covers New chat, and two file browsers (a popover and the column) plus two toggles for one column was one too many |
+| 2026-10-15 | Owner decision (dogfood): window glass on every theme, in either appearance, with an Off / Soft / Clear setting; the sheet loses its right and bottom margins and the pane column rounds off against the sidebar with a hairline; borrowed terminal palettes sit on their theme's own base. Amends Themes, Frame, Sheet and Window glass | Glass only on a dark Mac read as a missing feature for anyone on a light one, and a fixed 85% frame was barely translucent. The 8px margins spent space on a frame the eye did not need, while the sidebar and panes met with no visible edge. A navy or red theme over a borrowed grey terminal looked like two different apps |
+| 2026-10-16 | Owner decision: a bot without a picture is its Mochi character ("Mochi Orb Crew v2", drawn by Grok), the one of its identity colour slot, replacing the four shapes with a face. The characters move: idle breath, blink and one signature twitch; a quicker hop while the bot runs; blink only at 24px and under; paused off screen; still under reduced motion. Amends Avatars and the Motion rule's "only perpetual motion" | The owner picked the crew from a design contest ("go ahead as it is"); a character tells bots apart better than a coloured shape, and its motion says which bot is busy without a word |
 
 ### Desktop conversation view
 

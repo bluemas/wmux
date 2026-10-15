@@ -36,6 +36,7 @@ import { redactStoredSecretsDeep } from '../factory/secretRedaction';
 import type { BotBinding } from '../../shared/bot';
 import { SHARED_SURFACE } from '../../shared/botSurface';
 import { evaluateCommanderToolPermission } from './commanderToolSandbox';
+import { BotToolGuard, botToolNamingRule } from './botToolGuard';
 import { COMMANDER_MODE_ARG, COMMANDER_TOOL_SURFACE, COMMANDER_ONLY_TOOLS } from '../../shared/commanderSurface';
 import {
   type BrainAdapter,
@@ -122,6 +123,44 @@ export async function loadSdkQueryFn(): Promise<SdkQueryFn> {
 // vendored binary is too heavy to ship). Resolution lives in one shared module
 // so Moa and the first-run wizard agree on whether claude is installed.
 import { resolveClaudeExecutable } from '../claude/resolveClaudeExecutable';
+
+/** The SDK's warning that bare `allowedTools` names bypass `canUseTool`. */
+export const CAN_USE_TOOL_SHADOWED = 'CLAUDE_SDK_CAN_USE_TOOL_SHADOWED';
+let shadowedWarned = false;
+
+/**
+ * Run `fn` (one SDK `query()` call) with the SDK's CAN_USE_TOOL_SHADOWED
+ * warning let through once per process. The warning is by design here: the
+ * bare `mcp__wmux__*` names in `allowedTools` are meant to skip `canUseTool`
+ * (the D2 auto-allow list below); `canUseTool` gates only what is left (the
+ * Write sandbox, a bot's repository reads). The SDK warns on every `query()`,
+ * that is every brain and bot turn, and a plain Node warning is never
+ * deduplicated. Only that code is filtered, and only during the synchronous
+ * call; every other warning passes. Exported for tests.
+ */
+export function withShadowedWarningOnce<T>(fn: () => T, proc: Pick<NodeJS.Process, 'emitWarning'> = process): T {
+  const original = proc.emitWarning;
+  const filtered = function (this: unknown, warning: string | Error, ...rest: unknown[]): void {
+    const opts = rest[0];
+    const code = opts && typeof opts === 'object' ? (opts as { code?: unknown }).code : rest[1];
+    if (code === CAN_USE_TOOL_SHADOWED) {
+      if (shadowedWarned) return;
+      shadowedWarned = true;
+    }
+    (original as (...a: unknown[]) => void).call(proc, warning, ...rest);
+  };
+  proc.emitWarning = filtered as NodeJS.Process['emitWarning'];
+  try {
+    return fn();
+  } finally {
+    if (proc.emitWarning === filtered) proc.emitWarning = original;
+  }
+}
+
+/** Tests only. */
+export function __resetShadowedWarningForTesting(): void {
+  shadowedWarned = false;
+}
 export { resolveClaudeExecutable };
 
 /** GLM / Z.ai (or any Anthropic-compatible) endpoint profile. When set, the
@@ -931,6 +970,10 @@ export class ClaudeSdkAdapter implements BrainAdapter {
     options.canUseTool = async () => ({ behavior: 'deny' as const, message: 'bots act only through their wmux tools' });
     options.settingSources = [];
     options.cwd = bot.cwd;
+    // The prompts name wmux tools without their MCP prefix; say the exact
+    // names, or a model that copies a bare name reaches none of them.
+    const naming = botToolNamingRule(this.allowedTools);
+    if (naming && typeof options.systemPrompt === 'string') options.systemPrompt = `${options.systemPrompt}\n\n${naming}`;
     if (bot.repoRoot) this.applyRepoRead(options, bot.repoRoot);
     if (!this.mcpBundlePath) {
       delete options.mcpServers;
@@ -1140,7 +1183,7 @@ export class ClaudeSdkAdapter implements BrainAdapter {
             return;
           }
         }
-        handle = queryFn({ prompt, options });
+        handle = withShadowedWarningOnce(() => queryFn({ prompt, options }));
       } catch (err) {
         this.disposeHandoff();
         if (resumingUnvalidated && attempt === 0) {
@@ -1153,13 +1196,27 @@ export class ClaudeSdkAdapter implements BrainAdapter {
       this._active = handle;
       let yielded = false;
       let retryFresh = false;
+      // A bot turn that cannot reach its wmux tools ends in an error, never
+      // a silent success (botToolGuard.ts).
+      const guard = this.bot ? new BotToolGuard(this.allowedTools) : null;
+      let stopForTools = false;
       try {
         outer: for await (const msg of handle) {
-          for (const ev of normalizeSdkMessage(msg as RawSdkMessage, state)) {
+          let events = normalizeSdkMessage(msg as RawSdkMessage, state);
+          const noTools = guard?.observe(msg as RawSdkMessage) ?? null;
+          if (noTools) {
+            stopForTools = true;
+            events = [...events, { type: 'error', message: noTools, botTools: 'missing' }];
+          } else if (guard && events.some((e) => e.type === 'turn-end')) {
+            const unreached = guard.verdict();
+            if (unreached) events = events.map((e): BrainEvent => (e.type === 'turn-end' ? { type: 'error', message: unreached, botTools: 'unreached' } : e));
+          }
+          for (const ev of events) {
             // A turn that errors before ANYTHING reached the renderer, on the
             // first attempt against an unvalidated disk id → treat the id as
             // dead and swallow the error in favor of a fresh retry.
-            if (ev.type === 'error' && resumingUnvalidated && attempt === 0 && !yielded) {
+            // (Not the tool guard's error: that one is about the MCP server.)
+            if (ev.type === 'error' && resumingUnvalidated && attempt === 0 && !yielded && !noTools) {
               retryFresh = true;
               break outer;
             }
@@ -1196,6 +1253,7 @@ export class ClaudeSdkAdapter implements BrainAdapter {
             }
             yield ev;
           }
+          if (stopForTools) break;
         }
         // Some SDK error paths end the stream without a `result` frame; make
         // sure the session id captured mid-stream survives for resume.
@@ -1210,6 +1268,13 @@ export class ClaudeSdkAdapter implements BrainAdapter {
       } finally {
         if (this._active === handle) this._active = null;
         this.disposeHandoff();
+      }
+      if (stopForTools && handle.interrupt) {
+        try {
+          void Promise.resolve(handle.interrupt()).catch(() => undefined);
+        } catch {
+          /* already ending */
+        }
       }
       if (!retryFresh) return;
       // Best-effort teardown of the dead attempt's subprocess before retrying.

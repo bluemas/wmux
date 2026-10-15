@@ -98,6 +98,7 @@ import {
 } from '../../components/Sidebar/attentionBlink';
 import { initialGitPageState, type GitDragContext, type GitHandoffOpen, type GitPageState } from '../../components/Git/gitPageState';
 import { multiviewColumnCount, type MultiviewArrangement } from '../../utils/multiviewGrid';
+import { DEFAULT_WINDOW_GLASS, type WindowGlassLevel } from '../../utils/windowGlass';
 import {
   normalizeRoleBinding,
   type OrchestratorRoleBindings,
@@ -684,6 +685,11 @@ export interface UISlice {
   setAttentionBlinkRemindMs: (ms: AttentionRemindMs) => void;
   setAttentionBlinkFinished: (mode: AttentionBlinkFinished) => void;
 
+  /** Window glass on macOS: how translucent the frame and the sidebar are
+   *  over the window material. Per user, persisted in the session. */
+  windowGlass: WindowGlassLevel;
+  setWindowGlass: (level: WindowGlassLevel) => void;
+
   // ─── Toast / ring notification UI ────────────────────────────────────────
   toastEnabled: boolean;
   setToastEnabled: (enabled: boolean) => void;
@@ -933,6 +939,9 @@ export interface UISlice {
   companyViewVisible: boolean;
   toggleCompanyView: () => void;
   toggleBotsView: () => void;
+  /** The Bots page while the bots are on; otherwise Settings › Bots, where
+   *  they are turned on (the page has no rail item while they are off). */
+  openBotsPage: () => void;
   setCompanyViewVisible: (visible: boolean) => void;
 
   messageFeedVisible: boolean;
@@ -1876,6 +1885,12 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
   setAttentionBlinkRemindMs: (ms) => set((state) => { state.attentionBlinkRemindMs = ms; }),
   setAttentionBlinkFinished: (mode) => set((state) => { state.attentionBlinkFinished = mode; }),
 
+  windowGlass: DEFAULT_WINDOW_GLASS,
+  setWindowGlass: (level) => {
+    document.documentElement.setAttribute('data-glass-level', level);
+    set((state) => { state.windowGlass = level; });
+  },
+
   // ─── Toast / ring notification UI ────────────────────────────────────────
   toastEnabled: true,
 
@@ -2194,7 +2209,12 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
   // Opens the Bots rail page and, pressed there, returns to Workspaces.
   toggleBotsView: () => {
     if (get().appRoute === 'bots') set((state) => { leaveAppRoute(state, 'bots'); });
-    else get().setAppRoute('bots');
+    else get().openBotsPage();
+  },
+  openBotsPage: () => {
+    if (get().roomStatus?.enabled) get().setAppRoute('bots');
+    // Settings › Bots (FACTORY_SETTINGS_TAB in components/Bots/botsAddBot.ts).
+    else get().openSettingsTab('factory');
   },
   setCompanyViewVisible: (visible) => set((state) => { state.companyViewVisible = visible; }),
 

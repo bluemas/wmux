@@ -711,6 +711,22 @@ describe('TaskGateRunner — gate from a base ref', () => {
     }
   });
 
+  it('a base with no test script (a new repository) whose task adds one is refused as no_base_gate, never run; a base that has one stays a plain refusal', async () => {
+    // No scripts, no package.json at all, or a lint script but no test script.
+    for (const raw of [pkg({}), null, pkg({ lint: npmProject.lint })]) {
+      const runner = new TaskGateRunner({ ...base, readPackageScripts: () => ({ ...npmProject }), readBaseFile: baseFiles(raw) });
+      const r = await runner.resolveSteps(WT, REPO, 'origin/main');
+      expect(r).toMatchObject({ code: 'no_base_gate', refused: expect.stringContaining('origin/main has no npm') });
+      const run = await runner.run({ taskId: 'wtask-1', worktreePath: WT, systemWorkspaceId: 'ws-daemon', gateBaseRef: 'origin/main' });
+      expect(run).toMatchObject({ ok: false, status: 'refused', code: 'no_base_gate' });
+    }
+    // The base has a test script and the worktree changed it: the plain refusal, no greenfield code.
+    const changed = new TaskGateRunner({ ...base, readPackageScripts: () => ({ ...npmProject, test: 'true' }), readBaseFile: baseFiles(pkg(npmProject)) });
+    const r = await changed.resolveSteps(WT, REPO, 'origin/main');
+    expect(r).toMatchObject({ refused: expect.stringContaining('test script differs') });
+    expect(r).not.toHaveProperty('code');
+  });
+
   it('the worktree must carry the base\'s .npmrc (or neither has one)', async () => {
     const noneHere = { ...base, readPackageScripts: () => npmProject, fileExists: () => false };
     expect(await new TaskGateRunner({ ...noneHere, readBaseFile: baseFiles(pkg(npmProject)) }).resolveSteps(WT, REPO, 'origin/main')).toMatchObject({ steps: [{}, {}] });
@@ -845,7 +861,8 @@ describe('TaskGateRunner — a project with nothing to install', () => {
 });
 
 describe('TaskGateRunner — base ref and HEAD on a real repository', () => {
-  it('reads the base with git, refuses a diverged worktree, and pins HEAD', async () => {
+  // Real git processes: sized for a loaded CI runner (4.97 s of 5 s on Windows).
+  it('reads the base with git, refuses a diverged worktree, and pins HEAD', { timeout: 30_000 }, async () => {
     const { execFileSync } = await import('node:child_process');
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-gate-base-'));
     const g = (...args: string[]) => execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', '-c', 'commit.gpgsign=false', ...args], { cwd: dir, encoding: 'utf8' }).trim();

@@ -8,9 +8,13 @@ import type { FactoryBotRow } from './factoryPorts';
 type T = (key: string, vars?: Record<string, string | number>) => string;
 
 /** A thread's reference, short: `owner/repo#12` (github.com dropped), a
- *  task or handoff id, or the localized General. */
+ *  task or handoff id, or the localized General (or 1:1, or group chat). */
 export function threadRef(threadId: ThreadId, t: T): string {
   if (threadId === 'general') return t('room.thread.general');
+  // A bot's 1:1 with the owner: never its id.
+  if (threadId.startsWith('dm:')) return t('room.thread.dm');
+  // A group chat the owner made: never its id.
+  if (threadId.startsWith('group:')) return t('room.thread.group');
   const numbered = /^(pr|issue):(.+)#(\d+)$/.exec(threadId);
   if (numbered) {
     const repo = numbered[2].replace(/^github\.com\//, '');
@@ -52,7 +56,8 @@ export function requestTitles(cards: readonly RoomCard[]): Map<ThreadId, string>
     // Only main's line for the hop that opened this very thread names it.
     if (!id || out.has(c.threadId) || c.actor.kind !== 'system' || c.threadId !== `handoff:${c.refs?.handoffId}`) continue;
     const request = byId.get(id);
-    const own = request?.kind === 'human' && request.threadId === 'general' && request.workspaceId === c.workspaceId;
+    // The request was said in General, a coordinator's 1:1 or a group chat.
+    const own = request?.kind === 'human' && (request.threadId === 'general' || request.threadId.startsWith('dm:') || request.threadId.startsWith('group:')) && request.workspaceId === c.workspaceId;
     const line = own ? request.title.split('\n')[0].trim() : '';
     if (line) out.set(c.threadId, line);
   }
@@ -149,13 +154,131 @@ export function withoutInternalIds(text: string, labels: IdLabels): string {
   }).join('\n');
 }
 
-/** A card's title and body as the owner reads them: a routine's schedule
- *  (not the bot's own instructions), a refusal's plain sentences (not their
- *  codes), no role tag after a bot's name in what main wrote, and in a bot's
- *  own words the ids it cites shown as what they stand for (`labels`). Pure. */
-export function ownerCardText(card: Pick<RoomCard, 'kind' | 'title' | 'body' | 'actor'>, botNames: readonly string[], labels?: IdLabels): { title: string; body: string } {
-  let title = card.title;
-  let body = (card.body ?? '').trim();
+/** The factory system cards this build words in the reader's language
+ *  (RoomCard.notice): code → whether its body is worded too (true) or is the
+ *  evidence the card carries (a command, an error), kept as written. */
+const NOTICE_CODES: ReadonlyMap<string, boolean> = new Map([
+  ['worker.paused', true], ['worker.pausedResumable', true],
+  ['worker.done', true], ['worker.doneResumable', true],
+  ['worker.resumed', true], ['worker.waiting', true],
+  ['worker.noReport', true], ['worker.stillNoReport', true],
+  ['gate.checked', false], ['gate.passedNotCompleted', false],
+  ['gate.passed', false], ['gate.killed', false], ['gate.failed', false],
+  ['gate.skipped', false], ['gate.busy', true], ['gate.noBase', true], ['gate.refused', false],
+  ['gate.notRunNoBot', true], ['gate.notRunNoWorktree', true], ['gate.notRunNoBaseRef', true],
+  ['research.completed', true], ['research.notCompleted', false],
+  ['budget.exhausted', true], ['budget.held', true],
+  ['task.done', false], ['task.failed', false], ['task.cancelled', false],
+  ['task.stoppedByOwner', false], ['task.inputRequired', false],
+]);
+
+/** The notice codes that tell the owner a stopped worker can resume. */
+export const RESUMABLE_NOTICE_CODES: ReadonlySet<string> = new Set(['worker.pausedResumable', 'worker.doneResumable']);
+
+/** The task a system card offers Resume for: a card saying a stopped
+ *  worker can resume (by its notice code), whose task's worker is still
+ *  resumable now (`resumable`: an older card for a worker resumed since
+ *  offers nothing). Null otherwise. Pure. */
+export function cardResumeTaskId(card: Pick<RoomCard, 'actor' | 'notice' | 'refs'>, resumable: (taskId: string) => boolean): string | null {
+  if (card.actor.kind !== 'system' || !card.notice || !RESUMABLE_NOTICE_CODES.has(card.notice.code)) return null;
+  const taskId = card.refs?.taskId;
+  return taskId && resumable(taskId) ? taskId : null;
+}
+
+const NOTICE_WORDS: Readonly<Record<string, ReadonlySet<string>>> = {
+  status: new Set(['completed', 'cancelled', 'failed']),
+  by: new Set(['owner', 'bot']),
+  where: new Set(['folder', 'newPane']),
+  limit: new Set(['turns_hour', 'turns_day', 'concurrent_workers', 'worker_hours_day', 'factory_workers']),
+};
+
+/** A notice's clock time: the time today, else a short date and the time. */
+export function formatNoticeTime(at: number, now: number = Date.now()): string {
+  const d = new Date(at);
+  const time = d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  return d.toDateString() === new Date(now).toDateString()
+    ? time
+    : `${d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} ${time}`;
+}
+
+/** What holds the agent slots on a slot-wait card, in the reader's
+ *  language, from the values main sends (agentSlots.ts slotHolderArgs):
+ *  bots in a turn, workers by title, then the rest. Null for a card
+ *  written before them (its English `holders` stays). */
+function slotHoldersText(args: Readonly<Record<string, string | number>>, t: T): string | null {
+  const botCount = typeof args.botCount === 'number' ? args.botCount : null;
+  const workerCount = typeof args.workerCount === 'number' ? args.workerCount : null;
+  if (botCount === null && workerCount === null) return null;
+  const names = (v: unknown): string[] => (typeof v === 'string' && v ? v.split('\n') : []);
+  const list = (shown: string[], total: number): string => (total > shown.length
+    ? t('room.notice.holders.more', { names: shown.join(', '), count: total - shown.length })
+    : shown.join(', '));
+  const parts: string[] = [];
+  if (botCount) parts.push(t(botCount === 1 ? 'room.notice.holders.bot' : 'room.notice.holders.bots', { names: list(names(args.bots), botCount) }));
+  if (workerCount) {
+    const shown = names(args.workers).map((w) => `"${w}"`);
+    parts.push(t(workerCount === 1 ? 'room.notice.holders.worker' : 'room.notice.holders.workers', { names: list(shown, workerCount) }));
+  }
+  const inUse = typeof args.inUse === 'number' ? args.inUse : 0;
+  const rest = inUse - (botCount ?? 0) - (workerCount ?? 0);
+  if (rest > 0) parts.push(t(rest === 1 ? 'room.notice.holders.other' : 'room.notice.holders.others', { count: rest }));
+  return parts.length > 0 ? parts.join('; ') : t('room.notice.holders.none');
+}
+
+/** The title and body keys of a budget notice: which limit, and when the
+ *  bot picks up again (a time, else what lifts it). */
+function budgetNoticeKeys(code: string, args: Readonly<Record<string, string | number>>): { title: string; body: string } | null {
+  const timed = typeof args.until === 'number';
+  if (code === 'budget.held') return { title: 'room.notice.budget.held', body: timed ? 'room.notice.budget.held.at' : 'room.notice.budget.held.manual' };
+  if (code !== 'budget.exhausted' || args.limit === undefined) return null;
+  const turns = args.limit === 'turns_hour' || args.limit === 'turns_day';
+  return {
+    title: `room.notice.budget.exhausted.${args.limit}`,
+    body: timed ? 'room.notice.budget.exhausted.at' : turns ? 'room.notice.budget.exhausted.manual' : 'room.notice.budget.exhausted.workers',
+  };
+}
+
+/** A system card's words in the reader's language, from its stable code
+ *  (RoomCard.notice); null for a card with none or a code this build does
+ *  not know (its English title and body are shown). Pure over `t`. */
+export function noticeText(card: Pick<RoomCard, 'actor' | 'body' | 'notice'>, t: T, now: number = Date.now()): { title: string; body: string } | null {
+  const notice = card.actor.kind === 'system' ? card.notice : undefined;
+  const wordedBody = notice ? NOTICE_CODES.get(notice.code) : undefined;
+  if (!notice || wordedBody === undefined) return null;
+  const args = notice.args ?? {};
+  const vars: Record<string, string | number> = { ...args };
+  // A word the template needs, worded too; one this build does not know
+  // keeps the card's English.
+  for (const [key, known] of Object.entries(NOTICE_WORDS)) {
+    if (args[key] === undefined) continue;
+    if (!known.has(String(args[key]))) return null;
+  }
+  if (args.status !== undefined) {
+    vars.status = t(`room.notice.status.${args.status}`);
+    vars.pane = t(args.status === 'failed' ? 'room.notice.pane.stays' : 'room.notice.pane.closes');
+  }
+  if (args.by !== undefined) vars.who = t(`room.notice.by.${args.by}`);
+  if (args.where !== undefined) vars.place = t(`room.notice.where.${args.where}`);
+  if (typeof args.until === 'number') vars.time = formatNoticeTime(args.until, now);
+  if (notice.code === 'worker.waiting') {
+    const holders = slotHoldersText(args, t);
+    if (holders !== null) vars.holders = holders;
+  }
+  const budget = budgetNoticeKeys(notice.code, args);
+  if (budget) return { title: t(budget.title, vars), body: t(budget.body, vars) };
+  const key = `room.notice.${notice.code}`;
+  return { title: t(key, vars), body: wordedBody ? t(`${key}.body`, vars) : (card.body ?? '') };
+}
+
+/** A card's title and body as the owner reads them: a factory system card
+ *  in the reader's language (`t`, noticeText), a routine's schedule (not the
+ *  bot's own instructions), a refusal's plain sentences (not their codes), no
+ *  role tag after a bot's name in what main wrote, and in a bot's own words
+ *  the ids it cites shown as what they stand for (`labels`). Pure. */
+export function ownerCardText(card: Pick<RoomCard, 'kind' | 'title' | 'body' | 'actor' | 'notice'>, botNames: readonly string[], labels?: IdLabels, t?: T): { title: string; body: string } {
+  const worded = t ? noticeText(card, t) : null;
+  let title = worded?.title ?? card.title;
+  let body = (worded?.body ?? card.body ?? '').trim();
   if (card.kind === 'routine') body = routineCardBody(body);
   if (card.kind === 'refusal') body = withoutReasonCodes(body);
   if (card.actor.kind === 'system') {
@@ -184,20 +307,28 @@ export function botKindLabel(bot: { role: BotRole; template?: BotTemplate }, t: 
   return templateLabel(botTemplate(bot), t);
 }
 
-/** Who wrote a card: the bot's name from the bot runtime, else its role
- *  from main's bot store, else "Bot". */
+/** A card author as main's bot store knows it (room.handler.ts RoomActor):
+ *  a removed bot keeps its name, marked `removed`. */
+export interface RoomActorView { role: BotRole; name?: string; removed?: boolean; avatar?: string; hue?: number }
+
+/** Who wrote a card: the bot's name from the bot runtime, else the name
+ *  main's bot store keeps (a removed bot's marked so), else its role, else
+ *  "Bot". */
 export function actorLabel(
   actor: Party,
   t: T,
   bots: readonly FactoryBotRow[],
-  actors: Readonly<Record<string, { role: BotRole }>> = {},
+  actors: Readonly<Record<string, RoomActorView>> = {},
 ): string {
   if (actor.kind === 'human') return t('room.actor.you');
   if (actor.kind === 'system') return t('room.actor.system');
   const row = bots.find((b) => b.bot.id === actor.botId);
   if (row) return row.bot.name;
   const known = actors[actor.botId];
-  return known ? roleLabel(known.role, t) : t('room.actor.bot');
+  if (!known) return t('room.actor.bot');
+  const name = known.name?.trim();
+  if (!name) return roleLabel(known.role, t);
+  return known.removed ? t('room.actor.removed', { name }) : name;
 }
 
 export function kindLabel(kind: CardKind, t: T): string {

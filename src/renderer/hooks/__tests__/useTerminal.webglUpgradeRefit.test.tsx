@@ -15,7 +15,7 @@ import { installCanvas2dStub } from '../../../test-utils/canvas2dStub';
 import { act, useRef } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { FitAddon } from '@xterm/addon-fit';
-import { webglUpgradeQueue } from '../../terminal/webglUpgradeQueue';
+import { WEBGL_UPGRADE_HIDE_MAX_MS, webglUpgradeQueue } from '../../terminal/webglUpgradeQueue';
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -169,24 +169,31 @@ describe('useTerminal WebGL upgrade keeps the DOM frame off screen', { timeout: 
 
   it('hides the pane until the upgraded renderer has refit', async () => {
     const { jobs } = await setup('p-upgrade-hidden-until-refit');
-    expect(xtermEl().style.visibility).toBe('hidden');
+    expect(xtermEl().style.opacity).toBe('0');
     await act(async () => { jobs.at(-1)!(); });
-    expect(xtermEl().style.visibility).toBe('hidden');
+    expect(xtermEl().style.opacity).toBe('0');
     await settle();
-    expect(xtermEl().style.visibility).toBe('');
+    expect(xtermEl().style.opacity).toBe('');
   });
 
   it('shows the pane when building the renderer failed', async () => {
     const { jobs } = await setup('p-upgrade-fail-shows');
     webgl.fail = true;
     await act(async () => { jobs.at(-1)!(); });
-    expect(xtermEl().style.visibility).toBe('');
+    expect(xtermEl().style.opacity).toBe('');
+  });
+
+  it('shows the pane after a bounded wait when the build never runs', async () => {
+    await setup('p-upgrade-never-runs');
+    expect(xtermEl().style.opacity).toBe('0');
+    await act(async () => { await new Promise((r) => setTimeout(r, WEBGL_UPGRADE_HIDE_MAX_MS + 50)); });
+    expect(xtermEl().style.opacity).toBe('');
   });
 
   it('shows the pane again when it hides before the upgrade ran', async () => {
     const { Harness } = await setup('p-upgrade-hide-shows');
-    expect(xtermEl().style.visibility).toBe('hidden');
+    expect(xtermEl().style.opacity).toBe('0');
     await act(async () => { root!.render(<Harness visible={false} />); });
-    expect(xtermEl().style.visibility).toBe('');
+    expect(xtermEl().style.opacity).toBe('');
   });
 });

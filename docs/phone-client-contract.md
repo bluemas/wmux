@@ -4042,7 +4042,9 @@ In 5.0 the desktop's Moa becomes the HQ bot of an **agent factory**: long-lived
 bots bound to workspaces by role (`lead`, `triage`, `verifier`, `maintainer`,
 and the HQ's `moa`). Bots have no pane and no terminal. What they say lands in
 the workspace's **room**, a timeline of typed cards split into threads (one per
-PR, issue, task, handoff, plan or report, plus `general`). A desktop whose
+PR, issue, task, handoff, plan or report, plus `general`, one per bot that
+has talked with the owner: its 1:1, `dm:<botId>`, and one per group chat the
+owner made, `group:<groupId>`). A desktop whose
 factory is switched off keeps the Moa behaviour above unchanged.
 
 **`/api/config`.**
@@ -4101,7 +4103,11 @@ GET /api/config   (X-Wmux-Client-Caps: rooms-v1)
 unchanged on the wire, but the factory route wins over everything else — even
 over a Moa pane that is still up. The message becomes a `human` card in the HQ
 bot's room (`hqWorkspaceId`) addressed to that one bot (`hqBotId`), and a wake
-queued for it; the daemon answers on queue, never on reply:
+queued for it; the daemon answers on queue, never on reply. The card is in
+the HQ bot's 1:1 thread, `dm:<hqBotId>` (the desktop shows it in that
+bot's 1:1, not in its room), and so are the replies to it: read the room
+without `thread` (every card) or with `thread=dm:<hqBotId>`, not
+`thread=general`:
 
 | Answer | Meaning | Retry |
 |---|---|---|
@@ -4172,7 +4178,24 @@ is always listed.
 arrival order (`seq`, increasing; never sort by `at`).
 
 - `thread` — a thread id from the list (URL-encoded); omitted: every card of
-  the room. `general` reads the general thread only.
+  the room. `general` reads the general thread only. `dm:<botId>` is a
+  bot's 1:1 with the owner: the owner's messages to that bot from
+  its private chat (the desktop's, or the phone's to the HQ bot), its
+  answers and greeting, and the cards about work it starts there (a
+  coordinator's work runs in a `handoff:` thread whose `Finished` pointer
+  card lands here instead of `general`); the desktop never shows
+  it in the room. It is listed by `/threads` like any thread, with no
+  `pr`/`issue` reference; name it after the bot, never by its id.
+  `group:<groupId>` (`grp-` and 8 hex digits) is a group chat the owner made
+  on the desktop: its name and its bots live in the desktop only (no route
+  serves them), so name it generically ("Group chat"), never by its id. It
+  holds the owner's messages to that group, the bots' answers and the cards
+  of the work started there (a coordinator's `handoff:` thread opened there
+  points back to it). Since the desktop's group chats (2026-10-15) a
+  workspace's room is no conversation by itself: `general` keeps every
+  earlier card, and a workspace whose room the owner had written in reads
+  on as a group chat in `general`. Additive: no field, route or answer
+  changed; a client that draws threads generically shows it like any other.
 - `sinceSeq` — cards with a larger `seq`. Omitted: the newest page. Read
   forward from `0` for the whole history.
 - `limit` — 1–100, default 50.

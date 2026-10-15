@@ -1,8 +1,9 @@
 // What the owner reads of a card or a thread: names, never internal ids,
 // role tags or machine codes.
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import type { RoomCard } from '../../../../shared/room';
-import { ownerCardText, requestTitles, routineCardBody, threadLabel, withoutInternalIds, withoutReasonCodes, withoutRoleTags } from '../roomFormat';
+import { setLocale, t as i18nT } from '../../../i18n';
+import { actorLabel, cardResumeTaskId, formatNoticeTime, noticeText, ownerCardText, requestTitles, routineCardBody, threadLabel, withoutInternalIds, withoutReasonCodes, withoutRoleTags } from '../roomFormat';
 
 const t = (key: string) => key;
 const system = { kind: 'system' as const };
@@ -96,5 +97,106 @@ describe('owner text', () => {
     expect(ownerCardText(card, [], labels)).toEqual({ title: 'PR #2 approval', body: 'task Verify PR #1' });
     expect(ownerCardText(card, [])).toEqual({ title: 'apr-NQMvlIDZu05W', body: 'task `wtask-mv6yznk5-tv3qhcng`' });
     expect(ownerCardText(base({ title: 'apr-NQMvlIDZu05W' }), [], labels).title).toBe('apr-NQMvlIDZu05W');
+  });
+});
+
+describe('factory system cards in the reader\'s language (RoomCard.notice)', () => {
+  const card = (over: Partial<RoomCard>): Pick<RoomCard, 'kind' | 'title' | 'body' | 'actor' | 'notice' | 'refs'> => ({ kind: 'fact', title: 'English title', body: 'English body', actor: system, ...over });
+  afterEach(() => setLocale('en'));
+
+  it('words a known code in Korean, its values worded too; evidence bodies stay as written', () => {
+    setLocale('ko');
+    expect(noticeText(card({ notice: { code: 'worker.pausedResumable' } }), i18nT)?.title).toBe('워커 일시 중지됨 (이어서 가능)');
+    const done = noticeText(card({ notice: { code: 'worker.done', args: { status: 'cancelled' } } }), i18nT);
+    expect(done?.body).toContain('작업 취소됨:');
+    expect(done?.body).toContain('창은 닫혀요.');
+    expect(noticeText(card({ notice: { code: 'gate.noBase', args: { detail: 'origin/main has no npm test script' } } }), i18nT)?.body)
+      .toMatch(/^origin\/main has no npm test script\.\n\n지금 상태로는/);
+    // The gate's evidence (its command, an error) is not reworded.
+    expect(noticeText(card({ body: '`npm test` at abc1234', notice: { code: 'gate.failed', args: { exit: 2 } } }), i18nT))
+      .toEqual({ title: '게이트 실패 (종료 코드 2): 작업은 열린 채로 둠', body: '`npm test` at abc1234' });
+    expect(ownerCardText(card({ notice: { code: 'research.completed' } }), [], undefined, i18nT).title).toBe('조사 보고됨: 작업 완료');
+  });
+
+  it('keeps the English for no code, an unknown code or value, and a card that is not the system\'s', () => {
+    setLocale('ko');
+    expect(noticeText(card({}), i18nT)).toBeNull();
+    expect(noticeText(card({ notice: { code: 'worker.someday' } }), i18nT)).toBeNull();
+    expect(noticeText(card({ notice: { code: 'worker.done', args: { status: 'exploded' } } }), i18nT)).toBeNull();
+    expect(noticeText(card({ actor: bot, notice: { code: 'worker.paused' } }), i18nT)).toBeNull();
+    expect(ownerCardText(card({ notice: { code: 'worker.someday' } }), [], undefined, i18nT)).toEqual({ title: 'English title', body: 'English body' });
+  });
+
+  it('a budget card says which limit and when the bot picks up again, in the reader\'s language', () => {
+    const now = new Date(2026, 9, 16, 1, 38).getTime();
+    const until = new Date(2026, 9, 16, 2, 37).getTime();
+    const hour = card({ kind: 'budget', notice: { code: 'budget.exhausted', args: { bot: 'Reviewer', limit: 'turns_hour', until } } });
+    const en = noticeText(hour, i18nT, now);
+    expect(en?.title).toBe('Reviewer is out of turns for this hour');
+    expect(en?.body).toContain(`It picks up again at ${formatNoticeTime(until, now)}`);
+    expect(en?.title).not.toContain('turns_hour');
+    // No time: what lifts it; a worker limit: when a worker ends.
+    expect(noticeText(card({ notice: { code: 'budget.exhausted', args: { bot: 'Reviewer', limit: 'turns_day' } } }), i18nT, now)?.body).toMatch(/raise its limit or resume it/);
+    expect(noticeText(card({ notice: { code: 'budget.exhausted', args: { bot: 'Reviewer', limit: 'concurrent_workers' } } }), i18nT, now)?.body).toMatch(/one of the running ones ends/);
+    setLocale('ko');
+    const ko = noticeText(hour, i18nT, now);
+    expect(ko?.title).toBe('Reviewer: 이번 시간의 턴을 모두 썼습니다');
+    expect(ko?.body).toContain(formatNoticeTime(until, now));
+    expect(noticeText(card({ notice: { code: 'budget.held', args: { bot: 'Reviewer', until } } }), i18nT, now)?.title).toBe('대기 중: Reviewer의 턴이 소진됐습니다');
+    // A limit this build does not know keeps the English.
+    expect(noticeText(card({ notice: { code: 'budget.exhausted', args: { bot: 'Reviewer', limit: 'tokens_week' } } }), i18nT, now)).toBeNull();
+  });
+
+  it('a slot-wait card words its holders in the reader\'s language; an older card keeps its English holders', () => {
+    const args = { title: 'fix login', inUse: 4, cap: 4, holders: 'bot in a turn Dev; workers "a", "b"; 1 other worker starting, resumed or not yet reclaimed', bots: 'Dev', botCount: 1, workers: 'a\nb', workerCount: 2 };
+    expect(noticeText(card({ notice: { code: 'worker.waiting', args } }), i18nT)?.body).toContain(': bot in a turn Dev; workers "a", "b"; 1 other worker starting, resumed or not yet reclaimed.');
+    setLocale('ko');
+    const ko = noticeText(card({ notice: { code: 'worker.waiting', args } }), i18nT)?.body ?? '';
+    expect(ko).toContain('턴 진행 중인 봇 Dev; 워커 "a", "b"; 시작 중이거나 재개됐거나 아직 회수되지 않은 다른 워커 1개');
+    expect(ko).not.toContain('bot in a turn');
+    // More than shown: the rest is counted in the reader's words.
+    const more = noticeText(card({ notice: { code: 'worker.waiting', args: { ...args, inUse: 9, workerCount: 8 } } }), i18nT)?.body ?? '';
+    expect(more).toContain('워커 "a", "b" 외 6개');
+    const old = noticeText(card({ notice: { code: 'worker.waiting', args: { title: 'x', inUse: 1, cap: 1, holders: 'bot in a turn Dev' } } }), i18nT)?.body ?? '';
+    expect(old).toContain('bot in a turn Dev');
+  });
+
+  it('a task card\'s label in the reader\'s language, a stopped task Cancelled, its evidence body kept', () => {
+    setLocale('ko');
+    expect(noticeText(card({ notice: { code: 'task.done', args: { title: 'fix login' } } }), i18nT)).toEqual({ title: '작업 완료: fix login', body: 'English body' });
+    expect(noticeText(card({ notice: { code: 'task.stoppedByOwner', args: { title: 'fix login' } } }), i18nT)?.title).toBe('작업 취소됨 · 직접 중지함: fix login');
+    setLocale('en');
+    expect(noticeText(card({ notice: { code: 'task.cancelled', args: { title: 'fix login' } } }), i18nT)?.title).toBe('Task cancelled: fix login');
+  });
+
+  it('formatNoticeTime: the time today, the date and time on another day', () => {
+    const now = new Date(2026, 9, 16, 1, 0).getTime();
+    expect(formatNoticeTime(new Date(2026, 9, 16, 2, 5).getTime(), now)).not.toMatch(/Oct|10/);
+    expect(formatNoticeTime(new Date(2026, 9, 17, 2, 5).getTime(), now)).toMatch(/17/);
+  });
+
+  it('English words match what main writes', () => {
+    expect(noticeText(card({ notice: { code: 'worker.done', args: { status: 'failed' } } }), i18nT)?.body)
+      .toBe('Task failed: its Claude stopped to free memory. Its pane stays open until you have looked at it, then closes. The worktree is kept; no conversation was recorded to resume.');
+  });
+
+  it('a card saying a stopped worker can resume offers Resume while its task\'s worker is resumable', () => {
+    const paused = card({ notice: { code: 'worker.pausedResumable' }, refs: { taskId: 'wtask-a' } });
+    expect(cardResumeTaskId(paused, (id) => id === 'wtask-a')).toBe('wtask-a');
+    // Resumed since, or no task named: nothing.
+    expect(cardResumeTaskId(paused, () => false)).toBeNull();
+    expect(cardResumeTaskId(card({ notice: { code: 'worker.pausedResumable' } }), () => true)).toBeNull();
+    expect(cardResumeTaskId(card({ notice: { code: 'worker.paused' }, refs: { taskId: 'wtask-a' } }), () => true)).toBeNull();
+    expect(cardResumeTaskId(card({ actor: bot, notice: { code: 'worker.doneResumable' }, refs: { taskId: 'wtask-a' } }), () => true)).toBeNull();
+  });
+});
+
+describe('actorLabel', () => {
+  const botActor = { kind: 'bot' as const, workspaceId: 'ws-1', botId: 'bot-0000000d' };
+  it('names a bot the runtime no longer lists by the name main keeps, a removed one marked so; never its legacy role', () => {
+    expect(actorLabel(botActor, i18nT, [], { 'bot-0000000d': { role: 'lead', name: 'Developer' } })).toBe('Developer');
+    expect(actorLabel(botActor, i18nT, [], { 'bot-0000000d': { role: 'lead', name: 'Developer', removed: true } })).toBe('Developer (removed)');
+    expect(actorLabel(botActor, i18nT, [], { 'bot-0000000d': { role: 'lead' } })).toBe(i18nT('room.role.lead'));
+    expect(actorLabel(botActor, i18nT, [], {})).toBe('Bot');
   });
 });

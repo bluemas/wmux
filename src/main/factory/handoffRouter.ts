@@ -38,9 +38,11 @@
 //            The coordinator is woken once, with the last result, or with
 //            the result the relay could not pass on (a bot no longer
 //            enabled, a limit, a wake not taken). A parentless dispatch a
-//            coordinator sends from `general` opens a thread of its own;
-//            once its last result is in, General gets one card pointing
-//            at that thread, replying to the owner's message.
+//            coordinator sends from `general` (or from its own 1:1 thread,
+//            `dm:<botId>`, or a group chat's, `group:<id>`) opens a thread of
+//            its own; once its last result
+//            is in, the thread it was said in gets one card pointing at
+//            that thread, replying to the owner's message.
 //
 // A result (or refusal) answers its replyTo at most once: a second one is
 // refused `duplicate_result`. A send or question carrying a clientHandoffId
@@ -94,7 +96,7 @@ import {
   type HandoffStatus,
   type Party,
 } from '../../shared/handoff';
-import { GENERAL_THREAD, ROOM_LIMITS, parseThreadId, type RoomCard, type ThreadId } from '../../shared/room';
+import { GENERAL_THREAD, ROOM_LIMITS, dmThreadBot, groupThreadGroup, parseThreadId, type RoomCard, type ThreadId } from '../../shared/room';
 import { humanCardIdOfRun } from './humanMessage';
 import {
   DECISION_LIMITS,
@@ -114,6 +116,7 @@ import {
   isRoomWorkspaceId,
   oneLine,
   runningWake,
+  namesOthersGroup,
   runningWakeThread,
   sanitizeParty,
   sanitizeRefs,
@@ -320,10 +323,17 @@ export function parseHandoff(raw: unknown): Handoff | null {
     ...(typeof h.relayStopped === 'string' && oneLine(h.relayStopped, 300) ? { relayStopped: oneLine(h.relayStopped, 300) } : {}),
     ...(h.relayStopTold === true ? { relayStopTold: true as const } : {}),
     ...(h.kind === 'dispatch' && h.opensThread === true ? { opensThread: true as const } : {}),
+    ...(h.kind === 'dispatch' && h.opensThread === true ? storedOpenedIn(h.openedIn) : {}),
     ...((h.kind === 'result' || h.kind === 'refusal') && h.pointed === true ? { pointed: true as const } : {}),
     createdAt: h.createdAt,
     updatedAt: h.updatedAt,
   };
+}
+
+/** A stored `openedIn`: a 1:1 or group chat thread, or nothing (General). */
+function storedOpenedIn(raw: unknown): { openedIn?: ThreadId } {
+  const t = parseThreadId(raw);
+  return t && (dmThreadBot(t) || groupThreadGroup(t)) ? { openedIn: t } : {};
 }
 
 /** A stored `next`: distinct bot ids, at most MAX_RELAY, or nothing. */
@@ -388,7 +398,7 @@ export interface HandoffRouterOptions {
   file: string;
   decisions: AskDecisionPort;
   /** fact log, wake queue, bot directory (resolved on use). */
-  ports: () => Partial<Pick<FactoryRoomPorts, 'factLog' | 'wakes' | 'bots' | 'currentWakeThread' | 'currentWake'>>;
+  ports: () => Partial<Pick<FactoryRoomPorts, 'factLog' | 'wakes' | 'bots' | 'currentWakeThread' | 'currentWake' | 'groups'>>;
   rooms: () => RoomWriter | null;
   /** The taint tracker (wakeTaint.ts), when it runs: sends are marked as
    *  they are made, and a relay's dispatch before it is stored. */
@@ -541,7 +551,7 @@ export class HandoffRouter {
   /** Relays a stop cut short: a delivered result whose hop names the bots
    *  that follow, with no dispatch sent on for it yet, is sent on now (or
    *  brought to the coordinator); a delivered last result of a coordinator's
-   *  thread with no card in General gets it. */
+   *  thread with no pointing card yet gets it. */
   private resumeRelays(): void {
     const recent = this.now() - RELAY_STOP_RETRY_MS;
     for (const r of [...this.records.values()]) {
@@ -666,6 +676,7 @@ export class HandoffRouter {
     if (!title) return invalid('title is required');
     const namedThread = params.threadId === undefined ? undefined : parseThreadId(params.threadId);
     if (namedThread === null) return invalid('threadId is not a thread id');
+    if (this.othersDm(sender, namedThread)) return invalid('a bot names its own 1:1 thread, or a group chat it is in, only');
     if (params.toWorkspaceId !== undefined && !isRoomWorkspaceId(params.toWorkspaceId)) return invalid('toWorkspaceId is not a workspace id');
     if (params.toBotId !== undefined && (typeof params.toBotId !== 'string' || !BOT_ID_RE.test(params.toBotId))) return invalid('toBotId is not a bot id');
     if (kind === 'message' && params.toBotId === undefined) return invalid('a message needs toBotId');
@@ -778,11 +789,17 @@ export class HandoffRouter {
       createdAt: this.now(),
       updatedAt: this.now(),
     };
-    // A coordinator's new piece of work said in General gets a thread of its
-    // own: the whole flow (hops, workers, the report) stays together there.
-    if (kind === 'dispatch' && coordinator && !spec.namedThread && !parent && draft.threadId === GENERAL_THREAD) {
+    // A coordinator's new piece of work said in General — or in its own
+    // 1:1, or a group chat's thread — gets a thread of its own: the whole
+    // flow (hops, workers, the report) stays together there, and the 1:1 or
+    // the group stays the owner's talk.
+    const saidIn = draft.threadId;
+    const ownDm = dmThreadBot(saidIn) === sender.botId;
+    const inGroup = !!groupThreadGroup(saidIn);
+    if (kind === 'dispatch' && coordinator && !spec.namedThread && !parent && (saidIn === GENERAL_THREAD || ownDm || inGroup)) {
       draft.threadId = `handoff:${id}` as ThreadId;
       draft.opensThread = true;
+      if (ownDm || inGroup) draft.openedIn = saidIn;
     }
 
     if (!surfaceAllows(sender, 'handoff_send')) return this.refuse(draft, 'surface', 'the bot surface has no handoff_send');
@@ -833,7 +850,7 @@ export class HandoffRouter {
     this.opts.taint?.()?.markSent(draft.id, sender.botId, parent ? [parent.id] : []);
     // A result on a relay's hop that names bots to follow goes on to them;
     // any other is delivered (and, when it ends a coordinator's thread,
-    // pointed to from General).
+    // pointed to from where it was said).
     const result = kind === 'result' && parent && (parent.next?.length ?? 0) > 0
       ? this.relayOn(draft, parent, target.bot)
       : this.deliver(draft, target.bot);
@@ -1033,15 +1050,16 @@ export class HandoffRouter {
   }
 
   /** The last result of a coordinator's own thread (a dispatch it sent from
-   *  General, relayed or not) is in: one card in General points at that
-   *  thread, replying to the owner's message when the run is one. Written
-   *  once per result. */
+   *  General or its 1:1, relayed or not) is in: one card in the thread it
+   *  was said in points at that thread, replying to the owner's message when
+   *  the run is one. Written once per result. */
   private pointToThread(resultId: string, parent: Handoff, how: 'finished' | 'stopped'): void {
     const result = this.records.get(resultId);
     if (!result || result.pointed) return;
     if (how === 'finished' && (parent.next?.length ?? 0) > 0) return;
     const root = this.rootOf(parent);
-    // Only a thread this router opened for a coordinator's work in General.
+    // Only a thread this router opened for a coordinator's work in General
+    // or its 1:1.
     if (root.kind !== 'dispatch' || root.from.kind !== 'bot' || root.opensThread !== true) return;
     if (!isCoordinatorBot(safeGet(this.opts.ports().bots, root.from.botId))) return;
     const rooms = this.opts.rooms();
@@ -1049,17 +1067,18 @@ export class HandoffRouter {
     if (!rooms) return;
     // A card written before its mark was (a stop between the two): only the
     // mark is repaired.
-    const written = rooms.find(ws, (c) => c.threadId === GENERAL_THREAD && c.actor.kind === 'system' && c.refs?.handoffId === result.id && c.refs?.threadId === root.threadId);
+    const saidIn = root.openedIn ?? GENERAL_THREAD;
+    const written = rooms.find(ws, (c) => c.threadId === saidIn && c.actor.kind === 'system' && c.refs?.handoffId === result.id && c.refs?.threadId === root.threadId);
     const ownerCardId = humanCardIdOfRun(root.runId);
     const ownerCard = ownerCardId ? rooms.get(ws, ownerCardId) : null;
     const card = written ?? rooms.append({
       workspaceId: ws,
-      threadId: GENERAL_THREAD,
+      threadId: saidIn,
       kind: 'fact',
       actor: { kind: 'system' },
       title: `${how === 'stopped' ? 'Stopped' : 'Finished'}: ${root.payload.title}`,
       refs: { handoffId: result.id, threadId: root.threadId },
-    }, ownerCard && ownerCard.threadId === GENERAL_THREAD && ownerCard.kind === 'human' ? { replyTo: ownerCard.id } : undefined);
+    }, ownerCard && ownerCard.threadId === saidIn && ownerCard.kind === 'human' ? { replyTo: ownerCard.id } : undefined);
     // Written once per result: the mark is on the result itself.
     const now = card ? this.records.get(resultId) : null;
     if (now) this.put({ ...now, pointed: true });
@@ -1269,6 +1288,9 @@ export class HandoffRouter {
         ...(h.relay ? { relay: true } : {}),
         // The hop that opens a thread for the owner's request: that request's card names it.
         ...(kind === 'handoff.received' ? this.requestCardOf(h) : {}),
+        // ... and the 1:1 it was said in, when it was (its card, delivered or
+        // refused, links that 1:1).
+        ...(h.openedIn ? { openedIn: h.openedIn } : {}),
       },
     };
     const ports = this.opts.ports();
@@ -1283,13 +1305,14 @@ export class HandoffRouter {
     if (rooms) writeFactCards(rooms, { ...draft, id: `local-${kind}-${h.id}`, seq: 0, dedupeKey: '' }, ports.bots);
   }
 
-  /** The owner's General card a thread-opening dispatch answers, as
-   *  `{ requestCardId }`, or nothing (a bot's own work, or no such card). */
+  /** The owner's card a thread-opening dispatch answers (in General, or
+   *  the 1:1 it was said in), as `{ requestCardId }`, or nothing (a bot's
+   *  own work, or no such card). */
   private requestCardOf(h: Handoff): { requestCardId?: string } {
     if (h.opensThread !== true || h.from.kind !== 'bot' || h.attribution.originator.kind !== 'human') return {};
     const cardId = humanCardIdOfRun(h.runId);
     const card = cardId ? this.opts.rooms()?.get(h.from.workspaceId, cardId) : null;
-    return card && card.kind === 'human' && card.threadId === GENERAL_THREAD ? { requestCardId: card.id } : {};
+    return card && card.kind === 'human' && card.threadId === (h.openedIn ?? GENERAL_THREAD) ? { requestCardId: card.id } : {};
   }
 
   /** A party as the owner reads it: a bot by its name alone (its internal
@@ -1299,6 +1322,15 @@ export class HandoffRouter {
     if (p.kind === 'system') return 'wmux';
     const bot = safeGet(this.opts.ports().bots, p.botId);
     return bot ? bot.name || bot.role : p.botId;
+  }
+
+  /** A thread a bot may not name: another bot's 1:1, or a group chat it is
+   *  not in, unless its running wake is in it (a bot asked there answers
+   *  there). */
+  private othersDm(sender: BotBinding, threadId: ThreadId | undefined): boolean {
+    if (namesOthersGroup(this.opts.ports(), sender, threadId)) return true;
+    const of = dmThreadBot(threadId);
+    return !!of && of !== sender.botId && threadId !== runningWakeThread(this.opts.ports(), sender.botId);
   }
 
   // ── ask_person ──
@@ -1315,6 +1347,7 @@ export class HandoffRouter {
       if (!title) return invalid('title is required');
       const namedThread = params.threadId === undefined ? undefined : parseThreadId(params.threadId);
       if (namedThread === null) return invalid('threadId is not a thread id');
+      if (this.othersDm(sender, namedThread)) return invalid('a bot names its own 1:1 thread, or a group chat it is in, only');
       if (params.clientHandoffId !== undefined && (!isClientId(params.clientHandoffId) || params.clientHandoffId.startsWith('mention:') || params.clientHandoffId.startsWith('forward:'))) {
         return invalid('clientHandoffId is not a valid key');
       }

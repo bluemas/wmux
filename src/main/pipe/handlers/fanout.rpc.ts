@@ -123,7 +123,9 @@ import { getConnectorStore, isConnectionKey, type ConnectorStore } from '../../f
 import { CONNECTOR_LIMITS, CONNECTOR_NAME_RE, CONNECTOR_WORKER_AGENTS, type Connector } from '../../../shared/botConnector';
 import { codexConnectorRefusal } from '../../../shared/codexWorkerGuard';
 import { BOT_SECRET_LIMITS } from '../../../shared/botSecret';
-import { getBotRuntime } from '../../factory/BotRuntime';
+import { botCwd, getBotRuntime } from '../../factory/BotRuntime';
+import { getWmuxDir } from '../../../daemon/config';
+import { RESEARCH_PRESET } from '../../../shared/ledger';
 import { GENERAL_THREAD, parseThreadId, taskOriginThread, type ThreadId } from '../../../shared/room';
 import { getFactorySettings } from '../../factory/factorySettings';
 import { getBotFanoutReceipts } from '../../factory/botFanoutReceipts';
@@ -138,7 +140,7 @@ import { getFactLog, type FactLog } from '../../factory/factLog';
 import { getWakeQueue } from '../../factory/wakeQueue';
 import { getVerdictedTasks } from '../../factory/verdictedTasks';
 import { isWakeStoppedByOwner } from '../../factory/factoryStop';
-import { getAgentSlots } from '../../factory/agentSlots';
+import { getAgentSlots, getSlotLiveness, rowHoldsAgentSlot } from '../../factory/agentSlots';
 import { resumedWorkersLive } from '../../factory/workerReclaim';
 import type { LedgerEntry } from '../../../shared/ledger';
 import type { Fact } from '../../../shared/facts';
@@ -648,6 +650,9 @@ export interface FanOutRpcDeps {
   connectors?: () => ConnectorStore | null;
   /** The platform workers run on (default: this process's). */
   workerPlatform?: NodeJS.Platform;
+  /** The wmux data folder a bot's research scratch folders go under
+   *  (default: getWmuxDir()). Injected in tests. */
+  wmuxDir?: () => string;
 }
 
 /**
@@ -742,6 +747,17 @@ export function countOpenBotWorkers(
   return { bot, factory };
 }
 
+/** What fills a bot's own worker budget, for its refusal: a worker waiting
+ *  for an agent slot has not started, and the bot must not say it runs. Pure. */
+export function workersHeldNote(open: number, booked: number, waiting: number): string {
+  const parts: string[] = [];
+  if (open > 0) parts.push(`${open} of your workers ${open === 1 ? 'is' : 'are'} open`);
+  const starting = Math.max(0, booked - waiting);
+  if (starting > 0) parts.push(`${starting} ${starting === 1 ? 'is' : 'are'} starting`);
+  if (waiting > 0) parts.push(`${waiting} ${waiting === 1 ? 'is' : 'are'} waiting for an agent slot, not started`);
+  return parts.length > 0 ? `: ${parts.join(', ')}` : '';
+}
+
 /** Why a bot's fan-out may not launch now, or null. Pure. With the factory
  *  off no bot launches a worker, whatever its profile or wake say. */
 export function botLaunchRefusal(
@@ -790,9 +806,12 @@ function defaultBotPort(): FanOutBotPort | null {
       const wake = runningWake(resolveRoomPorts(), botId);
       return wake && wake.wakeId === runtime.currentTurn(botId)?.wakeId ? wake.handoffId ?? null : null;
     },
-    // Open bot tasks, plus resumed workers whose task row has ended.
+    // Open bot tasks whose worker still runs, plus resumed workers whose task
+    // row has ended.
     openWorkers: (botId) => {
-      const open = countOpenBotWorkers(getTaskLedger().list({ openOnly: true }), botId, (ids) => {
+      const live = getSlotLiveness();
+      const rows = getTaskLedger().list({ openOnly: true }).filter((r) => rowHoldsAgentSlot(r, live));
+      const open = countOpenBotWorkers(rows, botId, (ids) => {
         const kept = getVerdictedTasks();
         const found = verdictedTaskIds(ids.filter((id) => !kept?.has(id)));
         for (const id of ids) if (kept?.has(id)) found.add(id);
@@ -1328,6 +1347,8 @@ export function registerFanOutRpc(
     let botPresetName: string | undefined;
     /** The preset's worker prompt + the bot's prompt (bot callers only). */
     let botWorkerPrompt: string | undefined;
+    /** A bot's research task: no repository, no worktree (botFanoutPresets.ts). */
+    let botResearch = false;
     if (bot && selection.kind !== 'preset') {
       return deny('NOT_AUTHORIZED', `a bot fans out only through a bot preset (${SHARED_SURFACE.fanoutPresets.join(', ')}); roles and agents are refused`);
     }
@@ -1347,7 +1368,22 @@ export function registerFanOutRpc(
       if (!botPresetName) {
         return deny('NOT_AUTHORIZED', `a bot may fan out only with ${allowed.map((p) => `preset "${p}"`).join(', ')}`);
       }
-      if (!worktree) return deny('NOT_AUTHORIZED', 'a bot fans out only into worktrees (worktree:false is refused)');
+      botResearch = botPresetName === RESEARCH_PRESET;
+      // Only the research preset runs without a worktree (its own table row).
+      if (!worktree && !botResearch) return deny('NOT_AUTHORIZED', 'a bot fans out only into worktrees (worktree:false is refused)');
+      if (botResearch) {
+        // Research runs on its preset's own engine: another engine's launch
+        // guard may need a git worktree (codex's does), and a scratch folder
+        // has none.
+        const engine = botFanoutPreset(RESEARCH_PRESET)?.agent.agent;
+        const other = agentChoices.find((c) => c.agent !== engine);
+        if (other) {
+          return deny('FAILED_PRECONDITION', `research tasks run on ${engine} workers only, and this bot's workers run on ${other.agent}; pick ${engine} for its workers in the bot's profile to research`);
+        }
+        // A research worker reads the web: its task is outside text whatever
+        // woke the bot.
+        botWakeTainted = true;
+      }
       // verify: a detached checkout of one commit; every other preset: none.
       const checkoutRefusal = botPresetCheckoutRefusal(botPresetName, checkout);
       if (checkoutRefusal) return deny('INVALID_ARGUMENT', checkoutRefusal);
@@ -1361,7 +1397,11 @@ export function registerFanOutRpc(
       if (checkout && (params['files'] !== undefined || params['dependsOn'] !== undefined)) {
         return deny('INVALID_ARGUMENT', 'checkout cannot be combined with files or dependsOn');
       }
-      if (!botProfile?.repo) return deny('FAILED_PRECONDITION', 'this bot has no repository to fan out in (set its repo)');
+      // Every preset that changes code needs the bot's repository; research
+      // runs in a scratch folder and needs none.
+      if (!botResearch && !botProfile?.repo) {
+        return deny('FAILED_PRECONDITION', `this bot has no repository to fan out in (set its repo); a question that needs no code runs with preset "${RESEARCH_PRESET}"`);
+      }
     }
 
     // ── Global caps (live + rolling hour), reserved in this same tick ────
@@ -1387,7 +1427,10 @@ export function registerFanOutRpc(
       const budget = checkWorkers(botProfile.budget, botPort.usage(bot.botId), open.bot + bookedBot, n, Date.now());
       if (!budget.ok) {
         botPort.budgetExhausted(bot, budget.reason);
-        return deny('RESOURCE_EXHAUSTED', `this bot's worker budget refuses the fan-out (${budget.reason})`);
+        const held = budget.reason === 'concurrent_workers'
+          ? workersHeldNote(open.bot, bookedBot, getAgentSlots()?.waiting().filter((w) => w.botId === bot.botId).length ?? 0)
+          : '';
+        return deny('RESOURCE_EXHAUSTED', `this bot's worker budget refuses the fan-out (${budget.reason})${held}`);
       }
     }
 
@@ -1425,7 +1468,11 @@ export function registerFanOutRpc(
     // A bot has no pane: it fans out in the repository its profile names,
     // which must still be a git repository root.
     const botRepoPath = bot ? botProfile?.repo?.repoPath ?? '' : '';
+    // A research task's scratch folders: under the bot's own data folder,
+    // never in a repository (FanOutService.runOutputTasks makes the batch).
+    const botResearchRoot = bot && botResearch ? path.join(botCwd((deps.wmuxDir ?? getWmuxDir)(), bot.botId), 'research') : '';
     const deriveBotRoot = async (): Promise<{ root: string } | { code: string; message: string }> => {
+      if (botResearchRoot) return { root: botResearchRoot };
       let expected = botRepoPath;
       try {
         expected = fs.realpathSync(botRepoPath);
@@ -1454,7 +1501,8 @@ export function registerFanOutRpc(
     const callerRepoRoot = preflight.root;
     // A bot's workers may not push to this repository's own default branch:
     // read it before they launch (main and master are covered regardless).
-    if (bot) {
+    // A research task has no repository.
+    if (bot && !botResearch) {
       const note = await (deps.botDefaultBranch ?? noteBotRepoDefaultBranch)(callerRepoRoot).catch((): DefaultBranchNote => ({ name: null, recorded: false }));
       const refusal = defaultBranchRefusal(note);
       if (refusal) {
@@ -1492,7 +1540,11 @@ export function registerFanOutRpc(
       ...(agentChoices.length > 0 ? { agents: agentChoices } : {}),
       ...(worktree
         ? {}
-        : { worktree: false, outputFolder: fanoutPresetOutputFolder((selection as { preset: FanoutPreset }).preset) }),
+        : {
+            worktree: false,
+            outputFolder: fanoutPresetOutputFolder((selection as { preset: FanoutPreset }).preset),
+            ...(botResearchRoot ? { outputRoot: botResearchRoot } : {}),
+          }),
       verifiedWorkspaceId: callerWorkspaceId,
       workerPermissionMode: workerMode,
       // Who asked, for each task's lineage stamp — resolved above, the same
@@ -1561,7 +1613,9 @@ export function registerFanOutRpc(
               // the permission mode and tool rules, not just the prompt.
               promptPreview:
                 buildFanOutPreview(sharedPrompt, parsed.titles, parsed.taskPrompts, parsed.roles, agentLabels, graph) +
-                (worktree ? '' : '\n\nno worktree: each task writes into its own folder under the wmux outputs directory') +
+                (worktree ? '' : botResearchRoot
+                  ? `\n\nno worktree: a research task; each task works in its own scratch folder under ${botResearchRoot}`
+                  : '\n\nno worktree: each task writes into its own folder under the wmux outputs directory') +
                 // Only when a task can actually run claude: the flags are claude-only.
                 (agentChoices.length === 0 || agentChoices.some((c) => c.agent === 'claude')
                   ? `\n\nclaude workers launch with: ${workerLaunchFlags(workerMode, [])}`
