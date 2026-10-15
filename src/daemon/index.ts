@@ -6673,9 +6673,9 @@ function wireEvents(
     // EXCEPT a resize repaint: a refit burst right after pty:resize is not
     // work, and letting it rebut would silently kill a real completion
     // alarm (the same class of false-negative the resize-redraw guard in
-    // DaemonPTYBridge already protects the detector dedup from). The loose
-    // status-dot broadcast below still runs — only the strict alarm feed
-    // skips repaint-flagged bursts.
+    // DaemonPTYBridge already protects the detector dedup from). The bridge
+    // no longer emits a passive burst inside the resize-redraw window at all
+    // (it would light the status dot), so the flag is a backstop here.
     // #919 — compute canonical identity ONCE for this burst and use it for
     // both feeds below. Leaving either on the raw screen name would re-assert
     // the detector's sticky label on every output burst, undoing whatever the
