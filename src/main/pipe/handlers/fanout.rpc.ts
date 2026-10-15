@@ -117,7 +117,11 @@ import { botTemplate, type BotBinding, type BotProfile } from '../../../shared/b
 import { SHARED_SURFACE } from '../../../shared/botSurface';
 import { WAKE_LIMITS, botFanoutIdempotencyKey, type WakeItem } from '../../../shared/wake';
 import { getBotStore } from '../../factory/botStore';
+import { withBotWorkerAgent } from '../../../shared/botWorkerAgent';
 import { parseSecretNames, secretNamesRefusal } from '../../factory/secretGrants';
+import { getConnectorStore, isConnectionKey, type ConnectorStore } from '../../factory/connectorStore';
+import { CONNECTOR_LIMITS, CONNECTOR_NAME_RE, CONNECTOR_WORKER_AGENTS, type Connector } from '../../../shared/botConnector';
+import { codexConnectorRefusal } from '../../../shared/codexWorkerGuard';
 import { BOT_SECRET_LIMITS } from '../../../shared/botSecret';
 import { getBotRuntime } from '../../factory/BotRuntime';
 import { GENERAL_THREAD, parseThreadId, taskOriginThread, type ThreadId } from '../../../shared/room';
@@ -138,6 +142,9 @@ import { getAgentSlots } from '../../factory/agentSlots';
 import { resumedWorkersLive } from '../../factory/workerReclaim';
 import type { LedgerEntry } from '../../../shared/ledger';
 import type { Fact } from '../../../shared/facts';
+
+/** Per worker CLI: why a connection cannot reach its workers, or null. */
+const CONNECTOR_AGENT_REFUSAL: Readonly<Record<string, (c: Connector) => string | null>> = { codex: codexConnectorRefusal };
 
 type GetWindow = () => BrowserWindow | null;
 
@@ -637,6 +644,10 @@ export interface FanOutRpcDeps {
   /** A bot's repository: read its default branch for the workers' push
    *  rules (agents/botWorkerDefaultBranch). Injected in tests. */
   botDefaultBranch?: (repoRoot: string) => Promise<DefaultBranchNote>;
+  /** The connection library (default: the running one). */
+  connectors?: () => ConnectorStore | null;
+  /** The platform workers run on (default: this process's). */
+  workerPlatform?: NodeJS.Platform;
 }
 
 /**
@@ -1187,9 +1198,44 @@ export function registerFanOutRpc(
       if (!bot) return deny('INVALID_ARGUMENT', 'task.fanout.start accepts secretNames only from a factory bot');
       const names = parseSecretNames(params['secretNames']);
       if (!names) return deny('INVALID_ARGUMENT', `secretNames must be 1-${BOT_SECRET_LIMITS.NAMES_PER_FANOUT} distinct credential-shaped env names (for example NPM_TOKEN)`);
+      // A connection's key reaches a worker only through its connection.
+      const owned = names.filter((n) => isConnectionKey(n));
+      if (owned.length > 0) return deny('INVALID_ARGUMENT', `not a key you can hand to a worker: ${owned.join(', ')}`);
       const missing = secretNamesRefusal(names);
       if (missing) return deny('INVALID_ARGUMENT', missing);
       secretNames = names;
+    }
+    // A bot's connections for its workers (shared/botConnector.ts): names it
+    // picks from its own set, resolved now from main's library. The records
+    // resolved here are what each worker launches with, whatever the library
+    // says later; their keys go to each worker with the task's other secrets.
+    let connectors: Connector[] | undefined;
+    if (params['connectors'] !== undefined) {
+      if (!bot) return deny('INVALID_ARGUMENT', 'task.fanout.start accepts connectors only from a factory bot');
+      const raw = params['connectors'];
+      if (!Array.isArray(raw) || raw.length === 0 || raw.length > CONNECTOR_LIMITS.PER_FANOUT
+        || !raw.every((n) => typeof n === 'string' && CONNECTOR_NAME_RE.test(n)) || new Set(raw).size !== raw.length) {
+        return deny('INVALID_ARGUMENT', `connectors must be 1-${CONNECTOR_LIMITS.PER_FANOUT} distinct connection names from your wake prompt`);
+      }
+      if ((deps.workerPlatform ?? process.platform) === 'win32') {
+        return deny('FAILED_PRECONDITION', 'connections do not reach workers on Windows yet; start the task without connectors');
+      }
+      const lib = (deps.connectors ?? getConnectorStore)();
+      if (!lib) return deny('FAILED_PRECONDITION', 'connections are not running');
+      const mine = lib.forBot(bot.botId);
+      const unknown = (raw as string[]).filter((n) => !mine.some((c) => c.name === n));
+      if (unknown.length > 0) return deny('INVALID_ARGUMENT', `not one of your connections: ${unknown.join(', ')} (your wake prompt lists them)`);
+      connectors = (raw as string[]).map((n) => mine.find((c) => c.name === n)!);
+      const keys = [...new Set(connectors.flatMap((c) => c.secrets.map((s) => s.secret)))];
+      if (keys.length + (secretNames?.length ?? 0) > BOT_SECRET_LIMITS.NAMES_PER_FANOUT) {
+        return deny('INVALID_ARGUMENT', `a task carries at most ${BOT_SECRET_LIMITS.NAMES_PER_FANOUT} keys, its connections' included`);
+      }
+      if (keys.length > 0) {
+        const missing = secretNamesRefusal(keys);
+        if (missing) return deny('FAILED_PRECONDITION', `a connection's key is not stored: ask the owner to add it in Settings › Bots › Connections (${missing})`);
+      }
+      // Its tools return outside text: the task counts as started from it.
+      botWakeTainted = true;
     }
 
     // ── Fields the renderer may state but a wire caller may not ──────────
@@ -1268,7 +1314,10 @@ export function registerFanOutRpc(
       bot ? deps.botPresets ?? botFanoutPresetList : deps.presets ?? (() => loadFanoutPresets()),
     );
     if ('error' in selection) return deny('INVALID_ARGUMENT', selection.error);
-    const agentChoices = selection.kind === 'none' ? [] : selection.agents;
+    // A bot's workers run on the engine its owner picked in its profile
+    // (main's record of the bot, never the bot's arguments): the bot names
+    // only a preset. Applied before the labels, so the ledger names it.
+    const agentChoices = selection.kind === 'none' ? [] : bot ? withBotWorkerAgent(selection.agents, botProfile?.workerAgent) : selection.agents;
     const agentLabels = agentChoices.map(describeFanoutAgentChoice);
     const worktree = !(selection.kind === 'preset' && selection.preset.worktree === false);
     // §13 rule 3: a bot fans out only with the bot presets (every bot holds
@@ -1284,6 +1333,13 @@ export function registerFanOutRpc(
     }
     if (bot && params['dependsOn'] !== undefined) {
       return deny('INVALID_ARGUMENT', 'a bot fan-out cannot use dependsOn: start the next step from a later wake');
+    }
+    if (connectors && agentChoices.some((c) => !CONNECTOR_WORKER_AGENTS.has(c.agent))) {
+      return deny('FAILED_PRECONDITION', `connections reach ${[...CONNECTOR_WORKER_AGENTS].join(' and ')} workers only; start the task without connectors`);
+    }
+    if (connectors) {
+      const why = agentChoices.flatMap((a) => connectors!.map((c) => CONNECTOR_AGENT_REFUSAL[a.agent]?.(c) ?? null)).find((r) => r !== null);
+      if (why) return deny('FAILED_PRECONDITION', `${why}; start the task without that connection`);
     }
     if (bot && botPreset !== undefined) {
       const allowed = SHARED_SURFACE.fanoutPresets;
@@ -1456,6 +1512,7 @@ export function registerFanOutRpc(
       ...(bot && botWakeThread ? { threadId: botWakeThread } : {}),
       ...(bot && botWakeHandoff ? { handoffId: botWakeHandoff } : {}),
       ...(bot && secretNames ? { secretNames } : {}),
+      ...(bot && connectors ? { connectors } : {}),
     };
     const presetName = selection.kind === 'preset' ? selection.preset.name : undefined;
 

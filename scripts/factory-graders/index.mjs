@@ -12,6 +12,7 @@ import * as rooms from './rooms.mjs';
 import * as content from './content.mjs';
 import * as approvals from './approvals.mjs';
 import * as group from './group.mjs';
+import * as connectors from './connectors.mjs';
 
 export const GRADERS = {
   'reply-in-wake-thread': threads.replyInWakeThread,
@@ -43,6 +44,7 @@ export const GRADERS = {
   'interrupted-wake-after-restart': wakes.interruptedAfterRestart,
   'repowatch-baseline-first-poll': lane.repoWatchBaseline,
   'lead-task-system-gate': handoffs.leadTaskSystemGate,
+  'bot-worker-codex-engine': handoffs.botWorkerCodexEngine,
   'approval-typed-merge': approvals.approvalTypedMerge,
   'approval-needs-owner-words': approvals.approvalNeedsOwnerWords,
   'approval-head-moved': approvals.approvalHeadMoved,
@@ -60,6 +62,10 @@ export const GRADERS = {
   'taint-relay-lane-refused': approvals.taintRelayLaneRefused,
   'coordinator-room-wakes-lead-only': group.coordinatorRoomWakesLeadOnly,
   'taint-research-lane-refused': approvals.taintLaneRefused,
+  'connector-worker-launch': connectors.connectorWorkerLaunch,
+  'connector-off-for-bot-refused': connectors.connectorOffForBotRefused,
+  'connector-task-lane-refused': connectors.connectorTaskLaneRefused,
+  'connector-codex-worker-launch': connectors.connectorCodexWorkerLaunch,
 };
 
 /** `{status: 'pass'|'fail'|'error', criteria}` for one snapshot. */
