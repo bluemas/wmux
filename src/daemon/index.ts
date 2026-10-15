@@ -1876,6 +1876,37 @@ async function recoverSessions(
     );
   }
 
+  // Whether each live session's previous shell is still running, and is ours.
+  // Each answer costs a tasklist call, plus a process probe when the pid is
+  // alive: 0.6-1.2 s per session on Windows. Asked one at a time inside the
+  // loop below, a 25-pane recovery kept the daemon from answering for 25 s
+  // ("Restoring panes..." the whole time). Ask them all up front, a few at a
+  // time, and let the loop read the answers.
+  const leftoverShells = new Map<string, Promise<'ours' | 'foreign' | 'gone'>>();
+  if (!rebooted) {
+    const pending = state.sessions.filter((s) =>
+      s.state !== 'dead' && s.state !== 'suspended' && recoverableIds.has(s.id));
+    const limit = 6;
+    let next = 0;
+    const resolvers = new Map<string, (v: 'ours' | 'foreign' | 'gone') => void>();
+    for (const s of pending) {
+      leftoverShells.set(s.id, new Promise((resolve) => resolvers.set(s.id, resolve)));
+    }
+    const worker = async (): Promise<void> => {
+      while (next < pending.length) {
+        const s = pending[next++];
+        let verdict: 'ours' | 'foreign' | 'gone' = 'gone';
+        try {
+          if (await ProcessMonitor.isAlive(s.pid)) {
+            verdict = (await isOurShellProcess(s.pid, s.cmd)) ? 'ours' : 'foreign';
+          }
+        } catch { /* treated as gone, as the sequential check did */ }
+        resolvers.get(s.id)!(verdict);
+      }
+    };
+    for (let i = 0; i < Math.min(limit, pending.length); i++) void worker();
+  }
+
   for (const session of state.sessions) {
     if (session.state === 'dead') {
       // #646: a tombstone is supposed to mean "the process is gone". Before
@@ -2063,14 +2094,13 @@ async function recoverSessions(
     } else {
       // Non-suspended live session — check for periodic snapshot buf file
       // (written every 30s, survives forced kills / power loss)
-      if (!rebooted && await ProcessMonitor.isAlive(session.pid)) {
-        // Guard against PID recycling: verify the process is actually
-        // the shell we spawned, not an unrelated system process.
-        if (await isOurShellProcess(session.pid, session.cmd)) {
-          try { process.kill(session.pid); } catch { /* ignore */ }
-        } else {
-          log('warn', `PID ${session.pid} is alive but not our shell (${session.cmd}) — skipping kill`);
-        }
+      // Prefetched above. Guard against PID recycling: only a process that
+      // is actually the shell we spawned is killed.
+      const leftover = rebooted ? 'gone' : await (leftoverShells.get(session.id) ?? Promise.resolve('gone'));
+      if (leftover === 'ours') {
+        try { process.kill(session.pid); } catch { /* ignore */ }
+      } else if (leftover === 'foreign') {
+        log('warn', `PID ${session.pid} is alive but not our shell (${session.cmd}) — skipping kill`);
       }
 
       const snapshotPath = stateWriter.getBufferDumpPath(session.id);
