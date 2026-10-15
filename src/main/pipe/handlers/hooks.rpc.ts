@@ -45,6 +45,7 @@ import type { BrowserWindow } from 'electron';
 import type { RpcRouter } from '../RpcRouter';
 import { sendToRenderer } from './_bridge';
 import { dispatchNotification } from '../../notification/dispatchNotification';
+import { clearEscapeKey } from '../../notification/idleSuppression';
 import { broadcastMetadataUpdate } from '../../ipc/handlers/metadata.handler';
 import { DEFAULT_DEDUP_WINDOW_MS, type HookSignalRouter } from '../../hooks/HookSignalRouter';
 import { HookFloodMeter, describeHookFlood } from '../../hooks/HookFloodMeter';
@@ -648,7 +649,11 @@ export function registerHooksRpc(
 
     // The daemon-unreachable twin of HookIngest's drop: an interrupted-turn
     // Stop that lands after the next prompt has no effect at all.
-    if (signal.kind === 'agent.user_prompt_submit') lastPromptAtByPty.set(ptyId, Date.now());
+    // A new turn also forgets the last one's Escape (idleSuppression.clearEscapeKey).
+    if (signal.kind === 'agent.user_prompt_submit') {
+      lastPromptAtByPty.set(ptyId, Date.now());
+      clearEscapeKey(ptyId);
+    }
     if (isStaleInterruptedStop(signal, lastPromptAtByPty.get(ptyId))) return { ok: true };
 
     // Hook authority: EVERY resolved bridge signal (emit-class or not —

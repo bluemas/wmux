@@ -468,6 +468,41 @@ describe('DaemonNotificationRouter — the interrupt row closes the turn', () =>
     router.stop();
   });
 
+  it('one Escape settles one turn: the next turn survives a redraw of the old row', () => {
+    let now = 1_000_000;
+    const hookRouter = stubHookRouter(true);
+    const { router, captured } = makeRouter(hookRouter, [], 0, () => now);
+    captured.agent?.(metadataEvent('agent.user_prompt_submit'));
+    markEscapeKey(PTY, now);
+    captured.interrupted?.({ sessionId: PTY });
+    expect(lastStatus()).toBe('idle');
+
+    // Turn B starts 1.5 s later, inside the Escape window, and a repaint
+    // prints turn A's row again.
+    now += 1_500;
+    captured.agent?.(metadataEvent('agent.user_prompt_submit'));
+    expect(lastStatus()).toBe('running');
+    captured.interrupted?.({ sessionId: PTY });
+    expect(hookRouter.releaseHookTurnStart).toHaveBeenCalledTimes(1);
+    expect(lastStatus()).toBe('running');
+    router.stop();
+  });
+
+  it('a new prompt forgets an Escape that settled nothing', () => {
+    let now = 1_000_000;
+    const hookRouter = stubHookRouter(true);
+    const { router, captured } = makeRouter(hookRouter, [], 0, () => now);
+    // An Escape that only closed a popup, then the next prompt.
+    markEscapeKey(PTY, now);
+    now += 500;
+    captured.agent?.(metadataEvent('agent.user_prompt_submit'));
+    now += 500;
+    captured.interrupted?.({ sessionId: PTY });
+    expect(hookRouter.releaseHookTurnStart).not.toHaveBeenCalled();
+    expect(lastStatus()).toBe('running');
+    router.stop();
+  });
+
   it('leaves a pane with no open turn alone', () => {
     const { router, captured } = makeRouter(stubHookRouter(false));
     markEscapeKey(PTY);

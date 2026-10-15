@@ -7,6 +7,7 @@ import type { HookSignalRouter } from '../hooks/HookSignalRouter';
 import { dispatchNotification } from './dispatchNotification';
 import { toastManager } from './ToastManager';
 import {
+  clearEscapeKey,
   clearPty as clearSuppression,
   ESC_INTERRUPT_CONFIRM_MS,
   recentlyEscaped,
@@ -781,6 +782,8 @@ export class DaemonNotificationRouter {
               settleHookTurnToIdle(payload.sessionId, this.getHookRouter?.() ?? null, win, this.now());
             }
           } else if (metadataKind === 'agent.user_prompt_submit') {
+            // A new turn: an Escape from the last one must not confirm a redraw of its row.
+            clearEscapeKey(payload.sessionId);
             const hookRouter = this.getHookRouter?.();
             if (ev.signal && hookRouter) {
               const mirrored = this.getMirror().peek();
@@ -1389,6 +1392,7 @@ export class DaemonNotificationRouter {
     const onAgentInterrupted = (payload: { sessionId: string }) => {
       try {
         if (!recentlyEscaped(payload.sessionId, ESC_INTERRUPT_CONFIRM_MS, this.now())) return;
+        clearEscapeKey(payload.sessionId);
         settleHookTurnToIdle(payload.sessionId, this.getHookRouter?.() ?? null, this.getWindow(), this.now());
       } catch (err) {
         console.warn('[DaemonNotificationRouter] agent interrupted error:', err);

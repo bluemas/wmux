@@ -24,6 +24,7 @@ import { kittyChunkAsLegacy } from '../../shared/kittyKeyEvents';
 import {
   recentlyResized,
   RESIZE_REDRAW_GUARD_MS,
+  clearEscapeKey,
   markEscapeKey,
   recentlyEscaped,
   recentlySettled,
@@ -797,6 +798,7 @@ export class PTYBridge {
     const unsubInterrupted = agentDetector.onInterrupted(() => {
       try {
         if (!recentlyEscaped(ptyId) || recentlyResized(ptyId, RESIZE_REDRAW_GUARD_MS)) return;
+        clearEscapeKey(ptyId);
         settleHookTurnToIdle(ptyId, this.getHookRouter?.() ?? null, this.getWindow());
       } catch (err) {
         console.warn('[PTYBridge] onInterrupted callback error:', err);

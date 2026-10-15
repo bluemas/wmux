@@ -103,6 +103,15 @@ export function recentlyEscaped(
   return now - (lastEscapeAt.get(ptyId) ?? -Infinity) < windowMs;
 }
 
+/**
+ * Forget the pane's Escape: once it settled a turn, and when a new turn starts.
+ * Left in place, one Escape would still confirm a redraw of the old row after
+ * the next prompt and settle a turn that is running.
+ */
+export function clearEscapeKey(ptyId: string): void {
+  lastEscapeAt.delete(ptyId);
+}
+
 export function clearPty(ptyId: string): void {
   lastResizeAt.delete(ptyId);
   lastSettleAt.delete(ptyId);
