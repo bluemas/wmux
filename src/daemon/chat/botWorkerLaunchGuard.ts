@@ -24,6 +24,7 @@ import { getWmuxDir } from '../config';
 import { namesClaude, readBotWorkerSessions, spliceSettingsFlag, workerProjectSettingsRefusal, writeBotWorkerSettings } from '../../shared/botWorkerGuard';
 import { spliceWorkerLaunch } from '../../shared/botWorkerMcp';
 import { namesCodex } from '../../shared/codexWorkerGuard';
+import { toWslPath } from '../../shared/imagePaste';
 
 /** The first message as terminalLaunchCommand appends it: ` -- '<text>'`,
  *  each `'` written `'\''`. */
@@ -59,7 +60,7 @@ export function guardBotWorkerLaunch(
     // The daemon cannot tell whether a recorded connection is still the
     // bot's: a launch with connections starts only from main.
     if (carriesConnections(rec.launch.mcpConfigFile)) return null;
-    const strict = spliceWorkerLaunch(head, rec.launch.settingsFile, rec.launch.mcpConfigFile);
+    const strict = spliceWorkerLaunch(head, rec.launch.settingsFile, rec.launch.mcpConfigFile, rec.launch.settingSources);
     return strict === null ? null : strict + tail;
   }
   // Only a WSL pane launches with the settings file alone. Any other record
@@ -72,7 +73,8 @@ export function guardBotWorkerLaunch(
   } catch {
     return null;
   }
-  const guarded = spliceSettingsFlag(head, settingsPath);
+  // Linux claude opens the file through its /mnt mount, never by the Windows path.
+  const guarded = spliceSettingsFlag(head, toWslPath(settingsPath) ?? settingsPath);
   return guarded === null ? null : guarded + tail;
 }
 

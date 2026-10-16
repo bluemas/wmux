@@ -139,6 +139,42 @@ fi
 exec "$real" --settings "$WMUX_WSL_SETTINGS" \${WMUX_WSL_MCP_CONFIG:+--mcp-config="$WMUX_WSL_MCP_CONFIG"} "$@"
 `;
 
+/**
+ * #2231 — a fan-out task worktree on a Windows drive, worked on by Linux git.
+ * Git for Windows wrote its `.git` file as `gitdir: D:/…`, which Linux git
+ * reads as a relative path, so every git command in the worker failed. Main
+ * hands the pane the gitdir and the worktree as Linux paths
+ * (`WMUX_WSL_GIT_DIR`, `WMUX_WSL_GIT_WORK_TREE`; main/agents/wslWorkerGit.ts)
+ * and they become GIT_DIR / GIT_WORK_TREE here, inside Linux only: nothing is
+ * written to the repository, and no Windows process started from the pane
+ * inherits them. `WMUX_WSL_GIT_AUTOCRLF` carries Git for Windows' effective
+ * core.autocrlf (its system config sets `true`, so the worktree is checked out
+ * with CRLF and Linux git without it reads every text file as modified); it is
+ * appended to the GIT_CONFIG_COUNT list the user's startup files left, never
+ * written over it. With it go `core.filemode=false` (drvfs reads every file as
+ * 0777, so Linux git saw a mode change on every file and committed new ones
+ * as executable) and Git for Windows' own `user.name` / `user.email` when set
+ * (`WMUX_WSL_GIT_FILEMODE`, `WMUX_WSL_GIT_USER_NAME`, `WMUX_WSL_GIT_USER_EMAIL`).
+ * After the user's rc files, so they cannot undo it.
+ */
+export const WSL_TASK_GIT_ENV = `# A task worktree on a Windows drive: its gitdir by Linux paths (#2231).
+if [ -n "\${WMUX_WSL_GIT_DIR:-}" ] && [ -n "\${WMUX_WSL_GIT_WORK_TREE:-}" ]; then
+  export GIT_DIR="$WMUX_WSL_GIT_DIR" GIT_WORK_TREE="$WMUX_WSL_GIT_WORK_TREE"
+  # One git setting, appended to the GIT_CONFIG_COUNT list; an empty value adds nothing.
+  __wmux_git_config() {
+    [ -n "$2" ] || return 0
+    __wmux_n=\${GIT_CONFIG_COUNT:-0}
+    case "$__wmux_n" in ''|*[!0-9]*) __wmux_n=0 ;; esac
+    export "GIT_CONFIG_KEY_$__wmux_n=$1" "GIT_CONFIG_VALUE_$__wmux_n=$2" "GIT_CONFIG_COUNT=$((__wmux_n + 1))"
+    unset __wmux_n
+  }
+  __wmux_git_config core.autocrlf "\${WMUX_WSL_GIT_AUTOCRLF:-}"
+  __wmux_git_config core.filemode "\${WMUX_WSL_GIT_FILEMODE:-}"
+  __wmux_git_config user.name "\${WMUX_WSL_GIT_USER_NAME:-}"
+  __wmux_git_config user.email "\${WMUX_WSL_GIT_USER_EMAIL:-}"
+  unset -f __wmux_git_config
+fi`;
+
 export const WSL_CODEX_HOOK = `#!/bin/sh
 export ELECTRON_RUN_AS_NODE=1
 export WSLENV="\${WSLENV:+$WSLENV:}ELECTRON_RUN_AS_NODE/w"
@@ -411,6 +447,7 @@ fi
 if [ -n "$WMUX_WSL_ACCOUNT_HOME_UNREACHABLE" ]; then
   printf 'wmux: %s cannot be opened from this WSL distro, so this login will not be saved to the selected account. Use an account folder on a local drive or inside this distro.\\n' "$WMUX_WSL_ACCOUNT_HOME_UNREACHABLE" >&2
 fi
+${WSL_TASK_GIT_ENV}
 # An explicit workspace directory wins over a cd in the user's startup files.
 if [ -z "$WMUX_WSL_CWD" ] || ! builtin cd -- "$WMUX_WSL_CWD"; then
   printf 'wmux: cannot enter WSL directory "%s"; check the directory and WSLENV transport, then retry.\\n' "$WMUX_WSL_CWD" >&2
@@ -441,6 +478,12 @@ fi
     'WMUX_WSL_CODEX_BRIDGE/u', 'WMUX_WSL_CODEX_CONFIG/u', 'WMUX_WSL_CODEX_HOOK/p',
     'WMUX_WSL_CWD/u', 'WMUX_WSL_SETTINGS/p', 'WMUX_WSL_BIN/p', 'WMUX_WSL_BASHRC/p', 'WMUX_SHELL_INTEGRATION',
     ...(mcpEntry ? ['WMUX_WSL_MCP/u', 'WMUX_WSL_MCP_CONFIG/p'] : []),
+    // A fan-out or automation pane's claude skips the workspace-trust dialog
+    // (shared/agentFirstRun.ts CLAUDE_SANDBOXED_ENV). wsl.exe passes only the
+    // variables WSLENV names, so without this Linux claude in a WSL task pane
+    // stopped on "Is this a project you created or one you trust?" (#2231).
+    // Only a pane that carries it: an ordinary WSL pane keeps the dialog.
+    ...(options.env.CLAUDE_CODE_SANDBOXED ? ['CLAUDE_CODE_SANDBOXED/u'] : []),
   ];
   // Ordinary WSL panes keep their Linux profiles: copied Windows config can
   // contain Windows-only notify/MCP/hooks. Only forward the login's vendor.

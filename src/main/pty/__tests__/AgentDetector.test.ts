@@ -269,6 +269,70 @@ describe('AgentDetector', () => {
     });
   });
 
+  describe('interrupted-turn row', () => {
+    const ROW = '  \x1b[2m⎿\x1b[0m  Interrupted · What should Claude do instead?\n';
+
+    it('reports Claude Code\'s interrupt row on every sighting', () => {
+      const { det } = claudeGated();
+      const cb = vi.fn();
+      det.onInterrupted(cb);
+      det.feed(ROW);
+      expect(cb).toHaveBeenCalledTimes(1);
+      expect(cb.mock.calls[0][0]).toEqual({ agent: 'Claude Code' });
+      // A redraw prints it again; consumers filter on the preceding Escape.
+      det.feed(ROW);
+      expect(cb).toHaveBeenCalledTimes(2);
+    });
+
+    it('ignores the sentence quoted in a reply, and on a pane Claude does not own', () => {
+      const { det } = claudeGated();
+      const cb = vi.fn();
+      det.onInterrupted(cb);
+      det.feed('⏺ Claude printed "Interrupted · What should Claude do instead?" there.\n');
+      det.feed('  Interrupted · What should Claude do instead?\n');
+      expect(cb).not.toHaveBeenCalled();
+
+      const bare = new AgentDetector();
+      const bareCb = vi.fn();
+      bare.onInterrupted(bareCb);
+      bare.feed(ROW);
+      expect(bareCb).not.toHaveBeenCalled();
+    });
+
+    // Recorded from Claude Code 2.1.301 (120x40, fullscreen renderer): a single
+    // Esc while a Bash tool ran. The previous frame already showed
+    // `  ⎿  $ ping ...` on that row, so the diff skips the gutter with
+    // `CSI 4 C` (the `⎿` is never written again), moves down with `CSI 1 B`,
+    // and ends the row with a CUP instead of a newline. Nothing follows it
+    // until the next spinner frame, seconds later.
+    const LIVE_FRAME_BEFORE = '\u001b[?25l\u001b[H\r\u001b[10C\u001b[8B\u001b[1m1\u001b[22m shell\u001b[19Gcommand'
+      + '\u001b[38;2;153;153;153m · 10s\u001b[39m…\u001b[K\r\u001b[5C\u001b[2B\u001b[K\r\u001b[23B\u001b[K\r\u001b[3B❯ '
+      + '\u001b[40;1H\u001b[37;3H\u001b[?25h';
+    const LIVE_INTERRUPTED_FRAME = '\u001b[?25l\u001b[H\r\u001b[8B \u001b[3G\u001b[38;2;153;153;153mRan \u001b[1m1\u001b[22m'
+      + ' shell command \u001b[39m\u001b[K\r\u001b[4C\u001b[1B\u001b[38;2;153;153;153m Interrupted · What should Claude do instead?'
+      + '\u001b[39m\u001b[40;1H\u001b[37;3H\u001b[?25h';
+
+    it('reports the row as Claude Code draws it live, from the frame that draws it', () => {
+      const { det } = claudeGated();
+      const cb = vi.fn();
+      det.onInterrupted(cb);
+      det.feed(LIVE_FRAME_BEFORE);
+      expect(cb).not.toHaveBeenCalled();
+      det.feed(LIVE_INTERRUPTED_FRAME);
+      expect(cb).toHaveBeenCalledTimes(1);
+      expect(cb.mock.calls[0][0]).toEqual({ agent: 'Claude Code' });
+    });
+
+    it('does not take a cursor-placed row that never had the gutter', () => {
+      const { det } = claudeGated();
+      const cb = vi.fn();
+      det.onInterrupted(cb);
+      // Placed by CUP at its first column: a reply row, not the tool-result row.
+      det.feed('\u001b[12;3HInterrupted\u001b[1C·\u001b[1CWhat\u001b[1Cshould\u001b[1CClaude\u001b[1Cdo\u001b[1Cinstead?\u001b[40;1H');
+      expect(cb).not.toHaveBeenCalled();
+    });
+  });
+
   describe('Codex approval prompts (Phase 2 — clean-room transcribed from Codex CLI 0.145.0)', () => {
     const gated = () => {
       const det = new AgentDetector();

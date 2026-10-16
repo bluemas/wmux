@@ -339,7 +339,9 @@ status bar badges, `fleet_triage` or the phone's sidebar.
   headers — the list's, the chat's name-pill row and the panel's — are one
   44px band ending on the same line, with no rule under the chat's. Under an 800px-wide page (an
   ~860px window) it is one column: the list first; choosing a conversation opens the chat over
-  it, with a round back button left of the name pill.
+  it, with a round back button left of the name pill and, for a bot with workers, a round
+  workers button (an icon and the count) right of it that opens the bot's worker tree as a
+  popover, so a worker is reached without going back to the list.
 - **List:** the 16px title with Search, `⋯` (the page menu: Stop all
   bots, when main offers it) and `+` (a menu: Add bot — the Settings add
   form in a dialog; the bot it adds is selected — and New group chat) as
@@ -444,18 +446,37 @@ status bar badges, `fleet_triage` or the phone's sidebar.
   pill opens
   the bot's profile (template, job — the owner's words, with Edit —
   workspace, repository — with Change, Add bot's folder picker, checked
-  as at creation (a refusal says why in one line) — what its workers run on — a native Select:
+  as at creation (a refusal says why in one line) — the model it thinks
+  on (its own model and effort, as text with a muted Change that opens the
+  model combobox of Settings › Agents roles and an effort Select, with
+  Cancel and Save; an invalid model id is refused in one red line before
+  main is asked, and main checks it again) — what its workers run on — a native Select:
   Default (the presets' engine) or an installed engine that has a worker
-  guard, one not installed listed but disabled — on/off and presence (a
-  parked bot adds one muted line under it saying why — out of turns,
-  stopped after errors, paused by the owner — with a secondary Resume),
-  turns used and left today,
+  guard, one not installed listed but disabled — its workers' model and
+  effort (the same model line, for that engine) — on/off and presence
+  (right after Resume, "Resuming…" until the runtime reports, for 10 s at
+  most; then as any bot with no turn yet),
+  then Today (owner decision 2026-10-16): on top, one muted line naming the
+  first thing that keeps the bot from new work — paused by the owner,
+  stopped after errors, the usage limit until a time, out of turns until a
+  time, out of worker time for today (with its reset), its workers at its
+  cap, the factory's workers or agent slots full, its queue full — with a
+  secondary Resume while it is parked; under it one muted line per limit in
+  tabular figures: turns this hour (only with an hourly cap) and today,
+  used and left; worker time used of its cap; worker slots in use of its cap (the cap counts slots held, so a task in
+  review whose worker still holds one is named: "2 of 3 · 2 held by tasks in
+  review");
+  the queue of its cap (only when not empty); a line at its limit in the
+  caution yellow,
   its routines, its connections — each library connection that applies to
   it, an every-bot one with a switch that turns it off for this bot alone,
   a picked one with Edit and Remove from this bot, then Add connection and
-  Manage (Settings › Bots › Connections); then, read-only, what it can do in the owner's words — one phrase per power of
+  Manage (Settings › Bots › Connections); its skills (Skills, below); then, read-only, what it can do in the owner's words — one phrase per power of
   the shared surface, plus a Coordinator's reads in every workspace, never
   per-bot settings — whom it reports to (You), and its workers now; last,
+  Pause — a neutral secondary that parks the bot at once, with no confirm
+  (it is undone by Today's Resume, which then shows with "Paused by you"),
+  shown while the bot is on and not parked — then
   Stop — the bot's turn and its workers — a
   destructive secondary that asks in place, the solid red only on its
   final confirm, never a window dialog; under it Delete bot, the same
@@ -469,6 +490,26 @@ status bar badges, `fleet_triage` or the phone's sidebar.
   The messages, the rail and the composer sit in one column capped at
   **44rem**, centred; while a side panel is open the column fills the
   chat's width instead.
+- **Skills (2026-10-16):** a bot writes its own skills — procedures, not
+  facts — and the owner approves each one. In the profile, under its
+  connections, a Skills row lists them one line each: the name, then muted
+  where it stands ("approved 1.1.0", "waiting for your approval (1.0.0)",
+  "approved 1.0.0 · update 1.1.0 waiting for your approval", "archived",
+  or after "approved 1.0.0" the muted note that it changed since approval
+  and does not load until the bot proposes it again);
+  an approved skill's name is in the main text colour, every other one
+  muted, and the description is the row's tooltip. Each one not archived
+  has a muted text button, Archive, which acts at once (a skill is
+  proposed again by the bot, never restored by hand); a failure is one red
+  line under the list. With none, one muted line says when a bot proposes
+  one. There is no Approve in the profile: a proposal is decided on its
+  approval card in the chat, the same card as every other approval
+  (Approve / Deny, no Always allow — a rule never covers a skill, and the
+  owner's typed "ok" does not approve one), titled "Add the skill <name>
+  <version>?" or "Update the skill …", its body the bot's one line, what
+  Approve and Deny do, then the change as a `diff` code block (removed
+  lines `- `, added `+ `), always whole: a proposal whose change would not
+  fit the card is refused to the bot, never cut.
 - **Messages are bubbles in runs (owner decision 2026-10-14, the reference
   messenger's look; replaces the same day's flat rows):** a bot's messages
   on the left in soft `--selection-subtle` bubbles (18px radius, fill only,
@@ -518,9 +559,11 @@ status bar badges, `fleet_triage` or the phone's sidebar.
   (header, body and chip), one alignment per line. Consecutive system cards of one thread merge
   into one line naming the first three and "N events", the red and yellow
   words kept; it opens into the lines themselves. A 1:1 holds the system
-  cards of its own thread and of the work it started; from before 1:1
+  cards of its own thread; from before 1:1
   threads (and, for a lone bot, from the room too) those naming the bot or
-  its task, or written in a thread it wrote in.
+  its task, or written in a thread it wrote in. Those of the work a 1:1 or a
+  group started — and main's lines about it there, "Finished: …" — are
+  steps of its work card (Threads), not lines (owner decision 2026-10-16).
 - **Threads (owner decision 2026-10-14):** a thread other than General shows
   in the timeline as its first card (its root) — a system line (a task's
   start) as much as a message — carrying the thread's chip when its name
@@ -540,8 +583,28 @@ status bar badges, `fleet_triage` or the phone's sidebar.
   timeline. A card posted where the bot talks with the owner about another
   thread's subject (an approval in General about a PR) carries that
   thread's chip too, and shows in its panel. Inside the panel no row names
-  the panel's own thread. **No internal id in the
-  owner's view:**
+  the panel's own thread.
+  **Work handed off (owner decision 2026-10-16):** a thread the
+  conversation started (a coordinator's request thread, from a 1:1 or a
+  group) shows none of that: it is one **work card** at its root's place —
+  right after the delegating bot's message announcing it, when there is
+  one — inside that bot's run — 14px radius, a `--line` hairline and no
+  fill, a bubble's width at most. First, in 11px muted, the delegate's 16px
+  avatar, "Handed to <bot>" and "· <state>": a steady 6px muted dot and
+  Working (Waiting for review once its task reported), the needs-you dot and
+  text while anything in it waits on the owner, a success check and Done,
+  Failed in red, a neutral Cancelled. Then the work's name in 14px/500 (the
+  title the delegating bot gave it, else the first line of the owner's
+  request), the delegate's newest message in 13px `--text-sub` (two
+  lines at most), and a foot: the PR or issue chip, "N steps · last 15:12"
+  and a ghost Show steps ▾ (24px). It expands in place: a `--stroke`
+  hairline, the cards folded into it as one-line steps (time, the actor's
+  16px avatar or a system line's grey dot, its owner-facing words, a
+  refusal's red word kept), then Open thread and Hide steps ▴ — the one
+  toggle while it is open (the foot above keeps the chip and count). Expanded is
+  per card, for the session; folded by default. Its waiting cards still
+  show in the timeline, and Open thread shows the whole thread.
+  **No internal id in the owner's view:**
   a task's, a request's or a routine's id is only in a chip's tooltip; a
   routine card shows its schedule (never the instructions the bot gave
   itself); a refusal shows its plain sentences (never the reason codes); a
@@ -1534,6 +1597,8 @@ primitives plus `Settings/SettingsLayout.tsx` (`SettingsSection`,
 | 2026-10-15 | Owner decision: the agent bar drops Attach, Broadcast and New chat, and its Files button now toggles the file tree column (its own path-picker popover is gone); the titlebar's file tree icon is removed | The owner barely used them, and each duplicated a better home: dropping a file on a terminal or the tree's Insert path covers Attach, Multi Task covers fan-out work without pasting into plain shells, typing `/clear` covers New chat, and two file browsers (a popover and the column) plus two toggles for one column was one too many |
 | 2026-10-15 | Owner decision (dogfood): window glass on every theme, in either appearance, with an Off / Soft / Clear setting; the sheet loses its right and bottom margins and the pane column rounds off against the sidebar with a hairline; borrowed terminal palettes sit on their theme's own base. Amends Themes, Frame, Sheet and Window glass | Glass only on a dark Mac read as a missing feature for anyone on a light one, and a fixed 85% frame was barely translucent. The 8px margins spent space on a frame the eye did not need, while the sidebar and panes met with no visible edge. A navy or red theme over a borrowed grey terminal looked like two different apps |
 | 2026-10-16 | Owner decision: a bot without a picture is its Mochi character ("Mochi Orb Crew v2", drawn by Grok), the one of its identity colour slot, replacing the four shapes with a face. The characters move: idle breath, blink and one signature twitch; a quicker hop while the bot runs; blink only at 24px and under; paused off screen; still under reduced motion. Amends Avatars and the Motion rule's "only perpetual motion" | The owner picked the crew from a design contest ("go ahead as it is"); a character tells bots apart better than a coloured shape, and its motion says which bot is busy without a word |
+| 2026-10-16 | Owner decision: per-bot models. A bot's profile picks the model and effort it thinks on and its workers' model and effort, each a text value with a muted Change (model combobox + effort Select, Cancel and Save), between the repository and on/off lines; Settings › Bots' list rows and the group dialog's bot rows add one muted, truncated note of what is set (e.g. "haiku (latest) · workers opus (latest)"), nothing when both are on the defaults. New Coordinator, Issue and Researcher bots think on a fast model, new Developer and Reviewer bots' workers on the strongest; existing bots keep theirs. Amends the profile's item list only | The owner could not choose models per bot; a one-line note keeps the list scannable without a column, and the profile stays a list of lines with no new control style |
+| 2026-10-16 | Owner decision: a bot's profile shows Today — each of its limits (turns per hour and day, worker time, running workers, the queue) with what is used of it, and one line on top naming the first that stops it, in a fixed order | A bot has four separate limits plus a queue cap, and the owner could not tell which stopped it: the reviewer had 26 turns left but no worker time and a full queue, and looked simply stuck. The limits stay as they are; they are made visible |
 
 ### Desktop conversation view
 

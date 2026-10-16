@@ -32,8 +32,10 @@ import { TEAM_TEMPLATES, type FactoryBotCreateResult, type FactoryBotCreateTeamR
 import { BOTS_MAX } from './botStore';
 import type { WakeItem } from '../../shared/wake';
 import { normalizeRepoKey } from '../../shared/repoKey';
+import { getWmuxHomeDir } from '../../shared/constants';
 import { dmThreadId } from '../../shared/room';
 import { git as runGit, type GitResult } from '../git/git';
+import { dubiousOwnership, dubiousOwnershipMessage } from '../git/dubiousOwnership';
 import { parseRemoteKey } from '../github/PrProvider';
 import type { WorkspaceListEntry } from '../../shared/workspaceMirror';
 import type { BotStore } from './botStore';
@@ -46,7 +48,18 @@ export interface BotRepoDeps {
 
 export type BotRepoResult =
   | { ok: true; repo: { repoKey: string; repoPath: string } }
-  | { ok: false; code: 'invalid_argument' | 'not_a_repo' | 'no_remote'; message: string };
+  | { ok: false; code: 'invalid_argument' | 'not_a_repo' | 'repo_untrusted' | 'no_remote'; message: string };
+
+/** A repository inside WSL (`\\wsl.localhost\<distro>\…`, `\\wsl$\…`): its bot's
+ *  task worktrees on Windows are checked by their own path too, so the hint
+ *  names wmux's task folder root. */
+/** What a linked repository needs, said with every no_remote refusal. */
+const NEEDS_HOSTED_ORIGIN =
+  'A bot pushes its work to origin and opens pull requests there, so origin must be an https or ssh address of an owner/repo repository, such as https://github.com/<owner>/<repo>.git. A local path or a bare repository on disk cannot be used. Set it with "git remote set-url origin <address>" (or "git remote add origin <address>") and choose the folder again.';
+
+function taskFoldersFor(folder: string): string | undefined {
+  return /^(?:\\\\|\/\/)(?:wsl\$|wsl\.localhost)[\\/]/i.test(folder) ? path.join(getWmuxHomeDir(), 'worktrees') : undefined;
+}
 
 /** The bot repo a picked folder names: its git root and origin's repo key. */
 export async function resolveBotRepo(folder: unknown, deps: BotRepoDeps = {}): Promise<BotRepoResult> {
@@ -57,7 +70,13 @@ export async function resolveBotRepo(folder: unknown, deps: BotRepoDeps = {}): P
   const realpath = deps.realpath ?? ((p: string) => fs.realpathSync(p));
   const top = await git(['rev-parse', '--show-toplevel'], folder).catch(() => null);
   const root = top && top.code === 0 ? top.stdout.trim() : '';
-  if (!root) return { ok: false, code: 'not_a_repo', message: `${folder} is not a git checkout.` };
+  if (!root) {
+    // A repository git will not open (another user's: every WSL one, for Git
+    // for Windows) is not "not a checkout": say what to run.
+    const untrusted = top ? dubiousOwnership(top.stderr, folder) : null;
+    if (untrusted) return { ok: false, code: 'repo_untrusted', message: dubiousOwnershipMessage(folder, untrusted.command, taskFoldersFor(folder)) };
+    return { ok: false, code: 'not_a_repo', message: `${folder} is not a git checkout.` };
+  }
   let repoPath = root;
   try {
     repoPath = realpath(root);
@@ -66,9 +85,14 @@ export async function resolveBotRepo(folder: unknown, deps: BotRepoDeps = {}): P
   }
   const remote = await git(['remote', 'get-url', 'origin'], repoPath).catch(() => null);
   const url = remote && remote.code === 0 ? remote.stdout.trim() : '';
-  if (!url) return { ok: false, code: 'no_remote', message: `${repoPath} has no origin remote.` };
+  const untrustedRoot = !url && remote ? dubiousOwnership(remote.stderr, repoPath) : null;
+  if (untrustedRoot) return { ok: false, code: 'repo_untrusted', message: dubiousOwnershipMessage(repoPath, untrustedRoot.command, taskFoldersFor(repoPath)) };
+  // The refusal says what a bot needs, not only what is missing: the folder
+  // picker is the only way to link a repository, so the person has to learn
+  // here that the fix is in the repository's own remote (#2296 E2E, F1).
+  if (!url) return { ok: false, code: 'no_remote', message: `${repoPath} has no origin remote. ${NEEDS_HOSTED_ORIGIN}` };
   const repoKey = normalizeRepoKey(parseRemoteKey(url));
-  if (!repoKey) return { ok: false, code: 'no_remote', message: `The origin remote of ${repoPath} does not name an owner/repo repository.` };
+  if (!repoKey) return { ok: false, code: 'no_remote', message: `The origin remote of ${repoPath} is not an owner/repo address on a git host. ${NEEDS_HOSTED_ORIGIN}` };
   return { ok: true, repo: { repoKey, repoPath } };
 }
 

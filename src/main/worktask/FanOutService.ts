@@ -71,9 +71,11 @@ import {
   splitModelEnvMarker,
   type FanoutWorkerPermissionMode,
 } from '../../shared/workerLaunch';
-import { promptFileArgument } from '../../shared/promptFileArgument';
+import { launchLineForShell, promptFileArgument } from '../../shared/promptFileArgument';
+import { getPtyShell } from '../pty/ptyShellRegistry';
 import type { Connector } from '../../shared/botConnector';
 import { AGENT_SLUG_SET } from '../../shared/agentIdentity';
+import { getSharedTaskGateRunner } from './TaskGateRunner';
 import {
   clearFirstRunPrompts,
   detectFirstRunPrompt,
@@ -343,11 +345,11 @@ export interface FanOutRequest {
    * or dependsOn. Recorded on each task's ledger row.
    */
   checkout?: { sha: string; detached: true; fetchRef?: string };
-  /** A bot's fan-out: the room thread of the wake that asked (main's own wake
-   *  state). Recorded on each task's ledger row; see LedgerDispatch.threadId. */
+  /** A bot's fan-out: the room thread its tasks report in (main settles it).
+   *  Recorded on each task's ledger row; see LedgerDispatch.threadId. */
   threadId?: string;
-  /** A bot's fan-out: the handoff the asking wake delivered (main's own
-   *  wake state). Recorded on each task's ledger row; see
+  /** A bot's fan-out: the handoff its tasks belong to (main settles it).
+   *  Recorded on each task's ledger row; see
    *  LedgerDispatch.handoffId. */
   handoffId?: string;
   /** A bot's fan-out: the stored secrets each worker receives as env vars
@@ -486,6 +488,9 @@ export interface FanOutServiceOptions {
   launchPollMs?: number;
   /** #1920/#1921 — retry waits for the post-spawn daemon writes (tests pass zeros). */
   wiringRetryDelaysMs?: readonly number[];
+  /** A bot's worker: copy the bot's approved skills into its new worktree
+   *  (factory skills module). Best effort, never throws. Absent = off. */
+  botSkills?: (botId: string, worktreePath: string) => Promise<void>;
 }
 
 /** Create / hand over / discard a worker's private temp dir. */
@@ -555,6 +560,7 @@ export class FanOutService {
   private readonly launchConfirmMs: number;
   private readonly launchPollMs: number;
   private readonly wiringRetryDelaysMs: readonly number[];
+  private readonly botSkills?: (botId: string, worktreePath: string) => Promise<void>;
   /** #1919 — launch checks still in flight (tests await them). */
   private pendingLaunchChecks: Promise<void>[] = [];
 
@@ -582,6 +588,7 @@ export class FanOutService {
     this.launchConfirmMs = opts.launchConfirmMs ?? FANOUT_LAUNCH_CONFIRM_MS;
     this.launchPollMs = opts.launchPollMs ?? FANOUT_LAUNCH_POLL_MS;
     this.wiringRetryDelaysMs = opts.wiringRetryDelaysMs ?? FANOUT_WIRING_RETRY_DELAYS_MS;
+    this.botSkills = opts.botSkills;
   }
 
   /** Tests only: settle every launch check scheduled so far. */
@@ -1251,6 +1258,9 @@ export class FanOutService {
       cwd = path.join(ctx.output.batchDir, leaf);
       metaDir = path.join(ctx.output.batchDir, '.meta', leaf);
       try {
+        // The batch may be gone: the cleanup removes an emptied batch, and a
+        // task that waited on another one starts after it.
+        fs.mkdirSync(ctx.output.batchDir, { recursive: true });
         fs.mkdirSync(cwd); // non-recursive: an existing folder is a collision
       } catch (err) {
         await this.compensate(taskId, ctx.verifiedWorkspaceId);
@@ -1275,6 +1285,11 @@ export class FanOutService {
       if (!ctx.checkout) base.branch = plan.branch;
       cwd = plan.worktreePath;
       metaDir = plan.metaDir;
+      // The starting bot's approved skills, before the worker's agent starts
+      // (it reads .claude/skills/ at launch); git-excluded there.
+      if (ctx.requester?.kind === 'bot' && ctx.requester.botId && this.botSkills) {
+        await this.botSkills(ctx.requester.botId, plan.worktreePath).catch(() => undefined);
+      }
     }
     // A failure after this point keeps the folder: the worktree is preserved
     // for the J3 cleanup; an output folder is never removed by wmux at all.
@@ -1365,7 +1380,13 @@ export class FanOutService {
     // 돌린다. 실패는 태스크 실패로 취급하고 페인을 열지 않는다 — 의존성이 안 깔린
     // worktree에서 에이전트를 띄우면 그 사실을 발견하는 데 한 턴을 태운다.
     if (ctx.setupCommand !== undefined && plan) {
-      const setupRun = await runFanoutSetup(ctx.setupCommand, plan.worktreePath, taskEnv);
+      // Under the machine-wide gate permit: an install never overlaps a gate.
+      const setupCommand = ctx.setupCommand;
+      const worktreePath = plan.worktreePath;
+      const gates = getSharedTaskGateRunner();
+      const setupRun = gates
+        ? await gates.withPermit(() => runFanoutSetup(setupCommand, worktreePath, taskEnv))
+        : await runFanoutSetup(setupCommand, worktreePath, taskEnv);
       if (!setupRun.ok) {
         // 이 태스크만 보상한다 — 훅 타임아웃/실패는 fan-out 전체를 접지 않고,
         // 호출부 루프가 다음 태스크를 그대로 이어간다.
@@ -1754,9 +1775,12 @@ export class FanOutService {
       task.ok = false;
       // The line itself goes in the task's error only: on Windows it is a
       // long PowerShell expression, and the warning should stay one readable line.
+      // The line as that pane's shell takes it (a WSL or cmd pane gets its
+      // own prompt argument, as pty:create typed it).
+      const rerun = task.initialCommand ? launchLineForShell(task.initialCommand, getPtyShell(ptyId)) : '';
       task.error =
         `${launchFailedHeadline(ptyId, seconds)}` +
-        (task.initialCommand ? `; re-run the launch line there: ${task.initialCommand}` : '');
+        (rerun ? `; re-run the launch line there: ${rerun}` : '');
       await this.markLaunchFailed(task.taskId, ownerWorkspaceId, ptyId, seconds);
       try {
         onLaunchFailed?.(task);
@@ -1921,10 +1945,14 @@ export class FanOutService {
     const releaseBotSpawn = beginBotWorkerSpawn(input.ownerWorkspaceId, input.cwd, { botId: input.botId, taskId: input.taskId, ...(connectors.length > 0 ? { connectors } : {}) });
     let spawned: Awaited<ReturnType<FanOutRendererPort['spawnWorkspace']>>;
     try {
+      // The same first-run env as the task's first launch: without it a
+      // resumed worker stops at claude's folder-trust dialog (#2261).
+      const paneEnv = firstRunEnvForAgent(input.command);
       spawned = await this.renderer.spawnWorkspace({
         name: `wtask: ${input.title.slice(0, 32)}`,
         cwd: input.cwd,
         initialCommand: input.command,
+        ...(Object.keys(paneEnv).length > 0 ? { env: paneEnv } : {}),
         fanoutTaskOf: input.ownerWorkspaceId,
         fanoutOrigin: origin,
         ...(secretGrant ? { secretGrant } : {}),

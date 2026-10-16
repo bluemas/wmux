@@ -8,7 +8,9 @@
 //     (TaskWorktreeManager.removeWorktree: `git status --porcelain` must be
 //     empty; ignored files such as node_modules do not count and go with the
 //     folder). A dirty worktree is kept and never removed automatically; the
-//     task shows a note and Settings › Bots counts it.
+//     task shows a note and Settings › Bots counts it. A detached HEAD (a
+//     verify task's checkout) with commits no ref holds first gets
+//     `refs/wmux/keep/<taskId>`, so removal never leaves them to gc.
 //   - A research task's scratch folder
 //     (`<wmux data>/factory/bots/<botId>/research/<batch>/<task>`) is removed;
 //     its report is in the ledger and the room.
@@ -35,6 +37,7 @@ import { promisify } from 'node:util';
 import type { LedgerEntry } from '../../shared/ledger';
 import { getExecEnv } from '../../shared/execEnv';
 import { createFilePersister, readVersionedFile, type FilePersister } from './versionedFile';
+import { sessionHostDir } from '../worktask/stopSessionsInDir';
 
 export const TASK_FOLDERS_FILENAME = 'task-folders.json';
 export const TASK_FOLDERS_VERSION = 1 as const;
@@ -67,6 +70,9 @@ export interface TaskFolderRecord {
   repoHash?: string;
   branch?: string;
   head?: string;
+  /** The ref that holds a detached HEAD's commits no other ref held
+   *  (`refs/wmux/keep/<taskId>`), written before the worktree went. */
+  keepRef?: string;
   at: number;
 }
 
@@ -159,6 +165,7 @@ export interface TaskFolderSession {
   id: string;
   spawnCwd?: string;
   cwd?: string;
+  wslTarget?: { distribution?: unknown };
 }
 
 export interface TaskFolderPorts {
@@ -208,7 +215,8 @@ function defaultExists(p: string): boolean {
   }
 }
 
-/** Whether any daemon session was started in the folder or works in it now. */
+/** Whether any daemon session was started in the folder or works in it now
+ *  (a WSL pane's Linux path read as the Windows folder it is). */
 function folderInUse(folder: string, sessions: readonly TaskFolderSession[]): boolean {
   let real = folder;
   try {
@@ -216,7 +224,11 @@ function folderInUse(folder: string, sessions: readonly TaskFolderSession[]): bo
   } catch {
     /* compared as given */
   }
-  return sessions.some((s) => [s.spawnCwd, s.cwd].some((d) => typeof d === 'string' && d.length > 0 && (isInside(d, folder) || isInside(d, real))));
+  return sessions.some((s) => [s.spawnCwd, s.cwd].some((d) => {
+    if (typeof d !== 'string' || d.length === 0) return false;
+    const host = sessionHostDir(d, s);
+    return isInside(host, folder) || isInside(host, real);
+  }));
 }
 
 /** taskId → the cleanup running on its folder (one at a time per task). */
@@ -329,6 +341,7 @@ async function cleanTaskFolderNow(
       return 'failed';
     }
     await ports.store.put({ taskId: entry.id, kind, path: mission.folder, state: 'removed', at: now() }).catch(() => undefined);
+    removeEmptyResearchBatch(ports.store, path.dirname(mission.folder), root, log);
     ports.changed?.();
     return 'removed';
   }
@@ -339,9 +352,17 @@ async function cleanTaskFolderNow(
     return 'failed';
   }
   if ((folderHolds.get(entry.id) ?? 0) > 0) return 'skipped';
+  // Commits made on a detached HEAD are held by no branch: a ref keeps them
+  // before the worktree (and with it HEAD's reflog) goes.
+  const kept = await keepDetachedCommits(repo.repoRoot, mission.folder, entry.id, mission.branch, repo.head, entry.dispatch?.checkout?.sha);
+  if (kept === null) {
+    log(`[factory] worktree of ${entry.id} not removed: whether its commits are kept could not be read`);
+    return 'failed';
+  }
   const base = {
     taskId: entry.id, kind, path: mission.folder, repoRoot: repo.repoRoot, repoHash: repo.repoHash,
-    ...(mission.branch ? { branch: mission.branch } : {}), ...(repo.head ? { head: repo.head } : {}), at: now(),
+    ...(mission.branch ? { branch: mission.branch } : {}), ...(repo.head ? { head: repo.head } : {}),
+    ...(kept ? { keepRef: kept } : prior?.keepRef ? { keepRef: prior.keepRef } : {}), at: now(),
   };
   // How to put it back is on disk before the folder goes.
   try {
@@ -363,6 +384,37 @@ async function cleanTaskFolderNow(
   }
   log(`[factory] worktree of ${entry.id} not removed: ${r.error}`);
   return 'failed';
+}
+
+/**
+ * A research batch (`research/<batch>/`) whose task folders are all gone:
+ * removed with its `.meta` once nothing else is in it and every `.meta/<task>`
+ * belongs to a task this module removed (so none of the batch's tasks is
+ * still open). A task of the batch that starts later re-creates the batch
+ * (FanOutService). Only a batch right under the bot's research root, reached
+ * through no link. Synchronous on purpose: main's fan-out creates task
+ * folders synchronously too, so no task folder can appear between the check
+ * and the removal. Never throws.
+ */
+export function removeEmptyResearchBatch(store: Pick<TaskFolders, 'all'>, batch: string, root: string, log: (m: string) => void = () => undefined): boolean {
+  try {
+    const rel = path.relative(path.resolve(root), path.resolve(batch));
+    if (!rel || rel.startsWith('..') || path.isAbsolute(rel) || rel.includes(path.sep) || rel.includes('/')) return false;
+    if (!throughNoLink(batch, root)) return false;
+    const entries = fs.readdirSync(batch);
+    if (entries.some((e) => e !== '.meta')) return false;
+    if (entries.length > 0) {
+      const meta = path.join(batch, '.meta');
+      if (!fs.lstatSync(meta).isDirectory()) return false;
+      const removed = new Set(store.all().filter((r) => r.kind === 'research' && r.state === 'removed').map((r) => path.resolve(r.path)));
+      if (fs.readdirSync(meta).some((leaf) => !removed.has(path.resolve(batch, leaf)))) return false;
+    }
+    fs.rmSync(batch, { recursive: true });
+    return true;
+  } catch (err) {
+    log(`[factory] research batch ${batch} not removed: ${String(err)}`);
+    return false;
+  }
 }
 
 /** What a pass over many tasks did. */
@@ -585,6 +637,44 @@ export async function gitRepoInfo(worktreePath: string): Promise<{ repoRoot: str
     }
     const head = (await execFileAsync('git', ['rev-parse', 'HEAD'], opts).catch(() => ({ stdout: '' }))).stdout.trim();
     return { repoRoot: top, repoHash: crypto.createHash('sha256').update(real).digest('hex').slice(0, 12), ...(/^[0-9a-f]{40,64}$/.test(head) ? { head } : {}) };
+  } catch {
+    return null;
+  }
+}
+
+/** The ref namespace that holds commits of removed detached worktrees. */
+export const TASK_KEEP_REF_PREFIX = 'refs/wmux/keep/';
+
+/**
+ * Before a task worktree goes: when its HEAD is detached (or the mission
+ * names no branch), differs from the commit it was checked out at, and no ref
+ * contains it, point `refs/wmux/keep/<taskId>` at it so its commits stay
+ * reachable. Returns that ref when it was written, '' when nothing needed
+ * keeping, and null when git could not tell (the worktree then stays).
+ */
+export async function keepDetachedCommits(
+  repoRoot: string,
+  worktreePath: string,
+  taskId: string,
+  branch: string | undefined,
+  head: string | undefined,
+  checkedOutAt: string | undefined,
+): Promise<string | null> {
+  const opts = { timeout: 30_000, windowsHide: true, env: getExecEnv() };
+  if (branch) {
+    // On its branch, the branch holds the commits.
+    const onBranch = await execFileAsync('git', ['-C', worktreePath, 'symbolic-ref', '-q', 'HEAD'], opts).then(() => true, () => false);
+    if (onBranch) return '';
+  }
+  if (!head || !/^[0-9a-f]{40,64}$/.test(head)) return null;
+  if (head === checkedOutAt) return '';
+  try {
+    const holders = (await execFileAsync('git', ['-C', repoRoot, 'for-each-ref', '--count=1', '--format=%(refname)', '--contains', head], opts)).stdout.trim();
+    if (holders) return '';
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(taskId)) return null;
+    const ref = `${TASK_KEEP_REF_PREFIX}${taskId}`;
+    await execFileAsync('git', ['-C', repoRoot, 'update-ref', ref, head], opts);
+    return ref;
   } catch {
     return null;
   }

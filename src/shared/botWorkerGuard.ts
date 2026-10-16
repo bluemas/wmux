@@ -20,9 +20,10 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { tokenize, launcherStem } from './agentResume';
+import { tokenize, launcherStem, isPlausibleResumeSessionId, PERMISSION_FLAG, type PermissionMode } from './agentResume';
 import { splitModelEnvMarker } from './workerLaunch';
 import { stripPromptFileArgument } from './promptFileArgument';
+import { wslClaudeHooks } from './wslIntegration';
 
 /** `gh <group> <verb>` in every spelling gh runs it: with global options
  *  (`-R o/r`, `--repo=o/r`, `--hostname h`) before the group, between the
@@ -108,7 +109,12 @@ export const BOT_WORKER_DENY: readonly string[] = [...BOT_WORKER_MERGE_DENY, ...
 
 /** The worker's `--settings` document: every rule. */
 export function buildBotWorkerSettings(): Record<string, unknown> {
-  return { permissions: { deny: [...BOT_WORKER_DENY] } };
+  // Only a WSL pane's worker launches with this file alone (#2261). The WSL
+  // claude shim passes wmux's hooks as its own `--settings`, and of two
+  // `--settings` flags the last one wins, so this file carries those hooks
+  // too: without them no turn end and no session id reached wmux, so the
+  // worker was never paused when idle and could not be resumed.
+  return { permissions: { deny: [...BOT_WORKER_DENY] }, disableAllHooks: false, hooks: wslClaudeHooks() };
 }
 
 // ── factory/worker-default-branches.json ─────────────────────────────────────
@@ -219,6 +225,20 @@ export function isSingleCommand(command: string): boolean {
     else if (/[;&|#`\n\r]/.test(c) || (c === '$' && command[i + 1] === '(')) return false;
   }
   return quote === null;
+}
+
+/**
+ * A launch line for a cmd.exe pane. cmd has its own quoting: only `"…"`
+ * (and `^` escapes) quote, and `%`/`!` expand even inside double quotes, so
+ * isSingleCommand's reading does not hold there. With wmux's own prompt
+ * argument taken out, the rest may hold none of `'`, `&`, `|`, `^`, `%`, `!`,
+ * `<`, `>` or a line break. A `$(` anywhere is refused too: cmd evaluates
+ * none, so a prompt argument left in the PowerShell or POSIX shape (a prompt
+ * path cmdPromptFileArgument cannot name) would reach claude as its prompt.
+ * Pure.
+ */
+export function isPlainCmdLaunchLine(line: string): boolean {
+  return !line.includes('$(') && !/['&|^%!<>\r\n]/.test(stripPromptFileArgument(line));
 }
 
 /** Command or process substitution, quoted or not. */
@@ -354,6 +374,10 @@ export interface BotWorkerLaunchFiles {
   /** The connection keys the launch's environment was given (names), kept
    *  out of every other connection's server on a re-fire or resume. */
   connectionKeys?: string[];
+  /** `project`: the launch loads no user settings (`--setting-sources
+   *  project`), its hooks come from its own settings file — an isolated
+   *  instance's worker, run on that build's hook bridge (#2231). */
+  settingSources?: 'project';
 }
 
 /** One bot worker session. `workspaceId` and `at` are the version-1 record
@@ -376,6 +400,11 @@ export interface BotWorkerSessionRecord {
   codexHome?: string;
   launch?: BotWorkerLaunchFiles;
   wsl?: boolean;
+  /** The conversation the launch line pinned (`--session-id`), and the
+   *  permission mode its flags started it in: what a resume of that
+   *  conversation falls back to when no hook recorded a mode. */
+  launchSessionId?: string;
+  permissionMode?: PermissionMode;
 }
 
 /** The per-launch files under `<dir>/factory/`: only these folders, a JSON
@@ -387,7 +416,8 @@ export function isWorkerLaunchFiles(raw: unknown, dir: string): raw is BotWorker
     && path.dirname(p) === path.join(dir, 'factory', sub) && /^[0-9a-f]{12}\.json$/.test(path.basename(p));
   const keys = r.connectionKeys === undefined
     || (Array.isArray(r.connectionKeys) && r.connectionKeys.length <= 32 && r.connectionKeys.every((k) => typeof k === 'string' && /^[A-Z_][A-Z0-9_]{0,63}$/.test(k)));
-  return inside(r.settingsFile, 'worker-settings') && inside(r.mcpConfigFile, 'worker-mcp') && (r.level === 'core' || r.level === 'full') && keys;
+  return inside(r.settingsFile, 'worker-settings') && inside(r.mcpConfigFile, 'worker-mcp') && (r.level === 'core' || r.level === 'full') && keys
+    && (r.settingSources === undefined || r.settingSources === 'project');
 }
 
 export function botWorkerSessionsPath(dir: string): string {
@@ -407,7 +437,7 @@ export function readBotWorkerSessions(dir: string): { sessions: Map<string, BotW
       // Launch files that are not main's own are not used (the launch is then
       // guarded as a record without them).
       const launch = isWorkerLaunchFiles(r.launch, dir)
-        ? { settingsFile: r.launch.settingsFile, mcpConfigFile: r.launch.mcpConfigFile, level: r.launch.level, ...(r.launch.connectionKeys?.length ? { connectionKeys: [...r.launch.connectionKeys] } : {}) }
+        ? { settingsFile: r.launch.settingsFile, mcpConfigFile: r.launch.mcpConfigFile, level: r.launch.level, ...(r.launch.connectionKeys?.length ? { connectionKeys: [...r.launch.connectionKeys] } : {}), ...(r.launch.settingSources ? { settingSources: r.launch.settingSources } : {}) }
         : undefined;
       out.set(id, {
         workspaceId: r.workspaceId,
@@ -419,6 +449,8 @@ export function readBotWorkerSessions(dir: string): { sessions: Map<string, BotW
         ...(typeof r.codexHome === 'string' && r.codexHome.length <= 4096 ? { codexHome: r.codexHome } : {}),
         ...(launch ? { launch } : {}),
         ...(r.wsl === true ? { wsl: true } : {}),
+        ...(typeof r.launchSessionId === 'string' && isPlausibleResumeSessionId('claude', r.launchSessionId) ? { launchSessionId: r.launchSessionId } : {}),
+        ...(typeof r.permissionMode === 'string' && Object.prototype.hasOwnProperty.call(PERMISSION_FLAG, r.permissionMode) ? { permissionMode: r.permissionMode } : {}),
       });
     }
   } catch (err) {

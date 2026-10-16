@@ -124,14 +124,14 @@ import { isTaskState, type AgentStatus, type Task } from '../shared/types';
 import { ProcessMonitor } from './ProcessMonitor';
 import { AgentProcessTracker } from './AgentProcessTracker';
 import { liveRecoveryHint } from './recoveryHint';
-import { checkWslAgentRunning, reportedAgentForPane, WslPidWatcher } from './wslAgentProcess';
+import { checkWslAgentRunning, reportedAgentForPane, stopWslAgent, WslPidWatcher } from './wslAgentProcess';
 import { GateFlagFile } from './gateFlagFile';
 import { WSL_GATE_FLAG_FILE } from '../shared/wslIntegration';
 import { CommandStartAgentProbe } from './commandStartAgentProbe';
 import { resolveCanonicalAgentIdentity, detectorSuppressedBy, reportedAgentName, provesLiveAgent, type CanonicalAgentIdentity } from './canonicalAgent';
 import { decideLaunchPresence, launchPresenceNeedsProcessRead, type IdleShellRead } from './launchPresence';
 import { Watchdog } from './Watchdog';
-import { selectRecoverableSessions } from './recoverySelector';
+import { selectRecoverableSessions, startLeftoverShellReaps } from './recoverySelector';
 import { isShutdownKillExit, SHUTDOWN_KILL_RECLASSIFY_MS } from './shutdownKill';
 import {
   classifyReapIdentity,
@@ -145,6 +145,7 @@ import {
   shouldReconcileTombstone,
 } from './phantomExit';
 import { createSnapshotRunner } from './snapshotRunner';
+import { createBufferHibernation } from './BufferHibernation';
 import { RingBuffer } from './RingBuffer';
 import { GitContextWatcher } from '../main/pty/gitContextWatch';
 import { PortWatcher } from '../main/pty/portWatch';
@@ -156,7 +157,7 @@ import { isWslDistroSpawnArgs } from '../shared/wslDistro';
 import { randomUUID } from 'node:crypto';
 import { monitorEventLoopDelay, performance as nodePerformance } from 'node:perf_hooks';
 import { DAEMON_EXIT_ALREADY_RUNNING, ENV_KEYS, isBrainPty } from '../shared/constants';
-import { toResumeCommand, resumeGrammarFor, resumeOfferForRecovered, mergeResumeBinding, isProvisionalCapture, normalizeResumeCwd, isUsableResumeBinding, isPlausibleResumeSessionId } from '../shared/agentResume';
+import { toResumeCommand, resumeGrammarFor, resumeOfferForRecovered, mergeResumeBinding, isProvisionalCapture, transcriptRelocated, normalizeResumeCwd, isUsableResumeBinding, isPlausibleResumeSessionId } from '../shared/agentResume';
 import type { ResumeBinding } from '../shared/agentResume';
 import { agentDisplayToSlug, AGENT_SLUG_SET, isAgentSlug } from '../shared/agentIdentity';
 import type { AgentEventStatus } from '../main/pty/AgentDetector';
@@ -1877,36 +1878,31 @@ async function recoverSessions(
     );
   }
 
-  // Whether each live session's previous shell is still running, and is ours.
-  // Each answer costs a tasklist call, plus a process probe when the pid is
-  // alive: 0.6-1.2 s per session on Windows. Asked one at a time inside the
+  // Stop each live session's previous shell if it is still running and is
+  // ours. Each check costs a tasklist call, plus a process probe when the pid
+  // is alive: 0.6-1.2 s per session on Windows. Asked one at a time inside the
   // loop below, a 25-pane recovery kept the daemon from answering for 25 s
-  // ("Restoring panes..." the whole time). Ask them all up front, a few at a
-  // time, and let the loop read the answers.
-  const leftoverShells = new Map<string, Promise<'ours' | 'foreign' | 'gone'>>();
-  if (!rebooted) {
-    const pending = state.sessions.filter((s) =>
-      s.state !== 'dead' && s.state !== 'suspended' && recoverableIds.has(s.id));
-    const limit = 6;
-    let next = 0;
-    const resolvers = new Map<string, (v: 'ours' | 'foreign' | 'gone') => void>();
-    for (const s of pending) {
-      leftoverShells.set(s.id, new Promise((resolve) => resolvers.set(s.id, resolve)));
-    }
-    const worker = async (): Promise<void> => {
-      while (next < pending.length) {
-        const s = pending[next++];
-        let verdict: 'ours' | 'foreign' | 'gone' = 'gone';
-        try {
-          if (await ProcessMonitor.isAlive(s.pid)) {
-            verdict = (await isOurShellProcess(s.pid, s.cmd)) ? 'ours' : 'foreign';
-          }
-        } catch { /* treated as gone, as the sequential check did */ }
-        resolvers.get(s.id)!(verdict);
-      }
-    };
-    for (let i = 0; i < Math.min(limit, pending.length); i++) void worker();
-  }
+  // ("Restoring panes..." the whole time). Run them up front, a few at a time;
+  // each one confirms the identity and kills right after that check, and the
+  // loop waits for a session's entry before recreating it. WSL and
+  // scheduled-run sessions keep their own paths below.
+  const leftoverShells = rebooted
+    ? new Map<string, Promise<void>>()
+    : startLeftoverShellReaps(
+      state.sessions.filter((s) =>
+        s.state !== 'dead' && s.state !== 'suspended' && recoverableIds.has(s.id)
+        && !automationRunPtyIds.has(s.id) && !isWslShell(s.cmd)),
+      {
+        limit: 6,
+        isAlive: (pid) => ProcessMonitor.isAlive(pid),
+        reap: (s) => reapIfIdentityConfirmed({
+          pid: s.pid,
+          cmd: s.cmd,
+          storedStartTime: s.pidStartTime,
+          reason: `recovery of ${s.id}`,
+        }),
+      },
+    );
 
   for (const session of state.sessions) {
     if (session.state === 'dead') {
@@ -2095,14 +2091,9 @@ async function recoverSessions(
     } else {
       // Non-suspended live session — check for periodic snapshot buf file
       // (written every 30s, survives forced kills / power loss)
-      // Prefetched above. Guard against PID recycling: only a process that
-      // is actually the shell we spawned is killed.
-      const leftover = rebooted ? 'gone' : await (leftoverShells.get(session.id) ?? Promise.resolve('gone'));
-      if (leftover === 'ours') {
-        try { process.kill(session.pid); } catch { /* ignore */ }
-      } else if (leftover === 'foreign') {
-        log('warn', `PID ${session.pid} is alive but not our shell (${session.cmd}) — skipping kill`);
-      }
+      // The previous shell was stopped above (only after its identity was
+      // confirmed); wait for that before recreating the session.
+      await leftoverShells.get(session.id);
 
       const snapshotPath = stateWriter.getBufferDumpPath(session.id);
       if (fs.existsSync(snapshotPath)) {
@@ -3749,6 +3740,13 @@ function registerRpcHandlers(
     // miss) must not wipe a previously-captured mode (codex review 2026-06-14).
     // A synchronous exact-ID discovery may have just supplied the path.
     const next = mergeResumeBinding(managed.meta.resumeBinding, p.resumeBinding);
+    // The agent may have changed directory without the shell (EnterWorktree).
+    // Recovery spawns the pane in meta.cwd and resumes the exact session only
+    // when that matches the binding's cwd, so the pane follows the agent, but
+    // only when the transcript moved with it: after a Bash `cd` the hook's cwd
+    // changes while `--resume <id>` still works only from the old folder.
+    // `session:cwd` persists the move and tells the renderer.
+    if (transcriptRelocated(prev, next)) sessionManager.adoptAgentCwd(p.id, next.cwd);
     let durableChange = !prev
       || prev.sessionId !== next.sessionId
       || prev.agent !== next.agent
@@ -4923,6 +4921,7 @@ function registerRpcHandlers(
       commandRunning: session?.promptLog.commandRunningIfKnown(),
       isExec: !!session?.meta.exec,
       isWsl: !!session?.meta.wslTarget,
+      exitAfterPrompt: session?.promptLog.exitAfterPrompt(),
     };
     let idleShell: IdleShellRead | undefined;
     if (session && params['probeProcess'] === true && launchPresenceNeedsProcessRead(inputs)) {
@@ -4956,6 +4955,11 @@ function registerRpcHandlers(
       // whether the composer holds a draft, and how long keys have been quiet.
       hasDraft: bridge.hasDraft(),
       keyInputIdleMs: bridge.keyInputIdleMs(),
+      // #2263 — additive, for main's resync after it subscribes to events
+      // again: the latest window title, which it may have missed meanwhile,
+      // and whether a turn is open (a quiet turn reads `idle` above).
+      title: bridge.getTitle().title,
+      turnOpen: bridge.isTurnOpen(),
     };
   });
   // #1594 — what main's terminal_send needs to paste into a session: the agent
@@ -6443,10 +6447,14 @@ function wireEvents(
       log('warn', `session:died unwatch failed for ${payload.id}:`, err);
     }
 
-    // Clean up buffer dump file — dead sessions don't need snapshots
+    // Clean up buffer dump file — dead sessions don't need snapshots. A
+    // hibernated ring's bytes live only in that file: the dead pane keeps its
+    // scrollback in memory until its TTL, so bring them back first, and keep
+    // the file (the TTL reaper removes it) when they cannot be read yet.
     try {
       const bufPath = stateWriter.getBufferDumpPath(payload.id);
-      if (fs.existsSync(bufPath)) fs.unlinkSync(bufPath);
+      const awake = sessionManager.getSession(payload.id)?.ringBuffer.wake() !== false;
+      if (awake && fs.existsSync(bufPath)) fs.unlinkSync(bufPath);
     } catch { /* ignore */ }
 
     // Save state. This is the persistence anchor: even if every other step
@@ -6710,8 +6718,8 @@ function wireEvents(
     // work, and letting it rebut would silently kill a real completion
     // alarm (the same class of false-negative the resize-redraw guard in
     // DaemonPTYBridge already protects the detector dedup from). The bridge
-    // no longer emits a passive burst inside the resize-redraw window at all
-    // (it would light the status dot), so the flag is a backstop here.
+    // emits a passive burst inside the resize-redraw window only for a cycle
+    // a hook's running edge armed in a still-open turn, flagged.
     // #919 — compute canonical identity ONCE for this burst and use it for
     // both feeds below. Leaving either on the raw screen name would re-assert
     // the detector's sticky label on every output burst, undoing whatever the
@@ -6848,6 +6856,17 @@ function wireEvents(
       type: 'agent.critical',
       sessionId: payload.sessionId,
       data: payload.event,
+    };
+    pipeServer.broadcast(event);
+  });
+
+  // The agent printed its own "turn interrupted" row. No Stop hook follows an
+  // interrupt, so main settles the pane's turn latch on this.
+  sessionManager.on('session:turnInterrupted', (payload: { sessionId: string; agent: string }) => {
+    const event: DaemonEvent = {
+      type: 'agent.interrupted',
+      sessionId: payload.sessionId,
+      data: { agent: payload.agent },
     };
     pipeServer.broadcast(event);
   });
@@ -8285,7 +8304,18 @@ async function main(): Promise<void> {
       : '';
     const managed = id ? sessionManager.getSession(id) : undefined;
     if (!managed) return { ok: false, code: 'no_session' };
-    if (managed.meta.wslTarget || managed.meta.exec) return { ok: false, code: 'unsupported' };
+    if (managed.meta.exec) return { ok: false, code: 'unsupported' };
+    if (managed.meta.wslTarget) {
+      // #2261 — a WSL agent attributed from its own hook is stopped inside the
+      // distro; one never attributed stays unsupported (main closes its pane).
+      const wslAgent = agentProcessTracker.wslAgentFor(id);
+      if (!wslAgent) return { ok: false, code: 'unsupported' };
+      try {
+        return await stopWslAgent(wslAgent);
+      } catch {
+        return { ok: false, code: 'unknown' };
+      }
+    }
     try {
       return await stopAgentTree({
         tree: () => agentProcessTracker.agentProcessTree(id, 'claude'),
@@ -8901,8 +8931,21 @@ async function main(): Promise<void> {
     },
   });
   runSnapshotOnceRef = runSnapshotOnce;
+  // Idle-pane buffer hibernation rides the same tick, after the dumps (it
+  // reuses a dump that is still current instead of writing again).
+  const bufferHibernation = createBufferHibernation({
+    sessions: () => sessionManager.listManagedSessions(),
+    bufferPath: (id) => stateWriter.getBufferDumpPath(id),
+    ensureBufferDir: () => stateWriter.ensureBufferDir(),
+    idleHours: () => config.session.hibernateIdleHours ?? 0,
+    agentProcessAlive: (id) => agentProcessTracker.statusFor(id),
+    remoteViewer: (id) => webTerminalServer?.hasPaneViewer(id) === true,
+    log: (level, msg) => log(level, msg),
+  });
   const snapshotInterval = setInterval(() => {
-    void runSnapshotOnce();
+    void runSnapshotOnce()
+      .then(() => bufferHibernation.sweep())
+      .catch((err) => log('warn', '[hibernate] sweep failed:', err));
   }, (config.daemon.snapshotIntervalSec ?? 30) * 1000); // app-weight P1 knob (clamped 10–600 s)
   snapshotInterval.unref();
 

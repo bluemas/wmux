@@ -46,15 +46,19 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import type { BotBinding, BotProfile, BotStatus } from '../../shared/bot';
+import type { BotBinding, BotProfile, BotStatus, BotStatusUsage } from '../../shared/bot';
 import type { Fact } from '../../shared/facts';
 import type { RoomCard, ThreadId } from '../../shared/room';
 import { WAKE_LIMITS, type WakeItem, type WakeReason } from '../../shared/wake';
 import type { BrainAdapter, BrainEvent } from '../deck/BrainAdapter';
+import { USAGE_LIMIT_UNKNOWN_HOLD_MS, findClaudeUsageLimitNotice, parseUsageLimitReset, usageLimitHoldEndsAt } from '../../shared/usageLimit';
 import { emitBotHook } from './botHooks';
 import type { BotEngineFactory } from './botEngines';
 import type { BotStore } from './botStore';
-import { budgetLeft, checkTurn, nextTurnAllowedAt, recordTurn, unrecordTurn, type BudgetRefusalReason } from './budget';
+import {
+  budgetLeft, checkTurn, hourlyCap, nextTurnAllowedAt, recordTurn, runningWorkers, turnsUsedDay, turnsUsedHour, unrecordTurn,
+  workerHoursDay, workerTimeAllowedAt, type BotUsage, type BudgetRefusalReason,
+} from './budget';
 import type { FactorySettings } from './factorySettings';
 import { createFilePersister, readVersionedFile, type FilePersister } from './versionedFile';
 import {
@@ -178,6 +182,20 @@ export interface BotRuntimeDeps {
   resolveHandoff?: (handoffId: string) => WakeHandoffSummary | null;
   /** A bot's status changed. */
   onStatus?: (status: BotStatus) => void;
+  /** Its workers running now and the factory's worker load, for the status
+   *  (the profile's Today block); absent: not reported. */
+  workerLoad?: (botId: string) => BotWorkerLoad;
+}
+
+/** What `workerLoad` reports. */
+export interface BotWorkerLoad {
+  /** The bot's open workers, and every bot's, as the fan-out's cap counts them. */
+  running: number;
+  factoryRunning: number;
+  /** The bot's new workers waiting for an agent slot. */
+  waiting: number;
+  /** The factory's agent slots, or null before they are installed. */
+  slots: { inUse: number; cap: number } | null;
 }
 
 /** What a live session is bound to: its engine and the repository it
@@ -241,6 +259,12 @@ export interface BotRuntimePorts {
   /** A turn finished: the bot's open questions the owner's words in it
    *  answered close (handoffRouter.ts closeAnsweredInChat). */
   onTurnDone?: (profile: BotProfile, item: WakeItem) => void;
+  /** A turn answering an owner message finished with words but no
+   *  room_post: post those words as the bot's card in its wake's thread,
+   *  through room.post, unless the bot
+   *  wrote a card there since `since` (room.rpc.ts postTurnText). Called
+   *  while the wake still runs. */
+  postTurnText?: (profile: BotProfile, item: WakeItem, text: string, since: number) => Promise<unknown> | void;
   /** Whether the modules a wake prompt reads from (rooms, handoffs,
    *  routines) have started. Until then no turn starts, for at most
    *  CONTEXT_WAIT_MS. Absent: ready. */
@@ -280,6 +304,27 @@ const TRANSIENT_ERROR_RE = new RegExp([
  *  turn's own: worth retrying as is. Pure. */
 export function isTransientEngineError(message: string): boolean {
   return TRANSIENT_ERROR_RE.test(message);
+}
+
+/** The provider usage-limit notice a failed turn's error carries ("You've
+ *  hit your session limit · resets 1pm (Asia/Seoul)"), or null. The SDK
+ *  puts its own lead-in before the provider's words. Pure. */
+export function usageLimitNoticeOf(message: string): string | null {
+  return findClaudeUsageLimitNotice(message.replace(/^\s*Claude Code returned an error result:\s*/i, ''));
+}
+
+/** The shortest usage-limit park: a reset the text names that is already
+ *  past (an hour rounded down) must not turn into back-to-back retries. */
+export const USAGE_LIMIT_MIN_PARK_MS = 5 * 60_000;
+
+/** When a bot parked at `at` on `notice` picks up again. A clock time with
+ *  no date ("resets 1pm") is a rolling window, never more than the bounded
+ *  hold away: just past that hour, the parser would read tomorrow. Pure. */
+export function usageLimitParkUntil(notice: string, at: number): number {
+  let until = usageLimitHoldEndsAt({ detectedAt: at, resetsAt: parseUsageLimitReset(notice, at) ?? undefined });
+  const dated = /\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d|\|\s*\d{10}\b|\bin\s+\d/i.test(notice);
+  if (!dated) until = Math.min(until, at + USAGE_LIMIT_UNKNOWN_HOLD_MS);
+  return Math.max(until, at + USAGE_LIMIT_MIN_PARK_MS);
 }
 
 /** The run of a room-wide owner message a wake answers, or null. Pure. */
@@ -356,7 +401,9 @@ export class BotRuntime {
           : live?.attached
             ? 'idle'
             : 'unknown';
-    const left = budgetLeft(profile.budget, this.deps.store.usageOf(botId), this.now());
+    const now = this.now();
+    const usage = this.deps.store.usageOf(botId);
+    const left = budgetLeft(profile.budget, usage, now);
     const sessionId = live?.adapter.sessionId ?? this.deps.sessions.get(botId)?.sessionId;
     const err = this.lastError.get(botId);
     return {
@@ -366,8 +413,40 @@ export class BotRuntime {
       ...(run ? { currentTurn: { wakeId: run.item.id, startedAt: run.startedAt, ...(run.item.threadId ? { threadId: run.item.threadId } : {}) } } : {}),
       queueDepth: this.deps.queue.depth(botId),
       budgetLeft: { turnsHour: left.turnsHour, turnsDay: left.turnsDay, workerHoursDay: left.workerHoursDay },
+      usage: this.usageView(profile, usage, now),
       ...(err ? { lastError: { ...err } } : {}),
     };
+  }
+
+  /** The status's `usage`: what the bot used of each limit, when an
+   *  exhausted one frees up, and the worker load (when reported). */
+  private usageView(profile: BotProfile, usage: BotUsage, now: number): BotStatusUsage {
+    const out: BotStatusUsage = {
+      turnsHour: hourlyCap(profile.budget) === null ? null : turnsUsedHour(usage, now),
+      turnsDay: turnsUsedDay(usage, now),
+      workerHoursDay: workerHoursDay(usage, now),
+    };
+    if (!checkTurn(profile.budget, usage, now).ok) {
+      const at = nextTurnAllowedAt(profile.budget, usage, now);
+      if (Number.isFinite(at)) out.nextTurnAt = at;
+    }
+    let load: BotWorkerLoad | null = null;
+    try {
+      load = this.deps.workerLoad?.(profile.id) ?? null;
+    } catch {
+      /* the status never fails on the load */
+    }
+    if (out.workerHoursDay >= profile.budget.maxWorkerHoursPerDay && runningWorkers(usage) === 0 && (load?.running ?? 0) === 0) {
+      const at = workerTimeAllowedAt(profile.budget, usage, now);
+      if (Number.isFinite(at)) out.workerTimeAt = at;
+    }
+    if (load) {
+      out.workersRunning = load.running;
+      if (load.waiting > 0) out.workersWaiting = load.waiting;
+      out.factoryWorkers = load.factoryRunning;
+      if (load.slots) out.slots = { ...load.slots };
+    }
+    return out;
   }
 
   private pushStatus(botId: string): void {
@@ -571,6 +650,7 @@ export class BotRuntime {
     const cap = settings.globalConcurrentBots;
     const now = this.now();
     this.sweepBudgetParks(now);
+    this.sweepLimitParks(now);
     // Bots with work, most urgent next item first.
     const ready: Array<{ profile: BotProfile; item: WakeItem }> = [];
     for (const botId of this.deps.queue.botsWithQueued()) {
@@ -728,6 +808,7 @@ export class BotRuntime {
     emitBotHook({
       type: 'bot.budget_exhausted', botId: profile.id, workspaceId: profile.workspaceId, reason, wakeId: head.id,
       ...(Number.isFinite(until) ? { until } : {}),
+      parkedAt: now,
       at: now,
     });
     this.pushStatus(profile.id);
@@ -752,6 +833,27 @@ export class BotRuntime {
       if (this.liftBudgetPark(profile, now)) continue;
       const until = nextTurnAllowedAt(profile.budget, this.deps.store.usageOf(profile.id), now);
       if (Number.isFinite(until)) this.armHeldTimer(until);
+    }
+  }
+
+  /** A bot parked at the provider's usage limit picks up by itself at its
+   *  park's `until`: its parked wakes go back to the queue (not past its
+   *  budget: only the owner's Resume does that). Else wake up then. */
+  private sweepLimitParks(now: number): void {
+    for (const profile of this.deps.store.list()) {
+      const until = profile.parked?.reason === 'error' ? profile.parked.until : undefined;
+      if (until === undefined) continue;
+      if (now < until) {
+        this.armHeldTimer(until);
+        continue;
+      }
+      this.deps.store.setParked(profile.id, null);
+      delete profile.parked;
+      this.lastError.delete(profile.id);
+      this.deps.queue.unparkAll(profile.id);
+      this.dedupeHeldRoutines(profile.id);
+      this.lifecycle(profile.id, 'resumed');
+      this.pushStatus(profile.id);
     }
   }
 
@@ -870,6 +972,7 @@ export class BotRuntime {
   private async runTurn(profile: BotProfile, item: WakeItem): Promise<void> {
     const botId = profile.id;
     const run = this.running.get(botId);
+    const turnStartedAt = run?.startedAt ?? this.now();
     let outcome: 'done' | 'failed' | 'interrupted' | 'engine' = 'failed';
     let errorMessage = '';
     try {
@@ -890,6 +993,17 @@ export class BotRuntime {
         if (sessionId) {
           const accountId = s.live.adapter.conversationAccountId;
           this.deps.sessions.set(botId, { sessionId, ...(accountId !== undefined ? { accountId } : {}), repoPath: profile.repo?.repoPath ?? null, updatedAt: this.now() });
+        }
+        // A reply to the owner the bot wrote as plain text instead of a
+        // room_post would reach nobody: it becomes the bot's card, while the
+        // wake still runs (room.post pins its thread and the owner message it
+        // answers). Any other wake stays silent without a room_post.
+        if (item.reason.kind === 'human' && result.text.trim() && ports.postTurnText) {
+          try {
+            await ports.postTurnText(profile, item, result.text, turnStartedAt);
+          } catch (err) {
+            console.warn(`[factory] the reply of ${item.id} was not posted: ${String(err)}`);
+          }
         }
       } else {
         errorMessage = result.error;
@@ -919,7 +1033,7 @@ export class BotRuntime {
     timeoutMs: number,
     interrupted: () => boolean,
     stopped: Promise<'stop'> = new Promise<'stop'>(() => undefined),
-  ): Promise<{ ok: true; sessionId: string | null } | { ok: false; error: string; timedOut?: true; freshSession?: true }> {
+  ): Promise<{ ok: true; sessionId: string | null; text: string } | { ok: false; error: string; timedOut?: true; freshSession?: true }> {
     // A stored bot secret never reaches a bot's prompt (secretRedaction.ts).
     const iterator = live.adapter.send(redactStoredSecrets(prompt))[Symbol.asyncIterator]();
     let timer: unknown = null;
@@ -928,6 +1042,8 @@ export class BotRuntime {
     });
     let error = '';
     let freshSession = false;
+    // The turn's last assistant message: the text after its last tool call.
+    let text = '';
     try {
       for (;;) {
         const next = await Promise.race([iterator.next(), timeout, stopped]);
@@ -949,8 +1065,10 @@ export class BotRuntime {
         if (ev.type === 'turn-end') {
           // Let the adapter's own cleanup run (its generator is parked on this yield).
           await Promise.resolve(iterator.return?.()).catch(() => undefined);
-          return { ok: true, sessionId: ev.sessionId };
+          return { ok: true, sessionId: ev.sessionId, text };
         }
+        if (ev.type === 'text-delta') text += ev.text;
+        else if (ev.type === 'tool-start') text = '';
         if (ev.type === 'error') {
           error = ev.message;
           if (ev.botTools) freshSession = true;
@@ -971,7 +1089,8 @@ export class BotRuntime {
     // Quitting: the item stays `running` on disk, so the next start marks it
     // interrupted (R8) instead of replaying it.
     if (this.disposed) return;
-    const retryIn = outcome === 'failed' ? this.transientRetryDelay(item.id, message) : null;
+    const limitNotice = outcome === 'failed' || outcome === 'engine' ? usageLimitNoticeOf(message) : null;
+    const retryIn = outcome === 'failed' && limitNotice === null ? this.transientRetryDelay(item.id, message) : null;
     const finalAttempt = outcome !== 'failed' || item.attempts >= WAKE_LIMITS.MAX_ATTEMPTS;
     // Spent network retries stay counted until the wake ends, so the
     // ordinary retry after them does not earn a fresh set.
@@ -997,6 +1116,21 @@ export class BotRuntime {
           at,
         });
       }
+    } else if (limitNotice !== null) {
+      // The provider's usage limit, not the turn: the bot is parked until
+      // the window resets (a bounded hold when the text names no time) and
+      // then picks up by itself; the wake waits parked with it (its
+      // attempts start over when it is unparked), its turn not charged.
+      this.transientRetries.delete(item.id);
+      const until = usageLimitParkUntil(limitNotice, at);
+      this.lastError.set(botId, { message: message.slice(0, 500), at });
+      this.deps.queue.park(item.id);
+      if (startedAt !== undefined && this.deps.store.get(botId)) this.deps.store.mutateUsage(botId, (u) => { unrecordTurn(u, startedAt); });
+      // The owner's own park stays: only their Resume lifts it.
+      const current = this.deps.store.get(botId);
+      if (current && current.parked?.reason !== 'human') this.deps.store.setParked(botId, { reason: 'error', at, until });
+      emitBotHook({ type: 'bot.error', botId, workspaceId: profile.workspaceId, message: message.slice(0, 500), wakeId: item.id, until, at });
+      this.armHeldTimer(until);
     } else if (retryIn !== null) {
       // The network or the API server failed, not the turn: the wake waits
       // and runs again by itself; the bot is not parked.

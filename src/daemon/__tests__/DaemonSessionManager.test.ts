@@ -195,6 +195,38 @@ describe('DaemonSessionManager', () => {
     expect(meta?.spawnCwd).toBe(os.tmpdir());
   });
 
+  it('adoptAgentCwd moves cwd to the agent directory, and the shell moves it back', () => {
+    // An agent that changes directory on its own (EnterWorktree) emits no
+    // OSC 7, so without this the pane recovered into the launch folder.
+    const session = manager.createSession({ id: 'agent-cwd', cmd: 'cmd.exe', cwd: os.tmpdir() });
+    const toOsc7 = (p: string) => `\u001b]7;file://localhost${p.startsWith('/') ? p : '/' + p.replace(/\\/g, '/')}\u0007`;
+    const launch = path.join(os.tmpdir(), 'launch');
+    const worktree = path.join(launch, 'worktree');
+    lastMockPty?.simulateData(toOsc7(launch));
+
+    const moves: string[] = [];
+    manager.on('session:cwd', (e: { cwd: string }) => moves.push(e.cwd));
+    expect(manager.adoptAgentCwd('agent-cwd', worktree)).toBe(true);
+    expect(manager.adoptAgentCwd('agent-cwd', worktree)).toBe(false);
+    const meta = manager.getSession('agent-cwd')?.meta;
+    expect(meta?.cwd).toBe(worktree);
+    expect(meta?.spawnCwd).toBe(session.spawnCwd);
+
+    // The agent exits; the shell re-reports the folder it never left. That
+    // repeat of its last report must still move the cwd back.
+    lastMockPty?.simulateData(toOsc7(launch));
+    expect(meta?.cwd).toBe(launch);
+    expect(moves).toEqual([worktree, launch]);
+  });
+
+  it('adoptAgentCwd ignores unknown panes, empty values and control characters', () => {
+    manager.createSession({ id: 'agent-cwd-guard', cmd: 'cmd.exe', cwd: os.tmpdir() });
+    expect(manager.adoptAgentCwd('missing', os.tmpdir())).toBe(false);
+    expect(manager.adoptAgentCwd('agent-cwd-guard', '')).toBe(false);
+    expect(manager.adoptAgentCwd('agent-cwd-guard', 'C:\\a\u0007b')).toBe(false);
+    expect(manager.getSession('agent-cwd-guard')?.meta.cwd).toBe(os.tmpdir());
+  });
+
   it('★ REPLAYS a given spawnCwd instead of re-deriving it from the live cwd', () => {
     // Recovery and the supervised restart pass the LIVE meta.cwd back as `cwd`,
     // so the pane comes back where the human left it. That value has been

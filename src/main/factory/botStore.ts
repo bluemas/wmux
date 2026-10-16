@@ -11,8 +11,17 @@
 // Settings' Add bot) and `setAvatar`, both checked by botAvatar.ts; `update`
 // refuses it, so the pipe's bot.update never sets one. A picture that fails
 // the check on read is dropped and the bot kept; so is a job that fails
-// normalizeBotJob, and a worker agent (`workerAgent`, optional, owner-set
-// through `update`) that fails validateBotWorkerAgent.
+// normalizeBotJob, a worker agent (`workerAgent`, optional, owner-set
+// through `update`) that fails validateBotWorkerAgent, and an engine model
+// that fails fan-out's model rule (shared/fanoutPreset.ts
+// validateFanoutModel), which is refused on create/update.
+//
+// A bot's own model and effort are its engine's (`engine.model`/`effort`,
+// claude-sdk); its workers' are `workerAgent`. Both are optional, so a
+// profile written before the Bots profile could pick them loads unchanged.
+// A new bot of a template starts on that template's models
+// (shared/bot.ts TEMPLATE_MODEL_DEFAULTS) unless the caller names an engine
+// or worker agent; a stored bot is never moved onto them.
 //
 // Any number of bots, of any template, may share a workspace. A profile
 // written before templates gets its template from its role on read
@@ -33,6 +42,7 @@ import {
   BOT_NAME_MAX,
   DEFAULT_BOT_BUDGETS,
   TEMPLATE_LEGACY_ROLE,
+  TEMPLATE_MODEL_DEFAULTS,
   isBotBinding,
   isBotRole,
   isBotTemplate,
@@ -47,6 +57,8 @@ import {
   type BotTrigger,
   type RemovedBot,
   BOT_IDENTITY_SLOTS,
+  identityHueIndexes,
+  isIdentitySlot,
 } from '../../shared/bot';
 import { CLAUDE_EFFORT_LEVELS } from '../../shared/claudeModels';
 import { isFactKind, type FactFilter } from '../../shared/facts';
@@ -56,6 +68,7 @@ import { createFilePersister, readVersionedFile, type FilePersister } from './ve
 import { LEGACY_TRIAGE_TRIGGERS, defaultTriggers } from './roleDefaults';
 import { parseBotAvatar } from './botAvatar';
 import { validateBotWorkerAgent } from '../../shared/botWorkerAgent';
+import { validateBotBrainModel, validateFanoutModel } from '../../shared/fanoutPreset';
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return !!v && typeof v === 'object' && !Array.isArray(v);
@@ -70,7 +83,6 @@ const TRIGGERS_MAX = 32;
 const ACP_COMMAND_MAX = 512;
 const ACP_ARGS_MAX = 32;
 const ACP_ARG_MAX = 512;
-const MODEL_MAX = 128;
 const LABEL_MAX = 100;
 const BATCH_WINDOW_MAX_MS = 24 * 3_600_000;
 const BATCH_MAX = 100;
@@ -90,12 +102,16 @@ function boundedString(v: unknown, max: number): string | undefined {
   return t.length > 0 && t.length <= max ? t : undefined;
 }
 
-/** A well-formed engine (a fresh object), or null. */
-export function sanitizeBotEngine(raw: unknown): BotEngine | null {
+/** A well-formed engine (a fresh object), or null. A model must pass
+ *  fan-out's model rule (validateFanoutModel); on a read (`read: true`) a
+ *  stored model that does not is dropped and the engine kept, so the bot
+ *  runs on the default model rather than disappearing. */
+export function sanitizeBotEngine(raw: unknown, opts: { read?: boolean } = {}): BotEngine | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
   const r = raw as Record<string, unknown>;
-  const model = r.model === undefined ? undefined : boundedString(r.model, MODEL_MAX);
-  if (r.model !== undefined && model === undefined) return null;
+  const checked = r.model === undefined ? undefined : r.kind === 'claude-sdk' ? validateBotBrainModel(r.model) : validateFanoutModel(r.model);
+  if (checked && !checked.ok && opts.read !== true) return null;
+  const model = checked?.ok ? checked.model : undefined;
   switch (r.kind) {
     case 'claude-sdk': {
       if (r.effort !== undefined && (typeof r.effort !== 'string' || !EFFORTS.has(r.effort))) return null;
@@ -219,7 +235,8 @@ function sanitizeParked(raw: unknown): BotProfile['parked'] | null {
   const r = raw as Record<string, unknown>;
   if (r.reason !== 'budget' && r.reason !== 'error' && r.reason !== 'human') return null;
   if (!Number.isSafeInteger(r.at)) return null;
-  return { reason: r.reason, at: r.at as number };
+  const until = r.reason === 'error' && Number.isSafeInteger(r.until) ? (r.until as number) : undefined;
+  return { reason: r.reason, at: r.at as number, ...(until !== undefined ? { until } : {}) };
 }
 
 /** A profile read from disk, fully validated (a fresh object), or null. */
@@ -253,7 +270,7 @@ export function parseBotProfile(raw: unknown): BotProfile | null {
   if (!isBotRole(r.role)) return null;
   if (!isBotBinding({ workspaceId: r.workspaceId, botId: r.id, role: r.role })) return null;
   const name = boundedString(r.name, NAME_MAX);
-  const engine = sanitizeBotEngine(r.engine);
+  const engine = sanitizeBotEngine(r.engine, { read: true });
   const triggers = sanitizeTriggers(r.triggers);
   const budget = sanitizeBudget(r.budget, DEFAULT_BOT_BUDGETS[r.role], { read: true });
   if (!name || !engine || !triggers || !budget || typeof r.enabled !== 'boolean') return null;
@@ -283,11 +300,20 @@ export function parseBotProfile(raw: unknown): BotProfile | null {
     budget,
     ...(repo ? { repo } : {}),
     ...(avatar ? { avatar } : {}),
+    ...(isIdentitySlot(r.hue) ? { hue: r.hue } : {}),
     enabled: r.enabled,
     ...(parked ? { parked } : {}),
     createdAt: r.createdAt as number,
     updatedAt: r.updatedAt as number,
   };
+}
+
+/** The default engine with the template's own model (TEMPLATE_MODEL_DEFAULTS
+ *  `brain`) when it is claude-sdk and names no model itself. Pure. */
+function withTemplateBrain(engine: BotEngine | null, template: BotTemplate): BotEngine | null {
+  const brain = TEMPLATE_MODEL_DEFAULTS[template]?.brain;
+  if (!engine || !brain || engine.kind !== 'claude-sdk' || engine.model) return engine;
+  return { ...engine, model: brain.model };
 }
 
 function copyProfile(p: BotProfile): BotProfile {
@@ -344,6 +370,9 @@ export interface BotCreateInput {
   /** The job text (normalizeBotJob); absent = none. */
   job?: unknown;
   engine?: unknown;
+  /** What its workers run on (validateBotWorkerAgent); absent = the
+   *  template's default (TEMPLATE_MODEL_DEFAULTS), else the presets' engine. */
+  workerAgent?: unknown;
   triggers?: unknown;
   budget?: unknown;
   repo?: unknown;
@@ -434,6 +463,16 @@ export class BotStore implements BotDirectoryApi {
       if (legacy || entry.template !== bot.template) migrated = true;
       this.bots.set(bot.id, bot);
     }
+    // A profile from before identity slots were stored gets the slot the
+    // Bots page computed for it (oldest first, among its workspace's bots),
+    // written back once, so no bot's character changes with the upgrade.
+    const live = [...this.bots.values()];
+    const missing = live.filter((b) => b.hue === undefined);
+    if (missing.length > 0) {
+      const taken = live.filter((b) => b.hue !== undefined).map((b) => ({ workspaceId: b.workspaceId, index: b.hue as number }));
+      for (const [id, hue] of identityHueIndexes(missing, taken)) (this.bots.get(id) as BotProfile).hue = hue;
+      migrated = true;
+    }
     const usage = raw.usage && typeof raw.usage === 'object' && !Array.isArray(raw.usage)
       ? (raw.usage as Record<string, unknown>)
       : {};
@@ -508,8 +547,14 @@ export class BotStore implements BotDirectoryApi {
     const fallbackName = input.template === undefined && input.role !== undefined ? DEFAULT_NAMES[role] : TEMPLATE_NAMES[template];
     const name = input.name === undefined ? fallbackName : normalizeBotName(input.name);
     if (!name) return refuse('invalid_argument', `name must be 1-${NAME_MAX} characters, no control characters`);
-    const engine = input.engine === undefined ? sanitizeBotEngine(this.defaultEngine()) : sanitizeBotEngine(input.engine);
-    if (!engine) return refuse('invalid_argument', 'engine is malformed');
+    const engine = input.engine === undefined ? withTemplateBrain(sanitizeBotEngine(this.defaultEngine()), template) : sanitizeBotEngine(input.engine);
+    if (!engine) return refuse('invalid_argument', 'engine is malformed (a model must be one model id: letters/digits first, then . _ : -, optionally ending in a [variant])');
+    let workerAgent = TEMPLATE_MODEL_DEFAULTS[template]?.worker;
+    if (input.workerAgent !== undefined) {
+      const v = validateBotWorkerAgent(input.workerAgent, this.platform);
+      if (!v.ok) return refuse('invalid_argument', v.error);
+      workerAgent = v.value;
+    }
     // No triggers given: the role's defaults (roleDefaults.ts), so a new bot
     // wakes on its role's facts without the caller spelling them out.
     const triggers = input.triggers === undefined ? defaultTriggers(role) : sanitizeTriggers(input.triggers);
@@ -525,6 +570,12 @@ export class BotStore implements BotDirectoryApi {
     for (let i = 0; this.bots.has(id) && i < 8; i++) id = this.newId();
     if (!BOT_ID_RE.test(id) || this.bots.has(id)) return refuse('invalid_argument', 'could not mint a bot id');
     const now = this.now();
+    // The first slot free among the workspace's live bots, in the spread
+    // order; a removed bot's slot is free again.
+    const taken = [...this.bots.values()]
+      .filter((b) => b.workspaceId === workspaceId && b.hue !== undefined)
+      .map((b) => ({ workspaceId, index: b.hue as number }));
+    const hue = identityHueIndexes([{ id, createdAt: now, workspaceId }], taken).get(id);
     const bot: BotProfile = {
       version: 1,
       id,
@@ -534,10 +585,12 @@ export class BotStore implements BotDirectoryApi {
       name,
       ...(job ? { job } : {}),
       engine,
+      ...(workerAgent ? { workerAgent: { ...workerAgent } } : {}),
       triggers,
       budget,
       ...(repo ? { repo } : {}),
       ...(avatar ? { avatar } : {}),
+      ...(hue !== undefined ? { hue } : {}),
       enabled: input.enabled ?? true,
       createdAt: now,
       updatedAt: now,
@@ -576,7 +629,7 @@ export class BotStore implements BotDirectoryApi {
     }
     if (patch.engine !== undefined) {
       const engine = sanitizeBotEngine(patch.engine);
-      if (!engine) return refuse('invalid_argument', 'engine is malformed');
+      if (!engine) return refuse('invalid_argument', 'engine is malformed (a model must be one model id: letters/digits first, then . _ : -, optionally ending in a [variant])');
       next.engine = engine;
     }
     if (patch.workerAgent !== undefined) {
@@ -645,14 +698,15 @@ export class BotStore implements BotDirectoryApi {
     return { ok: true, bot: copyProfile(next) };
   }
 
-  /** Delete a profile, keeping its tombstone (`hue`: its colour slot). */
+  /** Delete a profile, keeping its tombstone with its colour slot (its
+   *  stored one; `hue`, the remover's, only for a profile without one). */
   remove(botId: string, opts: { hue?: number } = {}): boolean {
     const cur = this.bots.get(botId);
     if (!cur || !this.bots.delete(botId)) return false;
     this.usage.delete(botId);
     const tomb = parseRemovedBot({
       id: cur.id, workspaceId: cur.workspaceId, role: cur.role, template: cur.template, name: cur.name,
-      avatar: cur.avatar, hue: opts.hue, removedAt: this.now(),
+      avatar: cur.avatar, hue: cur.hue ?? opts.hue, removedAt: this.now(),
     });
     this.removed = this.removed.filter((r) => r.id !== botId);
     if (tomb) this.removed = [...this.removed, tomb].slice(-REMOVED_BOTS_MAX);
@@ -670,7 +724,7 @@ export class BotStore implements BotDirectoryApi {
     const cur = this.bots.get(botId);
     if (!cur) return null;
     const next: BotProfile = { ...cur, updatedAt: this.now() };
-    if (parked) next.parked = { reason: parked.reason, at: parked.at };
+    if (parked) next.parked = { reason: parked.reason, at: parked.at, ...(parked.reason === 'error' && parked.until !== undefined ? { until: parked.until } : {}) };
     else delete next.parked;
     this.bots.set(botId, next);
     this.changed();

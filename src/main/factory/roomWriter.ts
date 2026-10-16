@@ -284,6 +284,17 @@ export function namesOthersGroup(ports: Partial<FactoryRoomPorts>, bot: { worksp
   }
 }
 
+/** Why a bot may not name this thread for what it posts or the workers it
+ *  starts, or null: another bot's 1:1 is named only from the wake running
+ *  in it; a group chat's thread by its members, or from the wake running
+ *  in it. */
+export function botThreadRefusal(ports: Partial<FactoryRoomPorts>, bot: { workspaceId: string; botId: string }, threadId: ThreadId | undefined): string | null {
+  const dmOf = dmThreadBot(threadId);
+  if (dmOf && dmOf !== bot.botId && threadId !== runningWakeThread(ports, bot.botId)) return 'a bot posts in its own 1:1 thread only';
+  if (namesOthersGroup(ports, bot, threadId)) return 'a bot posts in a group chat it is in';
+  return null;
+}
+
 // ── JSONL files ────────────────────────────────────────────────────────────
 
 /** Whether appending to `file` needs a newline first: its last byte is not
@@ -996,8 +1007,19 @@ interface SystemCard { workspaces: string[]; threadId: ThreadId; kind: CardKind;
 const STOPPED_BY_OWNER_SUMMARY = 'stopped by owner';
 
 /** A task card's label in the English the card keeps, by its notice code. */
+/** #2231 — why wmux itself moved a task to input_required, from the summary
+ *  it wrote (FanOutService), so the room can word it in the reader's
+ *  language; null for a worker's own words. Pure. */
+export function inputRequiredWhy(summary: string): 'trustDialog' | 'firstRun' | 'launchFailed' | null {
+  if (/^worker is waiting on Claude Code's (?:workspace|codex folder) trust dialog;/.test(summary)) return 'trustDialog';
+  if (/^worker is waiting on Claude Code's [^;]+; it needs a keypress in the pane$/.test(summary)) return 'firstRun';
+  if (/^launch failed: no agent started in pane \S+ within \d+s/.test(summary)) return 'launchFailed';
+  return null;
+}
+
 const TASK_CARD_LABEL: Readonly<Record<string, string>> = {
   'task.done': 'Task done',
+  'task.reported': 'Task reported · in review',
   'task.failed': 'Task failed',
   'task.cancelled': 'Task cancelled',
   'task.stoppedByOwner': 'Task cancelled · stopped by owner',
@@ -1045,12 +1067,19 @@ export function systemCardForFact(fact: Fact, bots?: BotDirectoryApi): SystemCar
       // A room mention is the card that said it: its delivery adds no line.
       // A refused one shows above.
       if (p.mention === true) return null;
+      // Worded in the reader's language only for a bot addressee (ref.botId:
+      // handoffRouter emit's `directed`); the owner and wmux keep the English.
+      const hop = kind || 'handoff';
+      const hopNotice: CardNotice | undefined = fact.ref?.botId
+        ? { code: 'handoff.sent', args: { hop, to, title, ...(p.relay === true && kind !== 'answer' ? { relay: 1 } : {}) } }
+        : undefined;
       return {
         workspaces: [...new Set(workspaces)], threadId, kind: 'fact',
         title: kind === 'answer' ? `Answered → ${to}: ${title}`
           : p.relay === true ? `${kind || 'handoff'} → ${to}: ${title} (forwarded by wmux)`
           : `${kind || 'handoff'} → ${to}: ${title}`,
         ...(kind === 'answer' ? { body: capBody(p.answer, 1000) } : {}),
+        ...(hopNotice ? { notice: hopNotice } : {}),
         refs: {
           ...baseRefs,
           ...(str(p.requestCardId) ? { requestCardId: str(p.requestCardId) } : {}),
@@ -1066,7 +1095,8 @@ export function systemCardForFact(fact: Fact, bots?: BotDirectoryApi): SystemCar
       // the owner's stop ended it (factoryStop.ts).
       const cancelled = fact.kind === 'task.failed' && p.status === 'cancelled';
       const byOwner = cancelled && p.by === 'system' && p.summary === STOPPED_BY_OWNER_SUMMARY;
-      const code = fact.kind === 'task.done' ? 'task.done'
+      // A worker that reported is not done: the task waits on review.
+      const code = fact.kind === 'task.done' ? (p.status === 'review_requested' ? 'task.reported' : 'task.done')
         : byOwner ? 'task.stoppedByOwner'
           : cancelled ? 'task.cancelled'
             : fact.kind === 'task.failed' ? 'task.failed' : 'task.inputRequired';
@@ -1074,35 +1104,44 @@ export function systemCardForFact(fact: Fact, bots?: BotDirectoryApi): SystemCar
       const body = [byOwner ? '' : capBody(p.summary, 2000), gate].filter(Boolean).join('\n\n');
       const threadId = taskThread(fact);
       const title = str(p.title) || fact.ref?.taskId || 'task';
+      const why = code === 'task.inputRequired' ? inputRequiredWhy(str(p.summary)) : null;
       return {
         workspaces: factRooms(fact, bots), threadId, kind: 'fact',
         title: `${TASK_CARD_LABEL[code]}: ${title}`,
-        notice: { code, args: { title } },
+        notice: { code, args: { title, ...(why ? { why } : {}) } },
         ...(body ? { body } : {}), refs: baseRefs,
         // A task's end closes only its own thread: in the issue, PR or other
         // thread it was started from, the subject is still open.
         ...(fact.kind === 'task.done' && threadId === `task:${fact.ref?.taskId}` ? { closes: true as const } : {}),
       };
     }
-    case 'verdict.recorded':
+    case 'verdict.recorded': {
+      const pr = fact.ref?.pr;
+      const sha = sha7(fact.ref?.headSha);
+      const by = botLabel(bots, fact.ref?.botId);
       return {
         workspaces: factRooms(fact, bots), threadId: prThread(fact), kind: 'fact',
-        title: `Verdict ${str(p.verdict) || 'recorded'} for #${fact.ref?.pr ?? '?'} at ${sha7(fact.ref?.headSha)} by ${botLabel(bots, fact.ref?.botId)}`,
+        title: `Verdict ${str(p.verdict) || 'recorded'} for #${pr ?? '?'} at ${sha} by ${by}`,
         ...(capBody(p.summary, 2000) ? { body: capBody(p.summary, 2000) } : {}),
         refs: baseRefs,
+        ...(typeof pr === 'number' && str(p.verdict) ? { notice: { code: 'verdict.recorded', args: { verdict: str(p.verdict), pr, sha, bot: by } } } : {}),
       };
+    }
     case 'merge.done':
       return {
         workspaces: factRooms(fact, bots), threadId: prThread(fact), kind: 'fact',
         title: `Merged #${fact.ref?.pr ?? '?'} at ${sha7(fact.ref?.headSha)}`, refs: baseRefs, closes: true,
       };
     case 'pr.merged':
-    case 'pr.closed':
+    case 'pr.closed': {
+      const pr = fact.ref?.pr;
       return {
         workspaces: factRooms(fact, bots), threadId: prThread(fact), kind: 'fact',
-        title: `PR #${fact.ref?.pr ?? '?'} ${fact.kind === 'pr.merged' ? 'merged' : 'closed'}${str(p.title) ? `: ${str(p.title)}` : ''}`,
+        title: `PR #${pr ?? '?'} ${fact.kind === 'pr.merged' ? 'merged' : 'closed'}${str(p.title) ? `: ${str(p.title)}` : ''}`,
         refs: baseRefs, closes: true,
+        ...(typeof pr === 'number' ? { notice: { code: fact.kind, args: { pr, ...(str(p.title) ? { title: str(p.title) } : {}) } } } : {}),
       };
+    }
     case 'issue.closed':
       return {
         workspaces: factRooms(fact, bots), threadId: issueThread(fact), kind: 'fact',
@@ -1146,19 +1185,27 @@ export function systemCardForFact(fact: Fact, bots?: BotDirectoryApi): SystemCar
       // Main's own line to one bot; the owner sees it only when it says so
       // (a worker that could not start), in the thread it is about, title only.
       if (p.card !== true || !isRoomWorkspaceId(fact.workspaceId) || !str(p.title)) return null;
+      // Main's stable code for it, when it wrote one (botNotices.ts).
+      const notice = sanitizeNotice(p.notice);
       return {
         workspaces: [fact.workspaceId], threadId: parseThreadId(p.threadId) ?? GENERAL_THREAD,
         kind: p.topic === 'worker.start_failed' ? 'refusal' : 'fact',
         title: str(p.title), refs: baseRefs,
+        ...(notice ? { notice } : {}),
       };
     }
-    case 'bot.error':
+    case 'bot.error': {
+      // At the provider's usage limit: when the bot picks up by itself.
+      const name = botLabel(bots, fact.ref?.botId);
+      const until = typeof p.until === 'number' && Number.isFinite(p.until) && p.until > 0 ? p.until : null;
       return {
         workspaces: factRooms(fact, bots), threadId: GENERAL_THREAD, kind: 'fact',
-        title: `${botLabel(bots, fact.ref?.botId)} hit an error`,
+        title: until !== null ? `${name} hit its usage limit; it picks up again at ${formatHeldUntil(until, fact.at)}` : `${name} hit an error`,
         ...(capBody(p.message, 1000) ? { body: capBody(p.message, 1000) } : {}),
         refs: baseRefs,
+        notice: until !== null ? { code: 'bot.usageLimit', args: { bot: name, until } } : { code: 'bot.error', args: { bot: name } },
       };
+    }
     default:
       return null;
   }

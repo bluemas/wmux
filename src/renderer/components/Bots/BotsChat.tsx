@@ -20,6 +20,11 @@
 // card that waits on the owner shows in the main timeline whatever its
 // thread.
 //
+// Work the conversation handed off (owner decision 2026-10-16): a thread it
+// started — a coordinator's request thread — is one work card at its root's
+// position instead of the thread's cards, inside the delegating bot's run
+// (BotsWorkCard). A card in it that waits on the owner still shows.
+//
 // What is happening now sits in the working rail right above the composer:
 // "<bot> working · 0:14" with its queue and a neutral Stop (the turn only;
 // the profile's Stop ends the bot's workers too), then the bot's workers
@@ -52,7 +57,7 @@ import { FOCUS_RING } from '../focusRing';
 import Button from '../ui/Button';
 import Select from '../ui/Select';
 import Popover from '../ui/Popover';
-import { IconPlus } from '../icons';
+import { IconFanOut, IconPlus } from '../icons';
 import { renderBrainMarkdown, type MarkdownOptions } from '../shared/BrainMarkdown';
 import { getLocale } from '../../i18n';
 import { normalizeRepoKey } from '../../../shared/repoKey';
@@ -66,19 +71,22 @@ import { pendingForChip, useApprovals } from '../Room/approvalsStore';
 import { PresenceDot, botActionsFor, botPresence } from '../Room/BotChips';
 import { deliveryLine, deliveryTaken, roomPostParams, sentFrom, useMentionPicks, type SentTo } from '../Room/RoomComposer';
 import { actorLabel, botKindLabel, cardResumeTaskId, cardTone, isRefThread, kindLabel, ownerCardText, planTextWithNames, requestTitles, threadLabel, threadRef, type IdLabels, type RoomActorView } from '../Room/roomFormat';
-import { BOT_JOB_MAX, botTemplate, normalizeBotJob } from '../../../shared/bot';
+import { BOT_JOB_MAX, botTemplate, delegatesFromConversation, normalizeBotJob, type BotPresence, type BotProfile as BotProfileData } from '../../../shared/bot';
 import { DEFAULT_BOT_WORKER_AGENT, botWorkerAgentLabel, type BotWorkerAgentOption } from '../../../shared/botWorkerAgent';
 import { pickFolderDialog, templateJob } from '../Settings/FactoryTab';
 import BotAvatar, { botHueIndex, botIdentityColor, noteRemovedBotHues } from '../Room/BotAvatar';
 import { RoomAvatar } from './BotsAvatar';
 import { awaitsApproval, conversationCards, groupViewCards, livePlanIds, taskBubbles, conversationTurns, type BotTreeRow, type BotWorker, type Conversation, type RoomEntry } from './botsModel';
-import { treeRowLabel } from './BotsWorkerTree';
+import BotsWorkerTree, { treeRowLabel } from './BotsWorkerTree';
 import { loadWholeThread } from './useBots';
 import { loadRoomActors } from '../../hooks/useRoomSync';
 import { useShallow } from 'zustand/react/shallow';
 import type { BotTaskView } from '../../../shared/botTask';
 import { botCanDo } from './botsProfile';
 import { BotConnections } from './BotConnections';
+import { BotSkills } from './BotSkills';
+import { BotToday } from './BotToday';
+import { BrainModelLine, WorkerModelLine } from './BotModelLines';
 import { stopBotSummary, type BotsStopPort } from './botsStop';
 import { InlineConfirm } from './InlineConfirm';
 import BotsWorkerPanel from './BotsWorkerPanel';
@@ -86,6 +94,8 @@ import { displayWorkspaceName } from '../../utils/fanoutProvenance';
 import { BOTS_SESSION_START, selectWorkerPanelHost } from '../../stores/slices/roomSlice';
 import { routineScheduleText, routineStateText, useBotRoutines } from '../Schedules/BotRoutines';
 import { buildTimeline, clockTime, elapsed, fullTime, hasKindWord, liveNewAfter, separatorLabel, splitThreads, threadCards, type ThreadView, type TimelineItem } from './botsTimeline';
+import { conversationStartedThreads, workView } from './botsWork';
+import BotsWorkCard from './BotsWorkCard';
 import '../Chat/chatMono.css';
 
 const EMPTY_TREE: readonly BotTreeRow[] = [];
@@ -342,6 +352,9 @@ interface RowCtx {
    *  (absent: none, as while the bots are off): whether the task's worker
    *  is resumable now, and the resume. */
   resume?: { resumable: (taskId: string) => boolean; run: (taskId: string) => Promise<void> };
+  /** What a work card reads (absent: no work cards): which cards wait on
+   *  the owner, the bots' tasks, and the pull request a task opened. */
+  work?: { waits: (card: RoomCardData) => boolean; tasks: readonly BotTaskView[]; prUrl: (taskId: string) => string | null };
 }
 
 /** A bot message's prose: the title and the body as one text in one colour,
@@ -496,6 +509,63 @@ function MessageRow({ item, ctx, group }: { item: Extract<TimelineItem, { kind: 
   );
 }
 
+/** A bot's face as the chat knows it: its row, else what the room keeps
+ *  of it (a removed bot's tombstone); null when neither knows it. */
+function botFace(botId: string, ctx: RowCtx): Pick<BotProfileData, 'id' | 'name' | 'role' | 'avatar'> | null {
+  const row = ctx.bots.find((b) => b.bot.id === botId);
+  if (row) return row.bot;
+  const known = ctx.actors[botId];
+  return known?.role ? { id: botId, name: known.name ?? '', role: known.role, ...(known.avatar ? { avatar: known.avatar } : {}) } : null;
+}
+
+/** A thread the conversation started, as one work card in the delegating
+ *  bot's run: its avatar once beside the run's last item, its name above
+ *  the run in a room. */
+function WorkRow({ item, ctx, group }: { item: Extract<TimelineItem, { kind: 'work' }>; ctx: RowCtx; group: boolean }) {
+  const { work, delegatorId, continuation, runEnd } = item;
+  const { t } = ctx;
+  const opts = ctx.work;
+  const view = useMemo(
+    () => workView(work, { delegatorId, waits: opts?.waits ?? (() => false), tasks: opts?.tasks, requestTitle: ctx.requestTitle, prUrl: opts?.prUrl }),
+    [work, delegatorId, opts, ctx.requestTitle],
+  );
+  const party = (botId: string) => ({ kind: 'bot' as const, workspaceId: work.workspaceId, botId });
+  const face = delegatorId ? botFace(delegatorId, ctx) : null;
+  const showName = !!delegatorId && (group || (!!ctx.selfBot && delegatorId !== ctx.selfBot));
+  const textOf = (c: RoomCardData): string => {
+    const title = ownerCardText(c, ctx.botNames, c.actor.kind === 'bot' ? ctx.idLabels : undefined, t).title.split('\n')[0].trim();
+    return c.actor.kind === 'human' ? `${t('room.actor.you')}: ${title}` : title;
+  };
+  const refChip = view.refUrl ? ctx.markdown.linkChip?.(view.refUrl, null) : null;
+  return (
+    <div
+      className={`wmux-bots-msg${continuation ? ' is-continuation' : ''}`}
+      data-bots-bubble="work"
+      data-continuation={continuation ? 'true' : undefined}
+      data-run-end={runEnd ? 'true' : undefined}
+    >
+      <div className="wmux-bots-msg-gutter">{runEnd && face ? <BotAvatar bot={face} size={28} /> : null}</div>
+      <div className="wmux-bots-msg-main">
+        {!continuation && showName && (
+          <div className="wmux-bots-msg-head" data-bots-msg-head>
+            <span className="truncate" style={botNameStyle(delegatorId)}>{actorLabel(party(delegatorId), t, ctx.bots, ctx.actors)}</span>
+          </div>
+        )}
+        <BotsWorkCard
+          work={work}
+          view={view}
+          t={t}
+          faceOf={(botId) => botFace(botId, ctx)}
+          nameOf={(botId) => actorLabel(party(botId), t, ctx.bots, ctx.actors)}
+          textOf={textOf}
+          refChip={refChip}
+          onOpenThread={() => ctx.onThread(work.workspaceId, work.threadId)}
+        />
+      </div>
+    </div>
+  );
+}
+
 /** Consecutive system cards of one thread: one line naming each (a
  *  refusal's or a budget's word kept in its colour) and how many, which
  *  opens into the cards themselves. A lone card is its own line. */
@@ -577,6 +647,7 @@ function TimelineView({ items, ctx, group = false }: { items: readonly TimelineI
           case 'new': return <div key={item.key} className="wmux-bots-new" data-bots-new-divider role="separator"><span>{ctx.t('botsPage.chat.new')}</span></div>;
           case 'system': return <SystemGroup key={item.key} cards={item.cards} thread={item.thread} ctx={ctx} />;
           case 'message': return <MessageRow key={item.key} item={item} ctx={ctx} group={group} />;
+          case 'work': return <WorkRow key={item.key} item={item} ctx={ctx} group={group} />;
         }
       })}
     </>
@@ -655,6 +726,13 @@ function taskRailState(task: BotTaskView, t: T): string {
   return task.worker === 'resumable' ? `${t(state)} · ${t('botsPage.worker.canResume')}` : t(state);
 }
 
+/** Why a Resume was refused, in the reader's language when this build words
+ *  it (no free agent slot), else main's own message. Pure over `t`. */
+function resumeRefusalText(r: { message?: string; code?: string; cap?: number }, t: T): string | null {
+  if (r.code === 'no_slot' && typeof r.cap === 'number') return t('botsPage.worker.resumeNoSlot', { cap: r.cap });
+  return r.message ?? null;
+}
+
 /** A bot's task that is not a live worker, in the rail: waiting for an agent
  *  slot, or done with a stopped worker that can resume the same
  *  conversation. Open shows only while the worker's pane is still open; a
@@ -708,7 +786,7 @@ function TaskRow({ task, t, resumePort, readOnly, shownId, onOpen }: { task: Bot
             void resumeWorker(task.taskId)
               .then((r) => {
                 if (!live.current.mounted) return;
-                if (!r.ok) setError(r.message ?? null);
+                if (!r.ok) setError(resumeRefusalText(r, t));
                 else {
                   const opened = r.workspaceId ?? paneWorkspaceId;
                   if (opened) live.current.onOpen(opened);
@@ -732,8 +810,11 @@ const RAIL_ROWS_MAX = 3;
  *  one line ("<bot> working · 0:02 · Stop"), then the tasks the list's
  *  worker tree cannot show — waiting for an agent slot, or resumable with
  *  their pane cleared (owner decision 2026-10-14: the workers themselves are
- *  rows under their bot in the list). Nothing at all while nothing works;
- *  with the bots off, no turns and no Stop or Resume. */
+ *  rows under their bot in the list; narrowed by the owner decision
+ *  2026-10-16 to tasks still open: resuming an ended task's worker is the
+ *  bot's call, and the owner's Resume for it stays in its panel and on its
+ *  card). Nothing at all while nothing works; with the bots off, no turns
+ *  and no Stop or Resume. */
 function WorkingRail({ turns, tasks, t, now, readOnly, resumePort, shownId, onOpen }: {
   turns: readonly FactoryBotRow[];
   tasks: readonly BotTaskView[];
@@ -917,10 +998,25 @@ function BotsThreadPanel({ conversation, cards, workspaceId, threadId, ctx: pare
   const replyItems = buildTimeline(replies.map((card): RoomEntry => ({ kind: 'card', card })), { waits });
   const scrollRef = useRef<HTMLDivElement>(null);
   const lastId = cards[cards.length - 1]?.id ?? '';
+  // Not while the window is hidden (see BotsChat's own pin): the pin missed
+  // then is made when the window is shown again.
+  const missedPin = useRef(false);
   useEffect(() => {
     const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (!el) return;
+    if (document.visibilityState === 'hidden') missedPin.current = true;
+    else el.scrollTop = el.scrollHeight;
   }, [lastId]);
+  useEffect(() => {
+    const onVisible = () => {
+      const el = scrollRef.current;
+      if (!el || !missedPin.current || document.visibilityState === 'hidden') return;
+      missedPin.current = false;
+      el.scrollTop = el.scrollHeight;
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
+  }, []);
   return (
     <aside className="wmux-bots-side" data-bots-thread-panel={threadId} aria-label={t('botsPage.chat.threadPanel', { name: label })} style={style}>
       <div className="wmux-bots-worker-head">
@@ -1100,6 +1196,9 @@ function BotsComposer({ conversation, threadId, workspaceId: workspaceOverride, 
     : conversation.kind === 'bot' ? oneToOneRefusal(conversation.row, t)
       : roomCandidates.length === 0 ? t('botsPage.group.noneOn') : null;
 
+  // `t` reads the store's language: callbacks and memos keyed on it also
+  // key on the locale, so they re-word after a language change.
+  const locale = useStore((s) => s.locale);
   const submit = useCallback(async (e?: FormEvent) => {
     e?.preventDefault();
     if (inFlight || refusal) return;
@@ -1134,7 +1233,7 @@ function BotsComposer({ conversation, threadId, workspaceId: workspaceOverride, 
     } finally {
       setInFlight(false);
     }
-  }, [api, inFlight, refusal, text, workspaceId, threadId, mentions, picks, t, onSent]);
+  }, [api, inFlight, refusal, text, workspaceId, threadId, mentions, picks, t, locale, onSent]);
 
   // `@` suggestions: typing `@` and the start of a name in a room lists the
   // room's bots that match; Enter or Tab (or a click) puts `@Name ` in its
@@ -1444,14 +1543,18 @@ function ProfileLine({ label, value }: { label: string; value: React.ReactNode }
   );
 }
 
-/** Stop: the bot's turn and its workers, after an inline confirm. The
- *  result is a toast. */
-function StopBot({ row, port, t }: { row: FactoryBotRow; port: BotsStopPort; t: T }) {
+/** Pause (park the bot: it takes no new turn until Resume; reversible, so
+ *  no confirm) beside Stop (the bot's turn and its workers, after an inline
+ *  confirm; the result is a toast). A paused bot shows Resume in Today. */
+function StopBot({ row, port, act, t }: { row: FactoryBotRow; port: BotsStopPort; act?: FactoryBotPort['act']; t: T }) {
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [pausing, setPausing] = useState(false);
   const stopBot = port.stopBot;
-  if (!stopBot) return null;
+  const canPause = !!act && row.bot.enabled && botActionsFor(row).park;
+  if (!stopBot && !canPause) return null;
   const run = async () => {
+    if (!stopBot) return;
     setBusy(true);
     try {
       const r = await stopBot(row.bot.id);
@@ -1463,9 +1566,21 @@ function StopBot({ row, port, t }: { row: FactoryBotRow; port: BotsStopPort; t: 
       setBusy(false);
     }
   };
+  const pause = async () => {
+    if (!act) return;
+    setPausing(true);
+    try {
+      const r = await act('park', row.bot.id);
+      if (!r.ok) useStore.getState().pushToast({ message: t('room.bot.actionFailed', { name: row.bot.name, reason: r.message ?? '' }), level: 'error' });
+    } catch (err) {
+      useStore.getState().pushToast({ message: t('room.bot.actionFailed', { name: row.bot.name, reason: err instanceof Error ? err.message : String(err) }), level: 'error' });
+    } finally {
+      setPausing(false);
+    }
+  };
   return (
     <div className="mt-1 border-t border-[var(--stroke)] pt-2" data-bots-stop-bot={row.bot.id}>
-      {confirming ? (
+      {confirming && stopBot ? (
         <InlineConfirm
           text={t('botsPage.stop.botConfirm', { name: row.bot.name })}
           confirmLabel={t('botsPage.stop.bot')}
@@ -1476,7 +1591,10 @@ function StopBot({ row, port, t }: { row: FactoryBotRow; port: BotsStopPort; t: 
           testId="bots-stop-bot"
         />
       ) : (
-        <Button size="sm" variant="destructive" data-testid="bots-stop-bot" onClick={() => setConfirming(true)}>{t('botsPage.stop.bot')}</Button>
+        <div className="flex items-center gap-2">
+          {canPause && <Button size="sm" variant="secondary" data-testid="bots-pause-bot" disabled={pausing} onClick={() => void pause()}>{t('botsPage.pause.bot')}</Button>}
+          {stopBot && <Button size="sm" variant="destructive" data-testid="bots-stop-bot" onClick={() => setConfirming(true)}>{t('botsPage.stop.bot')}</Button>}
+        </div>
       )}
     </div>
   );
@@ -1485,35 +1603,6 @@ function StopBot({ row, port, t }: { row: FactoryBotRow; port: BotsStopPort; t: 
 /** The verbs the profile sends through the bot port beyond the job editor:
  *  Resume and Delete bot (absent ones show no control). */
 type BotAdminPort = Partial<Pick<FactoryBotPort, 'act' | 'remove'>>;
-
-/** A parked bot's line: why it takes no turn (out of turns, stopped after
- *  errors, parked by the owner) and Resume, which lets every wake waiting
- *  for it run now, past its limits if need be. */
-function ParkedLine({ row, port, t }: { row: FactoryBotRow; port?: BotAdminPort; t: T }) {
-  const [busy, setBusy] = useState(false);
-  const act = port?.act;
-  if (!botActionsFor(row).resume) return null;
-  const reason = row.bot.parked?.reason ?? 'human';
-  const resume = async () => {
-    if (!act) return;
-    setBusy(true);
-    try {
-      const r = await act('resume', row.bot.id);
-      if (!r.ok) useStore.getState().pushToast({ message: t('room.bot.actionFailed', { name: row.bot.name, reason: r.message ?? '' }), level: 'error' });
-    } catch (err) {
-      useStore.getState().pushToast({ message: t('room.bot.actionFailed', { name: row.bot.name, reason: err instanceof Error ? err.message : String(err) }), level: 'error' });
-    } finally {
-      setBusy(false);
-    }
-  };
-  return (
-    <div className="flex items-center gap-3 py-1 text-[12px]" data-bots-profile-parked={reason}>
-      <span className="w-[112px] shrink-0" aria-hidden="true" />
-      <span className="min-w-0 flex-1 text-[var(--text-sub)]">{t(`botsPage.profile.parked.${reason}`)}</span>
-      {act && <Button size="sm" variant="secondary" data-testid="bots-resume-bot" disabled={busy} onClick={() => void resume()}>{t('room.bot.resume')}</Button>}
-    </div>
-  );
-}
 
 /** Delete bot, after an inline confirm that says what happens: its history
  *  stays, its running workers are stopped, its routines are removed. Its
@@ -1671,6 +1760,7 @@ function RepoLine({ row, t, port, pickFolder = pickFolderDialog }: { row: Factor
             </button>
           )}
         </div>
+        {!row.bot.repo && !error && <p data-bots-profile-repo-hint className="mt-1 text-[11px] text-[var(--text-muted)]">{t('botsPage.profile.repoHint')}</p>}
         {error && <p role="alert" data-bots-profile-repo-error className="mt-1 text-[11px] text-[var(--accent-red)]">{error}</p>}
       </div>
     </div>
@@ -1746,12 +1836,62 @@ function WorkerEngineLine({ row, t, port }: { row: FactoryBotRow; t: T; port?: P
   );
 }
 
+/** Each bot's last presence the runtime reported while the app runs, and
+ *  when one last reported parked went unreported (its Resume). */
+const lastProfilePresence = new Map<string, BotPresence>();
+const profileResumedAt = new Map<string, number>();
+/** How long a resumed bot reads "Resuming…" at most. */
+export const RESUMING_MAX_MS = 10_000;
+
+/** The profile's state word. A bot the runtime reported parked and now
+ *  reports nothing for (its session attaches on its next turn) was just
+ *  resumed: it reads "Resuming…" until the runtime reports, for at most
+ *  RESUMING_MAX_MS; then it reads as any bot with no turn yet. */
+export function profilePresenceKey(
+  row: FactoryBotRow,
+  now: number = Date.now(),
+  last: Map<string, BotPresence> = lastProfilePresence,
+  resumedAt: Map<string, number> = profileResumedAt,
+): string {
+  const id = row.bot.id;
+  const presence = botPresence(row);
+  if (presence !== 'unknown') {
+    last.set(id, presence);
+    resumedAt.delete(id);
+    return `room.presence.${presence}`;
+  }
+  if (row.bot.enabled && !row.bot.parked) {
+    if (last.get(id) === 'parked') {
+      resumedAt.set(id, now);
+      last.set(id, 'unknown');
+    }
+    const at = resumedAt.get(id);
+    if (at !== undefined && now - at < RESUMING_MAX_MS) return 'botsPage.profile.resuming';
+  }
+  return 'room.presence.unknown';
+}
+
+/** The profile's state line: on/off and presence, re-read when "Resuming…"
+ *  runs out. */
+function ProfileState({ row, t }: { row: FactoryBotRow; t: T }) {
+  const [, expire] = useState(0);
+  const key = profilePresenceKey(row);
+  useEffect(() => {
+    if (key !== 'botsPage.profile.resuming') return;
+    const at = profileResumedAt.get(row.bot.id) ?? Date.now();
+    const h = setTimeout(() => expire((n) => n + 1), Math.max(0, at + RESUMING_MAX_MS - Date.now()));
+    return () => clearTimeout(h);
+  }, [key, row.bot.id]);
+  return <ProfileLine label={t('botsPage.profile.state')} value={<span data-bots-profile-state>{`${t(row.bot.enabled ? 'botsPage.profile.on' : 'botsPage.profile.off')} · ${t(key)}`}</span>} />;
+}
+
 /** The bot's profile under its name pill: template, job (editable),
- *  workspace, repo, what its workers run on, on/off, turns used and left today, its routines
+ *  workspace, repo, the model it thinks on, what its workers run on and
+ *  their model, on/off, what it used today of each limit (and what stops
+ *  it, with Resume when parked), its routines
  *  (read-only), its connections, then what it can do (the shared powers,
- *  read-only), whom it reports to, its workers now, and Stop. */
+ *  read-only), whom it reports to, its workers now, and Pause and Stop. */
 function BotProfile({ row, workers, workspaceName, t, stopPort, jobPort, adminPort }: { row: FactoryBotRow; workers: readonly BotWorker[]; workspaceName: string; t: T; stopPort: BotsStopPort; jobPort?: Pick<FactoryBotPort, 'update' | 'workerAgents'>; adminPort?: BotAdminPort }) {
-  const left = row.status?.budgetLeft?.turnsDay;
   const routines = (useBotRoutines()?.routines ?? []).filter((r) => r.botId === row.bot.id);
   const canDo = botCanDo(row.bot);
   const waiting = workers.filter((w) => w.waiting).length;
@@ -1762,15 +1902,11 @@ function BotProfile({ row, workers, workspaceName, t, stopPort, jobPort, adminPo
       <JobLine key={`${row.bot.id}:${row.bot.job ?? ''}`} row={row} t={t} jobPort={jobPort} />
       <ProfileLine label={t('botsPage.profile.workspace')} value={workspaceName} />
       <RepoLine row={row} t={t} port={jobPort} />
+      <BrainModelLine row={row} t={t} port={jobPort} />
       <WorkerEngineLine row={row} t={t} port={jobPort} />
-      <ProfileLine label={t('botsPage.profile.state')} value={`${t(row.bot.enabled ? 'botsPage.profile.on' : 'botsPage.profile.off')} · ${t(`room.presence.${botPresence(row)}`)}`} />
-      <ParkedLine row={row} port={adminPort} t={t} />
-      {typeof left === 'number' && (
-        <ProfileLine
-          label={t('botsPage.profile.turnsToday')}
-          value={<span data-bots-profile-turns>{t('botsPage.profile.turnsTodayValue', { used: Math.max(0, row.bot.budget.maxTurnsPerDay - left), left })}</span>}
-        />
-      )}
+      <WorkerModelLine row={row} t={t} port={jobPort} />
+      <ProfileState row={row} t={t} />
+      <BotToday row={row} act={adminPort?.act} liveWorkers={workers.length} t={t} />
       {routines.length > 0 && (
         <div className="flex items-baseline gap-3 py-1 text-[12px]" data-bots-profile-routines>
           <span className="w-[112px] shrink-0 text-[var(--text-muted)]">{t('botsPage.profile.routines')}</span>
@@ -1784,6 +1920,7 @@ function BotProfile({ row, workers, workspaceName, t, stopPort, jobPort, adminPo
         </div>
       )}
       <BotConnections row={row} t={t} />
+      <BotSkills row={row} t={t} />
       <div className="mt-1 border-t border-[var(--stroke)] pt-1">
         <div className="flex items-baseline gap-3 py-1 text-[12px]" data-bots-profile-can-do>
           <span className="w-[112px] shrink-0 text-[var(--text-muted)]">{t('botsPage.profile.canDo')}</span>
@@ -1802,7 +1939,7 @@ function BotProfile({ row, workers, workspaceName, t, stopPort, jobPort, adminPo
           )}
         />
       </div>
-      <StopBot row={row} port={stopPort} t={t} />
+      <StopBot row={row} port={stopPort} act={adminPort?.act} t={t} />
       <DeleteBot row={row} port={adminPort} t={t} />
     </div>
   );
@@ -1815,7 +1952,57 @@ export function waitsOnOwner(card: RoomCardData, livePlans: ReadonlySet<string>)
   return card.kind === 'question' || awaitsApproval(card, livePlans);
 }
 
-export function BotsChat({ conversation, roomCards, bots, title, workspaceName, t, onBack, api, now, readOnly = false, stopPort = {}, jobPort, resumePort, onOpenBot, onEditGroup, threadAsk }: {
+/** The narrow layout's way to a bot's workers without going back to the
+ *  list (#2231): a round button right of the name pill, mirroring the back
+ *  button, that opens the bot's worker tree as a popover. Shown only in the
+ *  one-column layout (bots.css); the wide layout's list shows the tree. */
+function HeadWorkers({ rows, name, shownId, t, onOpen }: {
+  rows: readonly BotTreeRow[];
+  name: string;
+  shownId: string | null;
+  t: T;
+  onOpen: (workspaceId: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef<HTMLSpanElement>(null);
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => { if (!wrapRef.current?.contains(e.target as Node)) setOpen(false); };
+    document.addEventListener('mousedown', onDown);
+    return () => document.removeEventListener('mousedown', onDown);
+  }, [open]);
+  const label = t(open ? 'botsPage.worker.collapse' : 'botsPage.worker.expand', { name, count: rows.length });
+  const treeId = 'bots-head-workers';
+  return (
+    <span ref={wrapRef} className="wmux-bots-head-workers">
+      <button
+        ref={buttonRef}
+        type="button"
+        data-bots-head-workers
+        aria-expanded={open}
+        aria-controls={open ? treeId : undefined}
+        aria-label={label}
+        title={label}
+        onClick={() => setOpen((v) => !v)}
+        className={`wmux-bots-back wmux-bots-head-workers-button ${FOCUS_RING}`}
+      >
+        <IconFanOut size={13} />
+        <span className="tabular-nums">{rows.length}</span>
+      </button>
+      {open && (
+        <Popover
+          className="wmux-bots-head-workers-pop"
+          onKeyDown={(e) => { if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setOpen(false); buttonRef.current?.focus(); } }}
+        >
+          <BotsWorkerTree id={treeId} rows={rows} name={name} shownId={shownId} t={t} onOpen={(workspaceId) => { setOpen(false); onOpen(workspaceId); }} />
+        </Popover>
+      )}
+    </span>
+  );
+}
+
+export function BotsChat({ conversation, roomCards, bots, title, workspaceName, t, onBack, api, now, readOnly: pausedView = false, stopPort = {}, jobPort, resumePort, onOpenBot, onEditGroup, threadAsk }: {
   conversation: Conversation;
   roomCards: readonly RoomCardData[];
   /** Every bot (names for senders and the addressee check). */
@@ -1845,6 +2032,9 @@ export function BotsChat({ conversation, roomCards, bots, title, workspaceName, 
    *  a new nonce opens it again. */
   threadAsk?: { workspaceId: string; threadId: ThreadId; nonce: number };
 }): React.ReactElement {
+  // A deleted bot's 1:1 is read only: no composer, profile or answers.
+  const removedBot = conversation.kind === 'bot' && conversation.removed === true;
+  const readOnly = pausedView || removedBot;
   const [profileOpen, setProfileOpen] = useState(false);
   const [sent, setSent] = useState<Record<string, SentTo[] | null>>({});
   const [started, setStarted] = useState<ReadonlySet<string>>(() => new Set());
@@ -1884,11 +2074,20 @@ export function BotsChat({ conversation, roomCards, bots, title, workspaceName, 
   const conversationId = conversation.id;
   // Cards that land while the chat is in view are not "new" (liveNewAfter).
   const [newAfter, setNewAfter] = useState(() => useStore.getState().botsSeenAt[conversationId] ?? BOTS_SESSION_START);
-  const { main, threads, surfaced } = useMemo(() => splitThreads(cards, waits), [cards, waits]);
+  // The threads this conversation started fold into work cards.
+  const startedThreads = useMemo(() => conversationStartedThreads(conversation, roomCards, roomThreads), [conversation, roomCards, roomThreads]);
+  const { main, threads, surfaced, work } = useMemo(() => splitThreads(cards, waits, startedThreads), [cards, waits, startedThreads]);
+  // Who handed it off: a 1:1's bot; in a group, its coordinator or lead bot
+  // (only their dispatch opens a thread), the nearest above when several.
+  const coordinators = useMemo(
+    () => (conversation.kind === 'room' ? new Set(conversation.bots.filter((r) => delegatesFromConversation(r.bot)).map((r) => r.bot.id)) : null),
+    [conversation],
+  );
+  const workAuthor = conversation.kind === 'bot' ? conversation.row.bot.id : coordinators?.size === 1 ? [...coordinators][0] : undefined;
   const items = useMemo(() => {
     const entries: RoomEntry[] = main.map((card) => ({ kind: 'card' as const, card }));
-    return buildTimeline(entries, { waits, threads, surfaced, newAfter });
-  }, [main, threads, surfaced, waits, newAfter]);
+    return buildTimeline(entries, { waits, threads, surfaced, newAfter, work, ...(workAuthor ? { workAuthor } : coordinators ? { workCandidates: coordinators } : {}) });
+  }, [main, threads, surfaced, waits, newAfter, work, workAuthor, coordinators]);
   const botNames = useMemo(() => bots.map((b) => b.bot.name), [bots]);
   const taskTitle = useMemo(() => {
     const byId = new Map<string, string>();
@@ -1900,6 +2099,17 @@ export function BotsChat({ conversation, roomCards, bots, title, workspaceName, 
     return (threadId: ThreadId) => byThread.get(threadId) ?? null;
   }, [roomCards]);
   const idLabels = useIdLabels(bots, t);
+  // A work card's state reads its tasks; its chip, the PR a task opened.
+  const workCtx = useMemo((): NonNullable<RowCtx['work']> => {
+    const tasks = bots.flatMap((r) => r.tasks ?? []);
+    const urls = new Map<string, string>();
+    for (const r of bots) {
+      const repo = r.bot.repo?.repoKey;
+      if (!repo || !/^github\.com\//.test(repo)) continue;
+      for (const task of r.tasks ?? []) if (task.pr) urls.set(task.taskId, `https://${repo}/pull/${task.pr.number}`);
+    }
+    return { waits, tasks, prUrl: (taskId) => urls.get(taskId) ?? null };
+  }, [bots, waits]);
 
   // An open conversation is read: the list row's unread count clears while
   // the window and the chat are in view, wherever it is scrolled (the
@@ -1929,12 +2139,19 @@ export function BotsChat({ conversation, roomCards, bots, title, workspaceName, 
       setNewAfter((cur) => liveNewAfter(cards, cur, before, visible, at));
     }
     const el = scrollRef.current;
-    if (el && atBottom.current) el.scrollTop = el.scrollHeight;
-    else if (added > 0) setNewCount((n) => n + added);
+    if (el && atBottom.current) {
+      // A hidden window draws no frames, and Blink keeps a scroll event (with
+      // the whole chat, once it unmounts) until the next one: pin on return.
+      if (document.visibilityState !== 'hidden') el.scrollTop = el.scrollHeight;
+    } else if (added > 0) setNewCount((n) => n + added);
     markSeen();
   }, [lastId, workers.length, markSeen, cards, inView]);
   useEffect(() => {
-    const onVisible = () => markSeen();
+    const onVisible = () => {
+      const el = scrollRef.current;
+      if (el && atBottom.current && document.visibilityState !== 'hidden') el.scrollTop = el.scrollHeight;
+      markSeen();
+    };
     document.addEventListener('visibilitychange', onVisible);
     // A window brought back to the front may not change visibility.
     window.addEventListener('focus', onVisible);
@@ -1983,7 +2200,7 @@ export function BotsChat({ conversation, roomCards, bots, title, workspaceName, 
       document.removeEventListener('keydown', onKey, true);
     };
   }, [profileOpen]);
-  const presence = conversation.kind === 'bot' ? botPresence(conversation.row) : null;
+  const presence = conversation.kind === 'bot' && !removedBot ? botPresence(conversation.row) : null;
   const group = conversation.kind === 'room';
   // One side panel at a time: a worker's terminal or a thread. The worker
   // panel belongs to the conversation it was opened from: another
@@ -2022,17 +2239,18 @@ export function BotsChat({ conversation, roomCards, bots, title, workspaceName, 
     shownChat.current.mounted = true;
     return () => { shownChat.current.mounted = false; };
   }, []);
+  const locale = useStore((s) => s.locale);
   const resumeShown = useCallback(async (taskId: string): Promise<void> => {
     const resume = resumePort?.resumeWorker;
     if (!resume) return;
     const asked = useStore.getState().botsWorkerPanel;
     await resume(taskId).then((r) => {
-      if (!r.ok) useStore.getState().pushToast({ message: r.message || t('botsPage.worker.resume'), level: 'error' });
+      if (!r.ok) useStore.getState().pushToast({ message: resumeRefusalText(r, t) || t('botsPage.worker.resume'), level: 'error' });
       else if (r.workspaceId && shownChat.current.mounted && shownChat.current.conversationId === conversationId && useStore.getState().botsWorkerPanel === asked) {
         useStore.getState().setBotsWorkerPanel({ workspaceId: r.workspaceId, conversationId });
       }
     }).catch((err: unknown) => useStore.getState().pushToast({ message: String(err), level: 'error' }));
-  }, [resumePort, conversationId, t]);
+  }, [resumePort, conversationId, t, locale]);
   const askedNonce = threadAsk?.nonce;
   useEffect(() => {
     if (threadAsk) onThread(threadAsk.workspaceId, threadAsk.threadId);
@@ -2044,11 +2262,14 @@ export function BotsChat({ conversation, roomCards, bots, title, workspaceName, 
   const shown = shownId && !openThread ? workerPanelView(shownId, workers, tree, tasks, t) : null;
   // The rail lists only the tasks with no row in the list's tree.
   const openWorkspaceIds = useStore(useShallow((s) => s.workspaces.map((w) => w.id)));
+  // An ended task is never a rail row (owner decision 2026-10-16), only one
+  // waiting for a slot or still open.
   const railTasks = useMemo(() => {
     const open = new Set(openWorkspaceIds);
     return tasks.filter((task) => {
       const pane = task.workerWorkspaceId ?? task.taskWorkspaceId;
-      return task.stage === 'waiting_slot' || !pane || !open.has(pane);
+      const ended = task.status === 'completed' || task.status === 'cancelled' || task.status === 'failed';
+      return task.stage === 'waiting_slot' || (!ended && (!pane || !open.has(pane)));
     });
   }, [tasks, openWorkspaceIds]);
   // PR and issue links become chips: titled from a thread this conversation
@@ -2091,7 +2312,7 @@ export function BotsChat({ conversation, roomCards, bots, title, workspaceName, 
     resumable: (taskId) => taskRows.some((row) => (row.tasks ?? []).some((task) => task.taskId === taskId && task.worker === 'resumable')),
     run: resumeShown,
   }), [readOnly, resumePort, taskRows, resumeShown]);
-  const ctx: RowCtx = { t, bots, actors, api, now, readOnly, jobPort: readOnly ? undefined : jobPort, nameOf, botNames, taskTitle, requestTitle, idLabels, sent, started, onThread, onOpenBot, markdown, ...(conversation.kind === 'bot' ? { selfBot: conversation.row.bot.id } : {}), ...(cardResume ? { resume: cardResume } : {}) };
+  const ctx: RowCtx = { t, bots, actors, api, now, readOnly, jobPort: readOnly ? undefined : jobPort, nameOf, botNames, taskTitle, requestTitle, idLabels, sent, started, onThread, onOpenBot, markdown, ...(conversation.kind === 'bot' ? { selfBot: conversation.row.bot.id } : {}), ...(cardResume ? { resume: cardResume } : {}), work: workCtx };
   // The open thread is read whole, from its first card (the cached room
   // timeline holds only its newest page), and shown from every card read
   // for the room — not only this conversation's.
@@ -2112,11 +2333,11 @@ export function BotsChat({ conversation, roomCards, bots, title, workspaceName, 
           type="button"
           ref={pillRef}
           data-bots-pill
-          aria-expanded={conversation.kind === 'bot' ? profileOpen : undefined}
+          aria-expanded={conversation.kind === 'bot' && !removedBot ? profileOpen : undefined}
           aria-haspopup={conversation.kind === 'room' && onEditGroup ? 'dialog' : undefined}
           title={conversation.kind === 'room' && onEditGroup ? t('botsPage.group.edit') : undefined}
           onClick={() => (conversation.kind === 'bot' ? setProfileOpen((v) => !v) : onEditGroup?.())}
-          disabled={conversation.kind !== 'bot' && !onEditGroup}
+          disabled={removedBot || (conversation.kind !== 'bot' && !onEditGroup)}
           className={`wmux-bots-pill ${FOCUS_RING}`}
         >
           {conversation.kind === 'bot' ? <BotAvatar bot={conversation.row.bot} size={20} /> : <RoomAvatar bots={conversation.bots} size={20} layout="row" />}
@@ -2124,8 +2345,9 @@ export function BotsChat({ conversation, roomCards, bots, title, workspaceName, 
           {presence && <PresenceDot presence={presence} />}
           {group && <span className="shrink-0 text-[11px] text-[var(--text-muted)]">{conversation.bots.length === 1 ? t('botsPage.botCountOne') : t('botsPage.botCount', { count: conversation.bots.length })}</span>}
         </button>
+        {tree.length > 0 && <HeadWorkers rows={tree} name={title} shownId={shownId} t={t} onOpen={openWorker} />}
       </div>
-      {profileOpen && conversation.kind === 'bot' && (
+      {profileOpen && conversation.kind === 'bot' && !removedBot && (
         <div className="wmux-bots-profile" ref={profileRef}><BotProfile row={conversation.row} workers={workers} workspaceName={workspaceName} t={t} stopPort={stopPort} jobPort={readOnly ? undefined : jobPort} adminPort={readOnly ? (jobPort?.remove ? { remove: jobPort.remove } : undefined) : jobPort} /></div>
       )}
 
@@ -2147,7 +2369,7 @@ export function BotsChat({ conversation, roomCards, bots, title, workspaceName, 
           }}
         >
           <div className="wmux-bots-column">
-            {empty && conversation.kind === 'bot' && (
+            {empty && conversation.kind === 'bot' && !removedBot && (
               <ChatIntro row={conversation.row} t={t} readOnly={readOnly} onPick={(text) => setPrefill({ text, nonce: Date.now() })} />
             )}
             {empty && conversation.kind === 'room' && (
@@ -2165,6 +2387,9 @@ export function BotsChat({ conversation, roomCards, bots, title, workspaceName, 
 
       <div className="wmux-bots-column wmux-bots-foot">
         <WorkingRail turns={turns} tasks={railTasks} t={t} now={now} readOnly={readOnly} resumePort={resumePort} shownId={shownId} onOpen={openWorker} />
+        {removedBot ? (
+          <p data-bots-removed-note className="py-3 text-center text-[12px] text-[var(--text-muted)]">{t('botsPage.removedChat')}</p>
+        ) : (
         <div className="wmux-bots-composer">
           <BotsComposer
             conversation={conversation}
@@ -2179,6 +2404,7 @@ export function BotsChat({ conversation, roomCards, bots, title, workspaceName, 
             prefill={prefill}
           />
         </div>
+        )}
       </div>
     </section>
     {((openThread && threadShown) || (shownId && shown)) && <SideSplitter areaRef={areaRef} split={split} t={t} onChange={onSplit} />}

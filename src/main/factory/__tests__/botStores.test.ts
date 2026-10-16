@@ -22,10 +22,11 @@ import {
   HOUR_MS,
   hourlyCap,
   turnsUsedDay,
+  workerTimeAllowedAt,
 } from '../budget';
 import { FactorySettingsStore, factorySettingsPath, mergeFactorySettings, DEFAULT_FACTORY_SETTINGS } from '../factorySettings';
 import { __resetBotHooksForTesting, onBotHook, type BotHookEvent } from '../botHooks';
-import { DEFAULT_BOT_BUDGETS } from '../../../shared/bot';
+import { DEFAULT_BOT_BUDGETS, IDENTITY_SPREAD } from '../../../shared/bot';
 import { WAKE_LIMITS } from '../../../shared/wake';
 import { BOTS_PLAN_CONSENT_VERSION } from '../../../shared/factorySettings';
 
@@ -79,6 +80,94 @@ describe('BotStore', () => {
     expect(parseBotProfile(stored)).toMatchObject({ id: r.bot.id });
     expect(parseBotProfile(stored)?.workerAgent).toBeUndefined();
     expect(parseBotProfile({ ...stored, workerAgent: { agent: 'codex' } })?.workerAgent).toEqual({ agent: 'codex' });
+  });
+
+  it('an old profile with no models loads unchanged (default brain, preset workers), stays version 1, and a stored model that fails the rule is dropped, the bot kept', async () => {
+    fs.mkdirSync(path.dirname(botsFilePath(dir)), { recursive: true });
+    const old = {
+      version: 1, id: 'bot-0a0a0a21', workspaceId: 'ws-1', role: 'moa', template: 'coordinator', name: 'Coordinator', hue: 5,
+      engine: { kind: 'claude-sdk' }, triggers: [], budget: DEFAULT_BOT_BUDGETS.moa, enabled: true, createdAt: 1, updatedAt: 1,
+    };
+    const pinned = { ...old, id: 'bot-0a0a0a22', role: 'lead', template: 'developer', name: 'Dev', hue: 2, engine: { kind: 'claude-sdk', model: 'claude-opus-5-5', effort: 'high' } };
+    const bad = { ...old, id: 'bot-0a0a0a23', role: 'lead', template: 'developer', name: 'Bad', hue: 4, engine: { kind: 'claude-sdk', model: 'claude opus', effort: 'low' } };
+    const variant = { ...old, id: 'bot-0a0a0a24', role: 'lead', template: 'developer', name: 'Long', hue: 3, engine: { kind: 'claude-sdk', model: 'sonnet[1m]' } };
+    fs.writeFileSync(botsFilePath(dir), JSON.stringify({ version: 1, bots: [old, pinned, bad, variant] }));
+    const s = newStore();
+    s.load();
+    // No template model is put on a stored coordinator: it stays on the default.
+    expect(s.get(old.id)?.engine).toEqual({ kind: 'claude-sdk' });
+    expect(s.get(old.id)?.workerAgent).toBeUndefined();
+    expect(s.get(pinned.id)?.engine).toEqual({ kind: 'claude-sdk', model: 'claude-opus-5-5', effort: 'high' });
+    expect(s.get(bad.id)?.engine).toEqual({ kind: 'claude-sdk', effort: 'low' });
+    // A bot's own model may carry a variant suffix (an SDK option, not a shell word).
+    expect(s.get(variant.id)?.engine).toEqual({ kind: 'claude-sdk', model: 'sonnet[1m]' });
+    // Written back as it was read: version 1, the untouched profiles equal.
+    await s.flush();
+    const disk = JSON.parse(fs.readFileSync(botsFilePath(dir), 'utf8'));
+    expect(disk.version).toBe(1);
+    expect(disk.bots[0]).toEqual(old);
+    expect(disk.bots[1]).toEqual(pinned);
+  });
+
+  it('a new bot starts on its template\'s models; an explicit engine or worker agent wins; Custom has none', () => {
+    const s = newStore();
+    const made = (input: Parameters<BotStore['create']>[0]) => {
+      const r = s.create(input);
+      if (!r.ok) throw new Error(r.message);
+      return r.bot;
+    };
+    for (const template of ['coordinator', 'issue', 'researcher'] as const) {
+      const b = made({ workspaceId: 'ws-1', template });
+      expect(b.engine).toEqual({ kind: 'claude-sdk', model: 'haiku' });
+      expect(b.workerAgent).toBeUndefined();
+    }
+    for (const template of ['developer', 'reviewer'] as const) {
+      const b = made({ workspaceId: 'ws-1', template });
+      expect(b.engine).toEqual({ kind: 'claude-sdk' });
+      expect(b.workerAgent).toEqual({ agent: 'claude', model: 'opus' });
+    }
+    expect(made({ workspaceId: 'ws-1', template: 'custom' })).toMatchObject({ engine: { kind: 'claude-sdk' } });
+    expect(made({ workspaceId: 'ws-1', template: 'custom' }).workerAgent).toBeUndefined();
+    expect(made({ workspaceId: 'ws-1', template: 'coordinator', engine: { kind: 'claude-sdk', model: 'sonnet' } }).engine).toEqual({ kind: 'claude-sdk', model: 'sonnet' });
+    expect(made({ workspaceId: 'ws-1', template: 'developer', workerAgent: { agent: 'codex', model: 'gpt-6.1-sol' } }).workerAgent).toEqual({ agent: 'codex', model: 'gpt-6.1-sol' });
+    // A factory default engine that already names a model keeps it.
+    const own = new BotStore(botsFilePath(dir), { now, newId: () => 'bot-000000ee', defaultEngine: () => ({ kind: 'claude-sdk', model: 'claude-sonnet-5-5' }) });
+    const o = own.create({ workspaceId: 'ws-2', template: 'coordinator' });
+    expect(o.ok && o.bot.engine).toEqual({ kind: 'claude-sdk', model: 'claude-sonnet-5-5' });
+  });
+
+  it('refuses a bot model or worker model that fan-out would refuse, on create and on update', () => {
+    const s = newStore();
+    for (const model of ['--dangerously-skip-permissions', 'claude opus', '-m', 'x'.repeat(65)]) {
+      expect(s.create({ workspaceId: 'ws-1', engine: { kind: 'claude-sdk', model } })).toMatchObject({ ok: false, code: 'invalid_argument' });
+      expect(s.create({ workspaceId: 'ws-1', workerAgent: { agent: 'claude', model } })).toMatchObject({ ok: false, code: 'invalid_argument' });
+    }
+    // An empty engine model is refused (absent means the default); for a
+    // worker, fan-out reads '' as "no model given".
+    expect(s.create({ workspaceId: 'ws-1', engine: { kind: 'claude-sdk', model: '' } })).toMatchObject({ ok: false, code: 'invalid_argument' });
+    const r = s.create({ workspaceId: 'ws-1', name: 'Dev' });
+    if (!r.ok) throw new Error('create');
+    expect(s.update(r.bot.id, { engine: { kind: 'claude-sdk', model: '--yolo' } })).toMatchObject({ ok: false, code: 'invalid_argument', message: expect.stringMatching(/model id/) });
+    expect(s.update(r.bot.id, { engine: { kind: 'claude-sdk', effort: 'turbo' } })).toMatchObject({ ok: false, code: 'invalid_argument' });
+    expect(s.update(r.bot.id, { engine: { kind: 'claude-sdk', model: 'claude-haiku-4-5-20251001', effort: 'low' } })).toMatchObject({ ok: true, bot: { engine: { kind: 'claude-sdk', model: 'claude-haiku-4-5-20251001', effort: 'low' } } });
+    expect(s.update(r.bot.id, { workerAgent: { agent: 'claude', model: 'opus', effort: 'max' } })).toMatchObject({ ok: true, bot: { workerAgent: { agent: 'claude', model: 'opus', effort: 'max' } } });
+    // The brain keeps a variant suffix; a worker's model lands on a shell line, so it does not.
+    expect(s.update(r.bot.id, { engine: { kind: 'claude-sdk', model: 'sonnet[1m]' } })).toMatchObject({ ok: true, bot: { engine: { kind: 'claude-sdk', model: 'sonnet[1m]' } } });
+    expect(s.update(r.bot.id, { workerAgent: { agent: 'claude', model: 'sonnet[1m]' } })).toMatchObject({ ok: false, code: 'invalid_argument' });
+  });
+
+  it('a usage-limit park keeps its until across a reload; only an error park carries one', async () => {
+    const s = newStore();
+    const r = s.create({ workspaceId: 'ws-1', name: 'Dev' });
+    if (!r.ok) throw new Error('create');
+    s.setParked(r.bot.id, { reason: 'error', at: 5, until: 99 });
+    expect(s.get(r.bot.id)?.parked).toEqual({ reason: 'error', at: 5, until: 99 });
+    await s.flush();
+    const again = newStore();
+    again.load();
+    expect(again.get(r.bot.id)?.parked).toEqual({ reason: 'error', at: 5, until: 99 });
+    again.setParked(r.bot.id, { reason: 'human', at: 6, until: 99 });
+    expect(again.get(r.bot.id)?.parked).toEqual({ reason: 'human', at: 6 });
   });
 
   it('creates with role defaults; any number of bots of one role share a workspace', () => {
@@ -196,24 +285,68 @@ describe('BotStore', () => {
     expect(s.create({ workspaceId: 'ws-4', role: 'lead', triggers: [{ kind: 'pr.opened', filter: { repoKey: 'h/a//c' } }] }).ok).toBe(false);
   });
 
-  it('a removed bot leaves a tombstone (name, role, colour slot) that survives a reload; a bad slot is not kept', async () => {
+  it('a removed bot leaves a tombstone (name, role, its stored colour slot) that survives a reload', async () => {
     const s = newStore();
     const a = s.create({ workspaceId: 'ws-1', template: 'developer', name: 'Developer' });
     const b = s.create({ workspaceId: 'ws-1', name: 'Other' });
     if (!a.ok || !b.ok) throw new Error('create');
+    expect([a.bot.hue, b.bot.hue]).toEqual([IDENTITY_SPREAD[0], IDENTITY_SPREAD[1]]);
+    // The store's slot wins over the remover's.
     expect(s.remove(a.bot.id, { hue: 3 })).toBe(true);
     expect(s.remove(b.bot.id, { hue: 99 })).toBe(true);
     expect(s.remove(a.bot.id)).toBe(false);
     expect(s.get(a.bot.id)).toBeNull();
     expect(s.listRemoved()).toEqual([
-      { id: a.bot.id, workspaceId: 'ws-1', role: 'lead', template: 'developer', name: 'Developer', hue: 3, removedAt: clock },
-      { id: b.bot.id, workspaceId: 'ws-1', role: 'lead', template: 'custom', name: 'Other', removedAt: clock },
+      { id: a.bot.id, workspaceId: 'ws-1', role: 'lead', template: 'developer', name: 'Developer', hue: IDENTITY_SPREAD[0], removedAt: clock },
+      { id: b.bot.id, workspaceId: 'ws-1', role: 'lead', template: 'custom', name: 'Other', hue: IDENTITY_SPREAD[1], removedAt: clock },
     ]);
     await s.flush();
     const t = newStore();
     t.load();
     expect(t.list()).toHaveLength(0);
-    expect(t.listRemoved().map((r) => [r.name, r.hue])).toEqual([['Developer', 3], ['Other', undefined]]);
+    expect(t.listRemoved().map((r) => [r.name, r.hue])).toEqual([['Developer', IDENTITY_SPREAD[0]], ['Other', IDENTITY_SPREAD[1]]]);
+  });
+
+  it('identity slots: kept across a relaunch after a delete, a new bot takes the freed slot, rooms count apart', async () => {
+    const s = newStore();
+    const made = ['A', 'B', 'C'].map((name) => {
+      const r = s.create({ workspaceId: 'ws-1', name });
+      if (!r.ok) throw new Error('create');
+      clock += 1;
+      return r.bot;
+    });
+    expect(made.map((b) => b.hue)).toEqual(IDENTITY_SPREAD.slice(0, 3));
+    expect(s.remove(made[0].id)).toBe(true);
+    await s.flush();
+    const t = newStore();
+    t.load();
+    // The survivors keep their characters after the relaunch.
+    expect(t.list().map((b) => [b.name, b.hue])).toEqual([['B', IDENTITY_SPREAD[1]], ['C', IDENTITY_SPREAD[2]]]);
+    // A new bot takes the removed bot's slot (the tombstone does not block it).
+    const d = t.create({ workspaceId: 'ws-1', name: 'D' });
+    const other = t.create({ workspaceId: 'ws-2', name: 'E' });
+    if (!d.ok || !other.ok) throw new Error('create');
+    expect(d.bot.hue).toBe(IDENTITY_SPREAD[0]);
+    expect(other.bot.hue).toBe(IDENTITY_SPREAD[0]);
+  });
+
+  it('identity slots: a file from before slots gets them once, in creation order, written back', async () => {
+    const base = { version: 1, role: 'lead', template: 'custom', engine: { kind: 'claude-sdk' }, triggers: [], budget: DEFAULT_BOT_BUDGETS.lead, enabled: true, updatedAt: 1 };
+    fs.mkdirSync(path.dirname(botsFilePath(dir)), { recursive: true });
+    fs.writeFileSync(botsFilePath(dir), JSON.stringify({
+      version: 1,
+      bots: [
+        { ...base, id: 'bot-0a0a0a03', workspaceId: 'ws-1', name: 'Third', createdAt: 30 },
+        { ...base, id: 'bot-0a0a0a01', workspaceId: 'ws-1', name: 'First', createdAt: 10 },
+        { ...base, id: 'bot-0a0a0a02', workspaceId: 'ws-1', name: 'Second', createdAt: 20, hue: IDENTITY_SPREAD[0] },
+      ],
+    }));
+    const s = newStore();
+    s.load();
+    expect(Object.fromEntries(s.list().map((b) => [b.name, b.hue]))).toEqual({ Second: IDENTITY_SPREAD[0], First: IDENTITY_SPREAD[1], Third: IDENTITY_SPREAD[2] });
+    await s.flush();
+    const onDisk = JSON.parse(fs.readFileSync(botsFilePath(dir), 'utf8')) as { bots: Array<{ name: string; hue?: number }> };
+    expect(onDisk.bots.every((b) => b.hue !== undefined)).toBe(true);
   });
 
   it('persists profiles and usage, and refuses a file of another version', async () => {
@@ -298,6 +431,23 @@ describe('budget windows', () => {
     expect(budgetLeft(open, u, 5)).toMatchObject({ turnsHour: null, turnsDay: 1 });
     recordTurn(u, 4);
     expect(checkTurn(open, u, 5)).toEqual({ ok: false, reason: 'turns_day' });
+  });
+
+  it('workerTimeAllowedAt: now under the cap, else when enough of the last day\'s worker time leaves it', () => {
+    const u = emptyUsage(); // cap: 1 worker-hour a day
+    recordWorkerStart(u, 'a', 0);
+    recordWorkerEnd(u, 'a', 30 * 60_000);
+    expect(workerTimeAllowedAt(budget, u, HOUR_MS)).toBe(HOUR_MS);
+    recordWorkerStart(u, 'b', HOUR_MS);
+    recordWorkerEnd(u, 'b', 2 * HOUR_MS);
+    const now = 3 * HOUR_MS;
+    // 1.5 h used: under the cap once the first run and the start of the
+    // second have left the day.
+    const at = workerTimeAllowedAt(budget, u, now);
+    expect(Math.abs(at - 25 * HOUR_MS)).toBeLessThanOrEqual(1_000);
+    expect(checkWorkers(budget, u, 0, 1, at).ok).toBe(true);
+    expect(checkWorkers(budget, u, 0, 1, at - 2_000).ok).toBe(false);
+    expect(workerTimeAllowedAt({ ...budget, maxWorkerHoursPerDay: 0 }, u, now)).toBe(Infinity);
   });
 
   it('nextTurnAllowedAt: now when a turn is allowed, else when the window that refuses frees one', () => {

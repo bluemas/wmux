@@ -7,7 +7,10 @@ import type { HookSignalRouter } from '../hooks/HookSignalRouter';
 import { dispatchNotification } from './dispatchNotification';
 import { toastManager } from './ToastManager';
 import {
+  clearEscapeKey,
   clearPty as clearSuppression,
+  ESC_INTERRUPT_CONFIRM_MS,
+  recentlyEscaped,
   recentlySettled,
   SETTLE_REDRAW_GUARD_MS,
 } from './idleSuppression';
@@ -16,6 +19,7 @@ import {
   getLastBroadcastAgentStatus,
   clearLastBroadcastAgentStatus,
 } from '../ipc/handlers/metadata.handler';
+import { noteBootSettled } from './turnEvidence';
 import { settleHookTurnToIdle, broadcastSettledIdle, holdsUnreadResult, holdsUnsettledRunningClaim } from './turnSettle';
 import { eventBus } from '../events/EventBus';
 import {
@@ -779,6 +783,8 @@ export class DaemonNotificationRouter {
               settleHookTurnToIdle(payload.sessionId, this.getHookRouter?.() ?? null, win, this.now());
             }
           } else if (metadataKind === 'agent.user_prompt_submit') {
+            // A new turn: an Escape from the last one must not confirm a redraw of its row.
+            clearEscapeKey(payload.sessionId);
             const hookRouter = this.getHookRouter?.();
             if (ev.signal && hookRouter) {
               const mirrored = this.getMirror().peek();
@@ -1248,6 +1254,9 @@ export class DaemonNotificationRouter {
 
     const onIdle = (payload: { sessionId: string; preTurn?: boolean }) => {
       const now = Date.now();
+      // The daemon's own word that no turn ran since the agent's SessionStart:
+      // turn-end evidence for the bot workers' idle stops, whatever the dot does.
+      if (payload.preTurn === true) noteBootSettled(payload.sessionId, now);
       // Daemon-mode twin of the PTYBridge.onActiveToIdle gate: byte silence on
       // a hook-governed pane is not a turn end (quiet reasoning, a long tool
       // call), so the clear would only make the dot flicker. The hook's Stop
@@ -1381,6 +1390,19 @@ export class DaemonNotificationRouter {
       }
     };
 
+    // The agent printed its own "turn interrupted" row. It confirms a lone
+    // Escape (recorded by PTYBridge.noteInterruptInput) as an interrupt; with
+    // no recent Escape it is an old turn's row, reprinted by a redraw.
+    const onAgentInterrupted = (payload: { sessionId: string }) => {
+      try {
+        if (!recentlyEscaped(payload.sessionId, ESC_INTERRUPT_CONFIRM_MS, this.now())) return;
+        clearEscapeKey(payload.sessionId);
+        settleHookTurnToIdle(payload.sessionId, this.getHookRouter?.() ?? null, this.getWindow(), this.now());
+      } catch (err) {
+        console.warn('[DaemonNotificationRouter] agent interrupted error:', err);
+      }
+    };
+
     // session:died (natural PTY exit) and session:destroyed (pty:dispose)
     // both clear agentStatus. Only listening to session:died left a stale
     // sidebar dot when the user closed a terminal intentionally (Codex P2).
@@ -1480,6 +1502,7 @@ export class DaemonNotificationRouter {
     this.daemonClient.on('session:died', onSessionEnd);
     this.daemonClient.on('session:destroyed', onSessionEnd);
     this.daemonClient.on('session:agentProcessExit', onAgentProcessExit);
+    this.daemonClient.on('session:agentInterrupted', onAgentInterrupted);
     this.daemonClient.on('session:transcriptActivity', onTranscriptActivity);
     this.daemonClient.on('session:restarted', onRestarted);
     this.daemonClient.on('supervision:changed', onSupervisionChanged);
@@ -1514,6 +1537,7 @@ export class DaemonNotificationRouter {
       () => this.daemonClient.off('session:died', onSessionEnd),
       () => this.daemonClient.off('session:destroyed', onSessionEnd),
       () => this.daemonClient.off('session:agentProcessExit', onAgentProcessExit),
+      () => this.daemonClient.off('session:agentInterrupted', onAgentInterrupted),
       () => this.daemonClient.off('session:transcriptActivity', onTranscriptActivity),
       () => this.daemonClient.off('session:restarted', onRestarted),
       () => this.daemonClient.off('supervision:changed', onSupervisionChanged),

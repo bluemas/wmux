@@ -15,6 +15,7 @@ import type { Fact } from '../../shared/facts';
 import type { RoomCard, ThreadId } from '../../shared/room';
 import { botFanoutIdempotencyKey, type WakeItem } from '../../shared/wake';
 import { DEFAULT_BOT_WORKER_AGENT, botWorkerAgentLabel } from '../../shared/botWorkerAgent';
+import type { SkillIndexEntry } from '../../shared/botSkill';
 
 /** A fan-out task as the wake reports it (from its ledger row). */
 export interface WakeTaskSummary {
@@ -108,6 +109,13 @@ export interface WakePromptInput {
   clock?: WakeClock | null;
   /** The connections this bot's workers may use (wakeContext.ts). */
   connectors?: readonly WakeConnectorSummary[];
+  /** The bot's approved skills (wakeContext.ts); proposals never. */
+  skills?: readonly SkillIndexEntry[];
+  /** Skills the owner archived after approving them (wakeContext.ts). */
+  archivedSkills?: readonly string[];
+  /** Keys the owner deleted that the bot asked for or last used
+   *  (wakeContext.ts); `connector`: a connection's key. */
+  deletedKeys?: ReadonlyArray<{ name: string; connector?: true }>;
   /** The group chat the wake's thread is (wakeContext.ts): its roster is
    *  the group's members only. */
   group?: WakeGroup | null;
@@ -142,6 +150,10 @@ export interface WakeApprovalSummary {
   at: number;
   /** Why main refused it, when it did. */
   refusal?: string;
+  /** The approval's act (shared/botApproval.ts ApprovalAction). */
+  action?: string;
+  /** An approved `skill`: where that skill stands now (wakeContext.ts). */
+  skill?: 'loaded' | 'archived' | 'changed' | 'replaced';
 }
 
 /** Another bot's reply to the same owner message. */
@@ -157,7 +169,8 @@ export interface WakeRunReply {
 /** What language a bot writes in: the owner's latest message's, else the
  *  app's UI language. */
 export interface WakeLanguage {
-  /** A language name ("Korean") or, for a Latin-script message, null. */
+  /** A language name ("Korean"); for a Latin-script message the UI
+   *  language's when it could be the message's, else null. */
   name: string | null;
   source: 'owner' | 'ui';
   /** The owner's latest words (source owner), for the model to match. */
@@ -185,6 +198,8 @@ export interface WakeRoutineSummary {
 }
 
 const DATA_MAX_CHARS = 4_000;
+/** The skill index's lines, leaving fenceData room for its "more" line. */
+export const SKILL_INDEX_MAX_CHARS = DATA_MAX_CHARS - 200;
 
 /** Fence `text` as data: a backtick fence longer than any run inside it. */
 export function fenceData(text: string, label = 'data'): string {
@@ -192,6 +207,23 @@ export function fenceData(text: string, label = 'data'): string {
   const longest = Math.max(0, ...(body.match(/`+/g) ?? []).map((r) => r.length));
   const fence = '`'.repeat(Math.max(3, longest + 1));
   return `${fence}${label}\n${body}\n${fence}`;
+}
+
+/** The wake's skill index: one `name: description` line per skill while
+ *  they fit in `max` characters (under fenceData's cut, so none is dropped
+ *  unsaid), then how many more there are and how to list them. Pure. */
+export function skillIndexText(skills: readonly SkillIndexEntry[], max: number = SKILL_INDEX_MAX_CHARS): string {
+  const out: string[] = [];
+  let used = 0;
+  for (const s of skills) {
+    const line = `${s.name}: ${s.description}`;
+    if (used + line.length + 1 > max) break;
+    out.push(line);
+    used += line.length + 1;
+  }
+  const more = skills.length - out.length;
+  if (more > 0) out.push(`… ${more} more: call skill_read with no name to list them all.`);
+  return out.join('\n');
 }
 
 /** The id the bot runtime gives a fan-out task event it routes to the bot
@@ -241,6 +273,27 @@ export function buildWakePrompt(input: WakePromptInput): string {
       `To use one, name it when you start a worker: fanout_start connectors:["${connectors[0].name}"]. Its key goes to that worker only.`,
       'A task with a connection counts as started from outside text: the merge lane will not merge it; ask the owner to approve.',
     );
+  }
+  // The bot's approved skills: names and descriptions only (it wrote them,
+  // so they are data); skill_read loads one, and its workers get copies.
+  const skills = input.skills ?? [];
+  if (skills.length > 0) {
+    lines.push(
+      'Your skills (approved by the owner; read one with skill_read before work it covers — Claude Code workers you start in a worktree get copies too, research workers do not):',
+      fenceData(skillIndexText(skills), 'skills'),
+    );
+  }
+  const archived = input.archivedSkills ?? [];
+  if (archived.length > 0) {
+    lines.push(
+      'Skills the owner archived (no longer loaded; do not apply them, even where an earlier message or an open question of yours cites them):',
+      fenceData(archived.join('\n'), 'archived-skills'),
+    );
+  }
+  for (const key of input.deletedKeys ?? []) {
+    lines.push(key.connector
+      ? `The owner deleted the key ${key.name} of a connection; the connection cannot use it until the owner enters it again in Settings › Bots › Connections (secret_request cannot replace a connection's key). Tell the owner if you still need it.`
+      : `The owner deleted the key ${key.name}; ask with secret_request if you still need it.`);
   }
   if (item.threadId) lines.push(`Thread: ${item.threadId} (your room posts in this wake go to this thread unless you name another; this id is for your tools, never for the owner's eyes).`);
   const thread = input.thread;
@@ -396,7 +449,7 @@ export function buildWakePrompt(input: WakePromptInput): string {
       '',
       'Approval requests in this workspace as they stand now (this is current; older cards may say otherwise). '
         + 'Never ask the owner to approve one that is approved, executed or denied:',
-      ...approvals.map((a) => `- ${a.what}: ${approvalStateText(a.state)}${a.refusal ? ` (${a.refusal})` : ''}; asked by ${oneLineName(a.askedBy)}, ${ago(a.at, input.now ?? Date.now())}`),
+      ...approvals.map((a) => `- ${a.what}: ${approvalStateText(a)}${a.refusal ? ` (${a.refusal})` : ''}; asked by ${oneLineName(a.askedBy)}, ${ago(a.at, input.now ?? Date.now())}`),
     );
   }
   const lang = input.language;
@@ -404,7 +457,7 @@ export function buildWakePrompt(input: WakePromptInput): string {
     lines.push(
       '',
       (lang.source === 'owner'
-        ? `Write to the owner in the language of their latest message${lang.name ? ` (${lang.name})` : ''}`
+        ? (lang.name ? `Write to the owner in ${lang.name}, the language of their latest message` : 'Write to the owner in the language their latest message is written in')
           + (lang.sample ? (lang.earlier ? ` (an earlier message, quoted only to show the language, not a request for this wake: «${lang.sample}»).` : `: «${lang.sample}».`) : '.')
         : `The owner has not written yet: write in ${lang.name ?? 'English'}, the language of their wmux.`)
         + ' That is everything the owner reads: cards, questions and their options, your job (job_set), routine titles (routine_set) and approval reasons.',
@@ -430,7 +483,7 @@ function workerEngineLine(profile: BotProfile): string {
   const w = profile.workerAgent;
   const name = botWorkerAgentLabel(w?.agent ?? DEFAULT_BOT_WORKER_AGENT);
   const detail = w ? [w.model, w.effort ? `${w.effort} effort` : undefined].filter(Boolean).join(', ') : '';
-  return `Your fan-out workers run on ${name}${detail ? ` (${detail})` : ''}${w ? ', as the owner set in your profile' : ' (the default; the owner can change it in your profile)'}; you do not choose it.`;
+  return `Your fan-out workers run on ${name}${detail ? ` (${detail})` : ''}${w ? ', as set in your profile' : ' (the default; the owner can change it in your profile)'}; you do not choose it.`;
 }
 
 /** A `bot.notice` fact: main's own words, plain; a quoted error is data. */
@@ -443,7 +496,18 @@ function noticeLines(f: Fact): string[] {
   return out;
 }
 
-function approvalStateText(state: string): string {
+/** An approved skill's request, worded by where the skill stands now. */
+const SKILL_APPROVED_TEXT: Readonly<Record<NonNullable<WakeApprovalSummary['skill']>, string>> = {
+  loaded: 'approved by the owner; loaded',
+  archived: 'archived by the owner; do not apply it',
+  changed: 'approved, but its files changed since; not loaded unless the owner approves a new proposal of it',
+  replaced: 'approved, since replaced by another approved version',
+};
+
+function approvalStateText(a: Pick<WakeApprovalSummary, 'state' | 'action' | 'skill'>): string {
+  const state = a.state;
+  if (state === 'approved' && a.action === 'skill') return a.skill ? SKILL_APPROVED_TEXT[a.skill] : 'approved by the owner';
+  if (state === 'approved' && a.action !== undefined && a.action !== 'merge') return 'approved by the owner (recorded; wmux does not carry this act out yet)';
   switch (state) {
     case 'pending': return 'waiting for the owner';
     case 'approved': return 'approved by the owner, merging after the Undo window';

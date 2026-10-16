@@ -13,7 +13,11 @@ import type { RpcContext } from '../../../../shared/rpc';
 
 vi.mock('../_bridge', () => ({ sendToRenderer: vi.fn() }));
 vi.mock('../../../git/git', () => ({ git: vi.fn() }));
-vi.mock('../../../deck/deckDecisionStore', () => ({ loadWorkspaceDecision: vi.fn(() => null) }));
+// Partial: the handoff router (imported by the handler) reads its limits.
+vi.mock('../../../deck/deckDecisionStore', async (actual) => ({
+  ...(await actual<typeof import('../../../deck/deckDecisionStore')>()),
+  loadWorkspaceDecision: vi.fn(() => null),
+}));
 
 import { sendToRenderer } from '../_bridge';
 import { git } from '../../../git/git';
@@ -25,6 +29,8 @@ import type { FanoutPreset } from '../../../../shared/fanoutPreset';
 import { DEFAULT_BOT_BUDGETS, type BotProfile, type BotRole } from '../../../../shared/bot';
 import { emptyUsage } from '../../../factory/budget';
 import type { ThreadId } from '../../../../shared/room';
+import type { BotGroup } from '../../../../shared/botGroup';
+import { setFactoryRoomPorts } from '../../../factory/roomWriter';
 import type { BotWorkerStartOutcome } from '../../../factory/botNotices';
 import { SecretStore, setSecretStore } from '../../../factory/secretStore';
 import { ConnectorStore } from '../../../factory/connectorStore';
@@ -356,17 +362,116 @@ describe('task.fanout.start — bot origin', () => {
     expect((r.start.mock.calls[0][0] as FanOutRequest).threadId).toBe('pr:github.com/acme/app#12');
   });
 
-  it('records no thread for a wake in general or with none, and never one the bot names', async () => {
-    for (const t of ['general', null, 'not a thread']) {
+  it('records no thread for a wake in general or with none, nor for General named', async () => {
+    const cases: Array<[string | null, string | undefined]> = [['general', undefined], [null, undefined], ['not a thread', undefined], ['pr:o/r#12', 'general']];
+    for (const [t, named] of cases) {
       const r = rig('verifier');
       r.setThread(t);
       const res = await r.call(
-        { idempotencyKey: 'wake:w-1:1', titles: ['verify'], preset: 'verify', checkout: { sha: SHA }, threadId: 'issue:acme/app#21' },
+        { idempotencyKey: 'wake:w-1:1', titles: ['verify'], preset: 'verify', checkout: { sha: SHA }, ...(named ? { threadId: named } : {}) },
         botCtx('verifier'),
       );
       expect(res.status).toBe('accepted');
       await r.flush();
       expect(r.start.mock.calls[0][0] as FanOutRequest).not.toHaveProperty('threadId');
+    }
+  });
+
+  it('records the thread the bot names over its wake\'s: a wake about one PR starting the next', async () => {
+    for (const [named, recorded] of [['pr:o/r#31', 'pr:github.com/o/r#31'], [`dm:${BOT_ID}`, `dm:${BOT_ID}`]] as const) {
+      const r = rig('verifier');
+      r.setThread('pr:o/r#12');
+      const res = await r.call(
+        { idempotencyKey: 'wake:w-1:1', titles: ['verify #31'], preset: 'verify', checkout: { sha: SHA }, threadId: named },
+        botCtx('verifier'),
+      );
+      expect(res.status).toBe('accepted');
+      await r.flush();
+      expect((r.start.mock.calls[0][0] as FanOutRequest).threadId).toBe(recorded);
+    }
+  });
+
+  it('refuses a thread the bot may not post in, or one that is no thread, before anything starts', async () => {
+    for (const named of ['dm:bot-99999999', 'group:grp-0a1b2c3d', 'not a thread']) {
+      const r = rig('verifier');
+      r.setThread('pr:o/r#12');
+      const res = await r.call(
+        { idempotencyKey: 'wake:w-1:1', titles: ['verify'], preset: 'verify', checkout: { sha: SHA }, threadId: named },
+        botCtx('verifier'),
+      );
+      expect(errorOf(res)).toMatchObject({ code: 'INVALID_ARGUMENT', message: expect.stringContaining('thread') });
+      await r.flush();
+      expect(r.start).not.toHaveBeenCalled();
+    }
+  });
+
+  it('takes a group chat the bot is in, and another bot\'s 1:1 only from the wake running in it', async () => {
+    const OTHER_DM = 'dm:bot-99999999';
+    let wakeThread: string | null = null;
+    setFactoryRoomPorts(() => ({
+      currentWakeThread: () => wakeThread as ThreadId | null,
+      groups: { byThread: (_ws, t) => (t === 'group:grp-0a1b2c3d' ? { memberIds: [BOT_ID] } : t === 'group:grp-0b0b0b0b' ? { memberIds: ['bot-99999999'] } : null) as BotGroup | null },
+    }));
+    try {
+      const attempt = async (named: string): Promise<Record<string, unknown>> =>
+        rig('verifier').call({ idempotencyKey: 'wake:w-1:1', titles: ['verify'], preset: 'verify', checkout: { sha: SHA }, threadId: named }, botCtx('verifier'));
+      expect((await attempt('group:grp-0a1b2c3d')).status).toBe('accepted');
+      expect(errorOf(await attempt('group:grp-0b0b0b0b')).code).toBe('INVALID_ARGUMENT');
+      expect(errorOf(await attempt(OTHER_DM)).code).toBe('INVALID_ARGUMENT');
+      wakeThread = OTHER_DM;
+      expect((await attempt(OTHER_DM)).status).toBe('accepted');
+    } finally {
+      setFactoryRoomPorts(() => null);
+    }
+  });
+
+  it('with no thread named, records the PR its tasks check out (pull/<n>/head) over a subject wake\'s, not over a conversation\'s', async () => {
+    const cases: Array<[string | null, string]> = [
+      ['pr:o/r#12', 'pr:github.com/o/r#31'],
+      [null, 'pr:github.com/o/r#31'],
+      ['handoff:h-x', 'handoff:h-x'],
+      [`dm:${BOT_ID}`, `dm:${BOT_ID}`],
+    ];
+    for (const [wakeThread, recorded] of cases) {
+      const r = rig('verifier');
+      r.setThread(wakeThread);
+      const res = await r.call(
+        { idempotencyKey: 'wake:w-1:1', titles: ['verify #31'], preset: 'verify', checkout: { sha: SHA, fetchRef: 'pull/31/head' } },
+        botCtx('verifier'),
+      );
+      expect(res.status).toBe('accepted');
+      await r.flush();
+      expect((r.start.mock.calls[0][0] as FanOutRequest).threadId).toBe(recorded);
+    }
+  });
+
+  it('records the handoff the task\'s subject belongs to (HandoffRouter.taskHandoff), not always the wake\'s', async () => {
+    const PR31 = 'pr:github.com/o/r#31';
+    const cases: Array<[string | null, Record<string, unknown>, Record<string, unknown>]> = [
+      // A wake about PR #12 starting the worker for #31: its subject is #31's thread and PR.
+      ['pr:o/r#12', { checkout: { sha: SHA, fetchRef: 'pull/31/head' } }, { threadId: PR31, pr: { number: 31, threadId: PR31 } }],
+      // A handoff's own thread stays the task's, but the PR it checks out is still its subject.
+      ['handoff:h-x', { checkout: { sha: SHA, fetchRef: 'pull/31/head' } }, { pr: { number: 31, threadId: PR31 } }],
+      // A named PR thread names the PR too.
+      ['pr:o/r#12', { checkout: { sha: SHA }, threadId: 'pr:o/r#31' }, { threadId: PR31, pr: { number: 31, threadId: PR31 } }],
+      ['handoff:h-x', { checkout: { sha: SHA }, threadId: 'handoff:h-y' }, { threadId: 'handoff:h-y' }],
+      ['pr:o/r#12', { checkout: { sha: SHA } }, {}],
+      // General names no subject; the PR checked out still is one.
+      ['pr:o/r#12', { checkout: { sha: SHA, fetchRef: 'pull/31/head' }, threadId: 'general' }, { pr: { number: 31, threadId: PR31 } }],
+    ];
+    for (const [wakeThread, extra, subject] of cases) {
+      for (const answer of ['h-31', null]) {
+        const r = rig('verifier');
+        r.setThread(wakeThread);
+        const taskHandoff = vi.fn(() => answer);
+        r.port.taskHandoff = taskHandoff;
+        expect((await r.call({ idempotencyKey: 'wake:w-1:1', titles: ['verify'], preset: 'verify', ...extra }, botCtx('verifier'))).status).toBe('accepted');
+        await r.flush();
+        expect(taskHandoff).toHaveBeenCalledWith({ workspaceId: 'ws-bot', botId: BOT_ID }, subject, 'h-dispatch');
+        const req = r.start.mock.calls[0][0] as FanOutRequest;
+        if (answer) expect(req.handoffId).toBe(answer);
+        else expect(req).not.toHaveProperty('handoffId');
+      }
     }
   });
 
@@ -425,6 +530,38 @@ describe('task.fanout.start — bot origin', () => {
     expect(errorOf(await r.call({ idempotencyKey: 'wake:w-1:2', titles: ['x'], preset: 'verify', checkout: { sha: SHA } }, botCtx('verifier'))).code).toBe('RESOURCE_EXHAUSTED');
     expect(r.port.exhausted).toEqual(['concurrent_workers', 'factory_workers']);
     expect(r.start).not.toHaveBeenCalled();
+  });
+
+  it('reads the workers\' panes fresh before the factory-wide cap check (#2255)', async () => {
+    const r = rig('verifier');
+    // The last check saw three live workers; two have paused since.
+    r.setOpen({ bot: 0, factory: 3 });
+    r.port.refreshLiveness = async () => {
+      r.setOpen({ bot: 0, factory: 1 });
+    };
+    const res = await r.call({ idempotencyKey: 'wake:w-1:1', titles: ['x'], preset: 'verify', checkout: { sha: SHA } }, botCtx('verifier'));
+    expect(res.status).toBe('accepted');
+    expect(r.port.exhausted).toEqual([]);
+  });
+
+  it('a poll of a known key answers without waiting on the panes read (#2255)', async () => {
+    const r = rig('verifier');
+    const params = { idempotencyKey: 'wake:w-1:1', titles: ['verify'], preset: 'verify', checkout: { sha: SHA } };
+    expect((await r.call(params, botCtx('verifier'))).status).toBe('accepted');
+    await r.flush();
+    const refresh = vi.fn(() => new Promise<void>(() => undefined));
+    r.port.refreshLiveness = refresh;
+    expect((await r.call(params, botCtx('verifier'))).status).toBe('completed');
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it('a panes read that hangs delays a new fan-out by the bounded wait only (#2255)', async () => {
+    const r = rig('verifier');
+    r.port.refreshLiveness = () => new Promise<void>(() => undefined);
+    const at = Date.now();
+    const res = await r.call({ idempotencyKey: 'wake:w-1:1', titles: ['x'], preset: 'verify', checkout: { sha: SHA } }, botCtx('verifier'));
+    expect(res.status).toBe('accepted');
+    expect(Date.now() - at).toBeLessThan(5_000);
   });
 
   it('a second concurrent start counts the first one still being started', async () => {
@@ -608,6 +745,15 @@ describe('task.fanout.start — bot origin', () => {
       expect((plain.start.mock.calls[0][0] as FanOutRequest).agents).toEqual([{ agent: 'claude' }]);
       // The bot still cannot name an engine itself.
       expect((await codex.call({ idempotencyKey: 'wake:w-1:2', titles: ['x'], agents: [{ agent: 'claude' }] }, botCtx('lead'))).status).not.toBe('accepted');
+    });
+
+    it('a model-only worker pick (the developer template\'s) puts every task on that model; research keeps working on it', async () => {
+      const r = rig('lead', { workerAgent: { agent: 'claude', model: 'opus' } }, { builtinPresets: true });
+      expect((await r.call({ idempotencyKey: 'wake:w-1:1', titles: ['a', 'b'], prompt: 'build it', preset: 'default' }, botCtx('lead'))).status).toBe('accepted');
+      expect((await r.call({ idempotencyKey: 'wake:w-1:2', titles: ['q'], prompt: 'q', preset: 'research' }, botCtx('lead'))).status).toBe('accepted');
+      await r.flush();
+      expect((r.start.mock.calls[0][0] as FanOutRequest).agents).toEqual([{ agent: 'claude', model: 'opus' }, { agent: 'claude', model: 'opus' }]);
+      expect((r.start.mock.calls[1][0] as FanOutRequest).agents).toEqual([{ agent: 'claude', model: 'opus' }]);
     });
 
     it('verify refuses a fan-out without a checkout; the other presets refuse one', async () => {

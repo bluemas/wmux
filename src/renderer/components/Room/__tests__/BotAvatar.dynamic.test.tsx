@@ -141,6 +141,19 @@ describe('bot identity', () => {
     expect(botIdentityColor(added.id)).toBe(before[0]);
   });
 
+  it('a bot with a stored slot (BotProfile.hue) keeps it, whatever the others and their order; one without falls back to the spread', () => {
+    const kept = [
+      { id: 'bot-kept-b', createdAt: 2, workspaceId: 'ws-kept', hue: IDENTITY_SPREAD[1] },
+      { id: 'bot-kept-c', createdAt: 3, workspaceId: 'ws-kept', hue: IDENTITY_SPREAD[2] },
+    ];
+    noteBotIdentities(kept, true);
+    expect(botCharacter('bot-kept-b')).toBe(MOCHI_CHARACTERS[IDENTITY_SPREAD[1]]);
+    expect(botCharacter('bot-kept-c')).toBe(MOCHI_CHARACTERS[IDENTITY_SPREAD[2]]);
+    const legacy = { id: 'bot-kept-old', createdAt: 9, workspaceId: 'ws-kept' };
+    noteBotIdentities([...kept, legacy], true);
+    expect(botCharacter(legacy.id)).toBe(MOCHI_CHARACTERS[IDENTITY_SPREAD[0]]);
+  });
+
   it('a bot\'s character is the one of its colour slot: each character wears its own designed colour', () => {
     expect(MOCHI_CHARACTERS.map((c) => c.body)).toEqual([...BOT_IDENTITY_HUES]);
     expect(new Set(MOCHI_CHARACTERS.map((c) => c.name)).size).toBe(BOT_IDENTITY_HUES.length);
@@ -235,6 +248,10 @@ describe('BotAvatar', () => {
     for (const cls of ['.wmux-mochi-body', '.wmux-mochi-eye', '.wmux-mochi-sig']) expect(reduced).toContain(cls);
     expect(reduced).toContain('animation: none !important');
     expect(css).toMatch(/\[data-avatar-offscreen\][^{]*\{\s*animation-play-state: paused/);
+    // A hidden window stops (not pauses) every animated part: Blink keeps a removed
+    // element's animations, and its detached tree, until the next drawn frame.
+    for (const cls of ['.wmux-mochi-body', '.wmux-mochi-eye', '.wmux-mochi-sig']) expect(css).toContain(`:root[data-document-hidden] .wmux-mochi ${cls}`);
+    expect(css).toMatch(/:root\[data-document-hidden\] \.wmux-mochi \.wmux-mochi-sig\s*\{\s*animation: none !important/);
     // Every character's animated parts carry the shared role classes the rules key on.
     for (let i = 1; i <= 8; i++) expect(css).toContain(`.wmux-mochi.is-working .wmux-mo${i}-root`);
     // Every animation the rules name has its keyframes (a missing one leaves a character still).

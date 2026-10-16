@@ -347,6 +347,21 @@ export function isProvisionalCapture(prev: ResumeBinding | undefined, next: Resu
 }
 
 /**
+ * True when the agent's transcript moved to another project folder between two
+ * captures of the same session. Claude relocates the transcript when it changes
+ * its own working directory (EnterWorktree, ExitWorktree) and `--resume <id>`
+ * then only works from the new folder. A Bash-tool `cd` changes the hook's
+ * `cwd` too, but leaves the transcript where it was, so resuming still needs
+ * the original folder. Only a relocation may move the pane's cwd.
+ */
+export function transcriptRelocated(prev: ResumeBinding | undefined, next: ResumeBinding): boolean {
+  if (!prev?.transcriptPath || !next.transcriptPath) return false;
+  if (prev.agent !== next.agent || prev.sessionId !== next.sessionId) return false;
+  const folder = (p: string) => p.replace(/[\\/][^\\/]*$/, '');
+  return folder(prev.transcriptPath) !== folder(next.transcriptPath);
+}
+
+/**
  * X6 ③: merge a freshly-captured binding over the previously-persisted one,
  * keeping `permissionMode` and `transcriptPath` STICKY. The bridge reads
  * permissionMode from the transcript's last 64KB; a turn that writes >64KB after
@@ -527,6 +542,38 @@ export function isResumableLaunchCommand(command: string): boolean {
   if (tokens.length === 0) return false;
   const stem = launcherStem(tokens[0].value);
   return RESUME_BY_LAUNCHER.has(stem) && !alreadyResumingOrOneShot(stem, tokens);
+}
+
+/**
+ * The conversation a Claude launch line pins (`--session-id <uuid>`, see
+ * withLaunchSessionId) and the permission mode its flags start it in
+ * (`--dangerously-skip-permissions`, `--permission-mode <mode>`; the last one
+ * wins, as for Claude Code). Null for a line that is not a Claude launch or
+ * pins no id. Only unquoted words before an unquoted `--` count: a quoted word
+ * is a prompt or a path. The caller unwraps a leading worker model-env marker
+ * first. Pure.
+ */
+export function launchedConversation(command: string): { sessionId: string; permissionMode?: PermissionMode } | null {
+  const tokens = tokenize(command);
+  if (tokens.length === 0 || tokens[0].quoted) return null;
+  const stem = launcherStem(tokens[0].value);
+  const pin = RESUME_BY_LAUNCHER.get(stem)?.pin;
+  if (!pin || !agentSupportsPermissionFlag(stem)) return null;
+  let sessionId: string | undefined;
+  let permissionMode: PermissionMode | undefined;
+  for (let i = 1; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t.quoted) continue;
+    if (t.value === '--') break;
+    const next = tokens[i + 1];
+    const value = (flag: string): string | undefined => (t.value === flag ? (next && !next.quoted ? next.value : undefined) : t.value.startsWith(`${flag}=`) ? t.value.slice(flag.length + 1) : undefined);
+    const id = value(pin);
+    if (id !== undefined && UUID_RE.test(id)) sessionId = id.toLowerCase();
+    if (t.value === '--dangerously-skip-permissions') permissionMode = 'bypassPermissions';
+    const mode = value('--permission-mode');
+    if (mode !== undefined && Object.prototype.hasOwnProperty.call(PERMISSION_FLAG, mode)) permissionMode = mode as PermissionMode;
+  }
+  return sessionId ? { sessionId, ...(permissionMode ? { permissionMode } : {}) } : null;
 }
 
 /**

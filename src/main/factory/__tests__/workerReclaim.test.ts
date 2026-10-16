@@ -12,7 +12,9 @@ import {
   isReclaimableEnd,
   isReclaimableReport,
   isReclaimedSince,
+  isWslWorkerPane,
   clearVerdict,
+  lifecycleCardTask,
   paneTurnEnded,
   noteWorkerAgentExit,
   reclaimWorker,
@@ -102,6 +104,14 @@ describe('isReclaimableEnd', () => {
   });
 });
 
+describe('lifecycleCardTask', () => {
+  it('names a task by its title, else by its short id', () => {
+    expect(lifecycleCardTask('Review PR #12', 'wtask-mvb2yimk-nj7z9ddg')).toBe('Review PR #12');
+    expect(lifecycleCardTask('  ', 'wtask-mvb2yimk-nj7z9ddg')).toBe('nj7z9ddg');
+    expect(lifecycleCardTask(undefined, 'wtask-mvb2yimk-nj7z9ddg')).toBe('nj7z9ddg');
+  });
+});
+
 describe('reclaimWorker', () => {
   it('stops the agent of every pane started in the worktree and records its conversation', async () => {
     const store = ReclaimedWorkers.at(dir);
@@ -113,7 +123,9 @@ describe('reclaimWorker', () => {
     expect(rec?.sessions).toEqual([{ sessionId: 'daemon-1', cwd: wt, resumeSessionId: UUID, permissionMode: 'bypassPermissions' }]);
     expect(rec?.state).toBe('stopped');
     expect(reclaimedWorkerState(store.get(rec!.taskId))).toBe('resumable');
-    expect(note.mock.calls[0][2]).toBe('Worker done (resumable)');
+    // The card names its task, so cards for tasks that ended together differ.
+    expect(note.mock.calls[0][2]).toBe('Worker done (resumable): perf-A');
+    expect(note.mock.calls[0][4]).toEqual({ code: 'worker.doneResumable', args: { status: 'completed', title: 'perf-A' } });
   });
 
   it('records nothing (and the worker keeps running) without a worktree or when every stop is refused; no pane left is recorded as nothing to stop', async () => {
@@ -127,6 +139,38 @@ describe('reclaimWorker', () => {
     const refused = reclaimPorts(store, [session()], { stopAgent: async () => ({ ok: false, code: 'unsupported' }) });
     expect(await reclaimWorker(refused.ports, row('completed'), 'completed')).toBeNull();
     expect(store.all()).toEqual([]);
+  });
+
+  it('a conversation no hook gave a mode (only SessionStart) resumes in the mode its launch line started it in', async () => {
+    const store = ReclaimedWorkers.at(dir);
+    const noMode = session({ agentProcessAlive: false, resumeBinding: { agent: 'claude', sessionId: UUID, cwd: wt } });
+    const launchedConversation = vi.fn((id: string) => (id === 'daemon-1' ? { sessionId: UUID, permissionMode: 'bypassPermissions' as const } : null));
+    const rec = await reclaimWorker(reclaimPorts(store, [noMode], { launchedConversation }).ports, row('completed'), 'completed');
+    expect(rec?.sessions[0]).toMatchObject({ resumeSessionId: UUID, permissionMode: 'bypassPermissions' });
+    const typeLine = vi.fn(() => true);
+    const r = await resumeWorker({ store, listSessions: async () => [noMode], typeLine, now: () => 9_000 }, 'wtask-abc-12345678', { kind: 'owner' });
+    expect(r).toMatchObject({ ok: true });
+    expect(typeLine).toHaveBeenCalledWith('daemon-1', `claude --resume ${UUID} --dangerously-skip-permissions`);
+  });
+
+  it('fills no mode for another conversation or a pane wmux did not launch, and keeps a mode a hook recorded', async () => {
+    const OTHER = '3fdb815c-c5dd-4354-92e7-78b232462903';
+    const noMode = session({ resumeBinding: { agent: 'claude', sessionId: UUID, cwd: wt } });
+    const cases: Array<[string, WorkerReclaimPorts['launchedConversation'], WorkerSessionInfo, string | undefined]> = [
+      // The pane's launch pinned another conversation (a later `claude` typed in it).
+      ['other', () => ({ sessionId: OTHER, permissionMode: 'bypassPermissions' }), noMode, undefined],
+      // No bot worker record for the pane (one the owner opened in the worktree).
+      ['owner', () => null, noMode, undefined],
+      // The launch line carried no mode flag.
+      ['flagless', () => ({ sessionId: UUID }), noMode, undefined],
+      // A hook recorded the mode: it is kept.
+      ['hook', () => ({ sessionId: UUID, permissionMode: 'bypassPermissions' }), session({ resumeBinding: { agent: 'claude', sessionId: UUID, cwd: wt, permissionMode: 'acceptEdits' } }), 'acceptEdits'],
+    ];
+    for (const [name, launchedConversation, pane, want] of cases) {
+      const store = ReclaimedWorkers.at(path.join(dir, name));
+      const rec = await reclaimWorker(reclaimPorts(store, [pane], { launchedConversation }).ports, row('completed'), 'completed');
+      expect(rec?.sessions[0].permissionMode, name).toBe(want);
+    }
   });
 
   it('persists the record across a reload', async () => {
@@ -164,6 +208,136 @@ async function settled(store: ReclaimedWorkers): Promise<void> {
   const any = store.all()[0];
   if (any) await store.put(any);
 }
+
+describe('a WSL worker (#2254): the daemon cannot stop its Linux agent', () => {
+  const unsupported = () => vi.fn(async () => ({ ok: false, code: 'unsupported' }));
+  const WSL = { distribution: 'Ubuntu-24.04', user: 'me' };
+  // Its launch line runs (OSC 133); its Linux agent was never attributed.
+  const wslWorker = (over: Partial<WorkerSessionInfo> = {}) => session({ agentProcessAlive: undefined, commandRunning: true, wslTarget: WSL, ...over });
+
+  it('isWslWorkerPane: a WSL pane running its launch line, never a plain WSL shell, an exec unit or a Windows pane', () => {
+    expect(isWslWorkerPane(wslWorker())).toBe(true);
+    expect(isWslWorkerPane(wslWorker({ commandRunning: false }))).toBe(false);
+    expect(isWslWorkerPane(wslWorker({ commandRunning: undefined }))).toBe(false);
+    expect(isWslWorkerPane(wslWorker({ agentProcessAlive: false }))).toBe(false);
+    expect(isWslWorkerPane(wslWorker({ exec: { command: 'claude' } }))).toBe(false);
+    expect(isWslWorkerPane(session({ commandRunning: true }))).toBe(false);
+  });
+
+  // The task's own workspace holds daemon-1; the owner's pane daemon-2,
+  // opened in the same folder from another workspace, runs vim there.
+  const ownPanes = (ws: string) => (ws === 'ws-task' ? ['daemon-1'] : ['daemon-2']);
+
+  it('a completed or cancelled task\'s WSL worker is stopped by closing its pane, as its card says; the owner\'s WSL pane in the same folder stays', async () => {
+    for (const ended of ['completed', 'cancelled'] as const) {
+      const store = ReclaimedWorkers.at(fs.mkdtempSync(path.join(dir, 'e-')));
+      const closePane = vi.fn(async () => undefined);
+      const { ports, note } = reclaimPorts(store, [wslWorker(), wslWorker({ id: 'daemon-2' })], { stopAgent: unsupported(), closePane, workspacePanes: ownPanes });
+      const rec = await reclaimWorker(ports, row(ended), ended);
+      expect(closePane.mock.calls).toEqual([['daemon-1']]);
+      expect(rec?.sessions.map((x) => x.sessionId)).toEqual(['daemon-1']);
+      expect(note.mock.calls[0][3]).toContain('Its pane closes.');
+    }
+  });
+
+  it('a resumed WSL worker whose pane a resume opened in a new workspace is closed there when its task ends', async () => {
+    const store = ReclaimedWorkers.at(dir);
+    await store.put({ taskId: 'wtask-abc-12345678', botId: BOT, ownerWorkspaceId: 'ws-owner', taskWorkspaceId: 'ws-task', paneWorkspaceId: 'ws-pane', title: 't', threadId: 'task:x' as never, ended: 'completed', sessions: [{ sessionId: 'daemon-1', cwd: wt }], state: 'resumed', at: 1 });
+    const closePane = vi.fn(async () => undefined);
+    const { ports } = reclaimPorts(store, [wslWorker()], { stopAgent: unsupported(), closePane, workspacePanes: (ws) => (ws === 'ws-pane' ? ['daemon-1'] : []) });
+    await reclaimWorker(ports, row('completed', { rev: 5 }), 'completed');
+    expect(closePane).toHaveBeenCalledWith('daemon-1');
+    await settled(store);
+  });
+
+  it('with the workspace tree unknown (or not given), no WSL pane is closed', async () => {
+    for (const workspacePanes of [() => null, undefined]) {
+      const store = ReclaimedWorkers.at(fs.mkdtempSync(path.join(dir, 'u-')));
+      const closePane = vi.fn(async () => undefined);
+      const { ports } = reclaimPorts(store, [wslWorker()], { stopAgent: unsupported(), closePane, workspacePanes });
+      expect(await reclaimWorker(ports, row('completed'), 'completed')).toBeNull();
+      expect(closePane).not.toHaveBeenCalled();
+    }
+  });
+
+  it('a WSL pane in the same folder but outside the task\'s workspace is never closed', async () => {
+    for (const workspacePanes of [(ws: string) => (ws === 'ws-other' ? ['daemon-1'] : []), undefined]) {
+      const store = ReclaimedWorkers.at(fs.mkdtempSync(path.join(dir, 'o-')));
+      const closePane = vi.fn(async () => undefined);
+      const { ports } = reclaimPorts(store, [wslWorker()], { stopAgent: unsupported(), closePane, ...(workspacePanes ? { workspacePanes } : {}) });
+      await reclaimWorker(ports, row('completed'), 'completed');
+      expect(closePane).not.toHaveBeenCalled();
+    }
+  });
+
+  it('an exec unit or a plain WSL shell in the worktree is never closed', async () => {
+    for (const pane of [session({ exec: { command: 'claude' } }), wslWorker({ commandRunning: false })]) {
+      const store = ReclaimedWorkers.at(fs.mkdtempSync(path.join(dir, 's-')));
+      const closePane = vi.fn(async () => undefined);
+      const { ports } = reclaimPorts(store, [pane], { stopAgent: unsupported(), closePane, workspacePanes: ownPanes });
+      expect(await reclaimWorker(ports, row('completed'), 'completed')).toBeNull();
+      expect(closePane).not.toHaveBeenCalled();
+    }
+  });
+
+  it('an idle reported (still open) or failed task keeps its WSL worker\'s pane: nothing is closed, no card says it paused', async () => {
+    for (const ended of ['reported', 'failed'] as const) {
+      const store = ReclaimedWorkers.at(fs.mkdtempSync(path.join(dir, 'r-')));
+      const current = row(ended === 'reported' ? 'review_requested' : 'failed', { updatedAt: 1_000 });
+      const closePane = vi.fn(async () => undefined);
+      const { ports, note } = reclaimPorts(store, [wslWorker()], { row: () => current, turnEnded: () => true, stopAgent: unsupported(), closePane, workspacePanes: ownPanes });
+      expect(await reclaimWorker(ports, current, ended)).toBeNull();
+      expect(closePane).not.toHaveBeenCalled();
+      expect(note).not.toHaveBeenCalled();
+      expect(store.all()).toEqual([]);
+    }
+  });
+
+  it('the stop of a resumed WSL worker closes its pane and counts it; a plain WSL shell and a pane outside its workspace stay', async () => {
+    const put = async (store: ReclaimedWorkers) => store.put({ taskId: 'wtask-abc-12345678', botId: BOT, ownerWorkspaceId: 'ws-owner', taskWorkspaceId: 'ws-task', title: 't', threadId: 'task:x' as never, ended: 'completed', sessions: [{ sessionId: 'daemon-1', cwd: wt }], state: 'resumed', at: 1 });
+    const store = ReclaimedWorkers.at(dir);
+    await put(store);
+    const closePane = vi.fn(async () => undefined);
+    const p: WorkerResumePorts = { store, listSessions: async () => [wslWorker()], typeLine: () => false, stopAgent: unsupported(), closePane, workspacePanes: ownPanes };
+    expect(await stopResumedWorkers(p, BOT)).toEqual({ stopped: 1, failed: 0, taskIds: ['wtask-abc-12345678'] });
+    expect(closePane).toHaveBeenCalledWith('daemon-1');
+    expect(store.get('wtask-abc-12345678')?.state).toBe('stopped');
+
+    const shellStore = ReclaimedWorkers.at(path.join(dir, 'shell'));
+    await put(shellStore);
+    const keep = vi.fn(async () => undefined);
+    const shell: WorkerResumePorts = { store: shellStore, listSessions: async () => [wslWorker({ commandRunning: false })], typeLine: () => false, stopAgent: unsupported(), closePane: keep, workspacePanes: ownPanes };
+    expect(await stopResumedWorkers(shell, BOT)).toEqual({ stopped: 0, failed: 1, taskIds: [] });
+    expect(keep).not.toHaveBeenCalled();
+
+    const otherStore = ReclaimedWorkers.at(path.join(dir, 'other'));
+    await put(otherStore);
+    const other: WorkerResumePorts = { store: otherStore, listSessions: async () => [wslWorker()], typeLine: () => false, stopAgent: unsupported(), closePane: keep, workspacePanes: () => ['daemon-2'] };
+    expect(await stopResumedWorkers(other, BOT)).toEqual({ stopped: 0, failed: 1, taskIds: [] });
+    expect(keep).not.toHaveBeenCalled();
+  });
+
+  it('the resume of a WSL worker is refused while a WSL agent still runs in its folder', async () => {
+    const store = ReclaimedWorkers.at(dir);
+    await store.put({ taskId: 'wtask-abc-12345678', botId: BOT, ownerWorkspaceId: 'ws-owner', taskWorkspaceId: 'ws-task', title: 't', threadId: 'task:x' as never, ended: 'completed', sessions: [{ sessionId: 'daemon-1', cwd: '/mnt/c/Users/me/wt', resumeSessionId: UUID, permissionMode: 'bypassPermissions' }], state: 'stopped', at: 1 });
+    const respawn = vi.fn(async () => ({ ok: true as const, workspaceId: 'ws-new', sessionId: 'daemon-9' }));
+    const other = wslWorker({ id: 'daemon-7', spawnCwd: '/mnt/c/Users/me/wt', cwd: '/mnt/c/Users/me/wt' });
+    const r = await resumeWorker({ store, listSessions: async () => [other], typeLine: () => false, respawn, folderExists: () => true, platform: 'win32', now: () => 9_000 }, 'wtask-abc-12345678', { kind: 'owner' });
+    expect(r).toMatchObject({ ok: false, code: 'already_running' });
+    expect(respawn).not.toHaveBeenCalled();
+  });
+
+  it('the resume of a WSL worker whose pane closed opens the recorded Linux folder as its Windows folder', async () => {
+    const store = ReclaimedWorkers.at(dir);
+    await store.put({ taskId: 'wtask-abc-12345678', botId: BOT, ownerWorkspaceId: 'ws-owner', taskWorkspaceId: 'ws-task', title: 't', threadId: 'task:x' as never, ended: 'completed', sessions: [{ sessionId: 'daemon-1', cwd: '/mnt/c/Users/me/wt', resumeSessionId: UUID, permissionMode: 'bypassPermissions' }], state: 'stopped', at: 1 });
+    const folderExists = vi.fn((d: string) => d === 'C:\\Users\\me\\wt');
+    const respawn = vi.fn(async () => ({ ok: true as const, workspaceId: 'ws-new', sessionId: 'daemon-9' }));
+    const r = await resumeWorker({ store, listSessions: async () => [], typeLine: () => false, respawn, folderExists, platform: 'win32', now: () => 9_000 }, 'wtask-abc-12345678', { kind: 'owner' });
+    expect(r).toMatchObject({ ok: true, sessionId: 'daemon-9' });
+    expect(respawn).toHaveBeenCalledWith(expect.objectContaining({ cwd: 'C:\\Users\\me\\wt' }));
+    await settled(store);
+  });
+});
 
 describe('a reported task whose worker sat idle (refused or failed gate)', () => {
   it('paneTurnEnded: a reported end outweighs an outstanding claim; a running turn or a prompt does not', () => {
@@ -246,9 +420,9 @@ describe('a reported task whose worker sat idle (refused or failed gate)', () =>
     if (!rec) throw new Error('not recorded');
     expect(rec).toMatchObject({ ended: 'reported', endRev: 3 });
     expect(reclaimedWorkerState(rec)).toBe('resumable');
-    expect(note.mock.calls.map((c) => c[2])).toEqual(['Worker paused (resumable)']);
+    expect(note.mock.calls.map((c) => c[2])).toEqual(['Worker paused (resumable): perf-A']);
     // Its stable code (worded in the reader's language) and the task its Resume acts on.
-    expect(note.mock.calls[0].slice(4)).toEqual([{ code: 'worker.pausedResumable' }, 'wtask-abc-12345678']);
+    expect(note.mock.calls[0].slice(4)).toEqual([{ code: 'worker.pausedResumable', args: { title: 'perf-A' } }, 'wtask-abc-12345678']);
     // Its workspace stays open (closing it would cancel the task).
     expect(clearVerdict(rec, true, 'ws-elsewhere')).toBe('keep');
     // The task completes later: the record follows the end, with no second stop and no second card.
@@ -289,8 +463,12 @@ describe('a research task (scratch folder, no worktree)', () => {
     const research = row('completed', { dispatch: { origin: { kind: 'bot', botId: BOT }, preset: RESEARCH_PRESET } });
     // The mission names the scratch folder as its outputDir; there is no worktreePath.
     const rpc = async () => ({ ok: true, tasks: [{ id: research.id, outputDir: wt }] });
-    const { ports } = reclaimPorts(store, [session()], { worktreeOf: (entry) => taskFolderFromMissions(rpc, entry) });
+    const { ports, note } = reclaimPorts(store, [session()], { worktreeOf: (entry) => taskFolderFromMissions(rpc, entry) });
     expect(await reclaimWorker(ports, research, 'completed')).toMatchObject({ state: 'stopped', sessions: [{ cwd: wt, resumeSessionId: UUID }] });
+    // Its card speaks of a task folder, not a worktree, and says so in its code.
+    expect(note.mock.calls[0][3]).toContain('The task folder and the conversation are kept');
+    expect(note.mock.calls[0][3]).not.toContain('worktree');
+    expect(note.mock.calls[0][4]).toEqual({ code: 'worker.doneResumable', args: { status: 'completed', title: 'perf-A', kind: 'research' } });
 
     // In its own pane.
     const typeLine = vi.fn(() => true);
@@ -333,9 +511,13 @@ describe('resumeWorker', () => {
 
   it('types the exact resume line into the recorded pane and marks the worker resumed', async () => {
     const store = await reclaimed();
-    const { ports, typeLine } = resumePorts(store, [session({ agentProcessAlive: false })]);
+    const note = vi.fn();
+    const { ports, typeLine } = resumePorts(store, [session({ agentProcessAlive: false })], { note });
     const r = await resumeWorker(ports, 'wtask-abc-12345678', { kind: 'owner' });
     expect(r).toMatchObject({ ok: true, sessionId: 'daemon-1', resumeSessionId: UUID });
+    // Its card names the task it resumed.
+    expect(note.mock.calls[0][2]).toBe('Worker resumed: perf-A');
+    expect(note.mock.calls[0][4]).toEqual({ code: 'worker.resumed', args: { by: 'owner', where: expect.any(String), title: 'perf-A' } });
     expect(typeLine).toHaveBeenCalledWith('daemon-1', `claude --resume ${UUID} --dangerously-skip-permissions`);
     expect(store.get('wtask-abc-12345678')?.state).toBe('resumed');
     // Its agent exiting makes it resumable again.

@@ -48,10 +48,34 @@ describe('resolveBotRepo', () => {
     expect(r).toMatchObject({ ok: false, code: 'not_a_repo' });
   });
 
+  it('a repository git will not open over ownership is not "not a checkout" (#2231)', async () => {
+    const folder = '/mnt/wsl/repo';
+    const dubious: GitResult = {
+      stdout: '',
+      stderr: "fatal: detected dubious ownership in repository at '//wsl.localhost/Ubuntu/home/dev/repo'\nTo add an exception for this directory, call:\n\n\tgit config --global --add safe.directory '%(prefix)///wsl.localhost/Ubuntu/home/dev/repo'\n",
+      code: 128,
+    };
+    const r = await resolveBotRepo(folder, { git: fakeGit(dubious, fail) });
+    expect(r).toMatchObject({ ok: false, code: 'repo_untrusted' });
+    if (r.ok) throw new Error('unreachable');
+    expect(r.message).toContain("git config --global --add safe.directory '%(prefix)///wsl.localhost/Ubuntu/home/dev/repo'");
+    expect(r.message).toContain(folder);
+    // The origin read refused the same way (the root is trusted, its gitdir is not).
+    const atOrigin = await resolveBotRepo('/src/app', { git: fakeGit(ok('/src/app\n'), dubious), realpath: (p) => p });
+    expect(atOrigin).toMatchObject({ ok: false, code: 'repo_untrusted' });
+  });
+
   it('refuses a checkout without an origin, or whose origin names no owner/repo', async () => {
     const top = ok('/src/app\n');
     expect(await resolveBotRepo('/src/app', { git: fakeGit(top, fail), realpath: (p) => p })).toMatchObject({ ok: false, code: 'no_remote' });
     expect(await resolveBotRepo('/src/app', { git: fakeGit(top, ok('/srv/git/app.git\n')), realpath: (p) => p })).toMatchObject({ ok: false, code: 'no_remote' });
+    // The refusal says what origin has to be, not only that it is wrong: the
+    // folder picker is the only way to link, so the fix is in the repository.
+    for (const url of [fail, ok('/srv/git/app.git\n')]) {
+      const r = await resolveBotRepo('/src/app', { git: fakeGit(top, url), realpath: (p) => p });
+      expect(r.ok ? '' : r.message).toMatch(/https:\/\/github\.com\/<owner>\/<repo>\.git/);
+      expect(r.ok ? '' : r.message).toContain('A local path or a bare repository on disk cannot be used.');
+    }
     expect(await resolveBotRepo('/src/app', { git: fakeGit(top, ok('https://gitlab.example.com/app.git\n')), realpath: (p) => p }))
       .toMatchObject({ ok: false, code: 'no_remote' });
     // A GitLab subgroup project is a repository, keyed by its whole path.

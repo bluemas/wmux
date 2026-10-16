@@ -86,6 +86,7 @@ export function surfaceNewInitialCommand(raw: unknown): string | undefined | nul
   return raw;
 }
 import { workspaceCloseRefusal } from '../components/Moa/moaHqGuard';
+import { reserveLeaf } from '../utils/reservedLeaves';
 
 // ---------------------------------------------------------------------------
 // Cold-park (TASK-9) daemon-backed read fallback
@@ -1324,6 +1325,10 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
     const newWsId = newWs.id;
     const paneId = newWs.activePaneId;
 
+    // The empty-leaf funnel must not start a shell in the leaf this spawn is
+    // about to fill (reservedLeaves.ts); released once the worker is in it,
+    // or the workspace is rolled back.
+    const releaseLeaf = reserveLeaf(paneId);
     let ptyId: string;
     try {
       const created = await window.electronAPI.pty.create(
@@ -1335,6 +1340,7 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
       const rollback = useStore.getState();
       rollback.removeWorkspace(newWsId);
       rollback.setActiveWorkspace(previousActiveId);
+      releaseLeaf();
       return { error: `mcp.claimWorkspace: PTY create failed — ${err instanceof Error ? err.message : String(err)}` };
     }
 
@@ -1345,9 +1351,11 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
       try { await window.electronAPI.pty.dispose(ptyId); } catch { /* best-effort */ }
       afterPty.removeWorkspace(newWsId);
       afterPty.setActiveWorkspace(previousActiveId);
+      releaseLeaf();
       return { error: 'mcp.claimWorkspace: pane disappeared during PTY creation' };
     }
     afterPty.addSurface(paneId, ptyId, '', '');
+    releaseLeaf();
 
     // Restore focus to whatever the user was looking at before — claim must
     // never steal the active view.
@@ -1609,6 +1617,10 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
     // after the marker decision, and after the profile has had its say.
     const launchCommand = createOptions.initialCommand ?? '';
 
+    // The empty-leaf funnel must not start a shell in the leaf this spawn is
+    // about to fill (reservedLeaves.ts); released once the worker is in it,
+    // or the workspace is rolled back.
+    const releaseLeaf = reserveLeaf(paneId);
     let ptyId: string;
     try {
       const created = await window.electronAPI.pty.create(
@@ -1619,6 +1631,7 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
       const rollback = useStore.getState();
       rollback.removeWorkspace(newWsId);
       rollback.setActiveWorkspace(previousActiveId);
+      releaseLeaf();
       return { error: `fanout.spawnWorkspace: PTY create failed — ${err instanceof Error ? err.message : String(err)}` };
     }
 
@@ -1628,9 +1641,11 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
       try { await window.electronAPI.pty.dispose(ptyId); } catch { /* best-effort */ }
       afterPty.removeWorkspace(newWsId);
       afterPty.setActiveWorkspace(previousActiveId);
+      releaseLeaf();
       return { error: 'fanout.spawnWorkspace: pane disappeared during PTY creation' };
     }
     afterPty.addSurface(paneId, ptyId, '', cwd, newWsId);
+    releaseLeaf();
 
     // 포커스 복원 — fan-out 스폰이 사람 화면을 훔치지 않는다. 아래 role 스탬프
     // 앞에 둔다: setRole은 IPC 왕복이고, 그 사이 사용자 화면이 새 워크스페이스에
