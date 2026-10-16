@@ -62,6 +62,7 @@ export const PHONE_ROOM_NOTICE_CODES: Readonly<Record<string, PhoneNoticeCode>> 
   'worker.noReport': bodied('worker.noReport'),
   'worker.stillNoReport': bodied('worker.stillNoReport'),
   'worker.startFailed': titled('worker.startFailed', { title: 'string', cause: 'string' }, START_CAUSES),
+  'worker.reportAfterEnd': bodied('worker.reportAfterEnd', { title: 'string' }),
   // The task gate (taskGate.ts).
   'gate.checked': titled('gate.checked'),
   'gate.passedNotCompleted': titled('gate.passedNotCompleted'),
@@ -77,6 +78,8 @@ export const PHONE_ROOM_NOTICE_CODES: Readonly<Record<string, PhoneNoticeCode>> 
   'gate.notRunNoBaseRef': bodied('gate.notRunNoBaseRef'),
   'research.completed': bodied('research.completed'),
   'research.notCompleted': titled('research.notCompleted'),
+  // A task its merged pull request ended (taskGate.ts).
+  'task.merged': bodied('task.merged', { pr: 'number' }),
   // The verify gate (verifyPreset.ts); a skip's reason is worded as the task gate's.
   'verify.passed': titled('verify.passed'),
   'verify.killed': titled('verify.killed'),

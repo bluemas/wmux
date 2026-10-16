@@ -1549,3 +1549,20 @@ export function setWorkerResumePorts(next: WorkerResumePorts | null): void {
 export function getWorkerResumePorts(): WorkerResumePorts | null {
   return resumePorts;
 }
+
+/** The workspaces the reclaimed workers of `botId`'s tasks in `owner` run
+ *  in (a resume may open a new one): panes of the bot's own tasks after
+ *  their row ended. */
+export function reclaimedWorkerWorkspaces(botId: string, owner: string, store: Pick<ReclaimedWorkers, 'all'> | null | undefined = resumePorts?.store): string[] {
+  return (store?.all() ?? [])
+    .filter((r) => r.botId === botId && r.ownerWorkspaceId === owner)
+    .map((r) => workerWorkspaceOf(r));
+}
+
+/** Whether `ptyId` is the recorded pane of a reclaimed worker of `botId`'s
+ *  task in `owner`, in the workspace that worker runs in: that pane only,
+ *  never another one opened there since. */
+export function isReclaimedWorkerPane(botId: string, owner: string, workspaceId: string, ptyId: string, store: Pick<ReclaimedWorkers, 'all'> | null | undefined = resumePorts?.store): boolean {
+  return (store?.all() ?? []).some((r) => r.botId === botId && r.ownerWorkspaceId === owner
+    && workerWorkspaceOf(r) === workspaceId && r.sessions.some((s) => s.sessionId === ptyId));
+}

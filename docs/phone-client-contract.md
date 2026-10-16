@@ -4367,6 +4367,7 @@ worded (the values listed); a value not listed means the English `title`.
 | `worker.waiting` | `title` string, `inUse` number, `cap` number, `holders` string, `bots` string, `botCount` number, `workers` string, `workerCount` number | `Worker waiting, not started` | `bots` / `workers`: names, one per line (the first few). `holders`: the same in English. |
 | `worker.noReport` | — | `Worker answered without reporting its task` | — |
 | `worker.stillNoReport` | — | `Worker still has not reported its task` | — |
+| `worker.reportAfterEnd` | `title` string | `Worker of "{title}" reported after its task ended` | `title`: the task's title. The task stays as it ended; the bot is woken with the worker's message. |
 | `worker.startFailed` | `title` string, `cause` string | `Worker for "{title}" could not start: {cause}` | `cause`: `fetch`, `worktree`, `repository`, `promptFile`, `slot`, `pane`, `setupStep` or `setup`. |
 | `gate.checked` | — | `Task checked: gate passed, task completed` | — |
 | `gate.passedNotCompleted` | — | `Gate passed: task not completed` | — |
@@ -4382,6 +4383,7 @@ worded (the values listed); a value not listed means the English `title`.
 | `gate.notRunNoBaseRef` | — | `Gate not run: task left open` | — |
 | `research.completed` | — | `Research reported: task completed` | — |
 | `research.notCompleted` | — | `Research reported: task not completed` | — |
+| `task.merged` | `pr` number | `PR #{pr} merged: task completed` | `pr`: the merged pull request that ended the task. |
 | `verify.passed` | — | `Verify gate passed` | — |
 | `verify.killed` | — | `Verify gate was killed` | — |
 | `verify.failed` | `exit` number | `Verify gate failed (exit {exit})` | — |
