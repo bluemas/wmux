@@ -85,13 +85,13 @@ import { getSharedTaskGateRunner } from '../worktask/TaskGateRunner';
 import { isPidAlive, sessionsStartedIn, stopSessionsInDir } from '../worktask/stopSessionsInDir';
 import { getWorkspaceMirror } from '../workspace/WorkspaceMirror';
 import { originDefaultRef, taskFolderFromMissions, worktreeFromMissions } from './verifyPreset';
-import { completeCheckedTask, completeResearchTask, gateCardNoted, installTaskGate } from './taskGate';
+import { completeCheckedTask, completeMergedTask, completeResearchTask, gateCardNoted, installTaskGate, worktreeHeadMerged } from './taskGate';
 import { TaskBranchCache, setBotTaskSources } from './botTasks';
 import { installLateStopSweep, setFactoryStopPorts, type FactoryStopPorts } from './factoryStop';
 import { getRoutineStore } from './routines';
 import { getGroupStore } from './groupStore';
 import { getAgentSlots } from './agentSlots';
-import { getWorkerResumePorts, isWslWorkerPane, reclaimedWorkerState, stopResumedWorkers, workerWorkspaceOf, type WorkerSessionInfo } from './workerReclaim';
+import { getWorkerResumePorts, isWslWorkerPane, reclaimedWorkerState, stopResumedWorker, stopResumedWorkers, workerWorkspaceOf, type WorkerSessionInfo } from './workerReclaim';
 import { getTaskFolderPorts } from './taskFolderCleanup';
 
 // ── Trigger cursor ─────────────────────────────────────────────────────────
@@ -715,6 +715,12 @@ export function createFactoryWiring(deps: Pick<FactoryHostDeps, 'wmuxDir'> & Par
       offTasks.push(ledger.onTransition((t) => {
         if (botTaskStoppedWaiting(t)) void getHandoffRouter()?.closeTaskQuestions(t.entry.id).catch(() => undefined);
       }));
+      // A task's branch (the Bots page, and the gate's merged PRs).
+      const branches = new TaskBranchCache(async (owner) => {
+        const rpc = daemonRpc(daemon);
+        if (!rpc) throw new Error('the daemon is not connected');
+        return rpc('task.mission.list', { verifiedWorkspaceId: owner });
+      });
       // The task gate, once every module started (its restart catch-up
       // writes cards, and the rooms module starts after this one).
       const gateTimer = setImmediate(() => {
@@ -734,6 +740,32 @@ export function createFactoryWiring(deps: Pick<FactoryHostDeps, 'wmuxDir'> & Par
           },
           complete: (taskId) => completeCheckedTask(ledger, taskId),
           completeResearch: (taskId) => completeResearchTask(ledger, taskId),
+          // A merged PR from a reported task's branch ends that task: GitHub's
+          // list is the evidence (the repo watch's gh runner and breaker); a
+          // pr.merged fact only checks again sooner.
+          onFact: (fn) => getFactLog()?.subscribe(fn) ?? (() => undefined),
+          prsOfBranch: async (repoKey, branch, base) => {
+            const { ghPrReviewService } = await import('../github/GhPrReviewService');
+            const r = await ghPrReviewService.mergedOfBranch(deps.wmuxDir(), repoKey, branch, base);
+            if (!r.ok) throw new Error(`${r.code}: ${r.message}`);
+            return r.value;
+          },
+          defaultBranchOf: async (repoKey) => {
+            const { ghPrReviewService } = await import('../github/GhPrReviewService');
+            const r = await ghPrReviewService.defaultBranch(deps.wmuxDir(), repoKey);
+            if (!r.ok) throw new Error(`${r.code}: ${r.message}`);
+            return r.value;
+          },
+          headOf: async (worktreePath) => {
+            const r = await git(['rev-parse', '--verify', '--quiet', 'HEAD^{commit}'], worktreePath);
+            return r.code === 0 && r.stdout.trim() ? r.stdout.trim() : null;
+          },
+          branchOf: async (entry) => {
+            const known = await branches.branches([entry]);
+            return known.has(entry.id) ? known.get(entry.id) ?? null : undefined;
+          },
+          headMerged: (worktreePath, sha) => worktreeHeadMerged(git, worktreePath, sha),
+          completeMerged: (taskId, pr, checkedRev) => completeMergedTask(ledger, taskId, pr, checkedRev),
           wake: (input) => {
             const q = getWakeQueue();
             if (!q) console.info(`[factory] wake queue not running; ${input.botId} was not woken`);
@@ -759,11 +791,6 @@ export function createFactoryWiring(deps: Pick<FactoryHostDeps, 'wmuxDir'> & Par
           offTasks.push(m.startWorkerLifecycle({ wmuxDir: deps.wmuxDir, getDaemonClient: deps.getDaemonClient, getMainWindow: deps.getMainWindow, fanOutService: deps.fanOutService }));
         })
         .catch((err) => console.warn(`[factory] worker lifecycle not started: ${String(err)}`));
-      const branches = new TaskBranchCache(async (owner) => {
-        const rpc = daemonRpc(daemon);
-        if (!rpc) throw new Error('the daemon is not connected');
-        return rpc('task.mission.list', { verifiedWorkspaceId: owner });
-      });
       setBotTaskSources({
         rows: () => ledger.list({}),
         workerState: (taskId) => reclaimedWorkerState(getWorkerResumePorts()?.store.get(taskId) ?? null),
@@ -787,6 +814,10 @@ export function createFactoryWiring(deps: Pick<FactoryHostDeps, 'wmuxDir'> & Par
         stopResumed: async (botId) => {
           const p = getWorkerResumePorts();
           return p ? stopResumedWorkers(p, botId) : 0;
+        },
+        stopResumedTask: async (taskId) => {
+          const p = getWorkerResumePorts();
+          return p ? stopResumedWorker(p, taskId) : { stopped: 0, failed: 0, taskIds: [] };
         },
       };
       setFactoryStopPorts(stopPorts);

@@ -172,7 +172,7 @@ const NOTICE_CODES: ReadonlyMap<string, boolean> = new Map([
   ['gate.passed', false], ['gate.killed', false], ['gate.failed', false],
   ['gate.skipped', false], ['gate.busy', true], ['gate.noBase', true], ['gate.refused', false],
   ['gate.notRunNoBot', true], ['gate.notRunNoWorktree', true], ['gate.notRunNoBaseRef', true],
-  ['research.completed', true], ['research.notCompleted', false],
+  ['research.completed', true], ['research.notCompleted', false], ['task.merged', true],
   ['budget.exhausted', true], ['budget.held', true], ['bot.usageLimit', false],
   ['task.done', false], ['task.reported', false], ['task.failed', false], ['task.cancelled', false],
   ['task.stoppedByOwner', false], ['task.inputRequired', false],
@@ -184,6 +184,7 @@ const NOTICE_CODES: ReadonlyMap<string, boolean> = new Map([
   ['bot.error', false], ['worker.startFailed', false],
   ['skill.archived', true],
   ['secret.deleted', true],
+  ['worker.reportAfterEnd', true],
 ]);
 
 /** The notice codes whose title names their subject by a `title` arg, with
@@ -348,6 +349,18 @@ export function ownerCardText(card: Pick<RoomCard, 'kind' | 'title' | 'body' | '
     body = withoutInternalIds(body, labels);
   }
   return { title, body };
+}
+
+/** A card's title and body shown once: a body that repeats its title, or
+ *  starts with it (a bot's turn text whose first line became the title, or
+ *  whose start was cut into the title, mid-word and maybe with a trailing
+ *  "…" or "..."), is the whole text, shown alone; any other body is kept.
+ *  Compared after trimming, with runs of white space as one. Pure. */
+export function onceText(title: string, body: string): { title: string; body: string } {
+  const norm = (v: string) => v.replace(/\s+/g, ' ').trim();
+  const head = norm(norm(title).replace(/(…|\.\.\.)$/, ''));
+  if (!head || !body.trim()) return { title, body };
+  return norm(body).startsWith(head) ? { title: body.trim(), body: '' } : { title, body };
 }
 
 export function roleLabel(role: BotRole, t: T): string {

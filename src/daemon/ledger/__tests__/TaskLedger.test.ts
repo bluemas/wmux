@@ -323,6 +323,39 @@ describe('TaskLedger — transition matrix', () => {
     expect(await b.update({ id: 'wtask-1', status: 'completed', actor: BRAIN, expectedRev: 3 })).toMatchObject({ ok: false, error: 'gate_required' });
   });
 
+  it('a gate result is recorded only on an open entry: a completed or cancelled one is left as it ended', async () => {
+    const a = open();
+    await seed(a, 'wtask-1');
+    await seed(a, 'wtask-2');
+    await seed(a, 'wtask-3');
+    await driveTo(a, 'wtask-1', 'completed');
+    await driveTo(a, 'wtask-2', 'cancelled');
+    await driveTo(a, 'wtask-3', 'failed');
+    for (const id of ['wtask-1', 'wtask-2']) {
+      const before = a.get(id);
+      expect(await a.recordGate(id, { ...PASS, exitCode: 1 }, SYSTEM, before?.rev)).toMatchObject({ ok: false, error: 'illegal_transition' });
+      expect(a.get(id)).toEqual(before);
+    }
+    // A failed task can be sent back to work, so a gate may still grade it.
+    expect((await a.recordGate('wtask-3', PASS)).ok).toBe(true);
+  });
+
+  it('a merge completion is recorded only on a move to completed; a dispatch keeps a well-formed repo key only', async () => {
+    const a = open();
+    await a.register({ id: 'wtask-1', taskWorkspaceId: 'ws-task', ownerWorkspaceId: 'ws-owner', title: 'lane', dispatch: { origin: { kind: 'bot', botId: 'b1' }, repoKey: 'github.com/acme/app' } });
+    await a.register({ id: 'wtask-2', taskWorkspaceId: 'ws-task', ownerWorkspaceId: 'ws-owner', title: 'lane', dispatch: { origin: { kind: 'bot', botId: 'b1' }, repoKey: 'GitHub.com/Acme/App' } });
+    expect(a.get('wtask-1')?.dispatch?.repoKey).toBe('github.com/acme/app');
+    expect(a.get('wtask-2')?.dispatch?.repoKey).toBeUndefined();
+    await driveTo(a, 'wtask-1', 'review_requested');
+    const sent = await a.update({ id: 'wtask-1', status: 'input_required', actor: BRAIN, expectedRev: 2, completion: { source: 'merge', pr: 4 } });
+    expect(sent.ok && sent.entry.completion).toBeUndefined();
+    await a.update({ id: 'wtask-1', status: 'review_requested', actor: SYSTEM, expectedRev: 3 });
+    const done = await a.update({ id: 'wtask-1', status: 'completed', actor: BRAIN, expectedRev: 4, force: true, reason: 'merged', completion: { source: 'merge', pr: 4 } });
+    expect(done.ok && done.entry.completion).toEqual({ source: 'merge', pr: 4 });
+    // Persisted: a restart reads it back.
+    expect(open().get('wtask-1')?.completion).toEqual({ source: 'merge', pr: 4 });
+  });
+
   it('forced completion logs the reason on the entry', async () => {
     const a = open();
     await seed(a);
