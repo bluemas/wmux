@@ -248,12 +248,16 @@ export function planRecoveryPillType(args: {
    *  once (no progressive stage). Ignored without `sessionId` (#1916): the
    *  session picker never carries a skip flag. */
   forceSkip: boolean;
+  /** Withhold the role's skip/bypass flag (and its skip spellings in the
+   *  role's args) for every agent, not only the ones the pill's toggle covers.
+   *  The automatic resume sets it: it never grants bypass on its own. */
+  withholdRoleSkip?: boolean;
   /** Progressive-assembly stage: 0 = nothing typed yet, 1 = base typed. */
   resumeStage: number;
   /** The pane's role→model binding (re-asserted on the launch), if bound. */
   roleBinding: RoleBinding | undefined;
 }): RecoveryPillPlan | null {
-  const { launcher, sessionId, permFlag, forceSkip, resumeStage, roleBinding } = args;
+  const { launcher, sessionId, permFlag, forceSkip, withholdRoleSkip, resumeStage, roleBinding } = args;
   const grammar = resumeGrammarFor(launcher);
   if (!grammar) return null; // not resumable — pill shouldn't have shown (defensive)
   // Re-assert the bound model on a launcher-prefixed line. The stage-2
@@ -266,7 +270,7 @@ export function planRecoveryPillType(args: {
   // wmux can vouch for (#1946: it opens the session picker). It never carries a
   // permission flag: not the toggle's, and none of the role's (skip flag or a
   // permission choice in its args), for any agent.
-  const toggledOff = !sessionId || (!forceSkip && agentSupportsPermissionFlag(launcher));
+  const toggledOff = !sessionId || !!withholdRoleSkip || (!forceSkip && agentSupportsPermissionFlag(launcher));
   const rewrite = (cmd: string): { text: string; rewritten: boolean } => {
     const r = applyRoleBinding(cmd, roleBinding, {
       suppressSkipPermissions: toggledOff,
@@ -410,6 +414,9 @@ export function planAutoResume(args: {
       ? permissionFlagFor(binding.permissionMode)
       : '',
     forceSkip: false,
+    // No bypass on the automatic path for any agent: Codex has no pill toggle,
+    // so without this a role's skipPermissions or bypass args would be typed.
+    withholdRoleSkip: true,
     // Both flags land on one line: the staged click flow does not apply here.
     resumeStage: 0,
     roleBinding: args.roleBinding,

@@ -4,6 +4,8 @@ import { BOT_ROLES, botTemplate, type BotRole, type BotTemplate } from '../../..
 import type { Party } from '../../../shared/handoff';
 import type { CardKind, RoomCard, ThreadId, ThreadSummary } from '../../../shared/room';
 import type { FactoryBotRow } from './factoryPorts';
+import { getLocale } from '../../i18n';
+import { closesFence, fenceOpenLength } from '../../../shared/markdownFence';
 
 type T = (key: string, vars?: Record<string, string | number>) => string;
 
@@ -144,13 +146,17 @@ export function withoutInternalIds(text: string, labels: IdLabels): string {
   // Inline code is code unless it is just the id.
   const onlyId = new RegExp(String.raw`^\x60(?:${TASK_ID}|${APPROVAL_ID}|${NUMBERED_THREAD})\x60$`);
   const prose = (part: string): string => part.split(INLINE_CODE).map((p, i) => (i % 2 === 0 || onlyId.test(p) ? swap(p) : p)).join('');
-  let fenced = false;
+  let fence = 0;
   return text.split('\n').map((line) => {
-    if (line.trimStart().startsWith('```')) {
-      fenced = !fenced;
+    if (fence === 0 && fenceOpenLength(line) > 0) {
+      fence = fenceOpenLength(line);
       return line;
     }
-    return fenced ? line : prose(line);
+    if (fence > 0) {
+      if (closesFence(line, fence)) fence = 0;
+      return line;
+    }
+    return prose(line);
   }).join('\n');
 }
 
@@ -158,7 +164,7 @@ export function withoutInternalIds(text: string, labels: IdLabels): string {
  *  (RoomCard.notice): code → whether its body is worded too (true) or is the
  *  evidence the card carries (a command, an error), kept as written. */
 const NOTICE_CODES: ReadonlyMap<string, boolean> = new Map([
-  ['worker.paused', true], ['worker.pausedResumable', true],
+  ['worker.paused', true], ['worker.pausedResumable', true], ['worker.idlePausedResumable', true],
   ['worker.done', true], ['worker.doneResumable', true],
   ['worker.resumed', true], ['worker.waiting', true],
   ['worker.noReport', true], ['worker.stillNoReport', true],
@@ -167,13 +173,29 @@ const NOTICE_CODES: ReadonlyMap<string, boolean> = new Map([
   ['gate.skipped', false], ['gate.busy', true], ['gate.noBase', true], ['gate.refused', false],
   ['gate.notRunNoBot', true], ['gate.notRunNoWorktree', true], ['gate.notRunNoBaseRef', true],
   ['research.completed', true], ['research.notCompleted', false],
-  ['budget.exhausted', true], ['budget.held', true],
+  ['budget.exhausted', true], ['budget.held', true], ['bot.usageLimit', false],
   ['task.done', false], ['task.reported', false], ['task.failed', false], ['task.cancelled', false],
   ['task.stoppedByOwner', false], ['task.inputRequired', false],
+  ['verify.passed', false], ['verify.killed', false], ['verify.failed', false], ['verify.skipped', false],
+  ['verify.busy', true], ['verify.refused', false],
+  ['verify.notRunNoBot', true], ['verify.notRunNoWorktree', true], ['verify.notRunNoBaseRef', true],
+  ['pr.merged', false], ['pr.closed', false], ['verdict.recorded', false],
+  ['handoff.sent', false], ['thread.finished', false], ['thread.stopped', false],
+  ['bot.error', false], ['worker.startFailed', false],
+  ['skill.archived', true],
+  ['secret.deleted', true],
+]);
+
+/** The notice codes whose title names their subject by a `title` arg, with
+ *  an `.untitled` template for a card that has none (a PR with no title
+ *  known, a worker card written before it named its task). */
+const UNTITLED_NOTICE_CODES: ReadonlySet<string> = new Set([
+  'pr.merged', 'pr.closed',
+  'worker.paused', 'worker.pausedResumable', 'worker.idlePausedResumable', 'worker.done', 'worker.doneResumable', 'worker.resumed',
 ]);
 
 /** The notice codes that tell the owner a stopped worker can resume. */
-export const RESUMABLE_NOTICE_CODES: ReadonlySet<string> = new Set(['worker.pausedResumable', 'worker.doneResumable']);
+export const RESUMABLE_NOTICE_CODES: ReadonlySet<string> = new Set(['worker.pausedResumable', 'worker.idlePausedResumable', 'worker.doneResumable']);
 
 /** The task a system card offers Resume for: a card saying a stopped
  *  worker can resume (by its notice code), whose task's worker is still
@@ -190,18 +212,30 @@ const NOTICE_WORDS: Readonly<Record<string, ReadonlySet<string>>> = {
   by: new Set(['owner', 'bot']),
   where: new Set(['folder', 'newPane']),
   limit: new Set(['turns_hour', 'turns_day', 'concurrent_workers', 'worker_hours_day', 'factory_workers']),
+  // The task a resumable worker card is about: a research task has a task
+  // folder, not a worktree.
+  kind: new Set(['research']),
+  // A hop's kind (handoffRouter.ts HandoffKind) on a card to a bot.
+  hop: new Set(['dispatch', 'result', 'message', 'refusal', 'answer']),
+  verdict: new Set(['pass', 'fail']),
+  // Why a worker could not start (botNotices.ts START_FAILURES).
+  cause: new Set(['fetch', 'worktree', 'repository', 'promptFile', 'slot', 'pane', 'setupStep', 'setup']),
 };
+
+/** Why wmux moved a task to input_required (roomWriter.ts inputRequiredWhy). */
+const INPUT_REQUIRED_WHY: ReadonlySet<string> = new Set(['trustDialog', 'firstRun', 'launchFailed']);
 
 /** Why a gate was skipped (TaskGateRunner.ts GateSkipReason). */
 const GATE_SKIP_REASONS: ReadonlySet<string> = new Set(['deps_missing', 'no_gate_command', 'gate_unavailable']);
 
-/** A notice's clock time: the time today, else a short date and the time. */
-export function formatNoticeTime(at: number, now: number = Date.now()): string {
+/** A notice's clock time in the app's language: the time today, else a
+ *  short date and the time. */
+export function formatNoticeTime(at: number, now: number = Date.now(), locale: string = getLocale()): string {
   const d = new Date(at);
-  const time = d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  const time = d.toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit' });
   return d.toDateString() === new Date(now).toDateString()
     ? time
-    : `${d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} ${time}`;
+    : `${d.toLocaleDateString(locale, { month: 'short', day: 'numeric' })} ${time}`;
 }
 
 /** What holds the agent slots on a slot-wait card, in the reader's
@@ -264,17 +298,34 @@ export function noticeText(card: Pick<RoomCard, 'actor' | 'body' | 'notice'>, t:
   if (args.where !== undefined) vars.place = t(`room.notice.where.${args.where}`);
   if (typeof args.until === 'number') vars.time = formatNoticeTime(args.until, now);
   // Why a gate did not run, worded; a reason this build does not know stays as written.
-  if (notice.code === 'gate.skipped' && typeof args.reason === 'string' && GATE_SKIP_REASONS.has(args.reason)) {
+  if ((notice.code === 'gate.skipped' || notice.code === 'verify.skipped') && typeof args.reason === 'string' && GATE_SKIP_REASONS.has(args.reason)) {
     vars.reason = t(`room.notice.gate.reason.${args.reason}`);
   }
   if (notice.code === 'worker.waiting') {
     const holders = slotHoldersText(args, t);
     if (holders !== null) vars.holders = holders;
   }
+  // Why wmux moved a task to input_required, worded (roomWriter inputRequiredWhy).
+  if (notice.code === 'task.inputRequired' && typeof args.why === 'string' && INPUT_REQUIRED_WHY.has(args.why)) {
+    return { title: t(`room.notice.${notice.code}`, vars), body: t(`room.notice.task.inputRequired.why.${args.why}`, vars) };
+  }
+  if (args.verdict !== undefined) vars.verdict = t(`room.notice.verdict.${args.verdict}`);
+  if (args.cause !== undefined) vars.cause = t(`room.notice.worker.startFailed.cause.${args.cause}`);
   const budget = budgetNoticeKeys(notice.code, args);
   if (budget) return { title: t(budget.title, vars), body: t(budget.body, vars) };
+  // A hop says what it carried: one template per kind, forwarded by wmux
+  // for a coordinator's relay.
+  if (notice.code === 'handoff.sent') {
+    if (args.hop === undefined) return null;
+    const hop = t(`room.notice.handoff.${args.hop}`, vars);
+    return { title: args.relay ? t('room.notice.handoff.forwarded', { hop }) : hop, body: card.body ?? '' };
+  }
   const key = `room.notice.${notice.code}`;
-  return { title: t(key, vars), body: wordedBody ? t(`${key}.body`, vars) : (card.body ?? '') };
+  // A PR closed with no title known says only its number; a worker card
+  // written before it named its task says what happened only.
+  const titleKey = UNTITLED_NOTICE_CODES.has(notice.code) && args.title === undefined ? `${key}.untitled` : key;
+  const bodyKey = args.kind === 'research' && RESUMABLE_NOTICE_CODES.has(notice.code) ? `${key}.body.research` : `${key}.body`;
+  return { title: t(titleKey, vars), body: wordedBody ? t(bodyKey, vars) : (card.body ?? '') };
 }
 
 /** A card's title and body as the owner reads them: a factory system card
@@ -367,15 +418,15 @@ export function cardTone(card: Pick<RoomCard, 'kind' | 'title' | 'closes'>): Car
   return null;
 }
 
-/** Clock time today, else a short date. */
-export function formatCardTime(at: number, now: number = Date.now()): string {
+/** Clock time today, else a short date, in the app's language. */
+export function formatCardTime(at: number, now: number = Date.now(), locale: string = getLocale()): string {
   if (!Number.isFinite(at) || at <= 0) return '';
   const d = new Date(at);
   const n = new Date(now);
   const sameDay = d.getFullYear() === n.getFullYear() && d.getMonth() === n.getMonth() && d.getDate() === n.getDate();
   return sameDay
-    ? d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
-    : d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    ? d.toLocaleTimeString(locale, { hour: '2-digit', minute: '2-digit' })
+    : d.toLocaleDateString(locale, { month: 'short', day: 'numeric' });
 }
 
 /** The first line of a message, as a card title (≤ 200 characters). */

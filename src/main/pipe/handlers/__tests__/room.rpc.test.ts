@@ -6,11 +6,15 @@ import type { BotBinding, BotProfile, BotRole } from '../../../../shared/bot';
 import type { Fact, FactDraft } from '../../../../shared/facts';
 import type { RpcContext } from '../../../../shared/rpc';
 import type { WakeItem } from '../../../../shared/wake';
-import type { RoomCard, ThreadId } from '../../../../shared/room';
+import { ROOM_LIMITS, type RoomCard, type ThreadId } from '../../../../shared/room';
+
+const ROOM_TITLE_MAX = ROOM_LIMITS.TITLE_MAX;
+const ROOM_BODY_MAX = ROOM_LIMITS.CARD_BODY_MAX;
 import { loadThreadDecision } from '../../../deck/deckDecisionStore';
 import { HANDOFFS_FILENAME, HandoffRouter, deckDecisionPort, setHandoffRouter } from '../../../factory/handoffRouter';
 import { RoomWriter, type FactoryRoomPorts } from '../../../factory/roomWriter';
 import { humanAddressees, humanCardIdOfRun, humanRunId } from '../../../factory/humanMessage';
+import { __resetRedactedSecretsForTesting, setRedactedSecrets } from '../../../factory/secretRedaction';
 import { botSeesFact } from '../../../factory/triggerEngine';
 import {
   createRoomModule,
@@ -20,6 +24,7 @@ import {
   handleRoomThreads,
   humanAddressee,
   onRoomCardResolved,
+  postTurnText,
   resolutionCorrection,
   type RoomHandlerDeps,
 } from '../room.rpc';
@@ -414,6 +419,83 @@ describe('room.post', () => {
   });
 });
 
+describe('a turn that ended with plain text: its words become the bot\'s card (round 7)', () => {
+  function rig(bots: BotProfile[], threadId: ThreadId) {
+    const s = setup(bots);
+    s.wake.thread = threadId;
+    s.wake.id = { wakeId: 'w-1', attempt: 1 };
+    // The turn began before anything in the test is written.
+    const since = Date.now() - 1;
+    const text = (b: BotProfile, words: string) => postTurnText(b, { id: 'w-1' }, words, since, s.deps);
+    const cards = () => s.writer.read('ws1', { threadId }).cards;
+    return { ...s, since, text, cards };
+  }
+
+  it('a 1:1: the words are one status card from the bot in its thread; the first line is the title', async () => {
+    const dev = bot('ws1', 'maintainer');
+    const r = rig([dev], `dm:${dev.id}` as ThreadId);
+    const res = await r.text(dev, 'All green.\n\nThe CI run passed.\u0000') as { ok: boolean };
+    expect(res.ok).toBe(true);
+    expect(r.cards()).toEqual([expect.objectContaining({
+      kind: 'status', threadId: `dm:${dev.id}`, title: 'All green.', body: 'The CI run passed.',
+      actor: { kind: 'bot', workspaceId: 'ws1', botId: dev.id }, clientPostId: 'wake:w-1:text',
+    })]);
+    // The same turn handed over twice still makes one card.
+    await r.text(dev, 'All green.');
+    expect(r.cards()).toHaveLength(1);
+  });
+
+  it('a group chat: posted in the group\'s thread; a long first line keeps the whole text, capped like a room_post body', async () => {
+    const GROUP = 'group:grp-0000aaaa' as ThreadId;
+    const a = bot('ws1', 'lead');
+    const r = rig([a], GROUP);
+    r.ports.groups = { byThread: (ws, t) => (t === GROUP ? { id: 'grp-0000aaaa', workspaceId: ws, name: 'Ship', memberIds: [a.id], threadId: GROUP, createdAt: 1, updatedAt: 1 } : null) };
+    const long = 'x'.repeat(ROOM_TITLE_MAX + 50) + '\n' + 'y'.repeat(20_000);
+    await r.text(a, long);
+    const [card] = r.cards();
+    expect(card).toMatchObject({ threadId: GROUP, kind: 'status' });
+    expect(card.title).toHaveLength(ROOM_TITLE_MAX);
+    expect(card.body?.length).toBe(ROOM_BODY_MAX);
+    expect(card.body?.startsWith('x')).toBe(true);
+  });
+
+  it('a turn that already posted in the thread, or ended with no words, adds nothing', async () => {
+    const dev = bot('ws1', 'maintainer');
+    const r = rig([dev], `dm:${dev.id}` as ThreadId);
+    expect(await r.text(dev, '   \n ')).toBeNull();
+    expect(r.cards()).toEqual([]);
+    await handleRoomPost({ kind: 'report', title: 'Done', clientPostId: 'own-key' }, asBot(dev), r.deps);
+    expect(await r.text(dev, 'Done, see the report.')).toBeNull();
+    expect(r.cards().map((c) => c.title)).toEqual(['Done']);
+  });
+
+  it('a card from an earlier attempt of the wake answered it; a card from an earlier wake did not; a busy thread hides nothing', async () => {
+    const dev = bot('ws1', 'maintainer');
+    const r = rig([dev], `dm:${dev.id}` as ThreadId);
+    const dm = `dm:${dev.id}` as ThreadId;
+    const actor = { kind: 'bot' as const, workspaceId: 'ws1', botId: dev.id };
+    // The previous wake's answer, written as this turn began.
+    r.writer.post({ workspaceId: 'ws1', threadId: dm, kind: 'status', actor, title: 'old', at: r.since, clientPostId: 'wake:w-0:1' });
+    // An earlier attempt of this wake posted, then failed; then a hundred more cards.
+    r.writer.post({ workspaceId: 'ws1', threadId: dm, kind: 'status', actor, title: 'first try', at: r.since - 10, clientPostId: 'wake:w-1:1' });
+    for (let i = 0; i < ROOM_LIMITS.PAGE + 5; i++) r.writer.append({ workspaceId: 'ws1', threadId: dm, kind: 'fact', actor: { kind: 'system' }, title: `f${i}` });
+    expect(await r.text(dev, 'Same answer again.')).toBeNull();
+    // Without that attempt's card, the reply is posted.
+    const r2 = rig([dev], 'general' as ThreadId);
+    r2.writer.post({ workspaceId: 'ws1', threadId: 'general' as ThreadId, kind: 'status', actor, title: 'old', at: r2.since, clientPostId: 'wake:w-0:1' });
+    expect(await r2.text(dev, 'New answer.')).toMatchObject({ ok: true });
+  });
+
+  it('another bot\'s card in the thread is not this bot\'s answer', async () => {
+    const dev = bot('ws1', 'maintainer');
+    const other = bot('ws1', 'lead');
+    const r2 = rig([dev, other], `dm:${dev.id}` as ThreadId);
+    r2.writer.post({ workspaceId: 'ws1', threadId: `dm:${dev.id}` as ThreadId, kind: 'status', actor: { kind: 'bot', workspaceId: 'ws1', botId: other.id }, title: 'hello' });
+    await r2.text(dev, 'Here is my answer.');
+    expect(r2.cards().map((c) => c.title)).toEqual(['hello', 'Here is my answer.']);
+  });
+});
+
 describe('a bot\'s reply links the owner message its wake answers', () => {
   type Card = { id: string; threadId: string; replyTo?: string };
   /** Each bot runs the wake given here, as main's runningWakeOf derives it
@@ -781,6 +863,66 @@ describe('the room module closes questions whose subject ended (A5)', () => {
     } finally {
       void mod.dispose?.();
       setHandoffRouter(null);
+    }
+  });
+});
+
+describe('long room card text is shortened as the last step', () => {
+  const VALUE = 'zQ9vT2mW8rL4nX6pB1cY3hJ5kD7fG0sE9uA2wR4t';
+  const MARK = '[secret:K]';
+  beforeEach(() => setRedactedSecrets([{ name: 'K', value: VALUE }]));
+  afterEach(() => __resetRedactedSecretsForTesting());
+
+  /** A first line with VALUE across char 200, then a body with VALUE across char 8192. */
+  const across = (): { title: string; text: string } => {
+    const title = 'a'.repeat(ROOM_TITLE_MAX - 20) + VALUE + 'b'.repeat(30);
+    const lead = `${title}\n`;
+    return { title, text: lead + 'c'.repeat(ROOM_BODY_MAX - 22 - lead.length) + VALUE + 'd'.repeat(100) };
+  };
+  const onDisk = (): string => (fs.readdirSync(dir, { recursive: true }) as string[])
+    .map((f) => path.join(dir, f))
+    .filter((f) => fs.statSync(f).isFile())
+    .map((f) => fs.readFileSync(f, 'utf8'))
+    .join('\n');
+  const clean = (x: string): void => {
+    expect(x).not.toContain(VALUE.slice(0, 20));
+    expect(x).not.toContain(VALUE.slice(20));
+  };
+
+  it('a turn\'s long words: processed whole, then shortened, in the card and its file', async () => {
+    const dev = bot('ws1', 'maintainer');
+    const s = setup([dev]);
+    s.wake.thread = `dm:${dev.id}` as ThreadId;
+    s.wake.id = { wakeId: 'w-1', attempt: 1 };
+    const { text } = across();
+    expect(text.indexOf(VALUE)).toBe(ROOM_TITLE_MAX - 20);
+    expect(text.lastIndexOf(VALUE)).toBe(ROOM_BODY_MAX - 22);
+    await postTurnText(dev, { id: 'w-1' }, text, Date.now() - 1, s.deps);
+    const [card] = s.writer.read('ws1', { threadId: `dm:${dev.id}` as ThreadId }).cards;
+    expect(card.title).toBe('a'.repeat(ROOM_TITLE_MAX - 20) + MARK + 'b'.repeat(10));
+    expect(card.body?.split(MARK)).toHaveLength(3);
+    clean(JSON.stringify(card));
+    clean(onDisk());
+  });
+
+  it('a long question a bot asks: processed whole, then shortened, in the card and the stores', async () => {
+    const lead = bot('ws1', 'lead');
+    const s = setup([lead]);
+    s.ports.currentWakeThread = () => 'general' as never;
+    const router = new HandoffRouter({ file: path.join(dir, 'factory', HANDOFFS_FILENAME), decisions: deckDecisionPort(dir), ports: () => s.ports, rooms: () => s.writer, log: () => undefined });
+    await router.start();
+    try {
+      const { title, text } = across();
+      const body = text.slice(title.length + 1);
+      const asked = await handleAskPerson({ title, body: 'c'.repeat(title.length + 1) + body }, asBot(lead), { router: () => router }) as { ok: boolean };
+      expect(asked.ok).toBe(true);
+      const [card] = s.writer.read('ws1').cards.filter((c) => c.kind === 'question');
+      expect(card.title).toBe('a'.repeat(ROOM_TITLE_MAX - 20) + MARK + 'b'.repeat(10));
+      expect(card.body).toContain(MARK);
+      clean(JSON.stringify(card));
+      clean(onDisk());
+    } finally {
+      router.dispose();
     }
   });
 });

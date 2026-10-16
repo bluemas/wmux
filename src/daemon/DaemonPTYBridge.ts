@@ -9,10 +9,10 @@ import { TerminalNotificationParser } from '../main/pty/oscNotification';
 import { AgentDetector, drawsCodexBanner, type AgentEventStatus } from '../main/pty/AgentDetector';
 import { ActivityMonitor } from '../main/pty/ActivityMonitor';
 import { parseOsc7Cwd, detectPromptCwd } from '../main/pty/cwdDetect';
-import { sanitizeTitle } from '../main/pty/titleDetect';
+import { ClaudeTitleTurnEdge, sanitizeTitle } from '../main/pty/titleDetect';
 import { RingBuffer } from './RingBuffer';
 import { PromptEventLog, parseOsc133Payload } from './PromptEventLog';
-import { RESIZE_REDRAW_GUARD_MS } from '../main/notification/idleSuppression';
+import { ESC_INTERRUPT_CONFIRM_MS, RESIZE_REDRAW_GUARD_MS } from '../main/notification/idleSuppression';
 import { stripReplayQuerySequences } from '../shared/replayQuerySanitizer';
 import { isFreshSessionSource } from '../shared/hooks/signal-types';
 import { ESCAPE_WIN32 } from '../shared/win32InputKeys';
@@ -71,10 +71,15 @@ export function scanStartupDa1(text: string): 'answer' | 'more' | 'closed' {
  *  - 'notification' → { sessionId, event: TerminalNotification & { ts } }
  *  - 'critical' → { sessionId: string, event: CriticalEvent }
  *  - 'usageLimit' → { sessionId: string, event: UsageLimitLineEvent }
+ *  - 'turnInterrupted' → { sessionId: string, agent: string } — the agent
+ *                 printed its own "turn interrupted" row (not inside a
+ *                 resize redraw or a muted replay)
  *  - 'inputSubmitted' → { sessionId: string } (input with a submit boundary)
  *  - 'active'   → { sessionId, agentName?, likelyRepaint? } — onActive cycle
- *                 start; likelyRepaint marks a passive burst inside the
- *                 resize-redraw guard window (alarm feeds must ignore it)
+ *                 start. A passive burst inside the resize-redraw guard
+ *                 window is not emitted, except a cycle a hook's running
+ *                 edge armed in a still-open turn: that one carries
+ *                 likelyRepaint (alarm feeds must ignore it)
  *  - 'idle'     → { sessionId, preTurn? }              — onActiveToIdle;
  *                 preTurn marks silence after a SessionStart with no turn
  *                 started since (see isPreTurn)
@@ -102,6 +107,7 @@ export class DaemonPTYBridge extends EventEmitter {
   private agentUnsubscribe: (() => void) | null = null;
   private criticalUnsubscribe: (() => void) | null = null;
   private usageLimitUnsubscribe: (() => void) | null = null;
+  private interruptedUnsubscribe: (() => void) | null = null;
   /** See noteInput: typed or pasted composer text not yet submitted. */
   private draftPending = false;
   private resizeGuardTimer: ReturnType<typeof setTimeout> | null = null;
@@ -169,6 +175,9 @@ export class DaemonPTYBridge extends EventEmitter {
    */
   private oscCwdSeen = false;
 
+  /** Last cwd emitted by the prompt-scrape fallback (shells without OSC 7). */
+  private lastDetectedPromptCwd = '';
+
   /**
    * A detector/hook terminal state (waiting, complete, awaiting input, error)
    * outranks passive byte throughput until a real submitted-input boundary
@@ -177,6 +186,8 @@ export class DaemonPTYBridge extends EventEmitter {
    */
   private explicitTerminalStatus = false;
   private submittedTurnPending = false;
+  /** The current activity cycle was armed by a hook's running edge and has not fired yet. */
+  private hookArmedCycle = false;
   private lastTurnStartedAt = 0;
 
   /**
@@ -229,6 +240,8 @@ export class DaemonPTYBridge extends EventEmitter {
 
   /** Last write to stdin that was a lone Esc, from any source (0 = never). */
   private lastEscAt = 0;
+  /** The `lastEscAt` an idle title already reported as an interrupt (#2264). */
+  private titleEdgeEscAt = 0;
   /** Latest OSC 0/2 window title (sanitized) and when it arrived (0 = never). */
   private lastTitle = '';
   private lastTitleAt = 0;
@@ -697,6 +710,7 @@ export class DaemonPTYBridge extends EventEmitter {
       // never earn `running` back after an idle, and the roster showed idle
       // for a pane genuinely mid-turn.
       if (this.activityMonitor && this.sessionId) {
+        if (authoritative) this.hookArmedCycle = true;
         this.activityMonitor.beginTurnIfInactive(this.sessionId);
       }
       return;
@@ -719,6 +733,7 @@ export class DaemonPTYBridge extends EventEmitter {
     if (!this.awaitingHuman && (authoritative || !this.hookSeen)) this.closeTurn(!authoritative || provisional);
     this.settledAtMs = Date.now();
     this.submittedTurnPending = false;
+    this.hookArmedCycle = false;
     if (this.resizeGuardTimer) {
       clearTimeout(this.resizeGuardTimer);
       this.resizeGuardTimer = null;
@@ -817,6 +832,17 @@ export class DaemonPTYBridge extends EventEmitter {
   }
 
   /**
+   * Something other than the shell moved the pane's cwd (an agent's hook
+   * reported its own directory). Forget the last shell-reported value so the
+   * shell's next report re-emits even when it names the same directory again,
+   * which is how the cwd moves back once the agent exits to the prompt.
+   */
+  forgetEmittedCwd(): void {
+    this.lastEmittedOscCwd = null;
+    this.lastDetectedPromptCwd = '';
+  }
+
+  /**
    * The agent's transcript recorded a turn end (completed or interrupted) at
    * `at`. An interrupt fires no Stop hook, so without this the episode would
    * stay open and the next prompt would join it. Ignored behind a dialog, or
@@ -910,6 +936,28 @@ export class DaemonPTYBridge extends EventEmitter {
   /** When a lone Esc was last written to this PTY, from any source; 0 = never. */
   getLastEscAt(): number {
     return this.lastEscAt;
+  }
+
+  /**
+   * Claude Code set its idle title with no Stop-hook row before it (#2264). An
+   * Esc while it is still thinking ends the turn without the `⎿  Interrupted`
+   * row, so this title is the only thing that confirms such an Esc. It is reported
+   * as the same `turnInterrupted` the row raises, and only right after a lone
+   * Esc reached this pane: every turn ends with this edge, and an ordinary
+   * turn end is not an interrupt. Main still checks its own Escape record
+   * before it settles. Dropped like the row inside a resize redraw or a muted
+   * replay.
+   */
+  private noteTitleTurnEnd(sessionId: string): void {
+    const now = Date.now();
+    if (this.muted || now - this.lastResizeAtMs < RESIZE_REDRAW_GUARD_MS) return;
+    if (now - this.lastEscAt >= ESC_INTERRUPT_CONFIRM_MS) return;
+    // One Esc confirms one turn: a later idle title inside the same window
+    // belongs to a turn that Esc never touched.
+    if (this.lastEscAt === this.titleEdgeEscAt) return;
+    if (this.agentDetector?.getLastAgent() !== 'Claude Code') return;
+    this.titleEdgeEscAt = this.lastEscAt;
+    this.emit('turnInterrupted', { sessionId, agent: 'Claude Code' });
   }
 
   /**
@@ -1066,6 +1114,7 @@ export class DaemonPTYBridge extends EventEmitter {
     this.sessionId = sessionId;
     this.explicitTerminalStatus = false;
     this.submittedTurnPending = false;
+    this.hookArmedCycle = false;
     this.inputInBracketedPaste = false;
     this.lastInputAt = 0;
     this.settledStatus = null;
@@ -1083,6 +1132,7 @@ export class DaemonPTYBridge extends EventEmitter {
     // settled this turn, byte silence is weaker evidence and must not clear the
     // explicit waiting/complete state five seconds later.
     this.idleUnsubscribe = activityMonitor.onActiveToIdle((ptyId) => {
+      this.hookArmedCycle = false;
       if (this.explicitTerminalStatus) return;
       this.emit('idle', { sessionId: ptyId, ...(this.isPreTurn() ? { preTurn: true } : {}) });
     });
@@ -1135,6 +1185,8 @@ export class DaemonPTYBridge extends EventEmitter {
       } else {
         const inputStartedTurn = this.submittedTurnPending;
         this.submittedTurnPending = false;
+        const hookArmed = this.hookArmedCycle;
+        this.hookArmedCycle = false;
 
         // Real submitted input already reset detector dedup in noteInput(). For
         // a passive startup/autonomous burst, retain the resize-redraw guard: a
@@ -1157,8 +1209,16 @@ export class DaemonPTYBridge extends EventEmitter {
             // two-minute activity window. Like the settled rejections above,
             // hand the cycle back instead of consuming it, so a real turn that
             // keeps writing past the guard window still reports running.
-            activityMonitor.endTurn(ptyId);
-            return;
+            // A cycle a hook's running edge armed is exempt while that turn is
+            // still open: handing it back would drop the hook's signal to the
+            // byte threshold for the rest of a sparse-output turn. Only the
+            // arming edge counts, not `turnOpen` alone: a boot paint or a
+            // submitted prompt that never got a settle also leaves the turn
+            // open, and its reveal repaint is still not work.
+            if (!(hookArmed && this.turnOpen)) {
+              activityMonitor.endTurn(ptyId);
+              return;
+            }
           } else {
             this.agentDetector?.resetEmissionState();
             this.openTurn(true);
@@ -1171,12 +1231,13 @@ export class DaemonPTYBridge extends EventEmitter {
       // 같은 daemon 프로세스인 여기서는 getLastAgent()가 닿는다. 이게 있어야
       // idle prompt 패턴이 안 잡히는 에이전트(Claude Code v2.1.x 등)도 running
       // 상태에서 agentName이 채워진다.
-      // `likelyRepaint`: this passive burst sits inside the resize-redraw
-      // guard window, so it is a TUI repaint, not work. The loose status dot
-      // still updates (the flag travels with the event), but the alarm's
-      // working feed in daemon/index.ts must NOT treat it as turn evidence —
-      // a repaint rebutting a pending completion window would silently kill
-      // a real "finished" alarm.
+      // `likelyRepaint` is true only for a cycle a hook's running edge armed
+      // in a still-open turn whose first output landed inside the
+      // resize-redraw guard window; every other burst in that window returned
+      // above. The status dot shows that hook turn running, but the alarm's
+      // working feed in daemon/index.ts must NOT treat the burst as turn
+      // evidence — a repaint rebutting a pending completion window would
+      // silently kill a real "finished" alarm.
       this.emit('active', {
         sessionId: ptyId,
         agentName: this.agentDetector?.getLastAgent() ?? undefined,
@@ -1190,6 +1251,8 @@ export class DaemonPTYBridge extends EventEmitter {
 
     // OSC events → cwd (OSC 7), prompt/command markers (OSC 133), and
     // desktop notifications (OSC 9/777/99)
+    // #2264: Claude Code's title turning idle right after a lone Esc (see noteTitleTurnEnd).
+    const titleTurnEdge = new ClaudeTitleTurnEdge();
     interpreter.onOsc((event) => {
       if (event.code === 0 || event.code === 2) {
         // OSC 0/2 window title (e.g. Claude Code `/rename`). OSC 1 (icon-only)
@@ -1200,13 +1263,14 @@ export class DaemonPTYBridge extends EventEmitter {
         this.lastTitle = title;
         this.lastTitleAt = Date.now();
         if (title) this.emit('title', { sessionId, title });
+        if (titleTurnEdge.observe(title)) this.noteTitleTurnEnd(sessionId);
         return;
       }
       if (event.code === 7) {
         // app-weight P1-4: dedup identical OSC 7 emissions. Shells re-emit
         // OSC 7 on every prompt redraw, so an idle pane would otherwise spam
         // the same cwd across daemon→main→renderer on each redraw. Mirrors
-        // the prompt-detect guard (lastDetectedCwd) below; the first OSC 7
+        // the prompt-detect guard (lastDetectedPromptCwd) below; the first OSC 7
         // after spawn always emits because the cache starts null.
         const cwd = parseOsc7Cwd(event.data);
         // OSC 7-sticky (2026-07-21): this shell has the integration hook — the
@@ -1270,9 +1334,14 @@ export class DaemonPTYBridge extends EventEmitter {
     this.usageLimitUnsubscribe = agentDetector.onUsageLimit((event) => {
       this.emit('usageLimit', { sessionId, event });
     });
+    // The interrupt row stays in the transcript: a resize redraw or a muted
+    // recovery replay prints it again for a turn that is long over.
+    this.interruptedUnsubscribe = agentDetector.onInterrupted(({ agent }) => {
+      if (this.muted || Date.now() - this.lastResizeAtMs < RESIZE_REDRAW_GUARD_MS) return;
+      this.emit('turnInterrupted', { sessionId, agent });
+    });
 
     // Prompt-based CWD detection state
-    let lastDetectedCwd = '';
     let promptBuffer = '';
 
     const capture = (data: string, buf?: Buffer, nativeChunk?: NativeOutputChunk): void => {
@@ -1291,6 +1360,8 @@ export class DaemonPTYBridge extends EventEmitter {
         else ringBuffer.write(buf ?? Buffer.from(data));
         // AFTER the ring write: the tracker's offsets are in the ring's own
         // coordinate system, so it needs the counter this chunk already moved.
+        // Before the titles in this chunk are read (see ClaudeTitleTurnEdge.noteOutput).
+        titleTurnEdge.noteOutput(data);
         interpreter.feed(data, ringBuffer.totalBytesWritten, nativeChunk);
         // After the mode tracker and OSC 133 have seen this chunk (see noteCodexOutput).
         this.noteCodexOutput(data);
@@ -1306,8 +1377,8 @@ export class DaemonPTYBridge extends EventEmitter {
           const clean = promptBuffer.replace(DaemonPTYBridge.ANSI_STRIP, '');
           const detectedCwd = detectPromptCwd(clean);
           if (detectedCwd !== null) {
-            if (detectedCwd !== lastDetectedCwd) {
-              lastDetectedCwd = detectedCwd;
+            if (detectedCwd !== this.lastDetectedPromptCwd) {
+              this.lastDetectedPromptCwd = detectedCwd;
               this.emit('cwd', { sessionId, cwd: detectedCwd });
             }
             promptBuffer = '';
@@ -1561,6 +1632,8 @@ export class DaemonPTYBridge extends EventEmitter {
     this.criticalUnsubscribe = null;
     this.usageLimitUnsubscribe?.();
     this.usageLimitUnsubscribe = null;
+    this.interruptedUnsubscribe?.();
+    this.interruptedUnsubscribe = null;
 
     // Stop activity monitor to clear timers and state
     if (this.activityMonitor && this.sessionId) {
@@ -1570,6 +1643,7 @@ export class DaemonPTYBridge extends EventEmitter {
     this.lastEmittedOscCwd = null;
     this.explicitTerminalStatus = false;
     this.submittedTurnPending = false;
+    this.hookArmedCycle = false;
     this.inputInBracketedPaste = false;
     this.lastInputAt = 0;
     this.inputRevision = 0;

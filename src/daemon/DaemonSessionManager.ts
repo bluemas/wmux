@@ -860,6 +860,10 @@ export class DaemonSessionManager extends EventEmitter {
       this.emit('session:usageLimit', payload);
     });
 
+    bridge.on('turnInterrupted', (payload) => {
+      this.emit('session:turnInterrupted', payload);
+    });
+
     bridge.on('inputSubmitted', (payload) => {
       this.emit('session:inputSubmitted', payload);
     });
@@ -1191,6 +1195,26 @@ export class DaemonSessionManager extends EventEmitter {
   confirmAgent(id: string): void {
     const managed = this.sessions.get(id);
     if (managed) managed.recoveredAgentUnconfirmed = false;
+  }
+
+  /**
+   * Move a pane's live cwd to the directory its agent reported in a hook.
+   * The shell only reports a `cd` it runs itself, so an agent that changes
+   * directory on its own (Claude's EnterWorktree, for one) left `meta.cwd` at
+   * the launch folder and recovery restarted the pane there, where the agent's
+   * session cannot be resumed. Only `cwd`, never `spawnCwd`, as on the shell
+   * path. Returns true when the cwd changed.
+   */
+  adoptAgentCwd(id: string, cwd: string): boolean {
+    const managed = this.sessions.get(id);
+    if (!managed || !cwd || managed.meta.cwd === cwd) return false;
+    if (containsControlChars(cwd)) return false;
+    managed.meta.cwd = cwd;
+    // The shell reports its own directory again once the agent exits; that
+    // report must not be swallowed as a repeat.
+    managed.bridge.forgetEmittedCwd();
+    this.emit('session:cwd', { sessionId: id, cwd });
+    return true;
   }
 
   /** Ask ConPTY for a full repaint by resizing to the size it already has. */

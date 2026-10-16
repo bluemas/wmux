@@ -126,24 +126,21 @@ import { BOT_SECRET_LIMITS } from '../../../shared/botSecret';
 import { botCwd, getBotRuntime } from '../../factory/BotRuntime';
 import { getWmuxDir } from '../../../daemon/config';
 import { RESEARCH_PRESET } from '../../../shared/ledger';
-import { GENERAL_THREAD, parseThreadId, taskOriginThread, type ThreadId } from '../../../shared/room';
+import { GENERAL_THREAD, parseThreadId, prThreadId, taskOriginThread, type ThreadId } from '../../../shared/room';
 import { getFactorySettings } from '../../factory/factorySettings';
 import { getBotFanoutReceipts } from '../../factory/botFanoutReceipts';
 import { noticeWorkerStarts, plainStartFailure, type BotWorkerStartOutcome } from '../../factory/botNotices';
 import { runningWakeTainted } from '../../factory/wakeTaint';
-import { resolveRoomPorts, runningWake } from '../../factory/roomWriter';
+import { botThreadRefusal, resolveRoomPorts, runningWake } from '../../factory/roomWriter';
+import { getHandoffRouter } from '../../factory/handoffRouter';
 import { emitBotHook } from '../../factory/botHooks';
 import { checkWorkers, recordWorkerStart, type BotUsage, type BudgetRefusalReason } from '../../factory/budget';
-import { getTaskLedger } from '../../deck/taskLedgerHost';
 import { botFanoutPreset, botFanoutPresetList, botPresetCheckoutRefusal, composeBotWorkerPrompt } from '../../worktask/botFanoutPresets';
-import { getFactLog, type FactLog } from '../../factory/factLog';
+import { getFactLog } from '../../factory/factLog';
 import { getWakeQueue } from '../../factory/wakeQueue';
-import { getVerdictedTasks } from '../../factory/verdictedTasks';
 import { isWakeStoppedByOwner } from '../../factory/factoryStop';
-import { getAgentSlots, getSlotLiveness, rowHoldsAgentSlot } from '../../factory/agentSlots';
-import { resumedWorkersLive } from '../../factory/workerReclaim';
-import type { LedgerEntry } from '../../../shared/ledger';
-import type { Fact } from '../../../shared/facts';
+import { getAgentSlots, refreshSlotLiveness } from '../../factory/agentSlots';
+import { countOpenBotWorkers, openBotWorkers, verdictedTaskIds } from '../../factory/openBotWorkers';
 
 /** Per worker CLI: why a connection cannot reach its workers, or null. */
 const CONNECTOR_AGENT_REFUSAL: Readonly<Record<string, (c: Connector) => string | null>> = { codex: codexConnectorRefusal };
@@ -188,6 +185,20 @@ export const FANOUT_WIRE_AGENT_CMD = 'claude';
  *  verdict (accept-then-poll), so this deadline only bounds how long the
  *  detached approval hop may hang before we record the fan-out as denied. */
 const APPROVAL_TIMEOUT_MS = 45_000;
+/** How long a bot's new fan-out waits for a fresh read of its workers' panes
+ *  before the caps are checked on what is already known (#2255). */
+const LIVENESS_WAIT_MS = 2_000;
+
+/** Resolves when `work` settles or after `ms`, whichever is first. */
+async function withinMs(work: Promise<unknown> | undefined, ms: number): Promise<void> {
+  if (!work) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([work.catch(() => undefined), new Promise<void>((resolve) => { timer = setTimeout(resolve, ms); })]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 /**
  * Upper bound on a caller-chosen idempotency key. The key is retained in the
@@ -666,17 +677,25 @@ export interface FanOutBotPort {
   /** The wake the bot is running now, or null between turns. */
   currentWakeId(botId: string): string | null;
   /** The room thread of that running wake, or null (main's wake state, read
-   *  with the wake id: the tasks the wake starts report in this thread). */
+   *  with the wake id: the tasks the wake starts report in this thread unless
+   *  the bot names another or they check out a PR). */
   currentWakeThread(botId: string): ThreadId | null;
   /** The handoff that running wake delivers (a dispatch the bot was given,
    *  or the one its task wake answers), or null. Its tasks record it, so
    *  their wakes still answer it. */
   currentWakeHandoff?(botId: string): string | null;
+  /** The handoff a task the bot starts now belongs to, or null for none
+   *  (HandoffRouter.taskHandoff): the wake's own unless the task's subject
+   *  (a named thread, a checked-out PR) is another one's. Absent: the wake's. */
+  taskHandoff?(bot: { workspaceId: string; botId: string }, subject: { threadId?: ThreadId; pr?: { number: number; threadId: ThreadId } }, wakeHandoffId: string | undefined): string | null;
   /** Whether that running wake carried outside text (factory/wakeTaint.ts);
    *  true when it cannot be told. Its tasks' dispatch carries the mark. */
   currentWakeTainted(botId: string): boolean;
   /** Open fan-out tasks started by this bot, and by any bot. */
   openWorkers(botId: string): { bot: number; factory: number };
+  /** Brings what openWorkers counts up to date (which workers' panes still
+   *  run an agent). Awaited before the caps are checked. Never rejects. */
+  refreshLiveness?(): Promise<void>;
   usage(botId: string): BotUsage;
   workersStarted(botId: string, taskIds: readonly string[]): void;
   budgetExhausted(bot: BotBinding, reason: BudgetRefusalReason | 'factory_workers'): void;
@@ -698,54 +717,10 @@ export interface FanOutBotPort {
 export const BOT_FANOUT_STARTING_NOTE =
   'Accepted: the workers are starting, not started. Say they are starting, not that they started: a worker that could not start wakes you, and one that started reports through its task.';
 
+export { countOpenBotWorkers, verdictedTaskIds };
+
 /** Fan-outs a bot may start inside one wake. */
 export const BOT_FANOUTS_PER_WAKE_MAX = 16;
-
-/** The verify tasks among `taskIds` whose verdict.recorded fact (naming the
- *  task as its evidence) is still in the fact log. Empty when the log is not
- *  running or cannot be scanned. The factory's verdicted-tasks file keeps
- *  them after the fact is gone (verdictedTasks.ts). */
-export function verdictedTaskIds(taskIds: readonly string[], log: unknown = getFactLog()): Set<string> {
-  const out = new Set<string>();
-  if (taskIds.length === 0 || !log || typeof (log as Partial<FactLog>).readWhere !== 'function') return out;
-  const want = new Set(taskIds);
-  // One fact per task is enough: the scan stops once every task is found.
-  const firstVerdict = (f: Fact): boolean => {
-    const id = f.ref?.taskId;
-    if (f.kind !== 'verdict.recorded' || !id || !want.has(id) || out.has(id)) return false;
-    out.add(id);
-    return true;
-  };
-  try {
-    (log as FactLog).readWhere(0, firstVerdict, want.size);
-  } catch {
-    out.clear(); // counted as open
-  }
-  return out;
-}
-
-/**
- * Open fan-out tasks started by `botId`, and by any bot. A verify task that
- * reported done (review_requested) and whose verdict is recorded has
- * finished its work — the verdict was the reason it ran — so it no longer
- * holds a worker slot. Pure over its inputs.
- */
-export function countOpenBotWorkers(
-  rows: ReadonlyArray<Pick<LedgerEntry, 'id' | 'status' | 'dispatch'>>,
-  botId: string,
-  verdicted: (taskIds: readonly string[]) => Set<string>,
-): { bot: number; factory: number } {
-  const botRows = rows.filter((e) => e.dispatch?.origin?.kind === 'bot');
-  const done = verdicted(botRows.filter((e) => e.status === 'review_requested' && e.dispatch?.preset === 'verify').map((e) => e.id));
-  let bot = 0;
-  let factory = 0;
-  for (const e of botRows) {
-    if (done.has(e.id)) continue;
-    factory++;
-    if (e.dispatch?.origin?.botId === botId) bot++;
-  }
-  return { bot, factory };
-}
 
 /** What fills a bot's own worker budget, for its refusal: a worker waiting
  *  for an agent slot has not started, and the bot must not say it runs. Pure. */
@@ -806,19 +781,14 @@ function defaultBotPort(): FanOutBotPort | null {
       const wake = runningWake(resolveRoomPorts(), botId);
       return wake && wake.wakeId === runtime.currentTurn(botId)?.wakeId ? wake.handoffId ?? null : null;
     },
+    taskHandoff: (bot, subject, wakeHandoffId) => {
+      const router = getHandoffRouter();
+      return router ? router.taskHandoff(bot, subject, wakeHandoffId) : wakeHandoffId ?? null;
+    },
+    refreshLiveness: refreshSlotLiveness,
     // Open bot tasks whose worker still runs, plus resumed workers whose task
     // row has ended.
-    openWorkers: (botId) => {
-      const live = getSlotLiveness();
-      const rows = getTaskLedger().list({ openOnly: true }).filter((r) => rowHoldsAgentSlot(r, live));
-      const open = countOpenBotWorkers(rows, botId, (ids) => {
-        const kept = getVerdictedTasks();
-        const found = verdictedTaskIds(ids.filter((id) => !kept?.has(id)));
-        for (const id of ids) if (kept?.has(id)) found.add(id);
-        return found;
-      });
-      return { bot: open.bot + resumedWorkersLive(botId), factory: open.factory + resumedWorkersLive() };
-    },
+    openWorkers: openBotWorkers,
     usage: (botId) => store.usageOf(botId),
     workersStarted: (botId, taskIds) => {
       const now = Date.now();
@@ -1086,6 +1056,23 @@ export function registerFanOutRpc(
         ? `${callerWorkspaceId}::commander::${callerKey}`
         : `${callerWorkspaceId}::${callerKey}`;
 
+    // A bot's caps below count its live workers: read their panes as they are
+    // now, not as the previous check saw them (#2255). Here, ahead of the
+    // synchronous stretch from the poll branch to the booking. A key already
+    // known is answered from bookkeeping and never waits, and a new one waits
+    // at most LIVENESS_WAIT_MS, well inside the caller's own deadline.
+    const keyKnown = params['cancelPending'] === true
+      || service.statusOf(key).state !== 'unknown'
+      || pending.has(key)
+      || terminal.has(key);
+    if (bot && !keyKnown) {
+      try {
+        await withinMs((deps.bot ?? defaultBotPort)()?.refreshLiveness?.(), LIVENESS_WAIT_MS);
+      } catch {
+        /* the caps count what is known */
+      }
+    }
+
     // ── Poll branch ──────────────────────────────────────────────────────
     // A repeat of a key we already know answers from bookkeeping and starts
     // nothing. This is the whole poll protocol.
@@ -1153,7 +1140,8 @@ export function registerFanOutRpc(
     let botPort: FanOutBotPort | null = null;
     let botProfile: BotProfile | null = null;
     let botWakeId = '';
-    // The thread of the wake that asks: its tasks' wakes and cards go there.
+    // The thread its tasks' wakes and cards go to: the one the bot names,
+    // else the PR its tasks check out, else the asking wake's.
     let botWakeThread: ThreadId | undefined;
     // Whether that wake carried outside text: its tasks are marked tainted.
     let botWakeTainted = false;
@@ -1162,6 +1150,8 @@ export function registerFanOutRpc(
     // Where the bot was talking when it asked (general included): how its
     // workers' start went is told there.
     let botNoticeThread: ThreadId = GENERAL_THREAD;
+    // The thread the bot named for its tasks, if any.
+    let botNamedThread: ThreadId | undefined;
     if (bot) {
       try {
         botPort = (deps.bot ?? defaultBotPort)();
@@ -1192,6 +1182,15 @@ export function registerFanOutRpc(
       const wakeThread = botPort.currentWakeThread(bot.botId);
       botWakeThread = taskOriginThread(wakeThread);
       botNoticeThread = parseThreadId(wakeThread) ?? GENERAL_THREAD;
+      // The bot may name its workers' subject instead (a wake about one PR
+      // starting the next queued one), as freely as it names a post's thread.
+      if (params['threadId'] !== undefined) {
+        const named = parseThreadId(params['threadId']);
+        if (named === null) return deny('INVALID_ARGUMENT', 'threadId is not a thread id');
+        const refused = botThreadRefusal(resolveRoomPorts(), bot, named);
+        if (refused) return deny('INVALID_ARGUMENT', `threadId: ${refused}`);
+        botNamedThread = named;
+      }
       // A researcher's tasks read outside text whatever woke it.
       botWakeTainted = botPort.currentWakeTainted(bot.botId) !== false || botTemplate(botProfile) === 'researcher';
       botWakeHandoff = botPort.currentWakeHandoff?.(bot.botId) ?? undefined;
@@ -1209,6 +1208,37 @@ export function registerFanOutRpc(
       const c = parseCheckout(params['checkout']);
       if ('error' in c) return deny('INVALID_ARGUMENT', c.error);
       checkout = c;
+    }
+    if (params['threadId'] !== undefined && !bot) return deny('INVALID_ARGUMENT', 'task.fanout.start accepts threadId only from a factory bot');
+    if (bot) {
+      // The PR a task checks out is its subject, unless the wake is a
+      // conversation (a handoff's, a 1:1, a group chat) the flow stays in.
+      const inConversation = /^(handoff|dm|group):/.test(botWakeThread ?? '');
+      const checkoutPr = /^pull\/([1-9][0-9]*)\/head$/.exec(checkout?.fetchRef ?? '')?.[1];
+      const pr = inConversation ? undefined : checkoutPr;
+      const repoKey = botProfile?.repo?.repoKey;
+      const prThread = pr && repoKey ? parseThreadId(prThreadId(repoKey, Number(pr))) ?? undefined : undefined;
+      // The handoff the tasks answer: the wake's, unless their subject is
+      // another one's (the reviewer's wake about PR #Y starting the queued
+      // worker for #X binds it to #X's dispatch, else to none).
+      // General names no subject (every card of the room is there).
+      const subjectThread = taskOriginThread(botNamedThread ?? prThread);
+      const namedPr = Number(/^pr:.+#([1-9][0-9]*)$/.exec(subjectThread ?? '')?.[1]);
+      const subjectPr = checkoutPr ? Number(checkoutPr) : repoKey && namedPr && subjectThread === prThreadId(repoKey, namedPr) ? namedPr : undefined;
+      const subjectPrThread = subjectPr && repoKey ? parseThreadId(prThreadId(repoKey, subjectPr)) : null;
+      if (botPort?.taskHandoff) {
+        botWakeHandoff = botPort.taskHandoff(
+          { workspaceId: bot.workspaceId, botId: bot.botId },
+          {
+            ...(subjectThread ? { threadId: subjectThread } : {}),
+            ...(subjectPr && subjectPrThread ? { pr: { number: subjectPr, threadId: subjectPrThread } } : {}),
+          },
+          botWakeHandoff,
+        ) ?? undefined;
+      }
+      // General names no subject: such tasks keep a thread of their own, as
+      // from a wake in General.
+      botWakeThread = taskOriginThread(botNamedThread ?? prThread ?? botWakeThread);
     }
     // A bot's named secrets for its workers (factory/secretGrants.ts): names
     // only, each stored now; the values reach each worker's process alone.

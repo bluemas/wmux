@@ -81,7 +81,7 @@ import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { atomicReadJSONSync, atomicWriteTextSync } from '../../daemon/util/atomicWrite';
 import { redactStoredSecretsDeep } from './secretRedaction';
-import { BOT_ID_RE, isBotRole, isCoordinatorBot, type BotBinding, type BotProfile } from '../../shared/bot';
+import { BOT_ID_RE, delegatesFromConversation, isBotRole, isCoordinatorBot, type BotBinding, type BotProfile } from '../../shared/bot';
 import { SHARED_SURFACE, type BotToolName } from '../../shared/botSurface';
 import type { Fact, FactDraft, FactRef } from '../../shared/facts';
 import type { WakeItem, WakeReason } from '../../shared/wake';
@@ -644,6 +644,43 @@ export class HandoffRouter {
     };
   }
 
+  /** The handoff a worker a bot starts now belongs to, recorded on its task
+   *  (LedgerDispatch.handoffId), or null for none. `wakeHandoffId` is the
+   *  handoff of the wake starting it, kept only while it is addressed to this
+   *  bot; it is judged by the hop it hands the bot (wokenHop: an answer's
+   *  held dispatch). `subject` is the thread the bot named (never General) or
+   *  the PR derived from its checkout (and that PR's thread). With no
+   *  subject, or one the wake's hop is about, the wake's handoff, as before.
+   *  Otherwise the one open dispatch addressed to this bot that is about the
+   *  subject (its thread, or the PR by thread or refs.pr); with several,
+   *  none. With none, the wake's handoff only while it cannot be told to be
+   *  about something else (no PR of its own, no thread of the subject's
+   *  kind): a task is never bound to another subject's handoff. */
+  taskHandoff(
+    bot: { workspaceId: string; botId: string },
+    subject: { threadId?: ThreadId; pr?: { number: number; threadId: ThreadId } },
+    wakeHandoffId: string | undefined,
+  ): string | null {
+    const hop = this.wokenHop(bot.botId, wakeHandoffId);
+    const wake = hop && hop.to.kind === 'bot' && hop.to.workspaceId === bot.workspaceId ? hop : null;
+    const own = wake && wakeHandoffId ? wakeHandoffId : null;
+    const { threadId, pr } = subject;
+    if (!threadId && !pr) return own;
+    const kind = (t: string | undefined): string | undefined => t?.slice(0, t.indexOf(':') + 1) || undefined;
+    // refs.pr counts only from a handoff not in another PR's thread (another repository's PR #n).
+    const about = (h: Handoff): boolean => h.threadId === threadId || (!!pr && (h.threadId === pr.threadId
+      || (h.payload.refs?.pr === pr.number && kind(h.threadId) !== 'pr:')));
+    if (wake && about(wake)) return own;
+    const candidates = [...this.records.values()].filter((h) =>
+      h.kind === 'dispatch' && h.to.kind === 'bot' && h.to.botId === bot.botId && h.to.workspaceId === bot.workspaceId
+      && (h.status === 'queued' || h.status === 'delivered') && !this.answered(h.id) && h.id !== wake?.id && about(h));
+    if (candidates.length === 1) return candidates[0].id;
+    if (candidates.length > 1 || !wake) return null;
+    const elsewhere = (!!threadId && kind(wake.threadId) === kind(threadId))
+      || (!!pr && (kind(wake.threadId) === 'pr:' || wake.payload.refs?.pr !== undefined));
+    return elsewhere ? null : own;
+  }
+
   /** A relay's last result (or one it stopped at): the hops before it in
    *  its chain, oldest first (at most 10). */
   private relayTrail(h: Handoff): { trail?: string[] } {
@@ -668,6 +705,8 @@ export class HandoffRouter {
   /** A bot sends a dispatch, result, refusal or message. Synchronous: the
    *  hop count and the record are settled before anything else runs. */
   send(sender: BotBinding, params: HandoffSendParams): HandoffResult {
+    // Processed whole, then each field shortened to its cap.
+    params = redactStoredSecretsDeep(params);
     const kind = params?.kind;
     if (kind !== 'dispatch' && kind !== 'result' && kind !== 'refusal' && kind !== 'message') {
       return invalid('kind must be dispatch, result, refusal or message');
@@ -720,6 +759,12 @@ export class HandoffRouter {
    */
   mention(sender: BotBinding, card: Pick<RoomCard, 'id' | 'threadId' | 'title' | 'body' | 'refs'>, botIds: readonly string[]): Array<{ botId: string; result: HandoffResult }> {
     const refs = sanitizeRefs({ pr: card.refs?.pr, issue: card.refs?.issue, headSha: card.refs?.headSha, taskId: card.refs?.taskId, url: card.refs?.url, messageId: card.id });
+    // The owner asked the poster in its own 1:1 and it asked around in
+    // General: the bots of its room answer in that 1:1, where the owner is.
+    const ports = this.opts.ports();
+    const wakeThread = runningWakeThread(ports, sender.botId);
+    const askedInDm = card.threadId === GENERAL_THREAD && runningWake(ports, sender.botId)?.reasonKind === 'human'
+      && dmThreadBot(wakeThread) === sender.botId;
     return botIds.map((botId) => ({
       botId,
       result: this.route(sender, {
@@ -727,7 +772,7 @@ export class HandoffRouter {
         title: oneLine(card.title, HANDOFF_STORE_LIMITS.TITLE_MAX) || 'message',
         body: card.body ?? '',
         refs: refs as FactRef | undefined,
-        namedThread: card.threadId,
+        namedThread: askedInDm && wakeThread && safeGet(ports.bots, botId)?.workspaceId === sender.workspaceId ? wakeThread : card.threadId,
         toBotId: botId,
         clientHandoffId: mentionKey(card.id, botId),
       }),
@@ -759,7 +804,9 @@ export class HandoffRouter {
     const ownerRun = !chainParent && wake?.runId && ID_RE.test(wake.runId) ? wake.runId : null;
     const from = botParty(sender);
     const id = newId('h');
-    const coordinator = isCoordinatorBot(safeGet(this.opts.ports().bots, sender.botId));
+    const senderProfile = safeGet(this.opts.ports().bots, sender.botId);
+    const coordinator = isCoordinatorBot(senderProfile);
+    const wakeThread = runningWakeThread(ports, sender.botId);
     // A chain a Coordinator starts begins at depth 0, like the owner's.
     const depth = chainParent ? chainParent.depth + 1 : coordinator ? 0 : 1;
     const runId = chainParent ? chainParent.runId : ownerRun ?? newId('run');
@@ -767,7 +814,7 @@ export class HandoffRouter {
       version: 1,
       id,
       runId,
-      threadId: spec.namedThread ?? parent?.threadId ?? runningWakeThread(ports, sender.botId)
+      threadId: spec.namedThread ?? parent?.threadId ?? wakeThread
         ?? chainParent?.threadId ?? (`handoff:${id}` as ThreadId),
       depth,
       hopsInRun: Math.max(this.hopsIn(runId), chainParent?.hopsInRun ?? 0) + 1,
@@ -792,11 +839,16 @@ export class HandoffRouter {
     // A coordinator's new piece of work said in General — or in its own
     // 1:1, or a group chat's thread — gets a thread of its own: the whole
     // flow (hops, workers, the report) stays together there, and the 1:1 or
-    // the group stays the owner's talk.
+    // the group stays the owner's talk. A `lead` bot's work does too, from
+    // its 1:1 or a group (delegatesFromConversation). Naming the thread the
+    // wake runs in is not naming another subject: it opens a thread like
+    // leaving thread_id out does.
     const saidIn = draft.threadId;
     const ownDm = dmThreadBot(saidIn) === sender.botId;
     const inGroup = !!groupThreadGroup(saidIn);
-    if (kind === 'dispatch' && coordinator && !spec.namedThread && !parent && (saidIn === GENERAL_THREAD || ownDm || inGroup)) {
+    const namedElsewhere = spec.namedThread !== undefined && spec.namedThread !== wakeThread;
+    const opens = coordinator ? saidIn === GENERAL_THREAD || ownDm || inGroup : delegatesFromConversation(senderProfile) && (ownDm || inGroup);
+    if (kind === 'dispatch' && opens && !namedElsewhere && !parent) {
       draft.threadId = `handoff:${id}` as ThreadId;
       draft.opensThread = true;
       if (ownDm || inGroup) draft.openedIn = saidIn;
@@ -1059,9 +1111,9 @@ export class HandoffRouter {
     if (how === 'finished' && (parent.next?.length ?? 0) > 0) return;
     const root = this.rootOf(parent);
     // Only a thread this router opened for a coordinator's work in General
-    // or its 1:1.
+    // or its 1:1 (or a lead bot's, delegatesFromConversation).
     if (root.kind !== 'dispatch' || root.from.kind !== 'bot' || root.opensThread !== true) return;
-    if (!isCoordinatorBot(safeGet(this.opts.ports().bots, root.from.botId))) return;
+    if (!delegatesFromConversation(safeGet(this.opts.ports().bots, root.from.botId))) return;
     const rooms = this.opts.rooms();
     const ws = root.from.workspaceId;
     if (!rooms) return;
@@ -1077,6 +1129,7 @@ export class HandoffRouter {
       kind: 'fact',
       actor: { kind: 'system' },
       title: `${how === 'stopped' ? 'Stopped' : 'Finished'}: ${root.payload.title}`,
+      notice: { code: how === 'stopped' ? 'thread.stopped' : 'thread.finished', args: { title: root.payload.title } },
       refs: { handoffId: result.id, threadId: root.threadId },
     }, ownerCard && ownerCard.threadId === saidIn && ownerCard.kind === 'human' ? { replyTo: ownerCard.id } : undefined);
     // Written once per result: the mark is on the result itself.
@@ -1338,6 +1391,8 @@ export class HandoffRouter {
   /** A bot asks the owner. The question is raised in its thread now, or
    *  waits there behind the thread's open decision. */
   askPerson(sender: BotBinding, params: AskPersonParams): Promise<HandoffResult> {
+    // Processed whole, then shortened (see send).
+    params = redactStoredSecretsDeep(params);
     const ports = this.opts.ports();
     // The default key is taken now, in call order, like a send's.
     const asking = runningWake(ports, sender.botId);

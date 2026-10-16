@@ -78,6 +78,16 @@ export function isCoordinatorBot(profile: { template?: BotTemplate; role: BotRol
   return !!profile && botTemplate(profile) === 'coordinator';
 }
 
+/** The bot's new piece of work handed off from its own 1:1 or a group chat
+ *  opens a request thread there (main/factory/handoffRouter.ts), which the
+ *  conversation shows folded into one work card (shared/botsWork.ts): the
+ *  Coordinator, or a bot with the `lead` role (the first bot a name-only
+ *  create makes is one). It grants nothing; powers stay with
+ *  isCoordinatorBot. Pure. */
+export function delegatesFromConversation(profile: { template?: BotTemplate; role: BotRole } | null | undefined): boolean {
+  return isCoordinatorBot(profile) || profile?.role === 'lead';
+}
+
 /** Longest job text, in UTF-16 units after trimming. */
 export const BOT_JOB_MAX = 2000;
 
@@ -99,6 +109,21 @@ export type BotEngine =
   | { kind: 'acp'; command: string; args: string[] };
 
 export const DEFAULT_BOT_ENGINE: BotEngine = { kind: 'claude-sdk' };
+
+/** The models a NEW bot of a template starts on (main/factory/botStore.ts
+ *  `create`, when the caller names no engine or worker agent): `brain` is
+ *  the bot's own `claude-sdk` model (BotEngine.model), `worker` its fan-out
+ *  workers' (BotProfile.workerAgent). The ids are aliases from the model
+ *  catalog (shared/claudeModels.ts CLAUDE_MODEL_OPTIONS), so they follow the
+ *  installed claude CLI's newest model of that tier. A stored bot is never
+ *  moved onto these; a template absent here starts on the defaults. */
+export const TEMPLATE_MODEL_DEFAULTS: Readonly<Partial<Record<BotTemplate, { brain?: { model: string }; worker?: BotWorkerAgent }>>> = {
+  coordinator: { brain: { model: 'haiku' } },
+  issue: { brain: { model: 'haiku' } },
+  researcher: { brain: { model: 'haiku' } },
+  developer: { worker: { agent: 'claude', model: 'opus' } },
+  reviewer: { worker: { agent: 'claude', model: 'opus' } },
+};
 
 /** The agent CLI a bot's fan-out workers run on (shared/botWorkerAgent.ts):
  *  a slug from fan-out's closed agent table that has a bot-worker guard, plus
@@ -174,7 +199,9 @@ export interface BotProfile {
    *  before slots were stored (the store fills it on load). */
   hue?: number;
   enabled: boolean;
-  parked?: { reason: 'budget' | 'error' | 'human'; at: number };
+  /** `until`: an error park at the provider's usage limit, lifted by
+   *  itself then (an older build reads it as a plain error park). */
+  parked?: { reason: 'budget' | 'error' | 'human'; at: number; until?: number };
   createdAt: number;
   updatedAt: number;
 }
@@ -284,7 +311,34 @@ export interface BotStatus {
   queueDepth: number;
   /** turnsHour is null when the bot has no hourly cap. */
   budgetLeft: { turnsHour: number | null; turnsDay: number; workerHoursDay: number };
+  /** What the profile's Today block shows beside budgetLeft (absent from an
+   *  older build). */
+  usage?: BotStatusUsage;
   lastError?: { message: string; at: number };
+}
+
+/** A bot's use of its limits now (main/factory/budget.ts). */
+export interface BotStatusUsage {
+  /** Turns started in the last hour; null when the bot has no hourly cap. */
+  turnsHour: number | null;
+  turnsDay: number;
+  /** Worker time in the last day, in hours (may pass the cap: a running
+   *  worker counts up to now). */
+  workerHoursDay: number;
+  /** When out of turns: when a turn is allowed again (absent: never, a cap
+   *  of 0). */
+  nextTurnAt?: number;
+  /** When out of worker time and no worker of its runs: when its worker
+   *  time drops below the cap. */
+  workerTimeAt?: number;
+  /** Its workers running now, as the fan-out's cap counts them. */
+  workersRunning?: number;
+  /** Its new workers waiting for an agent slot (they count against its cap). */
+  workersWaiting?: number;
+  /** Bot workers running factory-wide (cap WAKE_LIMITS.GLOBAL_CONCURRENT_WORKERS). */
+  factoryWorkers?: number;
+  /** The factory's agent slots (Settings › Bots). */
+  slots?: { inUse: number; cap: number };
 }
 
 export const BOT_RPC = {
@@ -360,7 +414,8 @@ export interface BotSetJobParams {
  *    (shared/botSecret.ts);
  *  - `connectors-changed`: the connection library changed
  *    (shared/botConnector.ts);
- *  - `groups-changed`: the owner's group chats changed (shared/botGroup.ts). */
+ *  - `groups-changed`: the owner's group chats changed (shared/botGroup.ts);
+ *  - `skills-changed`: a bot's skills changed (shared/botSkill.ts). */
 export type BotEventPayload =
   | { type: 'bot.status'; status: BotStatus }
   | { type: 'bots-changed' }
@@ -368,7 +423,8 @@ export type BotEventPayload =
   | { type: 'routines-changed'; botId?: string }
   | { type: 'secrets-changed' }
   | { type: 'connectors-changed' }
-  | { type: 'groups-changed' };
+  | { type: 'groups-changed' }
+  | { type: 'skills-changed'; botId?: string };
 
 export const BOT_EVENT = 'bot.event';
 

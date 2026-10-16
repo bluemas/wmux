@@ -7,13 +7,14 @@ import * as os from 'os';
 import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { BrainAdapter, BrainEvent, BrainStartOptions } from '../../deck/BrainAdapter';
-import { BotRuntime, BotSessionStore, CONTEXT_WAIT_MS, ROOM_RUN_STAGGER_MS, TRANSIENT_RETRY_BASE_MS, TRANSIENT_RETRY_MAX, botSessionsPath, isTransientEngineError, roomRunOf, setBotRuntimePorts, __resetBotRuntimePortsForTesting } from '../BotRuntime';
+import { BotRuntime, BotSessionStore, CONTEXT_WAIT_MS, ROOM_RUN_STAGGER_MS, TRANSIENT_RETRY_BASE_MS, TRANSIENT_RETRY_MAX, botSessionsPath, isTransientEngineError, roomRunOf, setBotRuntimePorts, usageLimitNoticeOf, usageLimitParkUntil, USAGE_LIMIT_MIN_PARK_MS, __resetBotRuntimePortsForTesting } from '../BotRuntime';
 import type { BotEngineFactory, BotEngineSpawnInput } from '../botEngines';
 import { BotStore, botsFilePath } from '../botStore';
 import { WakeQueue, wakeQueuePath } from '../wakeQueue';
 import { DEFAULT_FACTORY_SETTINGS, type FactorySettings } from '../factorySettings';
 import { __resetBotHooksForTesting, onBotHook, type BotHookEvent } from '../botHooks';
 import { HOUR_MS } from '../budget';
+import { USAGE_LIMIT_RESUME_GRACE_MS, USAGE_LIMIT_UNKNOWN_HOLD_MS, parseUsageLimitReset } from '../../../shared/usageLimit';
 
 /** A scripted engine session: each send waits for the test to end the turn. */
 class FakeAdapter implements BrainAdapter {
@@ -565,6 +566,71 @@ describe('BotRuntime', () => {
     expect(r.adapters[0].prompts).toHaveLength(4);
   });
 
+  it('a usage limit parks the bot until the reset, then it picks up by itself; its turn is not charged', async () => {
+    const timers: Array<{ fn: () => void; at: number }> = [];
+    const r = rig({ timers });
+    const id = createBot(r);
+    const item = must(r.runtime.wake(id, { text: 'hi' }));
+    await settle();
+    // The clock is 19:00 in Seoul: the window resets in two hours.
+    const text = "Claude Code returned an error result: You've hit your session limit · resets 9pm (Asia/Seoul)";
+    r.adapters[0].end([{ type: 'error', message: text }]);
+    await settle();
+    const reset = must(parseUsageLimitReset("You've hit your session limit · resets 9pm (Asia/Seoul)", clock));
+    expect(reset).toBe(clock + 2 * HOUR_MS);
+    const until = reset + USAGE_LIMIT_RESUME_GRACE_MS;
+    expect(until).toBeGreaterThan(clock);
+    expect(r.store.get(id)?.parked).toEqual({ reason: 'error', at: clock, until });
+    expect(r.queue.get(item.id)?.state).toBe('parked');
+    expect(hooks).toContainEqual(expect.objectContaining({ type: 'bot.error', botId: id, wakeId: item.id, until }));
+    expect(r.store.usageOf(id).turns).toHaveLength(0);
+    // Not before the reset.
+    clock = until - 1;
+    timers.filter((t) => t.at <= clock).forEach((t) => t.fn());
+    await settle();
+    expect(r.adapters[0].prompts).toHaveLength(1);
+    clock = until;
+    timers.filter((t) => t.at <= clock).forEach((t) => t.fn());
+    await settle();
+    expect(r.store.get(id)?.parked).toBeUndefined();
+    expect(r.adapters[0].prompts).toHaveLength(2);
+    r.adapters[0].end();
+    await settle();
+    expect(r.queue.get(item.id)?.state).toBe('done');
+  });
+
+  it('a usage limit that names no reset time holds for the bounded wait; an ordinary error park still waits for the owner', async () => {
+    const r = rig();
+    const id = createBot(r);
+    must(r.runtime.wake(id));
+    await settle();
+    r.adapters[0].end([{ type: 'error', message: "You've hit your limit" }]);
+    await settle();
+    expect(r.store.get(id)?.parked).toEqual({ reason: 'error', at: clock, until: clock + USAGE_LIMIT_UNKNOWN_HOLD_MS });
+    // A reset just past (the hour rounded down) waits the shortest park, never
+    // a day; a dated reset is kept as written.
+    const seoul1pm = Date.UTC(2026, 9, 16, 4, 0);
+    expect(usageLimitParkUntil("You've hit your session limit · resets 1pm (Asia/Seoul)", seoul1pm + 40_000)).toBe(seoul1pm + 40_000 + USAGE_LIMIT_MIN_PARK_MS);
+    expect(usageLimitParkUntil("You've hit your session limit · resets 1pm (Asia/Seoul)", seoul1pm + 90_000)).toBe(seoul1pm + 90_000 + USAGE_LIMIT_UNKNOWN_HOLD_MS);
+    const weekly = usageLimitParkUntil("You've hit your weekly limit · resets Oct 20, 9am (Asia/Seoul)", seoul1pm);
+    expect(weekly).toBe(Date.UTC(2026, 9, 20, 0, 0) + 30_000);
+    // A reply that only quotes the wording is not a limit.
+    expect(usageLimitNoticeOf("Earlier I said: You've hit your limit, then retried")).toBeNull();
+  });
+
+  it('a usage limit on a turn the owner parked meanwhile keeps the owner\'s park', async () => {
+    const r = rig();
+    const id = createBot(r);
+    const item = must(r.runtime.wake(id));
+    await settle();
+    r.runtime.park(id);
+    r.adapters[0].end([{ type: 'error', message: "You've hit your limit · resets 3pm" }]);
+    await settle();
+    expect(r.store.get(id)?.parked).toMatchObject({ reason: 'human' });
+    expect(r.store.get(id)?.parked).not.toHaveProperty('until');
+    expect(r.queue.get(item.id)?.state).toBe('parked');
+  });
+
   it('a network failure retries after a wait, spends no attempt and never parks the bot', async () => {
     const timers: Array<{ fn: () => void; at: number }> = [];
     const r = rig({ timers });
@@ -975,5 +1041,81 @@ describe('room-wide owner messages, wake context and turn ends', () => {
     r.runtime.kick();
     await settle();
     expect(r.adapters[0].prompts[1]).toContain('The owner woke you by hand.');
+  });
+
+  it('a turn that ends with plain text hands its last words to postTurnText while the wake runs; empty, failed or interrupted turns do not', async () => {
+    const r = rig();
+    const posted: Array<{ wakeId: string; text: string; since: number; running: boolean }> = [];
+    setBotRuntimePorts({
+      postTurnText: (p, item, text, since) => { posted.push({ wakeId: item.id, text, since, running: r.runtime.currentTurn(p.id)?.wakeId === item.id }); },
+    });
+    const id = createBot(r, 'lead');
+    const startedAt = clock;
+    const one = must(r.runtime.wake(id, { text: 'hi', threadId: `dm:${id}` }));
+    await settle();
+    // Narration before a tool call is not the reply; the text after it is.
+    r.adapters[0].end([
+      { type: 'text-delta', text: 'Let me check.' },
+      { type: 'tool-start', name: 'mcp__wmux__room_read', inputSummary: '' },
+      { type: 'tool-end', name: 'mcp__wmux__room_read', ok: true },
+      { type: 'text-delta', text: 'All ' },
+      { type: 'text-delta', text: 'green.' },
+      { type: 'turn-end', sessionId: 'sess-1' },
+    ]);
+    await settle();
+    expect(posted).toEqual([{ wakeId: one.id, text: 'All green.', since: startedAt, running: true }]);
+    // No words: nothing to post.
+    r.runtime.wake(id, { text: 'again' });
+    await settle();
+    r.adapters[0].end([{ type: 'text-delta', text: '  ' }, { type: 'turn-end', sessionId: 'sess-1' }]);
+    await settle();
+    // An error ends the turn without a result.
+    r.runtime.wake(id, { text: 'fail' });
+    await settle();
+    r.adapters[0].end([{ type: 'text-delta', text: 'Half an answer' }, { type: 'error', message: 'boom' }]);
+    await settle();
+    expect(posted).toHaveLength(1);
+  });
+
+  it('only a wake answering an owner message posts its plain text; a routine, fact, handoff, intro or manual wake stays silent', async () => {
+    const r = rig();
+    const posted: string[] = [];
+    setBotRuntimePorts({ postTurnText: (_p, item) => { posted.push(item.reason.kind); } });
+    const id = createBot(r, 'lead');
+    const reasons = [
+      { kind: 'routine', routineId: 'rt-1', dueAt: clock },
+      { kind: 'facts', factIds: ['f-1'], trigger: { kind: 'pr.opened' } },
+      { kind: 'handoff', handoffId: 'h-1' },
+      { kind: 'intro' },
+      { kind: 'manual', by: 'human' },
+      { kind: 'human', text: 'Hi all', source: 'desktop', runId: 'run-c-9', room: true, clientMessageId: 'cp-room' },
+    ] as const;
+    for (const reason of reasons) {
+      must(r.queue.enqueue({ botId: id, workspaceId: 'ws-1', reason: reason as never, priority: 0, threadId: 'general' }));
+      r.runtime.kick();
+      await settle();
+      r.adapters[0].end([{ type: 'text-delta', text: 'Nothing to add.' }, { type: 'turn-end', sessionId: 'sess-1' }]);
+      await settle();
+    }
+    // The room-wide owner message is the only one.
+    expect(posted).toEqual(['human']);
+  });
+
+  it('an interrupted turn posts nothing, nor does a post that throws fail the turn', async () => {
+    const r = rig();
+    const posted: string[] = [];
+    setBotRuntimePorts({ postTurnText: (_p, _i, text) => { posted.push(text); throw new Error('rooms down'); } });
+    const id = createBot(r, 'lead');
+    r.runtime.wake(id, { text: 'hi' });
+    await settle();
+    r.runtime.interrupt(id);
+    await settle();
+    expect(posted).toEqual([]);
+    const item = must(r.runtime.wake(id, { text: 'next' }));
+    await settle();
+    r.adapters.at(-1)?.end([{ type: 'text-delta', text: 'Done.' }, { type: 'turn-end', sessionId: 'sess-1' }]);
+    await settle();
+    expect(posted).toEqual(['Done.']);
+    expect(r.queue.list({ botId: id }).find((w) => w.id === item.id)?.state).toBe('done');
   });
 });

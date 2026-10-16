@@ -125,6 +125,16 @@ describe('X6 ② reboot-survival durability', () => {
     expect(body).not.toMatch(/stateWriter\.saveDebounced\(/);
   });
 
+  it('applyResumeBinding moves the pane cwd only when the transcript relocated', () => {
+    // Recovery resumes the exact session only when meta.cwd matches the
+    // binding's cwd; an agent that changed directory itself must move meta.cwd.
+    const src = fs.readFileSync(daemonIndexPath, 'utf-8');
+    const idx = src.indexOf('const applyResumeBinding =');
+    expect(idx).toBeGreaterThan(-1);
+    const body = src.slice(idx, src.indexOf("pipeServer.onRpc('daemon.setResumeBinding'", idx));
+    expect(body).toMatch(/transcriptRelocated\(prev, next\)\) sessionManager\.adoptAgentCwd\(p\.id, next\.cwd\)/);
+  });
+
   it('useTerminal onData guards clearResumeHint against focus reports (CSI I / CSI O)', () => {
     // The renderer retracts the resume pill when the user drives the shell
     // (terminal.onData). But xterm emits focus-tracking reports (CSI I / CSI O)

@@ -20,7 +20,7 @@ import { withFreshWindowsPath } from '../../../shared/windowsPathEnv';
 import { getAccountStore } from '../../account/accountStore';
 import { withAccountQuota } from '../../account/accountQuotaGate';
 import { botWorkerForCreate, clearedLaunchLine, forgetBotWorkerSession, guardedClaudeCwdRefusal, guardedCodexCwdRefusal, guardedCodexLaunch, guardedLaunchOf, isBotWorkerSession, noteBotWorkerSession, paneLaunchFolders, setWorkerMcpResolvers, withBotWorkerMergeGuard, type BotWorkerCreate } from '../../agents/botWorkerMergeGuard';
-import { namesClaude } from '../../../shared/botWorkerGuard';
+import { isPlainCmdLaunchLine, namesClaude } from '../../../shared/botWorkerGuard';
 import { namesCodex } from '../../../shared/codexWorkerGuard';
 import { getMcpTarget } from '../../../shared/mcpTargets';
 import { readTargetStatus } from '../../../shared/mcpRegistration';
@@ -31,10 +31,11 @@ import { resolveEnvPolicy, type SpawnKind } from '../../../shared/spawnKind';
 import { withheldCredentialNames } from '../../../shared/envFilter';
 import { getShellUtf8Locale } from '../../pty/shellLocale';
 import { forgetPtyShell, getPtyShell, recordPtyShell } from '../../pty/ptyShellRegistry';
-import { promptFileArgumentForShell } from '../../../shared/promptFileArgument';
+import { cmdLaunchPathRefusal, isCmdShellPath, promptFileArgumentForShell } from '../../../shared/promptFileArgument';
 import { resolveWslWorkerGit, withWslWorkerGit } from '../../agents/wslWorkerGit';
 import { withDaemonCreateRollback } from './daemonCreateRollback';
 import { getWorkspaceMirror } from '../../workspace/WorkspaceMirror';
+import { getWmuxDir } from '../../../daemon/config';
 import { scheduleInitialCommand } from './scheduleInitialCommand';
 import {
   createSessionDataDispatcher,
@@ -56,7 +57,8 @@ import {
   PROJECT_SUPERVISION_HEALTHY_UPTIME_SEC_MAX,
 } from '../../../shared/wmuxProjectConfig';
 import type { DaemonSupervisionPolicy } from '../../../shared/rpc';
-import type { ResumeBinding } from '../../../shared/agentResume';
+import { launchedConversation, type ResumeBinding } from '../../../shared/agentResume';
+import { splitModelEnvMarker } from '../../../shared/workerLaunch';
 import type { AgentSlug } from '../../../shared/events';
 import { createDeadPaneRecovery, type DeadPaneRecovery } from '../../../shared/ptyRecovery';
 import { isWslShell, type WslTarget } from '../../../shared/wsl';
@@ -198,13 +200,20 @@ function registeredClaudeLevel(): string | null {
  * its wmux level) instead of being spliced on its own, and the hint is
  * dropped. Returns what the guarded launch carried, for its session record.
  */
-async function stageCreate(options: PtyCreateOptions | undefined, botWorker: BotWorkerCreate | null): Promise<{ options: PtyCreateOptions | undefined; launch: ReturnType<typeof guardedLaunchOf> & ReturnType<typeof launchOfCodex> }> {
+async function stageCreate(options: PtyCreateOptions | undefined, botWorker: BotWorkerCreate | null): Promise<{ options: PtyCreateOptions | undefined; launch: ReturnType<typeof guardedLaunchOf> & ReturnType<typeof launchOfCodex> & { conversation?: ReturnType<typeof launchedConversation> } }> {
   // A fan-out line's prompt argument was built for the platform; the pane's
   // shell decides its form (a WSL pane runs bash).
-  const wsl = isWslShell(createShell(options));
+  const shellPath = createShell(options);
+  const wsl = isWslShell(shellPath);
   const line0 = options?.initialCommand;
+  // #2256: a path cmd cannot carry is refused by its own cause, before the
+  // merge-lane guard would refuse the line as one it cannot guard.
+  if (botWorker && line0 && process.platform === 'win32' && isCmdShellPath(shellPath)) {
+    const refusal = cmdLaunchPathRefusal(line0, getWmuxDir(), namesClaude(line0) && !namesCodex(line0));
+    if (refusal) throw new Error(`PTY_CREATE: ${refusal}`);
+  }
   if (options && line0) {
-    const rewritten = promptFileArgumentForShell(line0, { wsl });
+    const rewritten = promptFileArgumentForShell(line0, { wsl, cmd: process.platform === 'win32' && isCmdShellPath(shellPath) });
     if (rewritten !== line0) options = { ...options, initialCommand: rewritten };
   }
   let staged = await withAccountQuota(options);
@@ -218,7 +227,15 @@ async function stageCreate(options: PtyCreateOptions | undefined, botWorker: Bot
     staged = withWmuxTools(staged);
   }
   const guarded = withBotWorkerMergeGuard(await guardCodexBotWorker(staged, botWorker), botWorker, {}, { wsl, ...(level ? { level } : {}) });
-  return { options: withLaunchSessionPin(guarded), launch: { ...launchOfCodex(guarded), ...guardedLaunchOf(guarded) } };
+  // A bot worker's line in a cmd.exe pane is read by cmd's own rules.
+  if (botWorker && process.platform === 'win32' && isCmdShellPath(shellPath) && guarded?.initialCommand && !isPlainCmdLaunchLine(guarded.initialCommand)) {
+    throw new Error('PTY_CREATE: a bot\'s worker line for a Command Prompt pane holds characters cmd would read as more than one command');
+  }
+  const pinned = withLaunchSessionPin(guarded);
+  // A bot worker's record keeps the conversation its line pinned and the mode
+  // that line starts it in (workerReclaim.ts: a resume with no hook-recorded mode).
+  const conversation = botWorker && pinned?.initialCommand ? launchedConversation(splitModelEnvMarker(pinned.initialCommand).command) : null;
+  return { options: pinned, launch: { ...launchOfCodex(guarded), ...guardedLaunchOf(guarded), ...(conversation ? { conversation } : {}) } };
 }
 
 /** A guarded codex launch's folder and repository, for its session record. */
@@ -906,7 +923,8 @@ export function registerPTYHandlers(
       }
       // The interrupt edge: Ctrl+C / ESC ESC ends the agent's turn without any
       // Stop hook, and `claude` stays the foreground command so OSC 133 cannot
-      // see it either. Runs before the write so the settle is not gated on
+      // see it either. A lone ESC is recorded, and settles the turn once the
+      // agent prints its "Interrupted" row. Runs before the write so the settle is not gated on
       // delivery — the operator's intent is the same either way.
       ptyBridge.noteInterruptInput(id, data);
       const segments = segmentOversize(data);
@@ -970,8 +988,12 @@ export function registerPTYHandlers(
     // claude is not started again there.
     if (botPane && !dc && namesClaude(text)) throw new Error('PTY_WRITE_LAUNCH: a bot worker\'s claude starts again only with the wmux daemon');
     const folders = dc && botPane ? await paneLaunchFolders(id, (m, p) => dc.rpc(m, p)) : undefined;
-    const shaped = promptFileArgumentForShell(text, { wsl: isWslShell(getPtyShell(id)) });
-    const line = sanitizePtyText(await guardBotWorkerSessionText(id, shaped, 'write-launch', folders ? { folders } : {})) + (submit === true ? '\r' : '');
+    const shaped = promptFileArgumentForShell(text, { wsl: isWslShell(getPtyShell(id)), cmd: process.platform === 'win32' && isCmdShellPath(getPtyShell(id)) });
+    const guardedText = await guardBotWorkerSessionText(id, shaped, 'write-launch', folders ? { folders } : {});
+    if (botPane && process.platform === 'win32' && isCmdShellPath(getPtyShell(id)) && !isPlainCmdLaunchLine(guardedText)) {
+      throw new Error('PTY_WRITE_LAUNCH: a bot worker\'s line for a Command Prompt pane holds characters cmd would read as more than one command');
+    }
+    const line = sanitizePtyText(guardedText) + (submit === true ? '\r' : '');
     if (useDaemon && daemonClient) {
       if (!daemonClient.writeToSession(id, line)) throw new Error('PTY_WRITE_LAUNCH: the session is not live');
     } else {

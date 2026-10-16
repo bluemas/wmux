@@ -32,7 +32,8 @@ import { prStatusCache } from '../../metadata/PrStatusCache';
 import { getWmuxHomeDir } from '../../../shared/constants';
 import { sanitizePtyText } from '../../../shared/types';
 import { normalizeWorktreePath } from '../../../shared/workTask';
-import { promptFileArgumentForShell } from '../../../shared/promptFileArgument';
+import { isCmdShellPath, promptFileArgumentForShell } from '../../../shared/promptFileArgument';
+import { isPlainCmdLaunchLine } from '../../../shared/botWorkerGuard';
 import { isWslShell } from '../../../shared/wslTarget';
 import { getPtyShell } from '../../pty/ptyShellRegistry';
 import { guardBotWorkerSessionText } from '../../agents/codexWorkerGuard';
@@ -259,8 +260,11 @@ export function registerWorktaskHandlers(
       try {
         const folders = isBotWorkerSession(ptyId) ? await paneLaunchFolders(ptyId, (m, p) => dc.rpc(m, p)) : undefined;
         // The pane's shell decides the prompt argument's form (a WSL pane runs bash).
-        const shaped = promptFileArgumentForShell(initialCommand, { wsl: isWslShell(getPtyShell(ptyId)) });
+        const shaped = promptFileArgumentForShell(initialCommand, { wsl: isWslShell(getPtyShell(ptyId)), cmd: process.platform === 'win32' && isCmdShellPath(getPtyShell(ptyId)) });
         line = await guardBotWorkerSessionText(ptyId, shaped, 'refire', folders ? { folders } : {});
+        if (isBotWorkerSession(ptyId) && process.platform === 'win32' && isCmdShellPath(getPtyShell(ptyId)) && !isPlainCmdLaunchLine(line)) {
+          return { ok: false as const, error: 'worktask:refire: a bot worker\'s line for a Command Prompt pane holds characters cmd would read as more than one command' };
+        }
       } catch (err) {
         return { ok: false as const, error: err instanceof Error ? err.message : String(err) };
       }

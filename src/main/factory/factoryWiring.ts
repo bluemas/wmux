@@ -47,11 +47,12 @@ import fs from 'node:fs';
 import { atomicReadJSONSync, atomicWriteJSONSync } from '../../daemon/util/atomicWrite';
 import type { BotProfile } from '../../shared/bot';
 import type { Fact, FactDraft } from '../../shared/facts';
-import type { MoaWakePayload, MoaWakeResult } from '../../shared/moaWake';
+import type { MoaWakePayload, MoaWakeRefusalCode, MoaWakeResult } from '../../shared/moaWake';
+import type { BotGroup } from '../../shared/botGroup';
 import type { RoomCard, ThreadId } from '../../shared/room';
 import type { WakeItem } from '../../shared/wake';
 import type { FactorySettings } from '../../shared/factorySettings';
-import { ROOM_LIMITS, dmThreadId } from '../../shared/room';
+import { ROOM_LIMITS, dmThreadBot, dmThreadId, parseThreadId } from '../../shared/room';
 import { registerFactoryRpcModule, type FactoryHostDeps, type FactoryModuleHandle } from './factoryHost';
 import { getFactLog, type FactLog } from './factLog';
 import { currentWakeItem, currentWakeThread, getWakeQueue } from './wakeQueue';
@@ -70,6 +71,7 @@ import { readUiLocale } from '../quit/quitAndStopCopy';
 import { setFactoryPhoneMessageHandler } from './phoneMessage';
 import { humanCardIdOfRun, postHumanMessage } from './humanMessage';
 import { phoneBot } from './phoneBot';
+import { redactStoredSecrets } from './secretRedaction';
 import { ghIssueService, splitRepoKey } from '../github/GhIssueService';
 import { MORNING_SCHEDULE_FILENAME, MORNING_SCHEDULE_ID, MorningSchedule, localDay } from './morningSchedule';
 import { fireMorningReport } from './morningReport';
@@ -89,7 +91,7 @@ import { installLateStopSweep, setFactoryStopPorts, type FactoryStopPorts } from
 import { getRoutineStore } from './routines';
 import { getGroupStore } from './groupStore';
 import { getAgentSlots } from './agentSlots';
-import { getWorkerResumePorts, reclaimedWorkerState, stopResumedWorkers, workerWorkspaceOf } from './workerReclaim';
+import { getWorkerResumePorts, isWslWorkerPane, reclaimedWorkerState, stopResumedWorkers, workerWorkspaceOf, type WorkerSessionInfo } from './workerReclaim';
 import { getTaskFolderPorts } from './taskFolderCleanup';
 
 // ── Trigger cursor ─────────────────────────────────────────────────────────
@@ -241,7 +243,7 @@ export function factFromBotHook(ev: BotHookEvent): FactDraft | null {
     return { kind: 'bot.budget_exhausted', ...base, payload: { reason: ev.reason, ...(ev.wakeId ? { wakeId: ev.wakeId } : {}), ...(ev.until !== undefined ? { until: ev.until } : {}), ...(ev.parkedAt !== undefined ? { parkedAt: ev.parkedAt } : {}) } };
   }
   if (ev.type === 'bot.error') {
-    return { kind: 'bot.error', ...base, payload: { message: ev.message.slice(0, 500), ...(ev.wakeId ? { wakeId: ev.wakeId } : {}) } };
+    return { kind: 'bot.error', ...base, payload: { message: ev.message.slice(0, 500), ...(ev.wakeId ? { wakeId: ev.wakeId } : {}), ...(ev.until !== undefined ? { until: ev.until } : {}) } };
   }
   return null;
 }
@@ -358,9 +360,14 @@ export interface FactoryPhoneDeps {
 }
 
 /**
- * A phone message to Moa with the factory on: a `human` card in the HQ bot's
- * room and a priority-0 wake for it, idempotent per (caller, message id).
- * Null when the factory is off (the daemon then takes the Moa path).
+ * A phone message with the factory on: a `human` card and a priority-0 wake,
+ * idempotent per (caller, message id). Without a target it is for the phone
+ * bot, in that bot's 1:1; with `workspaceId` + `threadId` it is for that one
+ * conversation of the Bots page, as the desktop composer posts it: a bot's
+ * 1:1 (`dm:<botId>`, that bot alone) or a group chat's thread (every enabled
+ * member). A target that names no live bot or group, or one whose bots are
+ * all off, is refused before anything is written. Null when the factory is
+ * off (the daemon then takes the Moa path, or refuses a targeted message).
  */
 export function factoryPhoneMessage(payload: MoaWakePayload, deps: FactoryPhoneDeps): MoaWakeResult | null {
   const settings = deps.settings();
@@ -369,38 +376,88 @@ export function factoryPhoneMessage(payload: MoaWakePayload, deps: FactoryPhoneD
   const ports = deps.ports();
   // Not started yet (the first seconds after launch): retryable.
   if (!writer || !ports.wakes) return { ok: false, code: 'busy' };
-  // The bot the phone talks to (phoneBot.ts): pinned, else a Coordinator,
-  // else the HQ room's oldest.
   let enabledBots: BotProfile[] = [];
   try {
     enabledBots = ports.bots?.listEnabled() ?? [];
   } catch {
     enabledBots = [];
   }
-  const bot = phoneBot(enabledBots, settings);
-  if (!bot) return { ok: false, code: 'hq_missing' };
+  const target = phoneMessageTarget(payload, enabledBots, settings, ports);
+  if ('code' in target) return { ok: false, code: target.code };
   const actor = crypto.createHash('sha256').update(payload.actor).digest('hex').slice(0, 16);
   const clientPostId = `phone:${actor}:${payload.clientMessageId}`.slice(0, ROOM_LIMITS.CLIENT_ID_MAX);
+  // A retry posts nothing new: the room answers with the id's first card and
+  // queues that card's wakes. An id whose first card says other words (its
+  // body as the room stored it, secrets redacted) or sits in another thread
+  // is a reused id, never that card's retry: the daemon released the id when
+  // a queue was full, so it can come back here with another message.
+  const prior = writer.find(target.workspaceId, (c) => c.clientPostId === clientPostId);
+  // The text is processed whole and shortened last, as the room does for
+  // short text.
+  const whole = redactStoredSecrets(payload.text);
+  if (prior && (prior.threadId !== target.threadId || (prior.body ?? '') !== capBody(whole))) return { ok: false, code: 'id_reused' };
   const r = postHumanMessage(writer, ports, {
-    workspaceId: bot.workspaceId,
-    // The phone's chat with its bot is that bot's 1:1, as on the desktop.
-    threadId: dmThreadId(bot.id),
-    title: oneLine(payload.text, ROOM_LIMITS.TITLE_MAX) || 'Message',
-    body: capBody(payload.text),
+    workspaceId: target.workspaceId,
+    threadId: target.threadId,
+    title: oneLine(whole, ROOM_LIMITS.TITLE_MAX) || 'Message',
+    body: capBody(whole),
     // The card holds a capped copy; the bot's wake carries the whole message.
     wakeText: payload.text,
-    toBotId: bot.id,
+    ...(target.toBotId ? { toBotId: target.toBotId } : {}),
     clientPostId,
     source: 'phone',
   });
-  // The card is up but the HQ bot's queue took no wake, even past its cap:
-  // a retryable refusal, so the phone sends the same id again and that retry
-  // queues the wake once (postHumanMessage).
-  if (!r.ok) return r.code === 'queue_full' ? { ok: false, code: 'busy' } : { ok: false, code: 'hq_unknown' };
-  // A first send or a retry: the message's one wake is queued (or already ran).
+  // The card is up but a queue took no wake, even past its cap: a retryable
+  // refusal, so the phone sends the same id again and that retry queues the
+  // missing wakes once (postHumanMessage).
+  if (!r.ok) return r.code === 'queue_full' ? { ok: false, code: 'busy' } : { ok: false, code: payload.threadId !== undefined ? 'room_refused' : 'hq_unknown' };
+  // A first send or a retry: the message's wakes are queued (or already ran).
   if (r.wakeId) return { ok: true, accepted: true, queued: true };
-  // A retry whose card names a bot that is no longer the HQ bot.
+  // A retry whose card names no bot that is still on.
   return { ok: false, code: 'duplicate' };
+}
+
+/** Where a phone message goes: the phone bot's 1:1, or the conversation the
+ *  payload names, or why it cannot go there. */
+function phoneMessageTarget(
+  payload: MoaWakePayload,
+  enabledBots: readonly BotProfile[],
+  settings: { phoneBotId?: string },
+  ports: Partial<FactoryRoomPorts>,
+): { workspaceId: string; threadId: ThreadId; toBotId?: string } | { code: MoaWakeRefusalCode } {
+  if (payload.workspaceId === undefined || payload.threadId === undefined) {
+    // The bot the phone talks to (phoneBot.ts): pinned, else a Coordinator,
+    // else the oldest enabled bot.
+    const bot = phoneBot(enabledBots, settings);
+    if (!bot) return { code: 'hq_missing' };
+    // The phone's chat with its bot is that bot's 1:1, as on the desktop.
+    return { workspaceId: bot.workspaceId, threadId: dmThreadId(bot.id), toBotId: bot.id };
+  }
+  const { workspaceId } = payload;
+  const threadId = parseThreadId(payload.threadId);
+  if (!threadId) return { code: 'group_missing' };
+  const dmBot = dmThreadBot(threadId);
+  if (dmBot) {
+    let bot: BotProfile | null = null;
+    try {
+      bot = ports.bots?.get(dmBot) ?? null;
+    } catch {
+      bot = null;
+    }
+    if (!bot || bot.workspaceId !== workspaceId) return { code: 'bot_missing' };
+    if (!bot.enabled || !enabledBots.some((b) => b.id === bot.id)) return { code: 'bot_off' };
+    return { workspaceId, threadId, toBotId: bot.id };
+  }
+  let group: BotGroup | null = null;
+  try {
+    group = ports.groups?.byThread(workspaceId, threadId) ?? null;
+  } catch {
+    group = null;
+  }
+  if (!group) return { code: 'group_missing' };
+  // As the desktop: a group with no bot on takes no message.
+  if (!enabledBots.some((b) => b.workspaceId === workspaceId && group.memberIds.includes(b.id))) return { code: 'group_off' };
+  return { workspaceId, threadId };
 }
 
 /**
@@ -439,7 +496,7 @@ export function daemonRpc(client: () => Daemon | null): ((method: string, params
  *  session.stopAgent: asked to exit, killed after a grace, checked gone),
  *  then the pane itself, checked gone (stopSessionsInDir). `workspacePtys`:
  *  the panes a workspace owns, null when the workspace tree is not known (a
- *  session started in the folder then counts). A pane in another workspace,
+ *  session started in the folder then counts, a WSL pane excepted). A pane in another workspace,
  *  such as a terminal the owner opened in the folder, is never touched.
  *  `agentsOnly` (the re-stop of a task stopped before): only a leftover
  *  agent is stopped; a pane is closed only when it still runs an agent the
@@ -448,28 +505,33 @@ export function daemonRpc(client: () => Daemon | null): ((method: string, params
  *  How many workers were confirmed stopped: panes that ran an agent (the
  *  daemon's `agentProcessAlive`, or a claude this call stopped) whose agent
  *  or pane this call confirmed gone; a pane with no agent, such as a plain
- *  shell, does not count. Throws when one was not stopped. */
+ *  shell, does not count. A WSL pane running its launched worker
+ *  (isWslWorkerPane: its Linux agent is not always attributed) counts as
+ *  running one; a plain WSL shell at its prompt does not. Throws when one
+ *  was not stopped. */
 export async function stopTaskWorker(
   entry: LedgerEntry,
   client: () => Daemon | null,
   workspacePtys?: (workspaceId: string) => readonly string[] | null,
-  opts: { agentsOnly?: boolean } = {},
+  opts: { agentsOnly?: boolean; platform?: NodeJS.Platform } = {},
 ): Promise<number> {
   const rpc = daemonRpc(client);
   if (!rpc) throw new Error('the daemon is not connected');
   const worktree = await taskFolderFromMissions(rpc, entry);
   if (!worktree) throw new Error('the task worktree is not known');
   const own = workspacePtys?.(entry.taskWorkspaceId) ?? null;
-  type Session = { id: string; pid?: number; spawnCwd?: string; agentProcessAlive?: boolean };
+  type Session = WorkerSessionInfo & { pid?: number };
   const listSessions = async (): Promise<Session[]> => {
     const sessions = await rpc('daemon.listSessions', {});
     const all = Array.isArray(sessions) ? (sessions as Session[]) : [];
-    return own ? all.filter((x) => own.includes(x.id)) : all;
+    // An unknown tree: a WSL pane is never taken for the task's (its folder
+    // match alone cannot tell the worker from a pane the owner opened there).
+    return own ? all.filter((x) => own.includes(x.id)) : all.filter((x) => !x.wslTarget);
   };
   const before = await listSessions();
-  const agentLive = new Set(before.filter((x) => x.agentProcessAlive === true).map((x) => x.id));
+  const agentLive = new Set(before.filter((x) => x.agentProcessAlive === true || isWslWorkerPane(x)).map((x) => x.id));
   const stoppedAgents = new Set<string>();
-  for (const id of await sessionsStartedIn([worktree], { listSessions: async () => before })) {
+  for (const id of await sessionsStartedIn([worktree], { listSessions: async () => before, platform: opts.platform })) {
     const r = (await rpc('session.stopAgent', { sessionId: id })) as { ok?: boolean; stopped?: boolean; code?: string } | null;
     if (r?.ok === true && r.stopped === true) stoppedAgents.add(id);
     // Gone already, or a pane whose agent the daemon cannot stop this way
@@ -491,6 +553,7 @@ export async function stopTaskWorker(
     isAlive: isPidAlive,
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     log: (message) => console.warn(message),
+    platform: opts.platform,
   });
   if (stopped.length > 0) console.log(`[factory] stopped ${stopped.length} session(s) of task ${entry.id}`);
   const workers = new Set([...stoppedAgents, ...stopped.filter((id) => agentLive.has(id))]);
