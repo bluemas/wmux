@@ -31,12 +31,13 @@ import type { RpcRouter } from '../RpcRouter';
 import type { RpcContext } from '../../../shared/rpc';
 import { resolvePtyOwnerWorkspace } from '../../workspace/ptyOwnership';
 import { getTaskLedger } from '../../deck/taskLedgerHost';
-import type { TaskLedger } from '../../../daemon/ledger/TaskLedger';
+import { noChangesReceiptCurrent, type TaskLedger } from '../../../daemon/ledger/TaskLedger';
 import { getWmuxDir } from '../../../daemon/config';
 import { readBotWorkerDefaultBranches } from '../../../shared/botWorkerGuard';
 import { readRepoDefaultBranchByKey } from '../../agents/botWorkerDefaultBranch';
 import { getBotStore } from '../../factory/botStore';
 import { pushTaskBranch, type TaskPushGit, type TaskPushResult } from '../../worktask/taskPush';
+import { taskPushRecordOf, type TaskPushRecord } from '../../worktask/taskPushRecord';
 import { fetchTaskRefs } from '../../worktask/taskFetch';
 import { reclaimedWorkerOfPane } from '../../factory/workerReclaim';
 import type { ReclaimedWorker } from '../../factory/workerReclaim';
@@ -58,6 +59,8 @@ export interface TaskPushRpcDeps {
   repoDefaultBranch?: (repoKey: string) => Promise<string | null>;
   /** A bot's repository key (its profile). */
   botRepoKey?: (botId: string) => string | undefined;
+  /** Where a landed push is recorded (default: the one under wmuxDir). */
+  pushRecord?: Pick<TaskPushRecord, 'record' | 'begin' | 'end'>;
   /** The reclaimed worker whose recorded pane this is (default: the
    *  reclaimed workers' record). */
   reclaimedWorkerOfPane?: (workspaceId: string, ptyId: string) => Pick<ReclaimedWorker, 'taskId' | 'botId' | 'ownerWorkspaceId'> | null;
@@ -154,17 +157,43 @@ export function registerTaskPushRpc(router: RpcRouter, deps: TaskPushRpcDeps): v
   router.register('task.push', async (params, ctx?: RpcContext) => {
     const r = await resolveWorkerTask('task.push', params, ctx, { worker: 'pushes its branch', branch: 'to publish', repo: 'to push to' });
     if (!r.ok) return r;
-    const result: TaskPushResult = await push({
-      worktreePath: r.task.worktreePath,
-      branch: r.task.branch,
-      defaultBranches: readBotWorkerDefaultBranches(r.dir),
-      noHooksDir: path.join(r.dir, 'factory', 'no-hooks'),
-      ...(r.expectedRepoKey ? { expectedRepoKey: r.expectedRepoKey } : {}),
-      // Every task, bot or not: the repository's own default branch too (a
-      // task branch can be named by a person), read by the pushed-to key.
-      repoDefaultBranch: deps.repoDefaultBranch ?? ((key: string) => readRepoDefaultBranchByKey(key)),
-    }, ...(deps.git ? [deps.git] : []));
-    return { ...result, taskId: r.row.id };
+    // Main's own record of what was published: the no-changes check reads it
+    // (factory/noChangesCheck.ts) and answers `unknown` while this push is
+    // under way. Marked in the same tick as the check below, so no
+    // completion can be checked in between.
+    const record = deps.pushRecord ?? taskPushRecordOf(r.dir);
+    record.begin(r.row.id);
+    try {
+      // A report the system checked as making no changes stands on that: a
+      // commit published now would be completed with it, ungated. The bot
+      // sends the task back first; the worker's next report is checked anew.
+      const now = ledgerOf().get(r.row.id);
+      if (now?.status === 'review_requested' && now.gate?.skipped === 'no_changes' && noChangesReceiptCurrent(now)) {
+        return deny('FAILED_PRECONDITION', 'task.push: this task\'s report was checked as making no changes, and that report stands; to publish commits, ask the bot to send the task back, then report again');
+      }
+      // Completed on that check (a resumed worker of an ended task pushes
+      // otherwise): nothing gated it, so nothing of it is published. Only a
+      // skip that still governs the row: one recorded for its last report
+      // (the ledger takes `completed` on no other), not a merge completion.
+      // A skip a later report superseded completed nothing.
+      if (now?.status === 'completed' && now.gate?.skipped === 'no_changes' && noChangesReceiptCurrent(now) && now.completion?.source !== 'merge') {
+        return deny('FAILED_PRECONDITION', 'task.push: this task was completed as making no changes; commits made since are not published from it (start a new task for them)');
+      }
+      const result: TaskPushResult = await push({
+        worktreePath: r.task.worktreePath,
+        branch: r.task.branch,
+        defaultBranches: readBotWorkerDefaultBranches(r.dir),
+        noHooksDir: path.join(r.dir, 'factory', 'no-hooks'),
+        ...(r.expectedRepoKey ? { expectedRepoKey: r.expectedRepoKey } : {}),
+        // Every task, bot or not: the repository's own default branch too (a
+        // task branch can be named by a person), read by the pushed-to key.
+        repoDefaultBranch: deps.repoDefaultBranch ?? ((key: string) => readRepoDefaultBranchByKey(key)),
+      }, ...(deps.git ? [deps.git] : []));
+      if (result.ok) record.record(r.row.id, result.head);
+      return { ...result, taskId: r.row.id };
+    } finally {
+      record.end(r.row.id);
+    }
   });
 
   router.register('task.fetch', async (params, ctx?: RpcContext) => {

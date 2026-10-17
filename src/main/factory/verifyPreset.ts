@@ -197,6 +197,27 @@ export async function worktreeFromMissions(rpc: Rpc | null, entry: LedgerEntry):
   return null;
 }
 
+/** A task's worktree and branch, from the daemon's mission list of its
+ *  owner; null when it has either missing or the list cannot be read. */
+export async function taskMissionFromMissions(rpc: Rpc | null, entry: LedgerEntry): Promise<{ worktreePath: string; branch: string } | null> {
+  if (!rpc) return null;
+  let reply: unknown;
+  try {
+    reply = await rpc('task.mission.list', { verifiedWorkspaceId: entry.ownerWorkspaceId });
+  } catch {
+    return null;
+  }
+  const tasks = (reply as { ok?: unknown; tasks?: unknown } | null);
+  if (!tasks || tasks.ok !== true || !Array.isArray(tasks.tasks)) return null;
+  for (const t of tasks.tasks as Array<Record<string, unknown>>) {
+    if (!t || t.id !== entry.id) continue;
+    return typeof t.worktreePath === 'string' && t.worktreePath && typeof t.branch === 'string' && t.branch
+      ? { worktreePath: t.worktreePath, branch: t.branch }
+      : null;
+  }
+  return null;
+}
+
 /** The folder a task's worker runs in: its worktree, or the output folder of
  *  a task without one (a research task's scratch folder), or null. */
 export async function taskFolderFromMissions(rpc: Rpc | null, entry: LedgerEntry): Promise<string | null> {

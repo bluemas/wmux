@@ -5,9 +5,12 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { parseLsRemoteHead, pushTaskBranch, taskPushArgs, taskPushBranchRefusal, taskPushGitTarget, wslGitArgv, wslTaskPushGit, type TaskPushExec } from '../taskPush';
+import { defaultGit, parseLsRemoteHead, pushTaskBranch, taskPushArgs, taskPushBranchRefusal, taskPushGitTarget, wslGitArgv, wslTaskPushGit, type TaskPushExec } from '../taskPush';
 import { originUrlRepoKey, runWorkerGitRead } from '../workerGit';
 import { registerTaskPushRpc } from '../../pipe/handlers/taskPush.rpc';
+import { TASK_PUSHES_FILENAME, TaskPushRecord, taskPushRecordOf } from '../taskPushRecord';
+import { TaskLedger } from '../../../daemon/ledger/TaskLedger';
+import { completeMergedTask, recordNoChangesGate } from '../../factory/taskGate';
 import { parseRemoteKey } from '../../github/PrProvider';
 import { normalizeRepoKey } from '../../../shared/repoKey';
 import { readRepoDefaultBranchByKey } from '../../agents/botWorkerDefaultBranch';
@@ -104,10 +107,30 @@ describe('pushTaskBranch', () => {
     expect(await pushTaskBranch(input())).toMatchObject({ ok: false, reason: 'no-origin' });
   });
 
-  it('pushes exactly HEAD to refs/heads/<task branch> at origin\'s URL, fast-forward only', () => {
-    const args = taskPushArgs('wtask/one', 'git@github.com:o/r.git');
-    expect(args).toEqual(['push', '--no-verify', '--no-follow-tags', '--recurse-submodules=no', '--porcelain', '--', 'git@github.com:o/r.git', 'HEAD:refs/heads/wtask/one']);
+  it('pushes exactly the commit HEAD was resolved to, to refs/heads/<task branch> at origin\'s URL, fast-forward only', () => {
+    const sha = 'a'.repeat(40);
+    const args = taskPushArgs('wtask/one', 'git@github.com:o/r.git', sha);
+    expect(args).toEqual(['push', '--no-verify', '--no-follow-tags', '--recurse-submodules=no', '--porcelain', '--', 'git@github.com:o/r.git', `${sha}:refs/heads/wtask/one`]);
     expect(args.some((a) => a.startsWith('+') || a.includes('force'))).toBe(false);
+  });
+
+  it('HEAD moving during the push: the commit pushed, set upstream and reported is the one resolved first', async () => {
+    const resolved = git(work, 'rev-parse', 'HEAD');
+    // A git that commits in the worktree (moving HEAD) right before it pushes.
+    const moving = async (args: string[], cwd: string) => {
+      if (args.includes('push')) {
+        fs.writeFileSync(path.join(work, 'late.txt'), 'late\n');
+        git(work, 'add', '.');
+        git(work, 'commit', '-qm', 'late');
+      }
+      return defaultGit(args, cwd);
+    };
+    const r = await pushTaskBranch(input(), moving);
+    const moved = git(work, 'rev-parse', 'HEAD');
+    expect(moved).not.toBe(resolved);
+    expect(r).toMatchObject({ ok: true, head: resolved });
+    expect(git(origin, 'rev-parse', 'refs/heads/wtask/one')).toBe(resolved);
+    expect(git(work, 'rev-parse', 'refs/remotes/origin/wtask/one')).toBe(resolved);
   });
 
   it('refuses when the repository config redirects the push or names a program, and runs none of it', async () => {
@@ -190,7 +213,7 @@ describe('task.push: GitLab remotes', () => {
       calls.push(args);
       const sub = args[args.indexOf('-c', 2) + 2];
       if (sub === 'config') return { code: 0, stdout: 'local\0remote.origin.url\nssh://git@gitlab.corp.example:2222/group/sub/proj.git\0', stderr: '' };
-      if (sub === 'rev-parse') return { code: 0, stdout: 'abc\n', stderr: '' };
+      if (sub === 'rev-parse') return { code: 0, stdout: `${'a'.repeat(40)}\n`, stderr: '' };
       if (sub === 'ls-remote') return { code: 0, stdout: 'ref: refs/heads/develop\tHEAD\nabc\tHEAD\n', stderr: '' };
       // A worker-written origin/HEAD naming some other branch.
       if (sub === 'symbolic-ref') return { code: 0, stdout: 'refs/remotes/origin/elsewhere\n', stderr: '' };
@@ -347,23 +370,136 @@ describe('task.push: a repository inside WSL', () => {
 
 describe('task.push RPC', () => {
   type Handler = (params: Record<string, unknown>, ctx?: Record<string, unknown>) => Promise<unknown>;
-  const setup = (over: { row?: unknown; tasks?: unknown[]; caller?: string | null; repoDefault?: string | null; botRepo?: string } = {}) => {
+  const setup = (over: { row?: unknown; tasks?: unknown[]; caller?: string | null; repoDefault?: string | null; botRepo?: string; head?: string; fail?: boolean } = {}) => {
     const handlers = new Map<string, Handler>();
-    const push = vi.fn(async (i: { branch: string }) => ({ ok: true as const, branch: i.branch, remote: 'origin' as const, head: 'abc', output: '' }));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-task-push-rpc-'));
+    const push = vi.fn(async (i: { branch: string }) => (over.fail
+      ? { ok: false as const, reason: 'rejected' as const, error: 'non-fast-forward' }
+      : { ok: true as const, branch: i.branch, remote: 'origin' as const, head: over.head ?? 'abc', output: '' }));
     const row = over.row === undefined ? { id: 'wtask-1', ownerWorkspaceId: 'ws-owner', taskWorkspaceId: 'ws-task' } : over.row;
     registerTaskPushRpc({ register: (m: string, h: Handler) => handlers.set(m, h) } as never, {
       getWindow: () => null,
       daemon: { rpc: vi.fn(async () => ({ ok: true, tasks: over.tasks ?? [{ id: 'wtask-1', status: 'open', branch: 'wtask/one', worktreePath: '/w/one' }] })) },
-      getLedger: () => ({ findOpenByTaskWorkspace: (ws: string) => (ws === 'ws-task' ? row : null) }) as never,
+      getLedger: () => ({
+        findOpenByTaskWorkspace: (ws: string) => (ws === 'ws-task' ? row : null),
+        get: (id: string) => (row && (row as { id?: string }).id === id ? row : null),
+      }) as never,
       resolveCallerWorkspace: async () => (over.caller === undefined ? 'ws-task' : over.caller),
-      wmuxDir: () => fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-task-push-rpc-')),
+      wmuxDir: () => dir,
       push: push as never,
       repoDefaultBranch: async () => (over.repoDefault === undefined ? 'main' : over.repoDefault),
       botRepoKey: () => over.botRepo,
     });
-    return { call: handlers.get('task.push')!, push };
+    return { call: handlers.get('task.push')!, push, dir };
   };
   const local = { origin: 'local' };
+
+  it('refuses a push while the task\'s report stands checked as making no changes; one sent back pushes', async () => {
+    const reported = { id: 'wtask-1', ownerWorkspaceId: 'ws-owner', taskWorkspaceId: 'ws-task', status: 'review_requested', reportedAtRev: 2, gate: { exitCode: 0, tail: '', at: 1, command: 'none', skipped: 'no_changes', recordedBy: 'system', reportRev: 2 } };
+    const held = setup({ row: reported });
+    expect(await held.call({ senderPtyId: 'pty-1' }, local)).toMatchObject({ ok: false, error: { code: 'FAILED_PRECONDITION' } });
+    expect(held.push).not.toHaveBeenCalled();
+    // Its push record is not left "under way" by the refusal.
+    expect(taskPushRecordOf(held.dir).get('wtask-1')).toBeNull();
+    // Sent back (or reported again since): the old skip holds nothing up.
+    for (const row of [{ ...reported, status: 'working' }, { ...reported, reportedAtRev: 5 }]) {
+      const free = setup({ row });
+      expect(await free.call({ senderPtyId: 'pty-1' }, local)).toMatchObject({ ok: true });
+    }
+  });
+
+  it('a resumed worker of a task completed as making no changes cannot push; one of a task completed on a passing gate still can', async () => {
+    const ended = (gate: Record<string, unknown>) => ({
+      id: 'wtask-1', ownerWorkspaceId: 'ws-owner', taskWorkspaceId: 'ws-task', status: 'completed',
+      dispatch: { origin: { kind: 'bot', botId: 'bot-1' }, repoKey: 'github.com/acme/app' },
+      reportedAtRev: 2, gate,
+    });
+    const resumedPush = async (row: Record<string, unknown>) => {
+      const handlers = new Map<string, Handler>();
+      const push = vi.fn(async (i: { branch: string }) => ({ ok: true as const, branch: i.branch, remote: 'origin' as const, head: 'f'.repeat(40), output: '' }));
+      registerTaskPushRpc({ register: (m: string, h: Handler) => handlers.set(m, h) } as never, {
+        getWindow: () => null,
+        daemon: { rpc: vi.fn(async () => ({ ok: true, tasks: [{ id: 'wtask-1', status: 'closed', branch: 'wtask/one', worktreePath: '/w/one' }] })) },
+        // No open task in the pane's workspace: the resumed worker's record stands for it.
+        getLedger: () => ({ findOpenByTaskWorkspace: () => null, get: (id: string) => (id === 'wtask-1' ? row : null) }) as never,
+        resolveCallerWorkspace: async () => 'ws-resumed',
+        reclaimedWorkerOfPane: () => ({ taskId: 'wtask-1', botId: 'bot-1', ownerWorkspaceId: 'ws-owner' }),
+        exists: () => true,
+        wmuxDir: () => fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-task-push-rpc-')),
+        push: push as never,
+        repoDefaultBranch: async () => 'main',
+      });
+      return { result: await (handlers.get('task.push') as Handler)({ senderPtyId: 'pty-9' }, local), push };
+    };
+    const skipped = await resumedPush(ended({ exitCode: 0, tail: '', at: 1, command: 'none', skipped: 'no_changes', recordedBy: 'system', reportRev: 2 }));
+    expect(skipped.result).toMatchObject({ ok: false, error: { code: 'FAILED_PRECONDITION', message: expect.stringContaining('completed as making no changes') } });
+    expect(skipped.push).not.toHaveBeenCalled();
+    const gated = await resumedPush(ended({ exitCode: 0, tail: 'ok', at: 1, command: 'npm test', recordedBy: 'system' }));
+    expect(gated.result).toMatchObject({ ok: true });
+  });
+
+  it('a skip a later report superseded holds nothing back: sent back, reported again, completed by its merged PR, the resumed worker pushes', async () => {
+    const ledgerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-task-push-ledger-'));
+    try {
+      const ledger = new TaskLedger({ dir: ledgerDir });
+      const id = 'wtask-1';
+      await ledger.register({ id, taskWorkspaceId: 'ws-task', ownerWorkspaceId: 'ws-owner', title: 't', dispatch: { origin: { kind: 'bot', botId: 'bot-1' }, preset: 'default', repoKey: 'github.com/acme/app' } });
+      const step = async (status: string, actor: { kind: 'worker' | 'brain'; workspaceId: string }): Promise<void> => {
+        const r = await ledger.update({ id, status, actor, expectedRev: (ledger.get(id) as { rev: number }).rev });
+        if (!r.ok) throw new Error(r.message);
+      };
+      // A no-changes report (rev 2), its skip (rev 3), sent back (rev 4).
+      await step('review_requested', { kind: 'worker', workspaceId: 'ws-task' });
+      expect(await recordNoChangesGate(ledger, id, 'no commits', Date.now, 'b'.repeat(40))).toBe(true);
+      await step('input_required', { kind: 'brain', workspaceId: 'ws-owner' });
+      // A code report (rev 5) whose gate recorded nothing, completed by its merged PR (rev 6).
+      await step('review_requested', { kind: 'worker', workspaceId: 'ws-task' });
+      const merged = await completeMergedTask(ledger, id, 7, (ledger.get(id) as { rev: number }).rev);
+      expect(merged.entry).toMatchObject({ status: 'completed', completion: { source: 'merge', pr: 7 }, reportedAtRev: 5, gate: { skipped: 'no_changes', reportRev: 2 } });
+      const handlers = new Map<string, Handler>();
+      const push = vi.fn(async (i: { branch: string }) => ({ ok: true as const, branch: i.branch, remote: 'origin' as const, head: 'f'.repeat(40), output: '' }));
+      registerTaskPushRpc({ register: (m: string, h: Handler) => handlers.set(m, h) } as never, {
+        getWindow: () => null,
+        daemon: { rpc: vi.fn(async () => ({ ok: true, tasks: [{ id, status: 'closed', branch: 'wtask/one', worktreePath: '/w/one' }] })) },
+        getLedger: () => ledger,
+        resolveCallerWorkspace: async () => 'ws-resumed',
+        reclaimedWorkerOfPane: () => ({ taskId: id, botId: 'bot-1', ownerWorkspaceId: 'ws-owner' }),
+        exists: () => true,
+        wmuxDir: () => fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-task-push-rpc-')),
+        push: push as never,
+        repoDefaultBranch: async () => 'main',
+      });
+      expect(await (handlers.get('task.push') as Handler)({ senderPtyId: 'pty-9' }, local)).toMatchObject({ ok: true });
+      expect(push).toHaveBeenCalledTimes(1);
+    } finally {
+      fs.rmSync(ledgerDir, { recursive: true, force: true });
+    }
+  });
+
+  it('a push under way reads as unknown in main\'s record until it ends', async () => {
+    const sha = 'f'.repeat(40);
+    const r = setup({ head: sha });
+    let during: unknown = null;
+    r.push.mockImplementationOnce(async (i: { branch: string }) => {
+      during = taskPushRecordOf(r.dir).get('wtask-1');
+      return { ok: true as const, branch: i.branch, remote: 'origin' as const, head: sha, output: '' };
+    });
+    expect(await r.call({ senderPtyId: 'pty-1' }, local)).toMatchObject({ ok: true });
+    expect(during).toBe('unknown');
+    expect(taskPushRecordOf(r.dir).get('wtask-1')).toBe(sha);
+  });
+
+  it('records the commit a landed push published, in main\'s own record; a refused push records nothing', async () => {
+    const sha = 'f'.repeat(40);
+    const landed = setup({ head: sha });
+    expect(await landed.call({ senderPtyId: 'pty-1' }, local)).toMatchObject({ ok: true });
+    expect(taskPushRecordOf(landed.dir).get('wtask-1')).toBe(sha);
+    // A fresh reader of the same file (after a restart) sees it too.
+    expect(new TaskPushRecord(path.join(landed.dir, 'factory', TASK_PUSHES_FILENAME)).get('wtask-1')).toBe(sha);
+    const refused = setup({ head: sha, fail: true });
+    expect(await refused.call({ senderPtyId: 'pty-1' }, local)).toMatchObject({ ok: false });
+    expect(taskPushRecordOf(refused.dir).get('wtask-1')).toBeNull();
+  });
 
   it('pushes the branch of the caller\'s own task, named by main\'s record only', async () => {
     const { call, push } = setup();

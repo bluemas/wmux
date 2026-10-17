@@ -16,11 +16,12 @@
 import type { BrowserWindow } from 'electron';
 import type { RpcRouter } from '../RpcRouter';
 import type { RpcContext } from '../../../shared/rpc';
-import { WORKER_SETTABLE_STATUSES, isLedgerStatus, type LedgerActor } from '../../../shared/ledger';
+import { WORKER_SETTABLE_STATUSES, isLedgerStatus, type LedgerActor, type LedgerEntry } from '../../../shared/ledger';
 import { resolvePtyOwnerWorkspace } from '../../workspace/ptyOwnership';
 import { getTaskLedger } from '../../deck/taskLedgerHost';
 import { LEDGER_SUMMARY_MAX_BYTES, truncateHead, type TaskLedger } from '../../../daemon/ledger/TaskLedger';
 import { reportOnEndedTask } from '../../factory/endedTaskReport';
+import type { NoChangesVerdict } from '../../factory/noChangesCheck';
 
 type GetWindow = () => BrowserWindow | null;
 
@@ -29,6 +30,10 @@ export interface LedgerRpcDeps {
   getLedger?: () => TaskLedger;
   /** Injected in tests; defaults to the mirror/renderer resolution. */
   resolveCallerWorkspace?: (senderPtyId: string) => Promise<string | null>;
+  /** The no-changes check (factory/noChangesCheck.ts). A `completed` on a
+   *  no-changes skip goes through only when it answers `unchanged` now, at
+   *  the HEAD the skip checked; without it, such a completion is refused. */
+  noChangesCheck?: (entry: LedgerEntry) => Promise<NoChangesVerdict>;
 }
 
 function deny(code: string, message: string): { ok: false; error: { code: string; message: string } } {
@@ -131,6 +136,24 @@ export function registerLedgerRpc(router: RpcRouter, getWindow: GetWindow, deps:
         return deny('NOT_AUTHORIZED', 'ledger.update: a bot may update only the tasks it started');
       }
       if (params.force === true) return deny('NOT_AUTHORIZED', 'ledger.update: a bot cannot force a transition');
+    }
+    // A no-changes skip vouches for nothing the worker did after it: the
+    // completion asks the same check again (its HEAD, main's push record and
+    // origin's task branch against the recorded base), at the HEAD the skip
+    // checked. Anything else, or no answer, is refused.
+    const current = status === 'completed' && params.force !== true ? ledgerOf().get(taskId) : null;
+    if (current?.gate?.skipped === 'no_changes') {
+      const checked = current.gate.headSha;
+      let verdict: NoChangesVerdict;
+      try {
+        verdict = deps.noChangesCheck ? await deps.noChangesCheck(current) : { kind: 'unknown', why: 'the no-changes check is not available' };
+      } catch (err) {
+        verdict = { kind: 'unknown', why: String(err) };
+      }
+      if (verdict.kind !== 'unchanged' || !checked || verdict.head !== checked) {
+        const why = verdict.kind !== 'unchanged' ? verdict.why : `the task's HEAD is no longer ${checked ?? 'the commit the skip checked'}`;
+        return deny('FAILED_PRECONDITION', `ledger.update: the no-changes skip no longer holds (${why}); settle it failed, or have its worker report again so its work is gated`);
+      }
     }
     const res = await ledgerOf().update({
       id: taskId,
