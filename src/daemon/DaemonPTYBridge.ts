@@ -245,6 +245,9 @@ export class DaemonPTYBridge extends EventEmitter {
   /** Latest OSC 0/2 window title (sanitized) and when it arrived (0 = never). */
   private lastTitle = '';
   private lastTitleAt = 0;
+  /** When a Codex title spinner last reported this pane running (0 = not
+   *  spinning). See noteCodexTitleSpinner. */
+  private codexSpinnerActiveAt = 0;
   /** #1463 — a session started and no turn has since (see isPreTurn). */
   private preTurn = false;
   /** #1463 — arrival time of the last turn evidence: submitted input, an
@@ -760,6 +763,12 @@ export class DaemonPTYBridge extends EventEmitter {
     return this.turnOpen;
   }
 
+  /** Milliseconds since the pane's last settled status (a turn's result),
+   *  or null when none settled since its current agent started. */
+  settledAgoMs(): number | null {
+    return this.settledAtMs > 0 ? Math.max(0, Date.now() - this.settledAtMs) : null;
+  }
+
   /** #1621 — an authoritative hook has reported on this pane's current agent. */
   hasHookReports(): boolean {
     return this.hookSeen;
@@ -823,6 +832,40 @@ export class DaemonPTYBridge extends EventEmitter {
     this.turnOpen = false;
     if (!this.turnSoftClosed) this.bootEpisode = false;
   }
+
+  /**
+   * Codex keeps a braille spinner at the front of its window title while a
+   * turn runs. Without Codex hooks that spinner is the only running signal a
+   * long reasoning stretch gives: the screen barely changes, so the byte-rate
+   * heuristic stays quiet, and no tool runs for the transcript watcher to
+   * report. The pane then read Idle mid-turn once the renderer's two-minute
+   * activity stamp ran out.
+   *
+   * The spinner's first frame reports `active`, and so does a frame every
+   * CODEX_SPINNER_REFRESH_MS while it keeps spinning, which keeps the stamp
+   * fresh. Main still defers to a hook latch and to a just-settled pane. A
+   * pane waiting on a human is never promoted by its title.
+   */
+  private noteCodexTitleSpinner(sessionId: string): void {
+    if (!/codex/i.test(this.agentDetector?.getLastAgent() ?? '')) return;
+    if (!this.titleShowsRunningTurn()) {
+      this.codexSpinnerActiveAt = 0;
+      return;
+    }
+    if (this.awaitingHuman) return;
+    const now = Date.now();
+    if (this.codexSpinnerActiveAt > 0 && now - this.codexSpinnerActiveAt < DaemonPTYBridge.CODEX_SPINNER_REFRESH_MS) return;
+    this.codexSpinnerActiveAt = now;
+    this.emit('active', {
+      sessionId,
+      agentName: this.agentDetector?.getLastAgent() ?? undefined,
+      likelyRepaint: false,
+    });
+  }
+
+  /** How often a still-spinning Codex title re-reports running (well inside
+   *  the renderer's 120 s activity window). */
+  private static readonly CODEX_SPINNER_REFRESH_MS = 30_000;
 
   /** The agent's own running spinner is the latest window title, set within the freshness window. */
   private titleShowsRunningTurn(): boolean {
@@ -1264,6 +1307,7 @@ export class DaemonPTYBridge extends EventEmitter {
         this.lastTitleAt = Date.now();
         if (title) this.emit('title', { sessionId, title });
         if (titleTurnEdge.observe(title)) this.noteTitleTurnEnd(sessionId);
+        this.noteCodexTitleSpinner(sessionId);
         return;
       }
       if (event.code === 7) {

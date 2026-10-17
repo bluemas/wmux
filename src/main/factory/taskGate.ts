@@ -18,6 +18,20 @@
 //     system-recorded pass: the system adds no power a bot lacks;
 //   - anything else (a failing, killed, skipped or refused gate, no worktree,
 //     no base branch) leaves the task open.
+// A task that made no commits beyond the commit its branch was created from
+// (an operational task such as "call this API" commits nothing) is not gated
+// at all: the gate would grade that base commit, which says nothing about
+// the task, and a pass there completed tasks whose own report said they
+// failed. "No commits" is noChangesCheck.ts's answer, from main's records and
+// origin only: the base recorded at dispatch, the worktree's HEAD, main's
+// record of what task.push published and the task branch on origin itself
+// must all be that base or behind it. A system gate that ran nothing is then
+// recorded (`skipped: 'no_changes'`, exit 0, the way the runner records
+// `no_gate_command`), the task is left open, and the bot settles it from the
+// report: the ledger takes its `completed` on that record (only for the
+// report it was recorded on: LedgerGateResult.reportRev), or its `failed`;
+// main's ledger.update asks the same check again before it lets that
+// completion through. A `changed` or `unknown` answer is gated as before.
 // A research task (the `research` preset: a scratch folder, no repository,
 // no code) has no gate to run: its report completes it at once, written as
 // the task's owner the same way (the ledger lets a brain complete such a row
@@ -78,7 +92,7 @@
 // last day wakes its bot again too, in case the quit fell between the
 // completion and the wake (same id, so a delivered wake is dropped).
 
-import { isResearchDispatch, type LedgerEntry } from '../../shared/ledger';
+import { isResearchDispatch, type LedgerActor, type LedgerEntry, type LedgerGateResult } from '../../shared/ledger';
 import type { BotProfile } from '../../shared/bot';
 import type { Fact } from '../../shared/facts';
 import { normalizeRepoKey } from '../../shared/repoKey';
@@ -88,6 +102,7 @@ import type { WakeReason } from '../../shared/wake';
 import type { LedgerUpdateInput, LedgerUpdateResult } from '../../daemon/ledger/TaskLedger';
 import type { GateRunInput, GateRunResult } from '../worktask/TaskGateRunner';
 import { VERIFY_GATE_SYSTEM_WORKSPACE, verifyGateFactId } from './verifyPreset';
+import type { NoChangesVerdict } from './noChangesCheck';
 
 /** Whether a transition is a bot task (not a verify task) reporting its work. */
 export function isTaskGateReport(entry: LedgerEntry, to: string): boolean {
@@ -163,6 +178,49 @@ export async function completeCheckedTask(ledger: CheckedTaskLedger, taskId: str
     return { entry: null, why: String(err) };
   }
   return { entry: null, why: 'the task kept changing' };
+}
+
+/** The ledger calls recording a gate that ran nothing makes (TaskLedger). */
+export interface GateRecordingLedger {
+  get(id: string): LedgerEntry | null;
+  recordGate(id: string, gate: LedgerGateResult, actor?: LedgerActor, expectedRev?: number): Promise<LedgerUpdateResult>;
+}
+
+/** What a `no_changes` skip says (its card body and its ledger tail). */
+export function noChangesDetail(base: string): string {
+  return `The task's branch has no commits beyond ${base}, the commit it started from, so a gate would grade that commit and not the task. `
+    + 'No gate ran; the bot settles the task from its report.';
+}
+
+/**
+ * Record that a reported bot task made no commits beyond its base: a system
+ * gate that ran nothing (`exitCode: 0`, `command: 'none'`, `skipped:
+ * 'no_changes'`, the detail as its tail), as the gate runner records
+ * `no_gate_command`. The bot can then settle `completed` (the ledger takes it
+ * on a system gate with exit 0) or `failed`; the system completes nothing on
+ * it (isSystemGatePass refuses a skip). `headSha`: the HEAD that was
+ * checked, kept on the record. Only on a row still in review_requested (the
+ * ledger stamps the report it is for). One retry on a write that landed in
+ * between. Never throws; whether it was recorded.
+ */
+export async function recordNoChangesGate(ledger: GateRecordingLedger, taskId: string, detail: string, now: () => number = Date.now, headSha?: string): Promise<boolean> {
+  try {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const row = ledger.get(taskId);
+      if (!row || row.status !== 'review_requested') return false;
+      const r = await ledger.recordGate(
+        taskId,
+        { exitCode: 0, tail: detail, at: now(), command: 'none', skipped: 'no_changes', ...(headSha ? { headSha } : {}) },
+        { kind: 'system', workspaceId: VERIFY_GATE_SYSTEM_WORKSPACE },
+        row.rev,
+      );
+      if (r.ok) return true;
+      if (r.error !== 'stale_rev') return false;
+    }
+  } catch {
+    return false;
+  }
+  return false;
 }
 
 /** The reason the ledger records on a task its merged pull request ended. */
@@ -285,6 +343,13 @@ export interface TaskGatePorts {
   headMerged?: (worktreePath: string, sha: string) => Promise<boolean>;
   /** completeMergedTask over the hosted ledger. */
   completeMerged?: (taskId: string, pr: number, checkedRev: number) => Promise<{ entry: LedgerEntry } | { entry: null; why: string }>;
+  /** Whether the task made no changes (noChangesCheck.ts: its HEAD, main's
+   *  push record and origin's task branch against the base recorded at
+   *  dispatch). With recordNoChanges, an `unchanged` task is not gated;
+   *  `changed` or `unknown` is (absent: every report is gated). */
+  noChanges?: (entry: LedgerEntry) => Promise<NoChangesVerdict>;
+  /** recordNoChangesGate over the hosted ledger (`headSha`: the HEAD checked). */
+  recordNoChanges?: (taskId: string, detail: string, headSha?: string) => Promise<boolean>;
   /** How often open reports are checked for a merged PR (default
    *  MERGE_SWEEP_MS). */
   mergeSweepMs?: number;
@@ -337,7 +402,13 @@ export function describeTaskGate(r: GateRunResult): GateCard {
     return { title: `Gate ${verdict}: task left open`, body: `\`${g.command}\` ${head}; ${receipt}.`, notice };
   }
   if (r.ok && r.status === 'skipped') {
-    return { title: `Gate skipped (${r.skipped}): task left open`, body: r.detail, notice: { code: 'gate.skipped', args: { reason: r.skipped } } };
+    // A no_changes skip that did not land in the ledger leaves the bot no
+    // record to complete on: say so.
+    const body = r.skipped === 'no_changes' && r.recorded === false ? `${r.detail} The skip was NOT recorded (ledger unreachable).` : r.detail;
+    // The stored English words for no_changes are the rendered card's
+    // (room.notice.gate.reason.no_changes): the bot reads this title too.
+    const reason = r.skipped === 'no_changes' ? 'the task made no changes' : r.skipped;
+    return { title: `Gate skipped (${reason}): task left open`, body, notice: { code: 'gate.skipped', args: { reason: r.skipped } } };
   }
   if (!r.ok && r.status === 'busy') return { title: 'Gate already running: task left open', body: 'Another gate run holds this task; its result is in the task\'s ledger row when it ends.', notice: { code: 'gate.busy' } };
   if (!r.ok && r.code === 'no_base_gate') {
@@ -604,9 +675,28 @@ export function installTaskGate(ports: TaskGatePorts): () => void {
     if (picked.length > 0) void endMerged(picked);
   };
 
+  /** The base a task holds no commits beyond, and the HEAD that was checked:
+   *  its HEAD and every commit its branch was published at are that base or
+   *  behind it. Else null: commits of its own (local or pushed), no recorded
+   *  base, or anything that could not be read (the gate then runs as before). */
+  const unchangedBase = async (entry: LedgerEntry): Promise<{ base: string; head: string } | null> => {
+    if (!ports.noChanges || !ports.recordNoChanges) return null;
+    try {
+      const v = await ports.noChanges(entry);
+      if (v.kind === 'unchanged') return { base: v.base, head: v.head };
+      if (v.kind === 'unknown') log(`[factory] task ${entry.id} gated: whether it made changes is unknown (${v.why})`);
+      return null;
+    } catch (err) {
+      log(`[factory] base of task ${entry.id} not compared: ${String(err)}`);
+      return null;
+    }
+  };
+
   /** Gate a report. `atInstall`: one found open at install, whose merge
    *  check, when it cannot answer, defers it to the sweep (not gated, not
-   *  woken now), so it gets one wake: the completion's or its gate's. */
+   *  woken now), so it gets one wake: the completion's or its gate's. A
+   *  report the sweep later gates comes back through here, no_changes skip
+   *  included. */
   const run = async (taskId: string, atInstall: boolean): Promise<void> => {
     const entry = stillReported(taskId);
     if (!entry) return;
@@ -650,6 +740,18 @@ export function installTaskGate(ports: TaskGatePorts): () => void {
         body: !worktree ? 'The task worktree is not on disk.' : 'origin\'s default branch could not be resolved, so there is no base gate to run.',
         notice: { code: !worktree ? 'gate.notRunNoWorktree' : 'gate.notRunNoBaseRef' },
       });
+      return;
+    }
+    // No commits beyond its base: nothing of the task's to gate. Recorded as
+    // a skip and left open for the bot to settle from the report.
+    const unchanged = await unchangedBase(before);
+    if (unchanged && ports.recordNoChanges) {
+      if (again.has(taskId) || !stillReported(taskId)) return;
+      const detail = noChangesDetail(unchanged.base);
+      const recorded = await ports.recordNoChanges(taskId, detail, unchanged.head);
+      const now = again.has(taskId) ? null : stillReported(taskId);
+      if (!now) return;
+      await settle(now, describeTaskGate({ ok: true, status: 'skipped', taskId, skipped: 'no_changes', detail, recorded }));
       return;
     }
     const result = await ports.runGate({

@@ -227,7 +227,7 @@ const NOTICE_WORDS: Readonly<Record<string, ReadonlySet<string>>> = {
 const INPUT_REQUIRED_WHY: ReadonlySet<string> = new Set(['trustDialog', 'firstRun', 'launchFailed']);
 
 /** Why a gate was skipped (TaskGateRunner.ts GateSkipReason). */
-const GATE_SKIP_REASONS: ReadonlySet<string> = new Set(['deps_missing', 'no_gate_command', 'gate_unavailable']);
+const GATE_SKIP_REASONS: ReadonlySet<string> = new Set(['deps_missing', 'no_gate_command', 'gate_unavailable', 'no_changes']);
 
 /** A notice's clock time in the app's language: the time today, else a
  *  short date and the time. */
@@ -349,6 +349,18 @@ export function ownerCardText(card: Pick<RoomCard, 'kind' | 'title' | 'body' | '
     body = withoutInternalIds(body, labels);
   }
   return { title, body };
+}
+
+/** A card's title and body shown once: a body that repeats its title, or
+ *  starts with it (a bot's turn text whose first line became the title, or
+ *  whose start was cut into the title, mid-word and maybe with a trailing
+ *  "…" or "..."), is the whole text, shown alone; any other body is kept.
+ *  Compared after trimming, with runs of white space as one. Pure. */
+export function onceText(title: string, body: string): { title: string; body: string } {
+  const norm = (v: string) => v.replace(/\s+/g, ' ').trim();
+  const head = norm(norm(title).replace(/(…|\.\.\.)$/, ''));
+  if (!head || !body.trim()) return { title, body };
+  return norm(body).startsWith(head) ? { title: body.trim(), body: '' } : { title, body };
 }
 
 export function roleLabel(role: BotRole, t: T): string {

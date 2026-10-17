@@ -54,9 +54,13 @@ import { createWindow, loadMainRenderer } from './window/createWindow';
 import { attachDesktopPresenceReporter, reportDesktopPresence } from './window/desktopPresence';
 import { PTYManager } from './pty/PTYManager';
 import { PTYBridge } from './pty/PTYBridge';
+import { pruneDaemonPidMapAtConnect } from './pty/pidMap';
 import { registerAllHandlers } from './ipc/registerHandlers';
 import { RpcRouter } from './pipe/RpcRouter';
 import type { RpcMethod } from '../shared/rpc';
+import { git as gitRun } from './git/git';
+import { liveNoChangesCheck } from './factory/noChangesCheck';
+import { getBotStore } from './factory/botStore';
 import { PipeServer } from './pipe/PipeServer';
 import { registerWorkspaceRpc } from './pipe/handlers/workspace.rpc';
 import { registerSurfaceRpc } from './pipe/handlers/surface.rpc';
@@ -1190,7 +1194,15 @@ registerGitHandoffHandlers({
   startFanOut: (req) => startGuiFanOut(fanOutService, req),
 });
 registerFanOutRpc(rpcRouter, fanOutService, () => mainWindow, { getDaemonClient: () => daemonClient });
-registerLedgerRpc(rpcRouter, () => mainWindow);
+registerLedgerRpc(rpcRouter, () => mainWindow, {
+  // A completion on a no-changes skip asks the no-changes check again.
+  noChangesCheck: liveNoChangesCheck({
+    rpc: () => (daemonClient ? (method, params) => (daemonClient as DaemonClient).rpc(method as RpcMethod, params as Record<string, unknown>) : null),
+    git: gitRun,
+    wmuxDir: getWmuxDir,
+    botRepoKey: (botId) => getBotStore()?.get(botId)?.repo?.repoKey,
+  }),
+});
 registerTaskPushRpc(rpcRouter, {
   getWindow: () => mainWindow,
   daemon: {
@@ -2162,6 +2174,17 @@ app.on('ready', async () => {
         invokeRendererRpc,
       });
       logLine('info', 'main', 'handler swap (daemon connect): register done');
+      // Clear pid-map files that no longer name a daemon session's current
+      // shell. A daemon restart gives every recovered session a new shell PID,
+      // and an old PID left on disk can be reused by another process that then
+      // resolves to the old pane's identity. The daemon answers only after its
+      // recovery, so this list is complete.
+      void pruneDaemonPidMapAtConnect(() => client.rpc('daemon.listSessions', { includeSuspended: true }))
+        .then((removed) => {
+          if (removed > 0) logLine('info', 'main', `pid-map: removed ${removed} stale daemon entr${removed === 1 ? 'y' : 'ies'}`);
+        }, (err: unknown) => {
+          logLine('warn', 'main', `pid-map prune failed: ${err instanceof Error ? err.message : String(err)}`);
+        });
       // Mount the notification router now that we have a live daemon
       // client. PTY data flows through daemon → DaemonClient events,
       // and this router translates them into the same renderer-facing

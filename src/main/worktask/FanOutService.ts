@@ -133,6 +133,7 @@ export function workerTaskIdentityNote(taskId: string, channelId: string, botBra
   // shared/botWorkerGuard.ts): main pushes its task branch (task_push).
   const push = botBranch
     ? `- Your branch: \`${botBranch}\`. Commit, then publish it with the \`task_push\` tool (wmux pushes this branch to origin, fast-forward only); \`git push\` itself is refused. Open the pull request with \`gh pr create --head ${botBranch}\`.
+- Fresh main, or a conflict to settle: run the \`task_fetch\` tool (wmux fetches origin's default branch and your branch with its own credentials), then \`git merge origin/<default branch>\`. Never ask for credentials to fetch.
 ${botWorkerAgentPromptNote(agent)}`
     : '';
   // The task's connections: what they return is outside text.
@@ -1637,6 +1638,9 @@ export class FanOutService {
                 ...(ctx.preset ? { preset: ctx.preset } : {}),
                 ...(ctx.repoKey ? { repoKey: ctx.repoKey } : {}),
                 ...(ctx.checkout ? { checkout: { sha: ctx.checkout.sha, detached: true as const } } : {}),
+                // The commit the task branch was created from: the no-changes
+                // check's base (main's record, not the worktree's task.json).
+                ...(plan && !ctx.checkout && ctx.baseOid ? { baseOid: ctx.baseOid } : {}),
                 ...(ctx.threadId ? { threadId: ctx.threadId } : {}),
                 ...(ctx.handoffId ? { handoffId: ctx.handoffId } : {}),
                 ...(connectors.length > 0 ? { connectors: connectors.map((c) => c.name) } : {}),

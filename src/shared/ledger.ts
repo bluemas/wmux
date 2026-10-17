@@ -66,13 +66,22 @@ export interface LedgerGateResult {
    *  nothing to fail — `completed` is allowed (the exitCode is 0) and the
    *  ledger says why, in `command: 'none'` and in the tail. The other two skips
    *  (`deps_missing`, `gate_unavailable`) are NOT recorded at all: there a gate
-   *  existed and the environment stopped it, which is a human's problem. */
-  skipped?: 'no_gate_command';
+   *  existed and the environment stopped it, which is a human's problem.
+   *  `no_changes` (written by the bot task gate, factory/taskGate.ts): the
+   *  task's branch has no commits beyond the commit it started from, so a gate
+   *  would grade that base and not the task. Recorded the same way, so the
+   *  bot that reads the report can settle it `completed` or `failed`; the
+   *  system completes nothing on it (isSystemGatePass refuses any skip). */
+  skipped?: 'no_gate_command' | 'no_changes';
   /** The worktree HEAD the gate ran on: read by the gate runner before the
    *  run and again after it, and set only when both reads agree. Absent when
    *  HEAD could not be read or moved during the run — such a result is not
    *  evidence about any commit. */
   headSha?: string;
+  /** On a `no_changes` record only, stamped by the ledger itself: the
+   *  report it was recorded for (LedgerEntry.reportedAtRev then). `completed`
+   *  takes the record only while the row's current report is that one. */
+  reportRev?: number;
 }
 
 export interface LedgerEntry {
@@ -104,6 +113,10 @@ export interface LedgerEntry {
    *  (LedgerUpdateInput.completion; the ledger RPC never forwards it), never
    *  by a worker or a brain. Absent otherwise. */
   completion?: LedgerCompletion;
+  /** The rev of the row's latest move to review_requested (its current
+   *  report), written by the ledger on that move. Absent on rows not
+   *  reported since it existed. */
+  reportedAtRev?: number;
 }
 
 /** See LedgerEntry.completion. */
@@ -129,6 +142,11 @@ export interface LedgerDispatch {
   repoKey?: string;
   /** Set when the task worktree was created detached at a commit. */
   checkout?: { sha: string; detached: true };
+  /** The commit main created the task's branch from (origin's default branch
+   *  at fan-out), a full commit id; absent for a detached checkout, a task
+   *  with no worktree, one that fell back to the owner's HEAD, and rows
+   *  written before it existed. The no-changes check measures against it. */
+  baseOid?: string;
   /** A bot's task: the room thread the bot named when it started it (checked
    *  like a post's), else the PR it checks out, else the thread of the wake
    *  that started it (main's own wake state at dispatch). The task's wakes

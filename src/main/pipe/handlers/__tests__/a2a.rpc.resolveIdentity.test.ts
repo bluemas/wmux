@@ -405,6 +405,120 @@ describe('a2a.resolve.identity — server-side walk (callerPid)', () => {
   });
 });
 
+describe('a2a.resolve.identity — a reconnect between the connection check and the mint', () => {
+  // The check that the entries' client is still installed is awaited, and an
+  // await yields even when it answers at once. These tests queue the swap to
+  // client B inside that very gap: the first getDaemonClient() call after the
+  // armed point (the confirmation's own check) schedules it.
+  const sessions = [{ id: 'daemon-shell', pid: 49076, state: 'attached' }];
+  let current: DaemonClient;
+  let armed: boolean;
+  let a: { client: DaemonClient; rpc: ReturnType<typeof vi.fn> };
+  let b: { client: DaemonClient; rpc: ReturnType<typeof vi.fn> };
+
+  function client(onWslLive?: () => void) {
+    const rpc = vi.fn(async (method: string) => {
+      if (method === 'daemon.listSessions') return sessions;
+      if (method === 'session.wslAgentLive') { onWslLive?.(); return { live: true }; }
+      throw new Error(`unexpected ${method}`);
+    });
+    return { client: { isConnected: true, rpc } as unknown as DaemonClient, rpc };
+  }
+
+  function router(opts: { ppidByPid: Map<number, number>; armOnWalk?: boolean; armOnCodexCheck?: boolean }): RpcRouter {
+    const r = new RpcRouter();
+    registerA2aRpc(r, () => fakeWindow, makeWorker(), {
+      snapshot: async () => ({ ppidByPid: opts.ppidByPid, listeners: [] }),
+      // Called during the walk, after the snapshot: the next client lookup is the confirmation's.
+      createdAt: () => { if (opts.armOnWalk) armed = true; return null; },
+      classifyCodexCaller: async () => { if (opts.armOnCodexCheck) armed = true; return 'shared-server'; },
+      getDaemonClient: () => {
+        const c = current;
+        if (armed) {
+          armed = false;
+          queueMicrotask(() => { current = b.client; });
+        }
+        return c;
+      },
+    });
+    return r;
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    __resetWorkspaceClaimTrustForTesting();
+    dirRef.current = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-pidmap-gap-'));
+    fs.writeFileSync(path.join(dirRef.current, '49076'), 'daemon-shell');
+    sendToRendererMock.mockImplementation(
+      (_w: unknown, method: string, p: { ptyId: string }) =>
+        Promise.resolve({
+          workspaceId: method === 'input.findOwnerWorkspace' && p.ptyId === 'daemon-shell' ? 'ws-live' : null,
+        }),
+    );
+    armed = false;
+    a = client(() => { armed = true; });
+    b = client();
+    current = a.client;
+  });
+  afterEach(() => {
+    try { fs.rmSync(dirRef.current, { recursive: true, force: true }); } catch { /* best-effort */ }
+  });
+
+  it('the walk: no pane token', async () => {
+    const r = router({ ppidByPid: new Map([[39876, 49076], [49076, 1]]), armOnWalk: true });
+    const result = (await dispatchResolve(r, { callerPid: 39876 })) as ResolveResult & { workspaceToken?: string };
+
+    expect(current).toBe(b.client); // the swap did land
+    expect(result.workspaceToken).toBeUndefined();
+    expect(result.resolved).toBeNull();
+  });
+
+  it('the hinted pane: no token', async () => {
+    // The walk misses, so the hinted pane is attested (the WSL answer arms the swap).
+    const r = router({ ppidByPid: new Map([[39876, 1]]) });
+    const result = (await dispatchResolve(r, { callerPid: 39876, hintedPtyId: 'daemon-shell' })) as {
+      hintedPane?: { live: boolean; workspaceToken?: string };
+    };
+
+    expect(current).toBe(b.client);
+    expect(result.hintedPane).toEqual({ live: true });
+  });
+
+  it('the Codex thread: no thread claim', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-codex-home-gap-'));
+    const threadId = '019a0000-0000-7000-8000-0000000000aa';
+    const digest = (v: string) => createHash('sha256').update(v).digest('hex');
+    const dir = path.join(home, 'wmux-thread-owners');
+    fs.mkdirSync(dir, { recursive: true });
+    const suffix = process.env.WMUX_DATA_SUFFIX || '';
+    const env = {
+      WMUX_PTY_ID: 'daemon-shell', WMUX_WORKSPACE_ID: 'ws-frozen', WMUX_SURFACE_ID: '', WMUX_DATA_SUFFIX: suffix,
+      WMUX_PIPE_NAME: '', WMUX_HOOKS_TO_MAIN: '',
+    };
+    fs.writeFileSync(path.join(dir, `thread-${digest(threadId)}.json`), JSON.stringify({ version: 1, id: threadId, env, nonce: 'n1' }));
+    fs.writeFileSync(path.join(dir, `pane-${digest(JSON.stringify([suffix, 'daemon-shell']))}.json`), JSON.stringify({ id: threadId, nonce: 'n1' }));
+    const previous = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = home;
+    try {
+      // Control: without the swap the same call gets its thread claim.
+      const control = (await dispatchResolve(router({ ppidByPid: new Map() }), { codexThreadId: threadId, codexCallerPid: 4242 })) as {
+        threadClaim?: unknown;
+      };
+      expect(control.threadClaim).toMatchObject({ ptyId: 'daemon-shell' });
+
+      const r = router({ ppidByPid: new Map(), armOnCodexCheck: true });
+      const result = (await dispatchResolve(r, { codexThreadId: threadId, codexCallerPid: 4242 })) as { threadClaim?: unknown };
+
+      expect(current).toBe(b.client);
+      expect(result.threadClaim).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previous;
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('a2a.resolve.identity — pane claims from main\'s own answers', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -516,10 +630,12 @@ describe('a2a.resolve.identity — accounts and the pane the env names', () => {
       return { live: wslLive };
     });
     const router = new RpcRouter();
+    // One client for the whole connection, as main installs it.
+    const client = { rpc } as unknown as DaemonClient;
     registerA2aRpc(router, () => fakeWindow, makeWorker(), {
       snapshot: async () => ({ ppidByPid: new Map([[39876, 1]]), listeners: [] }),
       createdAt: () => null,
-      getDaemonClient: () => ({ rpc }) as unknown as DaemonClient,
+      getDaemonClient: () => client,
     });
     return { router, rpc };
   }
@@ -528,7 +644,8 @@ describe('a2a.resolve.identity — accounts and the pane the env names', () => {
     const { router, rpc } = routerWithDaemon(true);
     const result = (await dispatchResolve(router, { callerPid: 39876, hintedPtyId: 'auto-run-1' })) as { hintedPane?: unknown };
     expect(result.hintedPane).toEqual({ live: false });
-    expect(rpc).not.toHaveBeenCalled();
+    // The pid-map check may list sessions; the WSL attestation must not run.
+    expect(rpc).not.toHaveBeenCalledWith('session.wslAgentLive', expect.anything(), expect.anything());
   });
 
   it('attests a live pane only when the daemon follows a live WSL agent in it', async () => {
@@ -637,4 +754,266 @@ describe('a2a.resolve.identity — scheduled runs with a browser identity', () =
     expect(res.ok).toBe(true);
     return (res as { result: ResolveResult & { workspaceToken?: string } }).result;
   }
+});
+
+describe('a2a.resolve.identity — a pid-map hit must be the session\'s current shell', () => {
+  // Live repro (F23): after a daemon restart the old pane daemon-04f1c884
+  // runs a new shell (13632), but its file for the earlier shell 6780 was
+  // still there. Windows gave 6780 to a new worker's claude.exe, whose MCP
+  // server walked up to it before reaching the worker's own shell 7644.
+  const ppidByPid = new Map<number, number>([[39876, 6780], [6780, 7644], [7644, 1]]);
+  const owners: Record<string, string> = { 'daemon-04f1c884': 'ws-old', 'daemon-worker': 'ws-worker' };
+  let sessions: Array<{ id: string; pid?: number; state: string }>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    __resetWorkspaceClaimTrustForTesting();
+    dirRef.current = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-pidmap-live-'));
+    fs.writeFileSync(path.join(dirRef.current, '6780'), 'daemon-04f1c884');
+    fs.writeFileSync(path.join(dirRef.current, '7644'), 'daemon-worker');
+    sessions = [
+      { id: 'daemon-04f1c884', pid: 13632, state: 'detached' },
+      { id: 'daemon-worker', pid: 7644, state: 'attached' },
+    ];
+    sendToRendererMock.mockImplementation(
+      (_w: unknown, method: string, p: { ptyId: string }) =>
+        Promise.resolve({ workspaceId: method === 'input.findOwnerWorkspace' ? owners[p.ptyId] ?? null : null }),
+    );
+  });
+  afterEach(() => {
+    try { fs.rmSync(dirRef.current, { recursive: true, force: true }); } catch { /* best-effort */ }
+  });
+
+  function routerWith(daemon: DaemonClient | null): RpcRouter {
+    const router = new RpcRouter();
+    registerA2aRpc(router, () => fakeWindow, makeWorker(), {
+      snapshot: async () => ({ ppidByPid, listeners: [] }),
+      createdAt: () => null,
+      getDaemonClient: () => daemon,
+    });
+    return router;
+  }
+
+  function daemonListing(): { client: DaemonClient; rpc: ReturnType<typeof vi.fn> } {
+    const rpc = vi.fn(async (method: string) => {
+      if (method === 'daemon.listSessions') return sessions;
+      throw new Error(`unexpected ${method}`);
+    });
+    return { client: { isConnected: true, rpc } as unknown as DaemonClient, rpc };
+  }
+
+  it('skips the stale file and walks on to the real shell\'s entry', async () => {
+    const result = await dispatchResolve(routerWith(daemonListing().client), { callerPid: 39876 });
+
+    expect(result.resolved).toEqual({ workspaceId: 'ws-worker', ptyId: 'daemon-worker' });
+    // The client-side walk reads these, so the stale PID is gone from both.
+    expect(result.entries).toEqual([{ pid: '7644', ptyId: 'daemon-worker', workspaceId: 'ws-worker' }]);
+    expect(result.mappings).toEqual({ '7644': 'ws-worker' });
+  });
+
+  it('keeps the previous behaviour when the daemon is not connected', async () => {
+    const result = await dispatchResolve(routerWith(null), { callerPid: 39876 });
+
+    expect(result.resolved).toEqual({ workspaceId: 'ws-old', ptyId: 'daemon-04f1c884' });
+    expect(result.entries).toHaveLength(2);
+  });
+
+  it('keeps the previous behaviour when listSessions fails', async () => {
+    const rpc = vi.fn(async () => { throw new Error('daemon down'); });
+    const result = await dispatchResolve(
+      routerWith({ isConnected: true, rpc } as unknown as DaemonClient),
+      { callerPid: 39876 },
+    );
+
+    expect(result.entries).toHaveLength(2);
+  });
+
+  it('reads the list again before a cached one drops an entry', async () => {
+    const { client, rpc } = daemonListing();
+    const router = routerWith(client);
+    await dispatchResolve(router, { callerPid: 39876 });
+    expect(rpc).toHaveBeenCalledTimes(1);
+
+    // Within the cache window the old pane gets a new shell that reuses 6780
+    // (reconnect writes its file); the cached list still says 13632.
+    sessions = [
+      { id: 'daemon-04f1c884', pid: 6780, state: 'detached' },
+      { id: 'daemon-worker', pid: 7644, state: 'attached' },
+    ];
+    const second = await dispatchResolve(router, {});
+    expect(rpc).toHaveBeenCalledTimes(2);
+    expect(second.entries.map((e) => e.pid).sort()).toEqual(['6780', '7644']);
+
+    // A list that agrees is served from the cache.
+    await dispatchResolve(router, {});
+    expect(rpc).toHaveBeenCalledTimes(2);
+  });
+
+  it('skips a stale entry whose session the daemon no longer has (startup prune failed)', async () => {
+    // The old pane's session is gone, but its file survived because the
+    // startup prune did not run or failed; the renderer still answers for it.
+    sessions = [{ id: 'daemon-worker', pid: 7644, state: 'attached' }];
+    const { client, rpc } = daemonListing();
+
+    const result = await dispatchResolve(routerWith(client), { callerPid: 39876 });
+
+    expect(rpc).toHaveBeenCalledWith('daemon.listSessions', { includeSuspended: true }, expect.anything());
+    expect(result.resolved).toEqual({ workspaceId: 'ws-worker', ptyId: 'daemon-worker' });
+    expect(result.entries).toEqual([{ pid: '7644', ptyId: 'daemon-worker', workspaceId: 'ws-worker' }]);
+    expect(result.mappings).toEqual({ '7644': 'ws-worker' });
+  });
+
+  it('does not use a list cached before a daemon reconnect', async () => {
+    // Before the restart the old pane's shell really was 6780.
+    sessions = [
+      { id: 'daemon-04f1c884', pid: 6780, state: 'detached' },
+      { id: 'daemon-worker', pid: 7644, state: 'attached' },
+    ];
+    const before = daemonListing();
+    let current: DaemonClient = before.client;
+    const router = new RpcRouter();
+    registerA2aRpc(router, () => fakeWindow, makeWorker(), {
+      snapshot: async () => ({ ppidByPid, listeners: [] }),
+      createdAt: () => null,
+      getDaemonClient: () => current,
+    });
+    const first = await dispatchResolve(router, {});
+    expect(first.entries).toHaveLength(2);
+
+    // The daemon restarts inside the cache window: a new client, and the old
+    // pane now runs 13632. The cached list would still accept 6780.
+    sessions = [
+      { id: 'daemon-04f1c884', pid: 13632, state: 'detached' },
+      { id: 'daemon-worker', pid: 7644, state: 'attached' },
+    ];
+    const after = daemonListing();
+    current = after.client;
+    const second = await dispatchResolve(router, {});
+
+    expect(after.rpc).toHaveBeenCalledTimes(1);
+    expect(before.rpc).toHaveBeenCalledTimes(1);
+    expect(second.entries).toEqual([{ pid: '7644', ptyId: 'daemon-worker', workspaceId: 'ws-worker' }]);
+  });
+
+  describe('a reconnect in the middle of one resolve', () => {
+    const before = [
+      { id: 'daemon-04f1c884', pid: 6780, state: 'detached' },
+      { id: 'daemon-worker', pid: 7644, state: 'attached' },
+    ];
+
+    // Client A answers the list, then a reconnect installs client B while the
+    // resolve still awaits the process snapshot. `bAnswer` overrides B's list.
+    function midResolveReconnect(afterSessions: typeof before, bAnswer?: () => Promise<unknown>) {
+      let current: DaemonClient;
+      const bRpc = vi.fn(async (method: string) => {
+        if (method === 'daemon.listSessions') return bAnswer ? bAnswer() : afterSessions;
+        throw new Error(`unexpected ${method}`);
+      });
+      const b = { isConnected: true, rpc: bRpc } as unknown as DaemonClient;
+      let releaseSnapshot!: () => void;
+      const snapshotGate = new Promise<void>((r) => { releaseSnapshot = r; });
+      const aRpc = vi.fn(async (method: string) => {
+        if (method !== 'daemon.listSessions') throw new Error(`unexpected ${method}`);
+        // Replace the client only once A's answer is on its way back, then
+        // let the snapshot finish.
+        queueMicrotask(() => { current = b; releaseSnapshot(); });
+        return before;
+      });
+      current = { isConnected: true, rpc: aRpc } as unknown as DaemonClient;
+      const router = new RpcRouter();
+      registerA2aRpc(router, () => fakeWindow, makeWorker(), {
+        snapshot: async () => { await snapshotGate; return { ppidByPid, listeners: [] }; },
+        createdAt: () => null,
+        getDaemonClient: () => current,
+      });
+      return { router, aRpc, bRpc };
+    }
+
+    it('mints no token from the old connection\'s entries when the new one disagrees', async () => {
+      // After the restart the old pane runs 13632; 6780 is the worker's claude.exe.
+      const { router, aRpc, bRpc } = midResolveReconnect([
+        { id: 'daemon-04f1c884', pid: 13632, state: 'detached' },
+        { id: 'daemon-worker', pid: 7644, state: 'attached' },
+      ]);
+
+      const result = (await dispatchResolve(router, { callerPid: 39876 })) as ResolveResult & { workspaceToken?: string };
+
+      expect(aRpc).toHaveBeenCalledTimes(1);
+      expect(bRpc).toHaveBeenCalledTimes(1); // re-read once from the new client
+      expect(result.workspaceToken).toBeUndefined();
+      expect(result.resolved).toBeNull();
+      // The response carries the entries judged over the new connection.
+      expect(result.entries).toEqual([{ pid: '7644', ptyId: 'daemon-worker', workspaceId: 'ws-worker' }]);
+      expect(result.mappings).toEqual({ '7644': 'ws-worker' });
+    });
+
+    it.each([
+      ['rejects', async () => { throw new Error('daemon busy'); }],
+      ['answers with something that is not a list', async () => ({ error: 'malformed' })],
+    ])('mints no token when the re-read from the new connection %s', async (_label, bAnswer) => {
+      const { router, bRpc } = midResolveReconnect(before, bAnswer);
+
+      const result = (await dispatchResolve(router, { callerPid: 39876 })) as ResolveResult & { workspaceToken?: string };
+
+      expect(bRpc).toHaveBeenCalledTimes(1);
+      expect(result.workspaceToken).toBeUndefined();
+      expect(result.resolved).toBeNull();
+    });
+
+    it('keeps the claim when the new connection judges the entries the same way', async () => {
+      const { router, bRpc } = midResolveReconnect(before);
+
+      const result = (await dispatchResolve(router, { callerPid: 39876 })) as ResolveResult & { workspaceToken?: string };
+
+      expect(bRpc).toHaveBeenCalledTimes(1);
+      expect(result.resolved).toEqual({ workspaceId: 'ws-old', ptyId: 'daemon-04f1c884' });
+      expect(lookupWorkspaceClaim(result.workspaceToken)).toEqual({ kind: 'bound', workspaceId: 'ws-old', ptyId: 'daemon-04f1c884' });
+    });
+  });
+
+  it('mints no pane claim from a stale PID the cached list still calls current', async () => {
+    sessions = [
+      { id: 'daemon-04f1c884', pid: 6780, state: 'detached' },
+      { id: 'daemon-worker', pid: 7644, state: 'attached' },
+    ];
+    const { client, rpc } = daemonListing();
+    const router = routerWith(client);
+    await dispatchResolve(router, {}); // caches a list that names 6780
+    expect(rpc).toHaveBeenCalledTimes(1);
+
+    // Same connection, inside the cache window: a supervised restart moved the
+    // old pane to 13632 before its pid-map file was rewritten, and 6780 now
+    // belongs to the worker's claude.exe.
+    sessions = [
+      { id: 'daemon-04f1c884', pid: 13632, state: 'detached' },
+      { id: 'daemon-worker', pid: 7644, state: 'attached' },
+    ];
+    const result = (await dispatchResolve(router, { callerPid: 39876 })) as ResolveResult & { workspaceToken?: string };
+
+    expect(rpc).toHaveBeenCalledTimes(2); // the claim-minting call read the list again
+    expect(result.resolved).toEqual({ workspaceId: 'ws-worker', ptyId: 'daemon-worker' });
+    expect(lookupWorkspaceClaim(result.workspaceToken)).toEqual({ kind: 'bound', workspaceId: 'ws-worker', ptyId: 'daemon-worker' });
+  });
+
+  it('accepts a ptyId missing from the cached list once the re-read list has it', async () => {
+    // Cache the list while only the old pane exists.
+    fs.rmSync(path.join(dirRef.current, '7644'));
+    sessions = [{ id: 'daemon-04f1c884', pid: 6780, state: 'detached' }];
+    const { client, rpc } = daemonListing();
+    const router = routerWith(client);
+    await dispatchResolve(router, {});
+    expect(rpc).toHaveBeenCalledTimes(1);
+
+    // A new pane is created inside the cache window: its session and file appear.
+    sessions = [
+      { id: 'daemon-04f1c884', pid: 6780, state: 'detached' },
+      { id: 'daemon-worker', pid: 7644, state: 'attached' },
+    ];
+    fs.writeFileSync(path.join(dirRef.current, '7644'), 'daemon-worker');
+
+    const result = await dispatchResolve(router, {});
+
+    expect(rpc).toHaveBeenCalledTimes(2);
+    expect(result.entries.map((e) => e.pid).sort()).toEqual(['6780', '7644']);
+  });
 });
