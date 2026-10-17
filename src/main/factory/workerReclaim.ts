@@ -21,7 +21,8 @@
 // A task that was reported for review (`review_requested`) and whose worker
 // then sat idle for REPORTED_IDLE_MS (workerPanesIdle: its panes reported
 // their turn's end and nothing happened in them since, counted from their own
-// last turn end and input, never while the owner views them) has
+// last turn end and input, never while the owner views them and typed
+// into or focused them within VIEWED_ATTENTION_MS) has
 // its worker's agent stopped and recorded the same way, so a report whose
 // gate did not complete it (refused, failed) holds no memory and no agent
 // slot. The task stays `review_requested` and its workspace stays open:
@@ -144,6 +145,9 @@ export interface WorkerSessionInfo {
   agentProcessAlive?: boolean;
   /** OSC 133: a foreground command owns the pane (absent: unknown). */
   commandRunning?: boolean;
+  /** The daemon respawned the pane at its own restart and has seen no agent
+   *  there since (absent from a daemon that does not say). */
+  recoveredAgentUnconfirmed?: boolean;
   /** The pane runs in WSL (its Linux agent is not always attributed). */
   wslTarget?: { distribution?: unknown };
   /** An exec unit: the pane's process is the command itself. */
@@ -186,6 +190,23 @@ export function isTaskOwnWorkerPane(
     return sessionRecordOf?.(session.id)?.taskId === taskId;
   } catch {
     return false;
+  }
+}
+
+/** A conversation whose mode no hook carried (a WSL worker whose task ended
+ *  at its own report, before its first Stop) resumes in the mode wmux
+ *  launched it in: only the conversation the pane's own launch line pinned.
+ *  Fills `panes` in place. */
+export function fillLaunchedModes(panes: ReclaimedSession[], launchedConversation: WorkerReclaimPorts['launchedConversation']): void {
+  for (const p of panes) {
+    if (!p.resumeSessionId || p.permissionMode) continue;
+    let launched: { sessionId: string; permissionMode?: PermissionMode } | null = null;
+    try {
+      launched = launchedConversation?.(p.sessionId) ?? null;
+    } catch {
+      launched = null;
+    }
+    if (launched?.permissionMode && launched.sessionId === p.resumeSessionId) p.permissionMode = launched.permissionMode;
   }
 }
 
@@ -368,9 +389,10 @@ export interface WorkerReclaimPorts {
    *  in, as recorded when wmux created the pane as a bot worker; null when
    *  none was. Absent: no mode is filled in. */
   launchedConversation?: (sessionId: string) => { sessionId: string; permissionMode?: PermissionMode } | null;
-  /** A pane's bot worker session record (its task), null when none: a WSL
-   *  pane counts as the task's worker only when identified
-   *  (isTaskOwnWorkerPane). Absent: only the reclaim record identifies one. */
+  /** A pane's bot worker session record (its task), null when none. Given:
+   *  only a pane whose record names the task is recorded, stopped or closed
+   *  as its worker (a WSL pane too, isTaskOwnWorkerPane). Absent: every pane
+   *  started in the task folder counts. */
   sessionRecordOf?: WorkerSessionRecordOf;
   note?: (workspaceId: string, threadId: ThreadId, title: string, body: string, notice?: CardNotice, taskId?: string) => void;
   /** The Bots page re-reads (BOT_EVENT). */
@@ -456,6 +478,52 @@ export function workerPanesIdle(panes: readonly PaneActivity[], floor: number, n
     && (p.turnStartAt === undefined || p.turnEndAt >= p.turnStartAt)
     && p.status !== 'running' && p.status !== 'awaiting_input'
     && now - Math.max(floor, p.turnEndAt, p.inputAt ?? -Infinity) >= ms);
+}
+
+/** How long a worker the owner is shown (the active workspace, or the Bots
+ *  worker panel) stays protected from the idle stops after the owner last
+ *  typed into it or focused it (owner decision 2026-10-17): a worker left
+ *  open in a panel does not live forever. */
+export const VIEWED_ATTENTION_MS = 30 * 60_000;
+
+/** Whether being shown still protects a worker at `now`: the owner focused
+ *  it (`focusedAt`: it became the active workspace, its active pane changed,
+ *  or the Bots panel opened on it) or typed into one of its panes
+ *  (`inputAts`) within `ms`. Staying shown, or the panel closing, is no
+ *  focus. After
+ *  that the usual idle test decides; it never stops a pane with a live turn
+ *  or a prompt waiting (workerPanesIdle). Pure. */
+export function viewProtects(focusedAt: number | undefined, inputAts: ReadonlyArray<number | undefined>, now: number, ms: number = VIEWED_ATTENTION_MS): boolean {
+  const last = [focusedAt, ...inputAts].reduce<number>((a, b) => (b !== undefined && b > a ? b : a), -Infinity);
+  return now - last < ms;
+}
+
+/** When the owner last focused each shown workspace, from the renderer's
+ *  pushes: the viewed (active) workspace or its active pane changing, or the
+ *  Bots panel opening (or showing again) on it. The panel closing is no
+ *  focus. A workspace no longer shown is forgotten. */
+export interface ViewAttention {
+  observe(viewed: { workspaceId: string; paneId: string | null } | null, panelWorkspaceId: string | null, at: number): void;
+  /** Undefined: not focused while shown. */
+  focusedAt(workspaceId: string): number | undefined;
+}
+
+export function createViewAttention(): ViewAttention {
+  const focused = new Map<string, number>();
+  let last: { workspaceId: string; paneId: string | null } | null = null;
+  let lastPanel: string | null = null;
+  return {
+    observe(viewed, panelWorkspaceId, at) {
+      if (viewed?.workspaceId && (viewed.workspaceId !== last?.workspaceId || viewed.paneId !== last.paneId)) focused.set(viewed.workspaceId, at);
+      if (panelWorkspaceId && panelWorkspaceId !== lastPanel) focused.set(panelWorkspaceId, at);
+      last = viewed?.workspaceId ? { workspaceId: viewed.workspaceId, paneId: viewed.paneId } : null;
+      lastPanel = panelWorkspaceId || null;
+      for (const id of [...focused.keys()]) if (id !== viewed?.workspaceId && id !== panelWorkspaceId) focused.delete(id);
+    },
+    focusedAt(workspaceId) {
+      return focused.get(workspaceId);
+    },
+  };
 }
 
 /** One pane's turn as the daemon reports it (DaemonClient.getAgentState). */
@@ -730,8 +798,76 @@ export function resumedAgentAlive(rec: Pick<ReclaimedWorker, 'sessions'>, sessio
   });
 }
 
+/**
+ * Whether an agent runs in a task workspace's panes, for the fan-out slot of
+ * a task that ended: a pane whose agent the daemon sees alive, or one of the
+ * task's own worker panes (isTaskOwnWorkerPane) not known to run none (a WSL
+ * worker's launch line, isWslWorkerPane, an agent the daemon never
+ * attributed, or a pane it says nothing about). A gone, dead or suspended
+ * session, an agent seen to exit, a shell at its prompt, one the daemon
+ * respawned at its restart with nothing run in it since, or a command in a
+ * pane that is not the task's own is none. `silentRuns: false`: an own pane
+ * the daemon says nothing about runs none (only what is seen running counts).
+ * Pure.
+ */
+export function endedTaskAgentRuns(
+  ptys: readonly string[],
+  taskId: string,
+  recordedSessionIds: readonly string[],
+  sessions: ReadonlyMap<string, WorkerSessionInfo & { state?: unknown }>,
+  sessionRecordOf: WorkerSessionRecordOf | undefined,
+  silentRuns = true,
+): boolean {
+  return ptys.some((id) => {
+    const s = sessions.get(id);
+    if (!s || s.state === 'dead' || s.state === 'suspended') return false;
+    if (s.agentProcessAlive === true) return true;
+    if (s.agentProcessAlive === false || s.commandRunning === false) return false;
+    if (!silentRuns && s.commandRunning !== true) return false;
+    if (s.recoveredAgentUnconfirmed === true && s.commandRunning !== true) return false;
+    return isTaskOwnWorkerPane(s, taskId, recordedSessionIds, sessionRecordOf);
+  });
+}
+
+/**
+ * The open task workspaces that hold no live fan-out slot: a reclaimed
+ * worker's workspace still open (a failed task the owner has not looked at,
+ * one they are viewing, one with a busy pane) whose task did not reopen; a
+ * reported task's stopped worker while its task waits for review; and a task
+ * that ended with no agent left in its workspace (`endedNoAgent`: the owner's
+ * stop writes no record, a record left `stopping` is not stopped) while its
+ * row still says so and no resume started since. A workspace an agent was
+ * seen in (`agentWorkspaces`) is never one. `records`: [] when the reclaim
+ * store could not be read; the ended-task rule needs none. Pure.
+ */
+export function dormantTaskWorkspaceSet(p: {
+  records: readonly ReclaimedWorker[];
+  row: (taskId: string) => Pick<LedgerEntry, 'status'> | null;
+  workspaceRow: (workspaceId: string) => Pick<LedgerEntry, 'id' | 'status'> | null;
+  endedNoAgent: Iterable<string>;
+  agentWorkspaces: ReadonlySet<string>;
+}): Set<string> {
+  const ended = (status: string | undefined): boolean => status === 'completed' || status === 'cancelled' || status === 'failed';
+  const open = (status: string | undefined): boolean => status === 'working' || status === 'input_required' || status === 'review_requested';
+  const out = new Set<string>();
+  for (const r of p.records) {
+    if (r.state !== 'stopped') continue;
+    const status = p.row(r.taskId)?.status;
+    if (!open(status) || (r.ended === 'reported' && status === 'review_requested')) out.add(workerWorkspaceOf(r));
+  }
+  for (const ws of p.endedNoAgent) {
+    const row = p.workspaceRow(ws);
+    if (row && ended(row.status) && p.records.find((r) => r.taskId === row.id)?.state !== 'resumed') out.add(ws);
+  }
+  for (const ws of p.agentWorkspaces) out.delete(ws);
+  return out;
+}
+
 /** Attempts per ended task before the reclaim gives it up. */
 export const RECLAIM_ATTEMPTS_MAX = 3;
+/** A `stopping` record is looked at again this long after its stop began
+ *  (one an earlier run left is looked at right away). */
+export const STOPPING_SETTLE_MS = 2 * 60_000;
 
 /** Whether the task moved on from the state its worker is being stopped
  *  for. An end: its row is open again (it reopened since it ended); a row
@@ -829,6 +965,17 @@ export async function reclaimWorker(
         if (s && s.agentProcessAlive !== true && !isTaskOwnWorkerPane(s, entry.id, recorded, ports.sessionRecordOf)) ids.delete(id);
       }
     }
+    // Only the task's own worker panes: its bot worker session record names
+    // the task (written for the task's fan-out or resume spawn only). A shell
+    // the owner started in the task folder is never recorded, stopped or
+    // closed as the worker, whatever runs in it; a record an older version
+    // wrote with such a shell drops it here.
+    const ownPane = (id: string): boolean => !ports.sessionRecordOf || isTaskOwnWorkerPane({ id }, entry.id, [], ports.sessionRecordOf);
+    for (const id of [...ids]) if (!ownPane(id)) ids.delete(id);
+    // A pane the record kept whose session is gone (a closed pane, whose
+    // session record went with it) stays: nothing of it can be stopped or
+    // closed any more, and its conversation is what Resume reopens.
+    const keepRecorded = (id: string): boolean => ownPane(id) || !sessions.some((x) => x.id === id);
     const panes = sessions.filter((s) => ids.has(s.id)).map(reclaimedSessionOf).filter((s): s is ReclaimedSession => !!s);
     if (movedOn(ports, entry, ended)) return null;
     const prior = ports.store.get(entry.id);
@@ -836,13 +983,13 @@ export async function reclaimWorker(
     // the record follows the task (a gate written after the stop, the end
     // that came later), with no second stop and no second card.
     if (prior?.ended === 'reported' && prior.state === 'stopped' && !sessions.some((s) => ids.has(s.id) && s.agentProcessAlive === true)) {
-      await ports.store.put({ ...prior, ended, endRev: entry.rev, at: now() });
+      await ports.store.put({ ...prior, sessions: prior.sessions.filter((x) => keepRecorded(x.sessionId)), ended, endRev: entry.rev, at: now() });
       ports.changed?.();
       return ports.store.get(entry.id);
     }
     // An earlier attempt that did not finish: its recorded conversations are
     // kept (a stopped agent may no longer show its binding).
-    const kept = prior?.state === 'stopping' ? prior.sessions : [];
+    const kept = prior?.state === 'stopping' ? prior.sessions.filter((x) => keepRecorded(x.sessionId)) : [];
     for (const p of panes) {
       const old = kept.find((k) => k.sessionId === p.sessionId);
       if (!p.resumeSessionId && old?.resumeSessionId) {
@@ -850,19 +997,7 @@ export async function reclaimWorker(
         if (old.permissionMode) p.permissionMode = old.permissionMode;
       }
     }
-    // A conversation whose mode no hook carried (a WSL worker whose task ended
-    // at its own report, before its first Stop) resumes in the mode wmux
-    // launched it in: only the conversation the pane's own launch line pinned.
-    for (const p of panes) {
-      if (!p.resumeSessionId || p.permissionMode) continue;
-      let launched: { sessionId: string; permissionMode?: PermissionMode } | null = null;
-      try {
-        launched = ports.launchedConversation?.(p.sessionId) ?? null;
-      } catch {
-        launched = null;
-      }
-      if (launched?.permissionMode && launched.sessionId === p.resumeSessionId) p.permissionMode = launched.permissionMode;
-    }
+    fillLaunchedModes(panes, ports.launchedConversation);
     const rec: ReclaimedWorker = {
       taskId: entry.id,
       botId: entry.dispatch?.origin.botId ?? '',
@@ -944,7 +1079,9 @@ export async function reclaimWorker(
           if (out) out.deferred = true;
           break;
         }
-        if (r.ok !== true) {
+        // A pane gone since the read took its agent with it: no failed stop
+        // (counted as one, it kept the record `stopping` for good).
+        if (r.ok !== true && r.code !== 'no_session') {
           failed++;
           log(`[factory] reclaim: the agent of ${p.sessionId} (task ${entry.id}) was not stopped: ${r.code ?? 'refused'}`);
         }
@@ -1058,6 +1195,8 @@ export function isReclaimedSince(rec: ReclaimedWorker | null, entry: Pick<Ledger
 /** Install the reclaim on bot task ends. Returns the unsubscribe. */
 export function installWorkerReclaim(ports: WorkerReclaimPorts): () => void {
   const now = ports.now ?? Date.now;
+  const log = ports.log ?? ((m: string) => console.warn(m));
+  const installedAt = now();
   const inFlight = new Set<string>();
   const attempts = new Map<string, number>();
   const run = (entry: LedgerEntry, ended: ReclaimedWorker['ended']): void => {
@@ -1098,6 +1237,74 @@ export function installWorkerReclaim(ports: WorkerReclaimPorts): () => void {
     for (const e of rows) {
       if (e.updatedAt >= since && isReclaimableEnd(e, e.status)) run(e, e.status as 'completed' | 'cancelled' | 'failed');
       else if (ports.turnEnded && e.updatedAt <= idleSince && isReclaimableReport(e) && turnEndedIn(e)) run(e, 'reported');
+    }
+    void settleStopping();
+  };
+  // A record left `stopping` (a stop that failed or was cut off by a quit, a
+  // reported stop held back whose worker then exited, or a task whose end
+  // moved on to one this reclaim does not take, such as the owner's stop or
+  // one past the catch-up window) is never tried again by the above. Once
+  // stale (left by an earlier run, or begun STOPPING_SETTLE_MS ago) it is
+  // read again: no agent left in its panes, it is stopped; one still running
+  // in an ended task is stopped once more through the reclaim, per end.
+  const retried = new Set<string>();
+  let settling = false;
+  const settleStopping = async (): Promise<void> => {
+    if (settling || !ports.row) return;
+    const at = now();
+    const stale = ports.store.all().filter((r) => r.state === 'stopping' && !inFlight.has(r.taskId)
+      && (r.at < installedAt || at - r.at >= STOPPING_SETTLE_MS));
+    if (stale.length === 0) return;
+    settling = true;
+    try {
+      const byId = new Map((await ports.listSessions()).map((x) => [x.id, x]));
+      let moved = false;
+      for (const rec of stale) {
+        // Read again after the await: a reclaim that started meanwhile owns it.
+        const cur = ports.store.get(rec.taskId);
+        if (!cur || cur.state !== 'stopping' || cur.at !== rec.at || inFlight.has(rec.taskId)) continue;
+        let row: LedgerEntry | null;
+        try {
+          row = ports.row(rec.taskId);
+        } catch {
+          continue;
+        }
+        // An open task's worker is its row's: the reclaim of its next end
+        // looks at the record again.
+        if (row && (row.status === 'working' || row.status === 'input_required')) continue;
+        // Its recorded panes and every pane of its workspace: an agent in
+        // another pane there keeps it (a stopped record frees the slot).
+        const recorded = cur.sessions.map((x) => x.sessionId);
+        let panes: readonly string[] | null = [];
+        try {
+          panes = ports.workspacePanes ? ports.workspacePanes(workerWorkspaceOf(cur)) : [];
+        } catch {
+          panes = null;
+        }
+        if (!panes) continue;
+        const ptys = [...new Set([...recorded, ...panes])];
+        if (!endedTaskAgentRuns(ptys, cur.taskId, recorded, byId, ports.sessionRecordOf)) {
+          if (ports.store.setState(rec.taskId, 'stopped', now())) {
+            moved = true;
+            log(`[factory] reclaim: ${rec.taskId} was left stopping with no agent running; marked stopped`);
+          }
+          continue;
+        }
+        // Its agent still runs. A reported task still in review is the
+        // reported stop's to retry; an ended one is stopped once more.
+        if (!row || (row.status !== 'completed' && row.status !== 'cancelled' && row.status !== 'failed')) continue;
+        const key = `${row.id}@${row.rev}`;
+        if (retried.has(key)) continue;
+        retried.add(key);
+        attempts.delete(key);
+        log(`[factory] reclaim: ${rec.taskId} was left stopping with its agent running; its stop is tried again`);
+        run(row, row.status);
+      }
+      if (moved) ports.changed?.();
+    } catch (err) {
+      log(`[factory] reclaim: a look at workers left stopping failed: ${String(err)}`);
+    } finally {
+      settling = false;
     }
   };
   catchUp();
@@ -1239,6 +1446,17 @@ export function resumedWorkersLive(botId?: string): number {
  *  cleared: one of either at a time per task. */
 const resuming = new Set<string>();
 const clearing = new Set<string>();
+/** Hold a task's worker panes for a close made elsewhere (deadWorkerPanes.ts),
+ *  as a clear holds them: a resume of the task waits until the close is over.
+ *  null while a resume or a clear of it is under way. Returns the release. */
+export function holdWorkerPanes(taskId: string): (() => void) | null {
+  if (resuming.has(taskId) || clearing.has(taskId)) return null;
+  clearing.add(taskId);
+  return () => {
+    clearing.delete(taskId);
+  };
+}
+
 /** botId → its resumes past the budget check, until each is counted as
  *  resumed or ends. */
 const botStarting = new Map<string, number>();
@@ -1357,8 +1575,11 @@ async function resumeOnce(
   if (live.agentProcessAlive === true || live.commandRunning === true) {
     return refuse('already_running', 'an agent or another command is running in the worker\'s pane');
   }
-  // No observed agent exit and no shell prompt seen: what runs there is not known.
-  if (live.agentProcessAlive !== false && live.commandRunning !== false) {
+  // No observed agent exit and no shell prompt seen: what runs there is not
+  // known. A shell the daemon respawned at its restart, with no agent seen
+  // since, runs no agent (a fresh shell reports its prompt only after its
+  // first command).
+  if (live.agentProcessAlive !== false && live.recoveredAgentUnconfirmed !== true && live.commandRunning !== false) {
     return refuse('unknown_state', 'what runs in the worker\'s pane cannot be told; open it and resume from there');
   }
   // A pane a resume opened earlier whose task was not moved to it then.
@@ -1615,8 +1836,9 @@ export interface ResumedIdlePorts extends Pick<WorkerResumePorts, 'store' | 'sto
   /** What main knows of a pane's activity (workerPanesIdle). */
   paneActivity: (sessionId: string) => PaneActivity;
   /** Whether the owner is viewing the workspace now (the active one, or the
-   *  one the Bots worker panel shows; unknown: false): a worker the owner
-   *  looks at is never stopped as idle. Absent: never. */
+   *  one the Bots worker panel shows; unknown: false) and typed into it or
+   *  focused it within VIEWED_ATTENTION_MS (viewProtects): such a worker
+   *  is not stopped as idle. Absent: never. */
   viewed?: (workspaceId: string) => boolean;
   /** Default RESUMED_IDLE_MS. */
   idleMs?: number;

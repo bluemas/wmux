@@ -135,11 +135,26 @@ export interface LedgerDispatch {
   origin: { kind: string; botId?: string; tainted?: boolean };
   /** The fan-out preset name; absent when none. */
   preset?: string;
-  /** A bot's code task: the repository it was started in (normalized
-   *  `host/owner/repo`, from the bot's profile at dispatch). A merged pull
-   *  request ends only a task of its own repository; absent (a row written
-   *  before it existed, a research task) = none ends it. */
+  /** A code task: the repository it was started in (normalized
+   *  `host/owner/repo`; a bot's from its profile at dispatch, an owner's from
+   *  the caller repository's origin). A merged pull request ends only a bot
+   *  task of its own repository, and task_push and task_fetch work only with
+   *  it; absent (a row written before it existed, a research task, an origin
+   *  with no `host/owner/repo`) = no merge ends it, and task_fetch refuses a
+   *  task that is not a bot's. */
   repoKey?: string;
+  /** A code task: the git dir of the repository its worktree was created in
+   *  (the repository's common dir, resolved), recorded by main at dispatch.
+   *  task_push and task_fetch run git on this path and never on one found
+   *  through the worktree; absent (a row written before it existed, a task
+   *  with no worktree) = a bot's task uses its profile's repository, any
+   *  other task is refused. */
+  gitCommonDir?: string;
+  /** A code task: the git dir of the task's own worktree
+   *  (`<gitCommonDir>/worktrees/<id>`), recorded by main at dispatch. task_push
+   *  reads HEAD by this path; absent = derived from the common dir's
+   *  `worktrees/` for a row written before it existed. */
+  gitWorktreeDir?: string;
   /** Set when the task worktree was created detached at a commit. */
   checkout?: { sha: string; detached: true };
   /** The commit main created the task's branch from (origin's default branch

@@ -102,7 +102,35 @@ export interface FanOutAuditRecord {
   /** worktree:false — the batch folder the tasks write into (additive). */
   outputBatchDir?: string;
   /** kind 'launched': the line each task's pane was actually started with. */
-  launched?: { title: string; workspaceId?: string; command?: string; error?: string }[];
+  launched?: FanOutLaunchedTask[];
+}
+
+/** One task of a 'launched' record. `started: false` = the task got no
+ *  workspace, so nothing ran and no command is recorded. */
+export type FanOutLaunchedTask =
+  | { title: string; workspaceId: string; command?: string; error?: string }
+  | { title: string; started: false; error?: string };
+
+/**
+ * A task's entry in the 'launched' record. A task that got no workspace (its
+ * pane could not be created, its worktree preflight failed) launched nothing:
+ * it is marked `started: false` and carries no command, so the record cannot
+ * be read as a run.
+ */
+export function launchedAuditTask(t: {
+  title: string;
+  workspaceId?: string;
+  initialCommand?: string;
+  error?: string;
+}): FanOutLaunchedTask {
+  const error = t.error ? { error: t.error } : {};
+  if (!t.workspaceId) return { title: t.title, started: false, ...error };
+  return {
+    title: t.title,
+    workspaceId: t.workspaceId,
+    ...(t.initialCommand ? { command: t.initialCommand } : {}),
+    ...error,
+  };
 }
 
 export type CapReservation = { ok: true } | { ok: false; message: string };
@@ -123,6 +151,58 @@ export interface FanOutGuardsOptions {
   /** The ledger row of `workspaceId`'s task when a factory bot dispatched it
    *  (dispatch origin `bot`), else null. Defaults to the hosted ledger. */
   ledgerBotTask?: (workspaceId: string) => { owner: string; botId: string; at: number } | null;
+  /** The title and status of `workspaceId`'s task (any status), or null: what
+   *  a live-cap refusal names. Defaults to the hosted ledger. */
+  ledgerTaskOf?: (workspaceId: string) => { title: string; status: string } | null;
+}
+
+function hostedLedgerTaskOf(workspaceId: string): { title: string; status: string } | null {
+  const row = getTaskLedger().findByTaskWorkspace(workspaceId);
+  return row ? { title: row.title, status: row.status } : null;
+}
+
+/** What holds the live fan-out slots, for the cap's refusal. */
+export interface LiveSlotHolders {
+  /** Titles of open (not yet ended) tasks: they hold a slot whether or not
+   *  an agent runs in them. */
+  open: string[];
+  /** Titles of tasks that ended (completed, cancelled, failed) whose
+   *  workspace is not known to run no agent. */
+  ended: string[];
+  /** Open task workspaces whose task row is not known (a launch under way,
+   *  or one whose row was never written). */
+  untracked: number;
+  /** Tasks of fan-outs still being started. */
+  starting: number;
+}
+
+/** Names shown per group of a live-cap refusal; the rest are counted. */
+const HOLDER_TITLES_SHOWN = 3;
+
+function titleList(titles: readonly string[]): string {
+  const shown = titles.slice(0, HOLDER_TITLES_SHOWN).map((t) => `"${t}"`).join(', ');
+  return titles.length > HOLDER_TITLES_SHOWN ? `${shown} and ${titles.length - HOLDER_TITLES_SHOWN} more` : shown;
+}
+
+/** The live cap's refusal: what holds the slots (when known) and how one
+ *  frees. Pure. */
+export function liveCapMessage(live: number, count: number, holders: LiveSlotHolders | null): string {
+  const head =
+    `fan-out refused: at most ${FANOUT_LIVE_TASK_CAP} fan-out tasks may be live at once across wmux ` +
+    `(${live} live now, ${count} requested).`;
+  // A task that ended and runs no agent holds no slot, so every holder named
+  // here frees its slot this way.
+  const frees = ' A slot frees when a task ends and its agent stops, or when its task workspace is closed.';
+  if (!holders) return `${head}${frees}`;
+  const parts: string[] = [];
+  if (holders.open.length > 0) parts.push(`${holders.open.length} open (${titleList(holders.open)})`);
+  if (holders.ended.length > 0) {
+    parts.push(`${holders.ended.length} ended whose agent is not known to have stopped (${titleList(holders.ended)})`);
+  }
+  if (holders.untracked > 0) parts.push(`${holders.untracked} task ${holders.untracked === 1 ? 'workspace' : 'workspaces'} with no task record`);
+  if (holders.starting > 0) parts.push(`${holders.starting} starting`);
+  const held = parts.length > 0 ? ` Held by: ${parts.join('; ')}.` : '';
+  return `${head}${held}${frees}`;
 }
 
 function hostedLedgerBotTask(workspaceId: string): { owner: string; botId: string; at: number } | null {
@@ -148,6 +228,7 @@ export class FanOutGuards {
   private readonly countLiveOverride?: () => number;
   private readonly ledgerTaskOwner: (workspaceId: string) => string | null;
   private readonly ledgerBotTask: (workspaceId: string) => { owner: string; botId: string; at: number } | null;
+  private readonly ledgerTaskOf: (workspaceId: string) => { title: string; status: string } | null;
 
   /** null until first read. */
   private lineage: Map<string, LineageStamp> | null = null;
@@ -172,6 +253,7 @@ export class FanOutGuards {
       opts.ledgerTaskOwner ??
       ((ws) => getTaskLedger().findByTaskWorkspace(ws)?.ownerWorkspaceId ?? null);
     this.ledgerBotTask = opts.ledgerBotTask ?? hostedLedgerBotTask;
+    this.ledgerTaskOf = opts.ledgerTaskOf ?? hostedLedgerTaskOf;
   }
 
   /** Rename a torn store out of the way, so the next write starts clean and
@@ -295,13 +377,36 @@ export class FanOutGuards {
    */
   liveTaskCount(): number {
     if (this.countLiveOverride) return this.countLiveOverride();
+    return this.liveTaskWorkspaces().length;
+  }
+
+  /** The workspaces liveTaskCount counts (it throws the same way). A task
+   *  that ended and runs no agent any more is dormant, so it is not one,
+   *  whether or not its workspace was closed yet. */
+  liveTaskWorkspaces(): string[] {
     const open = this.openWorkspaceIds();
     if (!open) throw new Error('the open workspace list is not available yet');
     const stamps = this.loadLineage();
     const dormant = dormantTaskWorkspaces();
-    let n = 0;
-    for (const ws of open) if (stamps.has(ws) && !dormant.has(ws)) n++;
-    return n;
+    return open.filter((ws) => stamps.has(ws) && !dormant.has(ws));
+  }
+
+  /** What holds the live slots, or null when it cannot be told (the count
+   *  is overridden, or a read fails). */
+  private liveSlotHolders(starting: number): LiveSlotHolders | null {
+    if (this.countLiveOverride) return null;
+    try {
+      const holders: LiveSlotHolders = { open: [], ended: [], untracked: 0, starting };
+      for (const ws of this.liveTaskWorkspaces()) {
+        const task = this.ledgerTaskOf(ws);
+        if (!task) holders.untracked++;
+        else if (task.status === 'completed' || task.status === 'cancelled' || task.status === 'failed') holders.ended.push(task.title);
+        else holders.open.push(task.title);
+      }
+      return holders;
+    } catch {
+      return null;
+    }
   }
 
   // ── caps ─────────────────────────────────────────────────────────────────
@@ -377,12 +482,7 @@ export class FanOutGuards {
     }
     const live = liveNow + pendingCount + spawningCount;
     if (live + count > FANOUT_LIVE_TASK_CAP) {
-      return {
-        ok: false,
-        message:
-          `fan-out refused: at most ${FANOUT_LIVE_TASK_CAP} fan-out tasks may be live at once across wmux ` +
-          `(${live} live now, ${count} requested). It frees as task workspaces are closed — close one first.`,
-      };
+      return { ok: false, message: liveCapMessage(live, count, this.liveSlotHolders(pendingCount + spawningCount)) };
     }
 
     const recorded = hourly.reduce((sum, s) => sum + s.count, 0);
@@ -666,8 +766,9 @@ export function stampFanoutTaskPane(
 }
 
 /** Task workspaces kept open after their task ended and their agent was
- *  stopped (factory worker reclaim): no agent runs there, so they hold no
- *  live slot. A resumed worker is live again and is not in this set. */
+ *  stopped (factory worker reclaim), or whose task ended (the owner's stop
+ *  among them) and runs no agent any more: they hold no live slot. A
+ *  resumed worker is live again and is not in this set. */
 let dormantSource: () => ReadonlySet<string> = () => new Set();
 
 function dormantTaskWorkspaces(): ReadonlySet<string> {

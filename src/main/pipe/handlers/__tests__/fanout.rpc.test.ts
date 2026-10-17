@@ -129,6 +129,8 @@ function setup(opts?: {
   /** The fan-out worker permission mode Settings holds, read at each use.
    *  Defaults to auto. */
   workerMode?: () => 'auto' | 'acceptEdits' | 'bypassPermissions' | 'manual';
+  /** What an immediate run resolves with. Defaults to no tasks. */
+  startResult?: FanOutResult;
 }): Harness {
   const commanderAnchorPtyId =
     opts?.commanderAnchorPtyId === undefined ? 'pty-1' : opts.commanderAnchorPtyId;
@@ -156,7 +158,7 @@ function setup(opts?: {
         releaseRun = (r) => resolve(settle(r));
       });
     }
-    return Promise.resolve(settle({ ok: true, tasks: [] }));
+    return Promise.resolve(settle(opts?.startResult ?? { ok: true, tasks: [] }));
   });
 
   const statusOf = vi.fn((key: string): FanOutStatus => state.get(key) ?? { state: 'unknown' });
@@ -1501,6 +1503,36 @@ describe('task.fanout.start — audit record', () => {
     expect(fs.readFileSync(nodePath.join(dir, 'fanout-audit.jsonl'), 'utf8')).not.toMatch(/do the thing/);
   });
 
+  it('marks a task that got no workspace as not started, with no command', async () => {
+    const g = guardsIn(tmp());
+    const h = setup({
+      guards: g,
+      approval: { approved: true, outcome: 'auto' },
+      startResult: {
+        ok: false,
+        tasks: [
+          { index: 0, title: 'a', ok: true, taskId: 't-a', workspaceId: 'ws-a', initialCommand: 'claude "a"' },
+          {
+            index: 1,
+            title: 'b',
+            ok: false,
+            initialCommand: 'claude "b"',
+            error: 'renderer spawn failed: PTY create failed',
+          },
+        ],
+      },
+    });
+    await h.call(goodParams({ titles: ['a', 'b'] }));
+    await h.flush();
+    await h.flush();
+    const [launched] = g.recentAudit(1);
+    expect(launched.kind).toBe('launched');
+    expect(launched.launched).toEqual([
+      { title: 'a', workspaceId: 'ws-a', command: 'claude "a"' },
+      { title: 'b', started: false, error: 'renderer spawn failed: PTY create failed' },
+    ]);
+  });
+
   it('marks a dialog approval as human', async () => {
     const g = guardsIn(tmp());
     const h = setup({ guards: g });
@@ -1576,6 +1608,62 @@ describe('task.fanout.start — review follow-ups', () => {
     expect((await next.call(goodParams({ idempotencyKey: 'after', titles: ['1', '2', '3', '4', '5', '6', '7', '8'] }))).status).toBe(
       'accepted',
     );
+  });
+});
+
+// ── the repository an owner's code task records ──────────────────────────
+describe('task.fanout.start — owner repository key', () => {
+  const originIs = (url: string): void => {
+    const toplevel = vi.mocked(git).getMockImplementation();
+    vi.mocked(git).mockImplementation(async (args: string[], dir: string) =>
+      args[0] === 'remote' && dir === CALLER_REPO_ROOT
+        ? { stdout: `${url}\n`, stderr: '', code: 0 }
+        : (toplevel as NonNullable<typeof toplevel>)(args, dir));
+  };
+
+  it.each([
+    'https://github.com/Acme/App.git',
+    'git@github.com:acme/app.git',
+  ])('records the caller repository\'s origin (%s) as its key', async (url) => {
+    const h = setup();
+    originIs(url);
+    await h.call(goodParams());
+    await h.flush();
+    expect(h.request().repoKey).toBe('github.com/acme/app');
+    expect(vi.mocked(git)).toHaveBeenCalledWith(['remote', 'get-url', 'origin'], CALLER_REPO_ROOT);
+  });
+
+  it.each([
+    ['a local-path origin', '/srv/git/app.git'],
+    ['a file:// origin', 'file:///srv/git/app.git'],
+    ['an http origin task_push does not read a key from', 'http://github.com/acme/app.git'],
+  ])('records nothing for %s', async (_label, url) => {
+    const h = setup();
+    originIs(url);
+    await h.call(goodParams());
+    await h.flush();
+    expect(h.start).toHaveBeenCalledTimes(1);
+    expect(h.request()).not.toHaveProperty('repoKey');
+  });
+
+  it('records nothing, and still starts, when the repository has no origin', async () => {
+    const h = setup();
+    const toplevel = vi.mocked(git).getMockImplementation();
+    vi.mocked(git).mockImplementation(async (args: string[], dir: string) =>
+      args[0] === 'remote' ? { stdout: '', stderr: 'error: No such remote \'origin\'', code: 2 } : (toplevel as NonNullable<typeof toplevel>)(args, dir));
+    await h.call(goodParams());
+    await h.flush();
+    expect(h.start).toHaveBeenCalledTimes(1);
+    expect(h.request()).not.toHaveProperty('repoKey');
+  });
+
+  it('a no-worktree preset reads no origin and records no key', async () => {
+    const h = setup({ presets: [{ name: 'Notes', items: [{ agent: 'claude' }], worktree: false }] });
+    originIs('https://github.com/acme/app.git');
+    await h.call(goodParams({ preset: 'Notes', titles: ['one'] }));
+    await h.flush();
+    expect(h.request()).not.toHaveProperty('repoKey');
+    expect(vi.mocked(git).mock.calls.some((c) => (c[0] as string[])[0] === 'remote')).toBe(false);
   });
 });
 

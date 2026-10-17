@@ -98,7 +98,7 @@ import type { DaemonClient } from '../../DaemonClient';
 import { hostCwdForPane, type DaemonRpc } from '../../pty/wslCallerCwd';
 import { loadWorkspaceDecision } from '../../deck/deckDecisionStore';
 import type { FanOutRequest, FanOutService, FanOutTaskResult } from '../../worktask/FanOutService';
-import { getFanOutGuards, promptDigest, type FanOutGuards } from '../../worktask/fanoutGuards';
+import { getFanOutGuards, launchedAuditTask, promptDigest, type FanOutGuards } from '../../worktask/fanoutGuards';
 import { loadFanoutRequireApproval, loadFanoutWorkerPermissionMode } from '../../worktask/fanoutWorkerPolicy';
 import { workerLaunchFlags, type FanoutWorkerPermissionMode } from '../../../shared/workerLaunch';
 import { loadFanoutPresets } from '../../worktask/fanoutPresets';
@@ -128,6 +128,8 @@ import { getWmuxDir } from '../../../daemon/config';
 import { RESEARCH_PRESET } from '../../../shared/ledger';
 import { GENERAL_THREAD, parseThreadId, prThreadId, taskOriginThread, type ThreadId } from '../../../shared/room';
 import { normalizeRepoKey } from '../../../shared/repoKey';
+import { parseRemoteKey } from '../../github/PrProvider';
+import { originUrlRepoKey } from '../../worktask/workerGit';
 import { getFactorySettings } from '../../factory/factorySettings';
 import { getBotFanoutReceipts } from '../../factory/botFanoutReceipts';
 import { noticeWorkerStarts, plainStartFailure, type BotWorkerStartOutcome } from '../../factory/botNotices';
@@ -355,6 +357,24 @@ async function repoRootOf(dir: string): Promise<{ root: string | null; refusal: 
     return { root: fs.realpathSync(top), refusal: '' };
   } catch {
     return { root: top, refusal: '' };
+  }
+}
+
+/**
+ * `dir`'s origin as a repo key, or null: no origin, git failed, or an address
+ * with no `host/owner/repo` (a local path). Kept only when task_push reads the
+ * same key back from that address (worktask/workerGit.ts), so a recorded key
+ * always matches the task's own origin.
+ */
+async function originRepoKeyOf(dir: string): Promise<string | null> {
+  try {
+    const res = await runGit(['remote', 'get-url', 'origin'], dir);
+    if (res.code !== 0) return null;
+    const url = res.stdout.trim();
+    const key = normalizeRepoKey(parseRemoteKey(url));
+    return key && originUrlRepoKey(url) === key ? key : null;
+  } catch {
+    return null;
   }
 }
 
@@ -1543,6 +1563,9 @@ export function registerFanOutRpc(
         return deny('FAILED_PRECONDITION', refusal);
       }
     }
+    // An owner's code task: the repository its origin names, read from the
+    // root the tasks are made in. None for a local-path origin.
+    const ownerRepoKey = worktree && !bot ? await originRepoKeyOf(callerRepoRoot) : null;
     // ── Build the request from SERVER-DERIVED values only ────────────────
     // Note what is absent: agentCmd (R1), verifiedWorkspaceId and memberId
     // (R2), repoPath (R3). The request is constructed field by field — params
@@ -1598,6 +1621,8 @@ export function registerFanOutRpc(
       // of its own repository (factory/taskGate.ts), whatever the bot's
       // profile names later.
       ...(bot && !botResearch && normalizeRepoKey(botProfile?.repo?.repoKey) ? { repoKey: normalizeRepoKey(botProfile?.repo?.repoKey) as string } : {}),
+      // An owner's code task: its origin's, which task_fetch reads.
+      ...(ownerRepoKey ? { repoKey: ownerRepoKey } : {}),
       ...(bot && secretNames ? { secretNames } : {}),
       ...(bot && connectors ? { connectors } : {}),
     };
@@ -1772,12 +1797,7 @@ export function registerFanOutRpc(
               ...(presetName ? { preset: presetName } : {}),
               ...(agentLabels.length > 0 ? { agents: agentLabels } : {}),
               ...(outputBatchDir ? { outputBatchDir } : {}),
-              launched: tasks.map((t) => ({
-                title: t.title,
-                ...(t.workspaceId ? { workspaceId: t.workspaceId } : {}),
-                ...(t.initialCommand ? { command: t.initialCommand } : {}),
-                ...(t.error ? { error: t.error } : {}),
-              })),
+              launched: tasks.map(launchedAuditTask),
             });
           } catch (err) {
             console.warn(`[fanout.rpc] could not append the launch record for ${key}: ${String(err)}`);
