@@ -257,9 +257,8 @@ export class DaemonPTYBridge extends EventEmitter {
   /** Latest OSC 0/2 window title (sanitized) and when it arrived (0 = never). */
   private lastTitle = '';
   private lastTitleAt = 0;
-  /** When a Codex title spinner last reported this pane running (0 = not
-   *  spinning). See noteCodexTitleSpinner. */
-  private codexSpinnerActiveAt = 0;
+  /** When `active` was last emitted (0 = never); see noteCodexTitleSpinner. */
+  private lastActiveAt = 0;
   /** #1463 — a session started and no turn has since (see isPreTurn). */
   private preTurn = false;
   /** #1463 — arrival time of the last turn evidence: submitted input, an
@@ -812,26 +811,57 @@ export class DaemonPTYBridge extends EventEmitter {
    * report. The pane then read Idle mid-turn once the renderer's two-minute
    * activity stamp ran out.
    *
-   * The spinner's first frame reports `active`, and so does a frame every
-   * CODEX_SPINNER_REFRESH_MS while it keeps spinning, which keeps the stamp
-   * fresh. A pane whose hooks report is left to them, and the title waits out
-   * the settle cooldown: the last frames of a turn that just ended would
-   * otherwise reach the daemon's completion alarm as fresh work and cancel
-   * it. A pane waiting on a human is never promoted by its title, and neither is a
-   * pane Codex has left: another program's title can start with a braille
-   * frame too.
+   * The spinner goes through the same turn bookkeeping as output does, so
+   * the event, getAgentStatus() and isTurnOpen() agree. A frame arms the
+   * activity cycle, and the next frame reports `active` through onActive. On
+   * a pane a detector settled (its footer can match mid-turn), the frame also
+   * reopens the turn, as noteSpinnerTitle does for Claude Code, and the
+   * frame dropping from the title ends that turn again (endSpinnerTurn): the
+   * detector's dedup may keep the same footer from settling it a second time.
+   * While the turn runs and the cycle stays active, a frame every
+   * CODEX_SPINNER_REFRESH_MS reports `active` again, which keeps the
+   * renderer's stamp fresh.
+   *
+   * A pane whose hooks report is left to them, and the title waits out the
+   * settle cooldown and a resize repaint: the last frames of a turn that just
+   * ended would otherwise reach the daemon's completion alarm as fresh work
+   * and cancel it. A pane waiting on a human is never promoted by its title,
+   * and neither is a pane Codex has left: another program's title can start
+   * with a braille frame too.
    */
   private noteCodexTitleSpinner(sessionId: string): void {
     if (!this.codexHoldsPane || this.hookSeen || !/codex/i.test(this.agentDetector?.getLastAgent() ?? '')) return;
     if (!this.titleShowsRunningTurn()) {
-      this.codexSpinnerActiveAt = 0;
+      if (this.spinnerOpenedTurn && this.turnOpen && !this.awaitingHuman) this.endSpinnerTurn();
       return;
     }
-    if (this.awaitingHuman) return;
+    const monitor = this.activityMonitor;
+    if (!monitor || this.awaitingHuman || this.muted) return;
     const now = Date.now();
-    if (now - this.settledAtMs < DaemonPTYBridge.SETTLE_COOLDOWN_MS) return;
-    if (this.codexSpinnerActiveAt > 0 && now - this.codexSpinnerActiveAt < DaemonPTYBridge.CODEX_SPINNER_REFRESH_MS) return;
-    this.codexSpinnerActiveAt = now;
+    if (
+      now - this.settledAtMs < DaemonPTYBridge.SETTLE_COOLDOWN_MS
+      || now - this.lastResizeAtMs < RESIZE_REDRAW_GUARD_MS
+    ) return;
+    const promoted = this.explicitTerminalStatus;
+    if (promoted) {
+      if (!this.isInputQuiet()) return;
+      this.spinnerSettledStatus = this.settledStatus;
+      this.explicitTerminalStatus = false;
+      this.settledStatus = null;
+      this.submittedTurnPending = false;
+      const wasOpen = this.turnOpen;
+      this.openTurn(true);
+      if (!wasOpen) this.spinnerOpenedTurn = true;
+    }
+    if (!monitor.isActive(sessionId)) {
+      // A promotion keeps the detector's dedup, as the settled branch of
+      // onActive does: the footer still on screen must not settle it again.
+      if (promoted) this.spinnerArmedCycle = true;
+      monitor.beginTurnIfInactive(sessionId);
+      return;
+    }
+    if (!this.turnOpen || now - this.lastActiveAt < DaemonPTYBridge.CODEX_SPINNER_REFRESH_MS) return;
+    this.lastActiveAt = now;
     this.emit('active', {
       sessionId,
       agentName: this.agentDetector?.getLastAgent() ?? undefined,
@@ -1377,6 +1407,7 @@ export class DaemonPTYBridge extends EventEmitter {
       // working feed in daemon/index.ts must NOT treat the burst as turn
       // evidence — a repaint rebutting a pending completion window would
       // silently kill a real "finished" alarm.
+      this.lastActiveAt = Date.now();
       this.emit('active', {
         sessionId: ptyId,
         agentName: this.agentDetector?.getLastAgent() ?? undefined,
@@ -1809,6 +1840,7 @@ export class DaemonPTYBridge extends EventEmitter {
     this.codexBootWindow = false;
     this.codexBannerTail = '';
     this.codexHoldsPane = false;
+    this.lastActiveAt = 0;
     this.turnOpen = false;
     this.turnSoftClosed = false;
     this.bootEpisode = false;

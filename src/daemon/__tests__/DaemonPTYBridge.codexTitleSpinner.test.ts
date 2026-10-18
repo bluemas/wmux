@@ -1,8 +1,9 @@
 // A hookless Codex turn that reasons for minutes barely changes the screen and
 // runs no tool, so neither the byte-rate heuristic nor the transcript watcher
-// reports it. Its braille title spinner does: the bridge reports `active` on
-// the spinner's first frame and again every 30 s while it keeps spinning, so
-// the renderer's two-minute activity stamp never runs out mid-turn.
+// reports it. Its braille title spinner does: a frame arms the activity cycle,
+// the next one reports `active`, and a frame every 30 s reports it again while
+// it keeps spinning, so the renderer's two-minute activity stamp never runs
+// out mid-turn.
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { IPty } from 'node-pty';
 import { DaemonPTYBridge } from '../DaemonPTYBridge';
@@ -34,6 +35,15 @@ describe('DaemonPTYBridge — a Codex title spinner reports running', () => {
   let bridge: DaemonPTYBridge;
   let feed: (data: string) => void;
   let active: Array<{ likelyRepaint?: boolean }>;
+  let idle: unknown[];
+  const frames = ['⠋', '⠙', '⠹', '⠸'];
+  /** `n` spinner frames, `gapMs` apart. */
+  const spin = (n: number, gapMs: number) => {
+    for (let i = 0; i < n; i++) {
+      feed(title(`${frames[i % 4]} AAA quality pass | Heartbound`));
+      vi.advanceTimersByTime(gapMs);
+    }
+  };
 
   beforeEach(() => {
     vi.useFakeTimers();
@@ -45,7 +55,9 @@ describe('DaemonPTYBridge — a Codex title spinner reports running', () => {
     feed('ready\r\n'); // spends the cycle the banner armed
     vi.advanceTimersByTime(6_000); // past any boot burst and its idle
     active = [];
+    idle = [];
     bridge.on('active', (e: { likelyRepaint?: boolean }) => active.push(e));
+    bridge.on('idle', (e) => idle.push(e));
   });
 
   afterEach(() => {
@@ -53,51 +65,69 @@ describe('DaemonPTYBridge — a Codex title spinner reports running', () => {
     vi.useRealTimers();
   });
 
-  it('reports running on the first spinner frame, then every 30 s while it spins', () => {
-    const frames = ['⠋', '⠙', '⠹', '⠸'];
-    for (let i = 0; i < 10; i++) {
-      feed(title(`${frames[i % 4]} AAA quality pass | Heartbound`));
-      vi.advanceTimersByTime(100);
-    }
+  it('reports running from the spinner, then every 30 s while it spins', () => {
+    spin(10, 100);
     expect(active).toHaveLength(1);
     expect(active[0].likelyRepaint).toBe(false);
+    expect(bridge.getAgentStatus()).toBe('running');
+    expect(bridge.isTurnOpen()).toBe(true);
 
-    for (let s = 0; s < 31; s++) {
-      feed(title(`${frames[s % 4]} AAA quality pass | Heartbound`));
-      vi.advanceTimersByTime(1_000);
-    }
+    spin(31, 1_000);
     expect(active).toHaveLength(2);
   });
 
-  it('a title without the spinner reports nothing, and the next spinner reports again at once', () => {
-    feed(title('⠋ AAA quality pass | Heartbound'));
+  it('a title without the spinner reports nothing, and the next spinner reports once the pane went idle', () => {
+    spin(2, 100);
     expect(active).toHaveLength(1);
     feed(title('AAA quality pass | Heartbound'));
     vi.advanceTimersByTime(1_000);
     feed(title('Heartbound'));
+    vi.advanceTimersByTime(6_000);
     expect(active).toHaveLength(1);
-    feed(title('⠙ next turn | Heartbound'));
+    expect(idle).toHaveLength(1);
+    spin(2, 100);
     expect(active).toHaveLength(2);
+  });
+
+  it('reopens a turn a detector settled mid-turn, and the event, status and turn agree', () => {
+    spin(2, 100);
+    const turnId = bridge.getTurn(bridge.getAgentStatus()).id;
+    bridge.noteAgentStatus('waiting'); // the footer matched mid-turn
+    expect(bridge.isTurnOpen()).toBe(false);
+    active = [];
+
+    vi.advanceTimersByTime(6_100); // the settle cooldown
+    spin(2, 100);
+    expect(active).toHaveLength(1);
+    expect(bridge.getAgentStatus()).toBe('running');
+    expect(bridge.isTurnOpen()).toBe(true);
+    expect(bridge.getTurn(bridge.getAgentStatus())).toMatchObject({ id: turnId, state: 'running' });
+
+    // The frame drops when the turn ends: the turn closes and the settle is back.
+    feed(title('AAA quality pass | Heartbound'));
+    expect(bridge.isTurnOpen()).toBe(false);
+    expect(bridge.getAgentStatus()).toBe('waiting');
+    expect(idle).toHaveLength(1);
   });
 
   it('a pane whose hooks report is left to them: the last frames after Stop report nothing', () => {
     bridge.noteAgentStatus('running', true);
     active = [];
     bridge.noteAgentStatus('complete', true); // the Stop hook
-    feed(title('⠋ AAA quality pass | Heartbound'));
+    spin(2, 100);
     vi.advanceTimersByTime(7_000);
-    feed(title('⠙ AAA quality pass | Heartbound'));
+    spin(2, 100);
     expect(active).toHaveLength(0);
   });
 
   it('a detector settle holds the title back for the settle cooldown', () => {
     bridge.noteAgentStatus('waiting');
-    feed(title('⠋ AAA quality pass | Heartbound'));
+    spin(2, 100);
     vi.advanceTimersByTime(3_000);
-    feed(title('⠙ AAA quality pass | Heartbound'));
+    spin(2, 100);
     expect(active).toHaveLength(0);
-    vi.advanceTimersByTime(3_100);
-    feed(title('⠹ AAA quality pass | Heartbound'));
+    vi.advanceTimersByTime(3_000);
+    spin(2, 100);
     expect(active).toHaveLength(1);
   });
 
@@ -107,15 +137,17 @@ describe('DaemonPTYBridge — a Codex title spinner reports running', () => {
     // The detector still names Codex, but the shell owns the pane.
     expect(bridge.getLastAgent()).toBe('Codex CLI');
     feed(title('⠋ shell label'));
-    vi.advanceTimersByTime(30_000);
+    vi.advanceTimersByTime(100);
     feed(title('⠙ shell label'));
+    vi.advanceTimersByTime(30_000);
+    feed(title('⠹ shell label'));
     expect(active).toHaveLength(0);
 
     feed(LAUNCH_OUTPUT);
     feed(CODEX_MODES + BANNER);
     vi.advanceTimersByTime(6_000);
     active = [];
-    feed(title('⠋ AAA quality pass | Heartbound'));
+    spin(2, 100);
     expect(active).toHaveLength(1);
   });
 });
