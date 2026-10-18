@@ -814,19 +814,22 @@ export class DaemonPTYBridge extends EventEmitter {
    *
    * The spinner's first frame reports `active`, and so does a frame every
    * CODEX_SPINNER_REFRESH_MS while it keeps spinning, which keeps the stamp
-   * fresh. Main still defers to a hook latch and to a just-settled pane. A
-   * pane waiting on a human is never promoted by its title, and neither is a
+   * fresh. A pane whose hooks report is left to them, and the title waits out
+   * the settle cooldown: the last frames of a turn that just ended would
+   * otherwise reach the daemon's completion alarm as fresh work and cancel
+   * it. A pane waiting on a human is never promoted by its title, and neither is a
    * pane Codex has left: another program's title can start with a braille
    * frame too.
    */
   private noteCodexTitleSpinner(sessionId: string): void {
-    if (!this.codexHoldsPane || !/codex/i.test(this.agentDetector?.getLastAgent() ?? '')) return;
+    if (!this.codexHoldsPane || this.hookSeen || !/codex/i.test(this.agentDetector?.getLastAgent() ?? '')) return;
     if (!this.titleShowsRunningTurn()) {
       this.codexSpinnerActiveAt = 0;
       return;
     }
     if (this.awaitingHuman) return;
     const now = Date.now();
+    if (now - this.settledAtMs < DaemonPTYBridge.SETTLE_COOLDOWN_MS) return;
     if (this.codexSpinnerActiveAt > 0 && now - this.codexSpinnerActiveAt < DaemonPTYBridge.CODEX_SPINNER_REFRESH_MS) return;
     this.codexSpinnerActiveAt = now;
     this.emit('active', {

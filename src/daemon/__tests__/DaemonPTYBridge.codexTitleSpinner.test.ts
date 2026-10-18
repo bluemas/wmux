@@ -80,6 +80,27 @@ describe('DaemonPTYBridge — a Codex title spinner reports running', () => {
     expect(active).toHaveLength(2);
   });
 
+  it('a pane whose hooks report is left to them: the last frames after Stop report nothing', () => {
+    bridge.noteAgentStatus('running', true);
+    active = [];
+    bridge.noteAgentStatus('complete', true); // the Stop hook
+    feed(title('⠋ AAA quality pass | Heartbound'));
+    vi.advanceTimersByTime(7_000);
+    feed(title('⠙ AAA quality pass | Heartbound'));
+    expect(active).toHaveLength(0);
+  });
+
+  it('a detector settle holds the title back for the settle cooldown', () => {
+    bridge.noteAgentStatus('waiting');
+    feed(title('⠋ AAA quality pass | Heartbound'));
+    vi.advanceTimersByTime(3_000);
+    feed(title('⠙ AAA quality pass | Heartbound'));
+    expect(active).toHaveLength(0);
+    vi.advanceTimersByTime(3_100);
+    feed(title('⠹ AAA quality pass | Heartbound'));
+    expect(active).toHaveLength(1);
+  });
+
   it('a braille title after Codex has exited reports nothing, until Codex boots again', () => {
     feed(BACK_TO_SHELL);
     vi.advanceTimersByTime(6_000);
