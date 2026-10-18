@@ -1176,6 +1176,10 @@ export class DaemonPTYBridge extends EventEmitter {
    * Only `preTurn` moves; the episode and `hookSeen` are left as they were.
    * `turnOpen` is not a guard: before any turn evidence it can only be the
    * boot burst's own byte promotion.
+   *
+   * The same banner also records that Codex holds the pane (`codexHoldsPane`).
+   * That needs only the last two conditions: it is about which program draws
+   * the pane, not about the boot window or a dialog.
    */
   private noteCodexOutput(data: string): void {
     const text = this.codexBannerTail + data;
