@@ -270,6 +270,13 @@ export class DaemonPTYBridge extends EventEmitter {
   private codexBootWindow = false;
   private codexBannerTail = '';
   private static readonly CODEX_BANNER_TAIL = 512;
+  /**
+   * Codex drew its boot banner (launch, resume, `/new`) and no OSC 133 mark
+   * has arrived since. The detector's last agent outlives the agent itself:
+   * once the shell has the prompt back it still names Codex, so only this
+   * says Codex is the program writing the pane's title (see noteCodexOutput).
+   */
+  private codexHoldsPane = false;
 
   /**
    * Which terminal status settled the pane, while one has. Read only to keep
@@ -808,10 +815,12 @@ export class DaemonPTYBridge extends EventEmitter {
    * The spinner's first frame reports `active`, and so does a frame every
    * CODEX_SPINNER_REFRESH_MS while it keeps spinning, which keeps the stamp
    * fresh. Main still defers to a hook latch and to a just-settled pane. A
-   * pane waiting on a human is never promoted by its title.
+   * pane waiting on a human is never promoted by its title, and neither is a
+   * pane Codex has left: another program's title can start with a braille
+   * frame too.
    */
   private noteCodexTitleSpinner(sessionId: string): void {
-    if (!/codex/i.test(this.agentDetector?.getLastAgent() ?? '')) return;
+    if (!this.codexHoldsPane || !/codex/i.test(this.agentDetector?.getLastAgent() ?? '')) return;
     if (!this.titleShowsRunningTurn()) {
       this.codexSpinnerActiveAt = 0;
       return;
@@ -1137,9 +1146,10 @@ export class DaemonPTYBridge extends EventEmitter {
     const text = this.codexBannerTail + data;
     // A row can straddle two PTY chunks; keep enough of the tail to rejoin it.
     this.codexBannerTail = text.slice(-DaemonPTYBridge.CODEX_BANNER_TAIL);
-    if (!this.codexBootWindow || this.awaitingHuman) return;
     if (this.agentDetector?.getLastAgent() !== 'Codex CLI' || !this.modeTracker?.isSet(2004)) return;
-    if (drawsCodexBanner(text)) this.preTurn = true;
+    if (!drawsCodexBanner(text)) return;
+    this.codexHoldsPane = true;
+    if (this.codexBootWindow && !this.awaitingHuman) this.preTurn = true;
   }
 
   /**
@@ -1429,6 +1439,10 @@ export class DaemonPTYBridge extends EventEmitter {
           // The shell's foreground program changed hands: whatever episode was
           // open (an agent's, or the Enter that launched the next one) is over.
           if (parsed.type === 'command_start' || parsed.type === 'command_end') this.noteAgentEnded();
+          // The shell is drawing its prompt or running a command: Codex is gone,
+          // and a banner from before this mark must not be read again.
+          this.codexHoldsPane = false;
+          this.codexBannerTail = '';
           this.codexBootWindow = parsed.type === 'command_start' || (parsed.type !== 'command_end' && this.codexBootWindow);
           if (parsed.type === 'prompt_end') {
             this.emptyShellPrompt = this.inputRevision === 0 || this.completedShellCommand;
@@ -1791,6 +1805,7 @@ export class DaemonPTYBridge extends EventEmitter {
     this.turnEvidenceAt = 0;
     this.codexBootWindow = false;
     this.codexBannerTail = '';
+    this.codexHoldsPane = false;
     this.turnOpen = false;
     this.turnSoftClosed = false;
     this.bootEpisode = false;

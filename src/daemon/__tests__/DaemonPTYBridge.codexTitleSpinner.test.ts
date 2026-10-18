@@ -7,8 +7,15 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { IPty } from 'node-pty';
 import { DaemonPTYBridge } from '../DaemonPTYBridge';
 import { RingBuffer } from '../RingBuffer';
+import { PromptEventLog } from '../PromptEventLog';
 
 const BANNER = '\x1b[9;1H│ >_ OpenAI Codex (v0.149.1)            │\r\n';
+// Codex turns bracketed paste back on before it paints its banner.
+const CODEX_MODES = '\x1b[?2004h\x1b[?1049h';
+// Codex exits and zsh draws its prompt again (OSC 133 D, then A).
+const BACK_TO_SHELL = '\x1b[?1049l\x1b[?2004l\x1b]133;D;0\x07\x1b]133;A\x07% \x1b[?2004h';
+// What zsh prints on Enter: bracketed paste off, OSC 133 C.
+const LAUNCH_OUTPUT = '\x1b[?2004l\x1b]133;C\x07';
 const title = (t: string) => `\x1b]0;${t}\x07`;
 
 function makeFakePty(): { pty: IPty; feed: (data: string) => void } {
@@ -33,8 +40,8 @@ describe('DaemonPTYBridge — a Codex title spinner reports running', () => {
     bridge = new DaemonPTYBridge();
     const fake = makeFakePty();
     feed = fake.feed;
-    bridge.setupDataForwarding(fake.pty, new RingBuffer(65536), 'sess-1');
-    feed(BANNER);
+    bridge.setupDataForwarding(fake.pty, new RingBuffer(65536), 'sess-1', new PromptEventLog());
+    feed(CODEX_MODES + BANNER);
     feed('ready\r\n'); // spends the cycle the banner armed
     vi.advanceTimersByTime(6_000); // past any boot burst and its idle
     active = [];
@@ -73,14 +80,21 @@ describe('DaemonPTYBridge — a Codex title spinner reports running', () => {
     expect(active).toHaveLength(2);
   });
 
-  it('a Claude Code spinner title is left to its hooks', () => {
-    const claude = new DaemonPTYBridge();
-    const fake = makeFakePty();
-    claude.setupDataForwarding(fake.pty, new RingBuffer(65536), 'sess-2');
-    const seen: unknown[] = [];
-    claude.on('active', (e) => seen.push(e));
-    fake.feed(title('⠋ Thinking'));
-    expect(seen).toHaveLength(0);
-    claude.cleanup();
+  it('a braille title after Codex has exited reports nothing, until Codex boots again', () => {
+    feed(BACK_TO_SHELL);
+    vi.advanceTimersByTime(6_000);
+    // The detector still names Codex, but the shell owns the pane.
+    expect(bridge.getLastAgent()).toBe('Codex CLI');
+    feed(title('⠋ shell label'));
+    vi.advanceTimersByTime(30_000);
+    feed(title('⠙ shell label'));
+    expect(active).toHaveLength(0);
+
+    feed(LAUNCH_OUTPUT);
+    feed(CODEX_MODES + BANNER);
+    vi.advanceTimersByTime(6_000);
+    active = [];
+    feed(title('⠋ AAA quality pass | Heartbound'));
+    expect(active).toHaveLength(1);
   });
 });
