@@ -19,6 +19,7 @@ import { ESCAPE_WIN32 } from '../shared/win32InputKeys';
 import { isEscapeChunk } from '../shared/hooks/interruptKeystroke';
 import { kittyChunkAsLegacy } from '../shared/kittyKeyEvents';
 import { titleShowsFinishedTurn, titleShowsRunningTurn } from './transcript/chatScreenGate';
+import { CLAUDE_IDLE_TITLE, CLAUDE_RUNNING_TITLE, CLAUDE_RUNNING_TITLE_OSC } from '../shared/agentTitleRules';
 import type { TurnFailure } from '../shared/phoneTurnFailure';
 
 /**
@@ -918,9 +919,6 @@ export class DaemonPTYBridge extends EventEmitter {
 
   /** The output chunk the activity monitor is measuring sets Claude Code's spinner title. */
   private chunkSetsSpinnerTitle = false;
-  // eslint-disable-next-line no-control-regex
-  private static readonly CLAUDE_SPINNER_TITLE_OSC = /\x1b\][02];[◐◑]\s/;
-  private static readonly CLAUDE_SPINNER_TITLE = /^[◐◑]\s/;
   /** When the idle-title gate last held a burst back (0 = never). */
   private heldBurstAt = 0;
   private static readonly HELD_BURST_MS = 3000;
@@ -1073,6 +1071,16 @@ export class DaemonPTYBridge extends EventEmitter {
     if (ts >= this.turnOpenedAt) return { turnId: `t1:${this.turnNonce}.${this.turnSeq}`, current: true };
     if (this.turnSeq > 1 && ts >= this.prevTurnOpenedAt) return { turnId: `t1:${this.turnNonce}.${this.turnSeq - 1}`, current: false };
     return null;
+  }
+
+  /**
+   * The id of the latest episode when it is over for good: closed by a settle
+   * that is not soft (a soft close resumes under the same id). Null while it
+   * is open or soft-closed, or before the first episode.
+   */
+  endedTurnId(): string | null {
+    if (this.turnSeq === 0 || this.turnOpen || this.turnSoftClosed) return null;
+    return `t1:${this.turnNonce}.${this.turnSeq}`;
   }
 
   /**
@@ -1446,8 +1454,8 @@ export class DaemonPTYBridge extends EventEmitter {
         if (title) this.emit('title', { sessionId, title });
         if (titleTurnEdge.observe(title)) this.noteTitleTurnEnd(sessionId);
         this.noteCodexTitleSpinner(sessionId);
-        if (DaemonPTYBridge.CLAUDE_SPINNER_TITLE.test(title)) this.noteSpinnerTitle();
-        else if (this.spinnerOpenedTurn && this.turnOpen && !this.awaitingHuman && /^✳\s/.test(title)) this.endSpinnerTurn();
+        if (CLAUDE_RUNNING_TITLE.test(title)) this.noteSpinnerTitle();
+        else if (this.spinnerOpenedTurn && this.turnOpen && !this.awaitingHuman && CLAUDE_IDLE_TITLE.test(title)) this.endSpinnerTurn();
         return;
       }
       if (event.code === 7) {
@@ -1604,7 +1612,7 @@ export class DaemonPTYBridge extends EventEmitter {
       if (!this.muted && (!this.explicitTerminalStatus || this.isInputQuiet())) {
         // Only the settled hook-pane gate reads it (see idleTitleOnHookPane).
         this.chunkSetsSpinnerTitle = this.explicitTerminalStatus && this.hookSeen
-          && DaemonPTYBridge.CLAUDE_SPINNER_TITLE_OSC.test(data);
+          && CLAUDE_RUNNING_TITLE_OSC.test(data);
         try {
           activityMonitor.feed(sessionId, byteLength);
         } catch {

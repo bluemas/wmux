@@ -3,9 +3,10 @@
 // Every bot turn runs its own agent process, and every fan-out worker keeps an
 // interactive CLI with its MCP servers resident while its task is open. The
 // factory caps how many of those run at once (`maxConcurrentAgents`, Settings
-// › Bots): in use = bots running a turn + live bot workers (open bot tasks
-// whose worker still runs, see rowHoldsAgentSlot, and resumed workers) +
-// launches already granted that have not registered yet.
+// › Bots): in use = bots running a turn + live bot workers (the holder set's
+// bot holders, workerHolders.ts: open bot tasks whose worker still runs,
+// ended ones not stopped yet, resumed workers, and the launches granted or
+// held here).
 //
 // What the cap holds back is a NEW worker a bot starts: the task gets its
 // worktree, then waits for a slot before its pane is spawned, first come first
@@ -20,6 +21,7 @@
 // takes a free slot like a bot's resume does, or is refused (tryAcquire). A task row whose workspace is gone, or whose panes run no agent
 // any more, holds no slot either (an open row can outlive its worker).
 
+import { holderInputsChanged } from './holderInputs';
 import type { LedgerEntry } from '../../shared/ledger';
 
 export const SLOT_WAIT_MAX_MS = 30 * 60_000;
@@ -30,23 +32,6 @@ const POLL_MS = 2_000;
 /** A task row this recent counts even when its workspace or its agent is
  *  not seen yet: a worker's pane and agent come up after its row. */
 export const SLOT_ROW_GRACE_MS = 2 * 60_000;
-
-/** What is known of the workers' panes now. */
-export interface SlotLiveness {
-  /** Open workspace ids, or null when not known yet (every row counts). */
-  workspaces: ReadonlySet<string> | null;
-  /** Open workspaces whose panes all run no agent process any more. */
-  idleWorkspaces: ReadonlySet<string>;
-  /** Tasks whose worker main stopped (paused for review, or done) after the
-   *  row's last change, and did not resume: whatever their panes show (a WSL
-   *  pane's agent is often never attributed), they run no agent. */
-  stoppedTasks?: ReadonlySet<string>;
-  /** Open workspaces with a pane whose agent is seen alive or whose shell
-   *  runs a foreground command: a stopped task's worker relaunched there
-   *  holds its slot again. */
-  busyWorkspaces?: ReadonlySet<string>;
-  now: number;
-}
 
 /** Holders a slot-wait card names, at most, per kind. */
 export const SLOT_HOLDERS_SHOWN_MAX = 6;
@@ -106,22 +91,13 @@ export function paneShowsWork(s: SlotPaneInfo | undefined): boolean {
   return !!s && (s.agentProcessAlive === true || s.commandRunning === true);
 }
 
-/** Whether a ledger row holds an agent slot: an open bot task (the owner's
- *  own fan-outs do not count), whose workspace is open and whose agent still
- *  runs — or recent enough that its worker may still be coming up. A
- *  completed, cancelled or failed row never does. Pure. */
-export function rowHoldsAgentSlot(
-  row: Pick<LedgerEntry, 'dispatch' | 'taskWorkspaceId' | 'updatedAt'> & { id?: string; status?: LedgerEntry['status'] },
-  live: SlotLiveness | null,
-): boolean {
+/** Whether a ledger row holds an agent slot while no holder set is
+ *  installed (before the worker lifecycle host starts; it decides from then
+ *  on, workerHolders.ts): an open bot task. The owner's own fan-outs do not
+ *  count; a completed, cancelled or failed row never does. Pure. */
+export function rowHoldsAgentSlot(row: Pick<LedgerEntry, 'dispatch'> & { status?: LedgerEntry['status'] }): boolean {
   if (row.dispatch?.origin?.kind !== 'bot') return false;
-  if (row.status === 'completed' || row.status === 'cancelled' || row.status === 'failed') return false;
-  // Its worker was stopped after the row last changed: no agent, even when
-  // the row is recent or its pane is not known dead.
-  if (row.id && live?.stoppedTasks?.has(row.id) && !live.busyWorkspaces?.has(row.taskWorkspaceId)) return false;
-  if (!live || live.now - row.updatedAt < SLOT_ROW_GRACE_MS) return true;
-  if (live.workspaces && !live.workspaces.has(row.taskWorkspaceId)) return false;
-  return !live.idleWorkspaces.has(row.taskWorkspaceId);
+  return row.status !== 'completed' && row.status !== 'cancelled' && row.status !== 'failed';
 }
 
 export interface WaitingWorker {
@@ -138,7 +114,8 @@ export interface AgentSlotPorts {
   cap: () => number;
   /** Bots running a turn now. */
   runningBots: () => number;
-  /** Live workers: open fan-out tasks and resumed workers. */
+  /** Live workers, the slots granted and held here among them (the holder
+   *  set, workerHolders.ts, reads those through pendingSlots). */
   liveWorkers: () => number;
   /** Whether a spawned worker whose ledger row was not written still holds
    *  its slot: its workspace lives and still no row counts it. Absent: a held
@@ -168,6 +145,8 @@ interface Waiter {
 interface Grant {
   botId?: string;
   taskId?: string;
+  /** The owner's Resume took it (not a bot's). */
+  byOwner?: boolean;
   at: number;
 }
 
@@ -179,16 +158,46 @@ export class AgentSlots {
   private readonly queue: Waiter[] = [];
   private timer: ReturnType<typeof setTimeout> | null = null;
   private disposed = false;
-
   constructor(private readonly ports: AgentSlotPorts) {}
 
   /** Agents counted against the cap now. Never throws. */
   inUse(): number {
+    this.prune();
+    let n = 0;
+    try {
+      n += Math.max(0, this.ports.runningBots());
+    } catch {
+      /* counted as what could be read */
+    }
+    try {
+      n += Math.max(0, this.ports.liveWorkers());
+    } catch {
+      // Fail closed: the slots granted and held here still count when the
+      // workers that include them cannot be read.
+      n += this.grants.size + this.held.size;
+    }
+    return n;
+  }
+
+  /** The slots granted and not released yet, and the spawned workspaces
+   *  held with no ledger row: what the holder set counts of this budget. */
+  pendingSlots(): { grants: Array<{ taskId?: string; botId?: string; byOwner?: boolean }>; held: string[] } {
+    this.prune();
+    return {
+      grants: [...this.grants].map((g) => ({ ...(g.taskId ? { taskId: g.taskId } : {}), ...(g.botId ? { botId: g.botId } : {}), ...(g.byOwner ? { byOwner: true } : {}) })),
+      held: [...this.held],
+    };
+  }
+
+  /** Drops grants past SLOT_GRANT_MAX_MS and held workspaces stillHeld no
+   *  longer keeps. */
+  private prune(): void {
     const at = (this.ports.now ?? Date.now)();
     for (const g of [...this.grants]) {
       if (at - g.at < SLOT_GRANT_MAX_MS) continue;
       (this.ports.log ?? ((m: string) => console.warn(m)))(`[factory] the agent slot granted for ${g.taskId ?? 'a launch'} was never released; it no longer counts`);
       this.grants.delete(g);
+      holderInputsChanged();
     }
     for (const ws of [...this.held]) {
       let keep = false;
@@ -197,15 +206,11 @@ export class AgentSlots {
       } catch {
         keep = true; // cannot tell: keep counting it
       }
-      if (!keep) this.held.delete(ws);
+      if (!keep) {
+        this.held.delete(ws);
+        holderInputsChanged();
+      }
     }
-    let n = this.grants.size + this.held.size;
-    try {
-      n += Math.max(0, this.ports.runningBots()) + Math.max(0, this.ports.liveWorkers());
-    } catch {
-      /* counted as what could be read */
-    }
-    return n;
   }
 
   waiting(): WaitingWorker[] {
@@ -241,10 +246,11 @@ export class AgentSlots {
   }
 
   /** A slot now, or null when none is free (or others wait first): for a
-   *  start that does not wait (a bot's resume answers its tool call). */
-  tryAcquire(): SlotGrant | null {
+   *  start that does not wait (a bot's resume answers its tool call). `w`:
+   *  the task it is for, so the slot and that task count as one. */
+  tryAcquire(w?: { botId?: string; taskId?: string; byOwner?: boolean }): SlotGrant | null {
     if (this.disposed || this.queue.length > 0 || this.inUse() >= this.cap()) return null;
-    return this.grant();
+    return this.grant(w);
   }
 
   /** The cap in force (at least 1). */
@@ -298,22 +304,27 @@ export class AgentSlots {
     }
   }
 
-  private grant(w?: Pick<WaitingWorker, 'botId' | 'taskId'>): SlotGrant {
+  private grant(w?: { botId?: string; taskId?: string; byOwner?: boolean }): SlotGrant {
     let released = false;
     const release = (): void => {
       if (released) return;
       released = true;
       this.grants.delete(g);
+      holderInputsChanged();
       this.kick();
     };
-    const g: Grant = { ...(w ? { botId: w.botId, taskId: w.taskId } : {}), at: (this.ports.now ?? Date.now)() };
+    const g: Grant = { ...(w?.botId ? { botId: w.botId } : {}), ...(w?.taskId ? { taskId: w.taskId } : {}), ...(w?.byOwner ? { byOwner: true } : {}), at: (this.ports.now ?? Date.now)() };
     this.grants.add(g);
+    holderInputsChanged();
     return {
       ok: true,
       release,
       hold: (workspaceId) => {
         if (released) return;
-        if (workspaceId && this.ports.stillHeld) this.held.add(workspaceId);
+        if (workspaceId && this.ports.stillHeld) {
+          this.held.add(workspaceId);
+          holderInputsChanged();
+        }
         release();
       },
     };
@@ -368,31 +379,21 @@ export class IdleSnapshot {
 }
 
 let current: AgentSlots | null = null;
-let liveness: (() => SlotLiveness) | null = null;
 let livenessRefresh: (() => Promise<void>) | null = null;
 
-/** Set by the worker lifecycle host: what is known of the workers' panes,
- *  and how to bring that up to date before a decision. */
-export function setSlotLiveness(next: (() => SlotLiveness) | null, refresh?: () => Promise<void>): void {
-  liveness = next;
-  livenessRefresh = next ? refresh ?? null : null;
+/** Set by the worker lifecycle host: how to bring what the holder set reads
+ *  of the workers' panes up to date before a decision. */
+export function setSlotLivenessRefresh(refresh: (() => Promise<void>) | null): void {
+  livenessRefresh = refresh;
 }
 
-/** Brings what getSlotLiveness answers up to date. Never rejects. */
+/** Brings what the holder set reads of the workers' panes up to date.
+ *  Never rejects. */
 export async function refreshSlotLiveness(): Promise<void> {
   try {
     await livenessRefresh?.();
   } catch {
     /* decided on what is known */
-  }
-}
-
-/** What is known of the workers' panes now, or null (every bot row counts). */
-export function getSlotLiveness(): SlotLiveness | null {
-  try {
-    return liveness?.() ?? null;
-  } catch {
-    return null;
   }
 }
 
