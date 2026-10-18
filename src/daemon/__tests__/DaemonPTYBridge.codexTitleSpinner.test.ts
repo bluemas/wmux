@@ -131,6 +131,14 @@ describe('DaemonPTYBridge — a Codex title spinner reports running', () => {
     expect(active).toHaveLength(1);
   });
 
+  it('a braille title after the Codex process ended reports nothing on a shell without OSC 133', () => {
+    bridge.noteAgentEnded(); // the process tracker's death edge
+    vi.advanceTimersByTime(6_000);
+    spin(2, 100);
+    expect(active).toHaveLength(0);
+    expect(bridge.isTurnOpen()).toBe(false);
+  });
+
   it('a braille title after Codex has exited reports nothing, until Codex boots again', () => {
     feed(BACK_TO_SHELL);
     vi.advanceTimersByTime(6_000);

@@ -270,10 +270,11 @@ export class DaemonPTYBridge extends EventEmitter {
   private codexBannerTail = '';
   private static readonly CODEX_BANNER_TAIL = 512;
   /**
-   * Codex drew its boot banner (launch, resume, `/new`) and no OSC 133 mark
-   * has arrived since. The detector's last agent outlives the agent itself:
-   * once the shell has the prompt back it still names Codex, so only this
-   * says Codex is the program writing the pane's title (see noteCodexOutput).
+   * Codex drew its boot banner (launch, resume, `/new`) and neither an OSC
+   * 133 mark nor the end of its process (noteAgentEnded) has arrived since.
+   * The detector's last agent outlives the agent itself: once the shell has
+   * the prompt back it still names Codex, so only this says Codex is the
+   * program writing the pane's title (see noteCodexOutput).
    */
   private codexHoldsPane = false;
 
@@ -997,6 +998,7 @@ export class DaemonPTYBridge extends EventEmitter {
   noteAgentEnded(): void {
     this.closeTurn();
     this.hookSeen = false;
+    this.codexHoldsPane = false;
   }
 
   /**
