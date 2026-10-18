@@ -35,6 +35,9 @@ import { getTaskLedger } from '../deck/taskLedgerHost';
 import { getWorkspaceMirror } from '../workspace/WorkspaceMirror';
 import { sanitizeFanoutOrigin, type FanoutLineageEntry, type FanoutOrigin } from '../../shared/fanoutOrigin';
 import { BOT_ID_RE } from '../../shared/bot';
+import { getWorkerSlots, parseLaunchToken, type WorkerSlots } from '../factory/workerSlots';
+import { holderCounts, liveHolders, type LiveHolders, type ReservedTask } from '../factory/workerHolders';
+import { holderInputsChanged } from '../factory/holderInputs';
 
 export const FANOUT_LIVE_TASK_CAP = 8;
 export const FANOUT_HOURLY_TASK_CAP = 24;
@@ -61,7 +64,21 @@ interface LineageStamp {
   /** Who asked for the task (additive: older stamps lack it, and an older
    *  reader ignores it). Display only — the depth-1 check reads `owner`. */
   origin?: FanoutOrigin;
+  /** The task the workspace was created for, and its launch generation
+   *  (factory/workerSlots.ts). Additive, like `origin`. */
+  taskId?: string;
+  gen?: number;
 }
+
+/** The task a workspace was created for, as its stamp names it. */
+export interface StampTask {
+  taskId: string;
+  gen: number;
+}
+
+const isStampTask = (t: unknown): t is StampTask => !!t && typeof t === 'object'
+  && typeof (t as StampTask).taskId === 'string' && (t as StampTask).taskId.length > 0
+  && typeof (t as StampTask).gen === 'number' && Number.isInteger((t as StampTask).gen) && (t as StampTask).gen >= 1;
 
 interface HourlyStamp {
   /** The fan-out's scoped idempotency key (informational; not unique). */
@@ -233,15 +250,17 @@ export class FanOutGuards {
   /** null until first read. */
   private lineage: Map<string, LineageStamp> | null = null;
   private hourly: HourlyStamp[] | null = null;
-  /** Claim-time reservations: key → task count, counted against BOTH caps
-   *  until the fan-out starts or is dropped. Process memory only — a
-   *  reservation stands for tasks that have not started, and after a restart
-   *  they never will. */
-  private readonly pending = new Map<string, number>();
-  /** Started fan-outs: key → tasks not yet through their spawn. Each task
-   *  leaves this count as it settles (see taskSettled), by which time its
-   *  stamped workspace is what counts it. */
-  private readonly spawning = new Map<string, number>();
+  /** The bookings, one per task (#2393). `pending`: claim-time
+   *  reservations, counted against BOTH caps until the fan-out starts or is
+   *  dropped; `spawning`: a started fan-out's tasks not yet through their
+   *  spawn (each leaves as it settles, see taskSettled). Process memory only
+   *  — a booking stands for tasks that have not started, and after a restart
+   *  they never will. What the holder set reads
+   *  (factory/workerHolders.ts), so a booked task, the workspace it is
+   *  spawned in and its ledger row are one holder. A task minted by the
+   *  fan-out names its booking (bindTask) before its launch is recorded; its
+   *  workspace is then the task's by that record (factory/workerSlots.ts). */
+  private reserved: ReservedTask[] = [];
 
   constructor(opts: FanOutGuardsOptions = {}) {
     this.dir = opts.dir ?? getWmuxDir();
@@ -308,7 +327,8 @@ export class FanOutGuards {
           if (s && typeof s.owner === 'string' && s.owner.length > 0) {
             // A malformed origin drops the origin, never the stamp.
             const origin = sanitizeFanoutOrigin(s.origin);
-            map.set(ws, { owner: s.owner, at: typeof s.at === 'number' ? s.at : 0, ...(origin ? { origin } : {}) });
+            const task = isStampTask(s) ? { taskId: s.taskId, gen: s.gen } : {};
+            map.set(ws, { owner: s.owner, at: typeof s.at === 'number' ? s.at : 0, ...(origin ? { origin } : {}), ...task });
           }
         }
       } catch {
@@ -343,23 +363,28 @@ export class FanOutGuards {
   /** Stamp `workspaceId` as a task of `ownerWorkspaceId`. Synchronous and
    *  durable before it returns; throws when the write fails. A re-mark by the
    *  same owner never erases a recorded origin: it only adds one the stamp
-   *  does not have yet. */
-  markTask(workspaceId: string, ownerWorkspaceId: string, origin?: FanoutOrigin): void {
+   *  does not have yet. `task`: the task and launch generation it was created
+   *  for; a re-mark records a newer generation, never an older one. */
+  markTask(workspaceId: string, ownerWorkspaceId: string, origin?: FanoutOrigin, task?: StampTask): void {
     if (!workspaceId || !ownerWorkspaceId) throw new Error('markTask: workspace ids are required');
+    holderInputsChanged();
     const map = this.loadLineage();
     const clean = sanitizeFanoutOrigin(origin);
+    const named = isStampTask(task) ? { taskId: task.taskId, gen: task.gen } : null;
     const existing = map.get(workspaceId);
     if (existing?.owner === ownerWorkspaceId) {
-      if (existing.origin || !clean) return;
+      const addOrigin = !existing.origin && !!clean;
+      const addTask = !!named && (existing.taskId !== named.taskId || (existing.gen ?? 0) < named.gen);
+      if (!addOrigin && !addTask) return;
       const next = new Map(map);
-      next.set(workspaceId, { ...existing, origin: clean });
+      next.set(workspaceId, { ...existing, ...(addOrigin && clean ? { origin: clean } : {}), ...(addTask && named ? named : {}) });
       atomicWriteJSONSync(this.lineagePath(), { version: 1, tasks: Object.fromEntries(next) });
       this.lineage = next;
       return;
     }
     const next = new Map(map);
     next.delete(workspaceId);
-    next.set(workspaceId, { owner: ownerWorkspaceId, at: this.now(), ...(clean ? { origin: clean } : {}) });
+    next.set(workspaceId, { owner: ownerWorkspaceId, at: this.now(), ...(clean ? { origin: clean } : {}), ...(named ?? {}) });
     while (next.size > LINEAGE_MAX_ENTRIES) {
       const oldest = next.keys().next();
       if (oldest.done) break;
@@ -367,6 +392,19 @@ export class FanOutGuards {
     }
     atomicWriteJSONSync(this.lineagePath(), { version: 1, tasks: Object.fromEntries(next) });
     this.lineage = next;
+  }
+
+  /** The task and launch generation `workspaceId`'s stamp names, or null
+   *  (no stamp, one written before stamps named tasks, or the store cannot
+   *  be read). Never throws. */
+  taskOfWorkspace(workspaceId: string): StampTask | null {
+    let stamp: LineageStamp | undefined;
+    try {
+      stamp = this.loadLineage().get(workspaceId);
+    } catch {
+      return null;
+    }
+    return stamp?.taskId && stamp.gen ? { taskId: stamp.taskId, gen: stamp.gen } : null;
   }
 
   /**
@@ -377,18 +415,32 @@ export class FanOutGuards {
    */
   liveTaskCount(): number {
     if (this.countLiveOverride) return this.countLiveOverride();
+    const holders = this.holders();
+    if (holders) return holderCounts(holders.holders).live;
     return this.liveTaskWorkspaces().length;
   }
 
-  /** The workspaces liveTaskCount counts (it throws the same way). A task
-   *  that ended and runs no agent any more is dormant, so it is not one,
-   *  whether or not its workspace was closed yet. */
+  /** The holder set every live-worker cap filters (factory/workerHolders.ts),
+   *  read only by the hosted instance, whose bookings it holds; null while
+   *  the worker lifecycle host has not installed it. THROWS when the open
+   *  workspaces are unknown or the lineage store cannot be trusted, as the
+   *  workspace count does: the live cap then refuses. */
+  private holders(): LiveHolders | null {
+    if (hosted !== this) return null;
+    const live = liveHolders();
+    if (!live) return null;
+    if (!live.workspacesKnown) throw new Error('the open workspace list is not available yet');
+    this.loadLineage();
+    return live;
+  }
+
+  /** The workspaces liveTaskCount counts while no holder set is installed
+   *  (it throws the same way): every open stamped task workspace. */
   liveTaskWorkspaces(): string[] {
     const open = this.openWorkspaceIds();
     if (!open) throw new Error('the open workspace list is not available yet');
     const stamps = this.loadLineage();
-    const dormant = dormantTaskWorkspaces();
-    return open.filter((ws) => stamps.has(ws) && !dormant.has(ws));
+    return open.filter((ws) => stamps.has(ws));
   }
 
   /** What holds the live slots, or null when it cannot be told (the count
@@ -396,6 +448,18 @@ export class FanOutGuards {
   private liveSlotHolders(starting: number): LiveSlotHolders | null {
     if (this.countLiveOverride) return null;
     try {
+      const set = this.holders();
+      if (set) {
+        const out: LiveSlotHolders = { open: [], ended: [], untracked: 0, starting: 0 };
+        for (const h of set.holders) {
+          if (h.state === 'free') continue;
+          if (h.why === 'starting' && !h.status) out.starting++;
+          else if (h.status === 'completed' || h.status === 'cancelled' || h.status === 'failed') out.ended.push(h.title ?? h.taskId);
+          else if (h.status || h.why === 'resumed') out.open.push(h.title ?? h.taskId);
+          else out.untracked++;
+        }
+        return out;
+      }
       const holders: LiveSlotHolders = { open: [], ended: [], untracked: 0, starting };
       for (const ws of this.liveTaskWorkspaces()) {
         const task = this.ledgerTaskOf(ws);
@@ -462,25 +526,25 @@ export class FanOutGuards {
    * under `key`. Synchronous, so the claim that follows it happens in the same
    * tick and two concurrent calls cannot both squeeze under a cap.
    */
-  reserve(key: string, count: number): CapReservation {
+  reserve(key: string, count: number, who?: { ownerWorkspaceId: string; botId?: string }): CapReservation {
     const now = this.now();
     const windowStart = now - FANOUT_CAP_WINDOW_MS;
     const hourly = this.loadHourly().filter((s) => s.at > windowStart);
 
-    let pendingCount = 0;
-    for (const n of this.pending.values()) pendingCount += n;
-    let spawningCount = 0;
-    for (const n of this.spawning.values()) spawningCount += n;
-    let liveNow: number;
+    const pendingCount = this.booked('pending');
+    const spawningCount = this.booked('spawning');
+    let live: number;
     try {
-      liveNow = this.liveTaskCount();
+      // The holder set counts the bookings itself, one per task; the
+      // workspace count adds them.
+      const holders = this.countLiveOverride ? null : this.holders();
+      live = holders ? holderCounts(holders.holders).live : this.liveTaskCount() + pendingCount + spawningCount;
     } catch (err) {
       return {
         ok: false,
         message: `fan-out refused: the live-task count is unavailable (${(err as Error).message}); retry shortly`,
       };
     }
-    const live = liveNow + pendingCount + spawningCount;
     if (live + count > FANOUT_LIVE_TASK_CAP) {
       return { ok: false, message: liveCapMessage(live, count, this.liveSlotHolders(pendingCount + spawningCount)) };
     }
@@ -513,14 +577,40 @@ export class FanOutGuards {
       };
     }
 
-    this.pending.set(key, count);
+    holderInputsChanged();
+    this.reserved = this.reserved.filter((u) => !(u.key === key && u.phase === 'pending'));
+    for (let i = 0; i < count; i++) {
+      this.reserved.push({ key, ownerWorkspaceId: who?.ownerWorkspaceId ?? '', ...(who?.botId ? { botId: who.botId } : {}), phase: 'pending' });
+    }
     return { ok: true };
   }
 
   /** The fan-out never started (preflight failure, denial, repo moved, a
    *  throw): its reservation stops counting against either cap. */
   release(key: string): void {
-    this.pending.delete(key);
+    holderInputsChanged();
+    this.reserved = this.reserved.filter((u) => !(u.key === key && u.phase === 'pending'));
+  }
+
+  /** How many tasks are booked in `phase` (of `key`, or of every fan-out). */
+  private booked(phase: ReservedTask['phase'], key?: string): number {
+    let n = 0;
+    for (const u of this.reserved) if (u.phase === phase && (key === undefined || u.key === key)) n++;
+    return n;
+  }
+
+  /** The tasks booked now, one per task (copies). */
+  reservedTasks(): ReservedTask[] {
+    return this.reserved.map((u) => ({ ...u }));
+  }
+
+  /** A started fan-out minted `taskId`: one of its bookings is that task's
+   *  from now on. */
+  bindTask(key: string, taskId: string): void {
+    const unit = this.reserved.find((u) => u.taskId === taskId)
+      ?? this.reserved.find((u) => u.key === key && u.phase === 'spawning' && !u.taskId);
+    if (unit) unit.taskId = taskId;
+    holderInputsChanged();
   }
 
   /**
@@ -531,10 +621,10 @@ export class FanOutGuards {
    * appended, never replaced: a key reused after a restart adds to the hour.
    */
   commitStart(key: string, deferred = 0): void {
-    const count = this.pending.get(key);
-    if (count === undefined) return;
-    this.pending.delete(key);
-    this.spawning.set(key, (this.spawning.get(key) ?? 0) + count);
+    const count = this.booked('pending', key);
+    if (count === 0) return;
+    holderInputsChanged();
+    for (const u of this.reserved) if (u.key === key) u.phase = 'spawning';
     // Tasks that wait on dependencies are booked live now but stamped on the
     // hour only when they actually start (stampDeferredStart): stamped now,
     // one that waited past the window would start uncounted.
@@ -553,9 +643,7 @@ export class FanOutGuards {
     const recorded = this.loadHourly()
       .filter((s) => s.at > now - FANOUT_CAP_WINDOW_MS)
       .reduce((sum, s) => sum + s.count, 0);
-    let pendingCount = 0;
-    for (const n of this.pending.values()) pendingCount += n;
-    if (recorded + pendingCount + 1 > FANOUT_HOURLY_TASK_CAP) {
+    if (recorded + this.booked('pending') + 1 > FANOUT_HOURLY_TASK_CAP) {
       return {
         ok: false,
         message: `at most ${FANOUT_HOURLY_TASK_CAP} fan-out tasks may start per rolling hour across wmux, and the hour is full`,
@@ -608,16 +696,19 @@ export class FanOutGuards {
   }
 
   /** One task of a started fan-out finished its spawn (either way). From here
-   *  its stamped workspace, if it got one, is what counts it. */
-  taskSettled(key: string): void {
-    const left = (this.spawning.get(key) ?? 0) - 1;
-    if (left > 0) this.spawning.set(key, left);
-    else this.spawning.delete(key);
+   *  its stamped workspace, if it got one, is what counts it. `taskId`: the
+   *  task, when it was minted. */
+  taskSettled(key: string, taskId?: string): void {
+    holderInputsChanged();
+    const of = this.reserved.filter((u) => u.key === key && u.phase === 'spawning');
+    const unit = (taskId ? of.find((u) => u.taskId === taskId) : undefined) ?? of.find((u) => !u.taskId) ?? of[0];
+    if (unit) this.reserved = this.reserved.filter((u) => u !== unit);
   }
 
   /** The fan-out's run returned: whatever is still booked for it is dropped. */
   settleStarted(key: string): void {
-    this.spawning.delete(key);
+    holderInputsChanged();
+    this.reserved = this.reserved.filter((u) => !(u.key === key && u.phase === 'spawning'));
   }
 
   // ── audit ────────────────────────────────────────────────────────────────
@@ -753,35 +844,82 @@ export class FanOutGuards {
  * stamped with the owner. It is sanitized here; a malformed one is dropped.
  */
 export function stampFanoutTaskPane(
-  options: { fanoutTaskOf?: unknown; workspaceId?: unknown; fanoutOrigin?: unknown } | undefined,
+  options: { fanoutTaskOf?: unknown; workspaceId?: unknown; fanoutOrigin?: unknown; fanoutLaunch?: unknown } | undefined,
   guards: Pick<FanOutGuards, 'markTask'> = getFanOutGuards(),
+  launches: () => Pick<WorkerSlots, 'claimLaunch'> = getWorkerSlots,
 ): void {
   const owner = typeof options?.fanoutTaskOf === 'string' ? options.fanoutTaskOf : '';
   if (!owner) return;
   const ws = typeof options?.workspaceId === 'string' ? options.workspaceId : '';
   if (!ws) throw new Error('PTY_CREATE: a fan-out task pane needs its workspaceId for the lineage stamp');
   const origin = sanitizeFanoutOrigin(options?.fanoutOrigin);
-  if (origin) guards.markTask(ws, owner, origin);
+  // The launch its spawn carried (main recorded it before the spawn,
+  // factory/workerSlots.ts): the stamp names it from the start, and one that
+  // was abandoned or replaced fails the create (claimLaunch throws).
+  const token = parseLaunchToken(options?.fanoutLaunch);
+  const task: StampTask | null = token ? launches().claimLaunch(token) : null;
+  if (task) guards.markTask(ws, owner, origin ?? undefined, task);
+  else if (origin) guards.markTask(ws, owner, origin);
   else guards.markTask(ws, owner);
 }
 
-/** Task workspaces kept open after their task ended and their agent was
- *  stopped (factory worker reclaim), or whose task ended (the owner's stop
- *  among them) and runs no agent any more: they hold no live slot. A
- *  resumed worker is live again and is not in this set. */
-let dormantSource: () => ReadonlySet<string> = () => new Set();
+/** A task pane's create, once its session id is known and before the
+ *  session exists: the pane and its workspace are recorded as the launch's
+ *  its spawn carried (factory/workerSlots.ts). Throws (failing the create)
+ *  when that launch was abandoned or the record cannot be written. A pane
+ *  whose spawn carried no launch is not recorded. */
+export function recordFanoutTaskPane(
+  options: { fanoutTaskOf?: unknown; workspaceId?: unknown; fanoutLaunch?: unknown } | undefined,
+  sessionId: string,
+  launches: () => Pick<WorkerSlots, 'recordCreate'> = getWorkerSlots,
+): void {
+  const owner = typeof options?.fanoutTaskOf === 'string' ? options.fanoutTaskOf : '';
+  const ws = typeof options?.workspaceId === 'string' ? options.workspaceId : '';
+  const token = parseLaunchToken(options?.fanoutLaunch);
+  if (!owner || !ws || !token || !sessionId) return;
+  launches().recordCreate(token, ws, sessionId);
+}
 
-function dormantTaskWorkspaces(): ReadonlySet<string> {
+/** The task and generation a workspace was created (or relaunched) for:
+ *  its record (factory/workerSlots.ts), else its lineage stamp. Never throws. */
+export function taskOfWorkspace(workspaceId: string): StampTask | null {
   try {
-    return dormantSource();
+    return getWorkerSlots().workspaceOf(workspaceId) ?? getFanOutGuards().taskOfWorkspace(workspaceId);
   } catch {
-    return new Set();
+    return null;
   }
 }
 
-/** Install (or clear, with null) the dormant task-workspace source. */
-export function setDormantTaskWorkspaces(source: (() => ReadonlySet<string>) | null): void {
-  dormantSource = source ?? (() => new Set());
+/** How long a live-cap check waits for a fresh dormant read (#2387). A
+ *  second layer: the root fix is the durable "agent seen gone" fact
+ *  (factory/agentGoneFacts.ts, #2393), which answers without any read; this
+ *  wait only lets a task that ended since the last read count on a fresh one. */
+export const DORMANT_REFRESH_WAIT_MS = 2_000;
+
+let dormantRefresh: (() => Promise<void>) | null = null;
+
+/** Install (or clear, with null) how to bring the dormant source up to date. */
+export function setDormantRefresh(refresh: (() => Promise<void>) | null): void {
+  dormantRefresh = refresh;
+}
+
+/** Brings the dormant set up to date before a live-cap check: resolves once
+ *  the fresh read settles or after `timeoutMs`, whichever is first (the
+ *  check then decides on what is known). Never rejects. */
+export async function refreshDormantTaskWorkspaces(timeoutMs = DORMANT_REFRESH_WAIT_MS): Promise<void> {
+  let work: Promise<void> | undefined;
+  try {
+    work = dormantRefresh?.();
+  } catch {
+    return;
+  }
+  if (!work) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([work.catch(() => undefined), new Promise<void>((resolve) => { timer = setTimeout(resolve, timeoutMs); })]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 let hosted: FanOutGuards | null = null;

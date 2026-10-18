@@ -1,5 +1,5 @@
 import { configDefaults, defineConfig } from 'vitest/config';
-import lanes from './vitest.lanes.json';
+import { DurationSequencer } from './scripts/lib/duration-sequencer.mjs';
 
 const include = [
   'src/**/__tests__/**/*.test.{ts,tsx}',
@@ -24,15 +24,21 @@ const include = [
 // with `projects` the root runs no files, so those flags no longer reach them.
 const runtimeSuites = ['**/*.runtime.test.ts', '**/*.runtime.test.tsx', '**/*.runtime.test.mjs'];
 
+// The integration lane is named, not listed: `x.os.test.ts` runs there, every
+// other included file in unit. Its include is the same globs with `.os`, so
+// the two lanes cannot cover different trees.
+const osTests = '**/*.os.test.*';
+const osInclude = include.map((glob) => glob.replace('*.test.', '*.os.test.'));
+
 export default defineConfig({
   test: {
     setupFiles: ['./src/test-utils/isolateDataDir.ts', './src/test-utils/jsdomEnv.ts'],
     environment: 'node',
-    // Two lanes (scripts/lib/test-lanes.mjs has the rule, vitest.lanes.json the
-    // result): `integration` holds the files that spawn processes, open
-    // sockets or pipes, or run OS-touching code in a real temp dir; `unit` is
-    // the rest. `npm run test:parallel` runs both; CI runs them as separate
-    // jobs (test:unit, test:integration). Both keep per-file isolation:
+    // Two lanes (scripts/lib/test-lanes.mjs has the rule; a file's name,
+    // `.os.test` or not, has its lane): `integration` holds the files that
+    // spawn processes, open sockets or pipes, or run OS-touching code in a
+    // real temp dir; `unit` is the rest. `npm run test:parallel` runs both; CI
+    // runs them as separate jobs (test:unit, test:integration). Both keep per-file isolation:
     // isolateDataDir.ts gives every file a fresh temp HOME, and modules that
     // read HOME when they load see it only because each file imports them
     // anew, so turning `isolate` off is a decision of its own. Each project
@@ -40,13 +46,14 @@ export default defineConfig({
     projects: [
       {
         extends: true,
-        test: { name: 'unit', include, exclude: [...configDefaults.exclude, ...runtimeSuites, ...lanes.integration] },
+        test: { name: 'unit', include, exclude: [...configDefaults.exclude, ...runtimeSuites, osTests] },
       },
       {
         extends: true,
         test: {
           name: 'integration',
-          include: lanes.integration,
+          include: osInclude,
+          exclude: [...configDefaults.exclude, ...runtimeSuites],
           // Half the cores: on CI's 4-vCPU windows-latest that is 2 test files
           // at a time, leaving the other 2 cores to the git, node and
           // PowerShell processes those files start. Every flake of the week
@@ -61,21 +68,28 @@ export default defineConfig({
         },
       },
     ],
+    // `--shard` splits by the durations in vitest.durations.json, not by file
+    // count: vitest's own split gave the integration shards 447 s and 235 s.
+    // Root-only in vitest; it balances each project on its own
+    // (scripts/lib/duration-sequencer.mjs).
+    sequence: { sequencer: DurationSequencer },
     // CI only: retry a failed test once, so one flake no longer costs a full
     // rerun. Vitest's github-actions reporter (on by default in Actions) lists
     // every test that passed only on retry in the job summary.
     retry: process.env.CI ? 1 : 0,
-    // CI only: also write every retried test to test-results/retries-unit.json
-    // (scripts/vitest-retry-reporter.mjs), which the workflow lists with
-    // scripts/flaky-report.mjs and uploads, so a flake that passed on retry is
-    // recorded rather than lost in a green job. Naming any reporter replaces
+    // CI only: also write every retried test to test-results/retries-<project>.json,
+    // one file per project that ran (scripts/vitest-retry-reporter.mjs), which
+    // the workflow lists with scripts/flaky-report.mjs and uploads, so a flake
+    // that passed on retry is recorded rather than lost in a green job.
+    // Reporters are root-only, so the reporter takes the name from each test's
+    // project rather than from an option here. Naming any reporter replaces
     // vitest's defaults, so `default` and `github-actions` are listed again.
     ...(process.env.CI
       ? {
           reporters: [
             'default',
             ...(process.env.GITHUB_ACTIONS === 'true' ? ['github-actions'] : []),
-            ['./scripts/vitest-retry-reporter.mjs', { suite: 'unit' }],
+            './scripts/vitest-retry-reporter.mjs',
           ],
         }
       : {}),

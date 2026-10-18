@@ -54,6 +54,7 @@
 // turn ended, nothing typed into it) for RESUMED_IDLE_MS: then its agent is
 // stopped again the same way (createResumedIdleSweep), resumable once more.
 
+import { holderInputsChanged } from './holderInputs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { isResearchDispatch, type LedgerEntry } from '../../shared/ledger';
@@ -63,6 +64,7 @@ import { sessionHostDir, sessionsStartedIn } from '../worktask/stopSessionsInDir
 import { createFilePersister, readVersionedFile, type FilePersister } from './versionedFile';
 import { STOPPED_BY_OWNER } from './factoryStop';
 import { fanoutTaskShortId } from '../../shared/fanoutCallerNudge';
+import type { WorkerSlots } from './workerSlots';
 
 export const RECLAIMED_WORKERS_FILENAME = 'reclaimed-workers.json';
 export const RECLAIMED_WORKERS_VERSION = 1 as const;
@@ -268,6 +270,12 @@ export class ReclaimedWorkers {
   private readonly records = new Map<string, ReclaimedWorker>();
   private readonly persister: FilePersister;
 
+  /** Every change is saved through here, and tells the holder set. */
+  private save(): Promise<void> {
+    holderInputsChanged();
+    return this.persister.schedule();
+  }
+
   constructor(private readonly file: string) {
     this.persister = createFilePersister(file, () => ({ version: RECLAIMED_WORKERS_VERSION, workers: [...this.records.values()] }));
   }
@@ -303,12 +311,12 @@ export class ReclaimedWorkers {
       if (this.records.size <= RECLAIMED_WORKERS_MAX) break;
       if (r.state === 'stopped') this.records.delete(id);
     }
-    return this.persister.schedule();
+    return this.save();
   }
 
   remove(taskId: string): Promise<void> {
     if (!this.records.delete(taskId)) return Promise.resolve();
-    return this.persister.schedule();
+    return this.save();
   }
 
   /** Told of every state change made through setState (the agent budget
@@ -330,7 +338,7 @@ export class ReclaimedWorkers {
     const r = this.records.get(taskId);
     if (!r || r.endRev !== from || to === from) return;
     r.endRev = to;
-    void this.persister.schedule().catch((err) => console.warn(`[factory] reclaimed workers not written: ${String(err)}`));
+    void this.save().catch((err) => console.warn(`[factory] reclaimed workers not written: ${String(err)}`));
   }
 
   setState(taskId: string, state: ReclaimedWorker['state'], at: number): boolean {
@@ -340,7 +348,7 @@ export class ReclaimedWorkers {
     r.state = state;
     r.at = at;
     this.notifyState(r, from, state, at);
-    void this.persister.schedule().catch((err) => console.warn(`[factory] reclaimed workers not written: ${String(err)}`));
+    void this.save().catch((err) => console.warn(`[factory] reclaimed workers not written: ${String(err)}`));
     return true;
   }
 
@@ -349,7 +357,7 @@ export class ReclaimedWorkers {
     const r = this.records.get(taskId);
     if (!r || r.seenAt !== undefined) return false;
     r.seenAt = at;
-    void this.persister.schedule().catch((err) => console.warn(`[factory] reclaimed workers not written: ${String(err)}`));
+    void this.save().catch((err) => console.warn(`[factory] reclaimed workers not written: ${String(err)}`));
     return true;
   }
 
@@ -359,7 +367,7 @@ export class ReclaimedWorkers {
     if (!r) return Promise.resolve();
     r.paneWorkspaceId = workspaceId;
     r.sessions = [{ ...session }];
-    return this.persister.schedule();
+    return this.save();
   }
 
   /** The task whose recorded pane `sessionId` is, or null. */
@@ -829,40 +837,6 @@ export function endedTaskAgentRuns(
   });
 }
 
-/**
- * The open task workspaces that hold no live fan-out slot: a reclaimed
- * worker's workspace still open (a failed task the owner has not looked at,
- * one they are viewing, one with a busy pane) whose task did not reopen; a
- * reported task's stopped worker while its task waits for review; and a task
- * that ended with no agent left in its workspace (`endedNoAgent`: the owner's
- * stop writes no record, a record left `stopping` is not stopped) while its
- * row still says so and no resume started since. A workspace an agent was
- * seen in (`agentWorkspaces`) is never one. `records`: [] when the reclaim
- * store could not be read; the ended-task rule needs none. Pure.
- */
-export function dormantTaskWorkspaceSet(p: {
-  records: readonly ReclaimedWorker[];
-  row: (taskId: string) => Pick<LedgerEntry, 'status'> | null;
-  workspaceRow: (workspaceId: string) => Pick<LedgerEntry, 'id' | 'status'> | null;
-  endedNoAgent: Iterable<string>;
-  agentWorkspaces: ReadonlySet<string>;
-}): Set<string> {
-  const ended = (status: string | undefined): boolean => status === 'completed' || status === 'cancelled' || status === 'failed';
-  const open = (status: string | undefined): boolean => status === 'working' || status === 'input_required' || status === 'review_requested';
-  const out = new Set<string>();
-  for (const r of p.records) {
-    if (r.state !== 'stopped') continue;
-    const status = p.row(r.taskId)?.status;
-    if (!open(status) || (r.ended === 'reported' && status === 'review_requested')) out.add(workerWorkspaceOf(r));
-  }
-  for (const ws of p.endedNoAgent) {
-    const row = p.workspaceRow(ws);
-    if (row && ended(row.status) && p.records.find((r) => r.taskId === row.id)?.state !== 'resumed') out.add(ws);
-  }
-  for (const ws of p.agentWorkspaces) out.delete(ws);
-  return out;
-}
-
 /** Attempts per ended task before the reclaim gives it up. */
 export const RECLAIM_ATTEMPTS_MAX = 3;
 /** A `stopping` record is looked at again this long after its stop began
@@ -1137,13 +1111,17 @@ export async function reclaimWorker(
           entry.id,
         );
       } else {
+        // The stop's cause is the task's end, whoever ended it (the bot's
+        // ledger_update, its gate, a merge, a close). Freeing memory is the
+        // idle sweeps' cause (the cards above and createResumedIdleSweep's),
+        // not this one's.
         ports.note?.(
           entry.ownerWorkspaceId,
           taskThreadOf(entry),
           `${resumable ? 'Worker done (resumable)' : 'Worker done'}: ${task}`,
           resumable
-            ? `Task ${ended}: its Claude stopped to free memory. ${pane} The ${keptText}; Resume continues the same conversation.`
-            : `Task ${ended}: its Claude stopped to free memory. ${pane} The worktree is kept; no conversation was recorded to resume.`,
+            ? `Task ${ended}: its Claude stopped because the task ended. ${pane} The ${keptText}; Resume continues the same conversation.`
+            : `Task ${ended}: its Claude stopped because the task ended. ${pane} The worktree is kept; no conversation was recorded to resume.`,
           { code: resumable ? 'worker.doneResumable' : 'worker.done', args: { status: ended, title: task, ...(resumable && research ? { kind: 'research' } : {}) } },
           entry.id,
         );
@@ -1371,6 +1349,10 @@ export interface WorkerResumePorts {
   /** Type the launch line + Enter into the pane through the bot worker
    *  launch guard; false when nothing was typed. */
   typeLine: (sessionId: string, line: string) => boolean;
+  /** Each task's launch generation on disk (workerSlots.ts): a resume typed
+   *  into the worker's pane is a new launch, recorded before the line is
+   *  typed. Absent: not recorded. */
+  launches?: Pick<WorkerSlots, 'beginLaunch' | 'launched' | 'released'>;
   /** Whether the pane's agent runs (process truth), for a message. */
   agentAlive?: (sessionId: string) => Promise<boolean>;
   /** Deliver a message to the relaunched agent (waits while someone types). */
@@ -1424,22 +1406,12 @@ export interface WorkerResumePorts {
   senderTainted?: (botId: string) => boolean;
   /** Why the bot's own worker budget refuses one more worker now, or null
    *  (a bot's resume starts a worker like its fan-out does). `starting`:
-   *  the bot's other resumes under way, not yet counted as resumed. */
-  botWorkerRefusal?: (botId: string, starting: number) => string | null;
+   *  the bot's other resumes under way, not yet counted as resumed;
+   *  `taskId`: the task this resume is for. */
+  botWorkerRefusal?: (botId: string, starting: number, taskId?: string) => string | null;
   /** Whether the owner stopped this task (Stop, or bots switched off): a
    *  bot does not start its worker again. Absent: never. */
   stoppedByOwner?: (taskId: string) => boolean;
-}
-
-/** The bot's resumed workers still live outside an open ledger row (the
- *  worker lifecycle host sets the count; 0 while it is not running).
- *  Without a bot id: every bot's. */
-let resumedLiveCount: ((botId?: string) => number) | null = null;
-export function setResumedLiveCount(fn: ((botId?: string) => number) | null): void {
-  resumedLiveCount = fn;
-}
-export function resumedWorkersLive(botId?: string): number {
-  return resumedLiveCount?.(botId) ?? 0;
 }
 
 /** Tasks whose resume is being typed now, or whose workspace is being
@@ -1551,7 +1523,7 @@ async function resumeOnce(
     }
     let budget: string | null = null;
     try {
-      budget = ports.botWorkerRefusal?.(by.botId, botStarting.get(by.botId) ?? 0) ?? null;
+      budget = ports.botWorkerRefusal?.(by.botId, botStarting.get(by.botId) ?? 0, taskId) ?? null;
     } catch (err) {
       budget = `the worker budget could not be read: ${String(err)}`;
     }
@@ -1587,11 +1559,25 @@ async function resumeOnce(
     return refuse('not_reopened', 'the task could not be moved to the worker\'s pane; try again');
   }
   if (stopped()) return refuse('not_now', 'the bot\'s work was stopped while this resume was under way');
+  // A new launch of the task, on disk before the line is typed.
+  let gen: number | null = null;
+  try {
+    gen = ports.launches?.beginLaunch({
+      taskId: rec.taskId, origin: 'bot', botId: rec.botId, ownerWorkspaceId: rec.ownerWorkspaceId,
+      pane: { sessionId: pane.sessionId, workspaceId: workerWorkspaceOf(rec) },
+    }).gen ?? null;
+  } catch (err) {
+    return refuse('not_typed', `the resume was not typed: ${(err as Error).message}`);
+  }
   let typed = false;
   try {
     typed = ports.typeLine(pane.sessionId, line);
   } catch {
     typed = false;
+  }
+  if (gen !== null) {
+    if (typed) ports.launches?.launched(rec.taskId, gen, workerWorkspaceOf(rec), pane.sessionId);
+    else ports.launches?.released(rec.taskId, gen);
   }
   if (!typed) return refuse('not_typed', 'the resume line could not be typed into the worker\'s pane');
   return launched(ports, rec, pane.sessionId, pane.resumeSessionId, workerWorkspaceOf(rec), by, message, onLaunched, 'folder');
@@ -1742,13 +1728,6 @@ async function launched(
   }
   const delivered = up ? await ports.submit(sessionId, text.slice(0, RESUME_MESSAGE_MAX)).catch(() => false) : false;
   return { ...out, messageDelivered: delivered };
-}
-
-/** Ended bot tasks (in the catch-up window) whose worker was not reclaimed
- *  yet: still live for the agent budget. Pure over its inputs. */
-export function unreclaimedEndedWorkers(rows: readonly LedgerEntry[], store: Pick<ReclaimedWorkers, 'get'>, now: number): number {
-  const since = now - RECLAIM_CATCHUP_MS;
-  return rows.filter((e) => e.updatedAt >= since && isReclaimableEnd(e, e.status) && !isReclaimedSince(store.get(e.id), e)).length;
 }
 
 /** How the Bots page shows a reclaimed worker (BotTaskView.worker). Pure. */

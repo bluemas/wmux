@@ -141,6 +141,10 @@ export interface AgentIdentityRow {
   readonly detect?: 'screen';
   /** Hook bridge flavour; see {@link AgentHooksFlavour}. */
   readonly hooks?: AgentHooksFlavour;
+  /** Its transcript marks a turn that ended on an API error
+   *  (`isApiErrorMessage`), read when the StopFailure hook is not installed
+   *  (daemon/transcript/apiErrorTurnEnd). */
+  readonly apiErrorTurnEnd?: true;
   /** MCP registration target (src/shared/mcpTargets.ts). */
   readonly mcp?: AgentMcpTargetSpec;
   /** The pane is a TUI chat box: a pasted line lands in a composer, not a
@@ -160,6 +164,9 @@ export interface AgentIdentityRow {
    *  exact resume under that account's CLAUDE_CONFIG_DIR picks the copy up
    *  (src/daemon/continueOnAccount.ts). */
   readonly continueOnAccount?: true;
+  /** A double ESC at rest, with an empty composer, opens the agent's own
+   *  Rewind picker (src/daemon/transcript/openClaudeRewind.ts). */
+  readonly rewindPicker?: true;
   /** Listed in Settings -> Token usage (activeProviders). */
   readonly tokenUsage?: true;
   /** Has a model discovery source (modelCatalog). */
@@ -189,6 +196,7 @@ export const AGENT_IDENTITIES = [
     process: { packages: ['claude-code', '@anthropic-ai/claude-code'] },
     detect: 'screen',
     hooks: 'claude',
+    apiErrorTurnEnd: true,
     mcp: { format: 'json', configPath: ['.claude.json'], createIfMissing: true, verified: true, autoRegister: true },
     tuiComposer: true,
     dialogs: 'claude',
@@ -196,6 +204,7 @@ export const AGENT_IDENTITIES = [
     terminalChat: { send: true, cancel: true, images: true, queue: true },
     accounts: 'account-store',
     continueOnAccount: true,
+    rewindPicker: true,
     tokenUsage: true,
     modelCatalog: true,
   },
