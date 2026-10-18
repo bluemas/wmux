@@ -132,11 +132,43 @@ describe('DaemonPTYBridge — a Codex title spinner reports running', () => {
   });
 
   it('a braille title after the Codex process ended reports nothing on a shell without OSC 133', () => {
-    bridge.noteAgentEnded(); // the process tracker's death edge
+    bridge.noteAgentProcessAlive();
+    bridge.noteAgentProcessEnded(); // the process tracker's death edge
     vi.advanceTimersByTime(6_000);
-    spin(2, 100);
+    spin(8, 100);
+    vi.advanceTimersByTime(30_000);
+    spin(8, 100);
     expect(active).toHaveLength(0);
     expect(bridge.isTurnOpen()).toBe(false);
+  });
+
+  it('a banner before an OSC 133 mark in the same chunk does not outlive the mark', () => {
+    feed(CODEX_MODES + BANNER + BACK_TO_SHELL);
+    vi.advanceTimersByTime(6_000);
+    spin(8, 100);
+    expect(active).toHaveLength(0);
+
+    // The other order: the shell launches Codex, and its banner follows in the same chunk.
+    feed(LAUNCH_OUTPUT + CODEX_MODES + BANNER);
+    vi.advanceTimersByTime(6_000);
+    spin(3, 100);
+    expect(active).toHaveLength(1);
+  });
+
+  it('a late death edge of the old process leaves a relaunched Codex its pane', () => {
+    bridge.noteAgentProcessAlive(); // the first Codex process, seen alive
+    feed(BACK_TO_SHELL);
+    feed(LAUNCH_OUTPUT);
+    feed(CODEX_MODES + BANNER); // the relaunch, before the old death poll
+    feed(`${' '.repeat(600)}\r\n`); // its first paint pushes the banner out of any tail
+    bridge.noteAgentProcessEnded(); // the old process's death edge, late
+    vi.advanceTimersByTime(6_000);
+    spin(3, 100);
+    expect(active).toHaveLength(1);
+    spin(160, 1_000);
+    expect(active.length).toBeGreaterThan(1);
+    expect(bridge.getAgentStatus()).toBe('running');
+    expect(bridge.isTurnOpen()).toBe(true);
   });
 
   it('a braille title after Codex has exited reports nothing, until Codex boots again', () => {

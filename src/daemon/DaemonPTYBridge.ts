@@ -277,6 +277,15 @@ export class DaemonPTYBridge extends EventEmitter {
    * program writing the pane's title (see noteCodexOutput).
    */
   private codexHoldsPane = false;
+  /** Counts OSC 133 marks: each one hands the pane to another program. */
+  private shellMarkGen = 0;
+  /**
+   * `shellMarkGen` when the daemon last reported the pane's agent process
+   * alive (see noteAgentProcessAlive), or null. That process's death edge
+   * can arrive a monitor cadence late, after the shell relaunched Codex, and
+   * must not take the pane from the newer session.
+   */
+  private aliveProcessMarkGen: number | null = null;
 
   /**
    * Which terminal status settled the pane, while one has. Read only to keep
@@ -998,7 +1007,32 @@ export class DaemonPTYBridge extends EventEmitter {
   noteAgentEnded(): void {
     this.closeTurn();
     this.hookSeen = false;
+  }
+
+  /**
+   * The daemon's process tracker saw the pane's agent process end, or another
+   * agent launch in its place: noteAgentEnded, and Codex gives up the pane
+   * unless the shell has launched a program since that process was seen
+   * alive (a relaunch inside the death poll's lag). A shell without OSC 133
+   * marks shows no launch, so there the end always counts: a relaunched
+   * Codex then falls back to its output, never to another program's title.
+   */
+  noteAgentProcessEnded(): void {
+    this.noteAgentEnded();
+    const aliveGen = this.aliveProcessMarkGen;
+    this.aliveProcessMarkGen = null;
+    if (aliveGen === null || aliveGen === this.shellMarkGen) this.releaseCodexHold();
+  }
+
+  /** The daemon's process tracker reports the pane's agent process alive. */
+  noteAgentProcessAlive(): void {
+    this.aliveProcessMarkGen = this.shellMarkGen;
+  }
+
+  /** Codex no longer holds the pane; a banner already read must not give it back. */
+  private releaseCodexHold(): void {
     this.codexHoldsPane = false;
+    this.codexBannerTail = '';
   }
 
   /**
@@ -1182,11 +1216,17 @@ export class DaemonPTYBridge extends EventEmitter {
    * the pane, not about the boot window or a dialog.
    */
   private noteCodexOutput(data: string): void {
-    const text = this.codexBannerTail + data;
+    // Only what follows the chunk's last OSC 133 mark: a banner before it
+    // belongs to a program the mark says is gone (the mark already dropped
+    // the tail).
+    const mark = data.lastIndexOf('\x1b]133;');
+    const text = this.codexBannerTail + (mark >= 0 ? data.slice(mark) : data);
     // A row can straddle two PTY chunks; keep enough of the tail to rejoin it.
     this.codexBannerTail = text.slice(-DaemonPTYBridge.CODEX_BANNER_TAIL);
     if (this.agentDetector?.getLastAgent() !== 'Codex CLI' || !this.modeTracker?.isSet(2004)) return;
     if (!drawsCodexBanner(text)) return;
+    // Read once: the same banner left in the tail must not count again.
+    this.codexBannerTail = '';
     this.codexHoldsPane = true;
     if (this.codexBootWindow && !this.awaitingHuman) this.preTurn = true;
   }
@@ -1479,10 +1519,9 @@ export class DaemonPTYBridge extends EventEmitter {
           // The shell's foreground program changed hands: whatever episode was
           // open (an agent's, or the Enter that launched the next one) is over.
           if (parsed.type === 'command_start' || parsed.type === 'command_end') this.noteAgentEnded();
-          // The shell is drawing its prompt or running a command: Codex is gone,
-          // and a banner from before this mark must not be read again.
-          this.codexHoldsPane = false;
-          this.codexBannerTail = '';
+          // The shell is drawing its prompt or running a command: Codex is gone.
+          this.shellMarkGen += 1;
+          this.releaseCodexHold();
           this.codexBootWindow = parsed.type === 'command_start' || (parsed.type !== 'command_end' && this.codexBootWindow);
           if (parsed.type === 'prompt_end') {
             this.emptyShellPrompt = this.inputRevision === 0 || this.completedShellCommand;
@@ -1846,6 +1885,8 @@ export class DaemonPTYBridge extends EventEmitter {
     this.codexBootWindow = false;
     this.codexBannerTail = '';
     this.codexHoldsPane = false;
+    this.shellMarkGen = 0;
+    this.aliveProcessMarkGen = null;
     this.lastActiveAt = 0;
     this.turnOpen = false;
     this.turnSoftClosed = false;
