@@ -139,8 +139,8 @@ const attrValue = (m: RegExpMatchArray | null) => (m ? (m[1] ?? m[2] ?? m[3] ?? 
 export function reduceInlineHtml(text: string): string {
   return text.split(/(`[^`\n]+`)/).map((part, i) => {
     if (i % 2 === 1) return part;
-    let t = part.replace(/<img\b[^>]*>/gi, (tag) => decodeEntities(attrValue(attr(tag, 'alt'))));
-    t = t.replace(/<a\b([^>]*)>([\s\S]*?)<\/a\s*>/gi, (_m, attrs: string, inner: string) => {
+    let t = part.replace(/<img\b[^<>]*>/gi, (tag) => decodeEntities(attrValue(attr(tag, 'alt'))));
+    t = t.replace(/<a\b([^<>]*)>((?:(?!<a\b)[\s\S])*?)<\/a\s*>/gi, (_m, attrs: string, inner: string) => {
       const label = decodeEntities(inner.replace(/<[^>]*>/g, '')).replace(/[[\]]/g, '').trim();
       const href = decodeEntities(attrValue(attr(`<a${attrs}>`, 'href'))).trim();
       if (label && HTTP_URL.test(href) && !/[\s()]/.test(href)) return `[${label}](${href})`;
@@ -160,12 +160,21 @@ function preprocessGithubHtml(source: string): string {
   let fence = 0;
   const flush = () => {
     if (chunk.length === 0) return;
-    const text = chunk.join('\n')
+    // Code spans are set aside first, as reduceInlineHtml keeps them: a
+    // `<script>` or comment opener written as code would otherwise swallow
+    // the rest of the document. Skipped if the text holds the sentinels.
+    const joined = chunk.join('\n');
+    const spans: string[] = [];
+    const guarded = /[\uE000\uE001]/.test(joined)
+      ? joined
+      : joined.replace(/`[^`\n]+`/g, (span) => `\uE000${spans.push(span) - 1}\uE001`);
+    const text = guarded
       // \x21 is '!': this file is inlined into the web client's page, whose
       // build refuses a bundle containing a literal comment opener.
       .replace(/<\x21--[\s\S]*?(?:-->|$)/g, '')
       .replace(/<(script|style)\b[^>]*>[\s\S]*?(?:<\/\1\s*>|$)/gi, '')
-      .replace(/<br\s*\/?>/gi, '\n');
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/\uE000(\d+)\uE001/g, (_m, n: string) => spans[Number(n)]);
     // A loop, not push(...spread): a long run of short lines would pass
     // one argument per line and overflow the call stack.
     for (const l of text.split('\n')) out.push(l);
@@ -216,8 +225,8 @@ function renderInline(raw: string, keyPrefix: string, opts: MarkdownOptions = {}
   if (opts.githubHtml) opts = { ...opts, githubHtml: false };
   const parts: React.ReactNode[] = [];
   const regex = opts.links
-    ? /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(\*[^*\n]+\*)|(\[[^\]\n]+\]\([^)\n]+\))|(https?:\/\/[^\s<>()[\]]*[^\s<>()[\].,;:!?'"])/g
-    : /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(\*[^*\n]+\*)|(\[[^\]\n]+\]\([^)\n]+\))/g;
+    ? /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(\*[^*\n]+\*)|(\[[^[\]\n]+\]\([^()\n]+\))|(https?:\/\/[^\s<>()[\]]*[^\s<>()[\].,;:!?'"])/g
+    : /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(\*[^*\n]+\*)|(\[[^[\]\n]+\]\([^()\n]+\))/g;
   let lastIndex = 0;
   let match: RegExpExecArray | null;
   while ((match = regex.exec(text)) !== null) {

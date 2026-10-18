@@ -122,6 +122,24 @@ describe('renderBrainMarkdown', () => {
     expect(() => renderBrainMarkdown('a\n'.repeat(150_000), { githubHtml: true })).not.toThrow();
   });
 
+  it('GitHub HTML: a comment opener or <script> written as inline code hides nothing after it', () => {
+    gh('Use `<\x21--` to open a comment.\n\n# After comment\n\nUse `<script>` here.\n\n# After script');
+    const codes = [...container.querySelectorAll('[data-brain-md-code-inline]')].map((c) => c.textContent);
+    expect(codes).toEqual(['<\x21--', '<script>']);
+    const heads = [...container.querySelectorAll('[data-brain-md-heading]')].map((h) => h.textContent);
+    expect(heads).toEqual(['After comment', 'After script']);
+  });
+
+  it('unclosed link and anchor openers render in linear time', () => {
+    // Each opener once rescanned to the end of the line: ~100 KB of `[`
+    // took seconds. A generous bound still separates linear from quadratic.
+    const start = performance.now();
+    for (const src of ['['.repeat(100_000), '[a](b'.repeat(20_000), '<a>'.repeat(33_000), '<a '.repeat(33_000)]) {
+      renderBrainMarkdown(src, { links: true, githubHtml: true });
+    }
+    expect(performance.now() - start).toBeLessThan(1_500);
+  });
+
   it('renderBrainMarkdownWhole returns null only when the render would be cut', () => {
     expect(renderBrainMarkdownWhole('line\n'.repeat(MAX_BLOCKS - 1))).not.toBeNull();
     expect(renderBrainMarkdownWhole('line\n'.repeat(MAX_BLOCKS + 1))).toBeNull();
