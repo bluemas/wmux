@@ -6,7 +6,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createElement, act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { renderBrainMarkdown, MAX_QUOTE_DEPTH, MAX_BLOCKS } from '../BrainMarkdown';
+import { renderBrainMarkdown, renderBrainMarkdownWhole, MAX_QUOTE_DEPTH, MAX_BLOCKS } from '../BrainMarkdown';
 
 let container: HTMLDivElement;
 let root: Root;
@@ -115,6 +115,16 @@ describe('renderBrainMarkdown', () => {
     expect(() => render('line\n'.repeat(MAX_BLOCKS * 3))).not.toThrow();
     expect(container.querySelectorAll('[data-brain-md-p]').length).toBeLessThanOrEqual(MAX_BLOCKS);
     expect(container.querySelector('[data-brain-md-cut]')).not.toBeNull();
+  });
+
+  it('GitHub HTML: a ~300 KB body of short lines does not overflow the stack', () => {
+    // Preprocessing once pushed every line as one spread argument.
+    expect(() => renderBrainMarkdown('a\n'.repeat(150_000), { githubHtml: true })).not.toThrow();
+  });
+
+  it('renderBrainMarkdownWhole returns null only when the render would be cut', () => {
+    expect(renderBrainMarkdownWhole('line\n'.repeat(MAX_BLOCKS - 1))).not.toBeNull();
+    expect(renderBrainMarkdownWhole('line\n'.repeat(MAX_BLOCKS + 1))).toBeNull();
   });
 
   it('renders consecutive > lines as one blockquote, markdown inside', () => {

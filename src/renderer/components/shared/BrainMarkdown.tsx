@@ -166,7 +166,9 @@ function preprocessGithubHtml(source: string): string {
       .replace(/<\x21--[\s\S]*?(?:-->|$)/g, '')
       .replace(/<(script|style)\b[^>]*>[\s\S]*?(?:<\/\1\s*>|$)/gi, '')
       .replace(/<br\s*\/?>/gi, '\n');
-    out.push(...text.split('\n'));
+    // A loop, not push(...spread): a long run of short lines would pass
+    // one argument per line and overflow the call stack.
+    for (const l of text.split('\n')) out.push(l);
     chunk = [];
   };
   for (const line of lines) {
@@ -306,18 +308,31 @@ export function renderBrainMarkdown(source: string, opts: MarkdownOptions = {}):
   return renderBlocks(opts.githubHtml ? preprocessGithubHtml(source) : source, opts, 0, { left: MAX_BLOCKS });
 }
 
+/** renderBrainMarkdown, or null when the source runs past MAX_BLOCKS and
+ *  the render would be cut short. For callers that must show the whole
+ *  document (the editor's View mode falls back to raw text). */
+export function renderBrainMarkdownWhole(source: string, opts: MarkdownOptions = {}): React.ReactNode[] | null {
+  const budget: BlockBudget = { left: MAX_BLOCKS };
+  const nodes = renderBlocks(opts.githubHtml ? preprocessGithubHtml(source) : source, opts, 0, budget);
+  return budget.cut ? null : nodes;
+}
+
 /** Quotes nest this deep; a deeper `>` renders as text. Untrusted text (an
  *  issue body) could otherwise nest thousands deep and overflow the stack. */
 export const MAX_QUOTE_DEPTH = 4;
 /** Blocks drawn per render, every quote level together; the rest is cut. */
 export const MAX_BLOCKS = 2000;
 
-function renderBlocks(source: string, opts: MarkdownOptions, depth: number, budget: { left: number }): React.ReactNode[] {
+/** Blocks left to draw; `cut` is set once a render ran out of them. */
+interface BlockBudget { left: number; cut?: boolean }
+
+function renderBlocks(source: string, opts: MarkdownOptions, depth: number, budget: BlockBudget): React.ReactNode[] {
   const lines = source.split('\n');
   const out: React.ReactNode[] = [];
   let i = 0;
   while (i < lines.length) {
     if (budget.left <= 0) {
+      budget.cut = true;
       out.push(<div key={out.length} data-brain-md-cut className="text-[var(--text-muted)]">…</div>);
       break;
     }

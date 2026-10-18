@@ -52,4 +52,11 @@ describe('EditorPanel View mode', () => {
     expect(container.querySelector('[data-testid="editor-markdown"]')).toBeNull();
     expect(container.querySelector('pre')?.textContent).toBe('# not a heading\n');
   });
+
+  it('shows a markdown file too long to render whole as raw text, last line included', async () => {
+    const text = Array.from({ length: 2001 }, (_, i) => `line ${i + 1}`).join('\n\n');
+    await open('/p/long.md', text);
+    expect(container.querySelector('[data-testid="editor-markdown"]')).toBeNull();
+    expect(container.querySelector('pre')?.textContent).toContain('line 2001');
+  });
 });
