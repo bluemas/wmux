@@ -486,55 +486,6 @@ describe('AgentProcessTracker', () => {
     expect(listener).toHaveBeenCalledWith('s1', { slug: 'claude', alive: false });
   });
 
-  it('a death edge that re-arms picks a same-slug relaunch, and the superseded pid stays silent', async () => {
-    // The daemon re-arms on every death edge while the screen still names an
-    // agent: a Codex relaunched inside the death poll's lag opens no detector
-    // gate again, so nothing else would probe for it.
-    const watcher = makeWatcher();
-    let table = [entry(200, SHELL, 'codex')];
-    const tracker = new AgentProcessTracker(watcher, async () => table);
-    const states: Array<{ slug?: string; alive: boolean }> = [];
-    tracker.setStateChangeListener((id, state) => {
-      states.push(state);
-      if (!state.alive) tracker.armIfAgent(id, SHELL);
-    });
-
-    tracker.arm('s1', SHELL);
-    await flush();
-    const oldDeath = watcher.watches.get('agent:s1')?.onDead;
-    table = [entry(300, SHELL, 'codex')]; // the relaunch, before the poll noticed
-    oldDeath?.();
-    await flush();
-    expect(watcher.watches.get('agent:s1')?.pid).toBe(300);
-    expect(tracker.identityFor('s1')).toEqual({ slug: 'codex', alive: true });
-    expect(states).toEqual([
-      { slug: 'codex', alive: true },
-      { slug: 'codex', alive: false },
-      { slug: 'codex', alive: true },
-    ]);
-
-    // A second report of the old pid's death changes nothing.
-    oldDeath?.();
-    expect(tracker.identityFor('s1')).toEqual({ slug: 'codex', alive: true });
-    expect(states).toHaveLength(3);
-  });
-
-  it('a death edge that re-arms never takes a background job left behind for the agent', async () => {
-    const watcher = makeWatcher();
-    let table = [entry(200, SHELL, 'codex')];
-    const tracker = new AgentProcessTracker(watcher, async () => table);
-    tracker.setStateChangeListener((id, state) => {
-      if (!state.alive) tracker.armIfAgent(id, SHELL);
-    });
-
-    tracker.arm('s1', SHELL);
-    await flush();
-    table = [entry(400, SHELL, 'tail', 'tail -f build.log')];
-    watcher.watches.get('agent:s1')?.onDead();
-    await flush();
-    expect(tracker.identityFor('s1')).toEqual({ slug: 'codex', alive: false });
-  });
-
   it('disarm clears state, and a disarm racing an in-flight arm wins', async () => {
     const watcher = makeWatcher();
     let release: (v: ProcessTreeEntry[]) => void = () => undefined;

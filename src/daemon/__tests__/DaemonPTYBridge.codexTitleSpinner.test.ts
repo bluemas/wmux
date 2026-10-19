@@ -192,6 +192,15 @@ describe('DaemonPTYBridge — a Codex title spinner reports running', () => {
     expect(bridge.isTurnOpen()).toBe(false);
   });
 
+  it('Codex dying right after the first frame leaves no cycle reading running', () => {
+    spin(1, 100); // arms the cycle; no output follows to start its idle countdown
+    bridge.noteAgentEnded();
+    bridge.noteAgentProcess({ slug: 'codex', alive: false });
+    vi.advanceTimersByTime(60_000);
+    expect(bridge.isTurnOpen()).toBe(false);
+    expect(bridge.getAgentStatus()).not.toBe('running');
+  });
+
   it('another tracked agent ignores the braille title; a late launch edge does not stop a Codex turn', () => {
     bridge.noteAgentProcess({ slug: 'claude', alive: true });
     spin(8, 100);

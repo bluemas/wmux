@@ -8869,13 +8869,9 @@ async function main(): Promise<void> {
     // screen names an agent: arm() skipped probing while that pick read
     // alive, so an agent launched in the meantime was never attributed.
     // Probe again, or the launch edge that consumes the recovery offer and
-    // names the pane never comes. A named agent's death probes for a named
-    // agent only: one relaunched inside the death poll's lag opens no
-    // detector gate again, and a background job left behind must not be
-    // taken for it.
-    if (!state.alive && managed.bridge.getLastAgent()) {
-      if (state.slug === undefined) agentProcessTracker.arm(sessionId, managed.meta.pid);
-      else agentProcessTracker.armIfAgent(sessionId, managed.meta.pid);
+    // names the pane never comes.
+    if (!state.alive && state.slug === undefined && managed.bridge.getLastAgent()) {
+      agentProcessTracker.arm(sessionId, managed.meta.pid);
     }
     // A death edge, or a launch edge for a different agent than the last one
     // seen here, ends the previous agent's running episode.

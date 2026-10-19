@@ -872,6 +872,7 @@ export class DaemonPTYBridge extends EventEmitter {
       // onActive does: the footer still on screen must not settle it again.
       if (promoted) this.spinnerArmedCycle = true;
       monitor.beginTurnIfInactive(sessionId);
+      this.titleArmedCycle = true;
       return;
     }
     if (now - this.lastActiveAt < DaemonPTYBridge.CODEX_SPINNER_REFRESH_MS) return;
@@ -882,6 +883,10 @@ export class DaemonPTYBridge extends EventEmitter {
       likelyRepaint: false,
     });
   }
+
+  /** The activity cycle was last armed by noteCodexTitleSpinner; the tracked
+   *  process dying hands it back (noteAgentProcess). */
+  private titleArmedCycle = false;
 
   /** How often a still-spinning Codex title re-reports running (well inside
    *  the renderer's 120 s activity window). */
@@ -1025,6 +1030,11 @@ export class DaemonPTYBridge extends EventEmitter {
    */
   noteAgentProcess(state: { slug?: string; alive: boolean }): void {
     this.trackedAgent = { ...(state.slug ? { slug: state.slug } : {}), alive: state.alive };
+    // A cycle the title armed waits for output to start its idle countdown;
+    // an agent that died right after the frame writes none, and the cycle
+    // would read running forever. It goes with the process.
+    if (!state.alive && this.titleArmedCycle && this.sessionId) this.activityMonitor?.endTurn(this.sessionId);
+    if (!state.alive) this.titleArmedCycle = false;
   }
 
   /**
