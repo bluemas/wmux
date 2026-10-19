@@ -37,6 +37,7 @@ interface StateOverrides {
   surfaceActivity?: Record<string, string>;
   surfaceActivityAt?: Record<string, number>;
   surfaceTurnOpenAt?: Record<string, number>;
+  surfaceSubagents?: Record<string, number>;
   paneLabel?: Record<string, string>;
   agentClockMs?: number;
   remoteWorkspaces?: StoreState['remoteWorkspaces'];
@@ -569,6 +570,31 @@ describe('createWorkspaceAgentRosterSelector memoization', () => {
     expect(second).not.toBe(first);
     expect(second.rows[0].status).toBe('awaiting_input');
     expect(second.needsAttentionCount).toBe(1);
+  });
+
+  it('carries the subagent count, and a new count is a new reference', () => {
+    const select = createWorkspaceAgentRosterSelector('ws-1');
+    const first = select(state({ workspaces: [ws], surfaceAgent: agents }));
+    expect(first.rows[0].subagents).toBeUndefined();
+    const second = select(state({ workspaces: [ws], surfaceAgent: agents, surfaceSubagents: { 'pty-1': 2 } }));
+    expect(second).not.toBe(first);
+    expect(second.rows[0].subagents).toBe(2);
+    const third = select(state({ workspaces: [ws], surfaceAgent: agents, surfaceSubagents: { 'pty-1': 1 } }));
+    expect(third).not.toBe(second);
+    expect(third.rows[0].subagents).toBe(1);
+    const same = select(state({ workspaces: [ws], surfaceAgent: agents, surfaceSubagents: { 'pty-1': 1 } }));
+    expect(same).toBe(third);
+  });
+
+  it('a stashed pane carries its subagent count too', () => {
+    const stashedPane = { pane: leaf('p2', [surface('s2', 'pty-2')]) as Extract<Pane, { type: 'leaf' }>, stashedAt: NOW };
+    const withStash = { ...ws, stashedPanes: [stashedPane] };
+    const r = selectWorkspaceAgentRoster(state({
+      workspaces: [withStash],
+      surfaceAgent: { ...agents, 'pty-2': { name: 'B', status: 'idle' } },
+      surfaceSubagents: { 'pty-2': 3 },
+    }), 'ws-1');
+    expect(r.rows.find((row) => row.stashed)?.subagents).toBe(3);
   });
 
   it('returns a NEW reference when a row is added or removed', () => {

@@ -30,6 +30,11 @@
 //   - Lifecycle by reconcile. One unref'd timer; each tick re-derives the set
 //     of sessions that should be watched and drops the rest, so an agent exit
 //     or a closed pane can never leak a watcher.
+//   - Subagent count (subagentCount.ts). An agent with a counter (Claude,
+//     Codex) is read even while hook-fed, for the count only. A count is sent
+//     on change, and a watch that ends (agent death, session start, closed
+//     pane, replaced file) sends 0 if it had sent more, so a stale count never
+//     sticks.
 
 import type { ResumeBinding } from '../../shared/agentResume';
 import type { TurnEvent } from '../../shared/transcript/turnEvents';
@@ -39,6 +44,7 @@ import { isLineBoundary, readTranscriptDelta, readTranscriptPage, statTranscript
 import { HOOK_ACTIVITY_KINDS } from '../../shared/hooks/hookActivityKinds';
 import { MAX_RAW_LEN, summarizeActivity } from '../../shared/activitySummary';
 import { agentRow } from '../../shared/agentIdentity';
+import { SUBAGENT_COUNTERS, type SubagentCounter } from './subagentCount';
 
 /** Most bytes read for one session in one tick. */
 export const READ_CAP_BYTES = 256 * 1024;
@@ -124,6 +130,8 @@ export interface TranscriptActivityDeps {
   isAgentAlive: (sessionId: string) => boolean | undefined;
   /** Report a line ('' clears) for the session. */
   emit: (sessionId: string, activity: string) => void;
+  /** Report how many subagents the session's agent has running (on change). */
+  emitSubagents?: (sessionId: string, count: number) => void;
   /**
    * Every complete line read from a Claude transcript, in file order, with the
    * file it came from (the API-error turn end reads it; see apiErrorTurnEnd).
@@ -158,6 +166,10 @@ interface Watch {
   linesOnly: boolean;
   /** The one-time `onClaudeLine` replay of the window before `offset` is still owed. */
   replay?: boolean;
+  /** Counts the agent's running subagents from the lines `parse` reads. */
+  subagents?: SubagentCounter;
+  /** The count last sent (0 before any). */
+  subagentsSent: number;
 }
 
 /**
@@ -234,17 +246,18 @@ export class TranscriptActivityWatcher {
     if (LIVE_HOOK_KINDS.has(kind) || HOOK_ACTIVITY_KINDS.has(kind)) this.liveHookAt.set(sessionId, at);
     if (HOOK_ACTIVITY_KINDS.has(kind)) {
       this.hookFed.add(sessionId);
-      // The hook owns the activity line now; the Claude lines still matter.
+      // The hook owns the activity line now; the Claude lines and the
+      // subagent count still matter.
       const watch = this.watches.get(sessionId);
-      if (watch?.lines) {
+      if (watch?.lines || watch?.subagents) {
         watch.linesOnly = true;
         watch.sent = undefined;
         watch.pending = undefined;
-      } else this.watches.delete(sessionId);
+      } else this.dropWatch(sessionId);
     } else if (kind === 'agent.session_start') {
       this.sessionStartAt.set(sessionId, at);
       this.hookFed.delete(sessionId);
-      this.watches.delete(sessionId);
+      this.dropWatch(sessionId);
     } else if (kind === 'agent.stop' || kind === 'agent.stop_failure' || kind === 'agent.user_prompt_submit') {
       // The hook cleared (or is about to replace) the line: the next tool is new.
       const watch = this.watches.get(sessionId);
@@ -260,7 +273,7 @@ export class TranscriptActivityWatcher {
 
   /** The pane closed or its PTY died. */
   dropSession(sessionId: string): void {
-    this.watches.delete(sessionId);
+    this.dropWatch(sessionId);
     this.hookFed.delete(sessionId);
     this.liveHookAt.delete(sessionId);
     this.sessionStartAt.delete(sessionId);
@@ -295,12 +308,12 @@ export class TranscriptActivityWatcher {
     for (const map of [this.liveHookAt, this.sessionStartAt, this.deadSince]) {
       for (const id of [...map.keys()]) if (!live.has(id)) map.delete(id);
     }
-    for (const [id] of this.watches) if (!live.has(id)) this.watches.delete(id);
+    for (const [id] of [...this.watches]) if (!live.has(id)) this.dropWatch(id);
     for (const id of live) {
       try {
         this.reconcile(id);
       } catch {
-        this.watches.delete(id);
+        this.dropWatch(id);
       }
     }
     this.dropSharedTranscripts();
@@ -309,10 +322,26 @@ export class TranscriptActivityWatcher {
         this.read(id, watch);
       } catch {
         // One unreadable transcript must never stop the others.
-        this.watches.delete(id);
+        this.dropWatch(id);
       }
+      if (this.watches.get(id) === watch) this.flushSubagents(id, watch);
     }
     this.deps.afterTick?.();
+  }
+
+  /** Ends a watch; a subagent count it had sent goes back to 0. */
+  private dropWatch(id: string): void {
+    const watch = this.watches.get(id);
+    if (!watch) return;
+    this.watches.delete(id);
+    if (watch.subagentsSent > 0) this.deps.emitSubagents?.(id, 0);
+  }
+
+  private flushSubagents(id: string, watch: Watch): void {
+    const count = watch.subagents?.count ?? 0;
+    if (count === watch.subagentsSent) return;
+    watch.subagentsSent = count;
+    this.deps.emitSubagents?.(id, count);
   }
 
   /** One transcript, one pane: the pane whose agent spoke last keeps it. */
@@ -322,7 +351,7 @@ export class TranscriptActivityWatcher {
       const other = byPath.get(watch.path);
       if (other === undefined) { byPath.set(watch.path, id); continue; }
       const keep = (this.liveHookAt.get(id) ?? 0) > (this.liveHookAt.get(other) ?? 0) ? id : other;
-      this.watches.delete(keep === id ? other : id);
+      this.dropWatch(keep === id ? other : id);
       byPath.set(watch.path, keep);
     }
   }
@@ -331,10 +360,11 @@ export class TranscriptActivityWatcher {
     const fed = this.hookFed.has(id);
     let binding = fed || !this.agentAlive(id) ? undefined : this.deps.getBinding(id);
     // A hook-fed Claude pane is still read for its lines (an API-error turn
-    // end has no hook on an install without StopFailure), never for activity.
-    if (fed && this.deps.onClaudeLine && this.agentAlive(id)) {
+    // end has no hook on an install without StopFailure), and a hook-fed pane
+    // whose subagents can be counted for that count; never for activity.
+    if (fed && this.agentAlive(id)) {
       const own = this.deps.getBinding(id);
-      if (agentRow(own?.agent)?.apiErrorTurnEnd) binding = own;
+      if ((this.deps.onClaudeLine && agentRow(own?.agent)?.apiErrorTurnEnd) || (own && SUBAGENT_COUNTERS[own.agent])) binding = own;
     }
     const agentParse = binding ? PARSERS[binding.agent] : undefined;
     const path = binding?.transcriptPath;
@@ -344,20 +374,21 @@ export class TranscriptActivityWatcher {
       : agentParse;
     const current = this.watches.get(id);
     if (!parse || !path) {
-      this.watches.delete(id);
+      this.dropWatch(id);
       return;
     }
     if (current && current.path === path) {
       current.linesOnly = this.hookFed.has(id);
       return;
     }
+    // A watch of another file ends here: its count goes with it.
+    this.dropWatch(id);
     const stat = statTranscript(path);
-    if (!stat) {
-      this.watches.delete(id);
-      return;
-    }
+    if (!stat) return;
+    const subagents = binding ? SUBAGENT_COUNTERS[binding.agent]?.() : undefined;
+    const counted: ParseLine = subagents ? (line, offset) => { subagents.noteLine(line); return parse(line, offset); } : parse;
     // Start at the end: only what the agent writes from now on.
-    this.watches.set(id, { path, parse, ino: stat.ino, offset: stat.size, sentAt: 0, lines: !!onLine, linesOnly: this.hookFed.has(id), replay: !!onLine });
+    this.watches.set(id, { path, parse: counted, ino: stat.ino, offset: stat.size, sentAt: 0, lines: !!onLine, linesOnly: this.hookFed.has(id), replay: !!onLine, subagents, subagentsSent: 0 });
   }
 
   /** The one-time `onClaudeLine` replay a watch owes, if it owes one. */
@@ -381,7 +412,7 @@ export class TranscriptActivityWatcher {
     this.replayLines(id, watch);
     const stat = statTranscript(watch.path);
     if (!stat) {
-      this.watches.delete(id);
+      this.dropWatch(id);
       return;
     }
     let events: TurnEvent[] = [];
@@ -393,22 +424,27 @@ export class TranscriptActivityWatcher {
       watch.ino = stat.ino;
       watch.offset = stat.size;
       watch.pending = undefined;
+      watch.subagents?.reset();
       // In this tick, before afterTick settles a pending error the new file
       // may already have moved past.
       watch.replay = watch.lines;
       this.replayLines(id, watch);
     } else if (stat.size - watch.offset > READ_CAP_BYTES) {
       if (watch.lines) this.deps.onClaudeGap?.(id);
+      // Skipped lines may have started or ended subagents: count afresh from
+      // the window read below.
+      watch.subagents?.reset();
       const page = readTranscriptPage(watch.path, { maxBytes: JUMP_WINDOW_BYTES, parseLine: watch.parse });
-      if (!page) { this.watches.delete(id); return; }
+      if (!page) { this.dropWatch(id); return; }
       events = page.events;
       watch.offset = page.cursor.tailOffset;
     } else if (stat.size > watch.offset) {
       const delta = readTranscriptDelta(watch.path, watch.offset, READ_CAP_BYTES, watch.parse);
-      if (!delta) { this.watches.delete(id); return; }
+      if (!delta) { this.dropWatch(id); return; }
       if (delta.reset) {
         // Rewritten under the read: like a replacement, a gap then one replay.
         watch.offset = stat.size;
+        watch.subagents?.reset();
         watch.replay = watch.lines;
         this.replayLines(id, watch);
       } else {
