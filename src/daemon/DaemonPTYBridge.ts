@@ -884,8 +884,9 @@ export class DaemonPTYBridge extends EventEmitter {
     });
   }
 
-  /** The activity cycle was last armed by noteCodexTitleSpinner; the tracked
-   *  process dying hands it back (noteAgentProcess). */
+  /** The activity cycle was armed by noteCodexTitleSpinner and no output has
+   *  reached it yet; the tracked Codex dying or being replaced hands it back
+   *  (noteAgentProcess). Output (onActive) or idle clears it. */
   private titleArmedCycle = false;
 
   /** How often a still-spinning Codex title re-reports running (well inside
@@ -1321,6 +1322,7 @@ export class DaemonPTYBridge extends EventEmitter {
     // explicit waiting/complete state five seconds later.
     this.idleUnsubscribe = activityMonitor.onActiveToIdle((ptyId) => {
       this.hookArmedCycle = false;
+      this.titleArmedCycle = false;
       // F24: an episode only output opened, on a hook pane, ends when that
       // output stops (see `byteOpenedTurn`). Five seconds of byte silence
       // means no spinner either; the spinner title is output too. Softly, so
@@ -1336,6 +1338,9 @@ export class DaemonPTYBridge extends EventEmitter {
     // keystrokes quiet and outside the resize-redraw window — the three things
     // that separate an autonomous turn from echo and repaints.
     this.activeUnsubscribe = activityMonitor.onActive((ptyId) => {
+      // Output reached the cycle and started its idle countdown: whatever
+      // armed it, it can no longer read running forever.
+      this.titleArmedCycle = false;
       let likelyRepaint = false;
 
       if (this.explicitTerminalStatus) {
