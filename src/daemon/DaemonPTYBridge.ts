@@ -882,10 +882,15 @@ export class DaemonPTYBridge extends EventEmitter {
       if (this.titleCycleTimer) clearTimeout(this.titleCycleTimer);
       this.titleCycleTimer = setTimeout(() => {
         this.titleCycleTimer = null;
-        if (this.titleArmedCycle === null) return;
+        // Only the cycle the title armed, unclaimed: output, a submit, an idle
+        // or a hook took any other over, and it is theirs to end.
+        if (!this.titleCycleStillPending()) {
+          this.titleArmedCycle = null;
+          return;
+        }
         // No output at all since the frame: a turn the title opened ends as
         // if its frame had dropped (endSpinnerTurn releases the cycle too).
-        if (this.spinnerOpenedTurn && this.turnOpen && !this.awaitingHuman) this.endSpinnerTurn();
+        if (this.spinnerOpenedTurn && this.turnOpen && !this.awaitingHuman && !this.hookSeen) this.endSpinnerTurn();
         else this.releaseTitleCycle();
       }, DaemonPTYBridge.TITLE_CYCLE_IDLE_MS);
       return;
@@ -1065,12 +1070,16 @@ export class DaemonPTYBridge extends EventEmitter {
       clearTimeout(this.titleCycleTimer);
       this.titleCycleTimer = null;
     }
-    const monitor = this.activityMonitor;
-    if (
-      this.titleArmedCycle !== null && this.sessionId && monitor
-      && monitor.cycleOf(this.sessionId) === this.titleArmedCycle && !this.hookArmedCycle
-    ) monitor.endTurn(this.sessionId);
+    if (this.titleCycleStillPending() && this.sessionId) this.activityMonitor?.endTurn(this.sessionId);
     this.titleArmedCycle = null;
+  }
+
+  /** The cycle noteCodexTitleSpinner armed is still the monitor's current
+   *  one, and no hook has claimed it. */
+  private titleCycleStillPending(): boolean {
+    const monitor = this.activityMonitor;
+    return this.titleArmedCycle !== null && !!this.sessionId && !!monitor
+      && monitor.cycleOf(this.sessionId) === this.titleArmedCycle && !this.hookArmedCycle;
   }
 
   /**
