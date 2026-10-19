@@ -408,6 +408,12 @@ const electronAPI = {
       ipcRenderer.on(IPC.PTY_FLUSH_COMPLETE, listener);
       return () => { ipcRenderer.removeListener(IPC.PTY_FLUSH_COMPLETE, listener); };
     },
+    // Main dropped a write for this pty: the bytes never reached its shell.
+    onWriteDropped: (callback: (id: string) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, id: string) => callback(id);
+      ipcRenderer.on(IPC.PTY_WRITE_DROPPED, listener);
+      return () => { ipcRenderer.removeListener(IPC.PTY_WRITE_DROPPED, listener); };
+    },
   },
   // X8 supervision control (renderer-only, pane context menu). `rearm` resets a
   // tripped runaway guard and restarts the pane once; `stop` disarms it. Both
@@ -904,6 +910,11 @@ const electronAPI = {
       // #2404 — Settings' Update: adds only what a newer build expects.
       update: () =>
         ipcRenderer.invoke(IPC.HOOKS_BRIDGE_UPDATE) as Promise<
+          import('../cli/commands/setupHooks').UpdateOutcome
+        >,
+      // The same Update for one Claude account folder, named by account id.
+      updateAccount: (accountId: string) =>
+        ipcRenderer.invoke(IPC.HOOKS_BRIDGE_UPDATE_ACCOUNT, accountId) as Promise<
           import('../cli/commands/setupHooks').UpdateOutcome
         >,
       allowWorkerTools: () =>

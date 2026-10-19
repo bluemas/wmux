@@ -98,6 +98,7 @@ import { probeProjectConfig, maybeAutoApplyProjectLayout, workspaceProbeCwd } fr
 import { serializeTerminalBuffer } from '../../utils/scrollbackDump';
 import { pastePtyChunked } from '../../utils/clipboardChunk';
 import { isDaemonModeActive, setDaemonModeActive } from '../../daemon/daemonMode';
+import { noteDaemonConnected, noteDaemonDisconnected, noteDaemonGaveUp, noteDaemonReconnecting, notePaneReattached, notePaneWriteDropped, setDaemonLinkSurfaceResolver, type DaemonPaneRef } from '../../daemon/daemonLinkNotice';
 import { planAgentCandidateSeed, planLiveAgentSeed, asAgentSlug, markSeedAttempted } from '../../channels/agentCandidateSeed';
 import { agentSlugToDisplay } from '../../../shared/agentIdentity';
 import { RECONCILE_TIMEOUT_MS } from '../../../shared/timeouts';
@@ -1733,9 +1734,34 @@ export default function AppLayout() {
     });
     const offConnected = window.electronAPI.daemon.onConnected(() => {
       setDaemonModeActive(true);
+      noteDaemonConnected();
     });
+    // Every surface bound to a pty right now, keyed for the link notice.
+    const boundSurfaces = (): DaemonPaneRef[] => useStore.getState().workspaces.flatMap((ws) =>
+      getWorkspaceLeafPanes(ws).flatMap((leaf) => leaf.surfaces
+        .filter((sf) => sf.ptyId)
+        .map((sf) => ({ surfaceId: sf.id, ptyId: sf.ptyId as string }))));
     const offDisconnected = window.electronAPI.daemon.onDisconnected(() => {
       setDaemonModeActive(false);
+      // Every pane bound right now was attached to the daemon that dropped.
+      noteDaemonDisconnected(boundSurfaces());
+    });
+    // A pane is back once its own session pipe has replayed; the surface
+    // lookup covers a reconcile that rebound it to a new session.
+    const surfaceForPty = (ptyId: string): string | null => boundSurfaces().find((p) => p.ptyId === ptyId)?.surfaceId ?? null;
+    setDaemonLinkSurfaceResolver(surfaceForPty);
+    const offFlushComplete = window.electronAPI.pty.onFlushComplete((ptyId) => {
+      notePaneReattached(ptyId, () => surfaceForPty(ptyId));
+    });
+    // Main dropped a write: whatever sent it, it never reached the shell.
+    const offWriteDropped = window.electronAPI.pty.onWriteDropped((ptyId) => {
+      notePaneWriteDropped(ptyId);
+    });
+    const offReconnecting = window.electronAPI.daemon.onReconnecting(({ attempt }) => {
+      noteDaemonReconnecting(attempt);
+    });
+    const offRespawnExhausted = window.electronAPI.daemon.onRespawnExhausted(() => {
+      noteDaemonGaveUp();
     });
     // B′ stale-daemon auto-replacement started: without this toast the pane
     // freeze + scrollback replay during suspend→respawn→recover reads as an
@@ -1747,6 +1773,10 @@ export default function AppLayout() {
       offConnected();
       offDisconnected();
       offReplacing();
+      offReconnecting();
+      offRespawnExhausted();
+      offFlushComplete();
+      offWriteDropped();
     };
   }, []);
 

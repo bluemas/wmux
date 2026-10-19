@@ -86,7 +86,7 @@ import { BOT_EVENT } from '../../shared/bot';
 import type { LedgerEntry } from '../../shared/ledger';
 import { git } from '../git/git';
 import { getSharedTaskGateRunner } from '../worktask/TaskGateRunner';
-import { isPidAlive, sessionsStartedIn, stopSessionsInDir } from '../worktask/stopSessionsInDir';
+import { TREE_DESTROY_TIMEOUT_MS, destroyedTreeOf, isPidAlive, sessionsStartedIn, stopSessionsInDir } from '../worktask/stopSessionsInDir';
 import { getWorkspaceMirror } from '../workspace/WorkspaceMirror';
 import { originDefaultRef, taskFolderFromMissions, worktreeFromMissions } from './verifyPreset';
 import { completeCheckedTask, completeMergedTask, completeResearchTask, gateCardNoted, installTaskGate, recordNoChangesGate, worktreeHeadMerged } from './taskGate';
@@ -664,7 +664,9 @@ export async function stopTaskWorker(
       ? async () => (await listSessions()).filter((x) => agentLive.has(x.id) && !stoppedAgents.has(x.id))
       : listSessions,
     destroySession: async (id) => {
-      await rpc('daemon.destroySession', { id });
+      const c = client();
+      if (!c) throw new Error('the daemon is not connected');
+      return destroyedTreeOf(await c.rpc('daemon.destroySession' as never, { id, killTree: true }, { timeoutMs: TREE_DESTROY_TIMEOUT_MS }));
     },
     isAlive: isPidAlive,
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),

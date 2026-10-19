@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { EventEmitter } from 'node:events';
 
 // Local PTY mode writes the same pid-map anchors as daemon mode, through the
 // shared helpers, so a pane keeps one PID and dispose clears it by content.
@@ -81,5 +82,90 @@ describe('PTYManager pid-map anchors', () => {
 
       expect(read(4321)).toBe('daemon-other');
     } finally { manager.disposeAll(); }
+  });
+  // #2398 — node-pty 1.2.0-beta on Windows: pid 0 until the output pipe
+  // connects, and a CreateProcess failure is an exit while it is still 0.
+  const deferredPty = () => {
+    const exits = new EventEmitter();
+    const p = {
+      pid: 0,
+      _socket: new EventEmitter(),
+      kill: vi.fn(),
+      onData: vi.fn(),
+      onExit: (listener: (e: { exitCode: number }) => void) => {
+        exits.on('exit', listener);
+        return { dispose: () => { exits.off('exit', listener); } };
+      },
+      write: vi.fn(),
+      resize: vi.fn(),
+      fail: (exitCode: number) => exits.emit('exit', { exitCode }),
+    };
+    return p;
+  };
+
+  it('writes the anchor for the pid the deferred ConPTY reports, never for 0', async () => {
+    const late = deferredPty();
+    spawn.mockImplementationOnce(() => late as never);
+    const manager = new PTYManager();
+    try {
+      const pending = manager.createAsync({});
+      await new Promise<void>((r) => setImmediate(r));
+      expect(read(0)).toBeNull();
+      expect(manager.get('pty-1')).toBeUndefined();
+      late.pid = 6543;
+      late._socket.emit('ready_datapipe');
+      const instance = await pending;
+      expect(read(6543)).toBe(instance.id);
+      expect(read(0)).toBeNull();
+    } finally { manager.disposeAll(); }
+  });
+
+  it('registers nothing when the spawn fails before a pid exists', async () => {
+    const failed = deferredPty();
+    spawn.mockImplementationOnce(() => failed as never);
+    const manager = new PTYManager();
+    try {
+      const pending = manager.createAsync({});
+      await new Promise<void>((r) => setImmediate(r));
+      failed.fail(267);
+      await expect(pending).rejects.toThrow(/Cannot create process, error code: 267$/);
+      expect(manager.get('pty-1')).toBeUndefined();
+      expect(read(0)).toBeNull();
+      expect(fs.existsSync(mapDir) ? fs.readdirSync(mapDir) : []).toEqual([]);
+    } finally { manager.disposeAll(); }
+  });
+
+  it('reports a cancel, not the spawn error, when a disposed create then fails to spawn', async () => {
+    const failed = deferredPty();
+    spawn.mockImplementationOnce(() => failed as never);
+    const manager = new PTYManager();
+    try {
+      const pending = manager.createAsync({});
+      await new Promise<void>((r) => setImmediate(r));
+      manager.dispose('pty-1');
+      failed.fail(87);
+      await expect(pending).rejects.toThrow(/^PTY creation cancelled$/);
+    } finally { manager.disposeAll(); }
+  });
+
+  it('counts creates whose pid is pending against the instance limit, before spawning', async () => {
+    const pending: Array<ReturnType<typeof deferredPty>> = [];
+    spawn.mockImplementation(() => { const p = deferredPty(); pending.push(p); return p as never; });
+    const manager = new PTYManager();
+    try {
+      const creates = Array.from({ length: 21 }, () => manager.createAsync({}));
+      const settled = Promise.allSettled(creates);
+      await new Promise<void>((r) => setImmediate(r));
+      expect(pending).toHaveLength(20);
+      pending.forEach((p, i) => { p.pid = 9000 + i; p._socket.emit('ready_datapipe'); });
+      const results = await settled;
+      expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(20);
+      const rejected = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
+      expect(rejected.map((r) => String(r.reason?.message))).toEqual([expect.stringContaining('Maximum PTY instances reached')]);
+    } finally {
+      manager.disposeAll();
+      spawn.mockReset();
+      spawn.mockImplementation(() => ({ pid: 4321, kill: vi.fn(), onData: vi.fn(), onExit: vi.fn(), write: vi.fn(), resize: vi.fn() }));
+    }
   });
 });

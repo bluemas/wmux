@@ -69,7 +69,7 @@ import { normalizeRepoKey } from '../../shared/repoKey';
 import { isOriginPin } from '../../shared/originPin';
 import { emptyUsage, pruneUsage, sanitizeUsage, type BotUsage } from './budget';
 import { createFilePersister, readVersionedFile, type FilePersister } from './versionedFile';
-import { LEGACY_TRIAGE_TRIGGERS, defaultTriggers } from './roleDefaults';
+import { LEGACY_TRIAGE_TRIGGERS, LEGACY_VERIFIER_TRIGGERS, defaultTriggers } from './roleDefaults';
 import { parseBotAvatar } from './botAvatar';
 import { validateBotWorkerAgent } from '../../shared/botWorkerAgent';
 import { BOT_BRAIN_MODEL_MAX, validateBotBrainModel, validateFanoutModel } from '../../shared/fanoutPreset';
@@ -432,8 +432,9 @@ export class BotStore implements BotDirectoryApi {
   }
 
   /** Read the file (missing → empty). Throws on another version. A triage
-   *  profile still on the old default triggers gets the current defaults
-   *  (written back); triggers the owner edited are kept as they are. */
+   *  or verifier profile still on its role's old default triggers gets the
+   *  current defaults (written back); triggers the owner edited are kept as
+   *  they are. */
   load(): void {
     const raw = readVersionedFile(this.file, BOTS_FILE_VERSION);
     this.bots.clear();
@@ -460,6 +461,11 @@ export class BotStore implements BotDirectoryApi {
         bot.updatedAt = this.now();
         migrated = true;
         this.migrated.push(bot.id);
+      }
+      if (bot.role === 'verifier' && JSON.stringify(bot.triggers) === JSON.stringify(LEGACY_VERIFIER_TRIGGERS)) {
+        bot.triggers = defaultTriggers('verifier');
+        bot.updatedAt = this.now();
+        migrated = true;
       }
       // A profile written before templates (no `template` on disk) is
       // written back with the one parseBotProfile derived from its role, and

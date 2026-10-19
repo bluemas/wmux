@@ -478,6 +478,26 @@ export class WakeQueue implements WakeSinkApi {
     return n;
   }
 
+  /** Drop a bot's queued and parked PR-event wakes (pr.opened,
+   *  pr.head_moved, ci.failed) whose kind is no longer among its triggers
+   *  (`kept`): a reviewer moved to on-request verification was never asked
+   *  for those heads, and a parked one would run once its park lifts. Only
+   *  triggers enqueue these kinds. Code `expired`. */
+  dropPrEventWakes(botId: string, kept: ReadonlySet<string>): number {
+    let n = 0;
+    for (const i of this.items) {
+      if (i.botId !== botId || (i.state !== 'queued' && i.state !== 'parked') || i.reason.kind !== 'facts') continue;
+      const k = i.reason.trigger.kind;
+      if ((k === 'pr.opened' || k === 'pr.head_moved' || k === 'ci.failed') && !kept.has(k)) {
+        i.state = 'dropped';
+        i.dropped = { code: 'expired' };
+        n++;
+      }
+    }
+    if (n > 0) this.changed();
+    return n;
+  }
+
   /** Drop the queued issue wakes of a bot whose trigger does not check the
    *  author (queued under triggers that no longer apply). Code `expired`. */
   dropUnfilteredIssueWakes(botId: string): number {

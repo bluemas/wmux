@@ -29,6 +29,7 @@ import { RunHistoryStore } from './history/RunHistoryStore';
 import { AutomationEngine } from './automation/AutomationEngine';
 import { assertExternalSessionId, registerAutomationRpc } from './automation/rpc';
 import { killProcessTree } from './automation/treeKill';
+import { captureProcessTree, matchesRecordedStart, recordedStartOf, type CapturedTree } from './automation/verifiedTreeKill';
 import { recordedRunPtyIds } from './automation/store';
 import { AUTOMATION_EVENT } from '../shared/automation';
 import { InputReceiptStore } from './web/InputReceiptStore';
@@ -157,9 +158,9 @@ import { PortWatcher } from '../main/pty/portWatch';
 import { initDaemonLogSink, isBrokenPipeError, stdioErrorsConsumed } from './util/logSink';
 import { newerTimestamp } from './util/idleAnchor';
 import type { DaemonState } from './types';
-import type { DaemonEvent, DaemonCreateSessionParams, DaemonSessionIdParams, DaemonResizeParams, DaemonSetResumeBindingParams } from '../shared/rpc';
+import type { DaemonEvent, DaemonCreateSessionParams, DaemonDestroySessionParams, DaemonSessionIdParams, DaemonResizeParams, DaemonSetResumeBindingParams } from '../shared/rpc';
 import { isWslDistroSpawnArgs } from '../shared/wslDistro';
-import { gitWatchCwdFor } from './gitWatchCwd';
+import { gitDirMapperFor, gitWatchCwdFor } from './gitWatchCwd';
 import { randomUUID } from 'node:crypto';
 import { monitorEventLoopDelay, performance as nodePerformance } from 'node:perf_hooks';
 import { DAEMON_EXIT_ALREADY_RUNNING, ENV_KEYS, isBrainPty } from '../shared/constants';
@@ -2587,11 +2588,29 @@ function registerRpcHandlers(
   // Named for the same reason as createSessionRpc:
   // DELETE /api/sessions/:id must reap a pane exactly as a pane close does,
   // including the pipe stop, the listener removal and the buffer-dump cleanup.
+  //
+  // `killTree` (#2388): the pane's whole process tree is killed and checked
+  // gone, not just its shell. The tree is captured right before the PTY is
+  // destroyed, while the shell still runs (the destroy would orphan it), and
+  // killed after; the reply's `tree` says whether every process exited. A
+  // caller about to delete the folder the pane ran in keeps it when one did
+  // not.
+  /** A pane's tree kill under way: a second `killTree` destroy of the same
+   *  pane waits for its answer instead of finding no session (#2388). */
+  const treeKillsInFlight = new Map<string, Promise<unknown>>();
   const destroySessionRpc = async (params: Record<string, unknown>): Promise<unknown> => {
-    const p = params as unknown as DaemonSessionIdParams;
+    const p = params as unknown as DaemonDestroySessionParams;
+    const inFlight = p.killTree === true ? treeKillsInFlight.get(p.id) : undefined;
+    if (inFlight) return inFlight;
+    if (p.killTree !== true) return destroySessionNow(p);
+    const run = destroySessionNow(p).finally(() => treeKillsInFlight.delete(p.id));
+    treeKillsInFlight.set(p.id, run);
+    return run;
+  };
+  const destroySessionNow = async (p: DaemonDestroySessionParams): Promise<unknown> => {
     // OBSERVABILITY: log wmux-initiated kills (pane/workspace close, reset) so
     // they can be told apart from a process self-exit in the session:died log.
-    log('info', `[lifecycle] destroySession id=${p.id} reason=rpc`);
+    log('info', `[lifecycle] destroySession id=${p.id} reason=rpc${p.killTree === true ? ' killTree' : ''}`);
 
     // Remove data listener to prevent leak
     const tracked = sessionDataListeners.get(p.id);
@@ -2617,7 +2636,20 @@ function registerRpcHandlers(
     paneSupervisor.disarm(p.id);
 
     await codexPaneRelays.retire(p.id);
-    sessionManager.destroySession(p.id);
+    let captured: CapturedTree | null = null;
+    const live = p.killTree === true ? sessionManager.getSession(p.id)?.meta : undefined;
+    if (live && (live.state === 'attached' || live.state === 'detached') && live.pid > 0) {
+      const recorded = recordedStartOf(live);
+      captured = await captureProcessTree(live.pid, { rootIsOurs: (start) => matchesRecordedStart(recorded, start) });
+    }
+    try {
+      sessionManager.destroySession(p.id);
+    } catch (err) {
+      // Nothing killed: the captured tree runs on (POSIX: thawed).
+      captured?.release();
+      throw err;
+    }
+    const tree = p.killTree === true ? (captured ? await captured.kill() : { ok: true as const, killed: [] }) : undefined;
 
     // Clean up buffer dump file if exists
     const bufPath = stateWriter.getBufferDumpPath(p.id);
@@ -2626,7 +2658,9 @@ function registerRpcHandlers(
     const state = buildState(sessionManager);
     stateWriter.saveImmediate(state);
 
-    return { ok: true };
+    if (!tree) return { ok: true };
+    if (!tree.ok) log('warn', `[lifecycle] destroySession id=${p.id}: ${tree.survivors.length} process(es) of the pane did not exit: ${tree.survivors.map((s) => `${s.pid} (${s.reason})`).join(', ')}`);
+    return { ok: true, tree };
   };
   pipeServer.onRpc('daemon.destroySession', destroySessionRpc);
 
@@ -7416,13 +7450,19 @@ function wireContextWatchers(
   });
 
   // #2407: a WSL pane reports a Linux cwd; the watcher reads with Windows fs,
-  // so it is handed the Windows name of that directory (gitWatchCwdFor).
+  // so it is handed the Windows name of that directory (gitWatchCwdFor), and
+  // a way to read a worktree's Linux gitdir the same way (gitDirMapperFor).
   const onCreated = (payload: { session: { id: string; cwd: string; cmd?: string; wslTarget?: { distribution?: unknown } } }) => {
-    gitWatcher.update(payload.session.id, gitWatchCwdFor(payload.session));
+    gitWatcher.update(payload.session.id, gitWatchCwdFor(payload.session), gitDirMapperFor(payload.session));
   };
   const onCwd = (payload: { sessionId: string; cwd: string }) => {
     const meta = sessionManager.getSession(payload.sessionId)?.meta;
-    gitWatcher.update(payload.sessionId, gitWatchCwdFor({ cwd: payload.cwd, cmd: meta?.cmd, wslTarget: meta?.wslTarget }));
+    // Only a live session is watched. A WSL pane's share is polled, and its own
+    // wsl.exe is what keeps the distro running; a cwd adopted for a pane that
+    // has exited (adoptAgentCwd) must not start a poll that would wake it.
+    if (meta?.state !== 'attached' && meta?.state !== 'detached') return;
+    const session = { cwd: payload.cwd, cmd: meta?.cmd, wslTarget: meta?.wslTarget };
+    gitWatcher.update(payload.sessionId, gitWatchCwdFor(session), gitDirMapperFor(session));
   };
   const onGone = (payload: { id: string }) => {
     gitWatcher.remove(payload.id);
@@ -7430,13 +7470,16 @@ function wireContextWatchers(
   sessionManager.on('session:created', onCreated);
   sessionManager.on('session:cwd', onCwd);
   sessionManager.on('session:died', onGone);
+  // An involuntary exit leaves the session suspended, not died: its watch
+  // (and any share poll) goes too.
+  sessionManager.on('session:interrupted', onGone);
   sessionManager.on('session:destroyed', onGone);
 
   portWatcher.start();
 
   // Seed git context for sessions recovered before this wiring ran.
   for (const s of sessionManager.listLiveSessions()) {
-    gitWatcher.update(s.id, gitWatchCwdFor(s));
+    gitWatcher.update(s.id, gitWatchCwdFor(s), gitDirMapperFor(s));
   }
 
   resyncContextWatchers = () => { portWatcher.resync(); gitWatcher.resync(); };
@@ -7445,6 +7488,7 @@ function wireContextWatchers(
     sessionManager.off('session:created', onCreated);
     sessionManager.off('session:cwd', onCwd);
     sessionManager.off('session:died', onGone);
+    sessionManager.off('session:interrupted', onGone);
     sessionManager.off('session:destroyed', onGone);
     portWatcher.stop();
     gitWatcher.dispose();

@@ -18,6 +18,7 @@ import { t } from '../i18n';
 import { XTERM_THEMES, extractXtermColors, type ThemeId, type BuiltinThemeId } from '../themes';
 import { resolveMinimumContrastRatio } from '../tailwindPalette';
 import { isDaemonModeActive } from '../daemon/daemonMode';
+import { notePaneUserInput } from '../daemon/daemonLinkNotice';
 import { pastePtyChunked, chunkOnDataIfNeeded } from '../utils/clipboardChunk';
 import { pasteClipboardImage } from '../utils/imagePaste';
 import { openTerminalUrl } from '../utils/browserPaneActions';
@@ -2241,6 +2242,10 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
           }),
         };
         unpairedReleases.noteKeydown(e, pass);
+        // A key the user pressed here, not a byte xterm sent on its own (a
+        // cursor-position reply also arrives as onData): clears a reconnected
+        // pane's lost-input notice.
+        if (e.key !== 'Shift' && e.key !== 'Control' && e.key !== 'Alt' && e.key !== 'Meta') notePaneUserInput(ptyId);
       }
       return pass;
     });
@@ -2473,10 +2478,12 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
           const text = await window.clipboardAPI.readText();
           if (text) {
             const modes = (terminal as unknown as { modes?: { bracketedPasteMode?: boolean } }).modes;
+            notePaneUserInput(ptyId);
             await pastePtyChunked((d) => window.electronAPI.pty.write(ptyId, d), text, modes);
             return;
           }
           const imgModes = (terminal as unknown as { modes?: { bracketedPasteMode?: boolean } }).modes;
+          notePaneUserInput(ptyId);
           await pasteClipboardImage({
             ptyId,
             write: (d) => window.electronAPI.pty.write(ptyId, d),
@@ -2524,12 +2531,14 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
             // whole, and wraps the body in bracketed-paste markers when
             // the foreground app enabled DECSET 2004.
             const modes = (terminal as unknown as { modes?: { bracketedPasteMode?: boolean } }).modes;
+            notePaneUserInput(ptyId);
             await pastePtyChunked((d) => window.electronAPI.pty.write(ptyId, d), text, modes);
             return;
           }
           // No text — hand the image-only clipboard to the paste helper, which
           // picks the native-key or temp-PNG-path route per setting (#1196).
           const imgModes = (terminal as unknown as { modes?: { bracketedPasteMode?: boolean } }).modes;
+          notePaneUserInput(ptyId);
           await pasteClipboardImage({
             ptyId,
             write: (d) => window.electronAPI.pty.write(ptyId, d),
@@ -2563,10 +2572,12 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
           const text = await window.clipboardAPI.readText();
           if (text) {
             const modes = (terminal as unknown as { modes?: { bracketedPasteMode?: boolean } }).modes;
+            notePaneUserInput(ptyId);
             await pastePtyChunked((d) => window.electronAPI.pty.write(ptyId, d), text, modes);
             return;
           }
           const imgModes = (terminal as unknown as { modes?: { bracketedPasteMode?: boolean } }).modes;
+          notePaneUserInput(ptyId);
           await pasteClipboardImage({
             ptyId,
             write: (d) => window.electronAPI.pty.write(ptyId, d),
@@ -2702,10 +2713,12 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
           // PowerShell does not execute mid-paste, keeps surrogate pairs
           // whole, and wraps the body in bracketed-paste markers when
           // the foreground app enabled DECSET 2004.
+          notePaneUserInput(ptyId);
           await pastePtyChunked((d) => window.electronAPI.pty.write(ptyId, d), text, modes);
           return;
         }
 
+        notePaneUserInput(ptyId);
         await pasteClipboardImage({
           ptyId,
           write: (d) => window.electronAPI.pty.write(ptyId, d),
