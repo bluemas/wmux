@@ -44,6 +44,8 @@ export interface WorkspaceAgentRosterRow {
    */
   remote?: { hostId: string; hostLabel: string };
   activity?: string;
+  /** Subagents the pane's agent has running (surfaceSubagents); undefined for none. */
+  subagents?: number;
   hasAttention: boolean;
   needsAttention: boolean;
   isFocused: boolean;
@@ -255,6 +257,8 @@ export function selectWorkspaceAgentRoster(
         // states (dotRosterParity) build partial stores without this map.
         questionSeen: pendingQuestion !== undefined && state.surfaceQuestionSeen?.[ptyId] === pendingQuestion,
         activity,
+        // Optional-chained: partial test stores build without this map.
+        subagents: state.surfaceSubagents?.[ptyId] || undefined,
         hasAttention: attentionStatus !== undefined || pendingQuestion !== undefined,
         needsAttention: needsAttention(status),
         isFocused:
@@ -344,6 +348,7 @@ export function selectWorkspaceAgentRoster(
       activity: status === 'running' && activityIsFresh && ptyId
         ? nonEmpty(state.surfaceActivity[ptyId])
         : undefined,
+      subagents: ptyId && liveness !== 'exited' ? state.surfaceSubagents?.[ptyId] || undefined : undefined,
       hasAttention: attentionStatus !== undefined || pendingQuestion !== undefined,
       needsAttention: liveness === 'exited' || needsAttention(status),
       isFocused: false,
@@ -389,6 +394,7 @@ function rowsEqual(
       a.pendingQuestion !== b.pendingQuestion ||
       a.questionSeen !== b.questionSeen ||
       a.activity !== b.activity ||
+      a.subagents !== b.subagents ||
       a.hasAttention !== b.hasAttention ||
       a.needsAttention !== b.needsAttention ||
       a.isFocused !== b.isFocused ||
