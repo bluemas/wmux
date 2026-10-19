@@ -1,6 +1,6 @@
 ---
 name: verify
-description: "How to check a wmux change before calling it done: which typecheck and vitest suites to run for which area, known environment-only failures, building and installing the Windows installer, and reading live app state over CDP. Use after editing code in this repo, before committing, and when asked to build, reinstall or measure the installed app. For driving the UI itself, use verify-wmux."
+description: "How to check a wmux change before calling it done: which typecheck and vitest suites to run for which area, known environment-only failures, building and installing the Windows installer or the macOS app, and reading live app state over CDP. Use after editing code in this repo, before committing, and when asked to build, reinstall or measure the installed app. For driving the UI itself, use verify-wmux."
 ---
 
 # verify (fork notes)
@@ -61,6 +61,35 @@ root; delete it.
 
 Installing restarts the daemon only when the install folder's exe is replaced
 (same-version reinstall kills it): sessions then recover from snapshots.
+
+## 3b. Build and install (macOS, local unsigned)
+
+1. Dependencies: npm 11 skips dependency install scripts unless they are
+   allowed, and does so silently. `--allow-scripts` is rejected at project
+   scope, so write a temporary `.npmrc` with
+   `allow-scripts=electron,esbuild,node-pty,koffi,fsevents,fs-xattr,macos-alias,wasm-pack,electron-winstaller`,
+   run `npm ci`, then delete the `.npmrc`. Re-run after any pull that touches
+   `package-lock.json` or `patches/` (patch-package runs in postinstall).
+2. `npm run package` with Node 22 (nvm). Under Node 26 it exits 0 but leaves
+   no `out/`: electron-packager's `extract-zip` quits silently. Check that
+   `out/wmux-darwin-arm64/wmux.app` exists.
+3. Without Apple credentials the build is unsigned and its signature is
+   invalid after packaging: `ditto` it to `/Applications/wmux.app.new`, then
+   `codesign --force --deep --sign - /Applications/wmux.app.new` and
+   `codesign --verify --deep` it.
+4. Swap: the session usually runs inside the installed wmux, so never quit
+   the app or kill the daemon from it without asking. `mv` the running
+   bundle to `/Applications/wmux-old.app` (a running app survives the move),
+   `mv` the new one into place, and let the owner restart. Delete
+   `wmux-old.app` only when `lsof | grep wmux-old.app/` is empty; the app and
+   daemon keep executing from it until each restarts.
+5. Restart the app only (terminals survive, the daemon holds the PTYs):
+   from a `nohup` script with `trap '' HUP`,
+   `osascript -e 'quit app "wmux"'`, wait for
+   `pgrep -f "Contents/MacOS/wmux$"` to clear, then `open -a /Applications/wmux.app`.
+   Restarting the daemon kills every terminal, including the session. A
+   `package.json` version change since the daemon started makes the new app
+   replace the daemon by itself, so warn before restarting in that case.
 
 ## 4. Live app state
 
