@@ -35,6 +35,12 @@
 //     on change, and a watch that ends (agent death, session start, closed
 //     pane, replaced file) sends 0 if it had sent more, so a stale count never
 //     sticks.
+//   - Agent Teams teammates (teammateActivity.ts). A Claude watch, hook-fed or
+//     not, also scans its session's subagents/ folder every TEAMMATE_POLL_MS
+//     and reports the pane working on every scan that finds an in-process
+//     teammate still working, so the pane reads running after the lead's turn
+//     ended. Nothing is sent when none works: main's activity stamp decays on
+//     its own. The scanner lives on the watch, so it ends with it.
 
 import type { ResumeBinding } from '../../shared/agentResume';
 import type { TurnEvent } from '../../shared/transcript/turnEvents';
@@ -45,6 +51,7 @@ import { HOOK_ACTIVITY_KINDS } from '../../shared/hooks/hookActivityKinds';
 import { MAX_RAW_LEN, summarizeActivity } from '../../shared/activitySummary';
 import { agentRow } from '../../shared/agentIdentity';
 import { SUBAGENT_COUNTERS, type SubagentCounter } from './subagentCount';
+import { TeammateScanner, subagentsDirFor } from './teammateActivity';
 
 /** Most bytes read for one session in one tick. */
 export const READ_CAP_BYTES = 256 * 1024;
@@ -53,6 +60,10 @@ export const JUMP_WINDOW_BYTES = 64 * 1024;
 const DEFAULT_POLL_MS = 1500;
 /** Minimum spacing of two lines for one session (a clear is never held). */
 const DEFAULT_MIN_GAP_MS = 2000;
+/** How often a Claude watch scans its session's teammates. Each scan that
+ *  finds one working refreshes main's 120 s activity stamp, so a refresh that
+ *  lands inside main's 3 s settle guard right after a Stop is retried soon. */
+export const TEAMMATE_POLL_MS = 15_000;
 
 type ParseLine = (line: string, offset: number) => TurnEvent[];
 
@@ -133,6 +144,13 @@ export interface TranscriptActivityDeps {
   /** Report how many subagents the session's agent has running (on change). */
   emitSubagents?: (sessionId: string, count: number) => void;
   /**
+   * The session's Claude Code has an Agent Teams teammate still working: a
+   * running-state refresh, sent on every teammate scan that finds one (never
+   * a turn start, never a count).
+   */
+  emitTeammatesWorking?: (sessionId: string) => void;
+  teammatePollMs?: number;
+  /**
    * Every complete line read from a Claude transcript, in file order, with the
    * file it came from (the API-error turn end reads it; see apiErrorTurnEnd).
    * A new watch also replays its last JUMP_WINDOW_BYTES here once, so the
@@ -170,6 +188,10 @@ interface Watch {
   subagents?: SubagentCounter;
   /** The count last sent (0 before any). */
   subagentsSent: number;
+  /** Scans the session's subagents/ folder for working teammates (Claude). */
+  teammates?: TeammateScanner;
+  /** When `teammates` last scanned (0 before any). */
+  teammatesAt: number;
 }
 
 /**
@@ -325,6 +347,7 @@ export class TranscriptActivityWatcher {
         this.dropWatch(id);
       }
       if (this.watches.get(id) === watch) this.flushSubagents(id, watch);
+      if (this.watches.get(id) === watch) this.scanTeammates(id, watch);
     }
     this.deps.afterTick?.();
   }
@@ -342,6 +365,20 @@ export class TranscriptActivityWatcher {
     if (count === watch.subagentsSent) return;
     watch.subagentsSent = count;
     this.deps.emitSubagents?.(id, count);
+  }
+
+  private scanTeammates(id: string, watch: Watch): void {
+    if (!watch.teammates) return;
+    const now = this.now();
+    if (watch.teammatesAt > 0 && now - watch.teammatesAt < (this.deps.teammatePollMs ?? TEAMMATE_POLL_MS)) return;
+    watch.teammatesAt = now;
+    let working = false;
+    try {
+      working = watch.teammates.anyWorking(now);
+    } catch {
+      // An unreadable folder says nothing; the activity line is unaffected.
+    }
+    if (working) this.deps.emitTeammatesWorking?.(id);
   }
 
   /** One transcript, one pane: the pane whose agent spoke last keeps it. */
@@ -386,9 +423,10 @@ export class TranscriptActivityWatcher {
     const stat = statTranscript(path);
     if (!stat) return;
     const subagents = binding ? SUBAGENT_COUNTERS[binding.agent]?.() : undefined;
+    const teammates = binding?.agent === 'claude' && this.deps.emitTeammatesWorking ? new TeammateScanner(subagentsDirFor(path)) : undefined;
     const counted: ParseLine = subagents ? (line, offset) => { subagents.noteLine(line); return parse(line, offset); } : parse;
     // Start at the end: only what the agent writes from now on.
-    this.watches.set(id, { path, parse: counted, ino: stat.ino, offset: stat.size, sentAt: 0, lines: !!onLine, linesOnly: this.hookFed.has(id), replay: !!onLine, subagents, subagentsSent: 0 });
+    this.watches.set(id, { path, parse: counted, ino: stat.ino, offset: stat.size, sentAt: 0, lines: !!onLine, linesOnly: this.hookFed.has(id), replay: !!onLine, subagents, subagentsSent: 0, teammates, teammatesAt: 0 });
   }
 
   /** The one-time `onClaudeLine` replay a watch owes, if it owes one. */
