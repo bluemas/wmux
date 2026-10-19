@@ -256,6 +256,15 @@ describe('DaemonPTYBridge — a Codex title spinner reports running', () => {
     expect(bridge.getAgentStatus()).not.toBe('running');
   });
 
+  it('a cycle the title armed that no output reaches stops reading running, whatever closed the turn', () => {
+    spin(1, 100); // the first frame arms a cycle
+    bridge.noteServerLost(); // the backend turn is gone
+    feed(title('⠙ AAA quality pass | Heartbound')); // one trailing frame, then silence
+    vi.advanceTimersByTime(600_000);
+    expect(bridge.getAgentStatus()).not.toBe('running');
+    expect(bridge.isTurnOpen()).toBe(false);
+  });
+
   it('another tracked agent ignores the braille title; a late launch edge does not stop a Codex turn', () => {
     bridge.noteAgentProcess({ slug: 'claude', alive: true });
     spin(8, 100);

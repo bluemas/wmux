@@ -876,6 +876,18 @@ export class DaemonPTYBridge extends EventEmitter {
       if (promoted) this.spinnerArmedCycle = true;
       monitor.beginTurnIfInactive(sessionId);
       this.titleArmedCycle = monitor.cycleOf(sessionId);
+      // The monitor starts a cycle's idle countdown on output only. A cycle
+      // no output reaches (the TUI went quiet right after this frame) would
+      // read running forever, so it gets a countdown of its own.
+      if (this.titleCycleTimer) clearTimeout(this.titleCycleTimer);
+      this.titleCycleTimer = setTimeout(() => {
+        this.titleCycleTimer = null;
+        if (this.titleArmedCycle === null) return;
+        // No output at all since the frame: a turn the title opened ends as
+        // if its frame had dropped (endSpinnerTurn releases the cycle too).
+        if (this.spinnerOpenedTurn && this.turnOpen && !this.awaitingHuman) this.endSpinnerTurn();
+        else this.releaseTitleCycle();
+      }, DaemonPTYBridge.TITLE_CYCLE_IDLE_MS);
       return;
     }
     if (now - this.lastActiveAt < DaemonPTYBridge.CODEX_SPINNER_REFRESH_MS) return;
@@ -891,6 +903,10 @@ export class DaemonPTYBridge extends EventEmitter {
    *  until output or idle takes it over; the tracked Codex dying or being
    *  replaced while it is still that cycle hands it back (noteAgentProcess). */
   private titleArmedCycle: number | null = null;
+  /** Releases a title-armed cycle no output reached (see noteCodexTitleSpinner). */
+  private titleCycleTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The activity monitor's own idle delay. */
+  private static readonly TITLE_CYCLE_IDLE_MS = 5_000;
 
   /** How often a still-spinning Codex title re-reports running (well inside
    *  the renderer's 120 s activity window). */
@@ -1045,6 +1061,10 @@ export class DaemonPTYBridge extends EventEmitter {
   /** Ends the cycle noteCodexTitleSpinner armed if it is still that cycle and
    *  no hook claimed it (a submit, an idle or a new burst starts another). */
   private releaseTitleCycle(): void {
+    if (this.titleCycleTimer) {
+      clearTimeout(this.titleCycleTimer);
+      this.titleCycleTimer = null;
+    }
     const monitor = this.activityMonitor;
     if (
       this.titleArmedCycle !== null && this.sessionId && monitor
@@ -1840,6 +1860,8 @@ export class DaemonPTYBridge extends EventEmitter {
   }
 
   cleanup(): void {
+    if (this.titleCycleTimer) clearTimeout(this.titleCycleTimer);
+    this.titleCycleTimer = null;
     this.dataDisposable?.();
     this.dataDisposable = null;
     this.startupDa1 = null;
