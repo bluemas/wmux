@@ -226,6 +226,25 @@ describe('DaemonPTYBridge — a Codex title spinner reports running', () => {
     expect(bridge.getAgentStatus()).toBe('running');
   });
 
+  it('a successor\'s submit or running hook before its first output keeps its cycle through a late replacement edge', () => {
+    for (const claim of ['submit', 'hook'] as const) {
+      spin(1, 100); // the title arms a cycle
+      if (claim === 'submit') bridge.noteInput('hello\r');
+      else bridge.noteAgentStatus('running', true);
+      bridge.noteAgentEnded();
+      bridge.noteAgentProcess({ slug: 'gemini', alive: true });
+      for (let i = 0; i < 6; i++) {
+        feed('.');
+        vi.advanceTimersByTime(1_000);
+      }
+      expect(bridge.getAgentStatus(), claim).toBe('running');
+      // Back to a Codex pane at rest for the next claim.
+      bridge.noteAgentEnded();
+      bridge.noteAgentProcess({ slug: 'codex', alive: true });
+      vi.advanceTimersByTime(10_000);
+    }
+  });
+
   it('another tracked agent ignores the braille title; a late launch edge does not stop a Codex turn', () => {
     bridge.noteAgentProcess({ slug: 'claude', alive: true });
     spin(8, 100);

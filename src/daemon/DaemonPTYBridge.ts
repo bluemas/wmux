@@ -872,7 +872,7 @@ export class DaemonPTYBridge extends EventEmitter {
       // onActive does: the footer still on screen must not settle it again.
       if (promoted) this.spinnerArmedCycle = true;
       monitor.beginTurnIfInactive(sessionId);
-      this.titleArmedCycle = true;
+      this.titleArmedCycle = monitor.cycleOf(sessionId);
       return;
     }
     if (now - this.lastActiveAt < DaemonPTYBridge.CODEX_SPINNER_REFRESH_MS) return;
@@ -884,10 +884,10 @@ export class DaemonPTYBridge extends EventEmitter {
     });
   }
 
-  /** The activity cycle was armed by noteCodexTitleSpinner and no output has
-   *  reached it yet; the tracked Codex dying or being replaced hands it back
-   *  (noteAgentProcess). Output (onActive) or idle clears it. */
-  private titleArmedCycle = false;
+  /** The activity cycle noteCodexTitleSpinner armed (ActivityMonitor.cycleOf),
+   *  until output or idle takes it over; the tracked Codex dying or being
+   *  replaced while it is still that cycle hands it back (noteAgentProcess). */
+  private titleArmedCycle: number | null = null;
 
   /** How often a still-spinning Codex title re-reports running (well inside
    *  the renderer's 120 s activity window). */
@@ -1036,8 +1036,14 @@ export class DaemonPTYBridge extends EventEmitter {
     // writes none, and the cycle would read running forever. It goes with
     // the agent that armed it.
     if (state.alive && agentRow(state.slug)?.titleRunning) return;
-    if (this.titleArmedCycle && this.sessionId) this.activityMonitor?.endTurn(this.sessionId);
-    this.titleArmedCycle = false;
+    const monitor = this.activityMonitor;
+    if (
+      this.titleArmedCycle !== null && this.sessionId && monitor
+      // Still the cycle the title armed, and no hook claimed it since: a
+      // submit, an idle or a new burst starts another cycle.
+      && monitor.cycleOf(this.sessionId) === this.titleArmedCycle && !this.hookArmedCycle
+    ) monitor.endTurn(this.sessionId);
+    this.titleArmedCycle = null;
   }
 
   /**
@@ -1322,7 +1328,7 @@ export class DaemonPTYBridge extends EventEmitter {
     // explicit waiting/complete state five seconds later.
     this.idleUnsubscribe = activityMonitor.onActiveToIdle((ptyId) => {
       this.hookArmedCycle = false;
-      this.titleArmedCycle = false;
+      this.titleArmedCycle = null;
       // F24: an episode only output opened, on a hook pane, ends when that
       // output stops (see `byteOpenedTurn`). Five seconds of byte silence
       // means no spinner either; the spinner title is output too. Softly, so
@@ -1340,7 +1346,7 @@ export class DaemonPTYBridge extends EventEmitter {
     this.activeUnsubscribe = activityMonitor.onActive((ptyId) => {
       // Output reached the cycle and started its idle countdown: whatever
       // armed it, it can no longer read running forever.
-      this.titleArmedCycle = false;
+      this.titleArmedCycle = null;
       let likelyRepaint = false;
 
       if (this.explicitTerminalStatus) {
