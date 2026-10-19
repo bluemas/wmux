@@ -168,7 +168,7 @@ function preprocessGithubHtml(source: string): string {
       // inlined into the web client's page, whose build refuses a bundle
       // containing a literal comment opener.
       .replace(
-        /(`[^`\n]+`)|<\x21--[\s\S]*?(?:-->|$)|<(script|style)\b[^>]*>[\s\S]*?(?:<\/\2\s*>|$)/gi,
+        /(`[^`\n]+`)|<\x21--[\s\S]*?(?:-->|$)|<(script|style)\b[^<>]*>[\s\S]*?(?:<\/\2\s*>|$)/gi,
         (_m, code: string | undefined) => code ?? '',
       )
       .replace(/<br\s*\/?>/gi, '\n');

@@ -144,6 +144,12 @@ describe('renderBrainMarkdown', () => {
     expect(performance.now() - start).toBeLessThan(1_500);
   });
 
+  it('GitHub HTML: repeated unclosed <script openers are scanned in linear time', () => {
+    const start = performance.now();
+    renderBrainMarkdown('<script '.repeat(64_000), { githubHtml: true });
+    expect(performance.now() - start).toBeLessThan(1_500);
+  });
+
   it('unclosed link and anchor openers render in linear time', () => {
     // Each opener once rescanned to the end of the line: ~100 KB of `[`
     // took seconds. A generous bound still separates linear from quadratic.
