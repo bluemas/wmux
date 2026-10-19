@@ -11,11 +11,13 @@ import {
   type SpriteRef,
 } from '..';
 
+const REPO_ROOT = join(__dirname, '..', '..', '..', '..', '..');
+
 // Vite resolves `import url from './x.png'` to a root-relative path in tests
 // (`/src/renderer/assets/office/x.png`); read the file it names.
 function pngSize(src: string): { w: number; h: number } {
   const rel = src.split('?')[0].replace(/^\/+/, '');
-  const buf = readFileSync(join(process.cwd(), rel));
+  const buf = readFileSync(join(REPO_ROOT, rel));
   const signature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
   expect([...buf.subarray(0, 8)]).toEqual(signature);
   expect(buf.toString('latin1', 12, 16)).toBe('IHDR');
@@ -59,6 +61,19 @@ describe('office pixel-art assets', () => {
       // One frame size for every pose, so a pose change never moves the anchor.
       const { w, h } = c.frames.sit;
       for (const s of Object.values(c.frames)) expect([s.w, s.h]).toEqual([w, h]);
+    }
+  });
+
+  it('no two furniture or extras sprites overlap on their sheet', () => {
+    const rects = [...Object.entries(FURNITURE), ...Object.entries(OFFICE_EXTRAS)];
+    for (let i = 0; i < rects.length; i++) {
+      for (let j = i + 1; j < rects.length; j++) {
+        const [na, a] = rects[i];
+        const [nb, b] = rects[j];
+        if (a.src !== b.src) continue;
+        const overlap = a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+        expect(overlap, `${na} overlaps ${nb}`).toBe(false);
+      }
     }
   });
 

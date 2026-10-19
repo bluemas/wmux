@@ -1,16 +1,17 @@
-#!/usr/bin/env node
+// No #! line: vitest imports this module (officeArtPipeline.test.ts), and a
+// module with a shebang cannot be imported under vitest. Run it with `node`.
 // Builds the Office page's pixel art (original to this repo) into
 // src/renderer/assets/office/: furniture.png, characters.png and
 // layout.generated.ts (sprite rectangles and anchors). Deterministic: a rerun
 // with unchanged sources writes byte-identical files.
 //
-//   node scripts/office-art/build-office-art.mjs
+//   node scripts/office-art/build-office-art.mjs [out-dir]   (default: src/renderer/assets/office)
 //
 // See docs/office-art.md for the grid, palette and how to add a look.
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { Layer, compose, encodePng, toRgba } from './raster.mjs';
+import { Layer, bounds, compose, crop, encodePng, toRgba } from './raster.mjs';
 import { RAMPS } from './palette.mjs';
 import {
   SEAT,
@@ -101,6 +102,14 @@ export function buildSheets() {
       frames[look.id][pose] = { x: col * STATION.w, y: row * STATION.h, w: STATION.w, h: STATION.h };
     });
   });
+  // A fully transparent sprite or frame is a broken template: fail the build.
+  for (const f of furniture) {
+    if (bounds(f.layer).w <= 0) throw new Error(`furniture sprite ${f.key} is empty`);
+  }
+  for (const look of looks) for (const pose of POSES) {
+    const r = frames[look.id][pose];
+    if (bounds(crop(cSheet, r.x, r.y, r.w, r.h)).w <= 0) throw new Error(`character frame ${look.id}.${pose} is empty`);
+  }
   return { furniture, fSheet, cSheet, looks, frames };
 }
 
@@ -145,19 +154,31 @@ function layoutTs({ furniture, looks, frames }) {
   return lines.join('\r\n');
 }
 
-export function writeAll(outDir = OUT_DIR) {
+/** Render every output in memory: { built, files: { name: Buffer | string } }. Writes nothing. */
+export function renderAll() {
   const built = buildSheets();
+  const png = (layer) => encodePng(layer.w, layer.h, toRgba(layer, RAMPS));
+  return {
+    built,
+    files: {
+      'furniture.png': png(built.fSheet),
+      'characters.png': png(built.cSheet),
+      'layout.generated.ts': layoutTs(built),
+    },
+  };
+}
+
+/** Write the outputs to outDir (default: src/renderer/assets/office). */
+export function writeAll(outDir = OUT_DIR) {
+  const { built, files } = renderAll();
   mkdirSync(outDir, { recursive: true });
-  const write = (name, layer) =>
-    writeFileSync(join(outDir, name), encodePng(layer.w, layer.h, toRgba(layer, RAMPS)));
-  write('furniture.png', built.fSheet);
-  write('characters.png', built.cSheet);
-  writeFileSync(join(outDir, 'layout.generated.ts'), layoutTs(built));
+  for (const [name, data] of Object.entries(files)) writeFileSync(join(outDir, name), data);
   return built;
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const built = writeAll();
+// CLI: `node build-office-art.mjs [out-dir]`.
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  const built = writeAll(process.argv[2] ? resolve(process.argv[2]) : OUT_DIR);
   console.log(
     `furniture.png ${built.fSheet.w}x${built.fSheet.h}, characters.png ${built.cSheet.w}x${built.cSheet.h} (${built.looks.length} looks x ${POSES.length} poses)`,
   );
