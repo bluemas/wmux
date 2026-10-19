@@ -99,7 +99,13 @@ describe('selectOfficeEmployees', () => {
     const ws = workspace('ws-1', leaf('p1', [surface('s1', 'pty-1')]), 'p1', {
       stashedPanes: [{ pane: leaf('p-st', [surface('s-st', '')]), stashedAt: NOW - 1000 }],
     });
-    const s = state({ workspaces: [ws], surfaceAgent: { 'pty-1': claude() } });
+    // A stale agent entry under the cleared ptyId must not revive the pane.
+    const s = state({ workspaces: [ws], surfaceAgent: { 'pty-1': claude(), '': claude() } });
+    // The fixture is real: the roster does report the exited stashed pane
+    // (error + needs attention), so the Office is what leaves it out.
+    expect(selectWorkspaceAgentRoster(s, 'ws-1').rows.find((r) => r.stashed)).toMatchObject({
+      stashedLiveness: 'exited', status: 'error', needsAttention: true,
+    });
     expect(selectOfficeEmployees(s, NOW).map((e) => e.id)).toEqual(['pty-1']);
   });
 
