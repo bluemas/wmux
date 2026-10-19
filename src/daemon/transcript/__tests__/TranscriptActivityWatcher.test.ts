@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { ResumeBinding } from '../../../shared/agentResume';
+import type { TeammateInfo } from '../../../shared/types';
 import { TranscriptActivityWatcher, codexToolSummary } from '../TranscriptActivityWatcher';
 
 let dir: string;
@@ -246,6 +247,7 @@ describe('TranscriptActivityWatcher — Agent Teams teammates', () => {
     let offset = 0;
     const state: { alive: boolean; sessions: string[] } = { alive: true, sessions: ['pty-1'] };
     const working: string[] = [];
+    const rosters: [string, TeammateInfo[]][] = [];
     const binding: ResumeBinding = { agent, sessionId: 's', cwd: dir, transcriptPath: file, ts: 0 };
     const watcher = new TranscriptActivityWatcher({
       listSessionIds: () => state.sessions,
@@ -253,6 +255,7 @@ describe('TranscriptActivityWatcher — Agent Teams teammates', () => {
       isAgentAlive: () => state.alive,
       emit: () => {},
       emitTeammatesWorking: (id) => working.push(id),
+      emitTeammates: (id, list) => rosters.push([id, list]),
       now: () => Date.now() + offset,
       teammatePollMs: 15_000,
     });
@@ -260,7 +263,7 @@ describe('TranscriptActivityWatcher — Agent Teams teammates', () => {
       JSON.stringify({ type: 'user', timestamp: at, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'm1', content: 'ok' }] } }),
       JSON.stringify({ type: 'assistant', timestamp: at, message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: 'done' }] } }),
     ].map((l) => `${l}\n`).join(''));
-    return { watcher, working, state, finish, advance: (ms: number) => { offset += ms; } };
+    return { watcher, working, rosters, state, finish, advance: (ms: number) => { offset += ms; } };
   }
 
   it('refreshes once per teammate scan while a teammate works, even hook-fed after a Stop', () => {
@@ -301,6 +304,40 @@ describe('TranscriptActivityWatcher — Agent Teams teammates', () => {
     h.advance(15_000);
     h.watcher.tick();
     expect(h.working).toEqual(['pty-1']);
+  });
+
+  it('teammates are sent only when the list changes', () => {
+    const h = teammates();
+    h.watcher.tick();
+    expect(h.rosters).toHaveLength(1);
+    expect(h.rosters[0][0]).toBe('pty-1');
+    expect(h.rosters[0][1]).toMatchObject([{ name: 'mate', working: true }]);
+    h.advance(15_000);
+    h.watcher.tick();
+    expect(h.rosters).toHaveLength(1); // same list, only `at` may differ
+    h.finish();
+    h.advance(15_000);
+    h.watcher.tick();
+    expect(h.rosters).toHaveLength(2);
+    expect(h.rosters[1][1]).toMatchObject([{ name: 'mate', working: false }]);
+  });
+
+  it('drop sends an empty list once a non-empty list was sent', () => {
+    const h = teammates();
+    h.watcher.tick();
+    h.state.sessions = [];
+    h.advance(15_000);
+    h.watcher.tick();
+    expect(h.rosters).toHaveLength(2);
+    expect(h.rosters[1]).toEqual(['pty-1', []]);
+  });
+
+  it('drop sends nothing when no list was ever sent', () => {
+    const h = teammates('codex');
+    h.watcher.tick();
+    h.state.sessions = [];
+    h.watcher.tick();
+    expect(h.rosters).toEqual([]);
   });
 
   it('never scans for a Codex pane', () => {

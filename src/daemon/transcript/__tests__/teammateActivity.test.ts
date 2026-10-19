@@ -144,6 +144,42 @@ describe('TeammateScanner', () => {
     expect(new TeammateScanner(path.join(dir, 'nope', 'subagents')).anyWorking(Date.now())).toBe(false);
   });
 
+  it('list reports name from file, color from meta, working state and activity', () => {
+    const now = Date.now();
+    agent('zed-9f3', 'in_process_teammate', [reply('end_turn', now)]);
+    const file = agent('researcher-ab12', 'in_process_teammate', [toolUse('a', now)]);
+    fs.writeFileSync(file.replace(/.jsonl$/, '.meta.json'), JSON.stringify({ taskKind: 'in_process_teammate', color: 'blue' }));
+    const list = new TeammateScanner(sub).list(now);
+    expect(list.map((t) => t.name)).toEqual(['researcher', 'zed']);
+    expect(list[0]).toMatchObject({ name: 'researcher', color: 'blue', working: true, activity: '$ npm test' });
+    expect(list[0].at).toBeGreaterThan(0);
+    expect(list[1]).toMatchObject({ name: 'zed', working: false });
+    expect(list[1].color).toBeUndefined();
+    expect(list[1].activity).toBeUndefined();
+  });
+
+  it('list prefers the meta name when present', () => {
+    const now = Date.now();
+    const file = agent('mate-1', 'in_process_teammate', [toolUse('a', now)]);
+    fs.writeFileSync(file.replace(/.jsonl$/, '.meta.json'), JSON.stringify({ taskKind: 'in_process_teammate', name: 'Ada' }));
+    expect(new TeammateScanner(sub).list(now).map((t) => t.name)).toEqual(['Ada']);
+  });
+
+  it('list omits teammates older than 30 minutes', () => {
+    const old = Date.now() - PENDING_TOOL_CAP_MS - 60_000;
+    agent('stale-1', 'in_process_teammate', [reply('end_turn', old)], old);
+    const fresh = Date.now() - 20 * 60_000;
+    agent('idle-1', 'in_process_teammate', [reply('end_turn', fresh)], fresh);
+    expect(new TeammateScanner(sub).list(Date.now()).map((t) => t.name)).toEqual(['idle']);
+  });
+
+  it('list ignores files whose meta is not in_process_teammate', () => {
+    const now = Date.now();
+    agent('plain-1', undefined, [toolUse('x', now)]);
+    agent('other-1', 'something_else', [toolUse('y', now)]);
+    expect(new TeammateScanner(sub).list(now)).toEqual([]);
+  });
+
   it('asks again for a meta file written after the transcript', () => {
     const now = Date.now();
     const file = path.join(sub, 'agent-late.jsonl');

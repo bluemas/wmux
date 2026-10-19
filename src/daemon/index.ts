@@ -4121,6 +4121,10 @@ function registerRpcHandlers(
         const event: DaemonEvent = { type: 'agent.subagents', sessionId, data: { count } };
         pipeServer.broadcast(event);
       },
+      emitTeammates: (sessionId, teammates) => {
+        const event: DaemonEvent = { type: 'agent.teammates', sessionId, data: { teammates } };
+        pipeServer.broadcast(event);
+      },
       // An Agent Teams teammate of the pane's Claude still works after the
       // lead's turn ended. Straight to main as `activity.active` (its onActive
       // keeps its hook-latch and settle guards and refreshes the renderer's

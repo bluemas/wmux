@@ -1106,6 +1106,10 @@ export interface DaemonEvent {
     // ends, so a stale count never sticks.
     //   agent.subagents → { count: number }
     | 'agent.subagents'
+    // The pane's Claude Code Agent Teams teammates (daemon/transcript/
+    // teammateActivity), sent on change; [] when the watch ends.
+    //   agent.teammates → { teammates: TeammateInfo[] }
+    | 'agent.teammates'
     | 'prompt.event'
     | 'notification.event'
     | 'cwd.changed'

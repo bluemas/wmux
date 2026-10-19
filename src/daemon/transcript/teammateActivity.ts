@@ -32,6 +32,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { readTranscriptPage, statTranscript } from './readTail';
+import { parseTranscriptLine } from './parseEntry';
+import { activityFromEvents } from './TranscriptActivityWatcher';
+import type { TeammateInfo } from '../../shared/types';
 
 /** A pending tool call stops counting after this long without a record or file growth. */
 export const PENDING_TOOL_CAP_MS = 30 * 60_000;
@@ -94,26 +97,58 @@ export function teammateWorking(tail: TeammateTail | null, mtimeMs: number, now:
   return age <= (tail?.state === 'pending_tool' ? PENDING_TOOL_CAP_MS : FRESH_MS);
 }
 
-/** Whether the meta file next to `transcript` names an in-process teammate;
- *  undefined while there is no meta file yet (asked again on the next scan). */
-function isTeammateMeta(transcript: string): boolean | undefined {
+/** How many tail lines the activity line is read from (the newest tool call is near the end). */
+const ACTIVITY_TAIL_LINES = 40;
+const SIDECHAIN = /"isSidechain"\s*:\s*true/;
+
+interface TeammateMeta {
+  teammate: boolean;
+  name?: string;
+  color?: string;
+}
+
+/** The meta file next to `transcript`: whether it names an in-process teammate,
+ *  plus the teammate's own name and colour when it carries them; undefined
+ *  while there is no meta file yet (asked again on the next scan). */
+function readTeammateMeta(transcript: string): TeammateMeta | undefined {
   const meta = transcript.replace(/\.jsonl$/, '.meta.json');
   const stat = statTranscript(meta);
   if (!stat) return undefined;
-  if (stat.size > META_MAX_BYTES) return false;
+  if (stat.size > META_MAX_BYTES) return { teammate: false };
   try {
-    return record(JSON.parse(fs.readFileSync(meta, 'utf8'))).taskKind === 'in_process_teammate';
+    const parsed = record(JSON.parse(fs.readFileSync(meta, 'utf8')));
+    const str = (v: unknown) => (typeof v === 'string' && v ? v : undefined);
+    return { teammate: parsed.taskKind === 'in_process_teammate', name: str(parsed.name), color: str(parsed.color) };
   } catch {
-    return false;
+    return { teammate: false };
   }
+}
+
+/** `agent-<name>-<hash>.jsonl` → `<name>` (the name may itself hold dashes). */
+function nameFromFile(file: string): string {
+  const base = path.basename(file).replace(/\.jsonl$/, '').replace(/^agent-/, '');
+  const cut = base.lastIndexOf('-');
+  return cut > 0 ? base.slice(0, cut) : base;
 }
 
 interface FileState {
   /** Undefined until the meta file was read and named a teammate (or not). */
   teammate?: boolean;
+  name?: string;
+  color?: string;
+  /** The activity line of the tail (a tool call in progress), '' when none. */
+  activity: string;
   size: number;
   mtimeMs: number;
   tail: TeammateTail | null;
+}
+
+/** The activity line the lead's summarizer reads from a teammate's tail lines. */
+function activityOf(lines: readonly string[]): string {
+  // The parser collapses a sidechain record to one "Subagent thread" chip; a
+  // teammate's whole transcript is sidechain, and here it is the thread read.
+  const events = lines.slice(-ACTIVITY_TAIL_LINES).flatMap((line) => parseTranscriptLine(line.replace(SIDECHAIN, '"isSidechain":false'), 0));
+  return activityFromEvents(events) ?? '';
 }
 
 /** The `subagents/` folder of a Claude Code session's transcript. */
@@ -131,16 +166,22 @@ export class TeammateScanner {
 
   /** Whether at least one in-process teammate of the session works at `now`. */
   anyWorking(now: number): boolean {
-    this.list();
-    let working = false;
-    for (const name of this.names) {
-      // Every file is still visited (no early exit) so its cache stays current.
-      if (this.check(path.join(this.dir, name), now)) working = true;
-    }
-    return working;
+    return this.list(now).some((t) => t.working);
   }
 
-  private list(): void {
+  /** The session's fresh in-process teammates at `now`, sorted by name. */
+  list(now: number): TeammateInfo[] {
+    this.refresh();
+    const found: TeammateInfo[] = [];
+    // Every file is still visited so its cache stays current.
+    for (const file of this.names) {
+      const info = this.check(path.join(this.dir, file), now);
+      if (info) found.push(info);
+    }
+    return found.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  }
+
+  private refresh(): void {
     let mtimeMs: number;
     try {
       const st = fs.lstatSync(this.dir);
@@ -163,26 +204,41 @@ export class TeammateScanner {
     for (const file of [...this.files.keys()]) if (!keep.has(file)) this.files.delete(file);
   }
 
-  private check(file: string, now: number): boolean {
+  private check(file: string, now: number): TeammateInfo | null {
     const stat = statTranscript(file);
-    if (!stat) { this.files.delete(file); return false; }
+    if (!stat) { this.files.delete(file); return null; }
     let state = this.files.get(file);
     if (!state) {
-      state = { size: -1, mtimeMs: -1, tail: null };
+      state = { size: -1, mtimeMs: -1, tail: null, activity: '' };
       this.files.set(file, state);
     }
     // Too old to count whatever it says: stat only, no read.
-    if (now - stat.mtimeMs > PENDING_TOOL_CAP_MS) return false;
-    if (state.teammate === undefined) state.teammate = isTeammateMeta(file);
-    if (state.teammate !== true) return false;
+    if (now - stat.mtimeMs > PENDING_TOOL_CAP_MS) return null;
+    if (state.teammate === undefined) {
+      const meta = readTeammateMeta(file);
+      if (meta) {
+        state.teammate = meta.teammate;
+        state.name = meta.name ?? nameFromFile(file);
+        state.color = meta.color;
+      }
+    }
+    if (state.teammate !== true) return null;
     if (stat.size !== state.size || stat.mtimeMs !== state.mtimeMs) {
       const lines: string[] = [];
       const page = readTranscriptPage(file, { maxBytes: TAIL_READ_BYTES, parseLine: (line) => { lines.push(line); return []; } });
-      if (!page) return false;
+      if (!page) return null;
       state.size = stat.size;
       state.mtimeMs = stat.mtimeMs;
       state.tail = classifyTeammateTail(lines);
+      state.activity = activityOf(lines);
     }
-    return teammateWorking(state.tail, state.mtimeMs, now);
+    const working = teammateWorking(state.tail, state.mtimeMs, now);
+    return {
+      name: state.name ?? nameFromFile(file),
+      ...(state.color ? { color: state.color } : {}),
+      working,
+      ...(working && state.activity ? { activity: state.activity } : {}),
+      at: Math.max(state.tail?.at ?? 0, state.mtimeMs),
+    };
   }
 }

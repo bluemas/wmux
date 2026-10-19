@@ -1773,3 +1773,5 @@ export function validateNavigationUrl(url: string): UrlValidationResult {
   return { valid: true };
 }
 
+/** One Claude Code Agent Teams teammate of a pane, as the daemon reads it from the session's `subagents/` folder. */
+export interface TeammateInfo { name: string; color?: string; working: boolean; activity?: string; at: number }

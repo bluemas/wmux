@@ -52,6 +52,7 @@ import { MAX_RAW_LEN, summarizeActivity } from '../../shared/activitySummary';
 import { agentRow } from '../../shared/agentIdentity';
 import { SUBAGENT_COUNTERS, type SubagentCounter } from './subagentCount';
 import { TeammateScanner, subagentsDirFor } from './teammateActivity';
+import type { TeammateInfo } from '../../shared/types';
 
 /** Most bytes read for one session in one tick. */
 export const READ_CAP_BYTES = 256 * 1024;
@@ -149,6 +150,13 @@ export interface TranscriptActivityDeps {
    * a turn start, never a count).
    */
   emitTeammatesWorking?: (sessionId: string) => void;
+  /**
+   * The session's Claude Code Agent Teams teammates (fresh ones, by name), sent
+   * on every teammate scan whose list differs from the last one sent (the
+   * `at` stamps do not count); an empty list when the watch ends after a
+   * non-empty one, so a stale roster never sticks.
+   */
+  emitTeammates?: (sessionId: string, teammates: TeammateInfo[]) => void;
   teammatePollMs?: number;
   /**
    * Every complete line read from a Claude transcript, in file order, with the
@@ -192,6 +200,8 @@ interface Watch {
   teammates?: TeammateScanner;
   /** When `teammates` last scanned (0 before any). */
   teammatesAt: number;
+  /** The last teammate list sent, as its comparison key ('' while none was). */
+  teammatesSent: string;
 }
 
 /**
@@ -358,6 +368,7 @@ export class TranscriptActivityWatcher {
     if (!watch) return;
     this.watches.delete(id);
     if (watch.subagentsSent > 0) this.deps.emitSubagents?.(id, 0);
+    if (watch.teammatesSent !== '') this.deps.emitTeammates?.(id, []);
   }
 
   private flushSubagents(id: string, watch: Watch): void {
@@ -372,13 +383,19 @@ export class TranscriptActivityWatcher {
     const now = this.now();
     if (watch.teammatesAt > 0 && now - watch.teammatesAt < (this.deps.teammatePollMs ?? TEAMMATE_POLL_MS)) return;
     watch.teammatesAt = now;
-    let working = false;
+    let list: TeammateInfo[] = [];
     try {
-      working = watch.teammates.anyWorking(now);
+      list = watch.teammates.list(now);
     } catch {
       // An unreadable folder says nothing; the activity line is unaffected.
     }
-    if (working) this.deps.emitTeammatesWorking?.(id);
+    if (list.some((t) => t.working)) this.deps.emitTeammatesWorking?.(id);
+    // The roster is sent on change only; an empty one is "" so that a list
+    // that never had a teammate sends nothing, and one that emptied sends [].
+    const key = list.length ? JSON.stringify(list.map(({ name, color, working, activity }) => ({ name, color, working, activity }))) : '';
+    if (key === watch.teammatesSent) return;
+    watch.teammatesSent = key;
+    this.deps.emitTeammates?.(id, list);
   }
 
   /** One transcript, one pane: the pane whose agent spoke last keeps it. */
@@ -423,10 +440,10 @@ export class TranscriptActivityWatcher {
     const stat = statTranscript(path);
     if (!stat) return;
     const subagents = binding ? SUBAGENT_COUNTERS[binding.agent]?.() : undefined;
-    const teammates = binding?.agent === 'claude' && this.deps.emitTeammatesWorking ? new TeammateScanner(subagentsDirFor(path)) : undefined;
+    const teammates = binding?.agent === 'claude' && (this.deps.emitTeammatesWorking || this.deps.emitTeammates) ? new TeammateScanner(subagentsDirFor(path)) : undefined;
     const counted: ParseLine = subagents ? (line, offset) => { subagents.noteLine(line); return parse(line, offset); } : parse;
     // Start at the end: only what the agent writes from now on.
-    this.watches.set(id, { path, parse: counted, ino: stat.ino, offset: stat.size, sentAt: 0, lines: !!onLine, linesOnly: this.hookFed.has(id), replay: !!onLine, subagents, subagentsSent: 0, teammates, teammatesAt: 0 });
+    this.watches.set(id, { path, parse: counted, ino: stat.ino, offset: stat.size, sentAt: 0, lines: !!onLine, linesOnly: this.hookFed.has(id), replay: !!onLine, subagents, subagentsSent: 0, teammates, teammatesAt: 0, teammatesSent: '' });
   }
 
   /** The one-time `onClaudeLine` replay a watch owes, if it owes one. */
