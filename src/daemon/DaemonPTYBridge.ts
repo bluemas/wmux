@@ -839,7 +839,9 @@ export class DaemonPTYBridge extends EventEmitter {
    */
   private noteCodexTitleSpinner(sessionId: string): void {
     const slug = this.trackedAgent?.alive ? this.trackedAgent.slug : undefined;
-    if (!slug || !agentRow(slug)?.titleRunning || this.hookSeen) return;
+    // A boot is not a turn: before any turn evidence the spinner is the TUI
+    // starting up (MCP servers, an update check), and main reads it as idle.
+    if (!slug || !agentRow(slug)?.titleRunning || this.hookSeen || this.preTurn) return;
     if (!titleShowsRunningTurn({ title: this.lastTitle, at: this.lastTitleAt }, slug, Date.now())) {
       if (this.spinnerOpenedTurn && this.turnOpen && !this.awaitingHuman) this.endSpinnerTurn();
       return;

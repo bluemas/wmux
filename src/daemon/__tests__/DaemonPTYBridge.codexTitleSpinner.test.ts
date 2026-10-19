@@ -52,6 +52,10 @@ describe('DaemonPTYBridge — a Codex title spinner reports running', () => {
     feed(CODEX_MODES + BANNER);
     feed('ready\r\n'); // spends the cycle the banner armed
     vi.advanceTimersByTime(6_000); // past any boot burst and its idle
+    // A first prompt: the session is past its boot (no longer pre-turn).
+    bridge.noteInput('first task\r');
+    feed('working on it\r\n');
+    vi.advanceTimersByTime(7_000);
     active = [];
     idle = [];
     bridge.on('active', (e: { likelyRepaint?: boolean }) => active.push(e));
@@ -273,6 +277,23 @@ describe('DaemonPTYBridge — a Codex title spinner reports running', () => {
     vi.advanceTimersByTime(10_000);
     expect(bridge.isTurnOpen()).toBe(true);
     expect(bridge.getAgentStatus()).toBe('running');
+  });
+
+  it('a boot spinner before any turn settles no complete', () => {
+    const fresh = new DaemonPTYBridge();
+    const fake = makeFakePty();
+    fresh.setupDataForwarding(fake.pty, new RingBuffer(65536), 'sess-2', new PromptEventLog());
+    fresh.noteAgentProcess({ slug: 'codex', alive: true });
+    fake.feed(CODEX_MODES + BANNER);
+    vi.advanceTimersByTime(6_000);
+    for (let i = 0; i < 20; i++) {
+      fake.feed(title(`${frames[i % 4]} Booting MCP server`));
+      vi.advanceTimersByTime(100);
+    }
+    fake.feed(title('codex | ~/repo'));
+    vi.advanceTimersByTime(10_000);
+    expect(fresh.getAgentStatus()).not.toBe('complete');
+    fresh.cleanup();
   });
 
   it('another tracked agent ignores the braille title; a late launch edge does not stop a Codex turn', () => {
