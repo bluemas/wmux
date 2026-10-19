@@ -171,6 +171,11 @@ export interface AgentIdentityRow {
   readonly tokenUsage?: true;
   /** Has a model discovery source (modelCatalog). */
   readonly modelCatalog?: true;
+  /** A pane whose hooks do not report reads running while the tracked
+   *  process is alive and its window title shows the agent's running title
+   *  (agentTitleRules RUNNING_TITLE; DaemonPTYBridge noteCodexTitleSpinner).
+   *  Claude's spinner has its own path in the bridge, so it is not listed. */
+  readonly titleRunning?: true;
 }
 
 /**
@@ -228,6 +233,7 @@ export const AGENT_IDENTITIES = [
     accounts: 'account-store',
     tokenUsage: true,
     modelCatalog: true,
+    titleRunning: true,
   },
   {
     slug: 'gemini',

@@ -21,6 +21,7 @@ import { stripPassiveInput } from '../shared/terminal/passiveInput';
 import { kittyChunkAsLegacy } from '../shared/kittyKeyEvents';
 import { titleShowsFinishedTurn, titleShowsRunningTurn } from './transcript/chatScreenGate';
 import { CLAUDE_IDLE_TITLE, CLAUDE_RUNNING_TITLE, CLAUDE_RUNNING_TITLE_OSC } from '../shared/agentTitleRules';
+import { agentRow } from '../shared/agentIdentity';
 import type { TurnFailure } from '../shared/phoneTurnFailure';
 
 /**
@@ -257,9 +258,8 @@ export class DaemonPTYBridge extends EventEmitter {
   /** Latest OSC 0/2 window title (sanitized) and when it arrived (0 = never). */
   private lastTitle = '';
   private lastTitleAt = 0;
-  /** When a Codex title spinner last reported this pane running (0 = not
-   *  spinning). See noteCodexTitleSpinner. */
-  private codexSpinnerActiveAt = 0;
+  /** When `active` was last emitted (0 = never); see noteCodexTitleSpinner. */
+  private lastActiveAt = 0;
   /** #1463 — a session started and no turn has since (see isPreTurn). */
   private preTurn = false;
   /** #1463 — arrival time of the last turn evidence: submitted input, an
@@ -270,6 +270,12 @@ export class DaemonPTYBridge extends EventEmitter {
   private codexBootWindow = false;
   private codexBannerTail = '';
   private static readonly CODEX_BANNER_TAIL = 512;
+  /**
+   * The pane's agent process as the daemon's process tracker last reported
+   * it (see noteAgentProcess), or null before any report. The detector's last
+   * agent outlives the agent; this is the process truth the title path reads.
+   */
+  private trackedAgent: { slug?: string; alive: boolean } | null = null;
 
   /**
    * Which terminal status settled the pane, while one has. Read only to keep
@@ -789,6 +795,9 @@ export class DaemonPTYBridge extends EventEmitter {
   }
 
   private closeTurn(soft = false): void {
+    // A cycle the title armed for this turn, which no output has reached yet,
+    // ends with it: a trailing frame would otherwise reopen the turn.
+    this.releaseTitleCycle();
     this.byteOpenedTurn = false;
     this.spinnerOpenedTurn = false;
     if (this.turnOpen) this.turnSoftClosed = soft;
@@ -805,27 +814,107 @@ export class DaemonPTYBridge extends EventEmitter {
    * report. The pane then read Idle mid-turn once the renderer's two-minute
    * activity stamp ran out.
    *
-   * The spinner's first frame reports `active`, and so does a frame every
-   * CODEX_SPINNER_REFRESH_MS while it keeps spinning, which keeps the stamp
-   * fresh. Main still defers to a hook latch and to a just-settled pane. A
-   * pane waiting on a human is never promoted by its title.
+   * The spinner goes through the same turn bookkeeping as output does, so
+   * the event, getAgentStatus() and isTurnOpen() agree. A frame arms the
+   * activity cycle, and the next frame reports `active` through onActive.
+   * When no turn is open (a detector settled it, as Codex's footer can
+   * mid-turn), the frame also opens one, as noteSpinnerTitle does for Claude
+   * Code, and the frame dropping from the title ends that turn again
+   * (endSpinnerTurn): the detector's dedup may keep the same footer from
+   * settling it a second time. The trailing frames of a turn the transcript
+   * recorded as ended open nothing.
+   * While the turn runs and the cycle stays active, a frame every
+   * CODEX_SPINNER_REFRESH_MS reports `active` again, which keeps the
+   * renderer's stamp fresh.
+   *
+   * A pane whose hooks report is left to them, and the title waits out the
+   * settle cooldown and a resize repaint: the last frames of a turn that just
+   * ended would otherwise reach the daemon's completion alarm as fresh work
+   * and cancel it. A pane waiting on a human is never promoted by its title.
+   * The agent is the one the process tracker watches alive in the pane, with
+   * the registry's `titleRunning` capability (Claude's spinner has its own
+   * path above) and its running title from RUNNING_TITLE: the detector's last agent
+   * outlives the agent, and another program's title can start with a braille
+   * frame too.
    */
   private noteCodexTitleSpinner(sessionId: string): void {
-    if (!/codex/i.test(this.agentDetector?.getLastAgent() ?? '')) return;
-    if (!this.titleShowsRunningTurn()) {
-      this.codexSpinnerActiveAt = 0;
+    const slug = this.trackedAgent?.alive ? this.trackedAgent.slug : undefined;
+    // Before any turn evidence the title still counts: `codex "<prompt>"`
+    // (Fan-out's launch) submits its first turn itself, with no keystroke
+    // reaching the bridge. endSpinnerTurn settles such a turn as a boot.
+    if (!slug || !agentRow(slug)?.titleRunning || this.hookSeen) return;
+    if (!titleShowsRunningTurn({ title: this.lastTitle, at: this.lastTitleAt }, slug, Date.now())) {
+      if (this.spinnerOpenedTurn && this.turnOpen && !this.awaitingHuman) this.endSpinnerTurn();
       return;
     }
-    if (this.awaitingHuman) return;
+    const monitor = this.activityMonitor;
+    if (!monitor || this.awaitingHuman || this.muted) return;
     const now = Date.now();
-    if (this.codexSpinnerActiveAt > 0 && now - this.codexSpinnerActiveAt < DaemonPTYBridge.CODEX_SPINNER_REFRESH_MS) return;
-    this.codexSpinnerActiveAt = now;
+    if (
+      now - this.settledAtMs < DaemonPTYBridge.SETTLE_COOLDOWN_MS
+      || now - this.lastResizeAtMs < RESIZE_REDRAW_GUARD_MS
+    ) return;
+    const promoted = this.explicitTerminalStatus;
+    if (promoted && !this.isInputQuiet()) return;
+    // The last frames of a turn the transcript just recorded as ended belong to it.
+    if (!this.turnOpen && now - this.transcriptTurnEndAt < DaemonPTYBridge.SETTLE_COOLDOWN_MS) return;
+    const settled = this.settledStatus;
+    if (promoted) {
+      this.explicitTerminalStatus = false;
+      this.settledStatus = null;
+      this.submittedTurnPending = false;
+    }
+    // No turn is open (a detector settled it, or a late launch edge of another
+    // agent ended it) while the title spins: the title opens one, and its
+    // frame dropping ends it again (endSpinnerTurn), whichever path the next
+    // `active` takes.
+    if (!this.turnOpen) {
+      this.spinnerSettledStatus = promoted ? settled : null;
+      this.openTurn(true);
+      this.spinnerOpenedTurn = true;
+    }
+    if (!monitor.isActive(sessionId)) {
+      // A promotion keeps the detector's dedup, as the settled branch of
+      // onActive does: the footer still on screen must not settle it again.
+      if (promoted) this.spinnerArmedCycle = true;
+      monitor.beginTurnIfInactive(sessionId);
+      this.titleArmedCycle = monitor.cycleOf(sessionId);
+      // The monitor starts a cycle's idle countdown on output only. A cycle
+      // no output reaches (the TUI went quiet right after this frame) would
+      // read running forever, so it gets a countdown of its own.
+      if (this.titleCycleTimer) clearTimeout(this.titleCycleTimer);
+      this.titleCycleTimer = setTimeout(() => {
+        this.titleCycleTimer = null;
+        // Only the cycle the title armed, unclaimed: output, a submit, an idle
+        // or a hook took any other over, and it is theirs to end.
+        if (!this.titleCycleStillPending()) {
+          this.titleArmedCycle = null;
+          return;
+        }
+        // No output at all since the frame: a turn the title opened ends as
+        // if its frame had dropped (endSpinnerTurn releases the cycle too).
+        if (this.spinnerOpenedTurn && this.turnOpen && !this.awaitingHuman && !this.hookSeen) this.endSpinnerTurn();
+        else this.releaseTitleCycle();
+      }, DaemonPTYBridge.TITLE_CYCLE_IDLE_MS);
+      return;
+    }
+    if (now - this.lastActiveAt < DaemonPTYBridge.CODEX_SPINNER_REFRESH_MS) return;
+    this.lastActiveAt = now;
     this.emit('active', {
       sessionId,
       agentName: this.agentDetector?.getLastAgent() ?? undefined,
       likelyRepaint: false,
     });
   }
+
+  /** The activity cycle noteCodexTitleSpinner armed (ActivityMonitor.cycleOf),
+   *  until output or idle takes it over; the tracked Codex dying or being
+   *  replaced while it is still that cycle hands it back (noteAgentProcess). */
+  private titleArmedCycle: number | null = null;
+  /** Releases a title-armed cycle no output reached (see noteCodexTitleSpinner). */
+  private titleCycleTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The activity monitor's own idle delay. */
+  private static readonly TITLE_CYCLE_IDLE_MS = 5_000;
 
   /** How often a still-spinning Codex title re-reports running (well inside
    *  the renderer's 120 s activity window). */
@@ -913,15 +1002,19 @@ export class DaemonPTYBridge extends EventEmitter {
    * repaint under that title meets the idle-title gate.
    */
   private endSpinnerTurn(): void {
+    // A spinner that ran before any turn evidence (a boot, or a first turn
+    // the agent submitted itself) settles the way a boot does: an idle main
+    // treats as pre-turn, not a `complete` nobody asked for.
+    const preTurn = this.preTurn;
     this.closeTurn(true);
-    this.explicitTerminalStatus = true;
-    this.settledStatus = this.spinnerSettledStatus ?? 'complete';
+    this.settledStatus = this.spinnerSettledStatus ?? (preTurn ? null : 'complete');
+    this.explicitTerminalStatus = this.settledStatus !== null;
     this.spinnerSettledStatus = null;
     this.spinnerArmedCycle = false;
     if (this.activityMonitor && this.sessionId) {
       this.activityMonitor.endTurn(this.sessionId);
       // Main heard `running` from this turn; nothing else would retract it.
-      this.emit('idle', { sessionId: this.sessionId });
+      this.emit('idle', { sessionId: this.sessionId, ...(preTurn ? { preTurn: true } : {}) });
     }
   }
 
@@ -943,8 +1036,13 @@ export class DaemonPTYBridge extends EventEmitter {
    * when the end predates the latest turn evidence.
    */
   noteTranscriptTurnEnd(at: number): void {
-    if ((this.turnOpen || this.turnSoftClosed) && !this.awaitingHuman && at >= this.turnOpenedAt) this.closeTurn();
+    if ((this.turnOpen || this.turnSoftClosed) && !this.awaitingHuman && at >= this.turnOpenedAt) {
+      this.closeTurn();
+      this.transcriptTurnEndAt = Date.now();
+    }
   }
+  /** When noteTranscriptTurnEnd last closed an episode (0 = never). */
+  private transcriptTurnEndAt = 0;
 
   /**
    * The agent that owned this pane is gone (its process exited, another agent
@@ -955,6 +1053,40 @@ export class DaemonPTYBridge extends EventEmitter {
   noteAgentEnded(): void {
     this.closeTurn();
     this.hookSeen = false;
+  }
+
+  /**
+   * The daemon's process tracker picked the pane's agent process, or saw it
+   * die. Only the watched pid's death is reported, so a relaunch the tracker
+   * already picked is never ended by its predecessor's late death edge.
+   */
+  noteAgentProcess(state: { slug?: string; alive: boolean }): void {
+    this.trackedAgent = { ...(state.slug ? { slug: state.slug } : {}), alive: state.alive };
+    // A cycle the title armed waits for output to start its idle countdown;
+    // an agent that died (or was replaced by another) right after the frame
+    // writes none, and the cycle would read running forever. It goes with
+    // the agent that armed it.
+    if (state.alive && agentRow(state.slug)?.titleRunning) return;
+    this.releaseTitleCycle();
+  }
+
+  /** Ends the cycle noteCodexTitleSpinner armed if it is still that cycle and
+   *  no hook claimed it (a submit, an idle or a new burst starts another). */
+  private releaseTitleCycle(): void {
+    if (this.titleCycleTimer) {
+      clearTimeout(this.titleCycleTimer);
+      this.titleCycleTimer = null;
+    }
+    if (this.titleCycleStillPending() && this.sessionId) this.activityMonitor?.endTurn(this.sessionId);
+    this.titleArmedCycle = null;
+  }
+
+  /** The cycle noteCodexTitleSpinner armed is still the monitor's current
+   *  one, and no hook has claimed it. */
+  private titleCycleStillPending(): boolean {
+    const monitor = this.activityMonitor;
+    return this.titleArmedCycle !== null && !!this.sessionId && !!monitor
+      && monitor.cycleOf(this.sessionId) === this.titleArmedCycle && !this.hookArmedCycle;
   }
 
   /**
@@ -1239,6 +1371,7 @@ export class DaemonPTYBridge extends EventEmitter {
     // explicit waiting/complete state five seconds later.
     this.idleUnsubscribe = activityMonitor.onActiveToIdle((ptyId) => {
       this.hookArmedCycle = false;
+      this.titleArmedCycle = null;
       // F24: an episode only output opened, on a hook pane, ends when that
       // output stops (see `byteOpenedTurn`). Five seconds of byte silence
       // means no spinner either; the spinner title is output too. Softly, so
@@ -1254,6 +1387,9 @@ export class DaemonPTYBridge extends EventEmitter {
     // keystrokes quiet and outside the resize-redraw window — the three things
     // that separate an autonomous turn from echo and repaints.
     this.activeUnsubscribe = activityMonitor.onActive((ptyId) => {
+      // Output reached the cycle and started its idle countdown: whatever
+      // armed it, it can no longer read running forever.
+      this.titleArmedCycle = null;
       let likelyRepaint = false;
 
       if (this.explicitTerminalStatus) {
@@ -1364,6 +1500,7 @@ export class DaemonPTYBridge extends EventEmitter {
       // working feed in daemon/index.ts must NOT treat the burst as turn
       // evidence — a repaint rebutting a pending completion window would
       // silently kill a real "finished" alarm.
+      this.lastActiveAt = Date.now();
       this.emit('active', {
         sessionId: ptyId,
         agentName: this.agentDetector?.getLastAgent() ?? undefined,
@@ -1390,9 +1527,9 @@ export class DaemonPTYBridge extends EventEmitter {
         this.lastTitleAt = Date.now();
         if (title) this.emit('title', { sessionId, title });
         if (titleTurnEdge.observe(title)) this.noteTitleTurnEnd(sessionId);
-        this.noteCodexTitleSpinner(sessionId);
         if (CLAUDE_RUNNING_TITLE.test(title)) this.noteSpinnerTitle();
         else if (this.spinnerOpenedTurn && this.turnOpen && !this.awaitingHuman && CLAUDE_IDLE_TITLE.test(title)) this.endSpinnerTurn();
+        this.noteCodexTitleSpinner(sessionId);
         return;
       }
       if (event.code === 7) {
@@ -1739,6 +1876,8 @@ export class DaemonPTYBridge extends EventEmitter {
   }
 
   cleanup(): void {
+    if (this.titleCycleTimer) clearTimeout(this.titleCycleTimer);
+    this.titleCycleTimer = null;
     this.dataDisposable?.();
     this.dataDisposable = null;
     this.startupDa1 = null;
@@ -1791,6 +1930,9 @@ export class DaemonPTYBridge extends EventEmitter {
     this.turnEvidenceAt = 0;
     this.codexBootWindow = false;
     this.codexBannerTail = '';
+    this.trackedAgent = null;
+    this.lastActiveAt = 0;
+    this.transcriptTurnEndAt = 0;
     this.turnOpen = false;
     this.turnSoftClosed = false;
     this.bootEpisode = false;

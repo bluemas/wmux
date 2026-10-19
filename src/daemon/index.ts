@@ -8877,6 +8877,8 @@ async function main(): Promise<void> {
     // seen here, ends the previous agent's running episode.
     const previousSlug = managed.meta.lastDetectedAgent;
     if (!state.alive || (state.slug && previousSlug && state.slug !== previousSlug)) managed.bridge.noteAgentEnded();
+    // The process truth the bridge's running-title path reads.
+    managed.bridge.noteAgentProcess(state);
     const screenSlug = managed.bridge.getLastAgent();
     const canonical = canonicalIdentityFor(
       agentProcessTracker,
