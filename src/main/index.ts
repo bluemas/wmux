@@ -54,6 +54,7 @@ import { createWindow, loadMainRenderer } from './window/createWindow';
 import { attachDesktopPresenceReporter, reportDesktopPresence } from './window/desktopPresence';
 import { PTYManager } from './pty/PTYManager';
 import { PTYBridge } from './pty/PTYBridge';
+import { createLocalApprovalScreenReader } from './pty/localApprovalScreen';
 import { pruneDaemonPidMapAtConnect } from './pty/pidMap';
 import { registerAllHandlers } from './ipc/registerHandlers';
 import { RpcRouter } from './pipe/RpcRouter';
@@ -72,6 +73,7 @@ import { registerDeckRpc } from './pipe/handlers/deck.rpc';
 import { registerNotifyRpc } from './pipe/handlers/notify.rpc';
 import { registerMetaRpc } from './pipe/handlers/meta.rpc';
 import { registerSystemRpc } from './pipe/handlers/system.rpc';
+import { registerCodexRpc } from './pipe/handlers/codex.rpc';
 import { registerPerfRpc } from './pipe/handlers/perf.rpc';
 import { registerComputerRpc } from './pipe/handlers/computer.rpc';
 import { resolvePtyOwnerWorkspace } from './workspace/ptyOwnership';
@@ -183,7 +185,7 @@ import { DaemonClient, getDaemonPipeName, readDaemonAuthToken } from './DaemonCl
 import { raceDaemonShutdown } from './daemonShutdownRace';
 import { migrateScrollbackOnce } from './scrollback/legacyMigration';
 import { DaemonNotificationRouter } from './notification/DaemonNotificationRouter';
-import { resyncAfterResubscribe } from './notification/resubscribeResync';
+import { resyncAfterResubscribe, type DaemonSessionRow } from './notification/resubscribeResync';
 import { markRendererNotificationListenerNotReady } from './notification/rendererNotificationReadiness';
 import { RemoteInboxBridge } from './lanlink/RemoteInboxBridge';
 import { RemoteA2aBridge } from './a2a/RemoteA2aBridge';
@@ -196,6 +198,7 @@ import { toastManager } from './notification/ToastManager';
 import { WorkspaceContextRouter } from './metadata/WorkspaceContextRouter';
 import { ensureDaemon, killDaemonByPidFile, describeDaemonKillOutcome, killVerifiedDaemonPid, checkProcessLiveness, isDaemonPipeGone } from './daemon/launcher';
 import { DaemonRespawnController } from './daemon/DaemonRespawnController';
+import { createDaemonExitWatch } from './daemon/daemonExitWatch';
 import { loadConfig, getWmuxDir } from '../daemon/config';
 import { CHANNELS_EPOCH } from '../shared/channels';
 import { createTray, destroyTray, updateTraySessionCount } from './tray';
@@ -228,7 +231,7 @@ import { metadataStore } from './metadata/MetadataStore';
 import { collectLegacyMetadata } from './metadata/legacyMigration';
 import { sessionManager, registerSessionHandlers } from './ipc/handlers/session.handler';
 import { eventBus } from './events/EventBus';
-import { broadcastMetadataUpdate, currentPrOfPty, resetPollCacheOnRendererLoad } from './ipc/handlers/metadata.handler';
+import { broadcastMetadataUpdate, currentPrOfPty, getCwd, resetPollCacheOnRendererLoad } from './ipc/handlers/metadata.handler';
 import { broadcastSettledIdle } from './notification/turnSettle';
 import { readOrchRole } from '../shared/orchestratorRole';
 import { initLogSink, isBrokenPipeError, logLine, stdioErrorsConsumed } from './util/logSink';
@@ -262,7 +265,9 @@ if (process.platform === 'win32') {
   const squirrelCmd = process.argv[1];
   if (isSquirrelInstallerEvent(squirrelCmd)) {
     isSquirrelEvent = true;
+    // eslint-disable-next-line @typescript-eslint/no-var-requires -- Preserve installer-only module loading.
     const path = require('path');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires -- Preserve installer-only module loading.
     const { spawn } = require('child_process');
     const updateExe = path.resolve(path.dirname(process.execPath), '..', 'Update.exe');
     const target = path.basename(process.execPath);
@@ -401,6 +406,7 @@ if (!app.isPackaged && !process.env.WMUX_DATA_SUFFIX) {
 let portableDataForced = false;
 if (process.platform === 'darwin' && app.isPackaged && !process.env.WMUX_DATA_SUFFIX) {
   let realExecPath = process.execPath;
+  // eslint-disable-next-line @typescript-eslint/no-var-requires -- Keep this early portable-data check's loading order.
   try { realExecPath = require('fs').realpathSync(process.execPath); } catch { /* keep execPath */ }
   if (shouldUsePortableData(realExecPath, os.homedir(), process.env)) {
     portableDataForced = true;
@@ -497,6 +503,23 @@ let isQuitting = false;
 // tells before-quit to additionally tear the daemon down (daemon.shutdown +
 // pid-kill backstop) for an explicit full exit.
 let fullShutdownRequested = false;
+// The daemon's exit report for a deliberate stop (the tray's full shutdown or
+// the menu's "Quit and Stop Sessions"). The watch is taken from the respawn
+// controller before it is disposed and reported on before the stop begins, so
+// a daemon that dies natively during its teardown still has its exit code
+// logged; before-quit waits for it before quitting.
+let stopExitReport: Promise<void> | null = null;
+function startStopExitReport(): void {
+  if (stopExitReport) return;
+  const watch = daemonRespawnController?.takeExitWatch() ?? null;
+  if (watch) stopExitReport = watch.report('full shutdown').catch(() => { /* evidence only */ });
+}
+// How long before-quit waits for that report once the stop is done. The daemon
+// exits within about 1 s of acking daemon.shutdown (50 ms pipe teardown, a 1 s
+// forced exit), and at once after the pid-kill; a daemon still running after
+// this is one the stop did not end, and holding the quit for the report's own
+// 15 s budget would only delay the exit.
+const STOP_EXIT_REPORT_WAIT_MS = 2_000;
 // Windows sends WM_ENDSESSION to every top-level window, so a logoff can
 // reach more than one main window's 'session-end' listener (an update-recovery
 // window adopted while the old one is still being torn down). The emergency
@@ -540,6 +563,11 @@ let hookSignalRouter: HookSignalRouter | null = null;
 // hook's Stop candidate must arbitrate against the same pane gate.
 let localCompletionAlarm: CompletionAlarm | null = null;
 const ptyBridge = new PTYBridge(ptyManager, () => mainWindow, () => hookSignalRouter, () => localCompletionAlarm);
+ptyBridge.setApprovalScreenReader(createLocalApprovalScreenReader({
+  getPty: (id) => ptyManager.get(id),
+  getWindow: () => mainWindow,
+  read: (id) => sendToRenderer(() => mainWindow, 'input.readScreen', { ptyId: id, approvalScreen: true }, { timeoutMs: 4500 }),
+}));
 // The hooks carry the two things the updater cannot reach: the quit flag that
 // lets windows actually close (without it quitAndInstall never installs — see
 // prepareInstallQuit) and the way back if that handoff stalls.
@@ -771,6 +799,10 @@ ipcMain.handle('daemon:get-ready-state', async () => {
 // because pipeServer.getAuthToken() reads the file written during startup,
 // which may not have happened yet when handlers are first registered.
 const mcpHandlerOptions = {
+  // #2398 — every registerAllHandlers call spreads these, the handler swap to
+  // local mode on a daemon disconnect included: the local pty:reconnect needs
+  // to know whether that fallback is final.
+  daemonMayReturn: (): boolean => daemonRespawnController?.daemonMayReturn ?? false,
   mcpRegistrar,
   getMcpAuthToken: (): string | null => {
     try {
@@ -867,6 +899,7 @@ function attachWindowRecovery(win: BrowserWindow): void {
     }
     lastCrashTime = now;
     if (crashCount >= 3) {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires -- Preserve the existing crash-only dialog lookup.
       require('electron').dialog.showErrorBox('wmux', 'Renderer crashed repeatedly. Please restart.');
       app.quit();
       return;
@@ -1003,6 +1036,7 @@ registerDeckRpc(rpcRouter, () => mainWindow);
 registerNotifyRpc(rpcRouter, () => mainWindow);
 registerMetaRpc(rpcRouter, () => mainWindow);
 registerSystemRpc(rpcRouter);
+registerCodexRpc(rpcRouter, () => mainWindow, () => daemonClient);
 registerPerfRpc(rpcRouter);
 // Desktop computer use. Built on first call, so an install that never opts in
 // (Settings › Computer use) never constructs it or spawns a helper. Consent rides
@@ -1398,7 +1432,11 @@ const onClaudeTurnEnd = (workspaceId: string): void => {
   }
 };
 getAccountRotationService().setClaudeUsage(accountUsageService);
-const disposeHooksRpc = registerHooksRpc(rpcRouter, () => mainWindow, hookSignalRouter, () => daemonClient, onClaudeTurnEnd, getWorkspaceMirror, localCompletionAlarm);
+const disposeHooksRpc = registerHooksRpc(
+  rpcRouter, () => mainWindow, hookSignalRouter, () => daemonClient, onClaudeTurnEnd,
+  getWorkspaceMirror, localCompletionAlarm,
+  (ptyId, signal) => ptyBridge.noteAcceptedHook(ptyId, signal),
+);
 
 // ─── Phase 2 — Anthropic 5h/7d usage meter ──────────────────────────────────
 // Opt-in. Stays idle until the renderer sends IPC.USAGE_TOGGLE with `true`.
@@ -1810,6 +1848,7 @@ app.on('ready', async () => {
     getDaemonClient: () => daemonClient,
     isQuitting: () => isQuitting,
     prepareStop: () => {
+      startStopExitReport();
       daemonRespawnController?.dispose();
       daemonRespawnController = null;
     },
@@ -1825,6 +1864,7 @@ app.on('ready', async () => {
   if (process.platform === 'darwin' && app.isPackaged && process.env.WMUX_DATA_SUFFIX !== PORTABLE_DATA_SUFFIX) {
     const shimTimer = setTimeout(() => {
       try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires -- Preserve deferred CLI-shim module loading.
         const fs = require('fs') as typeof import('fs');
         const markerPath = `${getWmuxHomeDir()}/cli-shim-darwin-attempted`;
         if (fs.existsSync(markerPath) && !cliShim.darwinShimNeedsRepair(process.execPath)) return;
@@ -2340,18 +2380,34 @@ app.on('ready', async () => {
     },
     // #2263 — the daemon dropped our event subscription and the health probe
     // subscribed again; correct the panes from a fresh read of their state.
+    // main's cwd cache doubles as its record of which sessions it still
+    // tracks: pty create and reattach seed it, and session:died /
+    // session:destroyed drop it (WorkspaceContextRouter).
     onEventsResubscribed: (client) => {
       void resyncAfterResubscribe({
-        listSessionIds: async () => {
-          const sessions = (await client.rpc('daemon.listSessions', {})) as Array<{ id?: unknown }>;
-          return sessions.map((s) => s.id).filter((id): id is string => typeof id === 'string' && id.length > 0);
-        },
+        listSessions: async () => (await client.rpc('daemon.listSessions', {})) as DaemonSessionRow[],
+        trackedCwd: (id) => getCwd(id),
         readState: (id) => client.getAgentState(id),
+        emitDied: (id, exitCode, signal) => {
+          client.emit('session:died', { sessionId: id, exitCode, ...(signal !== undefined ? { signal } : {}) });
+        },
+        emitCwd: (id, cwd) => { client.emit('session:cwd', { sessionId: id, cwd }); },
+        onLiveEvent: (listener) => {
+          const onCwd = (payload: { sessionId: string }) => { listener('cwd', payload.sessionId); };
+          const onLifecycle = (payload: { sessionId: string }) => { listener('lifecycle', payload.sessionId); };
+          const lifecycle = ['session:died', 'session:destroyed', 'session:restarted'] as const;
+          client.on('session:cwd', onCwd);
+          for (const e of lifecycle) client.on(e, onLifecycle);
+          return () => {
+            client.off('session:cwd', onCwd);
+            for (const e of lifecycle) client.off(e, onLifecycle);
+          };
+        },
         emitTitle: (id, title) => { client.emit('session:title', { sessionId: id, title }); },
         hookRouter: hookSignalRouter,
         win: mainWindow && !mainWindow.isDestroyed() ? mainWindow : null,
       }).then((r) => {
-        logLine('info', 'daemon-respawn', `resync after resubscribe: ${r.panes} panes, ${r.statusesCorrected} statuses corrected, ${r.titles} titles`);
+        logLine('info', 'daemon-respawn', `resync after resubscribe: ${r.panes} panes, ${r.statusesCorrected} statuses corrected, ${r.titles} titles, ${r.deaths} deaths, ${r.cwds} cwds`);
       }, (err: unknown) => {
         logLine('warn', 'daemon-respawn', `resync after resubscribe failed: ${err instanceof Error ? err.message : String(err)}`);
       });
@@ -2361,6 +2417,10 @@ app.on('ready', async () => {
       warn: (msg) => { logLine('warn', 'daemon-respawn', msg); },
       error: (msg) => { logLine('error', 'daemon-respawn', msg); },
     },
+    // The daemon's exit code when it goes, native faults included.
+    watchDaemonExit: (pid, spawned) => createDaemonExitWatch(pid, spawned, {
+      log: (level, msg) => { logLine(level, 'daemon-exit', msg); },
+    }),
     // B′ stale-daemon auto-replacement (plans/daemon-auto-replace-plan-
     // 2026-07-05.md). Fires only when a REUSED daemon is positively older
     // than this app; the whole destructive path rides the daemon's own
@@ -3076,6 +3136,9 @@ app.on('before-quit', async (e) => {
   // and detaches listeners — it does NOT call `onUninstall()`, so the
   // shutdown-race path below remains the single authority for taking the
   // client offline cleanly.
+  // A full shutdown keeps watching the daemon's exit past dispose(). A detach
+  // Quit leaves the daemon alive on purpose: nothing to watch.
+  if (fullShutdownRequested) startStopExitReport();
   safeStep('daemonRespawnController.dispose', () => {
     daemonRespawnController?.dispose();
     daemonRespawnController = null;
@@ -3171,6 +3234,16 @@ app.on('before-quit', async (e) => {
         logLine('warn', 'main', `full-shutdown: post-throw pid-kill backstop ${describeDaemonKillOutcome(outcome)}`);
       });
     }
+  }
+
+  // The daemon goes after its ack, not with it: wait for its exit line.
+  if (fullShutdownRequested && stopExitReport) {
+    let waitTimer: NodeJS.Timeout | undefined;
+    await Promise.race([
+      stopExitReport,
+      new Promise<void>((resolve) => { waitTimer = setTimeout(resolve, STOP_EXIT_REPORT_WAIT_MS); }),
+    ]);
+    clearTimeout(waitTimer);
   }
 
   safeStep('claudeWorker.stop', () => claudeWorker.stop());

@@ -24,6 +24,7 @@ import { getFactorySettings } from './factorySettings';
 import { getRoomWriter } from './roomWriter';
 import { taskFolderFromMissions } from './verifyPreset';
 import { AgentSlots, getAgentSlots, setAgentSlots, setSlotLivenessRefresh, slotHolderArgs } from './agentSlots';
+import { releaseHeldFanouts } from './heldFanouts';
 import { checkWorkers, recordWorkerEnd, recordWorkerStart } from './budget';
 import { runningWakeTainted } from './wakeTaint';
 import { installReportNudge, submitToWorkerPane } from './workerReportNudge';
@@ -34,7 +35,6 @@ import { getFactLog } from './factLog';
 import { getWakeQueue } from './wakeQueue';
 import {
   RECLAIM_CATCHUP_MS,
-  REPORTED_IDLE_MS,
   isReclaimableEnd,
   RESUMED_IDLE_MS,
   ReclaimedWorkers,
@@ -43,11 +43,12 @@ import {
   createViewAttention,
   createWorkerClear,
   installWorkerReclaim,
-  isReclaimableReport,
   isReclaimedSince,
   isTaskWorkspaceOf,
   mergePaneActivity,
   noteWorkerAgentExit,
+  pauseDue,
+  pauseIdleMsFor,
   reportedWorkerPanes,
   resumedAgentAlive,
   setWorkerResumePorts,
@@ -56,7 +57,6 @@ import {
   type WorkerResumePorts,
   type WorkerSessionInfo,
   viewProtects,
-  workerPanesIdle,
 } from './workerReclaim';
 import { getWorkspaceMirror } from '../workspace/WorkspaceMirror';
 import { createDeadPaneSweep } from './deadWorkerPanes';
@@ -77,6 +77,8 @@ import { verdictedTaskIds } from './openBotWorkers';
 import type { FanOutService } from '../worktask/FanOutService';
 import { sendToRenderer } from '../pipe/handlers/_bridge';
 import { isFanoutWorkerPermissionMode } from '../../shared/workerLaunch';
+import { createWorkerLaunchRecovery } from './workerLaunchRecovery';
+import { LAUNCH_PROBE_CONFIRM_TIMEOUT_MS, LAUNCH_PROBE_TIMEOUT_MS } from '../worktask/fanoutLaunchProbe';
 import type { PermissionMode } from '../../shared/agentResume';
 
 /** A resumed worker is checked for an exited agent this often. */
@@ -129,10 +131,10 @@ export function startWorkerLifecycle(deps: WorkerLifecycleDeps): () => void {
   /** The reclaim record, once loaded below (the slot count reads it). */
   let reclaimedStore: ReclaimedWorkers | null = null;
   const daemon = (): DaemonClient | null => deps.getDaemonClient?.() ?? null;
-  const rpc = async (method: string, params: Record<string, unknown>): Promise<unknown> => {
+  const rpc = async (method: string, params: Record<string, unknown>, opts?: { timeoutMs: number }): Promise<unknown> => {
     const c = daemon();
     if (!c) throw new Error('the daemon is not connected');
-    return c.rpc(method as never, params);
+    return c.rpc(method as never, params, opts);
   };
   const changed = (): void => {
     try {
@@ -151,6 +153,18 @@ export function startWorkerLifecycle(deps: WorkerLifecycleDeps): () => void {
   // Each task's launch generation (workerSlots.ts): loaded, or rebuilt from
   // the ledger rows on the first start with it.
   const launches = getWorkerSlots();
+  const launchRecovery = createWorkerLaunchRecovery({ ledger, launches,
+    readSessions: () => rpc('daemon.listSessions', { withRecovery: true }),
+    readPresence: (id, probeProcess) => rpc('daemon.getLaunchPresence', { id, probeProcess },
+      { timeoutMs: probeProcess ? LAUNCH_PROBE_CONFIRM_TIMEOUT_MS : LAUNCH_PROBE_TIMEOUT_MS }), changed,
+    log: (message) => console.warn(message),
+  });
+  const recoverLaunches = (): void => { void launchRecovery.pass(); };
+  offs.push(() => launchRecovery.dispose());
+  const recoverySweep = setInterval(recoverLaunches, LIVENESS_REFRESH_MS);
+  recoverySweep.unref?.();
+  offs.push(() => clearInterval(recoverySweep));
+  recoverLaunches();
   const goneFacts = AgentGoneFacts.at(deps.wmuxDir(), (taskId) => launches.launchOf(taskId)?.launchedAt);
   goneFacts.load();
   setAgentGoneFacts(goneFacts);
@@ -253,8 +267,9 @@ export function startWorkerLifecycle(deps: WorkerLifecycleDeps): () => void {
       const ws = entries.find((e) => e.id === workspaceId);
       return ws && Array.isArray(ws.ptyIds) ? ws.ptyIds : [];
     };
-    // A reported task's own worker panes, and the daemon's view of their
-    // turn where main has none (after a restart): createDaemonTurnSeed.
+    // An open bot task's own worker panes (a reported one, or one still
+    // working or needing input), and the daemon's view of their turn where
+    // main has none (after a restart): createDaemonTurnSeed.
     const turnSeed = createDaemonTurnSeed({
       tasks: () => {
         const entries = mirror.getEntries();
@@ -262,7 +277,7 @@ export function startWorkerLifecycle(deps: WorkerLifecycleDeps): () => void {
         const out: Array<{ taskId: string; reportedAt: number; panes: readonly string[]; recorded: readonly string[]; launched: readonly string[] }> = [];
         for (const r of ledger.list({ openOnly: true })) {
           const rec = reclaimed.get(r.id);
-          if (!isReclaimableReport(r) || isReclaimedSince(rec, r)) continue;
+          if (pauseIdleMsFor(r) === null || isReclaimedSince(rec, r)) continue;
           const ws = entries.find((e) => e.id === r.taskWorkspaceId);
           const panes = ws && Array.isArray(ws.ptyIds) ? ws.ptyIds : [];
           out.push({
@@ -314,10 +329,13 @@ export function startWorkerLifecycle(deps: WorkerLifecycleDeps): () => void {
     const viewed = (workspaceId: string): boolean => (mirror.getViewed()?.workspaceId === workspaceId
       || mirror.getPanelWorkspaceId() === workspaceId)
       && viewProtects(attention.focusedAt(workspaceId), (workspacePtys(workspaceId) ?? []).map((id) => paneActivity(id).inputAt), Date.now());
+    // An open task's window: REPORTED_IDLE_MS once reported, OPEN_IDLE_MS
+    // while still working or needing input (pauseIdleMsFor), counted from
+    // its last row write.
     const reportedIdle = (entry: LedgerEntry): boolean => {
-      if (viewed(entry.taskWorkspaceId)) return false;
+      if (pauseIdleMsFor(entry) === null) return false;
       const panes = reportedWorkerPanes(turnSeed.workerPanes(entry.id), workspacePtys(entry.taskWorkspaceId));
-      return !!panes && workerPanesIdle(panes.map(paneActivity), entry.updatedAt, Date.now(), REPORTED_IDLE_MS);
+      return pauseDue(entry, viewed(entry.taskWorkspaceId), panes?.map(paneActivity) ?? null, entry.updatedAt, Date.now());
     };
     offs.push(installWorkerReclaim({
       onTransition: (fn) => ledger.onTransition(fn),
@@ -336,12 +354,19 @@ export function startWorkerLifecycle(deps: WorkerLifecycleDeps): () => void {
       // A WSL pane counts as the task's worker only when identified (#2266).
       sessionRecordOf: botWorkerSessionRecord,
       note,
+      noticeBot: (n) => {
+        noticeBot({ factLog: getFactLog, wakes: getWakeQueue }, n);
+      },
+      // A stopped worker frees its agent slot: the slot queue looks again,
+      // as after the resumed-worker stop.
       changed: () => {
         changed();
         reconcile();
+        getAgentSlots()?.kick();
       },
       retryMs: RESUMED_SWEEP_MS,
-      // A reported task's worker is stopped once every one of its own worker
+      // An open task's worker (reported, or still working or needing input
+      // past the longer window) is stopped once every one of its own worker
       // panes (turnSeed: a pane of its workspace whose agent runs; never a
       // plain shell) sat idle for the window, counted from the report and
       // from each pane's own last turn edge and input (workerPanesIdle), and
@@ -524,7 +549,10 @@ export function startWorkerLifecycle(deps: WorkerLifecycleDeps): () => void {
         if (!live) return 'the bot\'s worker count is not available yet';
         const open = holderCounts(live.holders.filter((h) => h.taskId !== taskId && h.why !== 'resuming'), botId).bot + starting;
         const c = checkWorkers(profile.budget, store.usageOf(botId), open, 1, Date.now());
-        return c.ok ? null : `this bot's worker budget refuses another worker now (${c.reason})`;
+        if (c.ok) return null;
+        return c.reason === 'concurrent_workers'
+          ? 'all of this bot\'s worker slots are in use (not a budget limit): resume it once one of its workers ends'
+          : `this bot's worker budget refuses another worker now (${c.reason})`;
       },
       note,
       changed,
@@ -705,6 +733,7 @@ export function startWorkerLifecycle(deps: WorkerLifecycleDeps): () => void {
       );
     },
     changed,
+    onKick: releaseHeldFanouts,
   });
   setAgentSlots(slots);
   // What moves between looks: a look is reused only within one turn and

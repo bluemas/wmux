@@ -1,6 +1,6 @@
 import {describe,it,expect,vi} from 'vitest';
 import type {ManagedSession} from '../../DaemonSessionManager';
-import {CodexPaneRelays} from '../codexPaneRelays';
+import {CodexPaneRelays,paneCodexHome} from '../codexPaneRelays';
 import {CodexUpstreamError,type createCodexTuiRelay} from '../codexTuiRelay';
 const owner=(id='pane')=>({meta:{id,state:'attached'}} as ManagedSession);
 function relay() {
@@ -30,6 +30,21 @@ function relay() {
       for(const waiter of [...state.waiters])if(waiter.turnId===turnId)waiter.resolve(status);
     }};
 }
+describe('Codex pane relay account',()=>{
+  it('serves the pane\'s own account and refuses another one',()=>{
+    expect(paneCodexHome(undefined,undefined,{home:'/u/me'})).toBe('/u/me/.codex');
+    expect(paneCodexHome('/u/me/.codex',undefined,{home:'/u/me'})).toBe('/u/me/.codex');
+    expect(paneCodexHome('/acct/b',  '/acct/b',{home:'/u/me'})).toBe('/acct/b');
+    expect(()=>paneCodexHome('/tmp/other',undefined,{home:'/u/me'})).toThrow(/Codex account is \/u\/me\/\.codex/);
+    expect(()=>paneCodexHome('/acct/a','/acct/b',{home:'/u/me'})).toThrow(/Codex account is \/acct\/b/);
+    expect(()=>paneCodexHome('relative',undefined,{home:'/u/me'})).toThrow('Invalid Codex account scope');
+  });
+  it('compares without case where the file system does',()=>{
+    expect(paneCodexHome('/U/Me/.Codex',undefined,{home:'/u/me',caseInsensitive:true})).toBe('/u/me/.codex');
+    expect(()=>paneCodexHome('/U/Me/.Codex',undefined,{home:'/u/me',caseInsensitive:false})).toThrow();
+  });
+});
+
 describe('Codex pane relay lifetime',()=>{
   it('publishes selection only for its committed managed instance',async()=>{
     const connection=relay();const registry=new CodexPaneRelays(async()=>connection);
@@ -127,6 +142,20 @@ describe('Codex pane relay lifetime',()=>{
     const next=await registry.prepare('pane');const current=owner();next.commit(current);
     await old.close();expect(registry.selection('pane',current)).toBeDefined();
     expect(second.close).not.toHaveBeenCalled();await registry.shutdown();
+  });
+  it('releases only the current lease: a stale lease keeps the replacement relay, the current lease closes it',async()=>{
+    const first=relay();const second=relay();let count=0;
+    const registry=new CodexPaneRelays(async()=>count++ ? second : first);
+    (await registry.prepare('pane')).commit(owner());
+    const stale=registry.leaseId('pane')!;
+    await registry.retire('pane');
+    (await registry.prepare('pane')).commit(owner());const current=registry.leaseId('pane')!;
+    expect(current).not.toBe(stale);
+    await registry.release('pane',stale);
+    expect(second.close).not.toHaveBeenCalled();expect(registry.leaseId('pane')).toBe(current);
+    await registry.release('pane',current);
+    expect(second.close).toHaveBeenCalledOnce();expect(registry.leaseId('pane')).toBeUndefined();
+    await registry.shutdown();
   });
   it('rejects duplicate reservations and all reservations after shutdown',async()=>{
     const registry=new CodexPaneRelays(async()=>relay());
