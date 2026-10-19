@@ -1,0 +1,70 @@
+// One palette for the whole Office: every material is a 5-step ramp
+// [highlight, light, base, shade, dark]. Light comes from the top-left, so top
+// faces take `light`, left (south-west) faces `base`, right (south-east) faces
+// `shade`, and outlines the material's own `dark` (selective outline).
+export const RAMPS = {
+  // Room
+  floor: ['#f6e2c0', '#efd6b0', '#e6c99f', '#d6b386', '#ab8a5f'],
+  carpet: ['#e2ece0', '#d1e2d1', '#bfd5c1', '#a5c0a9', '#71907a'],
+  rug: ['#f8e4dd', '#efd0c7', '#e2b8ad', '#cb9a90', '#8e6560'],
+  wall: ['#fdf9f2', '#f6efe3', '#ebe1d1', '#d8cbb7', '#a39480'],
+  wallSide: ['#f3ece0', '#e9dfcf', '#dcd0bd', '#c9baa3', '#978872'],
+  baseboard: ['#cdbca5', '#b8a68d', '#a29077', '#8a7860', '#5d4e3c'],
+  glass: ['#f6fdff', '#ddf3fc', '#c4e6f5', '#a6d3ea', '#6fa5c4'],
+  frame: ['#ffffff', '#f4f5f8', '#e3e6ee', '#c9cdd9', '#8b90a2'],
+  // Furniture
+  wood: ['#fcebcd', '#f4d8ab', '#e6c08d', '#cda06a', '#8c6642'],
+  woodDark: ['#dcb487', '#bd9163', '#9e744c', '#7d5839', '#4d3322'],
+  plastic: ['#ffffff', '#f3f4f8', '#e2e5ed', '#c8ccd9', '#8a8fa2'],
+  metal: ['#a3acbd', '#828ca1', '#646d82', '#4b5366', '#2c313e'],
+  bezel: ['#6c7385', '#535a6b', '#404656', '#30353f', '#1b1e26'],
+  screenOff: ['#73839b', '#5a6981', '#465369', '#374156', '#222838'],
+  screenOn: ['#f2fdff', '#d2f1fb', '#abe2f4', '#7cc8e8', '#3a8bb8'],
+  chair: ['#a7c0cb', '#86a3b1', '#6a8593', '#516875', '#32444e'],
+  sofa: ['#cde5dc', '#afd3c6', '#90bcab', '#71998b', '#47695b'],
+  cushion: ['#ffeab0', '#f9d683', '#eabd5f', '#c99a47', '#896530'],
+  leaf: ['#d3f0a8', '#a9d980', '#7fbb63', '#5a944c', '#325d33'],
+  leafDeep: ['#a9d98a', '#7fbf6a', '#5c9c52', '#437a40', '#284d28'],
+  pot: ['#f8cbab', '#e9a580', '#d3855e', '#b06545', '#723d28'],
+  soil: ['#9b7458', '#7d5a42', '#634532', '#4c3426', '#2f2017'],
+  paper: ['#ffffff', '#fbfaf5', '#efece2', '#dcd7c8', '#9f9a8a'],
+  // Accent colours (books, notebooks, code on screens, clothes)
+  coral: ['#ffc8b6', '#ffa58d', '#f2836d', '#d26354', '#8c3836'],
+  navy: ['#9aaedb', '#7489c3', '#566ea8', '#3f5388', '#253155'],
+  mustard: ['#ffeab0', '#f9d683', '#eabd5f', '#c99a47', '#896530'],
+  sage: ['#d4e9c9', '#b5d6a8', '#94bf88', '#739d6a', '#476542'],
+  teal: ['#a6e3da', '#76cabc', '#50a99b', '#3a8577', '#21524a'],
+  purple: ['#d7c7f3', '#b8a1e5', '#977ecb', '#755ea8', '#46366d'],
+  olive: ['#cfe0a6', '#adc681', '#8ca863', '#6c864a', '#41532b'],
+  hoodie: ['#e6e8ee', '#cbced8', '#adb1be', '#8d919f', '#5a5d6e'],
+  shirt: ['#ffffff', '#f4f5f9', '#e1e4ed', '#c6cad8', '#888ea1'],
+  red: ['#ffa3a1', '#f27c7b', '#d85e5f', '#b24547', '#6f272b'],
+  // Trousers and shoes
+  denim: ['#afc7ea', '#8caad8', '#6a89bf', '#506d9e', '#304267'],
+  charcoal: ['#9295a3', '#757887', '#5c5f6e', '#474956', '#2b2c36'],
+  khaki: ['#f0dfb7', '#dec894', '#c9ad76', '#ab8e5a', '#6f5a37'],
+  black: ['#777a88', '#5b5d6b', '#474956', '#353741', '#1e1f27'],
+  shoe: ['#908d9c', '#686574', '#4b4956', '#383641', '#1f1e26'],
+  sneaker: ['#ffffff', '#f3f4f8', '#e0e3ec', '#c4c8d6', '#7d8295'],
+  // Skin
+  skin1: ['#fff3e8', '#ffe4cf', '#f8cdae', '#e5a988', '#a96a52'],
+  skin2: ['#fde3c8', '#f2c7a0', '#dea67e', '#c0835d', '#814f36'],
+  skin3: ['#e8ba92', '#cf9669', '#b0764c', '#8f5a37', '#57341f'],
+  skin4: ['#c99569', '#a56e47', '#865535', '#6a4127', '#3d2416'],
+  // Hair
+  hairBlack: ['#646a86', '#454a63', '#33364a', '#242636', '#14151f'],
+  hairBrown: ['#c08c5f', '#976440', '#764a2e', '#593522', '#351f14'],
+  hairAuburn: ['#f19a6a', '#d06f45', '#aa5131', '#843b23', '#4f2114'],
+  hairBlonde: ['#fff3bf', '#f8de88', '#e6bf60', '#c39745', '#80602a'],
+  hairLilac: ['#f8d0ec', '#e2aad7', '#c286be', '#9c6599', '#5f3b5d'],
+  hairTeal: ['#a8ebe5', '#69c9cc', '#43a2ad', '#2f7988', '#1c4754'],
+  hairDark: ['#8f6447', '#6c4731', '#523424', '#3c251a', '#22140e'],
+  // Faces and props
+  eye: ['#ffffff', '#4a3f5c', '#352c45', '#2b2338', '#221b2d'],
+  white: ['#ffffff', '#ffffff', '#ffffff', '#f2f2f2', '#bdbdbd'],
+  mouth: ['#e98f86', '#d77168', '#bf5a55', '#9c4444', '#6a2c2f'],
+  blush: ['#ffd0c8', '#ffbdb3', '#f8a59c', '#e88d86', '#b8605c'],
+  mug: ['#ffffff', '#f4f4f6', '#e3e3ea', '#c8c8d4', '#8c8c9c'],
+  coffee: ['#b88a64', '#97694a', '#7a5137', '#5f3c28', '#3a2418'],
+  alert: ['#ffb4ad', '#ff8a80', '#ef5b52', '#c8403b', '#7d2124'],
+};
