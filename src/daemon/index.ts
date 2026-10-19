@@ -126,7 +126,7 @@ import { WorkTaskService } from './worktask/WorkTaskService';
 import { isTaskState, type AgentStatus, type Task } from '../shared/types';
 import { ProcessMonitor } from './ProcessMonitor';
 import { AgentProcessTracker } from './AgentProcessTracker';
-import { liveRecoveryHint, namedAgentAlive, screenShowsLiveAgent, sightedRecoveredAgent } from './recoveryHint';
+import { liveRecoveryHint, namedAgentAlive, recordWasMidTurn, screenShowsLiveAgent, sightedRecoveredAgent } from './recoveryHint';
 import { checkWslAgentRunning, reportedAgentForPane, stopWslAgent, WslPidWatcher } from './wslAgentProcess';
 import { GateFlagFile } from './gateFlagFile';
 import { WSL_GATE_FLAG_FILE } from '../shared/wslIntegration';
@@ -1062,6 +1062,14 @@ const recoveredAgentShellIds = new Map<string, AgentSlug>();
 // pill can build `--resume <id>` for the EXACT conversation; cleared when the
 // agent relaunches (live again → no pill).
 const recoveredResumeBindings = new Map<string, ResumeBinding>();
+
+// Parallel to recoveredAgentShellIds: panes recovered this boot whose agent was
+// mid-turn when the previous daemon died, read FROM THE PERSISTED session
+// (`turnRunningSince`). Surfaced on listSessions as `resumeWasRunning`, so the
+// automatic resume continues the interrupted turn instead of leaving the agent
+// idle. One-shot: cleared with the offer, and by the first submit into the
+// pane (the automatic resume line itself, or anything typed before it).
+const recoveredWasRunning = new Set<string>();
 
 // X6 ③: closed set of resumable agent slugs, used to validate a hook-supplied
 // binding agent before it is written to `lastDetectedAgent` (an AgentSlug).
@@ -2332,6 +2340,11 @@ async function recoverSessions(
     if (isUsableResumeBinding(m.resumeBinding) && normalizeResumeCwd(m.resumeBinding.cwd) === normalizeResumeCwd(m.cwd) && bindingTranscriptLives(m.resumeBinding)) {
       recoveredResumeBindings.set(recoveredId, m.resumeBinding);
     }
+    // The mid-turn mark is read off the OLD record, unlike the markers above:
+    // it describes the dead daemon's last moment, and the recovered meta's own
+    // mark belongs to the new shell (set again only by a turn it runs).
+    const persisted = state.sessions.find((s) => s.id === recoveredId);
+    if (persisted && recordWasMidTurn(persisted, Date.now())) recoveredWasRunning.add(recoveredId);
   }
 
   // Clean up orphaned buffer files. Preserve buffers for both the
@@ -3210,6 +3223,10 @@ function registerRpcHandlers(
       // only right after a reboot.
       const durableBinding = base.resumeBinding;
       delete base.resumeBinding;
+      // The live mid-turn mark is internal too: clients get only the recovered
+      // pane's one-shot `resumeWasRunning` below, read off the old record.
+      delete base.turnRunningSince;
+      if (!resumeAgent) recoveredWasRunning.delete(s.id);
       const withRuntime = base.supervision
         ? { ...base, supervisionRuntime: paneSupervisor.getRuntime(s.id) }
         : base;
@@ -3219,7 +3236,14 @@ function registerRpcHandlers(
       // sends none and the renderer gates the pill as before.
       const sighted = !!resumeAgent && !!sightedRecoveredAgent(sessionManager.getSession(s.id)?.bridge.getLastAgent());
       const withAgent = resumeAgent
-        ? { ...withRuntime, resumeAgent, ...(sighted ? { resumeAgentOnScreen: recoveredSighting.get(s.id)?.onScreen === true } : {}) }
+        ? {
+          ...withRuntime,
+          resumeAgent,
+          ...(sighted ? { resumeAgentOnScreen: recoveredSighting.get(s.id)?.onScreen === true } : {}),
+          // The agent was mid-turn when the old daemon died: an automatic
+          // resume carries a prompt that continues the turn.
+          ...(recoveredWasRunning.has(s.id) ? { resumeWasRunning: true as const } : {}),
+        }
         : withRuntime;
       // Binding to SURFACE: the recovery-transient one (recovered-this-boot,
       // cwd+transcript guarded) OR the durable meta binding re-probed for
@@ -3428,6 +3452,8 @@ function registerRpcHandlers(
           promotedSession.meta.codexRelayResume = session.codexRelayResume;
           const offer = resumeOfferForRecovered(promotedSession.meta);
           if (offer) recoveredAgentShellIds.set(sessionId, offer as AgentSlug);
+          // Read off the persisted record, as at boot recovery.
+          if (offer && recordWasMidTurn(session, Date.now())) recoveredWasRunning.add(sessionId);
           if (isUsableResumeBinding(session.resumeBinding) && normalizeResumeCwd(session.resumeBinding.cwd) === normalizeResumeCwd(promotedSession.meta.cwd)
             && (isWslShell(session.cmd) || bindingTranscriptLives(session.resumeBinding))) {
             recoveredResumeBindings.set(sessionId, session.resumeBinding);
@@ -4802,6 +4828,7 @@ function registerRpcHandlers(
         if (canonical && canonical.source !== 'screen') {
           recoveredAgentShellIds.delete(sessionId);
           recoveredResumeBindings.delete(sessionId);
+          recoveredWasRunning.delete(sessionId);
         }
         const wslTarget = managed.meta.wslTarget;
         if (!wslTarget) {
@@ -6801,6 +6828,7 @@ function wireEvents(
     log('info', `[lifecycle] session:died id=${payload.id} reason=${payload.reason ?? 'pty-exit'} exitCode=${payload.exitCode ?? 'null'} signal=${payload.signal ?? 'none'} cmd=${payload.cmd ?? '?'} idleMsBeforeExit=${payload.lastActivityMsAgo ?? '?'} liveTotal=${sessionManager.listSessions().length}`);
     recoveredAgentShellIds.delete(payload.id); // X6 ②: drop a stale resume hint
     recoveredResumeBindings.delete(payload.id); // X6 ③: ...and its exact binding (id reuse, CodeRabbit)
+    recoveredWasRunning.delete(payload.id);
     // M1: drop the dedup ledger + hook authority for the dead pane. Without
     // this the ledger accrues dead-id entries over a long daemon lifetime, and
     // a reused id would inherit a hook veto that suppresses its detector.
@@ -7244,6 +7272,7 @@ function wireEvents(
     if (slug && canonical && canonical.source !== 'screen') {
       recoveredAgentShellIds.delete(payload.sessionId);
       recoveredResumeBindings.delete(payload.sessionId);
+      recoveredWasRunning.delete(payload.sessionId);
     }
     // M1: the daemon owns hook-vs-detector arbitration now — the hook lands
     // here, not in main, so main can no longer run it and reads the outcome
@@ -7428,6 +7457,30 @@ function wireEvents(
     stateWriter.saveAsap(buildState(sessionManager));
   });
 
+  // An agent turn started or ended (meta.turnRunningSince, set by the session
+  // manager). Persisted within a second, not on the 30 s debounce: a daemon
+  // killed right after a turn ended must not leave a record that says it was
+  // running, or recovery would continue a finished turn. The short window
+  // coalesces a fleet's edges into one write (see the cwd handler above on why
+  // writes must stay async and few).
+  const AGENT_TURN_SAVE_DELAY_MS = 1_000;
+  let agentTurnSaveTimer: NodeJS.Timeout | null = null;
+  sessionManager.on('session:agentTurn', () => {
+    if (agentTurnSaveTimer || shuttingDown) return;
+    agentTurnSaveTimer = setTimeout(() => {
+      agentTurnSaveTimer = null;
+      if (!shuttingDown) void stateWriter.saveAsap(buildState(sessionManager));
+    }, AGENT_TURN_SAVE_DELAY_MS);
+    agentTurnSaveTimer.unref?.();
+  });
+
+  // The first submit into a recovered pane spends its continue mark: the
+  // automatic resume line itself, or anything typed before it, after which the
+  // pane is the user's and its old turn is not continued on its own.
+  sessionManager.on('session:inputSubmitted', (payload: { sessionId: string }) => {
+    recoveredWasRunning.delete(payload.sessionId);
+  });
+
   // Window-title change (OSC 0/2, detected in the daemon bridge). Broadcast so
   // main can forward it to the renderer as IPC.TERMINAL_TITLE_CHANGED — same
   // shape as cwd.changed above.
@@ -7446,6 +7499,7 @@ function wireEvents(
   sessionManager.on('session:destroyed', (payload: { id: string }) => {
     recoveredAgentShellIds.delete(payload.id); // X6 ②: drop hint on explicit close too (CodeRabbit #2)
     recoveredResumeBindings.delete(payload.id); // X6 ③: drop the exact binding too (id reuse, CodeRabbit)
+    recoveredWasRunning.delete(payload.id);
     hookIngest?.dropPty(payload.id); // M1: ...and the dedup ledger / hook authority
     // Transcript projection: the pane is gone, so its watch has no reader left…
     chatSessions?.drop(payload.id);
@@ -8939,6 +8993,7 @@ async function main(): Promise<void> {
     if (state.alive && state.slug) {
       recoveredAgentShellIds.delete(sessionId);
       recoveredResumeBindings.delete(sessionId);
+      recoveredWasRunning.delete(sessionId);
     }
     const managed = sessionManager.getSession(sessionId);
     if (!managed) return;
