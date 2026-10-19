@@ -1010,18 +1010,21 @@ export class DaemonPTYBridge extends EventEmitter {
   }
 
   /**
-   * The daemon's process tracker saw the pane's agent process end, or another
-   * agent launch in its place: noteAgentEnded, and Codex gives up the pane
-   * unless the shell has launched a program since that process was seen
-   * alive (a relaunch inside the death poll's lag). A shell without OSC 133
-   * marks shows no launch, so there the end always counts: a relaunched
-   * Codex then falls back to its output, never to another program's title.
+   * The daemon's process tracker saw the pane's agent process end:
+   * noteAgentEnded, and Codex gives up the pane. Not when the shell has
+   * launched a program since that process was seen alive: the death edge
+   * lags by up to a monitor cadence, the launch's OSC 133 marks already ended
+   * that agent, and the episode and pane now belong to the relaunch. A shell
+   * without OSC 133 marks shows no launch, so there the end always counts: a
+   * relaunched Codex then falls back to its output, never to another
+   * program's title.
    */
   noteAgentProcessEnded(): void {
-    this.noteAgentEnded();
     const aliveGen = this.aliveProcessMarkGen;
     this.aliveProcessMarkGen = null;
-    if (aliveGen === null || aliveGen === this.shellMarkGen) this.releaseCodexHold();
+    if (aliveGen !== null && aliveGen !== this.shellMarkGen) return;
+    this.noteAgentEnded();
+    this.releaseCodexHold();
   }
 
   /** The daemon's process tracker reports the pane's agent process alive. */

@@ -8876,7 +8876,10 @@ async function main(): Promise<void> {
     // A death edge, or a launch edge for a different agent than the last one
     // seen here, ends the previous agent's running episode.
     const previousSlug = managed.meta.lastDetectedAgent;
-    if (!state.alive || (state.slug && previousSlug && state.slug !== previousSlug)) managed.bridge.noteAgentProcessEnded();
+    // The launch edge is the new agent's own: it may already have drawn the
+    // banner that gave it the pane, so only a death edge releases that.
+    if (!state.alive) managed.bridge.noteAgentProcessEnded();
+    else if (state.slug && previousSlug && state.slug !== previousSlug) managed.bridge.noteAgentEnded();
     if (state.alive) managed.bridge.noteAgentProcessAlive();
     const screenSlug = managed.bridge.getLastAgent();
     const canonical = canonicalIdentityFor(

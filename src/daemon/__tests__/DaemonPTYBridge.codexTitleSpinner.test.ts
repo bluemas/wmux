@@ -161,10 +161,11 @@ describe('DaemonPTYBridge — a Codex title spinner reports running', () => {
     feed(LAUNCH_OUTPUT);
     feed(CODEX_MODES + BANNER); // the relaunch, before the old death poll
     feed(`${' '.repeat(600)}\r\n`); // its first paint pushes the banner out of any tail
-    bridge.noteAgentProcessEnded(); // the old process's death edge, late
     vi.advanceTimersByTime(6_000);
     spin(3, 100);
     expect(active).toHaveLength(1);
+    bridge.noteAgentProcessEnded(); // the old process's death edge, late, mid-turn
+    expect(bridge.isTurnOpen()).toBe(true);
     spin(160, 1_000);
     expect(active.length).toBeGreaterThan(1);
     expect(bridge.getAgentStatus()).toBe('running');
