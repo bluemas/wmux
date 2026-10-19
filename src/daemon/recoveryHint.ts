@@ -27,6 +27,25 @@ export function liveRecoveryHint<S, B>(
   return slug;
 }
 
+/** How recent a recovered pane's last output must be for its turn to be continued. */
+export const RESUME_CONTINUE_MAX_QUIET_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Whether the persisted record of a pane says its agent was mid-turn when the
+ * daemon that wrote it died (`turnRunningSince`, see DaemonPTYBridge
+ * isAgentMidTurn). A running agent paints all the time, so the record's last
+ * output is close to that death; when it is older than a day the machine sat
+ * off for that long or the pane was silent with a turn left open, and neither
+ * is work to pick up again on its own.
+ */
+export function recordWasMidTurn(record: { turnRunningSince?: unknown; lastActivity?: unknown }, now: number): boolean {
+  const since = record.turnRunningSince;
+  if (typeof since !== 'number' || !Number.isFinite(since) || since <= 0) return false;
+  const lastOutput = typeof record.lastActivity === 'string' ? Date.parse(record.lastActivity) : NaN;
+  if (!Number.isFinite(lastOutput)) return false;
+  return now - lastOutput <= RESUME_CONTINUE_MAX_QUIET_MS;
+}
+
 /**
  * The liveness `liveRecoveryHint` may consume a hint on: a live process the
  * tracker attributed to a named agent. A slugless pick (an unknown wrapper,
