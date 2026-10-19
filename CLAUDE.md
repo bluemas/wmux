@@ -75,3 +75,29 @@ In QA/design-review mode, flag any code that doesn't match DESIGN.md.
 - A beta-to-beta upgrade on one machine does not replace the running daemon
   (same version core, both prereleases) unless `CHANNELS_EPOCH` moved — the
   same trade-off as same-version dev builds above.
+
+## Structure (fork notes)
+
+Longer overview: `ARCHITECTURE.md` (its diagram predates the daemon split).
+
+- `src/daemon/` — the long-lived daemon (`wmux-daemon`, Electron-as-Node). Owns
+  every PTY (`DaemonPTYBridge`, `ActivityMonitor`, `AgentDetector`), session
+  recovery from `~/.wmux/sessions.json` + snapshots, hook ingest
+  (`hooks/HookIngest.ts`), transcript watchers. Survives app restarts.
+- `src/main/` — Electron main. `DaemonClient` talks to the daemon over the
+  named pipe `\\.\pipe\wmux-daemon-<user>` (JSON lines + token); pushed
+  events are opt-in (`daemon.events.subscribe` after `daemon.client.identify`).
+  `notification/DaemonNotificationRouter.ts` turns daemon events into renderer
+  IPC (`METADATA_UPDATE`); `daemon/DaemonRespawnController.ts` pings every
+  10 s and respawns a hung daemon.
+- `src/renderer/` — React + Zustand UI. Terminals in `hooks/useTerminal.ts`
+  (xterm.js, WebGL via `terminal/webglContextPool.ts`); sidebar running dot =
+  `stores/selectors/fleet.ts` `isHookRunning` (hook latch, or an activity
+  stamp younger than 120 s).
+- `src/shared/` — types and logic used by more than one process.
+- `integrations/<agent>/` — hook bridges installed into each agent
+  (`claude/bin/wmux-bridge.mjs`, `codex/…`); they post to the daemon.
+- Logs: `%APPDATA%\wmux\logs\main-*.log`, `~/.wmux/logs/daemon-*.log`,
+  `~/.wmux/bridge.log` (Claude hooks), `~/.wmux/codex-notify.log`.
+- Agent status path: hook or byte burst → daemon event (`agent.event`,
+  `activity.active`/`idle`) → main router → renderer store → sidebar.
