@@ -1031,10 +1031,12 @@ export class DaemonPTYBridge extends EventEmitter {
   noteAgentProcess(state: { slug?: string; alive: boolean }): void {
     this.trackedAgent = { ...(state.slug ? { slug: state.slug } : {}), alive: state.alive };
     // A cycle the title armed waits for output to start its idle countdown;
-    // an agent that died right after the frame writes none, and the cycle
-    // would read running forever. It goes with the process.
-    if (!state.alive && this.titleArmedCycle && this.sessionId) this.activityMonitor?.endTurn(this.sessionId);
-    if (!state.alive) this.titleArmedCycle = false;
+    // an agent that died (or was replaced by another) right after the frame
+    // writes none, and the cycle would read running forever. It goes with
+    // the agent that armed it.
+    if (state.alive && agentRow(state.slug)?.titleRunning) return;
+    if (this.titleArmedCycle && this.sessionId) this.activityMonitor?.endTurn(this.sessionId);
+    this.titleArmedCycle = false;
   }
 
   /**
