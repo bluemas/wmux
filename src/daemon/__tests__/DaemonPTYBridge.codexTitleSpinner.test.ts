@@ -13,10 +13,6 @@ import { PromptEventLog } from '../PromptEventLog';
 const BANNER = '\x1b[9;1H│ >_ OpenAI Codex (v0.149.1)            │\r\n';
 // Codex turns bracketed paste back on before it paints its banner.
 const CODEX_MODES = '\x1b[?2004h\x1b[?1049h';
-// Codex exits and zsh draws its prompt again (OSC 133 D, then A).
-const BACK_TO_SHELL = '\x1b[?1049l\x1b[?2004l\x1b]133;D;0\x07\x1b]133;A\x07% \x1b[?2004h';
-// What zsh prints on Enter: bracketed paste off, OSC 133 C.
-const LAUNCH_OUTPUT = '\x1b[?2004l\x1b]133;C\x07';
 const title = (t: string) => `\x1b]0;${t}\x07`;
 
 function makeFakePty(): { pty: IPty; feed: (data: string) => void } {
@@ -51,6 +47,7 @@ describe('DaemonPTYBridge — a Codex title spinner reports running', () => {
     const fake = makeFakePty();
     feed = fake.feed;
     bridge.setupDataForwarding(fake.pty, new RingBuffer(65536), 'sess-1', new PromptEventLog());
+    bridge.noteAgentProcess({ slug: 'codex', alive: true }); // the tracker picked Codex
     feed(CODEX_MODES + BANNER);
     feed('ready\r\n'); // spends the cycle the banner armed
     vi.advanceTimersByTime(6_000); // past any boot burst and its idle
@@ -131,10 +128,35 @@ describe('DaemonPTYBridge — a Codex title spinner reports running', () => {
     expect(active).toHaveLength(1);
   });
 
-  it('a braille title after the Codex process ended reports nothing on a shell without OSC 133', () => {
-    bridge.noteAgentProcessAlive();
-    bridge.noteAgentProcessEnded(); // the process tracker's death edge
+  it('a banner and a spinner report nothing until the process tracker names the agent', () => {
+    const fresh = new DaemonPTYBridge();
+    const fake = makeFakePty();
+    fresh.setupDataForwarding(fake.pty, new RingBuffer(65536), 'sess-2', new PromptEventLog());
+    const seen: unknown[] = [];
+    fresh.on('active', (e) => seen.push(e));
+    fake.feed(CODEX_MODES + BANNER);
+    fake.feed('ready\r\n');
     vi.advanceTimersByTime(6_000);
+    seen.length = 0;
+    for (let i = 0; i < 8; i++) {
+      fake.feed(title(`${frames[i % 4]} AAA quality pass | Heartbound`));
+      vi.advanceTimersByTime(100);
+    }
+    expect(seen).toHaveLength(0);
+    fresh.cleanup();
+  });
+
+  it('the tracked process dying ends the title path: frames after it report nothing', () => {
+    spin(2, 100);
+    expect(active).toHaveLength(1);
+    expect(bridge.getAgentStatus()).toBe('running');
+    expect(bridge.isTurnOpen()).toBe(true);
+
+    // The daemon's death edge: noteAgentEnded, then the process state.
+    bridge.noteAgentEnded();
+    bridge.noteAgentProcess({ slug: 'codex', alive: false });
+    vi.advanceTimersByTime(6_000);
+    active = [];
     spin(8, 100);
     vi.advanceTimersByTime(30_000);
     spin(8, 100);
@@ -142,53 +164,35 @@ describe('DaemonPTYBridge — a Codex title spinner reports running', () => {
     expect(bridge.isTurnOpen()).toBe(false);
   });
 
-  it('a banner before an OSC 133 mark in the same chunk does not outlive the mark', () => {
-    feed(CODEX_MODES + BANNER + BACK_TO_SHELL);
-    vi.advanceTimersByTime(6_000);
+  it('another tracked agent ignores the braille title; a late launch edge does not stop a Codex turn', () => {
+    bridge.noteAgentProcess({ slug: 'claude', alive: true });
     spin(8, 100);
     expect(active).toHaveLength(0);
 
-    // The other order: the shell launches Codex, and its banner follows in the same chunk.
-    feed(LAUNCH_OUTPUT + CODEX_MODES + BANNER);
-    vi.advanceTimersByTime(6_000);
+    // Codex takes the pane and a prompt starts a turn.
+    bridge.noteAgentProcess({ slug: 'codex', alive: true });
+    bridge.noteInput('fix the tests\r');
     spin(3, 100);
     expect(active).toHaveLength(1);
-  });
 
-  it('a late death edge of the old process leaves a relaunched Codex its pane', () => {
-    bridge.noteAgentProcessAlive(); // the first Codex process, seen alive
-    feed(BACK_TO_SHELL);
-    feed(LAUNCH_OUTPUT);
-    feed(CODEX_MODES + BANNER); // the relaunch, before the old death poll
-    feed(`${' '.repeat(600)}\r\n`); // its first paint pushes the banner out of any tail
-    vi.advanceTimersByTime(6_000);
-    spin(3, 100);
-    expect(active).toHaveLength(1);
-    bridge.noteAgentProcessEnded(); // the old process's death edge, late, mid-turn
-    expect(bridge.isTurnOpen()).toBe(true);
-    spin(160, 1_000);
-    expect(active.length).toBeGreaterThan(1);
-    expect(bridge.getAgentStatus()).toBe('running');
-    expect(bridge.isTurnOpen()).toBe(true);
-  });
-
-  it('a braille title after Codex has exited reports nothing, until Codex boots again', () => {
-    feed(BACK_TO_SHELL);
-    vi.advanceTimersByTime(6_000);
-    // The detector still names Codex, but the shell owns the pane.
-    expect(bridge.getLastAgent()).toBe('Codex CLI');
-    feed(title('⠋ shell label'));
-    vi.advanceTimersByTime(100);
-    feed(title('⠙ shell label'));
-    vi.advanceTimersByTime(30_000);
-    feed(title('⠹ shell label'));
-    expect(active).toHaveLength(0);
-
-    feed(LAUNCH_OUTPUT);
-    feed(CODEX_MODES + BANNER);
-    vi.advanceTimersByTime(6_000);
-    active = [];
+    // The tracker's launch edge for Codex arrives late, after the turn began:
+    // the daemon ends the previous agent's episode, then records Codex.
+    bridge.noteAgentEnded();
+    bridge.noteAgentProcess({ slug: 'codex', alive: true });
     spin(2, 100);
-    expect(active).toHaveLength(1);
+    expect(bridge.isTurnOpen()).toBe(true);
+    expect(bridge.getAgentStatus()).toBe('running');
+    spin(31, 1_000);
+    expect(active).toHaveLength(2);
+  });
+
+  it('a death edge after prompt-only marks (OSC 133 A/B) still ends the episode', () => {
+    bridge.noteAgentStatus('running', true);
+    expect(bridge.isTurnOpen()).toBe(true);
+    feed('\x1b]133;A\x07\x1b]133;B\x07');
+    bridge.noteAgentEnded();
+    bridge.noteAgentProcess({ slug: 'codex', alive: false });
+    expect(bridge.isTurnOpen()).toBe(false);
+    expect(bridge.hasHookReports()).toBe(false);
   });
 });

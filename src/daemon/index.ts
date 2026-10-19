@@ -8865,22 +8865,21 @@ async function main(): Promise<void> {
     const managed = sessionManager.getSession(sessionId);
     if (!managed) return;
     if (state.alive) sessionManager.confirmAgent(sessionId);
-    // A slugless pick (a `tail -f`, an unknown child) that dies while the
-    // screen names an agent: arm() skipped probing while that pick read
-    // alive, so an agent launched in the meantime was never attributed.
-    // Probe again, or the launch edge that consumes the recovery offer and
-    // names the pane never comes.
-    if (!state.alive && state.slug === undefined && managed.bridge.getLastAgent()) {
+    // A pick that dies while the screen names an agent: arm() skipped probing
+    // while that pick read alive, so an agent launched in the meantime was
+    // never attributed. That covers a slugless pick (a `tail -f`, an unknown
+    // child) and an agent relaunched inside the death poll's lag, whose
+    // banner opens no detector gate again. Probe again, or the launch edge
+    // that consumes the recovery offer and names the pane never comes.
+    if (!state.alive && managed.bridge.getLastAgent()) {
       agentProcessTracker.arm(sessionId, managed.meta.pid);
     }
     // A death edge, or a launch edge for a different agent than the last one
     // seen here, ends the previous agent's running episode.
     const previousSlug = managed.meta.lastDetectedAgent;
-    // The launch edge is the new agent's own: it may already have drawn the
-    // banner that gave it the pane, so only a death edge releases that.
-    if (!state.alive) managed.bridge.noteAgentProcessEnded();
-    else if (state.slug && previousSlug && state.slug !== previousSlug) managed.bridge.noteAgentEnded();
-    if (state.alive) managed.bridge.noteAgentProcessAlive();
+    if (!state.alive || (state.slug && previousSlug && state.slug !== previousSlug)) managed.bridge.noteAgentEnded();
+    // The process truth the bridge's running-title path reads.
+    managed.bridge.noteAgentProcess(state);
     const screenSlug = managed.bridge.getLastAgent();
     const canonical = canonicalIdentityFor(
       agentProcessTracker,

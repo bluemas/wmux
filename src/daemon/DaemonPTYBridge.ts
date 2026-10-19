@@ -20,7 +20,7 @@ import { isEscapeChunk } from '../shared/hooks/interruptKeystroke';
 import { stripPassiveInput } from '../shared/terminal/passiveInput';
 import { kittyChunkAsLegacy } from '../shared/kittyKeyEvents';
 import { titleShowsFinishedTurn, titleShowsRunningTurn } from './transcript/chatScreenGate';
-import { CLAUDE_IDLE_TITLE, CLAUDE_RUNNING_TITLE, CLAUDE_RUNNING_TITLE_OSC } from '../shared/agentTitleRules';
+import { CLAUDE_IDLE_TITLE, CLAUDE_RUNNING_TITLE, CLAUDE_RUNNING_TITLE_OSC, RUNNING_TITLE } from '../shared/agentTitleRules';
 import type { TurnFailure } from '../shared/phoneTurnFailure';
 
 /**
@@ -270,22 +270,11 @@ export class DaemonPTYBridge extends EventEmitter {
   private codexBannerTail = '';
   private static readonly CODEX_BANNER_TAIL = 512;
   /**
-   * Codex drew its boot banner (launch, resume, `/new`) and neither an OSC
-   * 133 mark nor the end of its process (noteAgentEnded) has arrived since.
-   * The detector's last agent outlives the agent itself: once the shell has
-   * the prompt back it still names Codex, so only this says Codex is the
-   * program writing the pane's title (see noteCodexOutput).
+   * The pane's agent process as the daemon's process tracker last reported
+   * it (see noteAgentProcess), or null before any report. The detector's last
+   * agent outlives the agent; this is the process truth the title path reads.
    */
-  private codexHoldsPane = false;
-  /** Counts OSC 133 marks: each one hands the pane to another program. */
-  private shellMarkGen = 0;
-  /**
-   * `shellMarkGen` when the daemon last reported the pane's agent process
-   * alive (see noteAgentProcessAlive), or null. That process's death edge
-   * can arrive a monitor cadence late, after the shell relaunched Codex, and
-   * must not take the pane from the newer session.
-   */
-  private aliveProcessMarkGen: number | null = null;
+  private trackedAgent: { slug?: string; alive: boolean } | null = null;
 
   /**
    * Which terminal status settled the pane, while one has. Read only to keep
@@ -835,13 +824,16 @@ export class DaemonPTYBridge extends EventEmitter {
    * A pane whose hooks report is left to them, and the title waits out the
    * settle cooldown and a resize repaint: the last frames of a turn that just
    * ended would otherwise reach the daemon's completion alarm as fresh work
-   * and cancel it. A pane waiting on a human is never promoted by its title,
-   * and neither is a pane Codex has left: another program's title can start
-   * with a braille frame too.
+   * and cancel it. A pane waiting on a human is never promoted by its title.
+   * The agent is the one the process tracker watches alive in the pane, with
+   * its running title read from RUNNING_TITLE: the detector's last agent
+   * outlives the agent, and another program's title can start with a braille
+   * frame too.
    */
   private noteCodexTitleSpinner(sessionId: string): void {
-    if (!this.codexHoldsPane || this.hookSeen || !/codex/i.test(this.agentDetector?.getLastAgent() ?? '')) return;
-    if (!this.titleShowsRunningTurn()) {
+    const slug = this.trackedAgent?.alive ? this.trackedAgent.slug : undefined;
+    if (!slug || !RUNNING_TITLE.has(slug) || this.hookSeen) return;
+    if (!titleShowsRunningTurn({ title: this.lastTitle, at: this.lastTitleAt }, slug, Date.now())) {
       if (this.spinnerOpenedTurn && this.turnOpen && !this.awaitingHuman) this.endSpinnerTurn();
       return;
     }
@@ -870,7 +862,14 @@ export class DaemonPTYBridge extends EventEmitter {
       monitor.beginTurnIfInactive(sessionId);
       return;
     }
-    if (!this.turnOpen || now - this.lastActiveAt < DaemonPTYBridge.CODEX_SPINNER_REFRESH_MS) return;
+    // Something ended the episode while the title kept spinning (a late
+    // launch edge of another agent): the turn still runs, so it opens again.
+    if (!this.turnOpen) {
+      this.spinnerSettledStatus = null;
+      this.openTurn(true);
+      this.spinnerOpenedTurn = true;
+    }
+    if (now - this.lastActiveAt < DaemonPTYBridge.CODEX_SPINNER_REFRESH_MS) return;
     this.lastActiveAt = now;
     this.emit('active', {
       sessionId,
@@ -1010,32 +1009,12 @@ export class DaemonPTYBridge extends EventEmitter {
   }
 
   /**
-   * The daemon's process tracker saw the pane's agent process end:
-   * noteAgentEnded, and Codex gives up the pane. Not when the shell has
-   * launched a program since that process was seen alive: the death edge
-   * lags by up to a monitor cadence, the launch's OSC 133 marks already ended
-   * that agent, and the episode and pane now belong to the relaunch. A shell
-   * without OSC 133 marks shows no launch, so there the end always counts: a
-   * relaunched Codex then falls back to its output, never to another
-   * program's title.
+   * The daemon's process tracker picked the pane's agent process, or saw it
+   * die. Only the watched pid's death is reported, so a relaunch the tracker
+   * already picked is never ended by its predecessor's late death edge.
    */
-  noteAgentProcessEnded(): void {
-    const aliveGen = this.aliveProcessMarkGen;
-    this.aliveProcessMarkGen = null;
-    if (aliveGen !== null && aliveGen !== this.shellMarkGen) return;
-    this.noteAgentEnded();
-    this.releaseCodexHold();
-  }
-
-  /** The daemon's process tracker reports the pane's agent process alive. */
-  noteAgentProcessAlive(): void {
-    this.aliveProcessMarkGen = this.shellMarkGen;
-  }
-
-  /** Codex no longer holds the pane; a banner already read must not give it back. */
-  private releaseCodexHold(): void {
-    this.codexHoldsPane = false;
-    this.codexBannerTail = '';
+  noteAgentProcess(state: { slug?: string; alive: boolean }): void {
+    this.trackedAgent = { ...(state.slug ? { slug: state.slug } : {}), alive: state.alive };
   }
 
   /**
@@ -1213,25 +1192,14 @@ export class DaemonPTYBridge extends EventEmitter {
    * Only `preTurn` moves; the episode and `hookSeen` are left as they were.
    * `turnOpen` is not a guard: before any turn evidence it can only be the
    * boot burst's own byte promotion.
-   *
-   * The same banner also records that Codex holds the pane (`codexHoldsPane`).
-   * That needs only the last two conditions: it is about which program draws
-   * the pane, not about the boot window or a dialog.
    */
   private noteCodexOutput(data: string): void {
-    // Only what follows the chunk's last OSC 133 mark: a banner before it
-    // belongs to a program the mark says is gone (the mark already dropped
-    // the tail).
-    const mark = data.lastIndexOf('\x1b]133;');
-    const text = this.codexBannerTail + (mark >= 0 ? data.slice(mark) : data);
+    const text = this.codexBannerTail + data;
     // A row can straddle two PTY chunks; keep enough of the tail to rejoin it.
     this.codexBannerTail = text.slice(-DaemonPTYBridge.CODEX_BANNER_TAIL);
+    if (!this.codexBootWindow || this.awaitingHuman) return;
     if (this.agentDetector?.getLastAgent() !== 'Codex CLI' || !this.modeTracker?.isSet(2004)) return;
-    if (!drawsCodexBanner(text)) return;
-    // Read once: the same banner left in the tail must not count again.
-    this.codexBannerTail = '';
-    this.codexHoldsPane = true;
-    if (this.codexBootWindow && !this.awaitingHuman) this.preTurn = true;
+    if (drawsCodexBanner(text)) this.preTurn = true;
   }
 
   /**
@@ -1522,9 +1490,6 @@ export class DaemonPTYBridge extends EventEmitter {
           // The shell's foreground program changed hands: whatever episode was
           // open (an agent's, or the Enter that launched the next one) is over.
           if (parsed.type === 'command_start' || parsed.type === 'command_end') this.noteAgentEnded();
-          // The shell is drawing its prompt or running a command: Codex is gone.
-          this.shellMarkGen += 1;
-          this.releaseCodexHold();
           this.codexBootWindow = parsed.type === 'command_start' || (parsed.type !== 'command_end' && this.codexBootWindow);
           if (parsed.type === 'prompt_end') {
             this.emptyShellPrompt = this.inputRevision === 0 || this.completedShellCommand;
@@ -1887,9 +1852,7 @@ export class DaemonPTYBridge extends EventEmitter {
     this.turnEvidenceAt = 0;
     this.codexBootWindow = false;
     this.codexBannerTail = '';
-    this.codexHoldsPane = false;
-    this.shellMarkGen = 0;
-    this.aliveProcessMarkGen = null;
+    this.trackedAgent = null;
     this.lastActiveAt = 0;
     this.turnOpen = false;
     this.turnSoftClosed = false;
