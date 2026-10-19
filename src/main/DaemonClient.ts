@@ -1098,6 +1098,14 @@ export class DaemonClient extends EventEmitter {
           }
           break;
         }
+        case 'agent.teammates': {
+          // The pane's Agent Teams teammates, from its session's subagents/ folder.
+          const data = event.data as { teammates?: unknown } | null;
+          if (Array.isArray(data?.teammates)) {
+            this.emit('session:teammates', { sessionId: event.sessionId, teammates: data.teammates });
+          }
+          break;
+        }
         case 'prompt.event':
           // OSC 133 shell-integration marker (A/B/C/D) parsed in the daemon.
           // DaemonNotificationRouter consumes this to tee the D variant onto

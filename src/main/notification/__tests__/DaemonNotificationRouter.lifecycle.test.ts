@@ -79,6 +79,7 @@ interface CapturedListeners {
   died?: (payload: { sessionId: string }) => void;
   transcript?: (payload: { sessionId: string; activity: string }) => void;
   subagents?: (payload: { sessionId: string; count: number }) => void;
+  teammates?: (payload: { sessionId: string; teammates: unknown[] }) => void;
   processExit?: (payload: { sessionId: string; slug?: string | null }) => void;
 }
 
@@ -94,6 +95,7 @@ function makeRouter(opts: {
       if (event === 'session:died') captured.died = cb as CapturedListeners['died'];
       if (event === 'session:transcriptActivity') captured.transcript = cb as CapturedListeners['transcript'];
       if (event === 'session:subagents') captured.subagents = cb as CapturedListeners['subagents'];
+      if (event === 'session:teammates') captured.teammates = cb as CapturedListeners['teammates'];
       if (event === 'session:agentProcessExit') captured.processExit = cb as CapturedListeners['processExit'];
     }),
     off: vi.fn(),
@@ -858,6 +860,30 @@ describe('DaemonNotificationRouter — M1 side-effect replay', () => {
       // A session that ends takes its subagent count with it.
       captured.died!({ sessionId: 'pty-a' });
       expect(broadcastMetadataUpdateMock).toHaveBeenCalledWith(null, expect.objectContaining({ ptyId: 'pty-a', subagents: 0, agentStatus: 'idle' }));
+    } finally {
+      router.stop();
+    }
+  });
+
+  it('teammates pass through for a hook-activity pane', async () => {
+    const { router, captured } = makeRouter();
+    try {
+      captured.agent!({ sessionId: 'pty-a', event: activityEvent('Read') });
+      await flushMicrotasks();
+      broadcastMetadataUpdateMock.mockClear();
+      const teammates = [{ name: 'alice', working: true, at: 1 }];
+      captured.teammates!({ sessionId: 'pty-a', teammates });
+      expect(broadcastMetadataUpdateMock).toHaveBeenLastCalledWith(null, { ptyId: 'pty-a', teammates });
+    } finally {
+      router.stop();
+    }
+  });
+
+  it('session end sends an empty teammate list', async () => {
+    const { router, captured } = makeRouter();
+    try {
+      captured.died!({ sessionId: 'pty-a' });
+      expect(broadcastMetadataUpdateMock).toHaveBeenCalledWith(null, expect.objectContaining({ ptyId: 'pty-a', teammates: [], agentStatus: 'idle' }));
     } finally {
       router.stop();
     }

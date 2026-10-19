@@ -2,7 +2,7 @@ import { HOOK_ACTIVITY_KINDS } from '../../shared/hooks/hookActivityKinds';
 import { isInternalForkPayload } from '../../shared/hooks/internalFork';
 import type { BrowserWindow } from 'electron';
 import type { DaemonClient } from '../DaemonClient';
-import type { AgentStatus } from '../../shared/types';
+import type { AgentStatus, TeammateInfo } from '../../shared/types';
 import type { HookSignalRouter } from '../hooks/HookSignalRouter';
 import { dispatchNotification } from './dispatchNotification';
 import { toastManager } from './ToastManager';
@@ -1377,6 +1377,16 @@ export class DaemonNotificationRouter {
       }
     };
 
+    // The pane's Agent Teams teammates. Like subagents, not an activity line:
+    // it passes through for a hook-fed pane too.
+    const onTeammates = (payload: { sessionId: string; teammates: TeammateInfo[] }) => {
+      try {
+        broadcastMetadataUpdate(this.getWindow(), { ptyId: payload.sessionId, teammates: payload.teammates });
+      } catch (err) {
+        console.warn('[DaemonNotificationRouter] teammates error:', err);
+      }
+    };
+
     const onAgentProcessExit = (payload: { sessionId: string; slug?: string | null }) => {
       // The agent whose hooks owned the line is gone; the next one (a hookless
       // Codex in the same pane) may report from its transcript.
@@ -1429,6 +1439,8 @@ export class DaemonNotificationRouter {
           pendingQuestion: '',
           // Nor any subagent of its agent.
           subagents: 0,
+          // Nor any teammate.
+          teammates: [],
         });
         this.lastAgentEventAt.delete(payload.sessionId);
         this.lastAgentNameByPty.delete(payload.sessionId);
@@ -1517,6 +1529,7 @@ export class DaemonNotificationRouter {
     this.daemonClient.on('session:agentInterrupted', onAgentInterrupted);
     this.daemonClient.on('session:transcriptActivity', onTranscriptActivity);
     this.daemonClient.on('session:subagents', onSubagents);
+    this.daemonClient.on('session:teammates', onTeammates);
     this.daemonClient.on('session:restarted', onRestarted);
     this.daemonClient.on('supervision:changed', onSupervisionChanged);
     // A2A channels (a2a-channels U4) — project daemon-broadcast channel
@@ -1553,6 +1566,7 @@ export class DaemonNotificationRouter {
       () => this.daemonClient.off('session:agentInterrupted', onAgentInterrupted),
       () => this.daemonClient.off('session:transcriptActivity', onTranscriptActivity),
       () => this.daemonClient.off('session:subagents', onSubagents),
+      () => this.daemonClient.off('session:teammates', onTeammates),
       () => this.daemonClient.off('session:restarted', onRestarted),
       () => this.daemonClient.off('supervision:changed', onSupervisionChanged),
       () => this.daemonClient.off('channel:message', onChannelMessage),

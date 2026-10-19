@@ -553,6 +553,13 @@ export interface MetadataUpdatePayload {
    * payload to workspace metadata. 0 clears.
    */
   subagents?: number;
+  /**
+   * The pane's Agent Teams teammates, read by the daemon from the session's
+   * `subagents/` folder. Per-ptyId only, like `subagents`: the renderer
+   * destructures it out before applying the payload to workspace metadata.
+   * An empty list clears.
+   */
+  teammates?: TeammateInfo[];
   // P2 — pane label relay. MetadataStore's `pane.metadata.changed` is teed to
   // the renderer as a paneId-only update (no ptyId/workspaceId);
   // useNotificationListener routes on `paneId` and writes ONLY the per-pane

@@ -170,6 +170,17 @@ describe('useNotificationListener — Fleet activity line (METADATA_UPDATE.activ
     expect(useStore.getState().surfaceSubagents['pty-1']).toBeUndefined();
   });
 
+  it('teammates are stored per pty, an empty list clears them, and they never reach workspace metadata', () => {
+    const wsId = seedActivePaneSurface('pty-1');
+    const teammates = [{ name: 'alice', working: true, at: 1 }];
+    act(() => { metaCb!({ ptyId: 'pty-1', teammates }); });
+    expect(useStore.getState().surfaceTeammates['pty-1']).toEqual(teammates);
+    const ws = useStore.getState().workspaces.find((w) => w.id === wsId)!;
+    expect((ws.metadata as Record<string, unknown> | undefined)?.teammates).toBeUndefined();
+    act(() => { metaCb!({ ptyId: 'pty-1', teammates: [] }); });
+    expect(useStore.getState().surfaceTeammates['pty-1']).toBeUndefined();
+  });
+
   // Byte-based per-PTY 'running' (daemon ActivityMonitor) has no activity
   // string; it must stamp the running freshness clock (surfaceActivityAt) so a
   // background dot lights — this replaced the per-tool PostToolUse hook. The

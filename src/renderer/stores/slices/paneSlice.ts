@@ -1,7 +1,7 @@
 import type { StateCreator } from 'zustand';
 import { paneTaskFoldKey } from '../../utils/sidebarLayout';
 import type { StoreState } from '../index';
-import type { Pane, PaneBranch, StashedPane, Workspace, AgentStatus } from '../../../shared/types';
+import type { Pane, PaneBranch, StashedPane, Workspace, AgentStatus, TeammateInfo } from '../../../shared/types';
 import type { AgentSlug } from '../../../shared/events';
 import {
   createLeafPane,
@@ -265,6 +265,11 @@ export interface PaneSlice {
   // at the same teardown sites as surfaceActivity. Transient — never persisted.
   surfaceSubagents: Record<string, number>;
   setSurfaceSubagents: (ptyId: string, count: number) => void;
+  // Each pane's Agent Teams teammates, keyed by ptyId. From
+  // METADATA_UPDATE.teammates; an empty list deletes the entry. Cleared at the
+  // same teardown sites as surfaceSubagents. Transient — never persisted.
+  surfaceTeammates: Record<string, TeammateInfo[]>;
+  setSurfaceTeammates: (ptyId: string, teammates: TeammateInfo[]) => void;
   /**
    * #1176 — the pendingQuestion text the user has already laid eyes on (they
    * focused the pane while it was blocked). The dot stays red — the agent IS
@@ -795,6 +800,7 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
   surfacePendingQuestion: {},
   surfaceLastMessage: {},
   surfaceSubagents: {},
+  surfaceTeammates: {},
   surfaceQuestionSeen: {},
   surfaceDismissedQuestion: {},
   agentClockMs: Date.now(),
@@ -863,6 +869,12 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
     if (!ptyId) return;
     if (count > 0) state.surfaceSubagents[ptyId] = count;
     else delete state.surfaceSubagents[ptyId];
+  }),
+
+  setSurfaceTeammates: (ptyId, teammates) => set((state: StoreState) => {
+    if (!ptyId) return;
+    if (teammates.length > 0) state.surfaceTeammates[ptyId] = teammates;
+    else delete state.surfaceTeammates[ptyId];
   }),
 
   markSurfaceQuestionSeen: (ptyId) => set((state: StoreState) => {
@@ -1147,6 +1159,7 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
             delete state.surfacePendingQuestion[s.ptyId];
             delete state.surfaceLastMessage[s.ptyId];
             delete state.surfaceSubagents[s.ptyId];
+            delete state.surfaceTeammates[s.ptyId];
             delete state.surfaceQuestionSeen[s.ptyId];
             delete state.surfaceDismissedQuestion[s.ptyId];
             delete state.surfaceActivityAt[s.ptyId];
