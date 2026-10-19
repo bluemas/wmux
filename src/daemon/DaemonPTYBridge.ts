@@ -20,7 +20,8 @@ import { isEscapeChunk } from '../shared/hooks/interruptKeystroke';
 import { stripPassiveInput } from '../shared/terminal/passiveInput';
 import { kittyChunkAsLegacy } from '../shared/kittyKeyEvents';
 import { titleShowsFinishedTurn, titleShowsRunningTurn } from './transcript/chatScreenGate';
-import { CLAUDE_IDLE_TITLE, CLAUDE_RUNNING_TITLE, CLAUDE_RUNNING_TITLE_OSC, RUNNING_TITLE } from '../shared/agentTitleRules';
+import { CLAUDE_IDLE_TITLE, CLAUDE_RUNNING_TITLE, CLAUDE_RUNNING_TITLE_OSC } from '../shared/agentTitleRules';
+import { agentRow } from '../shared/agentIdentity';
 import type { TurnFailure } from '../shared/phoneTurnFailure';
 
 /**
@@ -828,13 +829,14 @@ export class DaemonPTYBridge extends EventEmitter {
    * ended would otherwise reach the daemon's completion alarm as fresh work
    * and cancel it. A pane waiting on a human is never promoted by its title.
    * The agent is the one the process tracker watches alive in the pane, with
-   * its running title read from RUNNING_TITLE: the detector's last agent
+   * the registry's `titleRunning` capability (Claude's spinner has its own
+   * path above) and its running title from RUNNING_TITLE: the detector's last agent
    * outlives the agent, and another program's title can start with a braille
    * frame too.
    */
   private noteCodexTitleSpinner(sessionId: string): void {
     const slug = this.trackedAgent?.alive ? this.trackedAgent.slug : undefined;
-    if (!slug || !RUNNING_TITLE.has(slug) || this.hookSeen) return;
+    if (!slug || !agentRow(slug)?.titleRunning || this.hookSeen) return;
     if (!titleShowsRunningTurn({ title: this.lastTitle, at: this.lastTitleAt }, slug, Date.now())) {
       if (this.spinnerOpenedTurn && this.turnOpen && !this.awaitingHuman) this.endSpinnerTurn();
       return;

@@ -9,6 +9,7 @@ import type { IPty } from 'node-pty';
 import { DaemonPTYBridge } from '../DaemonPTYBridge';
 import { RingBuffer } from '../RingBuffer';
 import { PromptEventLog } from '../PromptEventLog';
+import { agentSlugsWith } from '../../shared/agentIdentity';
 
 const BANNER = '\x1b[9;1H│ >_ OpenAI Codex (v0.149.1)            │\r\n';
 // Codex turns bracketed paste back on before it paints its banner.
@@ -221,5 +222,11 @@ describe('DaemonPTYBridge — a Codex title spinner reports running', () => {
     bridge.noteAgentProcess({ slug: 'codex', alive: false });
     expect(bridge.isTurnOpen()).toBe(false);
     expect(bridge.hasHookReports()).toBe(false);
+  });
+});
+
+describe('the title-driven running path', () => {
+  it('applies to Codex only: Claude\'s spinner keeps its own bridge path', () => {
+    expect(agentSlugsWith('titleRunning')).toEqual(['codex']);
   });
 });
