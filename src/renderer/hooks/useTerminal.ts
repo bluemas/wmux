@@ -83,7 +83,8 @@ import {
   promoteTerminalToPriorityDrain,
   rebindTerminalOutputWriter,
 } from '../terminal/terminalOutputScheduler';
-import { reconnectPtyWithRetry as reconnectPtyWithRetryImpl } from './reconnectPtyWithRetry';
+import { reconnectPtyWithRetry as reconnectPtyWithRetryImpl, type ReconnectSettleInfo } from './reconnectPtyWithRetry';
+import { awaitsReconcile, requestReconcile } from './reconcileRequest';
 import { adoptTerminal, parkTerminal, restoreParkedViewport, type ParkedTerminal } from '../terminal/terminalPark';
 import { captureColdFrame, clearPersistedColdFrames, coldFrameFits, dropColdFrame, persistColdFrames, splitTrailingEscape, takeColdFrame, WarmFrameSwap, COLD_FRAME_MAX_ENTRIES, FULL_RESET, REPAINT_BEGIN, REPAINT_END, type ColdFrame } from '../terminal/coldFrame';
 
@@ -623,12 +624,12 @@ function revealTiming(ptyId: string, stage: string, extra = ''): void {
 // Read-path hydration (MCP pane.search / input.readScreen): a dirty hidden
 // pane must be re-synced before its buffer is scanned, or agents silently read
 // stale output. Keyed by ptyId; registered per mounted terminal.
-const hydrateRegistry = new Map<string, () => Promise<void>>();
+const hydrateRegistry = new Map<string, () => Promise<boolean>>();
 /** Longest a read waits for a painted cold frame to be swapped out. */
 const COLD_FRAME_READ_WAIT_MS = 3000;
-export async function hydrateTerminalForRead(ptyId: string): Promise<void> {
+export async function hydrateTerminalForRead(ptyId: string): Promise<boolean> {
   const fn = hydrateRegistry.get(ptyId);
-  if (fn) await fn();
+  return fn ? await fn() : false;
 }
 
 // Monotonic token source so each useTerminal instance gets a stable, unique key
@@ -650,11 +651,14 @@ let webglTokenSeq = 0;
 
 // RCA A1 — reconnect-with-retry policy lives in its own module so it can be
 // unit-tested without xterm/zustand/electron. Bound to the live deps here.
-function reconnectPtyWithRetry(ptyId: string, isCurrent: () => boolean, onRecoveryError?: (message: string | null, info?: { cwdMissing?: boolean; rateLimited?: boolean }) => void): Promise<{ cols: number; rows: number } | null> {
+function reconnectPtyWithRetry(ptyId: string, isCurrent: () => boolean, onRecoveryError?: (message: string | null, info?: ReconnectSettleInfo) => void): Promise<{ cols: number; rows: number } | null> {
   return reconnectPtyWithRetryImpl(ptyId, isCurrent, {
     reconnect: (id) => window.electronAPI.pty.reconnect(id),
     onRecoveryError,
     clearPtyId: (id, recovery) => useStore.getState().clearSurfacePtyIdByPty(id, recovery),
+    setUnconfirmed: (id, unconfirmed) => useStore.getState().setPtysUnconfirmed([id], unconfirmed),
+    isUnconfirmed: (id) => awaitsReconcile(useStore.getState(), id),
+    requestReconcile,
   });
 }
 
@@ -2490,7 +2494,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
             bracketedPasteMode: !!imgModes?.bracketedPasteMode,
             screenIsAlternate: terminal.buffer.active.type === 'alternate',
           });
-        })().catch(() => {});
+        })().catch(() => { /* Clipboard failures must not escape the key handler. */ });
         return false;
       }
 
@@ -2545,7 +2549,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
             bracketedPasteMode: !!imgModes?.bracketedPasteMode,
             screenIsAlternate: terminal.buffer.active.type === 'alternate',
           });
-        })().catch(() => {});
+        })().catch(() => { /* Clipboard failures must not escape the key handler. */ });
         return false;
       }
 
@@ -2584,7 +2588,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
             bracketedPasteMode: !!imgModes?.bracketedPasteMode,
             screenIsAlternate: terminal.buffer.active.type === 'alternate',
           });
-        })().catch(() => {});
+        })().catch(() => { /* Clipboard failures must not escape the key handler. */ });
         return false;
       }
 
@@ -3397,8 +3401,8 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // wedged (a handler that threw mid-drain strands every queued callback)
     // would otherwise never call back, and the read would burn its whole RPC
     // deadline and return nothing. See parseBarrier.ts.
-    const hydrateForRead = async (): Promise<void> => {
-      if (terminalRef.current !== terminal) return;
+    const hydrateForRead = async (): Promise<boolean> => {
+      if (terminalRef.current !== terminal) return false;
       // Cold-park reveal: a painted cold frame is minutes old. Let the daemon
       // replay replace it before the buffer is read (bounded: a lost flush
       // marker reads the frame, as before).
@@ -3406,7 +3410,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       while (warmSwap.phase !== 'idle' && terminalRef.current === terminal && performance.now() < swapDeadline) {
         await new Promise((resolve) => setTimeout(resolve, 50));
       }
-      if (terminalRef.current !== terminal) return;
+      if (terminalRef.current !== terminal) return false;
       if (isTerminalDirty(terminal)) {
         await startResync('hydrate-read');
       } else {
@@ -3418,6 +3422,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
           `[useTerminal] parse barrier timed out ptyId=${ptyIdRef.current} — reading a possibly unsettled buffer (xterm write buffer may be wedged)`,
         );
       }
+      return parsed && terminalRef.current === terminal && warmSwap.phase === 'idle' && !isTerminalDirty(terminal);
     };
     if (ptyId) hydrateRegistry.set(ptyId, hydrateForRead);
 
@@ -3685,9 +3690,9 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     let inFlight = false;
     reconnectInFlightRef.current = false;
     reconnectPendingRef.current = false;
-    // A rate-limited give-up keeps the live session but no daemon:connected is
-    // coming (the daemon never disconnected), so try again on a slow timer
-    // until it attaches or this effect is torn down.
+    // A rate-limited (or, #2398, an exhausted) give-up keeps the session but no
+    // daemon:connected is coming (the daemon never disconnected), so try again
+    // on a slow timer until it attaches or this effect is torn down.
     let slowRetry: ReturnType<typeof setTimeout> | null = null;
     const reattach = (reason: string) => {
       if (inFlight) return;
@@ -3698,9 +3703,10 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       revealTiming(id, 'reattach-start', `reason=${reason}`);
       return reconnectPtyWithRetry(id, () => ptyIdRef.current === id && terminalRef.current !== null, (message, info) => {
         // A non-null message means the attempt settled WITHOUT a session pipe
-        // (rate limited, WSL recovery pending); null means it attached.
-        reconnectPendingRef.current = message !== null;
-        if (info?.rateLimited && slowRetry === null) {
+        // (rate limited, WSL recovery pending); null means it attached —
+        // unless it is waiting on the reconcile (#2398), which shows no banner.
+        reconnectPendingRef.current = message !== null || info?.awaitingReconcile === true;
+        if ((info?.rateLimited || info?.unconfirmed || info?.awaitingReconcile) && slowRetry === null) {
           slowRetry = setTimeout(() => { slowRetry = null; void reattach('rate-limit-retry'); }, 8000 + Math.random() * 4000);
         }
         onRecoveryErrorRef.current?.(message, info);

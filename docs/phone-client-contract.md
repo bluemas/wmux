@@ -4366,6 +4366,8 @@ worded (the values listed); a value not listed means the English `title`.
 | `worker.paused` | `title` string | `Worker paused: {title}`<br>`Worker paused` | `title`: the task's title, or its short id when it has none. The second title when there is no `title` (a card written before worker cards named their task). |
 | `worker.pausedResumable` | `title` string, `kind` string | `Worker paused (resumable): {title}`<br>`Worker paused (resumable)` | `title` as `worker.paused`. `kind: "research"`: a research task (a task folder, not a worktree). |
 | `worker.idlePausedResumable` | `title` string, `kind` string | `Worker paused (resumable): {title}`<br>`Worker paused (resumable)` | As `worker.pausedResumable`. |
+| `worker.openIdlePaused` | `title` string | `Worker paused: {title}`<br>`Worker paused` | As `worker.paused`; the task was still working or needing input. |
+| `worker.openIdlePausedResumable` | `title` string, `kind` string | `Worker paused (resumable): {title}`<br>`Worker paused (resumable)` | As `worker.pausedResumable`; the task was still working or needing input. |
 | `worker.done` | `title` string, `status` string | `Worker done: {title}`<br>`Worker done` | `title` as `worker.paused`. `status`: `completed`, `cancelled` or `failed`. |
 | `worker.doneResumable` | `title` string, `status` string, `kind` string | `Worker done (resumable): {title}`<br>`Worker done (resumable)` | As `worker.done`; `kind` as `worker.pausedResumable`. |
 | `worker.resumed` | `title` string, `by` string, `where` string | `Worker resumed: {title}`<br>`Worker resumed` | `title` as `worker.paused`. `by`: `owner` or `bot`. `where`: `folder` or `newPane`. |
@@ -4399,6 +4401,7 @@ worded (the values listed); a value not listed means the English `title`.
 | `verify.notRunNoWorktree` | — | `Verify gate not run` | — |
 | `verify.notRunNoBaseRef` | — | `Verify gate not run` | — |
 | `budget.exhausted` | `bot` string, `limit` string, `until` number | `{bot} is out of turns for this hour`<br>`{bot} is out of turns for today`<br>`{bot} is running as many workers as it may at once`<br>`{bot} has used its worker hours for today`<br>`{bot} waits: the bots are running as many workers as they may at once` | One title per `limit`, in this order: `turns_hour`, `turns_day`, `concurrent_workers`, `worker_hours_day`, `factory_workers`. `until`: when it picks up by itself. |
+| `workers.full` | `bot` string, `scope` string, `inUse` number, `cap` number | `{bot} is waiting for a worker slot: {inUse} of its {cap} are in use`<br>`{bot} is waiting for a worker slot: the bots use {inUse} of {cap}` | One title per `scope`, in this order: `bot` (the bot's own worker slots), `factory` (every bot's workers counted). Not a budget limit: a slot frees when a running worker ends. |
 | `budget.held` | `bot` string, `until` number | `Queued: {bot} is out of turns` | `until`: when it has turns again. |
 | `bot.usageLimit` | `bot` string, `until` number | `{bot} hit its usage limit; it picks up again at {time}` | `{time}` is `until`. |
 | `bot.error` | `bot` string | `{bot} hit an error` | — |

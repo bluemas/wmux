@@ -54,6 +54,7 @@ import { redactStoredSecrets, redactStoredSecretsDeep } from './secretRedaction'
 import type { BotDirectoryApi, FactLogApi, WakeSinkApi } from './triggerEngine';
 import type { BotGroup } from '../../shared/botGroup';
 import { parseRoomAttachments } from '../../shared/roomAttachments';
+import { parseRoomFiles } from './roomFiles';
 
 export const ROOMS_DIRNAME = 'rooms';
 
@@ -451,6 +452,7 @@ export function parseCardLine(raw: unknown, workspaceId: string): RoomCard | nul
   const jobChange = c.kind === 'job_changed' ? sanitizeJobChange(c.jobChange) : undefined;
   const notice = actor.kind === 'system' ? sanitizeNotice(c.notice) : undefined;
   const attachments = c.kind === 'human' && actor.kind === 'human' ? parseRoomAttachments(c.attachments) : undefined;
+  const files = actor.kind === 'bot' ? parseRoomFiles(c.files) : undefined;
   return {
     version: 1,
     id: c.id,
@@ -471,6 +473,7 @@ export function parseCardLine(raw: unknown, workspaceId: string): RoomCard | nul
     ...(c.greeting === true && c.kind === 'question' ? { greeting: true as const } : {}),
     ...(notice ? { notice } : {}),
     ...(attachments ? { attachments } : {}),
+    ...(files ? { files } : {}),
   };
 }
 
@@ -510,6 +513,9 @@ export interface RoomCardInput {
   /** The owner's `human` cards only (RoomCard.attachments): photos already
    *  in the room's store. */
   attachments?: RoomCard['attachments'];
+  /** Bot cards only (RoomCard.files): files already in the room's file
+   *  store (roomFiles.ts). */
+  files?: RoomCard['files'];
 }
 
 /** A post from a bot or the owner: idempotent by clientPostId, and a replyTo
@@ -541,6 +547,8 @@ interface RoomState {
   byClientId: Map<string, string>;
   /** threadId → the owner's read position (seq). */
   readThrough: Record<string, number>;
+  /** The room's file was there but could not be read: it started empty. */
+  unreadable?: true;
 }
 
 export interface RoomWriterOptions {
@@ -620,10 +628,14 @@ export class RoomWriter {
     const byId = new Map<string, RoomCard>();
     let lines = 0;
     let text = '';
+    let unreadable = false;
     try {
       text = fs.readFileSync(this.file(workspaceId), 'utf8');
     } catch (err) {
-      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') this.log(`room ${workspaceId} unreadable; starting empty`, err);
+      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+        unreadable = true;
+        this.log(`room ${workspaceId} unreadable; starting empty`, err);
+      }
     }
     let highWater = 0;
     for (const line of text.split('\n')) {
@@ -655,6 +667,7 @@ export class RoomWriter {
       seenFacts: new Set(cards.filter((c) => c.refs?.factId).map(factCardKey).slice(-ROOM_STORE_LIMITS.SEEN_FACTS)),
       byClientId: new Map(cards.filter((c) => c.clientPostId).map((c) => [c.clientPostId as string, c.id])),
       readThrough: this.loadReadThrough(workspaceId),
+      ...(unreadable ? { unreadable: true as const } : {}),
     };
     if (state.lines - state.cards.length >= this.compactSlack || state.cards.length < byId.size) {
       this.compact(workspaceId, state);
@@ -722,6 +735,7 @@ export class RoomWriter {
     const jobChange = input.kind === 'job_changed' ? sanitizeJobChange(redactStoredSecretsDeep(input.jobChange)) : undefined;
     const notice = actor.kind === 'system' ? sanitizeNotice(redactStoredSecretsDeep(input.notice)) : undefined;
     const attachments = input.kind === 'human' && actor.kind === 'human' ? parseRoomAttachments(input.attachments) : undefined;
+    const files = actor.kind === 'bot' ? parseRoomFiles(input.files) : undefined;
     // A fact delivered twice (a re-subscribe, a replay) writes one card.
     const factKey = refs?.factId ? factCardKey({ refs, threadId, kind: input.kind }) : null;
     if (factKey && state.seenFacts.has(factKey)) return null;
@@ -743,6 +757,7 @@ export class RoomWriter {
       ...(input.greeting === true && input.kind === 'question' ? { greeting: true as const } : {}),
       ...(notice ? { notice } : {}),
       ...(attachments ? { attachments } : {}),
+      ...(files ? { files } : {}),
       ...(extra?.replyTo ? { replyTo: extra.replyTo } : {}),
       ...(extra?.clientPostId ? { clientPostId: extra.clientPostId } : {}),
     };
@@ -825,6 +840,17 @@ export class RoomWriter {
   get(workspaceId: string, id: string): RoomCard | null {
     const card = this.room(workspaceId)?.byId.get(id) ?? null;
     return card ? redactStoredSecretsDeep(card) : null;
+  }
+
+  /** The file ids the kept bot cards of a room list (the room file store's
+   *  sweep); null when the room's file could not be read, so its cards are
+   *  not known. */
+  fileIds(workspaceId: string): ReadonlySet<string> | null {
+    const state = this.room(workspaceId);
+    if (!state || state.unreadable) return null;
+    const ids = new Set<string>();
+    for (const c of state.cards) for (const f of c.files ?? []) ids.add(f.id);
+    return ids;
   }
 
   /** The first card of the room that matches, newest first. */
@@ -1187,6 +1213,24 @@ export function systemCardForFact(fact: Fact, bots?: BotDirectoryApi): SystemCar
         title: `${name} ${limit}${until !== null ? `; it picks up again at ${formatHeldUntil(until, fact.at)}` : ''}`,
         refs: baseRefs,
         ...(reason in BUDGET_LIMIT_TEXT ? { notice: { code: 'budget.exhausted', args: { bot: name, limit: reason, ...(until !== null ? { until } : {}) } } } : {}),
+      };
+    }
+    case 'bot.workers_full': {
+      // Not a budget limit: the bot waits for a worker slot, its own or the
+      // factory's, and is woken with its held request when one frees.
+      const name = botLabel(bots, fact.ref?.botId);
+      const scope = p.scope === 'factory' ? 'factory' : p.scope === 'bot' ? 'bot' : null;
+      const running = typeof p.running === 'number' && Number.isSafeInteger(p.running) ? p.running : null;
+      const limit = typeof p.limit === 'number' && Number.isSafeInteger(p.limit) ? p.limit : null;
+      if (!scope || running === null || limit === null) return null;
+      return {
+        workspaces: factRooms(fact, bots), threadId: GENERAL_THREAD, kind: 'fact',
+        title: scope === 'bot'
+          ? `${name} is waiting for a worker slot: ${running} of its ${limit} are in use`
+          : `${name} is waiting for a worker slot: the bots use ${running} of ${limit}`,
+        body: 'This is not a budget limit: a slot frees when a running worker ends.',
+        refs: baseRefs,
+        notice: { code: 'workers.full', args: { bot: name, scope, inUse: running, cap: limit } },
       };
     }
     case 'bot.notice': {

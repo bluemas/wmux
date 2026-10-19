@@ -2,6 +2,7 @@ import { DaemonClient } from '../DaemonClient';
 import type { DaemonInfo, DaemonPingResult } from './launcher';
 import type { ProcessLiveness } from '../../shared/processLiveness';
 import { isDaemonOlder, runDaemonReplacement, type ShutdownRpcResult } from './daemonReplacement';
+import type { DaemonExitWatch } from './daemonExitWatch';
 
 export interface DaemonRespawnState {
   attempt: number;
@@ -56,6 +57,12 @@ export interface DaemonRespawnDeps {
    * effects are injected so the replacement flow is unit-testable.
    */
   replacement?: DaemonReplacementHooks;
+  /**
+   * Start watching the installed daemon's process so its exit code can be
+   * logged when its socket closes (daemonExitWatch.ts). Optional: absent means
+   * no exit line, as before.
+   */
+  watchDaemonExit?: (pid: number | null, spawned: boolean) => DaemonExitWatch;
 }
 
 export interface DaemonReplacementHooks {
@@ -172,6 +179,8 @@ export class DaemonRespawnController {
    *  re-entrant respawn schedules from a health probe that races a real
    *  socket close. */
   private respawning = false;
+  /** True while `bootstrap()` is launching the first daemon. */
+  private bootstrapping = false;
   /**
    * Latest error captured by the respawn loop — set on bootstrap throw,
    * spawnAndConnect null returns inside attemptRespawn, and any other
@@ -197,6 +206,10 @@ export class DaemonRespawnController {
    * session suspended on disk (Codex #4 + Claude #2).
    */
   private replacementDeadEnd = false;
+  /** The daemon behind the client spawnAndConnect last returned: its pid, and whether this process spawned it. */
+  private connectedDaemon: { pid: number | null; spawned: boolean } = { pid: null, spawned: false };
+  /** Watches the installed daemon's process for its exit code. */
+  private exitWatch: DaemonExitWatch | null = null;
 
   constructor(
     private readonly deps: DaemonRespawnDeps,
@@ -208,6 +221,19 @@ export class DaemonRespawnController {
   /** True if a daemon client is currently installed and connected. */
   get isHealthy(): boolean {
     return this.client !== null && this.client.isConnected;
+  }
+
+  /**
+   * #2398 — whether a daemon may still come (back) without an app restart:
+   * the first launch is in flight, or a respawn is scheduled or running.
+   * False once the launch failed (bootstrap has no retry of its own) or the
+   * respawn budget ran out: the local-PTY fallback is then final, and a
+   * session only the daemon held is gone for this run. Read while no client
+   * is installed (the local handlers).
+   */
+  get daemonMayReturn(): boolean {
+    if (this.disposed || this.exhausted) return false;
+    return this.bootstrapping || this.respawning;
   }
 
   /** Current active client, or null when in local-only fallback. */
@@ -223,6 +249,7 @@ export class DaemonRespawnController {
   async bootstrap(): Promise<DaemonClient | null> {
     if (this.disposed) throw new Error('DaemonRespawnController already disposed');
     if (this.client) return this.client;
+    this.bootstrapping = true;
     try {
       const client = await this.spawnAndConnect();
       if (!client) {
@@ -248,6 +275,8 @@ export class DaemonRespawnController {
       this.lastError = this.stringifyError(err);
       this.deps.logger.warn(`bootstrap failed: ${this.lastError}`);
       return null;
+    } finally {
+      this.bootstrapping = false;
     }
   }
 
@@ -263,6 +292,21 @@ export class DaemonRespawnController {
     this.stopHealthProbe();
     this.detachDisconnectedListener();
     this.client = null;
+    // Not a report: a detach Quit closes the socket with the daemon alive on purpose.
+    this.exitWatch?.dispose();
+    this.exitWatch = null;
+  }
+
+  /**
+   * Hand the exit watch to the caller, so dispose() leaves it running. A full
+   * shutdown keeps watching the daemon through its teardown: a native crash
+   * there is one of the exits the watch exists for, and main is still alive
+   * awaiting the shutdown RPC when it happens.
+   */
+  takeExitWatch(): DaemonExitWatch | null {
+    const watch = this.exitWatch;
+    this.exitWatch = null;
+    return watch;
   }
 
   /** Public entry for tests / future manual reconnect UI. */
@@ -296,14 +340,16 @@ export class DaemonRespawnController {
       await client.disconnect().catch(() => { /* best-effort */ });
       return null;
     }
+    const answered = this.answeringDaemon(info, pong);
+    this.connectedDaemon = { pid: answered.pid, spawned: answered.spawned };
 
     // B′ staleness gate. Only a REUSED daemon can be stale (a daemon we just
     // spawned runs this app's own binary), and only once per app run.
     const rep = this.deps.replacement;
-    if (rep && !info.spawned && !this.replacedOnceThisRun) {
+    if (rep && !answered.spawned && !this.replacedOnceThisRun) {
       const verdict = isDaemonOlder(pong, rep.appVersion, rep.channelsEpoch);
       if (verdict.older) {
-        return await this.replaceStaleDaemon(client, info, rep, verdict.reason);
+        return await this.replaceStaleDaemon(client, answered, rep, verdict.reason);
       }
       if (verdict.warnOnKeep) {
         // The C1 banner is epoch-driven and cannot fire for these keep
@@ -415,8 +461,9 @@ export class DaemonRespawnController {
       this.lastError = 'replacement daemon spawned but control pipe connect failed';
       return null;
     }
+    let freshPong: DaemonPingResult | undefined;
     try {
-      await freshClient.rpc('daemon.ping', {});
+      freshPong = (await freshClient.rpc('daemon.ping', {})) as DaemonPingResult;
     } catch (err) {
       this.replacementDeadEnd = true;
       this.lastError = `replacement daemon auth/ping failed: ${this.stringifyError(err)}`;
@@ -442,7 +489,29 @@ export class DaemonRespawnController {
     this.deps.logger.info(
       `stale daemon replaced (old pid=${oldInfo.pid} → new pid=${freshInfo.pid})`,
     );
+    const answered = this.answeringDaemon(freshInfo, freshPong);
+    this.connectedDaemon = { pid: answered.pid, spawned: answered.spawned };
     return freshClient;
+  }
+
+  /**
+   * The daemon the client actually talks to. A reused daemon's pid comes from
+   * the pid file, which can be stale or name a reused pid while the canonical
+   * pipe still answers; the authenticated ping reports the pid of the daemon
+   * that answered. That one is what the exit watch and a stale-daemon
+   * replacement act on. When the two differ, the daemon is not the child just
+   * spawned, so an ended child-exit record under its pid is never taken for
+   * its exit. A daemon too old to report its pid leaves the launcher's answer.
+   */
+  private answeringDaemon(info: DaemonInfo, pong: DaemonPingResult | undefined): DaemonInfo {
+    const pid = pong?.pid;
+    if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0 || pid === info.pid) return info;
+    if (info.pid === null) {
+      this.deps.logger.info(`daemon pid ${pid} taken from its ping (the launcher had none)`);
+    } else {
+      this.deps.logger.warn(`daemon pid file names ${info.pid} but pid ${pid} answered the ping — using ${pid}`);
+    }
+    return { ...info, pid, spawned: false };
   }
 
   private async install(
@@ -463,10 +532,16 @@ export class DaemonRespawnController {
     // installed, no onUninstall fired, and no respawn scheduled.
     // Codex review P2 (round 3) on issue #54.
     this.respawning = false;
+    // Watch this daemon's process from now on: its exit code can only be read
+    // through a handle opened while it is alive.
+    this.exitWatch?.dispose();
+    this.exitWatch = this.deps.watchDaemonExit?.(this.connectedDaemon.pid, this.connectedDaemon.spawned) ?? null;
+    const exitWatch = this.exitWatch;
     // Wire the disconnected listener BEFORE we hand control to onInstall.
     // If a disconnect raced the install path itself, we still observe it.
     const listener = () => {
       this.deps.logger.warn('daemon disconnected (socket close)');
+      void exitWatch?.report('socket close');
       this.handleDisconnect('socket close');
     };
     this.disconnectedListener = listener;
@@ -562,6 +637,8 @@ export class DaemonRespawnController {
         this.deps.logger.error(
           'daemon hang detected — forcing respawn',
         );
+        // Says whether the daemon was still alive when main let go of it.
+        void this.exitWatch?.report('health probe hang');
         // Force a clean disconnect. The socket-close path will still fire
         // `disconnected`; we set `respawning` first so it short-circuits
         // to the scheduling logic rather than racing us.

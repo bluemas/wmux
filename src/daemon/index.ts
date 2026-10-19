@@ -17,7 +17,7 @@ import { persistCodexThreadOwner, invalidateCodexThreadOwner, trackCodexPaneOwne
 import { codexCdOperand, recoverCodexPane, withCodexRemote } from './web/recoverCodexPane';
 import { CodexRelayUnavailableError } from './web/codexTuiRelay';
 import { paneCodexSettings } from './web/paneCodexSettings';
-import { CodexPaneRelays } from './web/codexPaneRelays';
+import { CodexPaneRelays, paneCodexHome } from './web/codexPaneRelays';
 import { createCodexAccountStatusReader } from './web/codexAccountStatus';
 import { buildAgentLaunch, installedAgentLaunchOptions, pinnedAgentLaunch } from './web/agentLaunch';
 import { agentExecEnv } from '../shared/execEnv';
@@ -131,7 +131,7 @@ import { GateFlagFile } from './gateFlagFile';
 import { WSL_GATE_FLAG_FILE } from '../shared/wslIntegration';
 import { CommandStartAgentProbe } from './commandStartAgentProbe';
 import { resolveCanonicalAgentIdentity, detectorSuppressedBy, reportedAgentName, provesLiveAgent, type CanonicalAgentIdentity, recordPaneIdentity } from './canonicalAgent';
-import { decideLaunchPresence, launchPresenceNeedsProcessRead, type IdleShellRead } from './launchPresence';
+import { inspectLaunchPresence } from './launchPresence';
 import { promptLineState } from '../shared/promptLineState';
 import { parseWriteExpectation, writeIfUnchanged } from './writeIfUnchanged';
 import { Watchdog } from './Watchdog';
@@ -156,6 +156,7 @@ import { RingBuffer } from './RingBuffer';
 import { GitContextWatcher } from '../main/pty/gitContextWatch';
 import { PortWatcher } from '../main/pty/portWatch';
 import { initDaemonLogSink, isBrokenPipeError, stdioErrorsConsumed } from './util/logSink';
+import { installExitEvidence, noteExitReason, STATUS_CONTROL_C_EXIT } from './exitEvidence';
 import { newerTimestamp } from './util/idleAnchor';
 import type { DaemonState } from './types';
 import type { DaemonEvent, DaemonCreateSessionParams, DaemonDestroySessionParams, DaemonSessionIdParams, DaemonResizeParams, DaemonSetResumeBindingParams } from '../shared/rpc';
@@ -1155,7 +1156,9 @@ async function getBootId(): Promise<string> {
     } else if (process.platform === 'darwin') {
       // macOS: sysctl exposes the boot timestamp; encode it as a stable string.
       // Format: "{ sec = 1745678901, usec = 123456 } Mon Apr 28 ..."
+      // eslint-disable-next-line @typescript-eslint/no-var-requires -- keep this optional dependency lazy
       const { execFile } = require('child_process');
+      // eslint-disable-next-line @typescript-eslint/no-var-requires -- keep this optional dependency lazy
       const { promisify } = require('util');
       const execFileAsync = promisify(execFile);
       const { stdout } = await execFileAsync(
@@ -1181,6 +1184,7 @@ function getBootIdSync(): string {
     if (process.platform === 'win32') {
       return getWin32BootIdSync();
     } else if (process.platform === 'darwin') {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires -- keep this optional dependency lazy
       const { execFileSync } = require('child_process');
       const result = execFileSync(
         'sysctl',
@@ -1255,6 +1259,14 @@ function log(level: string, msg: string, ...args: unknown[]): void {
     // Logging must never crash the daemon.
   }
 }
+
+// Every exit JS can see leaves one line saying why; registered before the
+// exit listeners that save state, so the line lands even if one of them hangs.
+installExitEvidence(process, {
+  log,
+  ignoreError: (err) => !stdioErrorsConsumed() && isBrokenPipeError(err),
+  reportDir: path.join(wmuxDir, 'crash-reports'),
+});
 
 // === X6 resume on replay ===
 // Compute the NON-persisted launch command for a supervised exec session being
@@ -1567,7 +1579,9 @@ async function processLiveness(pid: number): Promise<ProcessLiveness> {
     // — so probe with tasklist. A thrown probe leaves stdout null → unknown.
     let stdout: string | null = null;
     try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires -- keep this optional dependency lazy
       const { execFile } = require('child_process');
+      // eslint-disable-next-line @typescript-eslint/no-var-requires -- keep this optional dependency lazy
       const { promisify } = require('util');
       const execFileAsync = promisify(execFile);
       const systemRoot = process.env.SystemRoot || 'C:\\Windows';
@@ -1608,7 +1622,9 @@ async function processLiveness(pid: number): Promise<ProcessLiveness> {
 async function reapProcessTree(pid: number, reason: string): Promise<void> {
   try {
     if (process.platform === 'win32') {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires -- keep this optional dependency lazy
       const { execFile } = require('child_process');
+      // eslint-disable-next-line @typescript-eslint/no-var-requires -- keep this optional dependency lazy
       const { promisify } = require('util');
       const execFileAsync = promisify(execFile);
       const systemRoot = process.env.SystemRoot || 'C:\\Windows';
@@ -1708,7 +1724,9 @@ async function reapIfIdentityConfirmed(opts: {
  *  Prevents killing unrelated processes after PID recycling (e.g. reboot). */
 async function isOurShellProcess(pid: number, expectedCmd: string): Promise<boolean> {
   try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires -- keep this optional dependency lazy
     const { execFile } = require('child_process');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires -- keep this optional dependency lazy
     const { promisify } = require('util');
     const execFileAsync = promisify(execFile);
     // Unix: check /proc/<pid>/exe or use ps
@@ -2879,7 +2897,7 @@ function registerRpcHandlers(
       // Stop existing SessionPipe if still listening (prevents EADDRINUSE on reconnect)
       const existingPipe = sessionPipes.get(p.id);
       if (existingPipe) {
-        await existingPipe.stop().catch(() => {});
+        await existingPipe.stop().catch(() => undefined);
         sessionPipes.delete(p.id);
       }
 
@@ -3283,6 +3301,9 @@ function registerRpcHandlers(
         .filter((s) => s.state === 'suspended' && !activeIdSet.has(s.id))
         .map((s) => ({
           id: s.id,
+          // `cmd` as every live entry has it (pty:reconnect records and returns
+          // it after a promote, #2398); `shell` kept for older readers.
+          cmd: s.cmd,
           shell: s.cmd,
           state: 'suspended' as const,
           cwd: s.cwd,
@@ -4534,6 +4555,25 @@ function registerRpcHandlers(
     return { ok: false, error };
   });
 
+  pipeServer.onRpc('daemon.codex.relay.prepare', async (params, ctx) => {
+    if (!firstPartyOnly(ctx.clientId, 'codex.relay.prepare') || process.platform !== 'win32') throw new Error('Unavailable');
+    const id = typeof params.id === 'string' ? params.id : '';
+    const owner = sessionManager.getSession(id);
+    if (!owner || !['attached','detached'].includes(owner.meta.state)) throw new Error('Terminal is no longer live');
+    const codeHome = paneCodexHome(typeof params.codeHome === 'string' ? params.codeHome : undefined, owner.meta.env?.CODEX_HOME);
+    const relay = await codexPaneRelays.prepare(id,codeHome);
+    if (sessionManager.getSession(id) !== owner || !relay.commit(owner)) {
+      await relay.close();
+      throw new Error('Terminal changed during launch');
+    }
+    return {url:relay.url,authToken:relay.authToken,leaseId:codexPaneRelays.leaseId(id)};
+  });
+  pipeServer.onRpc('daemon.codex.relay.close', async (params, ctx) => {
+    if (!firstPartyOnly(ctx.clientId, 'codex.relay.close') || typeof params.id !== 'string' || typeof params.leaseId !== 'string') throw new Error('Unavailable');
+    await codexPaneRelays.release(params.id,params.leaseId);
+    return {ok:true};
+  });
+
   pipeServer.onRpc('daemon.transcript.status', async (params, ctx) => {
     if (!firstPartyOnly(ctx.clientId, 'status')) {
       return { available: false, reason: 'not-authorized' };
@@ -4743,7 +4783,8 @@ function registerRpcHandlers(
         // broadcast (or drive phone liveness) when its window expires either.
         const screenSlug = agentDisplayToSlug(data.agent);
         // `false` also tells HookIngest not to record a terminal_prompt for it.
-        if (detectorSuppressedBy(canonicalIdentityFor(agentProcessTracker, sessionId, screenSlug), screenSlug)) return false;
+        const screenName = sessionManager.getSession(sessionId)?.bridge.getLastAgent();
+        if (detectorSuppressedBy(canonicalIdentityFor(agentProcessTracker, sessionId, screenName ? agentDisplayToSlug(screenName) : undefined), screenSlug)) return false;
         sessionManager.getSession(sessionId)?.bridge.noteAgentStatus(data.status as AgentEventStatus);
         const event: DaemonEvent = { type: 'agent.event', sessionId, data };
         pipeServer.broadcast(event);
@@ -4771,6 +4812,7 @@ function registerRpcHandlers(
           sessionId,
           screenAgent ? agentDisplayToSlug(screenAgent) : undefined,
         );
+        const identitySeeded = managed.bridge.noteHookAgentIdentity(signal, canonical);
         if (recordPaneIdentity(managed.meta, canonical, Date.now())) {
           stateWriter.saveImmediate(buildState(sessionManager));
         }
@@ -4792,7 +4834,7 @@ function registerRpcHandlers(
         if (agent) {
           agentProcessTracker.armWsl(sessionId, {
             shell: managed.meta.cmd, target: wslTarget, hostPid: managed.meta.pid,
-          }, agent);
+          }, agent, identitySeeded ? signal.ts : undefined);
         }
       },
       // #1463 — the agent's own "question answered" signal takes the same
@@ -5182,29 +5224,26 @@ function registerRpcHandlers(
   // cheaper signal already decided.
   pipeServer.onRpc('daemon.getLaunchPresence', async (params) => {
     const id = typeof params['id'] === 'string' ? params['id'] : '';
-    const session = id ? sessionManager.getSession(id) : undefined;
-    const inputs = {
-      sessionExists: !!session,
-      agentName: readDaemonAgentState(id).agentName ?? null,
-      trackerAlive: agentProcessTracker.statusFor(id),
-      commandRunning: session?.promptLog.commandRunningIfKnown(),
-      isExec: !!session?.meta.exec,
-      isWsl: !!session?.meta.wslTarget,
-      exitAfterPrompt: session?.promptLog.exitAfterPrompt(),
-      lineNeverRead: !!session && promptLineState(session.promptLog.snapshot(), session.ringBuffer.totalBytesWritten) === 'idle-at-prompt',
-    };
-    let idleShell: IdleShellRead | undefined;
-    if (session && params['probeProcess'] === true && launchPresenceNeedsProcessRead(inputs)) {
-      try {
-        idleShell = await agentProcessTracker.idleShellState(session.meta.pid, session.meta.env, true);
-      } catch {
-        idleShell = 'error';
-      }
-    }
-    return {
-      ...decideLaunchPresence({ ...inputs, idleShell }),
-      incarnationId: session?.meta.incarnationId ?? null,
-    };
+    const original = id ? sessionManager.getSession(id) : undefined;
+    return inspectLaunchPresence(() => {
+      const session = id ? sessionManager.getSession(id) : undefined;
+      return { session: session ?? null, incarnationId: session?.meta.incarnationId ?? null,
+        inputRevision: session?.bridge.getInputRevision() ?? 0,
+        outputBytes: session?.ringBuffer.totalBytesWritten ?? 0,
+        recoveredAgentUnconfirmed: session?.recoveredAgentUnconfirmed === true,
+        inputs: {
+          sessionExists: !!session,
+          agentName: readDaemonAgentState(id).agentName ?? null,
+          trackerAlive: agentProcessTracker.statusFor(id),
+          commandRunning: session?.promptLog.commandRunningIfKnown(),
+          isExec: !!session?.meta.exec,
+          isWsl: !!session?.meta.wslTarget,
+          exitAfterPrompt: session?.promptLog.exitAfterPrompt(),
+          lineNeverRead: !!session && promptLineState(session.promptLog.snapshot(), session.ringBuffer.totalBytesWritten) === 'idle-at-prompt',
+        } };
+    }, params['probeProcess'] === true, async () => original
+      ? agentProcessTracker.idleShellState(original.meta.pid, original.meta.env, true, { fresh: true })
+      : 'error');
   });
   pipeServer.onRpc('daemon.getAgentState', async (params) => {
     const id = typeof params['id'] === 'string' ? params['id'] : '';
@@ -6627,6 +6666,23 @@ function wireEvents(
     const screenAgent = managed?.bridge.getLastAgent() ?? null;
     return (screenAgent ? agentDisplayToSlug(screenAgent) : undefined) ?? managed?.meta.lastDetectedAgent;
   };
+  const installApprovalReader = (id: string): void => {
+    const managed = sessionManager.getSession(id);
+    if (!managed) return;
+    managed.bridge.setApprovalScreenReader(async (ptyId) => {
+      if (ptyId !== id || sessionManager.getSession(id) !== managed) return null;
+      const cols = managed.ptyProcess.cols;
+      const rows = managed.ptyProcess.rows;
+      const frame = await renderPaneScreen(() => sessionManager.getSession(id), generateTextSnapshot);
+      if (!frame) return null;
+      const isCurrent = (): boolean => sessionManager.getSession(id) === managed
+        && !managed.bridge.isMuted && managed.ringBuffer.totalBytesWritten === frame.mark
+        && managed.ptyProcess.cols === cols && managed.ptyProcess.rows === rows;
+      return isCurrent() ? { rows: frame.rows, isCurrent } : null;
+    });
+  };
+  for (const session of sessionManager.listSessions()) installApprovalReader(session.id);
+  sessionManager.on('session:created', (payload: { session: { id: string } }) => installApprovalReader(payload.session.id));
   const awaitingVerifier = new AwaitingScreenVerifier({
     isAwaiting: (id) => sessionManager.getSession(id)?.bridge.isAwaitingHuman() === true,
     eligible: (id) => isClaudeFamilyAgent(paneAgentSlug(id)),
@@ -6814,7 +6870,7 @@ function wireEvents(
     try {
       const pipe = sessionPipes.get(payload.id);
       if (pipe) {
-        pipe.stop().catch(() => {});
+        pipe.stop().catch(() => undefined);
         sessionPipes.delete(payload.id);
       }
     } catch (err) {
@@ -6912,7 +6968,7 @@ function wireEvents(
     try {
       const pipe = sessionPipes.get(payload.id);
       if (pipe) {
-        pipe.stop().catch(() => {});
+        pipe.stop().catch(() => undefined);
         sessionPipes.delete(payload.id);
       }
     } catch (err) {
@@ -7108,7 +7164,8 @@ function wireEvents(
     // the detector's sticky label on every output burst, undoing whatever the
     // canonical rule had corrected (Codex #5).
     const activeScreenSlug = agentDisplayToSlug(payload.agentName ?? '');
-    const activeCanonical = canonicalIdentityFor(agentProcessTracker, payload.sessionId, activeScreenSlug);
+    const activeScreenName = sessionManager.getSession(payload.sessionId)?.bridge.getLastAgent();
+    const activeCanonical = canonicalIdentityFor(agentProcessTracker, payload.sessionId, activeScreenName ? agentDisplayToSlug(activeScreenName) : undefined);
     // Past a usage-limit hold, real output means the agent works again.
     if (!payload.likelyRepaint) usageLimits?.noteActive(payload.sessionId);
     if (!payload.likelyRepaint) hookIngest?.notePaneWorking(
@@ -7178,7 +7235,8 @@ function wireEvents(
     // nothing. arm() above is fire-and-forget, so the FIRST banner on an
     // unarmed pane still resolves screen-tier — corrected on the tracker's
     // attribution callback or the next event once the probe lands.
-    const canonical = canonicalIdentityFor(agentProcessTracker, payload.sessionId, slug);
+    const screenName = managed?.bridge.getLastAgent();
+    const canonical = canonicalIdentityFor(agentProcessTracker, payload.sessionId, screenName ? agentDisplayToSlug(screenName) : undefined);
     // A screen-tier identity may name an unnamed pane, never rename one
     // (mayPersistIdentity): the flip is what made a Claude pane "codex" for
     // the resume pill after a quoted banner row or a post-exit shell echo.
@@ -7657,6 +7715,7 @@ async function shutdown(
 ): Promise<{ stateSaved: boolean }> {
   if (shuttingDown) return { stateSaved: false };
   shuttingDown = true;
+  noteExitReason(`shutdown (${signal})`);
   gateFlag?.stop();
   stopPushRecovery?.();
   sessionManager.cancelPendingCreates();
@@ -7715,6 +7774,7 @@ async function shutdown(
   // Hard timeout guard — force exit if shutdown hangs
   const shutdownTimeout = setTimeout(() => {
     log('error', 'Shutdown timed out after 10s — forcing exit');
+    noteExitReason('shutdown timed out after 10s');
     releaseLock();
     process.exit(1);
   }, 10_000);
@@ -7766,7 +7826,7 @@ async function shutdown(
   // Clean up all session pipes
   const pipeStopsStart = phaseStartedAt();
   const pipeStops = Array.from(sessionPipes.values()).map((pipe) =>
-    pipe.stop().catch(() => {}),
+    pipe.stop().catch(() => undefined),
   );
   await Promise.all(pipeStops);
   sessionPipes.clear();
@@ -7840,7 +7900,7 @@ async function shutdown(
   // still needs the pipe to flush its ack.
   if (!opts.skipPipeStop) {
     const pipeServerStopStart = phaseStartedAt();
-    await pipeServer.stop().catch(() => {});
+    await pipeServer.stop().catch(() => undefined);
     phaseLog('pipeServerStop', pipeServerStopStart);
   }
 
@@ -7894,6 +7954,7 @@ async function main(): Promise<void> {
 
   // 1. Single-instance check
   if (!(await acquireLock())) {
+    noteExitReason(lockHeldByLiveDaemon ? 'a live daemon holds the lock' : 'lock acquisition failed');
     // Under a service manager, a live daemon already running is not a crash:
     // DAEMON_EXIT_ALREADY_RUNNING is the code the unit's restart policy skips.
     // The desktop launcher's path keeps exit 1 here.
@@ -8872,6 +8933,12 @@ async function main(): Promise<void> {
   // (Codex #12). No identity-flip agent.event is fabricated (its lifecycle
   // status semantics would invent completions); the label self-heals through
   // activity.active / getAgentName on the next output burst.
+  agentProcessTracker.setIdentityProbeGuard((sessionId) => {
+    const managed = sessionManager.getSession(sessionId);
+    const guard = managed?.bridge.captureIdentityProbe();
+    if (!managed || !guard) return undefined;
+    return { epoch: guard.epoch, isCurrent: () => sessionManager.getSession(sessionId) === managed && guard.isCurrent() };
+  });
   agentProcessTracker.setStateChangeListener((sessionId, state) => {
     if (!state.alive) hookIngest?.expireAuthorityFor(sessionId, state.slug);
     if (!state.alive) automationEngine?.onAgentProcessExit(sessionId);
@@ -8934,8 +9001,8 @@ async function main(): Promise<void> {
     }
     // A death edge, or a launch edge for a different agent than the last one
     // seen here, ends the previous agent's running episode.
-    const previousSlug = managed.meta.lastDetectedAgent;
-    if (!state.alive || (state.slug && previousSlug && state.slug !== previousSlug)) managed.bridge.noteAgentEnded();
+    // The bridge validates the observation before retiring a previous owner,
+    // so a stale async probe cannot invalidate the replacement launch.
     // The process truth the bridge's running-title path reads.
     managed.bridge.noteAgentProcess(state);
     const screenSlug = managed.bridge.getLastAgent();
@@ -9513,8 +9580,24 @@ async function main(): Promise<void> {
 
   // 9. Signal handlers — doShutdown was hoisted above setCallbacks so
   // the idle-shutdown callback can reuse it.
-  process.on('SIGTERM', () => doShutdown('SIGTERM'));
-  process.on('SIGINT', () => doShutdown('SIGINT'));
+  // Each one says so first, synchronously: the graceful path can still die
+  // before it writes anything (the hard timeout, or a native fault mid-dump).
+  const onExitSignal = (sig: string): void => {
+    noteExitReason(`signal ${sig}`);
+    log('warn', `[exit] received ${sig} — shutting down`);
+  };
+  process.on('SIGTERM', () => { onExitSignal('SIGTERM'); void doShutdown('SIGTERM'); });
+  process.on('SIGINT', () => { onExitSignal('SIGINT'); void doShutdown('SIGINT'); });
+  if (process.platform === 'win32') {
+    // Ctrl+Break. With no listener Windows ends the process with
+    // STATUS_CONTROL_C_EXIT; a listener suppresses that, so this one logs and
+    // then exits with the same code. Only a daemon run in a console (a
+    // foreground `wmux daemon`) can receive it — the launcher's is detached.
+    process.on('SIGBREAK', () => {
+      onExitSignal('SIGBREAK');
+      process.exit(STATUS_CONTROL_C_EXIT);
+    });
+  }
 
   // Last-resort synchronous save on process exit — registered on ALL platforms.
   //
@@ -9585,6 +9668,7 @@ async function main(): Promise<void> {
     const code = (err as NodeJS.ErrnoException).code;
     if (code && FATAL_CODES.has(code)) {
       log('error', `Fatal error code ${code} — shutting down immediately`);
+      noteExitReason(`uncaught ${code}`);
       doShutdown('uncaughtException');
       return;
     }
@@ -9610,6 +9694,7 @@ async function main(): Promise<void> {
 
     if (timestamps.length >= UNCAUGHT_THRESHOLD) {
       log('error', `Same uncaught exception repeated ${timestamps.length} times in ${UNCAUGHT_WINDOW_MS / 1000}s — shutting down`);
+      noteExitReason(`uncaught exception repeated: ${errKey.slice(0, 80)}`);
       doShutdown('uncaughtException');
     }
   });
@@ -9643,10 +9728,12 @@ main().catch((err) => {
     // acquireLock() wrote for us; the launcher reconnects via the canonical
     // pipe name, not the pid file.
     log('warn', 'another live daemon owns the control pipe — exiting cleanly (EDAEMON_ALREADY_RUNNING)');
+    noteExitReason('another live daemon owns the control pipe');
     releaseLock();
     process.exit(DAEMON_EXIT_ALREADY_RUNNING);
   }
   log('error', 'Fatal error during startup:', err);
+  noteExitReason('startup failed');
   releaseLock();
   process.exit(1);
 });

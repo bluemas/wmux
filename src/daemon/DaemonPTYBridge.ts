@@ -20,9 +20,13 @@ import { isEscapeChunk } from '../shared/hooks/interruptKeystroke';
 import { stripPassiveInput } from '../shared/terminal/passiveInput';
 import { kittyChunkAsLegacy } from '../shared/kittyKeyEvents';
 import { titleShowsFinishedTurn, titleShowsRunningTurn } from './transcript/chatScreenGate';
-import { CLAUDE_IDLE_TITLE, CLAUDE_RUNNING_TITLE, CLAUDE_RUNNING_TITLE_OSC } from '../shared/agentTitleRules';
-import { agentRow } from '../shared/agentIdentity';
+import { AWAITING_TITLE, CLAUDE_IDLE_TITLE, CLAUDE_RUNNING_TITLE, CLAUDE_RUNNING_TITLE_OSC, RUNNING_TITLE } from '../shared/agentTitleRules';
+import { agentDisplayToSlug, agentRow, isAgentSlug } from '../shared/agentIdentity';
+import type { AgentSignal } from '../shared/hooks/signal-types';
+import { canSeedHookIdentity, DETECTOR_IDENTITY_HOOK_MAX_AGE_MS } from '../shared/hooks/detectorIdentity';
+import type { CanonicalAgentIdentity } from './canonicalAgent';
 import type { TurnFailure } from '../shared/phoneTurnFailure';
+import type { ApprovalScreenReader } from '../shared/approvalScreen';
 
 /**
  * #1965 — the answer the daemon gives the bundled OpenConsole's startup DA1.
@@ -105,6 +109,7 @@ export class DaemonPTYBridge extends EventEmitter {
   private outputInterpreter: OutputInterpreter | null = null;
   private modeTracker: OutputModes | null = null;
   private agentDetector: AgentDetector | null = null;
+  private approvalScreenReader: ApprovalScreenReader | null = null;
   private activityMonitor: ActivityMonitor | null = null;
   private dataDisposable: (() => void) | null = null;
   private exitDisposable: (() => void) | null = null;
@@ -281,6 +286,8 @@ export class DaemonPTYBridge extends EventEmitter {
    * agent outlives the agent; this is the process truth the title path reads.
    */
   private trackedAgent: { slug?: string; alive: boolean } | null = null;
+  /** This bridge's PTY lifetime; old async evidence cannot seed a replacement. */
+  private identityLifetimeAt = 0;
 
   /**
    * Which terminal status settled the pane, while one has. Read only to keep
@@ -375,6 +382,7 @@ export class DaemonPTYBridge extends EventEmitter {
 
   /** Called by DaemonSessionManager.resizeSession on every applied resize. */
   noteResize(): void {
+    this.agentDetector?.invalidateApprovalScreen();
     this.lastResizeAtMs = Date.now();
     // One event for BOTH resize paths (the phone's /api/sessions/:id/resize and
     // the desk's RPC) — they both land in resizeSession, and an SSE viewer whose
@@ -411,6 +419,7 @@ export class DaemonPTYBridge extends EventEmitter {
   noteInput(data: string, opts: boolean | { selfWrite: true } = false): void | number {
     if (typeof opts === 'object') {
       if (data.length > 0) {
+        this.agentDetector?.invalidateApprovalScreen();
         this.lastInputAt = Date.now();
         this.inputRevision += 1;
         this.keyInputRevision += 1;
@@ -436,6 +445,7 @@ export class DaemonPTYBridge extends EventEmitter {
       this.lastInputAt = Date.now();
       this.inputRevision += 1;
       const active = stripPassiveInput(data);
+      if (active.length > 0) this.agentDetector?.invalidateApprovalScreen();
       // Every path that types into a pane ends here (pipe, web raw input, chat
       // Stop, approval keys), so this is the one place a lone Esc is seen.
       // Inside a bracketed paste an ESC is text, not a key. On Windows the
@@ -473,6 +483,10 @@ export class DaemonPTYBridge extends EventEmitter {
     const keyProbe = wasAwaiting ? data.replace(DaemonPTYBridge.NON_KEY_INPUT, '') : data;
     const answerKey = wasAwaiting && !this.inputInBracketedPaste
       && (/^[1-9]$/.test(keyProbe) || isEscapeChunk(keyProbe));
+    // A single letter into a box the agent's title holds open (Codex's y / p /
+    // n): it went to the box, not the composer.
+    const titleDialogKey = wasAwaiting && this.titleRaisedAwaiting && !this.inputInBracketedPaste
+      && /^[a-z]$/i.test(keyProbe);
     const hasSubmitBoundary = this.scanSubmittedInput(data);
     const answered = forceSubmitted || hasSubmitBoundary || answerKey;
     // An unsubmitted draft in the composer: typed or pasted text with no Enter
@@ -485,7 +499,7 @@ export class DaemonPTYBridge extends EventEmitter {
       if (this.sessionId) this.emit('inputSubmitted', { sessionId: this.sessionId });
     } else if (clearsComposer) {
       this.draftPending = false;
-    } else if (!answerKey && DaemonPTYBridge.typesDraftText(data)) {
+    } else if (!answerKey && !titleDialogKey && DaemonPTYBridge.typesDraftText(data)) {
       // Not for a lone digit that answered a dialog: it went to the dialog,
       // not the composer. Counting it left a phantom draft that no Enter ever
       // followed, so every later hand-off into the idle pane was refused as
@@ -510,7 +524,8 @@ export class DaemonPTYBridge extends EventEmitter {
 
   /**
    * The dialog this pane was blocked on is gone, although no answer key was
-   * seen (the screen verifier read the pane and found no dialog on it twice).
+   * seen (the screen verifier read the pane and found no dialog on it twice,
+   * or the agent's title stopped showing it: noteTitleAwaitingHuman).
    * Runs exactly the path a recognised answer key runs. Returns false, and
    * does nothing, when the pane was not awaiting.
    */
@@ -583,7 +598,9 @@ export class DaemonPTYBridge extends EventEmitter {
     }
     // A submit, or a human answering the agent's dialog: a turn either way.
     this.byteOpenedTurn = false;
-    this.spinnerOpenedTurn = false;
+    // An answer resumes the episode it interrupted, so who opened it stands:
+    // a turn the spinner opened is still ended by its frame dropping.
+    if (!wasAwaiting) this.spinnerOpenedTurn = false;
     this.lastTurnStartedAt = Date.now();
     this.preTurn = false;
     this.codexBootWindow = false;
@@ -626,6 +643,7 @@ export class DaemonPTYBridge extends EventEmitter {
   }
 
   /** Every mouse report: SGR (press, release, wheel, motion) and X10. */
+  // eslint-disable-next-line no-control-regex -- terminal mouse reports contain ESC bytes
   private static readonly ANY_MOUSE = /\x1b\[<\d+;\d+;\d+[Mm]|\x1b\[M[\s\S]{3}/g;
   static readonly TYPED_INPUT_THROTTLE_MS = 30_000;
   private typedInputAt = -Infinity;
@@ -696,6 +714,13 @@ export class DaemonPTYBridge extends EventEmitter {
     // the turn was blocked on. The detector's own `waiting` / `complete` cannot:
     // the idle footer under an approval box matches those patterns too.
     if (status === 'awaiting_input') {
+      // Who answers for the dialog is settled when it opens; a later match of
+      // the same box (the detector's line, the hook) only adds the hook's claim.
+      if (!this.awaitingHuman) {
+        this.titleRaisedAwaiting = false;
+        this.awaitingFromHook = false;
+      }
+      if (authoritative) this.awaitingFromHook = true;
       this.awaitingHuman = true;
       this.awaitingQuestionAt = questionAt ?? null;
       // The agent's own dialog hook means its turn is running: an episode a
@@ -953,6 +978,61 @@ export class DaemonPTYBridge extends EventEmitter {
   /** The activity monitor's own idle delay. */
   private static readonly TITLE_CYCLE_IDLE_MS = 5_000;
 
+  /**
+   * Codex keeps `[ ! ] Action Required | …` in its window title while an
+   * approval box waits. The question on screen can wrap on a narrow pane or
+   * arrive in cursor-addressed pieces the detector's line patterns never see,
+   * so a pane without the PermissionRequest hook read running through the
+   * whole approval. The title raises the same `awaiting_input` the detector
+   * would, once per dialog (the title blinks). The agent is the one the
+   * process tracker watches alive in the pane, as for the running title.
+   *
+   * The title also says when the box is gone, which a keystroke cannot: Codex
+   * takes `y` / `p` as answers (not read as one by noteInput), and the box
+   * can be answered from elsewhere or withdrawn. A dialog the title raised
+   * ends when the title stops showing it, through the release a screen read
+   * runs (clearAwaiting).
+   */
+  private noteTitleAwaitingHuman(sessionId: string): void {
+    const slug = this.trackedAgent?.alive ? this.trackedAgent.slug : undefined;
+    const rule = slug ? AWAITING_TITLE.get(slug) : undefined;
+    if (!slug || !rule || this.muted) return;
+    if (rule.test(this.lastTitle)) {
+      if (this.awaitingHuman) {
+        // The detector's own line match for the same box: the title now
+        // answers for it too. A hook's dialog stays the hook's.
+        if (!this.awaitingFromHook) this.titleRaisedAwaiting = true;
+        return;
+      }
+      this.noteAgentStatus('awaiting_input');
+      this.titleRaisedAwaiting = true;
+      this.emit('agent', {
+        sessionId,
+        event: { agent: agentRow(slug)?.display ?? slug, status: 'awaiting_input', message: 'Approval requested' },
+      });
+      return;
+    }
+    if (!this.titleRaisedAwaiting || this.awaitingFromHook || !this.awaitingHuman || !this.lastTitle) return;
+    this.titleRaisedAwaiting = false;
+    // The box is gone from the pane's own display: the release a screen read
+    // that finds no dialog runs (answered event, approval card, turn resumed).
+    this.clearAwaiting('screen-cleared');
+    // Answered and still working: the running-title path carries the turn on.
+    if (RUNNING_TITLE.get(slug)?.test(this.lastTitle)) return;
+    // No spinner: the turn ended with the box (withdrawn, or denied). The
+    // resumed cycle would wait for output that may never come, so the pane
+    // settles at its prompt now, as the detector's idle prompt settles it.
+    this.noteAgentStatus('waiting');
+    this.emit('agent', {
+      sessionId,
+      event: { agent: agentRow(slug)?.display ?? slug, status: 'waiting', message: 'Waiting for input' },
+    });
+  }
+  /** The open dialog is one the title shows (noteTitleAwaitingHuman), not a hook's. */
+  private titleRaisedAwaiting = false;
+  /** The open dialog was raised by the agent's own hook. */
+  private awaitingFromHook = false;
+
   /** How often a still-spinning Codex title re-reports running (well inside
    *  the renderer's 120 s activity window). */
   private static readonly CODEX_SPINNER_REFRESH_MS = 30_000;
@@ -1027,7 +1107,7 @@ export class DaemonPTYBridge extends EventEmitter {
 
   /** The current activity cycle was armed by noteSpinnerTitle and has not fired yet. */
   private spinnerArmedCycle = false;
-  /** The open episode was opened by noteSpinnerTitle, and no hook or submit has spoken since. */
+  /** The open episode was opened by a running title (noteSpinnerTitle, noteCodexTitleSpinner), and no hook or submit has spoken since (answering its dialog keeps it). */
   private spinnerOpenedTurn = false;
   /** The settled status noteSpinnerTitle cleared, for endSpinnerTurn to put back. */
   private spinnerSettledStatus: AgentEventStatus | null = null;
@@ -1090,6 +1170,23 @@ export class DaemonPTYBridge extends EventEmitter {
   noteAgentEnded(): void {
     this.closeTurn();
     this.hookSeen = false;
+    this.agentDetector?.clearTrustedIdentity();
+  }
+
+  /** The host supplies a parsed live viewport with output/geometry fences. */
+  setApprovalScreenReader(reader: ApprovalScreenReader): void {
+    this.approvalScreenReader = reader;
+  }
+
+  private recheckQuietApproval(detector: AgentDetector): void {
+    const reader = this.approvalScreenReader;
+    const sessionId = this.sessionId;
+    if (!reader || !sessionId || this.muted) return;
+    void detector.revalidateApprovalScreen(async () => {
+      if (this.agentDetector !== detector || this.sessionId !== sessionId || this.muted) return null;
+      const snapshot = await reader(sessionId);
+      return this.agentDetector === detector && this.sessionId === sessionId && !this.muted ? snapshot : null;
+    }).catch(() => undefined); // an unavailable screen cannot change pane state
   }
 
   /**
@@ -1097,15 +1194,59 @@ export class DaemonPTYBridge extends EventEmitter {
    * die. Only the watched pid's death is reported, so a relaunch the tracker
    * already picked is never ended by its predecessor's late death edge.
    */
-  noteAgentProcess(state: { slug?: string; alive: boolean }): void {
+  noteAgentProcess(state: { slug?: string; alive: boolean; observedAt?: number; replacedLive?: true; identityEpoch?: number | null }): void {
+    const detector = this.agentDetector;
+    const now = Date.now();
+    const boundaryAt = Math.max(this.identityLifetimeAt, detector?.getIdentityBoundaryAt() ?? 0);
+    const epochProven = state.identityEpoch !== undefined && state.identityEpoch !== null
+      && state.identityEpoch === detector?.getIdentityEpoch();
+    // Missing time cannot seed identity. An explicit WSL replacement can
+    // still retire the old episode without granting the new process a seed.
+    // A probe begun before a shell return belongs to that older launch even
+    // when the process table arrives after the next one started.
+    if (state.alive && state.identityEpoch !== undefined && !epochProven) return;
+    if (state.alive && state.observedAt !== undefined && (!Number.isFinite(state.observedAt)
+      || (epochProven ? state.observedAt < boundaryAt : state.observedAt <= boundaryAt) || state.observedAt > now
+      || now - state.observedAt > DETECTOR_IDENTITY_HOOK_MAX_AGE_MS)) return;
+    const screenName = this.getLastAgent();
+    const previous = detector?.getTrustedAgent() ?? this.trackedAgent?.slug
+      ?? (screenName ? agentDisplayToSlug(screenName) : undefined);
+    if (!state.alive || ((state.observedAt !== undefined || state.replacedLive) && state.slug && previous && previous !== state.slug)) this.noteAgentEnded();
     this.trackedAgent = { ...(state.slug ? { slug: state.slug } : {}), alive: state.alive };
     this.reportMidTurn();
+    if (detector && state.alive && state.observedAt !== undefined && isAgentSlug(state.slug)) {
+      if (detector.seedTrustedIdentity(state.slug, detector.getIdentityEpoch())) this.recheckQuietApproval(detector);
+    }
     // A cycle the title armed waits for output to start its idle countdown;
     // an agent that died (or was replaced by another) right after the frame
     // writes none, and the cycle would read running forever. It goes with
     // the agent that armed it.
     if (state.alive && agentRow(state.slug)?.titleRunning) return;
     this.releaseTitleCycle();
+  }
+
+  /** Capture before an async probe, not when its result is delivered. */
+  captureIdentityProbe(): { epoch: number; isCurrent: () => boolean } | undefined {
+    const detector = this.agentDetector;
+    if (!detector) return undefined;
+    const epoch = detector.getIdentityEpoch();
+    return { epoch, isCurrent: () => this.agentDetector === detector && detector.getIdentityEpoch() === epoch };
+  }
+
+  /** Fresh hook identity may enable screen fallback patterns, never a turn. */
+  noteHookAgentIdentity(signal: AgentSignal, canonical: CanonicalAgentIdentity | undefined): boolean {
+    const detector = this.agentDetector;
+    if (!detector || !this.sessionId || canonical?.source !== 'hook' || canonical.slug !== signal.agent) return false;
+    if (!canSeedHookIdentity(signal, {
+      ptyId: this.sessionId, now: Date.now(),
+      boundaryAt: Math.max(this.identityLifetimeAt, detector.getIdentityBoundaryAt()),
+    })) return false;
+    // The caller computed the canonical identity with process contradiction
+    // checks; retain that check here for callers that race a process edge.
+    if (this.trackedAgent?.alive && this.trackedAgent.slug && this.trackedAgent.slug !== signal.agent) return false;
+    const seeded = detector.seedTrustedIdentity(signal.agent, detector.getIdentityEpoch());
+    if (seeded) this.recheckQuietApproval(detector);
+    return seeded;
   }
 
   /** Ends the cycle noteCodexTitleSpinner armed if it is still that cycle and
@@ -1387,6 +1528,7 @@ export class DaemonPTYBridge extends EventEmitter {
 
     const agentDetector = new AgentDetector();
     this.agentDetector = agentDetector;
+    this.identityLifetimeAt = Date.now();
 
     this.sessionId = sessionId;
     this.explicitTerminalStatus = false;
@@ -1568,6 +1710,7 @@ export class DaemonPTYBridge extends EventEmitter {
         if (titleTurnEdge.observe(title)) this.noteTitleTurnEnd(sessionId);
         if (CLAUDE_RUNNING_TITLE.test(title)) this.noteSpinnerTitle();
         else if (this.spinnerOpenedTurn && this.turnOpen && !this.awaitingHuman && CLAUDE_IDLE_TITLE.test(title)) this.endSpinnerTurn();
+        this.noteTitleAwaitingHuman(sessionId);
         this.noteCodexTitleSpinner(sessionId);
         return;
       }
@@ -1620,8 +1763,11 @@ export class DaemonPTYBridge extends EventEmitter {
     // same-chunk/full-screen redraw cannot race a terminal state back to running.
     this.agentUnsubscribe = agentDetector.onEvent((agentEvent) => {
       const wasSettled = this.explicitTerminalStatus;
+      // The question line of a box the agent's title already raised: the
+      // same dialog, told once (noteTitleAwaitingHuman).
+      const sameDialog = agentEvent.status === 'awaiting_input' && this.awaitingHuman && this.titleRaisedAwaiting;
       this.noteAgentStatus(agentEvent.status);
-      this.emit('agent', { sessionId, event: agentEvent });
+      if (!sameDialog) this.emit('agent', { sessionId, event: agentEvent });
       // #1463 — the agent's idle prompt, before any turn. The status above
       // ends the byte cycle, so no silence idle follows it, and main withholds
       // a detector `waiting` on a hook-reporting pane: without this the boot
@@ -1987,6 +2133,7 @@ export class DaemonPTYBridge extends EventEmitter {
     this.outputInterpreter?.dispose();
     this.outputInterpreter = null;
     this.modeTracker = null;
+    this.agentDetector?.clearTrustedIdentity();
     this.agentDetector = null;
     this.activityMonitor = null;
     this.sessionId = null;

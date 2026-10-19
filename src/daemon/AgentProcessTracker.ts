@@ -533,6 +533,14 @@ export interface WslTrackingOptions {
 export interface TrackedAgentState {
   slug?: AgentSlug;
   alive: boolean;
+  /** Actual process snapshot start (or WSL hook payload time), only on fresh launch edges.
+   * Cached identityFor reads deliberately omit it. */
+  observedAt?: number;
+  /** A same-boot WSL launch edge replaced a different live process. Teardown evidence
+   * only; unlike observedAt, this cannot seed detector identity. */
+  replacedLive?: true;
+  /** Captured detector epoch on a fresh probe; null means its owner changed. */
+  identityEpoch?: number | null;
 }
 
 export class AgentProcessTracker {
@@ -561,6 +569,8 @@ export class AgentProcessTracker {
   /** Shared snapshot promise — concurrent probes across sessions ride one
    *  enumeration instead of spawning one each. */
   private snapshotInFlight: Promise<ProcessTreeEntry[]> | null = null;
+  private snapshotStartedAt = 0;
+  private identityProbeGuard?: (sessionId: string) => { epoch: number; isCurrent: () => boolean } | undefined;
   private stateListener: ((sessionId: string, state: TrackedAgentState) => void) | undefined;
 
   constructor(
@@ -588,9 +598,11 @@ export class AgentProcessTracker {
   /** Which launch precondition failed, so a phone can be told what to do.
    *  `env` is the pane's spawn env, used only to locate a helper's install.
    *  `anyShell` also accepts PowerShell, pwsh and cmd: for a caller that only
-   *  needs the shell idle and never types a command into it. */
-  async idleShellState(pid: number, env: NodeJS.ProcessEnv = {}, anyShell = false): Promise<{ ok: true } | { ok: false; reason: 'missing' | 'unsupported-shell' | 'shell-has-children' }> {
-    const entries = await this.snapshot();
+   *  needs the shell idle and never types a command into it. `fresh` starts
+   *  its own enumeration: a confirming read must not join a snapshot that
+   *  began before its caller captured the pane's input/output witness. */
+  async idleShellState(pid: number, env: NodeJS.ProcessEnv = {}, anyShell = false, options: { fresh?: boolean } = {}): Promise<{ ok: true } | { ok: false; reason: 'missing' | 'unsupported-shell' | 'shell-has-children' }> {
+    const entries = await (options.fresh ? this.enumerate() : this.snapshot());
     const root = entries.find(entry => entry.pid === pid);
     if (!root) return { ok: false, reason: 'missing' };
     const shell = anyShell ? /^(?:-?)(?:zsh|bash|sh|powershell|pwsh|cmd)(?:\.exe)?$/i : /^(?:-?)(?:zsh|bash|sh)$/i;
@@ -616,6 +628,11 @@ export class AgentProcessTracker {
    *  authority (see daemon/index.ts). */
   setStateChangeListener(cb: (sessionId: string, state: TrackedAgentState) => void): void {
     this.stateListener = cb;
+  }
+
+  /** Captures only detector-seeding authority; process liveness keeps its own generation guard. */
+  setIdentityProbeGuard(capture: (sessionId: string) => { epoch: number; isCurrent: () => boolean } | undefined): void {
+    this.identityProbeGuard = capture;
   }
 
   private emitState(sessionId: string, state: TrackedAgentState): void {
@@ -708,9 +725,15 @@ export class AgentProcessTracker {
     this.inFlight.add(sessionId);
     if (requireSlug) this.slugOnlyInFlight.add(sessionId);
     const gen = this.generation.get(sessionId) ?? 0;
+    const identity = this.identityProbeGuard?.(sessionId);
     void (async () => {
       try {
-        const entries = await this.snapshot();
+        const ownsSnapshot = this.snapshotInFlight === null;
+        const snapshot = this.snapshot();
+        // A concurrent probe can share an older enumeration. Preserve its
+        // original time rather than laundering it through this delivery.
+        const observedAt = this.snapshotStartedAt;
+        const entries = await snapshot;
         if ((this.generation.get(sessionId) ?? 0) !== gen) return; // disarmed meanwhile
         const pick = selectAgentProcess(entries, shellPid);
         if (requireSlug) {
@@ -758,7 +781,9 @@ export class AgentProcessTracker {
             });
           }
         });
-        this.emitState(sessionId, { ...(pick.slug ? { slug: pick.slug } : {}), alive: true });
+        this.emitState(sessionId, { ...(pick.slug ? { slug: pick.slug } : {}), alive: true, observedAt,
+          ...(identity ? { identityEpoch: identity.isCurrent() ? (ownsSnapshot ? identity.epoch : undefined) : null } : {}),
+        });
       } catch {
         // Enumeration failed (timeout, spawn error) — undecided, never a lie.
         if (requireSlug) this.slugProbeBlockedUntil.set(sessionId, Date.now() + ARM_BACKOFF_MS);
@@ -789,7 +814,7 @@ export class AgentProcessTracker {
    * process is tracked alive, so a hook storm costs nothing; a different
    * process (a relaunch) replaces it.
    */
-  armWsl(sessionId: string, location: WslAgentLocation, agent: WslReportedAgent): void {
+  armWsl(sessionId: string, location: WslAgentLocation, agent: WslReportedAgent, observedAt?: number): void {
     if (!this.wsl.watcher) return;
     const cur = this.states.get(sessionId);
     if (cur?.alive && cur.wsl && cur.wsl.bootId === agent.bootId) {
@@ -801,6 +826,11 @@ export class AgentProcessTracker {
       if (agent.ancestors.includes(cur.pid)) return;
       if (BigInt(agent.start) < BigInt(cur.wsl.start)) return;
     }
+    // Start times order launches only within one boot. A queued old-boot
+    // report cannot establish that it replaced the current live owner.
+    const replacedLive = cur?.alive === true && cur.wsl?.bootId === agent.bootId
+      && (cur.pid !== agent.pid || cur.wsl.start !== agent.start);
+    const identity = observedAt !== undefined ? this.identityProbeGuard?.(sessionId) : undefined;
     const key = AgentProcessTracker.watchKey(sessionId);
     const watched: WslWatchedAgent = { ...location, pid: agent.pid, start: agent.start, bootId: agent.bootId };
     const state: TrackedAgent = { pid: agent.pid, alive: true, slug: agent.slug, wsl: watched };
@@ -811,7 +841,10 @@ export class AgentProcessTracker {
       state.alive = false;
       this.emitState(sessionId, { slug: agent.slug, alive: false });
     });
-    this.emitState(sessionId, { slug: agent.slug, alive: true });
+    this.emitState(sessionId, { slug: agent.slug, alive: true, ...(observedAt !== undefined ? { observedAt } : {}),
+      ...(replacedLive ? { replacedLive: true } : {}),
+      ...(identity ? { identityEpoch: identity.isCurrent() ? identity.epoch : null } : {}),
+    });
   }
 
   /** true = agent process observed alive; false = it was observed and DIED
@@ -969,6 +1002,7 @@ export class AgentProcessTracker {
 
   private snapshot(): Promise<ProcessTreeEntry[]> {
     if (!this.snapshotInFlight) {
+      this.snapshotStartedAt = Date.now();
       this.snapshotInFlight = this.enumerate().finally(() => {
         this.snapshotInFlight = null;
       });

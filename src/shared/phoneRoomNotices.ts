@@ -53,6 +53,8 @@ export const PHONE_ROOM_NOTICE_CODES: Readonly<Record<string, PhoneNoticeCode>> 
   'worker.paused': taskNamed('worker.paused'),
   'worker.pausedResumable': taskNamed('worker.pausedResumable', { kind: 'string' }, [`${k('worker.pausedResumable')}.body.research`]),
   'worker.idlePausedResumable': taskNamed('worker.idlePausedResumable', { kind: 'string' }, [`${k('worker.idlePausedResumable')}.body.research`]),
+  'worker.openIdlePaused': taskNamed('worker.openIdlePaused'),
+  'worker.openIdlePausedResumable': taskNamed('worker.openIdlePausedResumable', { kind: 'string' }, [`${k('worker.openIdlePausedResumable')}.body.research`]),
   'worker.done': taskNamed('worker.done', { status: 'string' }, STATUS),
   'worker.doneResumable': taskNamed('worker.doneResumable', { status: 'string', kind: 'string' }, [`${k('worker.doneResumable')}.body.research`, ...STATUS]),
   'worker.resumed': taskNamed('worker.resumed', { by: 'string', where: 'string' }, ['room.notice.by.owner', 'room.notice.by.bot', 'room.notice.where.folder', 'room.notice.where.newPane']),
@@ -95,6 +97,12 @@ export const PHONE_ROOM_NOTICE_CODES: Readonly<Record<string, PhoneNoticeCode>> 
     args: { bot: 'string', limit: 'string', until: 'number' },
     titles: BUDGET_LIMITS,
     more: ['room.notice.budget.exhausted.at', 'room.notice.budget.exhausted.manual', 'room.notice.budget.exhausted.workers'],
+  },
+  // A fan-out waiting for a worker slot, the bot's own or the factory's (roomWriter.ts).
+  'workers.full': {
+    args: { bot: 'string', scope: 'string', inUse: 'number', cap: 'number' },
+    titles: ['room.notice.workers.full.bot', 'room.notice.workers.full.factory'],
+    more: ['room.notice.workers.full.body'],
   },
   'budget.held': titled('budget.held', { bot: 'string', until: 'number' }, ['room.notice.budget.held.at', 'room.notice.budget.held.manual']),
   'bot.usageLimit': titled('bot.usageLimit', { bot: 'string', until: 'number' }),

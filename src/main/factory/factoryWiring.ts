@@ -65,6 +65,7 @@ import { onBotHook, type BotHookEvent } from './botHooks';
 import { normalizeRepoKey } from './repoWatch';
 import { setFactoryTriggerPorts, type BotDirectoryApi, type FactLogApi, type FactoryTrustApi } from './triggerEngine';
 import { ROOM_ATTACHMENTS_DIRNAME, RoomAttachmentStore, cardImages, getRoomAttachmentStore, setRoomAttachmentStore } from './roomAttachments';
+import { ROOM_FILES_DIRNAME, RoomFileStore, setRoomFileStore } from './roomFiles';
 import { capBody, getRoomWriter, oneLine, setFactoryRoomPorts, type FactoryRoomPorts, type RoomBotHookEvent, type RoomWriter, type RunningWake } from './roomWriter';
 import { getBotRuntime, setBotRuntimePorts } from './BotRuntime';
 import { getHandoffRouter, summarizeHandoff } from './handoffRouter';
@@ -256,6 +257,9 @@ export function factFromBotHook(ev: BotHookEvent): FactDraft | null {
   if (ev.type === 'bot.budget_exhausted') {
     return { kind: 'bot.budget_exhausted', ...base, payload: { reason: ev.reason, ...(ev.wakeId ? { wakeId: ev.wakeId } : {}), ...(ev.until !== undefined ? { until: ev.until } : {}), ...(ev.parkedAt !== undefined ? { parkedAt: ev.parkedAt } : {}) } };
   }
+  if (ev.type === 'bot.workers_full') {
+    return { kind: 'bot.workers_full', ...base, payload: { scope: ev.scope, running: ev.running, limit: ev.limit, held: ev.held } };
+  }
   if (ev.type === 'bot.error') {
     return { kind: 'bot.error', ...base, payload: { message: ev.message.slice(0, 500), ...(ev.wakeId ? { wakeId: ev.wakeId } : {}), ...(ev.until !== undefined ? { until: ev.until } : {}) } };
   }
@@ -357,7 +361,8 @@ export function runningWakeOf(botId: string): RunningWake | null {
   return {
     wakeId: item.id,
     attempt: Math.max(1, item.attempts),
-    ...(r.kind === 'handoff' || r.kind === 'mention' ? { handoffId: r.handoffId } : taskHandoff ? { handoffId: taskHandoff } : {}),
+    // A held fan-out's wake leads back to the handoff its asking wake delivered.
+    ...(r.kind === 'handoff' || r.kind === 'mention' || (r.kind === 'held_fanout' && r.handoffId) ? { handoffId: r.handoffId } : taskHandoff ? { handoffId: taskHandoff } : {}),
     ...(r.kind === 'human' && r.runId ? { runId: r.runId } : {}),
     reasonKind: r.kind,
     ...(taskIds.size === 1 ? { taskId: [...taskIds][0] } : {}),
@@ -805,6 +810,14 @@ export function createFactoryWiring(deps: Pick<FactoryHostDeps, 'wmuxDir'> & Par
   });
   photos.sweep();
   setRoomAttachmentStore(photos);
+  // The files bots attach to their cards: swept by age once the rooms start,
+  // since the sweep keeps every file a kept card lists (roomFiles.ts).
+  const roomFiles = new RoomFileStore({
+    root: path.join(deps.wmuxDir(), 'factory', ROOM_FILES_DIRNAME),
+    // An old file stays while a kept card (an open one) still lists it.
+    referenced: (workspaceId) => getRoomWriter()?.fileIds(workspaceId) ?? null,
+  });
+  setRoomFileStore(roomFiles);
   setFactoryPhoneMessageHandler((payload) => factoryPhoneMessageSaved(payload, { settings, writer: getRoomWriter, ports: roomPorts }));
 
   const morning = new MorningSchedule({
@@ -994,6 +1007,7 @@ export function createFactoryWiring(deps: Pick<FactoryHostDeps, 'wmuxDir'> & Par
       hooks.dispose();
       setFactoryPhoneMessageHandler(null);
       setRoomAttachmentStore(null);
+      setRoomFileStore(null);
       cursor.flush();
     },
   };
