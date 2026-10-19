@@ -160,21 +160,18 @@ function preprocessGithubHtml(source: string): string {
   let fence = 0;
   const flush = () => {
     if (chunk.length === 0) return;
-    // Code spans are set aside first, as reduceInlineHtml keeps them: a
-    // `<script>` or comment opener written as code would otherwise swallow
-    // the rest of the document. Skipped if the text holds the sentinels.
-    const joined = chunk.join('\n');
-    const spans: string[] = [];
-    const guarded = /[\uE000\uE001]/.test(joined)
-      ? joined
-      : joined.replace(/`[^`\n]+`/g, (span) => `\uE000${spans.push(span) - 1}\uE001`);
-    const text = guarded
-      // \x21 is '!': this file is inlined into the web client's page, whose
-      // build refuses a bundle containing a literal comment opener.
-      .replace(/<\x21--[\s\S]*?(?:-->|$)/g, '')
-      .replace(/<(script|style)\b[^>]*>[\s\S]*?(?:<\/\1\s*>|$)/gi, '')
-      .replace(/<br\s*\/?>/gi, '\n')
-      .replace(/\uE000(\d+)\uE001/g, (_m, n: string) => spans[Number(n)]);
+    const text = chunk.join('\n')
+      // One left-to-right pass, so whichever starts first wins: a code span
+      // keeps a `<script>` or comment opener written as code (which would
+      // otherwise swallow the rest of the document), and a real comment or
+      // script keeps the backticks inside it. \x21 is '!': this file is
+      // inlined into the web client's page, whose build refuses a bundle
+      // containing a literal comment opener.
+      .replace(
+        /(`[^`\n]+`)|<\x21--[\s\S]*?(?:-->|$)|<(script|style)\b[^>]*>[\s\S]*?(?:<\/\2\s*>|$)/gi,
+        (_m, code: string | undefined) => code ?? '',
+      )
+      .replace(/<br\s*\/?>/gi, '\n');
     // A loop, not push(...spread): a long run of short lines would pass
     // one argument per line and overflow the call stack.
     for (const l of text.split('\n')) out.push(l);
@@ -297,7 +294,9 @@ function renderInline(raw: string, keyPrefix: string, opts: MarkdownOptions = {}
 }
 
 /** A GFM table delimiter row: `| --- | :--: |`, at least one pipe. */
-const TABLE_SEPARATOR = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
+// No two whitespace runs touch, so a long line that is not a separator fails
+// in linear time (an editor file can be a megabyte).
+const TABLE_SEPARATOR = /^\s*(?:\|\s*)?:?-+:?\s*(?:\|\s*:?-+:?\s*)*(?:\|\s*)?$/;
 
 /** A table row's cells: outer pipes dropped, split on pipes not escaped as `\|`. */
 function tableCells(line: string): string[] {

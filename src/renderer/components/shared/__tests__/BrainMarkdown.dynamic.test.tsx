@@ -130,6 +130,20 @@ describe('renderBrainMarkdown', () => {
     expect(heads).toEqual(['After comment', 'After script']);
   });
 
+  it('GitHub HTML: a backtick inside a real comment does not keep the comment open; private-use characters stay as written', () => {
+    gh('<\x21-- `hidden -->` stray\n\n# Visible\n\nkeep 0 and `code`');
+    expect(container.textContent).not.toContain('hidden');
+    expect([...container.querySelectorAll('[data-brain-md-heading]')].map((h) => h.textContent)).toEqual(['Visible']);
+    expect(container.textContent).toContain('keep 0 and code');
+    expect(container.textContent).not.toContain('undefined');
+  });
+
+  it('a long line that is not a table separator is rejected in linear time', () => {
+    const start = performance.now();
+    renderBrainMarkdown(`a|b\n${' '.repeat(256_000)}x|`);
+    expect(performance.now() - start).toBeLessThan(1_500);
+  });
+
   it('unclosed link and anchor openers render in linear time', () => {
     // Each opener once rescanned to the end of the line: ~100 KB of `[`
     // took seconds. A generous bound still separates linear from quadratic.
