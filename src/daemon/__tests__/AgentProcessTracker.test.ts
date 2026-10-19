@@ -496,7 +496,7 @@ describe('AgentProcessTracker', () => {
     const states: Array<{ slug?: string; alive: boolean }> = [];
     tracker.setStateChangeListener((id, state) => {
       states.push(state);
-      if (!state.alive) tracker.arm(id, SHELL);
+      if (!state.alive) tracker.armIfAgent(id, SHELL);
     });
 
     tracker.arm('s1', SHELL);
@@ -517,6 +517,22 @@ describe('AgentProcessTracker', () => {
     oldDeath?.();
     expect(tracker.identityFor('s1')).toEqual({ slug: 'codex', alive: true });
     expect(states).toHaveLength(3);
+  });
+
+  it('a death edge that re-arms never takes a background job left behind for the agent', async () => {
+    const watcher = makeWatcher();
+    let table = [entry(200, SHELL, 'codex')];
+    const tracker = new AgentProcessTracker(watcher, async () => table);
+    tracker.setStateChangeListener((id, state) => {
+      if (!state.alive) tracker.armIfAgent(id, SHELL);
+    });
+
+    tracker.arm('s1', SHELL);
+    await flush();
+    table = [entry(400, SHELL, 'tail', 'tail -f build.log')];
+    watcher.watches.get('agent:s1')?.onDead();
+    await flush();
+    expect(tracker.identityFor('s1')).toEqual({ slug: 'codex', alive: false });
   });
 
   it('disarm clears state, and a disarm racing an in-flight arm wins', async () => {

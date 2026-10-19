@@ -812,11 +812,13 @@ export class DaemonPTYBridge extends EventEmitter {
    *
    * The spinner goes through the same turn bookkeeping as output does, so
    * the event, getAgentStatus() and isTurnOpen() agree. A frame arms the
-   * activity cycle, and the next frame reports `active` through onActive. On
-   * a pane a detector settled (its footer can match mid-turn), the frame also
-   * reopens the turn, as noteSpinnerTitle does for Claude Code, and the
-   * frame dropping from the title ends that turn again (endSpinnerTurn): the
-   * detector's dedup may keep the same footer from settling it a second time.
+   * activity cycle, and the next frame reports `active` through onActive.
+   * When no turn is open (a detector settled it, as Codex's footer can
+   * mid-turn), the frame also opens one, as noteSpinnerTitle does for Claude
+   * Code, and the frame dropping from the title ends that turn again
+   * (endSpinnerTurn): the detector's dedup may keep the same footer from
+   * settling it a second time. The trailing frames of a turn the transcript
+   * recorded as ended open nothing.
    * While the turn runs and the cycle stays active, a frame every
    * CODEX_SPINNER_REFRESH_MS reports `active` again, which keeps the
    * renderer's stamp fresh.
@@ -845,15 +847,23 @@ export class DaemonPTYBridge extends EventEmitter {
       || now - this.lastResizeAtMs < RESIZE_REDRAW_GUARD_MS
     ) return;
     const promoted = this.explicitTerminalStatus;
+    if (promoted && !this.isInputQuiet()) return;
+    // The last frames of a turn the transcript just recorded as ended belong to it.
+    if (!this.turnOpen && now - this.transcriptTurnEndAt < DaemonPTYBridge.SETTLE_COOLDOWN_MS) return;
+    const settled = this.settledStatus;
     if (promoted) {
-      if (!this.isInputQuiet()) return;
-      this.spinnerSettledStatus = this.settledStatus;
       this.explicitTerminalStatus = false;
       this.settledStatus = null;
       this.submittedTurnPending = false;
-      const wasOpen = this.turnOpen;
+    }
+    // No turn is open (a detector settled it, or a late launch edge of another
+    // agent ended it) while the title spins: the title opens one, and its
+    // frame dropping ends it again (endSpinnerTurn), whichever path the next
+    // `active` takes.
+    if (!this.turnOpen) {
+      this.spinnerSettledStatus = promoted ? settled : null;
       this.openTurn(true);
-      if (!wasOpen) this.spinnerOpenedTurn = true;
+      this.spinnerOpenedTurn = true;
     }
     if (!monitor.isActive(sessionId)) {
       // A promotion keeps the detector's dedup, as the settled branch of
@@ -861,13 +871,6 @@ export class DaemonPTYBridge extends EventEmitter {
       if (promoted) this.spinnerArmedCycle = true;
       monitor.beginTurnIfInactive(sessionId);
       return;
-    }
-    // Something ended the episode while the title kept spinning (a late
-    // launch edge of another agent): the turn still runs, so it opens again.
-    if (!this.turnOpen) {
-      this.spinnerSettledStatus = null;
-      this.openTurn(true);
-      this.spinnerOpenedTurn = true;
     }
     if (now - this.lastActiveAt < DaemonPTYBridge.CODEX_SPINNER_REFRESH_MS) return;
     this.lastActiveAt = now;
@@ -994,8 +997,13 @@ export class DaemonPTYBridge extends EventEmitter {
    * when the end predates the latest turn evidence.
    */
   noteTranscriptTurnEnd(at: number): void {
-    if ((this.turnOpen || this.turnSoftClosed) && !this.awaitingHuman && at >= this.turnOpenedAt) this.closeTurn();
+    if ((this.turnOpen || this.turnSoftClosed) && !this.awaitingHuman && at >= this.turnOpenedAt) {
+      this.closeTurn();
+      this.transcriptTurnEndAt = Date.now();
+    }
   }
+  /** When noteTranscriptTurnEnd last closed an episode (0 = never). */
+  private transcriptTurnEndAt = 0;
 
   /**
    * The agent that owned this pane is gone (its process exited, another agent
@@ -1854,6 +1862,7 @@ export class DaemonPTYBridge extends EventEmitter {
     this.codexBannerTail = '';
     this.trackedAgent = null;
     this.lastActiveAt = 0;
+    this.transcriptTurnEndAt = 0;
     this.turnOpen = false;
     this.turnSoftClosed = false;
     this.bootEpisode = false;

@@ -107,6 +107,33 @@ describe('DaemonPTYBridge — a Codex title spinner reports running', () => {
     expect(idle).toHaveLength(1);
   });
 
+  it('a turn the title opened ends when the frame drops, and sparse output after it is not running', () => {
+    bridge.noteTranscriptTurnEnd(Date.now()); // the boot episode ends
+    vi.advanceTimersByTime(7_000);
+    spin(3, 100);
+    expect(active).toHaveLength(1);
+    expect(bridge.isTurnOpen()).toBe(true);
+
+    feed(title('AAA quality pass | Heartbound'));
+    expect(bridge.isTurnOpen()).toBe(false);
+    expect(idle).toHaveLength(1);
+    for (let i = 0; i < 90; i++) {
+      feed('.');
+      vi.advanceTimersByTime(2_000);
+    }
+    expect(bridge.getAgentStatus()).not.toBe('running');
+    expect(active).toHaveLength(1);
+  });
+
+  it('the trailing frames of a turn the transcript ended open no new turn', () => {
+    spin(2, 100);
+    const turnId = bridge.getTurn(bridge.getAgentStatus()).id;
+    bridge.noteTranscriptTurnEnd(Date.now());
+    spin(5, 100);
+    expect(bridge.isTurnOpen()).toBe(false);
+    expect(bridge.getTurn(bridge.getAgentStatus()).id).toBe(turnId);
+  });
+
   it('a pane whose hooks report is left to them: the last frames after Stop report nothing', () => {
     bridge.noteAgentStatus('running', true);
     active = [];
