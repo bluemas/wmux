@@ -279,19 +279,26 @@ describe('DaemonPTYBridge — a Codex title spinner reports running', () => {
     expect(bridge.getAgentStatus()).toBe('running');
   });
 
-  it('a boot spinner before any turn settles no complete', () => {
+  it('a first turn Codex submitted itself (`codex "<prompt>"`) reports running, and settles as a boot, not complete', () => {
     const fresh = new DaemonPTYBridge();
     const fake = makeFakePty();
     fresh.setupDataForwarding(fake.pty, new RingBuffer(65536), 'sess-2', new PromptEventLog());
     fresh.noteAgentProcess({ slug: 'codex', alive: true });
-    fake.feed(CODEX_MODES + BANNER);
-    vi.advanceTimersByTime(6_000);
-    for (let i = 0; i < 20; i++) {
-      fake.feed(title(`${frames[i % 4]} Booting MCP server`));
+    fake.feed(CODEX_MODES + BANNER); // pre-turn: no keystroke will follow
+    fresh.noteAgentStatus('waiting', false); // a detector settle closes the boot episode
+    vi.advanceTimersByTime(7_000);
+    const events: Array<[string, { preTurn?: boolean }]> = [];
+    fresh.on('active', (e) => events.push(['active', e]));
+    fresh.on('idle', (e) => events.push(['idle', e]));
+    for (let i = 0; i < 650; i++) {
+      fake.feed(title(`${frames[i % 4]} Working | Heartbound`));
       vi.advanceTimersByTime(100);
     }
-    fake.feed(title('codex | ~/repo'));
+    expect(events.filter(([k]) => k === 'active').length).toBeGreaterThanOrEqual(2);
+    expect(fresh.getAgentStatus()).toBe('running');
+    fake.feed(title('codex | ~/repo')); // the frame drops
     vi.advanceTimersByTime(10_000);
+    expect(events.at(-1)).toEqual(['idle', expect.objectContaining({ preTurn: true })]);
     expect(fresh.getAgentStatus()).not.toBe('complete');
     fresh.cleanup();
   });

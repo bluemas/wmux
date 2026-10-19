@@ -839,9 +839,10 @@ export class DaemonPTYBridge extends EventEmitter {
    */
   private noteCodexTitleSpinner(sessionId: string): void {
     const slug = this.trackedAgent?.alive ? this.trackedAgent.slug : undefined;
-    // A boot is not a turn: before any turn evidence the spinner is the TUI
-    // starting up (MCP servers, an update check), and main reads it as idle.
-    if (!slug || !agentRow(slug)?.titleRunning || this.hookSeen || this.preTurn) return;
+    // Before any turn evidence the title still counts: `codex "<prompt>"`
+    // (Fan-out's launch) submits its first turn itself, with no keystroke
+    // reaching the bridge. endSpinnerTurn settles such a turn as a boot.
+    if (!slug || !agentRow(slug)?.titleRunning || this.hookSeen) return;
     if (!titleShowsRunningTurn({ title: this.lastTitle, at: this.lastTitleAt }, slug, Date.now())) {
       if (this.spinnerOpenedTurn && this.turnOpen && !this.awaitingHuman) this.endSpinnerTurn();
       return;
@@ -1001,15 +1002,19 @@ export class DaemonPTYBridge extends EventEmitter {
    * repaint under that title meets the idle-title gate.
    */
   private endSpinnerTurn(): void {
+    // A spinner that ran before any turn evidence (a boot, or a first turn
+    // the agent submitted itself) settles the way a boot does: an idle main
+    // treats as pre-turn, not a `complete` nobody asked for.
+    const preTurn = this.preTurn;
     this.closeTurn(true);
-    this.explicitTerminalStatus = true;
-    this.settledStatus = this.spinnerSettledStatus ?? 'complete';
+    this.settledStatus = this.spinnerSettledStatus ?? (preTurn ? null : 'complete');
+    this.explicitTerminalStatus = this.settledStatus !== null;
     this.spinnerSettledStatus = null;
     this.spinnerArmedCycle = false;
     if (this.activityMonitor && this.sessionId) {
       this.activityMonitor.endTurn(this.sessionId);
       // Main heard `running` from this turn; nothing else would retract it.
-      this.emit('idle', { sessionId: this.sessionId });
+      this.emit('idle', { sessionId: this.sessionId, ...(preTurn ? { preTurn: true } : {}) });
     }
   }
 
