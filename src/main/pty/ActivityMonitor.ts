@@ -20,6 +20,7 @@ interface PtyState {
   activeFired: boolean;  // onActive already fired this cycle — dedup IPC spam
   idleTimer: ReturnType<typeof setTimeout> | null;
   lastReschedule: number; // last time we (re)scheduled the idle timer
+  cycle: number;          // bumped whenever a cycle starts or ends (cycleOf)
 }
 
 export class ActivityMonitor {
@@ -76,12 +77,19 @@ export class ActivityMonitor {
       activeFired: false,
       idleTimer: null,
       lastReschedule: 0,
+      cycle: 0,
     });
   }
 
   /** Current throughput state for authoritative daemon-side snapshots. */
   isActive(ptyId: string): boolean {
     return this.states.get(ptyId)?.active === true;
+  }
+
+  /** Which cycle the pane is in: it changes whenever a cycle begins or ends,
+   *  so a caller that armed one can tell it is still that cycle. */
+  cycleOf(ptyId: string): number | null {
+    return this.states.get(ptyId)?.cycle ?? null;
   }
 
   /**
@@ -102,6 +110,7 @@ export class ActivityMonitor {
     s.activeFired = false;
     s.idleTimer = null;
     s.lastReschedule = 0;
+    s.cycle += 1;
   }
 
   /**
@@ -155,6 +164,7 @@ export class ActivityMonitor {
     s.activeFired = false;
     s.idleTimer = null;
     s.lastReschedule = 0;
+    s.cycle += 1;
   }
 
   feed(ptyId: string, byteCount: number): void {
@@ -174,12 +184,14 @@ export class ActivityMonitor {
     // Enter active state when threshold reached (and not already notified)
     if (!s.active && !s.notified && s.bytes > ActivityMonitor.ACTIVE_THRESHOLD) {
       s.active = true;
+      s.cycle += 1;
     }
 
     // If already notified, check if this is a new significant burst to re-arm
     if (s.notified && s.bytes > ActivityMonitor.ACTIVE_THRESHOLD) {
       s.notified = false;
       s.active = true;
+      s.cycle += 1;
     }
 
     // If active, reset the idle countdown — but throttle the reschedule
@@ -212,6 +224,7 @@ export class ActivityMonitor {
           s.notified = true;     // prevent re-firing idle until new cycle
           s.activeFired = false; // re-arm onActive for the next cycle
           s.idleTimer = null;
+          s.cycle += 1;
           this.idleCallbacks.forEach((cb) => cb(ptyId));
         }, ActivityMonitor.IDLE_DELAY_MS);
       }
