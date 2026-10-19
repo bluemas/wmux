@@ -795,6 +795,9 @@ export class DaemonPTYBridge extends EventEmitter {
   }
 
   private closeTurn(soft = false): void {
+    // A cycle the title armed for this turn, which no output has reached yet,
+    // ends with it: a trailing frame would otherwise reopen the turn.
+    this.releaseTitleCycle();
     this.byteOpenedTurn = false;
     this.spinnerOpenedTurn = false;
     if (this.turnOpen) this.turnSoftClosed = soft;
@@ -1036,11 +1039,15 @@ export class DaemonPTYBridge extends EventEmitter {
     // writes none, and the cycle would read running forever. It goes with
     // the agent that armed it.
     if (state.alive && agentRow(state.slug)?.titleRunning) return;
+    this.releaseTitleCycle();
+  }
+
+  /** Ends the cycle noteCodexTitleSpinner armed if it is still that cycle and
+   *  no hook claimed it (a submit, an idle or a new burst starts another). */
+  private releaseTitleCycle(): void {
     const monitor = this.activityMonitor;
     if (
       this.titleArmedCycle !== null && this.sessionId && monitor
-      // Still the cycle the title armed, and no hook claimed it since: a
-      // submit, an idle or a new burst starts another cycle.
       && monitor.cycleOf(this.sessionId) === this.titleArmedCycle && !this.hookArmedCycle
     ) monitor.endTurn(this.sessionId);
     this.titleArmedCycle = null;
