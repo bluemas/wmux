@@ -4920,7 +4920,7 @@ export const en = {
   'office.empty': "No agent sessions yet",
   'office.emptyHint': "Start Claude Code or Codex in a pane and it takes a desk here.",
   'office.roomLabel': "Office, {count} agents",
-  'office.employeeLabel': "{name}, {workspace}: {state}",
+  'office.employeeLabel': "{name}, {workspace}, {agent} {tag}: {state}",
   'office.state.working': "Working",
   'office.state.resting': "Resting",
   'office.state.finished': "Finished",

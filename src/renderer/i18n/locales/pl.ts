@@ -4880,7 +4880,7 @@ export const pl = {
   'office.empty': "Brak sesji agentów",
   'office.emptyHint': "Uruchom Claude Code lub Codex w panelu, a zajmie tu biurko.",
   'office.roomLabel': "Biuro, agenci: {count}",
-  'office.employeeLabel': "{name}, {workspace}: {state}",
+  'office.employeeLabel': "{name}, {workspace}, {agent} {tag}: {state}",
   'office.state.working': "Pracuje",
   'office.state.resting': "Odpoczywa",
   'office.state.finished': "Ukończone",

@@ -4025,7 +4025,7 @@ export const zh = {
   'office.empty': "还没有智能体会话",
   'office.emptyHint': "在窗格中启动 Claude Code 或 Codex，它会在这里坐到一张办公桌前。",
   'office.roomLabel': "办公室，{count} 个智能体",
-  'office.employeeLabel': "{name}，{workspace}：{state}",
+  'office.employeeLabel': "{name}，{workspace}，{agent} {tag}：{state}",
   'office.state.working': "工作中",
   'office.state.resting': "休息中",
   'office.state.finished': "已完成",

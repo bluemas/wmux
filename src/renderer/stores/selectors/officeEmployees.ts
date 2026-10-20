@@ -1,5 +1,8 @@
 import type { StoreState } from '../index';
 import { agentRow, type AgentSlugWith } from '../../../shared/agentIdentity';
+import { getLeafPanes } from '../../../shared/paneUtils';
+import type { PaneLeaf, Workspace } from '../../../shared/types';
+import { computePaneAutoName } from '../../utils/paneNaming';
 import { selectWorkspaceAgentRoster, type WorkspaceAgentRosterRow } from './workspaceAgentRoster';
 
 export type OfficeState = 'working' | 'needs_you' | 'finished' | 'resting';
@@ -13,6 +16,16 @@ export interface OfficeEmployee {
   kind: AgentSlugWith<'officeLook'> | 'other' | 'teammate';
   /** Pane name / teammate name. */
   name: string;
+  /**
+   * The name the Office shows: the pane's explicit label, else the workspace
+   * name, with the agent and then the pane tag added while two employees
+   * would read the same. A teammate's is its own name.
+   */
+  label: string;
+  /** The agent's short name (`Claude`, `Codex`); a teammate's is its lead's. */
+  agent: string;
+  /** The pane's unique coordinate, e.g. `w30-2`; a teammate's is its lead's. */
+  paneTag: string;
   workspaceName: string;
   state: OfficeState;
   need?: OfficeNeed;
@@ -54,6 +67,36 @@ function needOf(row: WorkspaceAgentRosterRow): OfficeNeed | undefined {
   return undefined;
 }
 
+/** The agent's name without a trailing `CLI` / `Code`: `Codex CLI` → `Codex`. */
+function shortAgentName(agentName: string): string {
+  return agentName.replace(/\s+(CLI|Code)$/i, '') || agentName;
+}
+
+/** Every leaf of a workspace, laid out or stashed, by id. */
+function leavesById(workspace: Workspace): Map<string, PaneLeaf> {
+  const leaves = [
+    ...getLeafPanes(workspace.rootPane),
+    ...(workspace.stashedPanes ?? []).flatMap((s) => getLeafPanes(s.pane)),
+  ];
+  return new Map(leaves.map((l) => [l.id, l]));
+}
+
+/**
+ * Where two pane employees would read the same, add the agent; where that
+ * still collides, the pane tag instead. Teammates keep their own names.
+ */
+function disambiguateLabels(employees: OfficeEmployee[]): void {
+  const panes = employees.filter((e) => e.kind !== 'teammate');
+  const step = (make: (e: OfficeEmployee) => string): void => {
+    const counts = new Map<string, number>();
+    for (const e of panes) counts.set(e.label, (counts.get(e.label) ?? 0) + 1);
+    for (const e of panes) if ((counts.get(e.label) ?? 0) > 1) e.label = make(e);
+  };
+  const base = new Map(panes.map((e) => [e, e.label]));
+  step((e) => `${base.get(e)} · ${e.agent}`);
+  step((e) => `${base.get(e)} · ${e.paneTag}`);
+}
+
 /**
  * Fleet's "Finished": an unseen `complete` attention status. Not the lifecycle
  * status, which can stay 'complete' after the owner looked at the pane; the
@@ -71,6 +114,7 @@ function isFinished(row: WorkspaceAgentRosterRow): boolean {
 export function selectOfficeEmployees(state: StoreState, _now: number): OfficeEmployee[] {
   const out: OfficeEmployee[] = [];
   for (const workspace of state.workspaces) {
+    const leaves = leavesById(workspace);
     for (const row of selectWorkspaceAgentRoster(state, workspace.id).rows) {
       if (row.remote || !row.ptyId || !row.agentName) continue;
       if (row.stashed && row.stashedLiveness === 'exited') continue;
@@ -91,10 +135,18 @@ export function selectOfficeEmployees(state: StoreState, _now: number): OfficeEm
       // A finished turn the owner has not looked at yet: reporting at the desk.
       if (officeState === 'resting' && isFinished(row)) officeState = 'finished';
 
+      const leaf = leaves.get(row.paneId);
+      const explicitLabel = (state.paneLabel?.[row.paneId] ?? leaf?.metadata?.label)?.trim();
+      const agent = shortAgentName(row.agentName);
+      const paneTag = computePaneAutoName(workspace.wsOrdinal ?? 0, leaf?.ordinal ?? 0);
+
       out.push({
         id: row.ptyId,
         kind: agentKind(row),
         name: row.paneName,
+        label: explicitLabel || workspace.name,
+        agent,
+        paneTag,
         workspaceName: workspace.name,
         state: officeState,
         ...(need ? { need } : {}),
@@ -112,6 +164,9 @@ export function selectOfficeEmployees(state: StoreState, _now: number): OfficeEm
           id,
           kind: 'teammate',
           name: mate.name,
+          label: mate.name,
+          agent,
+          paneTag,
           workspaceName: workspace.name,
           state: mate.working ? 'working' : 'resting',
           ...(mate.activity ? { bubble: mate.activity } : {}),
@@ -123,6 +178,7 @@ export function selectOfficeEmployees(state: StoreState, _now: number): OfficeEm
       }
     }
   }
+  disambiguateLabels(out);
   return out;
 }
 
@@ -135,6 +191,9 @@ function employeesEqual(previous: OfficeEmployee[], next: OfficeEmployee[]): boo
       a.id !== b.id ||
       a.kind !== b.kind ||
       a.name !== b.name ||
+      a.label !== b.label ||
+      a.agent !== b.agent ||
+      a.paneTag !== b.paneTag ||
       a.workspaceName !== b.workspaceName ||
       a.state !== b.state ||
       a.need !== b.need ||

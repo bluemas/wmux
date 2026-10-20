@@ -208,7 +208,13 @@ function Employee({ employee, layout, t, now, locale, onJump }: EmployeeProps) {
       data-office-employee={employee.id}
       data-state={employee.state}
       data-pose={pose}
-      aria-label={t('office.employeeLabel', { name: employee.name, workspace: employee.workspaceName, state: stateText })}
+      aria-label={t('office.employeeLabel', {
+        name: employee.label,
+        workspace: employee.workspaceName,
+        agent: employee.agent,
+        tag: employee.paneTag,
+        state: stateText,
+      })}
       style={{ left: left * OFFICE_SCALE, top: top * OFFICE_SCALE, width: STATION.w * OFFICE_SCALE, height: STATION.h * OFFICE_SCALE }}
       onClick={() => onJump(employee)}
     >
@@ -224,8 +230,10 @@ function Employee({ employee, layout, t, now, locale, onJump }: EmployeeProps) {
         aria-hidden="true"
         style={{ left: STATION.seatX * OFFICE_SCALE, top: (STATION.seatY + 2) * OFFICE_SCALE, zIndex: LABEL_Z }}
       >
-        <span className="wmux-office-employee__name">{employee.name}</span>
-        <span className="wmux-office-employee__workspace"> · {employee.workspaceName}</span>
+        <span className="wmux-office-employee__name">{employee.label}</span>
+        <span className="wmux-office-employee__workspace">
+          {` · ${employee.workspaceName} · ${employee.agent} · ${employee.paneTag}`}
+        </span>
       </span>
       {(alert || done || activity) && (
         <span

@@ -4421,7 +4421,7 @@ export const ko = {
   'office.empty': "아직 에이전트 세션이 없습니다",
   'office.emptyHint': "패널에서 Claude Code나 Codex를 시작하면 여기 책상에 앉습니다.",
   'office.roomLabel': "사무실, 에이전트 {count}명",
-  'office.employeeLabel': "{name}, {workspace}: {state}",
+  'office.employeeLabel': "{name}, {workspace}, {agent} {tag}: {state}",
   'office.state.working': "작업 중",
   'office.state.resting': "휴식 중",
   'office.state.finished': "완료",

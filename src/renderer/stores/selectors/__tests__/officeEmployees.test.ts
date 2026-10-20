@@ -256,6 +256,63 @@ describe('selectOfficeEmployees', () => {
     expect(next[0].state).toBe('finished');
   });
 
+  const named = (id: string, wsOrdinal: number, leaves: PaneLeaf[]): Workspace =>
+    workspace(id, leaves.length === 1 ? leaves[0] : { id: `${id}-split`, type: 'branch', direction: 'horizontal', children: leaves, sizes: leaves.map(() => 100 / leaves.length) } as unknown as Pane, leaves[0].id, { name: id === 'ws-a' ? 'PowerCraft' : 'Docs', wsOrdinal });
+  const ordinal = (l: PaneLeaf, n: number): PaneLeaf => ({ ...l, ordinal: n });
+
+  it('labels use the workspace name', () => {
+    const s = state({
+      workspaces: [named('ws-a', 30, [ordinal(leaf('p1', [surface('s1', 'pty-1')]), 1)]), named('ws-b', 31, [ordinal(leaf('p2', [surface('s2', 'pty-2')]), 1)])],
+      surfaceAgent: { 'pty-1': claude(), 'pty-2': { name: 'Codex CLI', status: 'idle' } },
+    });
+    const [a, b] = selectOfficeEmployees(s, NOW);
+    expect(a).toMatchObject({ label: 'PowerCraft', workspaceName: 'PowerCraft', agent: 'Claude', paneTag: 'w30-1' });
+    expect(b).toMatchObject({ label: 'Docs', agent: 'Codex', paneTag: 'w31-1' });
+    // The pane name stays for compatibility.
+    expect(a.name).toBe('w30-1');
+  });
+
+  it('explicit pane label wins', () => {
+    const p1 = { ...ordinal(leaf('p1', [surface('s1', 'pty-1')]), 1), metadata: { label: 'backend' } } as PaneLeaf;
+    const p2 = ordinal(leaf('p2', [surface('s2', 'pty-2')]), 2);
+    const s = state({
+      workspaces: [named('ws-a', 30, [p1, p2])],
+      surfaceAgent: { 'pty-1': claude(), 'pty-2': claude() },
+      paneLabel: { p2: ' frontend ' },
+    });
+    expect(selectOfficeEmployees(s, NOW).map((e) => e.label)).toEqual(['backend', 'frontend']);
+  });
+
+  it('duplicate labels add the agent, then the pane tag', () => {
+    const leaves = [1, 2, 3].map((n) => ordinal(leaf(`p${n}`, [surface(`s${n}`, `pty-${n}`)]), n));
+    const s = state({
+      workspaces: [named('ws-a', 30, leaves), named('ws-b', 31, [ordinal(leaf('p9', [surface('s9', 'pty-9')]), 1)])],
+      surfaceAgent: {
+        'pty-1': { name: 'Codex CLI', status: 'idle' },
+        'pty-2': claude(),
+        'pty-3': claude(),
+        'pty-9': claude(),
+      },
+    });
+    expect(selectOfficeEmployees(s, NOW).map((e) => e.label)).toEqual([
+      'PowerCraft · Codex',
+      'PowerCraft · w30-2',
+      'PowerCraft · w30-3',
+      'Docs',
+    ]);
+  });
+
+  it('teammates keep their own name', () => {
+    const s = state({
+      workspaces: [named('ws-a', 30, [ordinal(leaf('p1', [surface('s1', 'pty-lead')]), 1)])],
+      surfaceAgent: { 'pty-lead': claude() },
+      surfaceTeammates: { 'pty-lead': [mate('reviewer', true)] },
+    });
+    const [lead, tm] = selectOfficeEmployees(s, NOW);
+    expect(lead.label).toBe('PowerCraft');
+    expect(tm).toMatchObject({ label: 'reviewer', name: 'reviewer', agent: 'Claude', paneTag: 'w30-1' });
+  });
+
   it('returns a stable array from the memoized selector when inputs are unchanged', () => {
     const s = state({ workspaces: leadWs(), surfaceAgent: { 'pty-lead': claude() } });
     const sel = createOfficeEmployeesSelector();

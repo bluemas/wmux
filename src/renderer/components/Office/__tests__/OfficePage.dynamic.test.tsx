@@ -30,7 +30,10 @@ function emp(id: string, extra: Partial<OfficeEmployee> = {}): OfficeEmployee {
   return {
     id,
     kind: 'claude',
-    name: `name-${id}`,
+    name: `pane-${id}`,
+    label: `name-${id}`,
+    agent: 'Claude',
+    paneTag: `w1-${id}`,
     workspaceName: 'alpha',
     state: 'working',
     jumpPtyId: id,
@@ -101,6 +104,17 @@ describe('OfficePage', () => {
     expect(employeeEl('pty-1').getAttribute('data-pose')).toBe('type');
     expect(employeeEl('pty-2').getAttribute('data-pose')).toBe('rest');
     expect(container.querySelector('[data-office-empty]')).toBeNull();
+  });
+
+  it('shows the label, and the workspace, agent and pane tag on hover and to screen readers', () => {
+    mount([emp('pty-1', { label: 'PowerCraft · Codex', agent: 'Codex', paneTag: 'w30-2', workspaceName: 'PowerCraft' })]);
+    const el = employeeEl('pty-1');
+    expect(el.querySelector('.wmux-office-employee__name')!.textContent).toBe('PowerCraft · Codex');
+    expect(el.textContent).not.toContain('pane-pty-1');
+    const details = el.querySelector('.wmux-office-employee__workspace')!.textContent ?? '';
+    for (const part of ['PowerCraft', 'Codex', 'w30-2']) expect(details).toContain(part);
+    const aria = el.getAttribute('aria-label') ?? '';
+    for (const part of ['PowerCraft · Codex', 'PowerCraft', 'Codex', 'w30-2', 'Working']) expect(aria).toContain(part);
   });
 
   it('bubble truncates long activity and hides empty', () => {
