@@ -554,6 +554,7 @@ export function useKeyboard() {
       openSettings: () => { store.getState().toggleSettingsPanel(); },
       // S-C1 cockpit — every agent, one screen.
       toggleFleetView: () => { store.getState().toggleFleetView(); },
+      toggleOfficeView: () => { store.getState().toggleOfficeView(); },
       toggleCompanyView: () => { store.getState().toggleCompanyView(); },
       toggleBotsView: () => { store.getState().toggleBotsView(); },
       // Back to single view.

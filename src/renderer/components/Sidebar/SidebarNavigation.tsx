@@ -113,7 +113,7 @@ export default function SidebarNavigation({ compact = false, home = false }: {
     {
       id: 'office', label: t('office.title'), name: t('office.title'), active: route === 'office',
       icon: <IconOffice size={16} />,
-      onClick: go('office', () => useStore.getState().setAppRoute(route === 'office' ? 'workspaces' : 'office')),
+      onClick: go('office', () => useStore.getState().toggleOfficeView()),
     },
     ...(schedulesAvailable ? [{
       id: 'schedules', label: t('schedules.title'), name: schedulesName, active: schedulesOpen,

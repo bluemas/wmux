@@ -372,6 +372,11 @@ export default function CommandPalette() {
         action: () => { useStore.getState().setFleetViewVisible(true); setVisible(false); },
       },
       {
+        label: t('palette.cmd.openOffice'),
+        shortcut: 'toggleOfficeView',
+        action: () => { useStore.getState().setAppRoute('office'); setVisible(false); },
+      },
+      {
         // The keyboard route to fan-out (see openMultiTask). This command does
         // not care whether the agent toolbar exists.
         label: t('palette.cmd.multiTask'),

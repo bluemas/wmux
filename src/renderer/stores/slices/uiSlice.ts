@@ -238,6 +238,8 @@ export interface UISlice {
   fleetViewVisible: boolean;
   toggleFleetView: () => void;
   setFleetViewVisible: (visible: boolean) => void;
+  /** Opens the Office page, or returns to Workspaces when it is open. */
+  toggleOfficeView: () => void;
 
   // J3 §1 — 태스크 정리 목록(팔레트 진입). 전용 루트 디스크 정본 스캔 결과를
   // 4종(미물질화·디스크 결측·보존·무연결)으로 보여준다. 전이 UI 상태(미영속).
@@ -1277,6 +1279,9 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
     if (visible) get().setAppRoute('fleet');
     else set((state) => { leaveAppRoute(state, 'fleet'); });
   },
+
+  // The Office page toggles like Fleet: open it, or close it back to Workspaces.
+  toggleOfficeView: () => get().setAppRoute(get().appRoute === 'office' ? 'workspaces' : 'office'),
 
   // S-C2 — cockpit tab. Defaults to the agent grid; FleetView resets it on
   // unmount so reopening the cockpit always lands on 'fleet'.

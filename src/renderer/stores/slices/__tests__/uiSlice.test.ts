@@ -624,6 +624,13 @@ describe('UISlice — Fleet View overlay (S-C1)', () => {
     expect(store.getState().fleetViewVisible).toBe(false);
   });
 
+  it('toggleOfficeView opens the Office page and returns to Workspaces', () => {
+    store.getState().toggleOfficeView();
+    expect(store.getState().appRoute).toBe('office');
+    store.getState().toggleOfficeView();
+    expect(store.getState().appRoute).toBe('workspaces');
+  });
+
   it('opening Fleet View closes the competing overlays', () => {
     store.setState({
       commandPaletteVisible: true,

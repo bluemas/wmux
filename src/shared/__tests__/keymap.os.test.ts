@@ -241,6 +241,28 @@ describe('openPrivateBrowser (Ctrl+Shift+N)', () => {
   });
 });
 
+describe('toggleOfficeView (Shift+Alt+O)', () => {
+  it('is a default row, and the only binding on its combo on every platform', () => {
+    const rows = WMUX_KEYMAP.filter((e) => e.action === 'toggleOfficeView');
+    expect(rows.map((e) => e.combo)).toEqual(['Shift+Alt+O']);
+    for (const platform of ['win32', 'darwin', 'linux'] as const) {
+      const bindings = defaultBindings(platform);
+      const combo = bindings.find((b) => b.action === 'toggleOfficeView')?.combo;
+      expect(combo).toBe('Shift+Alt+O');
+      expect(bindings.filter((b) => b.combo === combo)).toHaveLength(1);
+    }
+  });
+
+  it('fires on Shift+Alt+O, and on Option+Shift+O on macOS (which types a glyph)', () => {
+    const o = { key: 'O', code: 'KeyO', ctrlKey: false, shiftKey: true, altKey: true };
+    expect(resolveShortcut(ev(o), win)).toBe('toggleOfficeView');
+    expect(resolveShortcut(ev({ ...o, key: 'Ø' }), mac)).toBe('toggleOfficeView');
+    // Ctrl+Shift+O stays Company View; Alt+O alone is the pane's.
+    expect(resolveShortcut(ev({ key: 'O', code: 'KeyO', shiftKey: true }), win)).toBe('toggleCompanyView');
+    expect(resolveShortcut(ev({ key: 'o', code: 'KeyO', ctrlKey: false, altKey: true }), win)).toBeNull();
+  });
+});
+
 describe('effectiveBindings — the user\'s overrides', () => {
   const upAlt = ev({ key: 'ArrowUp', code: 'ArrowUp', ctrlKey: false, altKey: true });
 

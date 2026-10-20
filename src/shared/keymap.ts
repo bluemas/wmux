@@ -57,7 +57,7 @@ export const SHORTCUT_ACTION_IDS = [
   'nextSurface', 'prevSurface', 'nextPane', 'prevPane',
   'focusUp', 'focusDown', 'focusLeft', 'focusRight',
   'focusUpAlt', 'focusDownAlt', 'focusLeftAlt', 'focusRightAlt',
-  'toggleSidebar', 'toggleFileTree', 'openSettings', 'toggleFleetView', 'toggleCompanyView', 'toggleBotsView',
+  'toggleSidebar', 'toggleFileTree', 'openSettings', 'toggleFleetView', 'toggleOfficeView', 'toggleCompanyView', 'toggleBotsView',
   'clearMultiview', 'openBrowser', 'openPrivateBrowser', 'addBookmark', 'toggleMessageFeed',
   'zoomIn', 'zoomOut', 'zoomReset',
   'mentionAgent',
@@ -184,6 +184,9 @@ export const WMUX_KEYMAP: readonly KeymapEntry[] = [
   { action: 'toggleFileTree', combo: 'Ctrl+Shift+E', descriptionKey: 'settings.sc.toggleFileTree' },
   { action: 'openSettings', combo: 'Ctrl+,', descriptionKey: 'settings.sc.openSettings' },
   { action: 'toggleFleetView', combo: 'Ctrl+Shift+A', descriptionKey: 'settings.sc.toggleFleetView' },
+  // Ctrl+Shift+O is Company View. No Ctrl, so macOS uses it as written
+  // (Option+Shift+O types a glyph; the resolver falls back to the physical key).
+  { action: 'toggleOfficeView', combo: 'Shift+Alt+O', descriptionKey: 'settings.sc.toggleOfficeView' },
   { action: 'toggleCompanyView', combo: 'Ctrl+Shift+O', descriptionKey: 'settings.sc.toggleCompanyView' },
   { action: 'toggleBotsView', combo: 'Ctrl+Shift+J', descriptionKey: 'settings.sc.toggleBotsView' },
   { action: 'clearMultiview', combo: 'Ctrl+Shift+G', descriptionKey: 'settings.sc.clearMultiview' },

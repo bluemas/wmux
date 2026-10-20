@@ -50,6 +50,18 @@ afterEach(() => {
 });
 
 describe('shortcuts on a rail page', () => {
+  it('Shift+Alt+O opens the Office page and returns to Workspaces', () => {
+    const office = { shiftKey: true, altKey: true, key: 'O', code: 'KeyO' };
+    press(office);
+    expect(useStore.getState().appRoute).toBe('office');
+    press(office);
+    expect(useStore.getState().appRoute).toBe('workspaces');
+    // From another page it goes to the Office page, not back.
+    act(() => useStore.getState().setAppRoute('fleet'));
+    press(office);
+    expect(useStore.getState().appRoute).toBe('office');
+  });
+
   it('pane and PTY shortcuts do nothing while Fleet covers the panes', () => {
     expect(WORKSPACES_ONLY_ACTIONS.has('closeSurface')).toBe(true);
     expect(WORKSPACES_ONLY_ACTIONS.has('splitHorizontal')).toBe(true);
