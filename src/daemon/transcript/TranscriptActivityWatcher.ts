@@ -42,7 +42,7 @@ import type { ResumeBinding } from '../../shared/agentResume';
 import type { TurnEvent } from '../../shared/transcript/turnEvents';
 import { parseTranscriptLine } from './parseEntry';
 import { parseCodexLineDetailed } from './parseCodexEntry';
-import { isLineBoundary, readTranscriptDelta, readTranscriptPage, statTranscript } from './readTail';
+import { isLineBoundary, readRange, readTranscriptDelta, readTranscriptPage, statTranscript } from './readTail';
 import { HOOK_ACTIVITY_KINDS } from '../../shared/hooks/hookActivityKinds';
 import { MAX_RAW_LEN, summarizeActivity } from '../../shared/activitySummary';
 import { agentRow } from '../../shared/agentIdentity';
@@ -359,24 +359,23 @@ export class TranscriptActivityWatcher {
   }
 
   /**
-   * Feeds `counter` every complete line from `from` to `size`, when that is
-   * at most SUBAGENT_CATCHUP_BYTES (no read, oversized records included, goes
-   * past `size`). Returns the line boundary it reached: the end, or the start
-   * of a record still being written. Null when it could not read them all (a
-   * longer skip, the file changed under it): the caller then counts afresh.
+   * Feeds `counter` every complete line in [`from`, `size`) with one read,
+   * when that range is at most SUBAGENT_CATCHUP_BYTES: nothing past `size`
+   * is read, however the file grows meanwhile. Returns the line boundary it
+   * reached: past the last complete line (a record still being written after
+   * it is read once it ends). Null for a longer range or a failed read: the
+   * caller then counts afresh.
    */
   private catchUpSubagents(counter: SubagentCounter, path: string, from: number, size: number): number | null {
     if (size - from > SUBAGENT_CATCHUP_BYTES) return null;
-    const feed: ParseLine = (line) => { counter.noteLine(line); return []; };
-    let offset = from;
-    while (offset < size) {
-      const delta = readTranscriptDelta(path, offset, READ_CAP_BYTES, feed);
-      if (!delta || delta.reset) return null;
-      // No line end ahead: a record still being written, read once it grows.
-      if (delta.cursor.tailOffset <= offset) break;
-      offset = delta.cursor.tailOffset;
+    const raw = readRange(path, from, size - from);
+    if (!raw || raw.length !== size - from) return null;
+    const end = raw.lastIndexOf(0x0a);
+    if (end < 0) return from;
+    for (const line of raw.subarray(0, end).toString('utf8').split('\n')) {
+      if (line) counter.noteLine(line);
     }
-    return offset;
+    return from + end + 1;
   }
 
   /** One transcript, one pane: the pane whose agent spoke last keeps it. */
@@ -465,7 +464,7 @@ export class TranscriptActivityWatcher {
       // may already have moved past.
       watch.replay = watch.lines;
       this.replayLines(id, watch);
-    } else if (stat.size - watch.offset > READ_CAP_BYTES && stat.size === watch.stalledSize) {
+    } else if (stat.size > watch.offset && stat.size === watch.stalledSize) {
       // Still the record the counter stopped on, and nothing appended: the
       // bytes after the cursor were all read last tick.
     } else if (stat.size - watch.offset > READ_CAP_BYTES) {

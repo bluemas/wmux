@@ -329,7 +329,7 @@ describe('TranscriptActivityWatcher — subagent count', () => {
       h.watcher.tick();
       h.watcher.tick();
       // Only the per-tick line-boundary probe, never the record again.
-      const bytes = reads.mock.calls.reduce((sum, call) => sum + Number(call[3] ?? 0), 0);
+      const bytes = reads.mock.calls.reduce((sum, call) => sum + Number((call as unknown[])[3] ?? 0), 0);
       expect(bytes).toBeLessThan(1024);
     } finally {
       reads.mockRestore();
@@ -338,6 +338,25 @@ describe('TranscriptActivityWatcher — subagent count', () => {
     h.append(claudeToolResult('toolu_1', 'done'));
     h.watcher.tick();
     expect(h.counts.at(-1)).toEqual(['pty-1', 0]);
+  });
+
+  it('a short partial record after a large skip is not read again either', () => {
+    const h = harness('claude');
+    h.watcher.tick();
+    h.append(claudeToolUse('toolu_1', 'Agent'));
+    h.watcher.tick();
+    h.append(claudeToolUse('toolu_2', 'Read'), claudeToolResult('toolu_2', 'x'.repeat(READ_CAP_BYTES + 10_000)));
+    fs.appendFileSync(h.file, claudeToolResult('toolu_3', 'y'.repeat(100 * 1024)).slice(0, 100 * 1024));
+    h.watcher.tick();
+    const reads = vi.spyOn(fs, 'readSync');
+    try {
+      h.watcher.tick();
+      const bytes = reads.mock.calls.reduce((sum, call) => sum + Number((call as unknown[])[3] ?? 0), 0);
+      expect(bytes).toBeLessThan(1024);
+    } finally {
+      reads.mockRestore();
+    }
+    expect(h.counts).toEqual([['pty-1', 1]]);
   });
 
   it('a closed pane sends 0 for a count it had sent', () => {
