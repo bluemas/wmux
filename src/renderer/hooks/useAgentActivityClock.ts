@@ -39,14 +39,18 @@ export function useAgentActivityClock(): void {
   useEffect(() => {
     let lastSlowBumpAt = 0;
     const id = setInterval(() => {
-      const { surfaceActivityAt, surfaceTurnOpenAt } = useStore.getState();
+      const { surfaceActivityAt, surfaceTurnOpenAt, surfaceTeammatesAt } = useStore.getState();
       const now = Date.now();
       let anyFresh = false;
-      for (const ptyId in surfaceActivityAt) {
-        if (now - surfaceActivityAt[ptyId] <= HOOK_RUNNING_TTL_MS + DECAY_GRACE_MS) {
-          anyFresh = true;
-          break;
+      // An Agent Teams teammate's stamp decays on the same window.
+      for (const stamps of [surfaceActivityAt, surfaceTeammatesAt ?? {}]) {
+        for (const ptyId in stamps) {
+          if (now - stamps[ptyId] <= HOOK_RUNNING_TTL_MS + DECAY_GRACE_MS) {
+            anyFresh = true;
+            break;
+          }
         }
+        if (anyFresh) break;
       }
       if (anyFresh) {
         bumpAgentClock();

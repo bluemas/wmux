@@ -190,6 +190,17 @@ describe('TeammateScanner', () => {
     expect(scanner.anyWorking(now + FRESH_MS + 60_000)).toBe(false);
   });
 
+  it('bookkeeping lines that push the conversation out of the window keep the last verdict', () => {
+    const now = Date.now();
+    const file = agent('mate', 'in_process_teammate', [prompt(now), toolResult('a', now), reply('end_turn', now)]);
+    const scanner = new TeammateScanner(sub);
+    expect(scanner.anyWorking(now)).toBe(false);
+    const filler = JSON.stringify({ type: 'api-request', timestamp: iso(now), body: 'b'.repeat(300 * 1024) });
+    fs.appendFileSync(file, `${filler}\n${JSON.stringify({ type: 'attachment', timestamp: iso(now), attachment: { type: 'x' } })}\n`);
+    fs.utimesSync(file, (now + 1000) / 1000, (now + 1000) / 1000);
+    expect(scanner.anyWorking(now + 1000)).toBe(false);
+  });
+
   it('a final reply too big for the tail window still reads as replied', () => {
     const now = Date.now();
     const long = JSON.stringify({

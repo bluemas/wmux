@@ -198,9 +198,13 @@ export class TeammateScanner {
     if (state.teammate === undefined) state.teammate = isTeammateMeta(file);
     if (state.teammate !== true) return false;
     if (stat.size !== state.size || stat.mtimeMs !== state.mtimeMs) {
-      // A replaced or truncated file is another conversation: its calls are
-      // not the ones carried.
-      if (stat.ino !== state.ino || stat.size < state.size) state.pending.clear();
+      // A replaced or truncated file is another conversation: its calls and
+      // verdict are not the ones carried.
+      const replaced = stat.ino !== state.ino || stat.size < state.size;
+      if (replaced) {
+        state.pending.clear();
+        state.tail = null;
+      }
       state.ino = stat.ino;
       let tail = readTail(file, TAIL_READ_BYTES, state.pending);
       // Nothing meaningful in the window of a file bigger than it: the last
@@ -210,7 +214,9 @@ export class TeammateScanner {
       if (tail === undefined) return false;
       state.size = stat.size;
       state.mtimeMs = stat.mtimeMs;
-      state.tail = tail;
+      // Bookkeeping lines alone (an API request, an attachment) say nothing of
+      // the conversation: the last verdict stands, aged by the file's mtime.
+      if (tail !== null || replaced) state.tail = tail;
     }
     return teammateWorking(state.tail, state.mtimeMs, now);
   }

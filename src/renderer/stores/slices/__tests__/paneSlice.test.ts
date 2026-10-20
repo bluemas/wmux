@@ -945,28 +945,15 @@ describe('surfacePendingQuestion lifecycle', () => {
     expect(store.getState().surfacePendingQuestion['pty-1']).toBeUndefined();
   });
 
-  it('is kept by an Agent Teams teammate\'s running stamp (the lead\'s question stands)', () => {
+  it('is kept by an Agent Teams teammate\'s stamp, which touches nothing of the lead\'s', () => {
     const store = createTestStore();
     store.getState().setSurfacePendingQuestion('pty-1', 'Shall I merge?');
     store.getState().setSurfaceAgentStatus('pty-1', 'complete');
     store.getState().markSurfaceTeammatesWorking('pty-1');
-    expect(store.getState().surfaceActivityAt['pty-1']).toBeGreaterThan(0);
+    expect(store.getState().surfaceTeammatesAt['pty-1']).toBeGreaterThan(0);
+    expect(store.getState().surfaceActivityAt['pty-1']).toBeUndefined();
     expect(store.getState().surfacePendingQuestion['pty-1']).toBe('Shall I merge?');
     expect(store.getState().surfaceAgentStatus['pty-1']).toBe('complete');
-  });
-
-  it('a teammate stamp leaves a lead waiting or on an error as it is', () => {
-    const store = createTestStore();
-    store.getState().setSurfaceAgent('pty-1', 'Claude Code', 'waiting');
-    store.getState().markSurfaceTeammatesWorking('pty-1');
-    expect(store.getState().surfaceActivityAt['pty-1']).toBeUndefined();
-    store.getState().setSurfaceAgent('pty-1', 'Claude Code', 'complete');
-    store.getState().markSurfaceTeammatesWorking('pty-1');
-    expect(store.getState().surfaceActivityAt['pty-1']).toBeGreaterThan(0);
-    // The lead moves on to waiting: the teammate's running evidence goes too.
-    store.getState().setSurfaceAgentStatus('pty-1', 'waiting');
-    expect(store.getState().surfaceActivityAt['pty-1']).toBeUndefined();
-    expect(store.getState().surfaceTeammatesAt['pty-1']).toBeUndefined();
   });
 
   it('an empty write clears it (every stop writes the field)', () => {

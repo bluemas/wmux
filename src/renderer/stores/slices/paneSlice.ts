@@ -283,8 +283,8 @@ export interface PaneSlice {
   // the byte-based per-PTY 'running' broadcast has no tool name. Same 120s-TTL
   // decay as setSurfaceActivity's stamp; lights background dots from bytes.
   markSurfaceRunning: (ptyId: string) => void;
-  /** An Agent Teams teammate still works: the running stamp, nothing else (the
-   *  lead's question and status stay). */
+  /** An Agent Teams teammate still works: its own stamp, nothing else (the
+   *  lead's activity stamp, question and status stay). */
   markSurfaceTeammatesWorking: (ptyId: string) => void;
   // "running" freshness (orca-style): epoch-ms of each pane's last activity
   // signal. The fleet selector treats a fresh stamp (within HOOK_RUNNING_TTL_MS)
@@ -302,8 +302,8 @@ export interface PaneSlice {
   // string, so it stamps the timestamp only (markSurfaceRunning).
   surfaceActivityAt: Record<string, number>;
   // When an Agent Teams teammate of each pane's agent last reported working
-  // (markSurfaceTeammatesWorking). The roster lets this stamp, unlike any
-  // other, show a finished (complete) lead's pane as running. Transient.
+  // (markSurfaceTeammatesWorking). Fleet and the roster read it through
+  // isTeammateRunning; it is never the activity stamp. Transient.
   surfaceTeammatesAt: Record<string, number>;
   // The TURN LATCH: ptyId → epoch-ms of the hook-reported turn start
   // (`UserPromptSubmit`, arriving as a METADATA_UPDATE tagged
@@ -649,22 +649,6 @@ function captureStashOrigin(ws: Workspace, paneId: string): StashedPane['origin'
   };
 }
 
-/** Lifecycle statuses a teammate stamp never shows as running (markSurfaceTeammatesWorking). */
-const TEAMMATE_BLOCKING_STATUSES: ReadonlySet<AgentStatus> = new Set(['waiting', 'error', 'awaiting_input']);
-
-/**
- * The lead moved to a status a teammate never shows as running: the running
- * evidence a teammate left goes with it (the activity stamp only when it is
- * the teammate's own), or Fleet keeps reading it as running.
- */
-function dropTeammateEvidence(state: StoreState, ptyId: string, status: AgentStatus | null | undefined): void {
-  if (!status || !TEAMMATE_BLOCKING_STATUSES.has(status)) return;
-  const at = state.surfaceTeammatesAt[ptyId];
-  if (at === undefined) return;
-  delete state.surfaceTeammatesAt[ptyId];
-  if (state.surfaceActivityAt[ptyId] === at) delete state.surfaceActivityAt[ptyId];
-}
-
 export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]], [], PaneSlice> = (set, get) => ({
   paneNotificationRing: {},
 
@@ -686,7 +670,6 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
 
   setSurfaceAgentStatus: (ptyId, status) => set((state: StoreState) => {
     if (!ptyId) return;
-    dropTeammateEvidence(state, ptyId, status);
     // Store only attention-worthy statuses; everything else (running, idle,
     // null) clears the entry so the blink stops as soon as the agent
     // resumes, goes idle, or the PTY exits.
@@ -720,7 +703,6 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
 
   setSurfaceAgent: (ptyId, name, status, slug) => set((state: StoreState) => {
     if (!ptyId) return;
-    dropTeammateEvidence(state, ptyId, status);
     const existing = state.surfaceAgent[ptyId];
     // Never overwrite a known agent name with an empty one. PTYBridge's
     // ActivityMonitor 'running' broadcasts carry agentName = getLastAgent() ??
@@ -915,14 +897,9 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
 
   markSurfaceTeammatesWorking: (ptyId) => set((state: StoreState) => {
     if (!ptyId) return;
-    // A lead left waiting at its prompt, on an error, or on a question keeps
-    // that status in every view: Fleet would read the stamp as running while
-    // the roster kept the lead's status.
-    const lifecycle = state.surfaceAgent[ptyId]?.status;
-    if (lifecycle && TEAMMATE_BLOCKING_STATUSES.has(lifecycle)) return;
-    const now = Date.now();
-    state.surfaceActivityAt[ptyId] = now;
-    state.surfaceTeammatesAt[ptyId] = now;
+    // Its own stamp only (see isTeammateRunning): the activity stamp and the
+    // lead's status and question are left as they are.
+    state.surfaceTeammatesAt[ptyId] = Date.now();
   }),
 
   markSurfaceTurnOpen: (ptyId) => set((state: StoreState) => {

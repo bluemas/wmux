@@ -6,20 +6,7 @@ import { remoteAgentKey } from '../../../shared/remoteHosts';
 import { agentDisplayToSlug } from '../../../shared/agentIdentity';
 import type { StoreState } from '../index';
 import { computePaneAutoName, paneDisplayName } from '../../utils/paneNaming';
-import { HOOK_RUNNING_TTL_MS, isHookRunning, isQuietUsageLimitError, pickStashedRepresentativeSurface, resolveRemoteAgent } from './fleet';
-
-/**
- * An Agent Teams teammate of the pane's agent reported working lately, after
- * the lead's last turn end: the one stamp that shows a finished lead's pane
- * (complete, already seen) as running.
- */
-function teammatesWorking(state: StoreState, ptyId: string): boolean {
-  // Optional-chained: partial test stores build without these maps.
-  const at = state.surfaceTeammatesAt?.[ptyId];
-  if (!at || state.agentClockMs - at > HOOK_RUNNING_TTL_MS) return false;
-  const end = state.surfaceTurnEndAt?.[ptyId];
-  return end === undefined || at > end;
-}
+import { HOOK_RUNNING_TTL_MS, isHookRunning, isQuietUsageLimitError, isTeammateRunning, pickStashedRepresentativeSurface, resolveRemoteAgent } from './fleet';
 
 /** One detected agent session, kept attached to the terminal surface that owns it. */
 export interface WorkspaceAgentRosterRow {
@@ -240,8 +227,15 @@ export function selectWorkspaceAgentRoster(
       if (
         !attentionStatus &&
         !pendingQuestion &&
-        (lifecycleStatus === 'idle' || (lifecycleStatus === 'complete' && teammatesWorking(state, ptyId))) &&
-        hookRunning
+        ((lifecycleStatus === 'idle' && hookRunning)
+          // A finished lead (complete, seen) too, while a teammate works: the
+          // same verdict Fleet's dot reads (isTeammateRunning).
+          || ((lifecycleStatus === 'idle' || lifecycleStatus === 'complete') && isTeammateRunning({
+            teammatesAt: state.surfaceTeammatesAt?.[ptyId],
+            turnEndAt: state.surfaceTurnEndAt?.[ptyId],
+            agentClockMs: state.agentClockMs,
+            lifecycle: agent.status,
+          })))
       ) {
         status = 'running';
       }
@@ -334,8 +328,13 @@ export function selectWorkspaceAgentRoster(
           ? 'idle'
           : (agent?.status ?? 'idle');
       status = attentionStatus ?? lifecycle;
-      const finishedLead = lifecycle === 'complete' && !!ptyId && teammatesWorking(state, ptyId);
-      if (!attentionStatus && (lifecycle === 'idle' || finishedLead) && hookRunning) status = 'running';
+      const teammate = !!ptyId && (lifecycle === 'idle' || lifecycle === 'complete') && isTeammateRunning({
+        teammatesAt: state.surfaceTeammatesAt?.[ptyId],
+        turnEndAt: state.surfaceTurnEndAt?.[ptyId],
+        agentClockMs: state.agentClockMs,
+        lifecycle: agent?.status,
+      });
+      if (!attentionStatus && ((lifecycle === 'idle' && hookRunning) || teammate)) status = 'running';
     }
 
     rows.push({
