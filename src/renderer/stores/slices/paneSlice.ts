@@ -649,6 +649,22 @@ function captureStashOrigin(ws: Workspace, paneId: string): StashedPane['origin'
   };
 }
 
+/** Lifecycle statuses a teammate stamp never shows as running (markSurfaceTeammatesWorking). */
+const TEAMMATE_BLOCKING_STATUSES: ReadonlySet<AgentStatus> = new Set(['waiting', 'error', 'awaiting_input']);
+
+/**
+ * The lead moved to a status a teammate never shows as running: the running
+ * evidence a teammate left goes with it (the activity stamp only when it is
+ * the teammate's own), or Fleet keeps reading it as running.
+ */
+function dropTeammateEvidence(state: StoreState, ptyId: string, status: AgentStatus | null | undefined): void {
+  if (!status || !TEAMMATE_BLOCKING_STATUSES.has(status)) return;
+  const at = state.surfaceTeammatesAt[ptyId];
+  if (at === undefined) return;
+  delete state.surfaceTeammatesAt[ptyId];
+  if (state.surfaceActivityAt[ptyId] === at) delete state.surfaceActivityAt[ptyId];
+}
+
 export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]], [], PaneSlice> = (set, get) => ({
   paneNotificationRing: {},
 
@@ -670,6 +686,7 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
 
   setSurfaceAgentStatus: (ptyId, status) => set((state: StoreState) => {
     if (!ptyId) return;
+    dropTeammateEvidence(state, ptyId, status);
     // Store only attention-worthy statuses; everything else (running, idle,
     // null) clears the entry so the blink stops as soon as the agent
     // resumes, goes idle, or the PTY exits.
@@ -703,6 +720,7 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
 
   setSurfaceAgent: (ptyId, name, status, slug) => set((state: StoreState) => {
     if (!ptyId) return;
+    dropTeammateEvidence(state, ptyId, status);
     const existing = state.surfaceAgent[ptyId];
     // Never overwrite a known agent name with an empty one. PTYBridge's
     // ActivityMonitor 'running' broadcasts carry agentName = getLastAgent() ??
@@ -901,7 +919,7 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
     // that status in every view: Fleet would read the stamp as running while
     // the roster kept the lead's status.
     const lifecycle = state.surfaceAgent[ptyId]?.status;
-    if (lifecycle === 'waiting' || lifecycle === 'error' || lifecycle === 'awaiting_input') return;
+    if (lifecycle && TEAMMATE_BLOCKING_STATUSES.has(lifecycle)) return;
     const now = Date.now();
     state.surfaceActivityAt[ptyId] = now;
     state.surfaceTeammatesAt[ptyId] = now;

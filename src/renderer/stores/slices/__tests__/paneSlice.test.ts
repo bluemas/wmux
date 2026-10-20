@@ -963,6 +963,10 @@ describe('surfacePendingQuestion lifecycle', () => {
     store.getState().setSurfaceAgent('pty-1', 'Claude Code', 'complete');
     store.getState().markSurfaceTeammatesWorking('pty-1');
     expect(store.getState().surfaceActivityAt['pty-1']).toBeGreaterThan(0);
+    // The lead moves on to waiting: the teammate's running evidence goes too.
+    store.getState().setSurfaceAgentStatus('pty-1', 'waiting');
+    expect(store.getState().surfaceActivityAt['pty-1']).toBeUndefined();
+    expect(store.getState().surfaceTeammatesAt['pty-1']).toBeUndefined();
   });
 
   it('an empty write clears it (every stop writes the field)', () => {
