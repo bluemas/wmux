@@ -2346,6 +2346,9 @@ async function recoverSessions(
     const persisted = state.sessions.find((s) => s.id === recoveredId);
     if (persisted && recordWasMidTurn(persisted, Date.now())) recoveredWasRunning.add(recoveredId);
   }
+  // The recovery save above ran before these marks: persist them now, so a
+  // second death before the panes resume still owes the continue.
+  if (recoveredWasRunning.size > 0) void stateWriter.saveAsap(buildState(sessionManager));
 
   // Clean up orphaned buffer files. Preserve buffers for both the
   // recovered sessions and the cap-skipped suspended ones — the latter
@@ -3226,6 +3229,7 @@ function registerRpcHandlers(
       // The live mid-turn mark is internal too: clients get only the recovered
       // pane's one-shot `resumeWasRunning` below, read off the old record.
       delete base.turnRunningSince;
+      delete base.resumeContinuePending;
       if (!resumeAgent) recoveredWasRunning.delete(s.id);
       const withRuntime = base.supervision
         ? { ...base, supervisionRuntime: paneSupervisor.getRuntime(s.id) }
@@ -7682,7 +7686,9 @@ function buildState(sessionManager: DaemonSessionManager): DaemonState {
   if (!cachedBootId) cachedBootId = getBootIdSync();
   return {
     version: 1,
-    sessions: sessionManager.listSessions(),
+    // A continue still owed to a recovered pane is persisted with it (see
+    // DaemonSession.resumeContinuePending); a spent one drops out here.
+    sessions: sessionManager.listSessions().map((s) => (recoveredWasRunning.has(s.id) ? { ...s, resumeContinuePending: true as const } : s)),
     bootId: cachedBootId,
   };
 }

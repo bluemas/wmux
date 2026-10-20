@@ -154,6 +154,11 @@ describe('recordWasMidTurn — the old record says the agent was mid-turn', () =
     expect(recordWasMidTurn({ turnRunningSince: 0, lastActivity: recent }, now)).toBe(false);
   });
 
+  it('true for a continue an earlier recovery still owed (a second death before the resume)', () => {
+    expect(recordWasMidTurn({ resumeContinuePending: true, lastActivity: recent }, now)).toBe(true);
+    expect(recordWasMidTurn({ resumeContinuePending: 'yes', lastActivity: recent }, now)).toBe(false);
+  });
+
   it('false when the pane was quiet for longer than the bound', () => {
     const stale = new Date(now - RESUME_CONTINUE_MAX_QUIET_MS - 1).toISOString();
     expect(recordWasMidTurn({ turnRunningSince: now - RESUME_CONTINUE_MAX_QUIET_MS - 60_000, lastActivity: stale }, now)).toBe(false);
@@ -193,6 +198,18 @@ describe('turnRunningSince wiring', () => {
     // The carry-forward of the other markers must not copy it onto the new meta.
     const carry = src.slice(src.indexOf('for (const persisted of state.sessions) {'), src.indexOf('const liveState = buildState(sessionManager);'));
     expect(carry).not.toMatch(/turnRunningSince/);
+    expect(carry).not.toMatch(/resumeContinuePending/);
+  });
+
+  it('an owed continue is persisted until spent, and never sent to clients', () => {
+    const src = read('index.ts');
+    const build = src.slice(src.indexOf('function buildState(sessionManager: DaemonSessionManager): DaemonState {'));
+    expect(build.slice(0, 900)).toMatch(/recoveredWasRunning\.has\(s\.id\) \? \{ \.\.\.s, resumeContinuePending: true as const \} : s/);
+    // The boot recovery save runs before the marks: they are saved after them.
+    const rec = src.slice(src.indexOf('for (const recoveredId of recoveredIds) {'));
+    expect(rec.slice(0, 4000)).toMatch(/if \(recoveredWasRunning\.size > 0\) void stateWriter\.saveAsap\(buildState\(sessionManager\)\);/);
+    const at = src.indexOf("pipeServer.onRpc('daemon.listSessions'");
+    expect(src.slice(at, at + 9000)).toMatch(/delete base\.resumeContinuePending;/);
   });
 
   it('listSessions strips the raw field and surfaces the one-shot mark with the offer only', () => {

@@ -38,9 +38,11 @@ export const RESUME_CONTINUE_MAX_QUIET_MS = 24 * 60 * 60 * 1000;
  * off for that long or the pane was silent with a turn left open, and neither
  * is work to pick up again on its own.
  */
-export function recordWasMidTurn(record: { turnRunningSince?: unknown; lastActivity?: unknown }, now: number): boolean {
+export function recordWasMidTurn(record: { turnRunningSince?: unknown; resumeContinuePending?: unknown; lastActivity?: unknown }, now: number): boolean {
   const since = record.turnRunningSince;
-  if (typeof since !== 'number' || !Number.isFinite(since) || since <= 0) return false;
+  const midTurn = typeof since === 'number' && Number.isFinite(since) && since > 0;
+  // A continue owed by an earlier recovery and not yet spent counts the same.
+  if (!midTurn && record.resumeContinuePending !== true) return false;
   const lastOutput = typeof record.lastActivity === 'string' ? Date.parse(record.lastActivity) : NaN;
   if (!Number.isFinite(lastOutput)) return false;
   return now - lastOutput <= RESUME_CONTINUE_MAX_QUIET_MS;
