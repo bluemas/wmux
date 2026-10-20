@@ -122,6 +122,8 @@ interface FileState {
   teammate?: boolean;
   /** Tool calls seen without a result yet, across reads. */
   pending: Set<string>;
+  /** The file's inode at the last read: another one is a replaced file. */
+  ino: number;
   size: number;
   mtimeMs: number;
   tail: TeammateTail | null;
@@ -188,7 +190,7 @@ export class TeammateScanner {
     if (!stat) { this.files.delete(file); return false; }
     let state = this.files.get(file);
     if (!state) {
-      state = { size: -1, mtimeMs: -1, tail: null, pending: new Set() };
+      state = { size: -1, mtimeMs: -1, tail: null, pending: new Set(), ino: stat.ino };
       this.files.set(file, state);
     }
     // Too old to count whatever it says: stat only, no read.
@@ -196,6 +198,10 @@ export class TeammateScanner {
     if (state.teammate === undefined) state.teammate = isTeammateMeta(file);
     if (state.teammate !== true) return false;
     if (stat.size !== state.size || stat.mtimeMs !== state.mtimeMs) {
+      // A replaced or truncated file is another conversation: its calls are
+      // not the ones carried.
+      if (stat.ino !== state.ino || stat.size < state.size) state.pending.clear();
+      state.ino = stat.ino;
       let tail = readTail(file, TAIL_READ_BYTES, state.pending);
       // Nothing meaningful in the window of a file bigger than it: the last
       // record may be one too big for the window (a long final reply), which

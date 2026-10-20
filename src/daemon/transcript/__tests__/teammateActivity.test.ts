@@ -177,6 +177,19 @@ describe('TeammateScanner', () => {
     expect(pending.size).toBe(0);
   });
 
+  it('a replaced transcript does not inherit the old one\'s pending calls', () => {
+    const now = Date.now();
+    const file = agent('mate', 'in_process_teammate', [toolUse('old', now)]);
+    const scanner = new TeammateScanner(sub);
+    expect(scanner.anyWorking(now)).toBe(true);
+    const fresh = `${file}.new`;
+    fs.writeFileSync(fresh, `${prompt(now)}\n${toolResult('other', now)}\n`);
+    fs.renameSync(fresh, file);
+    fs.utimesSync(file, now / 1000, now / 1000);
+    // Past FRESH_MS, inside PENDING_TOOL_CAP_MS: nothing of the new file is pending.
+    expect(scanner.anyWorking(now + FRESH_MS + 60_000)).toBe(false);
+  });
+
   it('a final reply too big for the tail window still reads as replied', () => {
     const now = Date.now();
     const long = JSON.stringify({

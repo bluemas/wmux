@@ -955,6 +955,16 @@ describe('surfacePendingQuestion lifecycle', () => {
     expect(store.getState().surfaceAgentStatus['pty-1']).toBe('complete');
   });
 
+  it('a teammate stamp leaves a lead waiting or on an error as it is', () => {
+    const store = createTestStore();
+    store.getState().setSurfaceAgent('pty-1', 'Claude Code', 'waiting');
+    store.getState().markSurfaceTeammatesWorking('pty-1');
+    expect(store.getState().surfaceActivityAt['pty-1']).toBeUndefined();
+    store.getState().setSurfaceAgent('pty-1', 'Claude Code', 'complete');
+    store.getState().markSurfaceTeammatesWorking('pty-1');
+    expect(store.getState().surfaceActivityAt['pty-1']).toBeGreaterThan(0);
+  });
+
   it('an empty write clears it (every stop writes the field)', () => {
     const store = createTestStore();
     store.getState().setSurfacePendingQuestion('pty-1', 'Shall I merge?');

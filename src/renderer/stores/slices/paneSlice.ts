@@ -897,6 +897,11 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
 
   markSurfaceTeammatesWorking: (ptyId) => set((state: StoreState) => {
     if (!ptyId) return;
+    // A lead left waiting at its prompt, on an error, or on a question keeps
+    // that status in every view: Fleet would read the stamp as running while
+    // the roster kept the lead's status.
+    const lifecycle = state.surfaceAgent[ptyId]?.status;
+    if (lifecycle === 'waiting' || lifecycle === 'error' || lifecycle === 'awaiting_input') return;
     const now = Date.now();
     state.surfaceActivityAt[ptyId] = now;
     state.surfaceTeammatesAt[ptyId] = now;
