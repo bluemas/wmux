@@ -19,6 +19,52 @@ function makeFakePty(): IPty {
   } as unknown as IPty;
 }
 
+describe('DaemonPTYBridge — an interrupted turn is never continued', () => {
+  const ROW = '  ⎿  Interrupted · What should Claude do instead?\r\n';
+  let bridge: DaemonPTYBridge;
+  let feed: (data: string) => void;
+  let edges: Array<number | null>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    bridge = new DaemonPTYBridge();
+    let onData: ((data: string) => void) | null = null;
+    const pty = {
+      onData: (cb: (data: string) => void) => { onData = cb; return { dispose: () => { onData = null; } }; },
+      onExit: () => ({ dispose: () => undefined }),
+    } as unknown as IPty;
+    feed = (data) => onData?.(data);
+    bridge.setupDataForwarding(pty, new RingBuffer(65536), 'sess-1', new PromptEventLog());
+    feed('Claude Code v2.1.300\r\n  bypass permissions on\r\n'); // opens the Claude gate
+    vi.advanceTimersByTime(10_000);
+    edges = [];
+    bridge.on('agentTurn', (p: { runningSince: number | null }) => edges.push(p.runningSince));
+    bridge.noteInput('fix the build\r');
+    bridge.noteAgentStatus('running', true); // UserPromptSubmit
+  });
+
+  afterEach(() => {
+    bridge.cleanup();
+    vi.useRealTimers();
+  });
+
+  it('the agent\'s interrupt row ends the mid-turn mark, though no Stop closes the episode', () => {
+    expect(bridge.isAgentMidTurn()).toBe(true);
+    bridge.noteInput('\x1b');
+    feed(ROW);
+    expect(bridge.isAgentMidTurn()).toBe(false);
+    expect(edges.at(-1)).toBeNull();
+  });
+
+  it('the next prompt is a turn to continue again', () => {
+    bridge.noteInput('\x1b');
+    feed(ROW);
+    bridge.noteInput('try another way\r');
+    expect(bridge.isAgentMidTurn()).toBe(true);
+    expect(typeof edges.at(-1)).toBe('number');
+  });
+});
+
 describe('DaemonPTYBridge — agentTurn edges', () => {
   let bridge: DaemonPTYBridge;
   let edges: Array<number | null>;
