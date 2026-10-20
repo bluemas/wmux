@@ -463,7 +463,12 @@ export class DaemonPTYBridge extends EventEmitter {
       // Inside a bracketed paste an ESC is text, not a key. On Windows the
       // approval answers write Esc as a win32-input-mode record (#1915).
       if ((active === '\x1b' || active === ESCAPE_WIN32) && !this.inputInBracketedPaste) this.lastEscAt = this.lastInputAt;
-      if ((active === '\x1b' || active === ESCAPE_WIN32 || active === '\x03') && !this.inputInBracketedPaste) this.lastInterruptKeyAt = this.lastInputAt;
+      // A key that interrupts a turn, in every encoding wmux writes: an Esc
+      // (bare, kitty CSI-u, win32), a double Esc in one chunk, Ctrl+C (also
+      // as a kitty key).
+      if (!this.inputInBracketedPaste && (isEscapeChunk(active) || active === '\x1b\x1b' || active.includes('\x03') || active.startsWith('\x1b[99;5'))) {
+        this.lastInterruptKeyAt = this.lastInputAt;
+      }
       if (active.length > 0) {
         this.keyInputRevision += 1;
         this.lastKeyInputAt = this.lastInputAt;

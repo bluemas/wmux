@@ -70,6 +70,19 @@ describe('DaemonPTYBridge — an interrupted turn is never continued', () => {
     expect(bridge.isAgentMidTurn()).toBe(true);
   });
 
+  it('a double Esc in one write, or Ctrl+C, is an interrupt key too', () => {
+    bridge.noteInput('\x1b\x1b');
+    feed(ROW);
+    expect(bridge.isAgentMidTurn()).toBe(false);
+    vi.advanceTimersByTime(500);
+    bridge.noteInput('go on\r');
+    expect(bridge.isAgentMidTurn()).toBe(true);
+    vi.advanceTimersByTime(500);
+    bridge.noteInput('\x03');
+    feed(ROW);
+    expect(bridge.isAgentMidTurn()).toBe(false);
+  });
+
   it('an interrupt row with no interrupt key before it is a redraw, not an interrupt', () => {
     vi.advanceTimersByTime(10_000);
     feed(ROW);
