@@ -146,7 +146,7 @@
 /* A finished turn waiting to be looked at: the app's success green. */
 .wmux-office-bubble--done {
   border-color: #1f6940;
-  background: var(--accent-green, #34d399);
+  background: var(--accent-green);
   color: #0b2a1c;
   font-family: var(--font-ui);
   font-weight: 500;
@@ -183,3 +183,4 @@
 @media (prefers-reduced-motion: reduce) {
   .wmux-office-sprite--loop { animation: none; }
 }
+:root[data-reduced-motion] .wmux-office-sprite--loop { animation: none; }

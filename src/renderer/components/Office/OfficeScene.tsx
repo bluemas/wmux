@@ -217,8 +217,8 @@ function Employee({ employee, layout, t, now, locale, onJump }: EmployeeProps) {
       aria-label={t('office.employeeLabel', {
         name: employee.label,
         workspace: employee.workspaceName,
-        agent: employee.agent,
-        tag: employee.paneTag ?? '',
+        // The agent and its pane tag, leaving out a tag the pane does not have yet.
+        agent: [employee.agent, employee.paneTag].filter(Boolean).join(' '),
         state: stateText,
       })}
       style={{ left: left * OFFICE_SCALE, top: top * OFFICE_SCALE, width: STATION.w * OFFICE_SCALE, height: STATION.h * OFFICE_SCALE }}

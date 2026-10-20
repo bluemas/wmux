@@ -117,6 +117,11 @@ describe('OfficePage', () => {
     for (const part of ['PowerCraft · Codex', 'PowerCraft', 'Codex', 'w30-2', 'Working']) expect(aria).toContain(part);
   });
 
+  it('leaves a missing pane tag out of the accessible name', () => {
+    mount([emp('pty-1', { label: 'PowerCraft', agent: 'Codex', paneTag: undefined, workspaceName: 'PowerCraft' })]);
+    expect(employeeEl('pty-1').getAttribute('aria-label')).toBe('PowerCraft, PowerCraft, Codex: Working');
+  });
+
   it('bubble truncates long activity and hides empty', () => {
     const long = 'Running the whole integration suite\nagainst every fixture in the repo';
     mount([
