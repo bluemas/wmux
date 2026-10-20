@@ -59,7 +59,6 @@ describe('DaemonPTYBridge — an interrupted turn is never continued', () => {
   it('an old turn\'s interrupt row, redrawn while a new turn runs, leaves that turn\'s mark', () => {
     bridge.noteInput('\x1b');
     feed(ROW);
-    vi.advanceTimersByTime(800);
     bridge.noteInput('try another way\r');
     bridge.noteAgentStatus('running', true); // the new turn's UserPromptSubmit
     vi.advanceTimersByTime(1_000);
@@ -67,6 +66,22 @@ describe('DaemonPTYBridge — an interrupted turn is never continued', () => {
     expect(bridge.isAgentMidTurn()).toBe(true);
     vi.advanceTimersByTime(6_000);
     feed(ROW);
+    expect(bridge.isAgentMidTurn()).toBe(true);
+  });
+
+  it('a session start delivered after the interrupt does not bring the turn back', () => {
+    bridge.noteInput('\x1b');
+    feed(ROW);
+    bridge.noteSessionStart(Date.now(), 'resume');
+    expect(bridge.isAgentMidTurn()).toBe(false);
+  });
+
+  it('an Esc and the next prompt in the same millisecond still read in order', () => {
+    bridge.noteInput('\x1b');
+    feed(ROW);
+    bridge.noteInput('try another way\r');
+    bridge.noteAgentStatus('running', true);
+    feed(ROW); // the old row, redrawn
     expect(bridge.isAgentMidTurn()).toBe(true);
   });
 
