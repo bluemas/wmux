@@ -23,6 +23,10 @@ export interface PhoneNoticeCode {
   more?: readonly string[];
 }
 
+/** The notice codes that tell the owner a stopped worker can resume (the
+ *  desktop's card Resume, and the phone card's `resumable`). */
+export const RESUMABLE_NOTICE_CODES: ReadonlySet<string> = new Set(['worker.pausedResumable', 'worker.idlePausedResumable', 'worker.openIdlePausedResumable', 'worker.doneResumable']);
+
 /** The longest string arg the phone receives (a task title, a gate's error,
  *  the slot holders). */
 export const PHONE_NOTICE_ARG_MAX = 500;
@@ -78,7 +82,8 @@ export const PHONE_ROOM_NOTICE_CODES: Readonly<Record<string, PhoneNoticeCode>> 
   'gate.notRunNoBot': bodied('gate.notRunNoBot'),
   'gate.notRunNoWorktree': bodied('gate.notRunNoWorktree'),
   'gate.notRunNoBaseRef': bodied('gate.notRunNoBaseRef'),
-  'research.completed': bodied('research.completed'),
+  'research.completed': bodied('research.completed', { verified: 'number', total: 'number' }, ['room.notice.research.completed.body.counted']),
+  'research.unverified': bodied('research.unverified', { verified: 'number', total: 'number' }),
   'research.notCompleted': titled('research.notCompleted'),
   // A task its merged pull request ended (taskGate.ts).
   'task.merged': bodied('task.merged', { pr: 'number' }),
@@ -98,11 +103,13 @@ export const PHONE_ROOM_NOTICE_CODES: Readonly<Record<string, PhoneNoticeCode>> 
     titles: BUDGET_LIMITS,
     more: ['room.notice.budget.exhausted.at', 'room.notice.budget.exhausted.manual', 'room.notice.budget.exhausted.workers'],
   },
-  // A fan-out waiting for a worker slot, the bot's own or the factory's (roomWriter.ts).
+  // A fan-out waiting for a worker slot, the bot's own, the factory's or
+  // wmux's live fan-out cap (roomWriter.ts); `held`: 1 when the request is
+  // held and starts by itself.
   'workers.full': {
-    args: { bot: 'string', scope: 'string', inUse: 'number', cap: 'number' },
-    titles: ['room.notice.workers.full.bot', 'room.notice.workers.full.factory'],
-    more: ['room.notice.workers.full.body'],
+    args: { bot: 'string', scope: 'string', inUse: 'number', cap: 'number', held: 'number' },
+    titles: ['room.notice.workers.full.bot', 'room.notice.workers.full.factory', 'room.notice.workers.full.wmux'],
+    more: ['room.notice.workers.full.body', 'room.notice.workers.full.held'],
   },
   'budget.held': titled('budget.held', { bot: 'string', until: 'number' }, ['room.notice.budget.held.at', 'room.notice.budget.held.manual']),
   'bot.usageLimit': titled('bot.usageLimit', { bot: 'string', until: 'number' }),

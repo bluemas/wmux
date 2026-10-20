@@ -110,6 +110,18 @@ describe('WorktaskCleanupView', () => {
     expect(useStore.getState().worktaskCleanupVisible).toBe(false);
   });
 
+  // #2388: a half-removed folder whose repository is gone is kept: the close
+  // says where it stays.
+  it('a close that kept the folder says where it stays', async () => {
+    act(() => root.render(createElement(WorktaskCleanupView)));
+    await flush();
+    act(() => button('Close').click());
+    await flush();
+    await act(async () => { finishClose({ ok: true, taskId: 'task-1', archivePending: false, unmaterialized: true, keptFolder: '/wt/fix-parser' }); });
+    await flush();
+    expect(useStore.getState().toasts.some((toast) => toast.message === 'Task closed. Its folder was kept at /wt/fix-parser.')).toBe(true);
+  });
+
   it('says why a phone worktree was not removed: a shell inside it, or a Windows hold', async () => {
     const api = (window as unknown as { electronAPI: { workTask: Record<string, unknown> } }).electronAPI.workTask;
     api.scan = vi.fn(async () => ({
@@ -214,6 +226,39 @@ describe('WorktaskCleanupView', () => {
       expect(container.textContent).toContain('Detail from a newer main');
       expect(container.textContent).toContain('Detail from an older main');
     });
+  });
+
+  // #2388: Close and keep folder shows only after a refused close, never for
+  // an unpushed branch, and closes the task through task:close with keepFolder.
+  it('offers Close and keep folder after a refused close, and it closes keeping the folder', async () => {
+    act(() => root.render(createElement(WorktaskCleanupView)));
+    await flush();
+    expect(container.querySelector('[data-cleanup-close-keep-folder]')).toBeNull();
+    act(() => button('Close').click());
+    await flush();
+    await act(async () => { finishClose({ ok: false, reason: 'error', error: 'could not verify all processes exited' }); });
+    await flush();
+    const keep = container.querySelector('[data-cleanup-close-keep-folder]') as HTMLButtonElement;
+    expect(keep?.textContent).toBe('Close and keep folder');
+    act(() => keep.click());
+    await flush();
+    const close = (window as unknown as { electronAPI: { workTask: { close: ReturnType<typeof vi.fn> } } }).electronAPI.workTask.close;
+    expect(close).toHaveBeenLastCalledWith('task-1', 'ws-task', { keepFolder: true });
+    await act(async () => { finishClose({ ok: true, taskId: 'task-1', archivePending: false, keptFolder: '/wt/fix-parser' }); });
+    await flush();
+    expect(useStore.getState().toasts.some((toast) => toast.message === 'Task closed. Its folder was kept at /wt/fix-parser.')).toBe(true);
+    expect(container.querySelector('[data-cleanup-close-keep-folder]')).toBeNull();
+  });
+
+  it('offers no Close and keep folder for an unpushed branch', async () => {
+    act(() => root.render(createElement(WorktaskCleanupView)));
+    await flush();
+    act(() => button('Close').click());
+    await flush();
+    await act(async () => { finishClose({ ok: false, reason: 'unpushed', aheadCount: 1 }); });
+    await flush();
+    expect(container.querySelector('[data-cleanup-close-failed]')).not.toBeNull();
+    expect(container.querySelector('[data-cleanup-close-keep-folder]')).toBeNull();
   });
 
   it('Commit & close leaves focus on the terminal holding the prepared line', async () => {

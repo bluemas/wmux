@@ -26,6 +26,7 @@
  */
 
 import { botWorkerAgentPromptNote } from '../../shared/codexWorkerGuard';
+import { DEFAULT_RESEARCH_CRITERIA } from '../../shared/nonCodeTaskEvidence';
 import { ensureSecretHook } from '../git/secretHookHost';
 import { beginBotWorkerSpawn } from '../agents/botWorkerMergeGuard';
 import { mintSecretGrant, revokeSecretGrant } from '../factory/secretGrants';
@@ -604,6 +605,8 @@ export class FanOutService {
   constructor(opts: FanOutServiceOptions) {
     this.daemon = opts.daemon;
     this.renderer = opts.renderer;
+    // No pending-removal store (#2388): fan-out only removes a worktree no
+    // pane ever ran in, by force, and a forced removal records nothing.
     this.worktrees = opts.worktrees ?? new TaskWorktreeManager({ onCreated: ensureSecretHook });
     this.project = opts.project;
     this.firstRun = opts.firstRun;
@@ -1771,6 +1774,7 @@ export class FanOutService {
                 ...(ctx.handoffId ? { handoffId: ctx.handoffId } : {}),
                 ...(ctx.workflow ? { workflow: ctx.workflow } : {}),
                 ...(connectors.length > 0 ? { connectors: connectors.map((c) => c.name) } : {}),
+                ...(ctx.preset === 'research' ? { criteria: [...DEFAULT_RESEARCH_CRITERIA] } : {}),
               },
             }
           : {}),

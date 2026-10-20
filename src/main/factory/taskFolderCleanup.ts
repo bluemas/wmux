@@ -66,7 +66,8 @@ import type { LedgerEntry } from '../../shared/ledger';
 import { BOT_ID_RE } from '../../shared/bot';
 import { getExecEnv } from '../../shared/execEnv';
 import { createFilePersister, readVersionedFile, type FilePersister } from './versionedFile';
-import { sessionHostDir } from '../worktask/stopSessionsInDir';
+import { assertNothingRunsIn, sessionHostDir } from '../worktask/stopSessionsInDir';
+import { treeKillRefusal } from '../../daemon/automation/verifiedTreeKill';
 import { STOPPED_BY_OWNER, STOP_SYSTEM_WORKSPACE, isStoppedByOwnerRow } from './factoryStop';
 
 export const TASK_FOLDERS_FILENAME = 'task-folders.json';
@@ -242,6 +243,11 @@ export interface TaskFolderSession {
   spawnCwd?: string;
   cwd?: string;
   wslTarget?: { distribution?: unknown };
+  /** The daemon's session meta, for why a pane still runs (#2388). */
+  pid?: number;
+  state?: string;
+  pidStartTime?: string;
+  pidCreatedAtFt?: string;
 }
 
 export interface TaskFolderPorts {
@@ -267,6 +273,11 @@ export interface TaskFolderPorts {
   /** Whether a task gate's process runs for this task now (its own spawn,
    *  not a daemon session). Absent: none. */
   gateRunning?: (taskId: string) => boolean;
+  /** #2388: throws while something an earlier stop of the folder's panes
+   *  left runs, or such a stop is under way (their sessions are gone from
+   *  the daemon's list by then). Default: assertNothingRunsIn, given the
+   *  sessions this pass read. */
+  nothingRunsIn?: (folder: string, sessions: readonly TaskFolderSession[]) => Promise<void>;
   /** Default: removeTreeNoFollow. */
   removeDir?: (dir: string) => Promise<void>;
   /** Default: gitWorktreeRegistered. */
@@ -312,14 +323,14 @@ function defaultExists(p: string): boolean {
 
 /** Whether any daemon session was started in the folder or works in it now
  *  (a WSL pane's Linux path read as the Windows folder it is). */
-function folderInUse(folder: string, sessions: readonly TaskFolderSession[]): boolean {
+function sessionsInFolder(folder: string, sessions: readonly TaskFolderSession[]): TaskFolderSession[] {
   let real = folder;
   try {
     real = fs.realpathSync(folder);
   } catch {
     /* compared as given */
   }
-  return sessions.some((s) => [s.spawnCwd, s.cwd].some((d) => {
+  return sessions.filter((s) => [s.spawnCwd, s.cwd].some((d) => {
     if (typeof d !== 'string' || d.length === 0) return false;
     const host = sessionHostDir(d, s);
     return isInside(host, folder) || isInside(host, real);
@@ -328,6 +339,10 @@ function folderInUse(folder: string, sessions: readonly TaskFolderSession[]): bo
 
 /** taskId → why its folder's last removal failed (read right after it). */
 const folderFailures = new Map<string, string>();
+/** taskId → why its folder is still in use, when a stop could not end the
+ *  pane holding it (#2388: its process identity is not known). Read right
+ *  after it, like folderFailures. */
+const folderBusyReasons = new Map<string, string>();
 
 /** The real path of a folder as the OS resolves it (native: on Windows a
  *  junction or a volume mount point resolves to its target), compared
@@ -543,6 +558,25 @@ export async function holdTaskFolder(taskId: string): Promise<() => void> {
   };
 }
 
+/** Tasks whose folder the owner kept (Close and keep folder, #2388): no
+ *  cleanup removes it, even one handed the task's mission before the close
+ *  detached it. */
+const keptByOwner = new Set<string>();
+
+/**
+ * Close and keep folder holds the task's folder while the task closes, as a
+ * resume does (holdTaskFolder). The release says whether the task closed
+ * keeping it; a cleanup queued with a mission read before the detach then
+ * leaves the folder alone.
+ */
+export async function holdTaskFolderToKeep(taskId: string): Promise<(kept: boolean) => void> {
+  const release = await holdTaskFolder(taskId);
+  return (kept) => {
+    if (kept) keptByOwner.add(taskId);
+    release();
+  };
+}
+
 /** Whether the folder is where its root says, through no link: the real
  *  path relative to the root's real path is the path as written. */
 function throughNoLink(folder: string, root: string): boolean {
@@ -590,7 +624,7 @@ async function cleanTaskFolderNow(
   const now = ports.now ?? Date.now;
   const log = ports.log ?? ((m: string) => console.warn(m));
   const exists = ports.exists ?? defaultExists;
-  if (!isEndedBotTask(entry) || !mission || mission.detached === true) return 'skipped';
+  if (!isEndedBotTask(entry) || !mission || mission.detached === true || keptByOwner.has(entry.id)) return 'skipped';
   const botId = entry.dispatch?.origin.botId ?? '';
   const kind = taskFolderKind(mission.folder, mission.branch, botId, ports.roots);
   if (!kind) return 'skipped';
@@ -656,7 +690,7 @@ async function cleanTaskFolderNow(
     folderFailures.set(entry.id, reason);
     return 'failed';
   };
-  if ((folderHolds.get(entry.id) ?? 0) > 0) return 'skipped';
+  if ((folderHolds.get(entry.id) ?? 0) > 0 || keptByOwner.has(entry.id)) return 'skipped';
   if (prior?.state === 'removed') return 'skipped';
   if (prior?.state === 'kept_dirty' && opts.force !== true) return 'skipped';
   if (prior?.state === 'restored' && now() - prior.at < TASK_FOLDER_RESTORE_HOLD_MS) return 'skipped';
@@ -673,8 +707,21 @@ async function cleanTaskFolderNow(
     await ports.store.put({ taskId: entry.id, kind, path: mission.folder, state: 'removed', ...keep, ...stoppedMark, at: now() }).catch(() => undefined);
     return 'skipped';
   }
-  if (folderInUse(mission.folder, sessions)) return 'busy';
+  const inFolder = sessionsInFolder(mission.folder, sessions);
+  if (inFolder.length > 0) {
+    // A pane a stop left running says why: Clean up now names it.
+    const refused = inFolder.map((x) => (typeof x.pid === 'number' && typeof x.state === 'string'
+      ? treeKillRefusal({ pid: x.pid, state: x.state, pidStartTime: x.pidStartTime, pidCreatedAtFt: x.pidCreatedAtFt })
+      : null)).find((r): r is string => r !== null);
+    if (refused) folderBusyReasons.set(entry.id, `a pane of the task is still running: ${refused}`);
+    return 'busy';
+  }
   if (ports.gateRunning?.(entry.id) === true) return 'busy';
+  try {
+    await (ports.nothingRunsIn ?? ((d, list) => assertNothingRunsIn(d, { listSessions: async () => [...list] })))(mission.folder, sessions);
+  } catch {
+    return 'busy';
+  }
   const root = kind === 'research' ? path.join(ports.roots.wmuxDir, 'factory', 'bots', botId, 'research') : ports.roots.worktrees;
   if (!throughNoLink(mission.folder, root)) {
     log(`[factory] folder of ${entry.id} left alone: it is not where its root says (a link)`);
@@ -733,7 +780,7 @@ async function cleanTaskFolderNow(
   const repo = await ports.repoInfo(mission.folder).catch(() => null);
   // A detached checkout comes back on its commit, so it needs one.
   if (!repo || (!mission.branch && !repo.head)) return fail(prior?.repoRoot ? 'its repository could not be read' : 'it is no longer a worktree, and its repository was not recorded');
-  if ((folderHolds.get(entry.id) ?? 0) > 0) return 'skipped';
+  if ((folderHolds.get(entry.id) ?? 0) > 0 || keptByOwner.has(entry.id)) return 'skipped';
   // Commits made on a detached HEAD are held by no branch: a ref keeps them
   // before the worktree (and with it HEAD's reflog) goes.
   const kept = await keepDetachedCommits(repo.repoRoot, mission.folder, entry.id, mission.branch, repo.head, entry.dispatch?.checkout?.sha);
@@ -841,12 +888,16 @@ export async function cleanTaskFolders(ports: TaskFolderPorts, rows: readonly Le
   const count = (r: TaskFolderOutcome, taskId: string, folder: string | undefined): void => {
     if (r === 'removed') out.removed++;
     else if (r === 'kept_dirty') out.keptDirty++;
-    else if (r === 'busy') out.busy++;
-    else if (r === 'failed') {
+    else if (r === 'busy') {
+      out.busy++;
+      const why = folderBusyReasons.get(taskId);
+      if (why) (out.notRemoved ??= []).push({ path: folder ?? taskId, reason: why });
+    } else if (r === 'failed') {
       out.failed++;
       (out.notRemoved ??= []).push({ path: folder ?? taskId, reason: folderFailures.get(taskId) ?? 'it could not be removed' });
     }
     folderFailures.delete(taskId);
+    folderBusyReasons.delete(taskId);
   };
   const handled = new Set<string>();
   for (const row of ended) {
@@ -859,7 +910,17 @@ export async function cleanTaskFolders(ports: TaskFolderPorts, rows: readonly Le
   // ended rows after a while: its record says where it is.
   for (const rec of keptRecords(ports.store)) {
     if (handled.has(rec.taskId)) continue;
-    count(await cleanTaskFolder(ports, keptRow(rec), { folder: rec.path, ...(rec.branch ? { branch: rec.branch } : {}) }, sessions, opts), rec.taskId, rec.path);
+    // Its mission, when the daemon still holds it, says whether the folder
+    // was handed to the owner (detached: Close and keep folder, #2388), as
+    // the automatic pass reads it; only a mission gone too leaves the record
+    // to say where.
+    // Missions that could not be read leave it for a later pass.
+    const owner = rec.stopped?.workspaceId;
+    if (owner && !byOwner.has(owner)) byOwner.set(owner, await ports.missions(owner).catch(() => null));
+    const missions = owner ? byOwner.get(owner) : undefined;
+    if (owner && !missions) continue;
+    const mission = missions?.get(rec.taskId) ?? { folder: rec.path, ...(rec.branch ? { branch: rec.branch } : {}) };
+    count(await cleanTaskFolder(ports, keptRow(rec), mission, sessions, opts), rec.taskId, rec.path);
   }
   return out;
 }
@@ -1079,6 +1140,7 @@ export function installTaskFolderCleanup(ports: TaskFolderPorts & {
           if (!missions) continue;
           const r = await cleanTaskFolder(ports, row, missions.get(row.id) ?? null, sessions);
           folderFailures.delete(row.id);
+          folderBusyReasons.delete(row.id);
           if (r === 'failed') {
             const key = `${row.id}@${row.rev}`;
             attempts.set(key, (attempts.get(key) ?? 0) + 1);
@@ -1102,6 +1164,7 @@ export function installTaskFolderCleanup(ports: TaskFolderPorts & {
             ?? (live ? null : { folder: rec.path, ...(rec.branch ? { branch: rec.branch } : {}) });
           const r = await cleanTaskFolder(ports, live ?? keptRow(rec), mission, sessions, { keptTtl: true });
           folderFailures.delete(rec.taskId);
+          folderBusyReasons.delete(rec.taskId);
           if (r === 'failed') {
             const key = `${rec.taskId}@kept`;
             attempts.set(key, (attempts.get(key) ?? 0) + 1);

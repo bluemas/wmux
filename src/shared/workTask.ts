@@ -249,7 +249,9 @@ export const WORKTASK_META_FILENAME = 'task.json';
 
 /** task:close 결과(TaskCloseService.CloseTaskResult 미러). */
 export type CloseTaskResultWire =
-  | { ok: true; taskId: string; archivePending: boolean; unmaterialized?: boolean }
+  /** `keptFolder`: the task closed and its folder stays on disk at this path
+   *  (the owner chose Close and keep folder, or its repository is gone). */
+  | { ok: true; taskId: string; archivePending: boolean; unmaterialized?: boolean; keptFolder?: string }
   | {
       ok: false;
       taskId: string;
