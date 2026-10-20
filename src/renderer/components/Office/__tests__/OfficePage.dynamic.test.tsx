@@ -153,6 +153,31 @@ describe('OfficePage', () => {
     for (const b of bubbles) expect(b!.classList.contains('wmux-office-bubble--line')).toBe(true);
   });
 
+  it('status bubbles draw above every name label; activity bubbles stay below', () => {
+    // Desks 0-4 are the back row, 5-9 the row in front of it.
+    mount([
+      ...Array.from({ length: 5 }, (_, i) => emp(`w${i}`, { bubble: `Running step ${i}` })),
+      emp('q', { state: 'needs_you', need: 'question' }),
+      emp('d1', { state: 'finished' }),
+      emp('d2', { state: 'finished' }),
+      emp('e', { state: 'needs_you', need: 'error' }),
+      emp('w9', { bubble: 'Thinking' }),
+    ]);
+    const zOf = (el: Element | null): number => Number((el as HTMLElement).style.zIndex);
+    const labels = Array.from(container.querySelectorAll('.wmux-office-employee__label')).map(zOf);
+    const bubbles = Array.from(container.querySelectorAll<HTMLElement>('[data-office-bubble]'));
+    const status = bubbles.filter((b) => b.getAttribute('data-office-bubble') !== 'activity');
+    const activity = bubbles.filter((b) => b.getAttribute('data-office-bubble') === 'activity');
+    expect(status.length).toBe(4);
+    expect(activity.length).toBe(6);
+    for (const b of status) expect(zOf(b)).toBeGreaterThan(Math.max(...labels));
+    for (const b of activity) expect(zOf(b)).toBeLessThan(Math.min(...labels));
+    // Among themselves, status bubbles still stack by depth: the nearer one wins.
+    const q = zOf(employeeEl('q').querySelector('[data-office-bubble]'));
+    const e = zOf(employeeEl('e').querySelector('[data-office-bubble]'));
+    expect(e).toBeGreaterThan(q);
+  });
+
   it('needs-you employee shows a raised hand and a red bubble', () => {
     const resetsAt = new Date(2026, 9, 20, 14, 0).getTime();
     mount([

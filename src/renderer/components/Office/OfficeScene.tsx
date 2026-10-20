@@ -17,10 +17,16 @@ import { stackIndex, type OfficeLayout, type OfficeProp, type Seat } from './off
 
 /** Display scale: the art is drawn at 1x and meant to be seen at 2x. */
 export const OFFICE_SCALE = 2;
-/** Above every sprite: bubbles stack by depth from here, so a nearer employee's wins. */
+/** Above every sprite: activity bubbles stack by depth from here, so a nearer employee's wins. */
 const BUBBLE_Z = 100000;
-/** Names sit above every bubble (depths stay well under 10000). */
+/** Names sit above every activity bubble (depths stay well under 10000). */
 const LABEL_Z = 110000;
+/**
+ * Needs-you and finished bubbles sit above every name, so a status is never
+ * hidden, and stack by depth among themselves; still under the hovered
+ * label and bubble (120000+).
+ */
+const STATUS_BUBBLE_Z = 110001;
 const BUBBLE_MAX = 40;
 
 type Translate = (key: TranslationKey, vars?: Record<string, string | number>) => string;
@@ -242,7 +248,7 @@ function Employee({ employee, layout, t, now, locale, onJump }: EmployeeProps) {
           }`}
           data-office-bubble={alert ? 'alert' : done ? 'done' : 'activity'}
           aria-hidden="true"
-          style={{ left: STATION.seatX * OFFICE_SCALE, zIndex: BUBBLE_Z + Math.round(seat.z) }}
+          style={{ left: STATION.seatX * OFFICE_SCALE, zIndex: (alert || done ? STATUS_BUBBLE_Z : BUBBLE_Z) + Math.round(seat.z) }}
         >
           {alert || done ? (
             <>
