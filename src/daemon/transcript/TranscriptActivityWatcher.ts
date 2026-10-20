@@ -41,7 +41,14 @@
 //     teammate still working, so the pane reads running after the lead's turn
 //     ended. Nothing is sent when none works: main's activity stamp decays on
 //     its own. The scanner lives on the watch, so it ends with it.
+//   - Claude background shells (subagentCount.ts `shells()`). The same scan
+//     also reports the pane working while a shell it launched still works
+//     (shellWorking: output written within SHELL_FRESH_MS, launch younger
+//     than SHELL_MAX_AGE_MS), even after a typed prompt started a turn whose
+//     Stop the bridge scopes to its own dispatches. The caps keep a dev
+//     server left up from holding the pane running for good.
 
+import fs from 'node:fs';
 import type { ResumeBinding } from '../../shared/agentResume';
 import type { TurnEvent } from '../../shared/transcript/turnEvents';
 import { parseTranscriptLine } from './parseEntry';
@@ -50,7 +57,7 @@ import { isLineBoundary, readTranscriptDelta, readTranscriptPage, statTranscript
 import { HOOK_ACTIVITY_KINDS } from '../../shared/hooks/hookActivityKinds';
 import { MAX_RAW_LEN, summarizeActivity } from '../../shared/activitySummary';
 import { agentRow } from '../../shared/agentIdentity';
-import { SUBAGENT_COUNTERS, type SubagentCounter } from './subagentCount';
+import { SUBAGENT_COUNTERS, type ShellEntry, type SubagentCounter } from './subagentCount';
 import { TeammateScanner, subagentsDirFor } from './teammateActivity';
 
 /** Most bytes read for one session in one tick. */
@@ -64,6 +71,24 @@ const DEFAULT_MIN_GAP_MS = 2000;
  *  finds one working refreshes main's 120 s activity stamp, so a refresh that
  *  lands inside main's 3 s settle guard right after a Stop is retried soon. */
 export const TEAMMATE_POLL_MS = 15_000;
+/** A background shell counts as working while its output file changed this
+ *  recently (as a teammate's FRESH_MS): a dev server left up goes quiet. */
+export const SHELL_FRESH_MS = 10 * 60_000;
+/** ...and never past this long after its launch, however much it writes. */
+export const SHELL_MAX_AGE_MS = 60 * 60_000;
+
+/** Whether a background shell still reads as working at `now`. A launch that
+ *  named no output file goes by its age alone; a named file that cannot be
+ *  read says it is not (the safe direction). */
+export function shellWorking(shell: ShellEntry, now: number): boolean {
+  if (now - shell.startedAt >= SHELL_MAX_AGE_MS) return false;
+  if (!shell.outputFile) return true;
+  try {
+    return now - fs.statSync(shell.outputFile).mtimeMs <= SHELL_FRESH_MS;
+  } catch {
+    return false;
+  }
+}
 
 type ParseLine = (line: string, offset: number) => TurnEvent[];
 
@@ -144,11 +169,11 @@ export interface TranscriptActivityDeps {
   /** Report how many subagents the session's agent has running (on change). */
   emitSubagents?: (sessionId: string, count: number) => void;
   /**
-   * The session's Claude Code has an Agent Teams teammate still working: a
-   * running-state refresh, sent on every teammate scan that finds one (never
-   * a turn start, never a count).
+   * The session's Claude Code has background work still going (an Agent
+   * Teams teammate, or a background shell): a running-state refresh, sent on
+   * every scan that finds some (never a turn start, never a count).
    */
-  emitTeammatesWorking?: (sessionId: string) => void;
+  emitBackgroundWorking?: (sessionId: string) => void;
   teammatePollMs?: number;
   /**
    * Every complete line read from a Claude transcript, in file order, with the
@@ -190,7 +215,7 @@ interface Watch {
   subagentsSent: number;
   /** Scans the session's subagents/ folder for working teammates (Claude). */
   teammates?: TeammateScanner;
-  /** When `teammates` last scanned (0 before any). */
+  /** When the background scan (teammates, then shells) last ran (0 before any). */
   teammatesAt: number;
 }
 
@@ -347,7 +372,7 @@ export class TranscriptActivityWatcher {
         this.dropWatch(id);
       }
       if (this.watches.get(id) === watch) this.flushSubagents(id, watch);
-      if (this.watches.get(id) === watch) this.scanTeammates(id, watch);
+      if (this.watches.get(id) === watch) this.scanBackground(id, watch);
     }
     this.deps.afterTick?.();
   }
@@ -367,7 +392,7 @@ export class TranscriptActivityWatcher {
     this.deps.emitSubagents?.(id, count);
   }
 
-  private scanTeammates(id: string, watch: Watch): void {
+  private scanBackground(id: string, watch: Watch): void {
     if (!watch.teammates) return;
     const now = this.now();
     if (watch.teammatesAt > 0 && now - watch.teammatesAt < (this.deps.teammatePollMs ?? TEAMMATE_POLL_MS)) return;
@@ -378,7 +403,8 @@ export class TranscriptActivityWatcher {
     } catch {
       // An unreadable folder says nothing; the activity line is unaffected.
     }
-    if (working) this.deps.emitTeammatesWorking?.(id);
+    if (!working) working = (watch.subagents?.shells?.() ?? []).some((shell) => shellWorking(shell, now));
+    if (working) this.deps.emitBackgroundWorking?.(id);
   }
 
   /** One transcript, one pane: the pane whose agent spoke last keeps it. */
@@ -423,7 +449,7 @@ export class TranscriptActivityWatcher {
     const stat = statTranscript(path);
     if (!stat) return;
     const subagents = binding ? SUBAGENT_COUNTERS[binding.agent]?.() : undefined;
-    const teammates = binding?.agent === 'claude' && this.deps.emitTeammatesWorking ? new TeammateScanner(subagentsDirFor(path)) : undefined;
+    const teammates = binding?.agent === 'claude' && this.deps.emitBackgroundWorking ? new TeammateScanner(subagentsDirFor(path)) : undefined;
     const counted: ParseLine = subagents ? (line, offset) => { subagents.noteLine(line); return parse(line, offset); } : parse;
     // Start at the end: only what the agent writes from now on.
     this.watches.set(id, { path, parse: counted, ino: stat.ino, offset: stat.size, sentAt: 0, lines: !!onLine, linesOnly: this.hookFed.has(id), replay: !!onLine, subagents, subagentsSent: 0, teammates, teammatesAt: 0 });

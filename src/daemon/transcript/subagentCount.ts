@@ -15,6 +15,8 @@ export interface SubagentCounter {
   noteLine(line: string): void;
   /** Subagents currently running. */
   readonly count: number;
+  /** Background shells still running (Claude only; not part of `count`). */
+  shells?(): ShellEntry[];
   /** Forget everything (lines were skipped, or the file was replaced). */
   reset(): void;
 }
@@ -102,6 +104,23 @@ const CLAUDE_TASK_STOP_TOOLS: ReadonlySet<string> = new Set(['TaskStop', 'KillSh
  *  same shape wmux-bridge.mjs BACKGROUND_TASK_ID_RE matches), anchored at the
  *  start so a result that only quotes it started nothing. */
 const ASYNC_AGENT_RE = /^\s*Async agent launched successfully[\s\S]*?agentId:\s*([\w-]+)/i;
+/** The immediate result of a shell call (any tool: Bash, PowerShell) that left
+ *  its command running: launched in the background, or moved there after its
+ *  timeout. The same two shapes as wmux-bridge.mjs BACKGROUND_TASK_ID_RE, and
+ *  anchored the same way, so a Read of a log that quotes one counts nothing. */
+const BACKGROUND_SHELL_RE = /^\s*Command running in background with ID:\s*([\w-]+)|^\s*Command\b[^\n]*?moved to the background \(ID:\s*([\w-]+)\)/i;
+/** The file the launch result says the shell's output goes to. */
+const SHELL_OUTPUT_RE = /Output is being written to:\s*(\S[^\n]*?\.output)\b/;
+
+/** A Claude background shell that has not ended yet. */
+export interface ShellEntry {
+  toolUseId: string;
+  taskId: string;
+  /** Where its output is written, when the launch result named it. */
+  outputFile?: string;
+  /** Launch time (the record's timestamp, else when it was read). */
+  startedAt: number;
+}
 
 function resultText(content: unknown): string {
   if (typeof content === 'string') return content;
@@ -122,22 +141,49 @@ function resultText(content: unknown): string {
  *     it), or a TaskStop names its agent id.
  * Only `assistant` / `user` records are read for tool calls: other records
  * (an `api-request-blob`) can carry copies of earlier turns.
+ *
+ * Background shells are tracked apart from the count (`shells()`): the
+ * watcher keeps the pane running while one still works. A shell starts at its
+ * call's immediate result (BACKGROUND_SHELL_RE) and ends the same ways an
+ * async agent does: a `<task-notification>` naming its tool_use id or task id,
+ * or a TaskStop / KillShell / KillBash naming its task id. A typed prompt does
+ * not end one: the build the agent started in an earlier turn still runs.
  */
 export class ClaudeSubagentCounter implements SubagentCounter {
   /** Foreground Agent/Task calls without a result yet, by tool_use id. */
   private readonly foreground = new Set<string>();
   /** Async agents: tool_use id → agent id. */
   private readonly async = new Map<string, string>();
+  /** Background shells, by tool_use id. */
+  private readonly shellsById = new Map<string, ShellEntry>();
 
   get count(): number { return this.foreground.size + this.async.size; }
+
+  /** Background shells launched since the watch started, not ended yet. */
+  shells(): ShellEntry[] { return [...this.shellsById.values()]; }
 
   reset(): void {
     this.foreground.clear();
     this.async.clear();
+    this.shellsById.clear();
   }
 
+  /** Ends the async agent or background shell with this task id. */
   private settleAgentId(agentId: string): void {
     for (const [toolUseId, id] of this.async) if (id === agentId) this.async.delete(toolUseId);
+    for (const [toolUseId, shell] of this.shellsById) if (shell.taskId === agentId) this.shellsById.delete(toolUseId);
+  }
+
+  /** `recordTaskId`: the record's `toolUseResult.backgroundTaskId`, when the
+   *  record holds this one result only (a rewording of the text then still
+   *  counts; a Read result never carries one). */
+  private noteShell(entry: Record<string, unknown>, toolUseId: string, text: string, recordTaskId: string | undefined): void {
+    const m = BACKGROUND_SHELL_RE.exec(text);
+    const taskId = m?.[1] ?? m?.[2] ?? recordTaskId;
+    if (!taskId) return;
+    const outputFile = SHELL_OUTPUT_RE.exec(text)?.[1];
+    const at = typeof entry.timestamp === 'string' ? Date.parse(entry.timestamp) : NaN;
+    this.shellsById.set(toolUseId, { toolUseId, taskId, ...(outputFile ? { outputFile } : {}), startedAt: Number.isFinite(at) ? at : Date.now() });
   }
 
   noteLine(line: string): void {
@@ -156,6 +202,9 @@ export class ClaudeSubagentCounter implements SubagentCounter {
       && (typeof message.content === 'string' || (content && !content.some((b) => record(b).type === 'tool_result')))) {
       this.foreground.clear();
     }
+    const results = content ? content.filter((b) => record(b).type === 'tool_result').length : 0;
+    const backgroundTaskId = record(entry.toolUseResult).backgroundTaskId;
+    const recordTaskId = results === 1 && typeof backgroundTaskId === 'string' && backgroundTaskId ? backgroundTaskId : undefined;
     for (const raw of content ?? []) {
       const block = record(raw);
       if (block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
@@ -166,8 +215,12 @@ export class ClaudeSubagentCounter implements SubagentCounter {
           if (typeof taskId === 'string' && taskId) this.settleAgentId(taskId);
         }
       } else if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
-        if (!this.foreground.delete(block.tool_use_id)) continue;
-        const agentId = ASYNC_AGENT_RE.exec(resultText(block.content))?.[1];
+        const text = resultText(block.content);
+        if (!this.foreground.delete(block.tool_use_id)) {
+          if (entry.type === 'user') this.noteShell(entry, block.tool_use_id, text, recordTaskId);
+          continue;
+        }
+        const agentId = ASYNC_AGENT_RE.exec(text)?.[1];
         if (agentId) this.async.set(block.tool_use_id, agentId);
       }
     }
@@ -181,7 +234,10 @@ export class ClaudeSubagentCounter implements SubagentCounter {
     if (typeof body !== 'string' || !body.includes('<task-notification>')) return;
     // Its arrival settles the task, whatever its <status> says.
     const toolUseId = /<tool-use-id>([^<]+)<\/tool-use-id>/.exec(body)?.[1]?.trim();
-    if (toolUseId) this.async.delete(toolUseId);
+    if (toolUseId) {
+      this.async.delete(toolUseId);
+      this.shellsById.delete(toolUseId);
+    }
     const taskId = /<task-id>([^<]+)<\/task-id>/.exec(body)?.[1]?.trim();
     if (taskId) this.settleAgentId(taskId);
   }
