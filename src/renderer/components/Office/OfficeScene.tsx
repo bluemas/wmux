@@ -17,8 +17,10 @@ import { stackIndex, type OfficeLayout, type OfficeProp, type Seat } from './off
 
 /** Display scale: the art is drawn at 1x and meant to be seen at 2x. */
 export const OFFICE_SCALE = 2;
-/** Above every sprite: names and bubbles stay readable over the room. */
-const TEXT_Z = 100000;
+/** Above every sprite: bubbles stack by depth from here, so a nearer employee's wins. */
+const BUBBLE_Z = 100000;
+/** Names sit above every bubble (depths stay well under 10000). */
+const LABEL_Z = 110000;
 const BUBBLE_MAX = 40;
 
 type Translate = (key: TranslationKey, vars?: Record<string, string | number>) => string;
@@ -207,17 +209,17 @@ function Employee({ employee, layout, t, now, locale, onJump }: EmployeeProps) {
       <span
         className="wmux-office-employee__label"
         aria-hidden="true"
-        style={{ left: STATION.seatX * OFFICE_SCALE, top: (STATION.seatY + 2) * OFFICE_SCALE, zIndex: TEXT_Z }}
+        style={{ left: STATION.seatX * OFFICE_SCALE, top: (STATION.seatY + 2) * OFFICE_SCALE, zIndex: LABEL_Z }}
       >
         <span className="wmux-office-employee__name">{employee.name}</span>
         <span className="wmux-office-employee__workspace"> · {employee.workspaceName}</span>
       </span>
       {(alert || activity) && (
         <span
-          className={`wmux-office-bubble${alert ? ' wmux-office-bubble--alert' : ''}`}
+          className={`wmux-office-bubble ${alert ? 'wmux-office-bubble--alert' : 'wmux-office-bubble--line'}`}
           data-office-bubble={alert ? 'alert' : 'activity'}
           aria-hidden="true"
-          style={{ left: STATION.seatX * OFFICE_SCALE, zIndex: TEXT_Z + 1 }}
+          style={{ left: STATION.seatX * OFFICE_SCALE, zIndex: BUBBLE_Z + Math.round(seat.z) }}
         >
           {alert ? (
             <>

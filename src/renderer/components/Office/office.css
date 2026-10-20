@@ -90,7 +90,7 @@
 .wmux-office-employee:hover .wmux-office-employee__label,
 .wmux-office-employee:focus-visible .wmux-office-employee__label {
   max-width: 240px;
-  z-index: 100010 !important;
+  z-index: 120001 !important;
 }
 .wmux-office-employee:hover .wmux-office-employee__workspace,
 .wmux-office-employee:focus-visible .wmux-office-employee__workspace { display: inline; }
@@ -122,7 +122,19 @@
   text-align: left;
   pointer-events: auto;
 }
-.wmux-office-employee:hover .wmux-office-bubble { z-index: 100011 !important; }
+.wmux-office-employee:hover .wmux-office-bubble,
+.wmux-office-employee:focus-visible .wmux-office-bubble { z-index: 120000 !important; }
+
+/* Activity: one short line so it never covers a neighbour's desk; the whole
+   (at most 40 character) text shows on hover or focus. */
+.wmux-office-bubble--line {
+  display: block;
+  max-width: 94px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.wmux-office-employee:hover .wmux-office-bubble--line,
+.wmux-office-employee:focus-visible .wmux-office-bubble--line { max-width: 300px; }
 
 .wmux-office-bubble--alert {
   border-color: #8f1d22;

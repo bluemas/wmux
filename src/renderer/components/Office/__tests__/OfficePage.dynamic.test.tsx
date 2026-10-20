@@ -124,6 +124,21 @@ describe('OfficePage', () => {
     expect(employeeEl('rest').querySelector('[data-office-bubble]')).toBeNull();
   });
 
+  it('names stay above every bubble and activity bubbles are one line stacked by depth', () => {
+    // Desk 0 is in the back row; desk 5 is the desk in front of it in the next row.
+    mount(Array.from({ length: 6 }, (_, i) => emp(`e${i}`, { bubble: `Running step ${i}` })));
+    const zOf = (el: Element | null): number => Number((el as HTMLElement).style.zIndex);
+    const bubbles = ['e0', 'e5'].map((id) => employeeEl(id).querySelector('[data-office-bubble]'));
+    const labels = ['e0', 'e5'].map((id) => employeeEl(id).querySelector('.wmux-office-employee__label'));
+    // (a) any name beats any bubble.
+    const lowestLabel = Math.min(...labels.map(zOf));
+    for (const b of bubbles) expect(zOf(b)).toBeLessThan(lowestLabel);
+    // (b) the nearer employee's bubble wins.
+    expect(zOf(bubbles[1])).toBeGreaterThan(zOf(bubbles[0]));
+    // (c) activity bubbles are single-line.
+    for (const b of bubbles) expect(b!.classList.contains('wmux-office-bubble--line')).toBe(true);
+  });
+
   it('needs-you employee shows a raised hand and a red bubble', () => {
     const resetsAt = new Date(2026, 9, 20, 14, 0).getTime();
     mount([
