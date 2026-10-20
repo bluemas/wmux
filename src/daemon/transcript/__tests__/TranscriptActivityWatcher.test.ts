@@ -250,10 +250,10 @@ describe('TranscriptActivityWatcher — Agent Teams teammates', () => {
       listSessionIds: () => state.sessions,
       getBinding: () => binding,
       isAgentAlive: () => state.alive,
-      emit: () => {},
+      emit: () => { /* the activity line is not under test here */ },
       emitTeammatesWorking: (id) => working.push(id),
       // As in the daemon: a hook-fed Claude pane keeps its watch for its lines.
-      onClaudeLine: () => {},
+      onClaudeLine: () => { /* read, not under test */ },
       now: () => Date.now() + offset,
       teammatePollMs: 15_000,
     });

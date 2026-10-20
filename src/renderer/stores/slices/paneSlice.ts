@@ -283,6 +283,9 @@ export interface PaneSlice {
   // the byte-based per-PTY 'running' broadcast has no tool name. Same 120s-TTL
   // decay as setSurfaceActivity's stamp; lights background dots from bytes.
   markSurfaceRunning: (ptyId: string) => void;
+  /** An Agent Teams teammate still works: the running stamp, nothing else (the
+   *  lead's question and status stay). */
+  markSurfaceTeammatesWorking: (ptyId: string) => void;
   // "running" freshness (orca-style): epoch-ms of each pane's last activity
   // signal. The fleet selector treats a fresh stamp (within HOOK_RUNNING_TTL_MS)
   // as 'running' even when the terminal has gone quiet — so an agent thinking
@@ -881,6 +884,11 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
     // covers agents with no tool hooks at all.
     delete state.surfacePendingQuestion[ptyId];
     delete state.surfaceQuestionSeen[ptyId];
+  }),
+
+  markSurfaceTeammatesWorking: (ptyId) => set((state: StoreState) => {
+    if (!ptyId) return;
+    state.surfaceActivityAt[ptyId] = Date.now();
   }),
 
   markSurfaceTurnOpen: (ptyId) => set((state: StoreState) => {

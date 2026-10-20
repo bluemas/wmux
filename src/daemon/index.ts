@@ -4103,14 +4103,14 @@ function registerRpcHandlers(
         pipeServer.broadcast(event);
       },
       // An Agent Teams teammate of the pane's Claude still works after the
-      // lead's turn ended. Straight to main as `activity.active` (its onActive
-      // keeps its hook-latch and settle guards and refreshes the renderer's
-      // 120 s running stamp). Deliberately NOT through the bridge's 'active' /
-      // session:active: that also feeds the completion alarm's working evidence
+      // lead's turn ended. Its own event, not `activity.active`: main relays it
+      // to the renderer's running stamp and leaves the pane's status (the
+      // lead's) alone. Not through the bridge's 'active' / session:active
+      // either: that also feeds the completion alarm's working evidence
       // (notePaneWorking), the usage-limit hold and the awaiting verifier, and
       // the lead's turn really did end.
       emitTeammatesWorking: (sessionId) => {
-        const event: DaemonEvent = { type: 'activity.active', sessionId, data: null };
+        const event: DaemonEvent = { type: 'agent.teammates', sessionId, data: null };
         pipeServer.broadcast(event);
       },
       onClaudeLine: (sessionId, path, line) => turnEnds.noteLine(sessionId, path, line),

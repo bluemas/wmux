@@ -1109,6 +1109,9 @@ export class DaemonClient extends EventEmitter {
           }
           break;
         }
+        case 'agent.teammates':
+          this.emit('session:teammates', { sessionId: event.sessionId });
+          break;
         case 'prompt.event':
           // OSC 133 shell-integration marker (A/B/C/D) parsed in the daemon.
           // DaemonNotificationRouter consumes this to tee the D variant onto

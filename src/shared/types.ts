@@ -546,6 +546,12 @@ export interface MetadataUpdatePayload {
   // applying any active-pane update to workspace metadata (it is not workspace
   // state). Never persisted.
   activity?: string;
+  /**
+   * An Agent Teams teammate of this pane's agent still works: refreshes the
+   * pane's running stamp only, never its status. Per-ptyId, destructured out
+   * like `activity`.
+   */
+  teammatesWorking?: true;
   // P2 — pane label relay. MetadataStore's `pane.metadata.changed` is teed to
   // the renderer as a paneId-only update (no ptyId/workspaceId);
   // useNotificationListener routes on `paneId` and writes ONLY the per-pane

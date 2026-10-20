@@ -1358,6 +1358,18 @@ export class DaemonNotificationRouter {
     // The daemon read the last tool from the agent's own transcript (a pane
     // with no per-tool hook). Same metadata a PostToolUse hook writes; a pane
     // whose hook reports wins.
+    // An Agent Teams teammate still works after the lead's turn ended: the
+    // renderer's running stamp only. The pane's status stays the lead's (a
+    // finished turn, a question), so nothing here has to be put back when the
+    // teammates stop; the stamp fades on its own.
+    const onTeammates = (payload: { sessionId: string }) => {
+      try {
+        broadcastMetadataUpdate(this.getWindow(), { ptyId: payload.sessionId, teammatesWorking: true });
+      } catch (err) {
+        console.warn('[DaemonNotificationRouter] teammates error:', err);
+      }
+    };
+
     const onTranscriptActivity = (payload: { sessionId: string; activity: string }) => {
       if (this.hookActivityPanes.has(payload.sessionId)) return;
       try {
@@ -1504,6 +1516,7 @@ export class DaemonNotificationRouter {
     this.daemonClient.on('session:agentProcessExit', onAgentProcessExit);
     this.daemonClient.on('session:agentInterrupted', onAgentInterrupted);
     this.daemonClient.on('session:transcriptActivity', onTranscriptActivity);
+    this.daemonClient.on('session:teammates', onTeammates);
     this.daemonClient.on('session:restarted', onRestarted);
     this.daemonClient.on('supervision:changed', onSupervisionChanged);
     // A2A channels (a2a-channels U4) — project daemon-broadcast channel
@@ -1539,6 +1552,7 @@ export class DaemonNotificationRouter {
       () => this.daemonClient.off('session:agentProcessExit', onAgentProcessExit),
       () => this.daemonClient.off('session:agentInterrupted', onAgentInterrupted),
       () => this.daemonClient.off('session:transcriptActivity', onTranscriptActivity),
+      () => this.daemonClient.off('session:teammates', onTeammates),
       () => this.daemonClient.off('session:restarted', onRestarted),
       () => this.daemonClient.off('supervision:changed', onSupervisionChanged),
       () => this.daemonClient.off('channel:message', onChannelMessage),

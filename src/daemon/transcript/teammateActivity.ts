@@ -30,7 +30,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { readTranscriptPage, statTranscript } from './readTail';
+import { TAIL_BYTES, readTranscriptPage, statTranscript } from './readTail';
 
 /** A pending tool call stops counting after this long without a record or file growth. */
 export const PENDING_TOOL_CAP_MS = 30 * 60_000;
@@ -94,7 +94,8 @@ export function teammateWorking(tail: TeammateTail | null, mtimeMs: number, now:
 }
 
 /** Whether the meta file next to `transcript` names an in-process teammate;
- *  undefined while there is no meta file yet (asked again on the next scan). */
+ *  undefined while there is no meta file yet, or it could not be read whole
+ *  (caught mid-write, say): asked again on the next scan. */
 function isTeammateMeta(transcript: string): boolean | undefined {
   const meta = transcript.replace(/\.jsonl$/, '.meta.json');
   const stat = statTranscript(meta);
@@ -103,7 +104,7 @@ function isTeammateMeta(transcript: string): boolean | undefined {
   try {
     return record(JSON.parse(fs.readFileSync(meta, 'utf8'))).taskKind === 'in_process_teammate';
   } catch {
-    return false;
+    return undefined;
   }
 }
 
@@ -118,6 +119,13 @@ interface FileState {
 /** The `subagents/` folder of a Claude Code session's transcript. */
 export function subagentsDirFor(transcriptPath: string): string {
   return path.join(transcriptPath.replace(/\.jsonl$/, ''), 'subagents');
+}
+
+/** The classified tail of `file` read `maxBytes` back; undefined when unreadable. */
+function readTail(file: string, maxBytes: number): TeammateTail | null | undefined {
+  const lines: string[] = [];
+  const page = readTranscriptPage(file, { maxBytes, parseLine: (line) => { lines.push(line); return []; } });
+  return page ? classifyTeammateTail(lines) : undefined;
 }
 
 /** Scans one session's `subagents/` folder; keep one per watched transcript. */
@@ -152,12 +160,14 @@ export class TeammateScanner {
       return;
     }
     if (mtimeMs === this.dirMtimeMs) return;
-    this.dirMtimeMs = mtimeMs;
     try {
       this.names = fs.readdirSync(this.dir).filter((n) => n.endsWith('.jsonl'));
     } catch {
+      // Listed again on the next scan: the folder's mtime is not taken.
       this.names = [];
+      return;
     }
+    this.dirMtimeMs = mtimeMs;
     const keep = new Set(this.names.map((n) => path.join(this.dir, n)));
     for (const file of [...this.files.keys()]) if (!keep.has(file)) this.files.delete(file);
   }
@@ -175,12 +185,15 @@ export class TeammateScanner {
     if (state.teammate === undefined) state.teammate = isTeammateMeta(file);
     if (state.teammate !== true) return false;
     if (stat.size !== state.size || stat.mtimeMs !== state.mtimeMs) {
-      const lines: string[] = [];
-      const page = readTranscriptPage(file, { maxBytes: TAIL_READ_BYTES, parseLine: (line) => { lines.push(line); return []; } });
-      if (!page) return false;
+      let tail = readTail(file, TAIL_READ_BYTES);
+      // Nothing meaningful in the window of a file bigger than it: the last
+      // record may be one too big for the window (a long final reply), which
+      // a full-size page reads whole.
+      if (tail === null && stat.size > TAIL_READ_BYTES) tail = readTail(file, TAIL_BYTES);
+      if (tail === undefined) return false;
       state.size = stat.size;
       state.mtimeMs = stat.mtimeMs;
-      state.tail = classifyTeammateTail(lines);
+      state.tail = tail;
     }
     return teammateWorking(state.tail, state.mtimeMs, now);
   }

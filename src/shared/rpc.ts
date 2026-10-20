@@ -1101,6 +1101,11 @@ export interface DaemonEvent {
     // activity line; '' clears it.
     //   agent.transcriptActivity → { activity: string }
     | 'agent.transcriptActivity'
+    // An Agent Teams teammate of the pane's agent still works (its own
+    // transcript, daemon/transcript/teammateActivity). Sent on every scan that
+    // finds one; nothing when none works.
+    //   agent.teammates → null
+    | 'agent.teammates'
     | 'prompt.event'
     | 'notification.event'
     | 'cwd.changed'

@@ -393,7 +393,7 @@ export class TranscriptActivityWatcher {
       this.watches.delete(id);
       return;
     }
-    const teammates = binding?.agent === 'claude' && this.deps.emitTeammatesWorking ? new TeammateScanner(subagentsDirFor(path)) : undefined;
+    const teammates = agentRow(binding?.agent)?.teammateTranscripts && this.deps.emitTeammatesWorking ? new TeammateScanner(subagentsDirFor(path)) : undefined;
     // Start at the end: only what the agent writes from now on.
     this.watches.set(id, { path, parse, ino: stat.ino, offset: stat.size, sentAt: 0, lines: !!onLine, linesOnly: this.hookFed.has(id), replay: !!onLine, teammates, teammatesAt: 0 });
   }

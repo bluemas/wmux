@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -125,6 +125,41 @@ describe('TeammateScanner', () => {
     expect(scanner.anyWorking(now)).toBe(false);
     agent('mate', 'in_process_teammate', [toolUse('a', now)]);
     expect(scanner.anyWorking(now)).toBe(true);
+  });
+
+  it('a meta file caught mid-write is asked again, not taken as no teammate', () => {
+    const now = Date.now();
+    const file = agent('mate', 'in_process_teammate', [toolUse('a', now)]);
+    const meta = file.replace(/\.jsonl$/, '.meta.json');
+    const whole = fs.readFileSync(meta, 'utf8');
+    fs.writeFileSync(meta, whole.slice(0, 10));
+    const scanner = new TeammateScanner(sub);
+    expect(scanner.anyWorking(now)).toBe(false);
+    fs.writeFileSync(meta, whole);
+    expect(scanner.anyWorking(now)).toBe(true);
+  });
+
+  it('a folder listing that failed once is listed again on the next scan', () => {
+    const now = Date.now();
+    agent('mate', 'in_process_teammate', [toolUse('a', now)]);
+    const scanner = new TeammateScanner(sub);
+    const spy = vi.spyOn(fs, 'readdirSync').mockImplementationOnce(() => { throw new Error('EBUSY'); });
+    try {
+      expect(scanner.anyWorking(now)).toBe(false);
+      expect(scanner.anyWorking(now)).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('a final reply too big for the tail window still reads as replied', () => {
+    const now = Date.now();
+    const long = JSON.stringify({
+      type: 'assistant', isSidechain: true, timestamp: iso(now),
+      message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: 'r'.repeat(200 * 1024) }] },
+    });
+    agent('mate', 'in_process_teammate', [prompt(now), long]);
+    expect(new TeammateScanner(sub).anyWorking(now)).toBe(false);
   });
 
   it('stops counting once the teammate replies, and re-reads only a changed file', () => {

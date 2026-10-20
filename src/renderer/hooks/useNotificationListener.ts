@@ -749,7 +749,7 @@ export function useNotificationListener() {
       // workspace metadata — pull it OUT here, alongside ptyId, so it can never
       // flow into `...rest` and get written into updateWorkspaceMetadata by
       // applyToWorkspace's spread.
-      const { ptyId, workspaceId: payloadWsId, activity, pendingQuestion, lastMessage, lastActivity, paneId, paneLabel, paneRole, agentSlug, hookKind, settled, ...rest } = payload;
+      const { ptyId, workspaceId: payloadWsId, activity, teammatesWorking, pendingQuestion, lastMessage, lastActivity, paneId, paneLabel, paneRole, agentSlug, hookKind, settled, ...rest } = payload;
 
       // The orchestrator's own brain pty (the `claude-pty` vendor's embedded
       // Claude Code TUI) is not a fleet agent. The daemon has no idea it is
@@ -909,6 +909,10 @@ export function useNotificationListener() {
         // '' clears.
         if (typeof lastMessage === 'string') {
           state.setSurfaceLastMessage(ptyId, lastMessage);
+        }
+        // An Agent Teams teammate still works: the running stamp only.
+        if (teammatesWorking === true) {
+          state.markSurfaceTeammatesWorking(ptyId);
         }
         // Workspace-wide (#977): the one-shot agent-name backfill below lands
         // HERE and nowhere else. A stashed pane that missed the original
