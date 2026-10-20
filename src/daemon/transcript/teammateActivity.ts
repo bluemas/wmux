@@ -156,6 +156,14 @@ export function subagentsDirFor(transcriptPath: string): string {
   return path.join(transcriptPath.replace(/\.jsonl$/, ''), 'subagents');
 }
 
+/**
+ * A fresh teammate scanner for a watched transcript, for an agent whose
+ * in-process teammates write their own transcripts (Claude Code Agent Teams).
+ */
+export const TEAMMATE_SCANNERS: Readonly<Record<string, (transcriptPath: string) => TeammateScanner>> = {
+  claude: (transcriptPath) => new TeammateScanner(subagentsDirFor(transcriptPath)),
+};
+
 /** Scans one session's `subagents/` folder; keep one per watched transcript. */
 export class TeammateScanner {
   private dirMtimeMs = -1;

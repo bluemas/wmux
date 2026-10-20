@@ -1,4 +1,5 @@
 import type { StoreState } from '../index';
+import { agentRow, type AgentSlugWith } from '../../../shared/agentIdentity';
 import { selectWorkspaceAgentRoster, type WorkspaceAgentRosterRow } from './workspaceAgentRoster';
 
 export type OfficeState = 'working' | 'needs_you' | 'resting';
@@ -8,7 +9,8 @@ export type OfficeNeed = 'question' | 'error' | 'usage_limit';
 export interface OfficeEmployee {
   /** ptyId, or `${leadPtyId}#${teammateName}` for a teammate. */
   id: string;
-  kind: 'claude' | 'codex' | 'other' | 'teammate';
+  /** The agent's slug when it has its own Office looks (`officeLook`), else 'other'. */
+  kind: AgentSlugWith<'officeLook'> | 'other' | 'teammate';
   /** Pane name / teammate name. */
   name: string;
   workspaceName: string;
@@ -42,7 +44,7 @@ function hashLook(id: string): number {
 }
 
 function agentKind(row: WorkspaceAgentRosterRow): OfficeEmployee['kind'] {
-  return row.slug === 'claude' || row.slug === 'codex' ? row.slug : 'other';
+  return agentRow(row.slug)?.officeLook ? (row.slug as AgentSlugWith<'officeLook'>) : 'other';
 }
 
 function needOf(row: WorkspaceAgentRosterRow): OfficeNeed | undefined {

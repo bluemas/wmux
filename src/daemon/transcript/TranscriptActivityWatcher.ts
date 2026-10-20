@@ -58,7 +58,7 @@ import { HOOK_ACTIVITY_KINDS } from '../../shared/hooks/hookActivityKinds';
 import { MAX_RAW_LEN, summarizeActivity } from '../../shared/activitySummary';
 import { agentRow } from '../../shared/agentIdentity';
 import { SUBAGENT_COUNTERS, type ShellEntry, type SubagentCounter } from './subagentCount';
-import { TeammateScanner, subagentsDirFor } from './teammateActivity';
+import { TEAMMATE_SCANNERS, type TeammateScanner } from './teammateActivity';
 import type { TeammateInfo } from '../../shared/types';
 
 /** Most bytes read for one session in one tick. */
@@ -483,7 +483,8 @@ export class TranscriptActivityWatcher {
     const stat = statTranscript(path);
     if (!stat) return;
     const subagents = binding ? SUBAGENT_COUNTERS[binding.agent]?.() : undefined;
-    const teammates = binding?.agent === 'claude' && (this.deps.emitBackgroundWorking || this.deps.emitTeammates) ? new TeammateScanner(subagentsDirFor(path)) : undefined;
+    const scanTeammates = binding && (this.deps.emitBackgroundWorking || this.deps.emitTeammates) ? TEAMMATE_SCANNERS[binding.agent] : undefined;
+    const teammates = scanTeammates?.(path);
     const counted: ParseLine = subagents ? (line, offset) => { subagents.noteLine(line); return parse(line, offset); } : parse;
     // Start at the end: only what the agent writes from now on.
     this.watches.set(id, { path, parse: counted, ino: stat.ino, offset: stat.size, sentAt: 0, lines: !!onLine, linesOnly: this.hookFed.has(id), replay: !!onLine, subagents, subagentsSent: 0, teammates, teammatesAt: 0, teammatesSent: '' });

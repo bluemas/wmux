@@ -176,6 +176,9 @@ export interface AgentIdentityRow {
    *  (agentTitleRules RUNNING_TITLE; DaemonPTYBridge noteCodexTitleSpinner).
    *  Claude's spinner has its own path in the bridge, so it is not listed. */
   readonly titleRunning?: true;
+  /** Drawn in the Office page with its own character looks; an agent without
+   *  it wears the generic hooded character (docs/office-art.md). */
+  readonly officeLook?: true;
 }
 
 /**
@@ -212,6 +215,7 @@ export const AGENT_IDENTITIES = [
     rewindPicker: true,
     tokenUsage: true,
     modelCatalog: true,
+    officeLook: true,
   },
   {
     slug: 'codex',
@@ -234,6 +238,7 @@ export const AGENT_IDENTITIES = [
     tokenUsage: true,
     modelCatalog: true,
     titleRunning: true,
+    officeLook: true,
   },
   {
     slug: 'gemini',
