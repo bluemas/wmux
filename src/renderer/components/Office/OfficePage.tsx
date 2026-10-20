@@ -5,6 +5,7 @@ import { getLocale } from '../../i18n';
 import { createOfficeEmployeesSelector, type OfficeEmployee } from '../../stores/selectors/officeEmployees';
 import { focusPaneByPtyId } from '../../hooks/useNotificationListener';
 import { layoutOffice, type OfficeLayout } from './officeLayout';
+import { rememberOfficeLayout, rememberedOfficeLayout } from './officeMemory';
 import OfficeScene from './OfficeScene';
 import './office.css';
 
@@ -19,11 +20,16 @@ export default function OfficePage() {
   const selector = useMemo(() => createOfficeEmployeesSelector(), []);
   const employees = useStore(selector);
 
-  // Each employee keeps its desk while the page is open.
+  // Each employee keeps its desk and its place in the boss queue, also across
+  // leaving the page and coming back. On return, the queue area is sized
+  // afresh (it only grows while the page is open).
   const previous = useRef<OfficeLayout | undefined>(undefined);
   const layout = useMemo(() => {
-    const next = layoutOffice(employees, previous.current);
+    const remembered = rememberedOfficeLayout();
+    const prev = previous.current ?? (remembered && { ...remembered, queueRows: 0 });
+    const next = layoutOffice(employees, prev);
     previous.current = next;
+    rememberOfficeLayout(next);
     return next;
   }, [employees]);
 

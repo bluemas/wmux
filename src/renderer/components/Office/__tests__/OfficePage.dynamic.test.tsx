@@ -22,6 +22,7 @@ vi.mock('../../../hooks/useNotificationListener', async (importOriginal) => {
 });
 
 import OfficePage from '../OfficePage';
+import { forgetOfficeLayout } from '../officeMemory';
 import { useStore } from '../../../stores';
 import { focusPaneByPtyId } from '../../../hooks/useNotificationListener';
 
@@ -84,6 +85,7 @@ beforeEach(() => {
     useStore.setState({ ...useStore.getInitialState(), locale: 'en' });
   });
   vi.mocked(focusPaneByPtyId).mockClear();
+  forgetOfficeLayout();
 });
 
 afterEach(() => {
@@ -304,6 +306,42 @@ describe('OfficePage', () => {
     expect(deskOf('a').getAttribute('data-desk-state')).toBe('working');
   });
 
+  it('queue order and desks survive leaving the page and coming back', () => {
+    mount([emp('a', { state: 'needs_you' }), emp('b', { state: 'needs_you' }), emp('w')]);
+    expect(employeeEl('a').getAttribute('data-queue-place')).toBe('0');
+    const desk = employeeEl('w').style.left + employeeEl('w').style.top;
+    act(() => {
+      root.unmount();
+    });
+    container.remove();
+    // The rail unmounts the page while it is hidden; the list order may differ on return.
+    mount([emp('w'), emp('b', { state: 'needs_you' }), emp('a', { state: 'needs_you' })]);
+    expect(employeeEl('a').getAttribute('data-queue-place')).toBe('0');
+    expect(employeeEl('b').getAttribute('data-queue-place')).toBe('1');
+    expect(employeeEl('w').style.left + employeeEl('w').style.top).toBe(desk);
+  });
+
+  it('growing the room does not mark anyone walking', () => {
+    // 5 need you, 5 finished, 10 work (the first `called` of them need you too), 10 rest.
+    const team = (called: number) =>
+      Array.from({ length: 30 }, (_, i) =>
+        emp(`p${i}`, {
+          state: i < 5 || (i >= 10 && i < 10 + called) ? 'needs_you' : i < 10 ? 'finished' : i < 20 ? 'working' : 'resting',
+        }),
+      );
+    mount(team(0));
+    const height = (container.querySelector('.wmux-office-room') as HTMLElement).style.height;
+    // Four workers are called: the needs-you rows grow by one and so does the room.
+    update(team(4));
+    expect((container.querySelector('.wmux-office-room') as HTMLElement).style.height).not.toBe(height);
+    const walking = Array.from(container.querySelectorAll('[data-office-employee][data-walking]'))
+      .map((el) => el.getAttribute('data-office-employee'))
+      .sort();
+    // Only the four who left their desks and the finished, a row further back, walk.
+    expect(walking).toEqual(['p10', 'p11', 'p12', 'p13', 'p5', 'p6', 'p7', 'p8', 'p9']);
+    for (let i = 14; i < 20; i += 1) expect(deskOf(`p${i}`).getAttribute('data-desk-state')).toBe('working');
+  });
+
   it('reduced motion disables the transition: the employee jumps to its spot', () => {
     document.documentElement.setAttribute('data-reduced-motion', 'true');
     mount([emp('a')]);
@@ -314,9 +352,11 @@ describe('OfficePage', () => {
     expect(el.hasAttribute('data-walking')).toBe(false);
     // The CSS transition is off under both reduced-motion sources.
     const css = readFileSync(join(__dirname, '..', 'office.css'), 'utf8').replace(/\s+/g, ' ');
-    expect(css).toMatch(/\.wmux-office-employee \{[^}]*transition: left/);
-    expect(css).toMatch(/@media \(prefers-reduced-motion: reduce\) \{[^@]*\.wmux-office-employee \{ transition: none; \}/);
-    expect(css).toContain(':root[data-reduced-motion] .wmux-office-employee { transition: none; }');
+    // Only a walking employee transitions, so a room that grows moves the rest at once.
+    expect(css).not.toMatch(/\.wmux-office-employee \{[^}]*transition/);
+    expect(css).toMatch(/\.wmux-office-employee\[data-walking\] \{[^}]*transition: left/);
+    expect(css).toMatch(/@media \(prefers-reduced-motion: reduce\) \{[^@]*\.wmux-office-employee\[data-walking\] \{ transition: none; \}/);
+    expect(css).toContain(':root[data-reduced-motion] .wmux-office-employee[data-walking] { transition: none; }');
   });
 
   it("click jumps to the employee's pane", () => {

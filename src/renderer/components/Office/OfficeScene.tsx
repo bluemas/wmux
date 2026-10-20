@@ -194,13 +194,19 @@ type PoseName = 'type' | 'raiseHand' | 'rest' | 'stand' | 'walk';
 
 type SpotKind = 'desk' | 'queue' | 'sofa';
 
-/** Where an employee belongs now: its desk, its place in the boss queue, or a sofa. */
-function spotFor(employee: OfficeEmployee, layout: OfficeLayout): { seat: Seat; kind: SpotKind } | null {
-  let seat: Seat | undefined;
-  if (employee.state === 'working') seat = layout.desks[layout.deskFor[employee.id]];
-  else if (employee.state === 'resting') seat = layout.lounge[layout.loungeFor[employee.id]];
-  else seat = layout.queue[layout.queueFor[employee.id]];
-  return seat ? { seat, kind: seat.spot } : null;
+/**
+ * Where an employee belongs now: its desk, its place in the boss queue, or a
+ * sofa. `key` names the spot, not its pixels, so a room that grows (and
+ * moves every spot on screen) does not count as anyone moving.
+ */
+function spotFor(employee: OfficeEmployee, layout: OfficeLayout): { seat: Seat; kind: SpotKind; key: string } | null {
+  const pick = (kind: SpotKind, seats: Seat[], index: number | undefined) => {
+    const seat = index === undefined ? undefined : seats[index];
+    return seat ? { seat, kind, key: `${kind}:${index}` } : null;
+  };
+  if (employee.state === 'working') return pick('desk', layout.desks, layout.deskFor[employee.id]);
+  if (employee.state === 'resting') return pick('sofa', layout.lounge, layout.loungeFor[employee.id]);
+  return pick('queue', layout.queue, layout.queueFor[employee.id]);
 }
 
 /** Frame top-left: a desk frame shares the station's origin; elsewhere the character's anchor stands on the seat point. */
@@ -267,14 +273,16 @@ interface EmployeeProps {
 function Employee({ employee, layout, walking, onArrive, t, now, locale, onJump }: EmployeeProps) {
   const sheet = characterFor(employee);
   const id = employee.id;
-  // A walk that never fires transitionend (hidden window, same spot) still ends.
+  const spot = spotFor(employee, layout);
+  const spotKey = spot?.key;
+  // A walk that never fires transitionend (hidden window, same spot) still
+  // ends; a new target mid-walk restarts the clock.
   useEffect(() => {
     if (!walking) return undefined;
     const timer = setTimeout(() => onArrive(id), WALK_MS + 100);
     return () => clearTimeout(timer);
-  }, [walking, id, onArrive]);
+  }, [walking, id, onArrive, spotKey]);
 
-  const spot = spotFor(employee, layout);
   if (!spot) return null;
   const { seat } = spot;
   const { left, top } = frameOrigin(seat);
@@ -325,6 +333,7 @@ function Employee({ employee, layout, walking, onArrive, t, now, locale, onJump 
       data-state={employee.state}
       data-pose={pose}
       data-spot={spot.kind}
+      data-queue-place={spot.kind === 'queue' ? layout.queueFor[id] : undefined}
       data-walking={walking || undefined}
       aria-label={t('office.employeeLabel', {
         name: employee.label,
@@ -395,7 +404,7 @@ export default function OfficeScene({ employees, layout, t, now, locale, onJump,
     const out: Record<string, string> = {};
     for (const e of employees) {
       const spot = spotFor(e, layout);
-      if (spot) out[e.id] = `${spot.seat.x},${spot.seat.y}`;
+      if (spot) out[e.id] = spot.key;
     }
     return out;
   }, [employees, layout]);

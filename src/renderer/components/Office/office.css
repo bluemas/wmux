@@ -56,11 +56,14 @@
   font: inherit;
   cursor: pointer;
   pointer-events: none;
-  /* Walking between the desk, the boss queue and the sofas. Keep the
-     duration in step with WALK_MS in OfficeScene.tsx. */
-  transition: left 0.9s ease-in-out, top 0.9s ease-in-out;
 }
 .wmux-office-employee:focus { outline: none; }
+/* Walking between the desk, the boss queue and the sofas. Only while walking,
+   so a room that grows moves everyone else at once. Keep the duration in
+   step with WALK_MS in OfficeScene.tsx. */
+.wmux-office-employee[data-walking] {
+  transition: left 0.9s ease-in-out, top 0.9s ease-in-out;
+}
 
 .wmux-office-employee__hit {
   position: absolute;
@@ -71,11 +74,12 @@
   pointer-events: auto;
 }
 
-.wmux-office-employee__label {
+/* Name labels, and the boss desk's nameplate set the same way. */
+.wmux-office-employee__label,
+.wmux-office-nameplate {
   position: absolute;
   transform: translateX(-50%);
   width: max-content;
-  max-width: 120px;
   padding: 1px 6px;
   border-radius: 6px;
   background: rgba(32, 30, 40, 0.78);
@@ -84,28 +88,20 @@
   font-size: 11px;
   line-height: 16px;
   white-space: nowrap;
+}
+.wmux-office-employee__label {
+  max-width: 120px;
   overflow: hidden;
   text-overflow: ellipsis;
   pointer-events: auto;
 }
+.wmux-office-nameplate {
+  font-weight: 600;
+  pointer-events: none;
+}
 
 .wmux-office-employee__workspace { display: none; opacity: 0.75; }
 
-/* The boss desk's nameplate: a name label, set like the employees'. */
-.wmux-office-nameplate {
-  position: absolute;
-  transform: translateX(-50%);
-  padding: 1px 6px;
-  border-radius: 6px;
-  background: rgba(32, 30, 40, 0.78);
-  color: #fdfcf8;
-  font-family: var(--font-ui);
-  font-size: 11px;
-  font-weight: 600;
-  line-height: 16px;
-  white-space: nowrap;
-  pointer-events: none;
-}
 .wmux-office-employee:hover .wmux-office-employee__label,
 .wmux-office-employee:focus-visible .wmux-office-employee__label {
   max-width: 240px;
@@ -201,7 +197,7 @@
 
 @media (prefers-reduced-motion: reduce) {
   .wmux-office-sprite--loop { animation: none; }
-  .wmux-office-employee { transition: none; }
+  .wmux-office-employee[data-walking] { transition: none; }
 }
 :root[data-reduced-motion] .wmux-office-sprite--loop { animation: none; }
-:root[data-reduced-motion] .wmux-office-employee { transition: none; }
+:root[data-reduced-motion] .wmux-office-employee[data-walking] { transition: none; }
