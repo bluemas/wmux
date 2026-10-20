@@ -46,7 +46,7 @@ describe('Sidebar global navigation', () => {
   it('shows Remote and Fleet as the default destinations, alongside search', async () => {
     await act(async () => root.render(<SidebarNavigation />));
     expect([...container.querySelectorAll('[data-sidebar-nav]')].map((el) => el.getAttribute('data-sidebar-nav')))
-      .toEqual(['search', 'remote', 'fleet']);
+      .toEqual(['search', 'remote', 'fleet', 'office']);
     await act(async () => button('remote').click());
     expect(button('remote').getAttribute('aria-expanded')).toBe('true');
     expect(container.querySelector('[role="dialog"]')).not.toBeNull();

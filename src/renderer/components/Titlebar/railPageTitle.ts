@@ -6,6 +6,7 @@ import type { TranslationKey } from '../../i18n/locales/en';
 export const RAIL_PAGE_TITLE_KEYS: Partial<Record<AppRoute, TranslationKey>> = {
   bots: 'botsPage.title',
   fleet: 'fleet.title',
+  office: 'office.title',
   schedules: 'schedules.title',
   remote: 'sidebar.remote',
   git: 'git.title',

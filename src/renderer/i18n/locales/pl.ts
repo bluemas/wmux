@@ -4874,6 +4874,7 @@ export const pl = {
   'botsPage.teamName.reviewer': "Recenzent",
   'room.composer.toLead': "Do {name}",
   // Office page
+  'office.title': "Biuro",
   'office.empty': "Brak sesji agentów",
   'office.emptyHint': "Uruchom Claude Code lub Codex w panelu, a zajmie tu biurko.",
   'office.roomLabel': "Biuro, agenci: {count}",

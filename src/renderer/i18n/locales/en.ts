@@ -4914,6 +4914,7 @@ export const en = {
   'botsPage.teamName.reviewer': "Reviewer",
   'room.composer.toLead': "To {name}",
   // Office page
+  'office.title': "Office",
   'office.empty': "No agent sessions yet",
   'office.emptyHint': "Start Claude Code or Codex in a pane and it takes a desk here.",
   'office.roomLabel': "Office, {count} agents",

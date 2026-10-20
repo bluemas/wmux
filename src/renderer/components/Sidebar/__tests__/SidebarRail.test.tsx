@@ -33,10 +33,10 @@ const rail = () => container.querySelector<HTMLDivElement>('[data-sidebar-rail]'
 const navIds = () => [...container.querySelectorAll('[data-sidebar-nav]')].map((el) => el.getAttribute('data-sidebar-nav'));
 
 describe('sidebar icon rail', () => {
-  it('lists only pages — Workspaces, Bots, Fleet, Schedules, Remote and Git — each named', async () => {
+  it('lists only pages — Workspaces, Bots, Fleet, Office, Schedules, Remote and Git — each named', async () => {
     await act(async () => root.render(<MiniSidebar rail collapsed={false} />));
     // Search & commands is a palette (the titlebar pill), not a page.
-    expect(navIds()).toEqual(['home', 'bots', 'fleet', 'schedules', 'remote', 'git']);
+    expect(navIds()).toEqual(['home', 'bots', 'fleet', 'office', 'schedules', 'remote', 'git']);
     // Home is the current page until another is chosen.
     expect(container.querySelector('[data-sidebar-nav="home"]')?.getAttribute('aria-current')).toBe('page');
     for (const b of rail().querySelectorAll('button')) {
@@ -47,15 +47,15 @@ describe('sidebar icon rail', () => {
   it('lists Bots only while the bots are on, appearing and going without a restart', async () => {
     act(() => useStore.setState({ roomStatus: { running: false, enabled: false, hqWorkspaceId: null } }));
     await act(async () => root.render(<MiniSidebar rail collapsed={false} />));
-    expect(navIds()).toEqual(['home', 'fleet', 'schedules', 'remote', 'git']);
+    expect(navIds()).toEqual(['home', 'fleet', 'office', 'schedules', 'remote', 'git']);
     // Settings › Bots' switch writes the setting and re-reads this status.
     act(() => useStore.setState({ roomStatus: { running: true, enabled: true, hqWorkspaceId: null } }));
-    expect(navIds()).toEqual(['home', 'bots', 'fleet', 'schedules', 'remote', 'git']);
+    expect(navIds()).toEqual(['home', 'bots', 'fleet', 'office', 'schedules', 'remote', 'git']);
     act(() => useStore.setState({ roomStatus: { running: false, enabled: false, hqWorkspaceId: null } }));
-    expect(navIds()).toEqual(['home', 'fleet', 'schedules', 'remote', 'git']);
+    expect(navIds()).toEqual(['home', 'fleet', 'office', 'schedules', 'remote', 'git']);
     // No status read yet (or no bot runtime): not listed either.
     act(() => useStore.setState({ roomStatus: null }));
-    expect(navIds()).toEqual(['home', 'fleet', 'schedules', 'remote', 'git']);
+    expect(navIds()).toEqual(['home', 'fleet', 'office', 'schedules', 'remote', 'git']);
   });
 
   it('the Bots shortcut and palette command open Settings › Bots while the bots are off', () => {
@@ -191,7 +191,7 @@ describe('sidebar icon rail', () => {
     await act(async () => root.render(<MiniSidebar rail collapsed={false} />));
     const pressed = () => [...container.querySelectorAll('[data-sidebar-nav][aria-current="page"]')]
       .map((el) => el.getAttribute('data-sidebar-nav'));
-    for (const page of ['fleet', 'schedules', 'remote'] as const) {
+    for (const page of ['fleet', 'office', 'schedules', 'remote'] as const) {
       act(() => container.querySelector<HTMLButtonElement>(`[data-sidebar-nav="${page}"]`)!.click());
       expect(useStore.getState().appRoute).toBe(page);
       expect(pressed()).toEqual([page]);
@@ -229,7 +229,7 @@ describe('Moa and the rail', () => {
   it('has no Moa entry: the panel is its home', async () => {
     useStore.setState({ workspaces: [ws('a'), ws('hq')], activeWorkspaceId: 'a', activeRemoteKey: null, moa: moa(true) } as never);
     await act(async () => root.render(<MiniSidebar rail collapsed={false} />));
-    expect(navIds()).toEqual(['home', 'bots', 'fleet', 'schedules', 'remote', 'git']);
+    expect(navIds()).toEqual(['home', 'bots', 'fleet', 'office', 'schedules', 'remote', 'git']);
     expect(container.querySelector('[data-sidebar-nav="moa"]')).toBeNull();
   });
 

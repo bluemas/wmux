@@ -4019,6 +4019,7 @@ export const zh = {
   'botsPage.models.workersOn': "工作者 {model}",
   'botsPage.profile.workersUnavailable': "{name}（此系统不可用）",
   // Office page
+  'office.title': "办公室",
   'office.empty': "还没有智能体会话",
   'office.emptyHint': "在窗格中启动 Claude Code 或 Codex，它会在这里坐到一张办公桌前。",
   'office.roomLabel': "办公室，{count} 个智能体",

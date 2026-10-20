@@ -192,7 +192,7 @@ describe('useTerminalCopyShortcut — DOM glue', () => {
     addTerminal('pty-term', 'stale selection behind the page', true);
     mocks.activePtyId = 'pty-term';
     focusComposer();
-    for (const route of ['bots', 'fleet', 'schedules', 'remote', 'git', 'settings'] as const) {
+    for (const route of ['bots', 'fleet', 'office', 'schedules', 'remote', 'git', 'settings'] as const) {
       useStore.setState({ appRoute: route });
       const ev = pressCtrlC();
       expect(ev.defaultPrevented).toBe(false);

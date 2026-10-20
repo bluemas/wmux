@@ -32,6 +32,18 @@ export function IconX({ size = 14 }: { size?: number }) {
 
 /** Two overlapping figures — channel member roster count. Replaces the 👥 glyph
  *  (the Unicode members emoji that issue #145 set out to eliminate). */
+/** A desk with a monitor on it — the Office rail page. */
+export function IconOffice({ size = 14 }: { size?: number }) {
+  return (
+    <Icon size={size}>
+      <rect x="3.2" y="1.8" width="7.6" height="5.2" rx="0.9" />
+      <path d="M7 7v2" />
+      <path d="M1.5 9.2h11" />
+      <path d="M3 9.2v3M11 9.2v3" />
+    </Icon>
+  );
+}
+
 export function IconUsers({ size = 14 }: { size?: number }) {
   return (
     <Icon size={size}>

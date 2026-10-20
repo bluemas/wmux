@@ -11,7 +11,7 @@ import { ownerFleetState } from './botTasks';
 import { selectScheduleNavSummary } from '../../stores/selectors/schedules';
 import { formatNextShort } from '../Schedules/format';
 import { useT } from '../../hooks/useT';
-import { Icon, IconClock, IconGitBranch, IconGrid, IconRemoteDevices, IconRobot, IconUsers } from '../icons';
+import { Icon, IconClock, IconGitBranch, IconGrid, IconOffice, IconRemoteDevices, IconRobot, IconUsers } from '../icons';
 import { useBots, useBotsSync } from '../Bots/useBots';
 import { selectGitRailSignal } from '../Git/gitSignal';
 import { selectRemoteNeedsYou } from '../../stores/slices/a2aRemoteSlice';
@@ -109,6 +109,11 @@ export default function SidebarNavigation({ compact = false, home = false }: {
       id: 'fleet', label: t('fleet.title'), name: fleetName, active: fleetOpen,
       icon: <IconUsers size={16} />,
       onClick: go('fleet', () => useStore.getState().toggleFleetView()),
+    },
+    {
+      id: 'office', label: t('office.title'), name: t('office.title'), active: route === 'office',
+      icon: <IconOffice size={16} />,
+      onClick: go('office', () => useStore.getState().setAppRoute(route === 'office' ? 'workspaces' : 'office')),
     },
     ...(schedulesAvailable ? [{
       id: 'schedules', label: t('schedules.title'), name: schedulesName, active: schedulesOpen,

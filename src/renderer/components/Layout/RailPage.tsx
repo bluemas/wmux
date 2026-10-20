@@ -2,6 +2,7 @@ import { lazy, Suspense, useEffect } from 'react';
 import { useStore } from '../../stores';
 import { ErrorBoundary } from '../ErrorBoundary';
 import FleetView from '../FleetView/FleetView';
+import OfficePage from '../Office/OfficePage';
 import SchedulesView from '../Schedules/SchedulesView';
 import RemotePage from '../Remote/RemotePage';
 import GitPage from '../Git/GitPage';
@@ -12,7 +13,7 @@ import { selectSelectedRemotePcName } from '../Git/thisComputerOnly';
 const SettingsPanel = lazy(() => import('../Settings/SettingsPanel'));
 
 /** Rail pages that show this computer only (Remote is about the others). */
-const THIS_COMPUTER_PAGES: ReadonlySet<string> = new Set(['bots', 'fleet', 'schedules', 'git']);
+const THIS_COMPUTER_PAGES: ReadonlySet<string> = new Set(['bots', 'fleet', 'office', 'schedules', 'git']);
 
 /**
  * The muted line a rail page shows while another computer is selected in the
@@ -63,6 +64,7 @@ export default function RailPage() {
       <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
         {route === 'bots' && <ErrorBoundary name="BotsPage"><BotsPage /></ErrorBoundary>}
         {route === 'fleet' && <ErrorBoundary name="FleetView"><FleetView /></ErrorBoundary>}
+        {route === 'office' && <ErrorBoundary name="OfficePage"><OfficePage /></ErrorBoundary>}
         {route === 'schedules' && <ErrorBoundary name="SchedulesView"><SchedulesView /></ErrorBoundary>}
         {route === 'remote' && <ErrorBoundary name="RemotePage"><RemotePage /></ErrorBoundary>}
         {route === 'git' && <ErrorBoundary name="GitPage"><GitPage /></ErrorBoundary>}

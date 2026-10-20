@@ -4415,6 +4415,7 @@ export const ko = {
   'botsPage.teamName.reviewer': "리뷰어",
   'room.composer.toLead': "{name}에게",
   // Office page
+  'office.title': "사무실",
   'office.empty': "아직 에이전트 세션이 없습니다",
   'office.emptyHint': "패널에서 Claude Code나 Codex를 시작하면 여기 책상에 앉습니다.",
   'office.roomLabel': "사무실, 에이전트 {count}명",
