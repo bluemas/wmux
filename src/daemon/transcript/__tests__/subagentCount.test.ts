@@ -177,6 +177,121 @@ describe('ClaudeSubagentCounter', () => {
   });
 });
 
+// Real background-shell shapes (live transcript, 2026-10-19): a string
+// tool_result and a toolUseResult naming the task.
+const shellOutput = (taskId: string) => `C:\\Users\\me\\AppData\\Local\\Temp\\claude\\C--git-x\\s1\\tasks\\${taskId}.output`;
+const shellLaunch = (toolUseId: string, taskId: string) => JSON.stringify({
+  type: 'user', timestamp: ts, toolUseResult: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: taskId },
+  message: { role: 'user', content: [{ tool_use_id: toolUseId, type: 'tool_result', is_error: false,
+    content: `Command running in background with ID: ${taskId}. Output is being written to: ${shellOutput(taskId)}. You will be notified when it completes — do not poll that file or sleep while waiting.` }] },
+});
+const shellMoved = (toolUseId: string, taskId: string) => JSON.stringify({
+  type: 'user', timestamp: ts,
+  toolUseResult: { stdout: '', stderr: '', interrupted: false, isImage: false, noOutputExpected: false, backgroundTaskId: taskId, timedOutAfterMs: 120000 },
+  message: { role: 'user', content: [{ tool_use_id: toolUseId, type: 'tool_result', is_error: false,
+    content: `Command did not complete within its 120s timeout and was moved to the background (ID: ${taskId}). Output is being written to: ${shellOutput(taskId)}. You will be notified when it completes.` }] },
+});
+const shellNotificationBody = (taskId: string, toolUseId: string) =>
+  `<task-notification>\n<task-id>${taskId}</task-id>\n<tool-use-id>${toolUseId}</tool-use-id>\n<output-file>${shellOutput(taskId)}</output-file>\n<status>completed</status>\n<summary>Background command "Build" completed (exit code 0)</summary>\n</task-notification>`;
+
+describe('ClaudeSubagentCounter — background shells', () => {
+  const launchShell = (c: ClaudeSubagentCounter, toolUseId = 'toolu_s1', taskId = 'b9jfvl78j', tool = 'PowerShell') => {
+    c.noteLine(claudeToolUse(toolUseId, tool, { command: 'pnpm tauri build', run_in_background: true }));
+    c.noteLine(shellLaunch(toolUseId, taskId));
+  };
+
+  it('a background launch is a shell, not a subagent, and survives a typed prompt', () => {
+    const c = new ClaudeSubagentCounter();
+    launchShell(c);
+    expect(c.count).toBe(0);
+    expect(c.shells()).toEqual([{ toolUseId: 'toolu_s1', taskId: 'b9jfvl78j', outputFile: shellOutput('b9jfvl78j'), startedAt: Date.parse(ts) }]);
+    c.noteLine(userPrompt('when the build ends, reinstall and push'));
+    expect(c.shells().map((s) => s.taskId)).toEqual(['b9jfvl78j']);
+  });
+
+  it('a Bash launch counts the same way', () => {
+    const c = new ClaudeSubagentCounter();
+    launchShell(c, 'toolu_b', 'b1', 'Bash');
+    expect(c.shells().map((s) => s.taskId)).toEqual(['b1']);
+  });
+
+  it('its task-notification settles it, and the duplicate delivery changes nothing', () => {
+    const c = new ClaudeSubagentCounter();
+    launchShell(c, 'toolu_s1', 'b9jfvl78j');
+    launchShell(c, 'toolu_s2', 'b222');
+    c.noteLine(JSON.stringify({ type: 'queue-operation', operation: 'enqueue', timestamp: ts, sessionId: 's', content: shellNotificationBody('b9jfvl78j', 'toolu_s1') }));
+    expect(c.shells().map((s) => s.taskId)).toEqual(['b222']);
+    c.noteLine(JSON.stringify({ type: 'user', timestamp: ts, origin: { kind: 'task-notification' }, message: { role: 'user', content: shellNotificationBody('b9jfvl78j', 'toolu_s1') } }));
+    expect(c.shells().map((s) => s.taskId)).toEqual(['b222']);
+  });
+
+  it('a notification naming only the task id settles it', () => {
+    const c = new ClaudeSubagentCounter();
+    launchShell(c, 'toolu_s1', 'b9jfvl78j');
+    c.noteLine(JSON.stringify({ type: 'queue-operation', operation: 'enqueue', timestamp: ts, content: shellNotificationBody('b9jfvl78j', 'other') }));
+    expect(c.shells()).toEqual([]);
+  });
+
+  it('a TaskStop, KillShell or KillBash naming the task id settles it', () => {
+    const c = new ClaudeSubagentCounter();
+    launchShell(c, 'toolu_s1', 'b1');
+    launchShell(c, 'toolu_s2', 'b2');
+    launchShell(c, 'toolu_s3', 'b3');
+    c.noteLine(claudeToolUse('toolu_k1', 'TaskStop', { task_id: 'b1' }));
+    expect(c.shells().map((s) => s.taskId)).toEqual(['b2', 'b3']);
+    c.noteLine(claudeToolUse('toolu_k2', 'KillShell', { shell_id: 'b2' }));
+    c.noteLine(claudeToolUse('toolu_k3', 'KillBash', { bash_id: 'b3' }));
+    expect(c.shells()).toEqual([]);
+  });
+
+  it('a foreground shell moved to the background after its timeout counts', () => {
+    const c = new ClaudeSubagentCounter();
+    c.noteLine(claudeToolUse('toolu_m', 'Bash', { command: 'cargo build --release' }));
+    c.noteLine(shellMoved('toolu_m', 'b11hgp3v3'));
+    expect(c.shells()).toEqual([{ toolUseId: 'toolu_m', taskId: 'b11hgp3v3', outputFile: shellOutput('b11hgp3v3'), startedAt: Date.parse(ts) }]);
+  });
+
+  it('a launch without an output path still counts, by its launch age', () => {
+    const c = new ClaudeSubagentCounter();
+    c.noteLine(claudeToolResult('toolu_s', 'Command running in background with ID: b77'));
+    expect(c.shells()).toEqual([{ toolUseId: 'toolu_s', taskId: 'b77', startedAt: Date.parse(ts) }]);
+  });
+
+  it('a Read result that quotes a launch started nothing', () => {
+    const c = new ClaudeSubagentCounter();
+    c.noteLine(claudeToolUse('toolu_r', 'Read', { file_path: 'C:/x/session.jsonl' }));
+    c.noteLine(JSON.stringify({
+      type: 'user', timestamp: ts, toolUseResult: { type: 'text', file: { filePath: 'C:/x/session.jsonl', content: '…' } },
+      message: { role: 'user', content: [{ tool_use_id: 'toolu_r', type: 'tool_result', content: `1\t{"content":"Command running in background with ID: b9jfvl78j. Output is being written to: ${shellOutput('b9jfvl78j')}."}` }] },
+    }));
+    expect(c.shells()).toEqual([]);
+  });
+
+  it('an api-request-blob copy of a launch is ignored', () => {
+    const c = new ClaudeSubagentCounter();
+    const launch = JSON.parse(shellLaunch('toolu_s1', 'b9jfvl78j'));
+    c.noteLine(JSON.stringify({ type: 'api-request-blob', sessionId: 's', hash: 'h', message: launch.message, toolUseResult: launch.toolUseResult }));
+    expect(c.shells()).toEqual([]);
+  });
+
+  it('a Monitor is not a shell', () => {
+    const c = new ClaudeSubagentCounter();
+    c.noteLine(claudeToolUse('toolu_mon', 'Monitor', {}));
+    c.noteLine(JSON.stringify({
+      type: 'user', timestamp: ts, toolUseResult: { taskId: 'blx1jwcox', timeoutMs: 1200000 },
+      message: { role: 'user', content: [{ tool_use_id: 'toolu_mon', type: 'tool_result', content: 'Monitor started (task blx1jwcox, timeout 1200000ms).' }] },
+    }));
+    expect(c.shells()).toEqual([]);
+  });
+
+  it('reset forgets its shells', () => {
+    const c = new ClaudeSubagentCounter();
+    launchShell(c);
+    c.reset();
+    expect(c.shells()).toEqual([]);
+  });
+});
+
 describe('TranscriptActivityWatcher — subagent count', () => {
   let dir: string;
   beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tx-subagents-')); });

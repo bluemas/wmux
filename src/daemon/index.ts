@@ -4125,14 +4125,14 @@ function registerRpcHandlers(
         const event: DaemonEvent = { type: 'agent.teammates', sessionId, data: { teammates } };
         pipeServer.broadcast(event);
       },
-      // An Agent Teams teammate of the pane's Claude still works after the
-      // lead's turn ended. Straight to main as `activity.active` (its onActive
+      // An Agent Teams teammate or a background shell of the pane's Claude
+      // still works after the lead's turn ended. Straight to main as `activity.active` (its onActive
       // keeps its hook-latch and settle guards and refreshes the renderer's
       // 120 s running stamp). Deliberately NOT through the bridge's 'active' /
       // session:active: that also feeds the completion alarm's working evidence
       // (notePaneWorking), the usage-limit hold and the awaiting verifier, and
       // the lead's turn really did end.
-      emitTeammatesWorking: (sessionId) => {
+      emitBackgroundWorking: (sessionId) => {
         const event: DaemonEvent = { type: 'activity.active', sessionId, data: null };
         pipeServer.broadcast(event);
       },

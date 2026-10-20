@@ -254,7 +254,7 @@ describe('TranscriptActivityWatcher — Agent Teams teammates', () => {
       getBinding: () => binding,
       isAgentAlive: () => state.alive,
       emit: () => {},
-      emitTeammatesWorking: (id) => working.push(id),
+      emitBackgroundWorking: (id) => working.push(id),
       emitTeammates: (id, list) => rosters.push([id, list]),
       now: () => Date.now() + offset,
       teammatePollMs: 15_000,
@@ -368,6 +368,124 @@ describe('TranscriptActivityWatcher — Agent Teams teammates', () => {
     const h = teammates('codex');
     h.watcher.tick();
     expect(h.working).toEqual([]);
+  });
+});
+
+describe('TranscriptActivityWatcher — Claude background shells', () => {
+  function shells() {
+    const file = path.join(dir, 'claude.jsonl');
+    fs.writeFileSync(file, `${JSON.stringify({ type: 'summary', summary: 'old session' })}\n`);
+    const output = path.join(dir, 'tasks', 'b9jfvl78j.output');
+    fs.mkdirSync(path.dirname(output), { recursive: true });
+    fs.writeFileSync(output, '');
+    let offset = 0;
+    const state: { alive: boolean; sessions: string[] } = { alive: true, sessions: ['pty-1'] };
+    const working: string[] = [];
+    const binding: ResumeBinding = { agent: 'claude', sessionId: 's', cwd: dir, transcriptPath: file, ts: 0 };
+    const watcher = new TranscriptActivityWatcher({
+      listSessionIds: () => state.sessions,
+      getBinding: () => binding,
+      isAgentAlive: () => state.alive,
+      emit: () => {},
+      emitBackgroundWorking: (id) => working.push(id),
+      now: () => Date.now() + offset,
+      teammatePollMs: 15_000,
+    });
+    const at = new Date().toISOString();
+    const launch = () => append(file,
+      JSON.stringify({ type: 'assistant', timestamp: at, message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_s1', name: 'PowerShell', input: { command: 'pnpm tauri build', run_in_background: true } }] } }),
+      JSON.stringify({
+        type: 'user', timestamp: at, toolUseResult: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'b9jfvl78j' },
+        message: { role: 'user', content: [{ tool_use_id: 'toolu_s1', type: 'tool_result', content: `Command running in background with ID: b9jfvl78j. Output is being written to: ${output}. You will be notified when it completes.` }] },
+      }),
+      // The owner types a follow-up while the build runs: the shell stays.
+      JSON.stringify({ type: 'user', timestamp: at, message: { role: 'user', content: 'when the build ends, reinstall' } }),
+    );
+    /** The build writes more output, as of the watcher's clock. */
+    const grow = () => {
+      fs.appendFileSync(output, 'compiling…\n');
+      const t = new Date(Date.now() + offset);
+      fs.utimesSync(output, t, t);
+    };
+    const notify = () => append(file, JSON.stringify({
+      type: 'queue-operation', operation: 'enqueue', timestamp: at,
+      content: `<task-notification>\n<task-id>b9jfvl78j</task-id>\n<tool-use-id>toolu_s1</tool-use-id>\n<output-file>${output}</output-file>\n<status>completed</status>\n</task-notification>`,
+    }));
+    return { watcher, working, state, launch, grow, notify, advance: (ms: number) => { offset += ms; } };
+  }
+
+  it('reports the pane working on every scan while the shell output is fresh, past a typed prompt', () => {
+    const h = shells();
+    h.watcher.tick();
+    expect(h.working).toEqual([]);
+    h.launch();
+    h.advance(15_000);
+    h.watcher.tick();
+    expect(h.working).toEqual(['pty-1']);
+    h.advance(5_000);
+    h.watcher.tick();
+    expect(h.working).toEqual(['pty-1']); // not before the next scan is due
+    h.advance(10_000);
+    h.grow();
+    h.watcher.tick();
+    expect(h.working).toEqual(['pty-1', 'pty-1']);
+  });
+
+  it('stops once its task-notification arrives', () => {
+    const h = shells();
+    h.watcher.tick();
+    h.launch();
+    h.advance(15_000);
+    h.watcher.tick();
+    h.notify();
+    h.advance(15_000);
+    h.watcher.tick();
+    expect(h.working).toEqual(['pty-1']);
+  });
+
+  it('stops once the output has not grown for 10 minutes', () => {
+    const h = shells();
+    h.watcher.tick();
+    h.launch();
+    h.grow();
+    h.advance(9 * 60_000);
+    h.watcher.tick();
+    expect(h.working).toEqual(['pty-1']);
+    h.advance(61_000 + 15_000);
+    h.watcher.tick();
+    expect(h.working).toEqual(['pty-1']);
+  });
+
+  it('stops at the 60 minute cap even while the output still grows', () => {
+    const h = shells();
+    h.watcher.tick();
+    h.launch();
+    h.advance(59 * 60_000);
+    h.grow();
+    h.watcher.tick();
+    expect(h.working).toEqual(['pty-1']);
+    h.advance(2 * 60_000);
+    h.grow();
+    h.watcher.tick();
+    expect(h.working).toEqual(['pty-1']);
+  });
+
+  it('sends nothing after the watch is dropped', () => {
+    const h = shells();
+    h.watcher.tick();
+    h.launch();
+    h.advance(15_000);
+    h.watcher.tick();
+    expect(h.working).toEqual(['pty-1']);
+    h.state.sessions = [];
+    h.advance(15_000);
+    h.grow();
+    h.watcher.tick();
+    h.state.sessions = ['pty-1'];
+    h.advance(15_000);
+    h.grow();
+    h.watcher.tick(); // a new watch starts at the end: the old launch is not counted
+    expect(h.working).toEqual(['pty-1']);
   });
 });
 
