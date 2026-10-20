@@ -42,7 +42,7 @@ import type { ResumeBinding } from '../../shared/agentResume';
 import type { TurnEvent } from '../../shared/transcript/turnEvents';
 import { parseTranscriptLine } from './parseEntry';
 import { parseCodexLineDetailed } from './parseCodexEntry';
-import { isLineBoundary, readTranscriptDelta, readTranscriptPage, statTranscript } from './readTail';
+import { MAX_OVERSIZED_SCAN_BYTES, isLineBoundary, readTranscriptDelta, readTranscriptPage, statTranscript } from './readTail';
 import { HOOK_ACTIVITY_KINDS } from '../../shared/hooks/hookActivityKinds';
 import { MAX_RAW_LEN, summarizeActivity } from '../../shared/activitySummary';
 import { agentRow } from '../../shared/agentIdentity';
@@ -357,8 +357,10 @@ export class TranscriptActivityWatcher {
 
   /**
    * Feeds `counter` every complete line from `from` toward `size`, at most
-   * SUBAGENT_CATCHUP_BYTES. Returns the line boundary it reached, or null when
-   * the budget ran out (or the file changed under it) before the end.
+   * SUBAGENT_CATCHUP_BYTES. Returns the line boundary it reached: the end, or
+   * the start of a record still being written. Null when it could not read
+   * them all (the budget ran out, a record too big to find its end, the file
+   * changed under it): the caller then counts afresh.
    */
   private catchUpSubagents(counter: SubagentCounter, path: string, from: number, size: number): number | null {
     const feed: ParseLine = (line) => { counter.noteLine(line); return []; };
@@ -367,8 +369,12 @@ export class TranscriptActivityWatcher {
       if (offset - from >= SUBAGENT_CATCHUP_BYTES) return null;
       const delta = readTranscriptDelta(path, offset, READ_CAP_BYTES, feed);
       if (!delta || delta.reset) return null;
-      // A record still being written: the next tick reads it.
-      if (delta.cursor.tailOffset <= offset) break;
+      if (delta.cursor.tailOffset <= offset) {
+        // No line end ahead: a record still being written, which the next
+        // tick reads, unless the reader could not look far enough to tell.
+        if (size - offset > MAX_OVERSIZED_SCAN_BYTES) return null;
+        break;
+      }
       offset = delta.cursor.tailOffset;
     }
     return offset;

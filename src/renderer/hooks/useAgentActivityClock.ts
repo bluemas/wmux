@@ -40,7 +40,7 @@ export function useAgentActivityClock(): void {
   useEffect(() => {
     let lastSlowBumpAt = 0;
     const id = setInterval(() => {
-      const { surfaceActivityAt, surfaceTurnOpenAt, surfaceSubagentsAt } = useStore.getState();
+      const { surfaceActivityAt, surfaceTurnOpenAt, surfaceSubagentsAt, agentClockMs } = useStore.getState();
       const now = Date.now();
       let anyFresh = false;
       for (const ptyId in surfaceActivityAt) {
@@ -50,10 +50,12 @@ export function useAgentActivityClock(): void {
         }
       }
       // A subagent count the roster shows until it goes stale (a 0 that
-      // never arrived), so the clock must still move when it does.
+      // never arrived), so the clock must move until the roster's own clock
+      // has passed it: judged on that clock, not on now, so a timer that
+      // slept through the window still makes the move that hides it.
       for (const ptyId in surfaceSubagentsAt ?? {}) {
         if (anyFresh) break;
-        if (now - surfaceSubagentsAt[ptyId] <= SUBAGENT_COUNT_STALE_MS + DECAY_GRACE_MS) anyFresh = true;
+        if (agentClockMs - surfaceSubagentsAt[ptyId] <= SUBAGENT_COUNT_STALE_MS) anyFresh = true;
       }
       if (anyFresh) {
         bumpAgentClock();

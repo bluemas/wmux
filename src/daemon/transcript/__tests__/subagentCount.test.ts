@@ -104,6 +104,17 @@ describe('CodexSubagentCounter', () => {
 });
 
 describe('ClaudeSubagentCounter', () => {
+  it('a subagent\'s own records in the lead\'s transcript change nothing', () => {
+    const c = new ClaudeSubagentCounter();
+    c.noteLine(claudeToolUse('toolu_1', 'Agent'));
+    expect(c.count).toBe(1);
+    const side = (line: string) => JSON.stringify({ ...JSON.parse(line), isSidechain: true });
+    c.noteLine(side(userPrompt('the subagent\'s task')));
+    expect(c.count).toBe(1);
+    c.noteLine(side(claudeToolUse('toolu_9', 'Agent')));
+    expect(c.count).toBe(1);
+  });
+
   it('an async agent counts from its launch until its task-notification', () => {
     const c = new ClaudeSubagentCounter();
     c.noteLine(claudeToolUse('toolu_1', 'Agent', { prompt: 'p', run_in_background: true }));
@@ -289,6 +300,20 @@ describe('TranscriptActivityWatcher — subagent count', () => {
     fs.appendFileSync(h.file, `${big.slice(READ_CAP_BYTES + 20_000)}\n`);
     h.watcher.tick();
     expect(h.counts).toEqual([['pty-1', 1]]);
+  });
+
+  it('a record too big to find its end makes the counter start afresh past it, not stick on it', () => {
+    const h = harness('claude');
+    h.watcher.tick();
+    h.append(claudeToolUse('toolu_1', 'Agent'), claudeToolResult('toolu_1', asyncLaunched('a111')));
+    h.watcher.tick();
+    h.append(claudeToolResult('toolu_2', 'x'.repeat(9 * 1024 * 1024)));
+    h.watcher.tick();
+    expect(h.counts.at(-1)).toEqual(['pty-1', 0]);
+    // The cursor moved past it: what follows is read.
+    h.append(claudeToolUse('toolu_3', 'Agent'));
+    h.watcher.tick();
+    expect(h.counts.at(-1)).toEqual(['pty-1', 1]);
   });
 
   it('a closed pane sends 0 for a count it had sent', () => {

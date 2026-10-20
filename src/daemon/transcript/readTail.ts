@@ -41,7 +41,7 @@ const LINE_READ_BYTES = 512 * 1024;
  * in this file: an 8MB ceiling covers any plausible single transcript entry and
  * still costs at most 32 bounded reads.
  */
-const MAX_OVERSIZED_SCAN_BYTES = 8 * 1024 * 1024;
+export const MAX_OVERSIZED_SCAN_BYTES = 8 * 1024 * 1024;
 
 export interface ReadPageOptions {
   /**

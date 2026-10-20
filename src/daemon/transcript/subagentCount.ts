@@ -145,7 +145,10 @@ export class ClaudeSubagentCounter implements SubagentCounter {
     const turnEnd = this.foreground.size > 0 && line.includes('"stop_reason":"');
     if (!notification && !turnEnd && !line.includes('"tool_use"') && !line.includes('"tool_result"') && !line.includes('"type":"user"')) return;
     const entry = parse(line);
-    if (!entry) return;
+    // A subagent's own records (older Claude Code wrote them into the lead's
+    // transcript) are its conversation, not the lead's: its task prompt is no
+    // human prompt, and its calls are not the lead's subagents.
+    if (!entry || entry.isSidechain === true) return;
     const message = record(entry.message);
     // Only the conversation's own records: an `api-request-blob` carries a
     // copy of earlier turns, and re-reading its tool calls would revive them.
