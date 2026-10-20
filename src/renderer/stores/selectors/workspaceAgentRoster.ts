@@ -8,6 +8,19 @@ import type { StoreState } from '../index';
 import { computePaneAutoName, paneDisplayName } from '../../utils/paneNaming';
 import { HOOK_RUNNING_TTL_MS, isHookRunning, isQuietUsageLimitError, pickStashedRepresentativeSurface, resolveRemoteAgent } from './fleet';
 
+/**
+ * An Agent Teams teammate of the pane's agent reported working lately, after
+ * the lead's last turn end: the one stamp that shows a finished lead's pane
+ * (complete or waiting, already seen) as running.
+ */
+function teammatesWorking(state: StoreState, ptyId: string): boolean {
+  // Optional-chained: partial test stores build without these maps.
+  const at = state.surfaceTeammatesAt?.[ptyId];
+  if (!at || state.agentClockMs - at > HOOK_RUNNING_TTL_MS) return false;
+  const end = state.surfaceTurnEndAt?.[ptyId];
+  return end === undefined || at > end;
+}
+
 /** One detected agent session, kept attached to the terminal surface that owns it. */
 export interface WorkspaceAgentRosterRow {
   workspaceId: string;
@@ -227,7 +240,8 @@ export function selectWorkspaceAgentRoster(
       if (
         !attentionStatus &&
         !pendingQuestion &&
-        lifecycleStatus === 'idle' &&
+        (lifecycleStatus === 'idle'
+          || ((lifecycleStatus === 'complete' || lifecycleStatus === 'waiting') && teammatesWorking(state, ptyId))) &&
         hookRunning
       ) {
         status = 'running';
@@ -321,7 +335,8 @@ export function selectWorkspaceAgentRoster(
           ? 'idle'
           : (agent?.status ?? 'idle');
       status = attentionStatus ?? lifecycle;
-      if (!attentionStatus && lifecycle === 'idle' && hookRunning) status = 'running';
+      const finishedLead = (lifecycle === 'complete' || lifecycle === 'waiting') && !!ptyId && teammatesWorking(state, ptyId);
+      if (!attentionStatus && (lifecycle === 'idle' || finishedLead) && hookRunning) status = 'running';
     }
 
     rows.push({

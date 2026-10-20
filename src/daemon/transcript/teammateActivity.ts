@@ -55,9 +55,11 @@ const record = (v: unknown): Record<string, unknown> => (v && typeof v === 'obje
 /**
  * What a teammate transcript's tail lines (oldest first) say. Null when no
  * meaningful record is among them (a tail of bookkeeping lines only).
+ * `pending` carries the calls still without a result from earlier reads of
+ * the same file: a large result of a sibling call can push a call out of the
+ * window while it still runs.
  */
-export function classifyTeammateTail(lines: readonly string[]): TeammateTail | null {
-  const pending = new Set<string>();
+export function classifyTeammateTail(lines: readonly string[], pending: Set<string> = new Set()): TeammateTail | null {
   let last: { entry: Record<string, unknown>; blocks: Record<string, unknown>[] } | null = null;
   for (const line of lines) {
     // Cheap pre-filter: only conversation records matter.
@@ -111,6 +113,8 @@ function isTeammateMeta(transcript: string): boolean | undefined {
 interface FileState {
   /** Undefined until the meta file was read and named a teammate (or not). */
   teammate?: boolean;
+  /** Tool calls seen without a result yet, across reads. */
+  pending: Set<string>;
   size: number;
   mtimeMs: number;
   tail: TeammateTail | null;
@@ -122,10 +126,10 @@ export function subagentsDirFor(transcriptPath: string): string {
 }
 
 /** The classified tail of `file` read `maxBytes` back; undefined when unreadable. */
-function readTail(file: string, maxBytes: number): TeammateTail | null | undefined {
+function readTail(file: string, maxBytes: number, pending: Set<string>): TeammateTail | null | undefined {
   const lines: string[] = [];
   const page = readTranscriptPage(file, { maxBytes, parseLine: (line) => { lines.push(line); return []; } });
-  return page ? classifyTeammateTail(lines) : undefined;
+  return page ? classifyTeammateTail(lines, pending) : undefined;
 }
 
 /** Scans one session's `subagents/` folder; keep one per watched transcript. */
@@ -177,7 +181,7 @@ export class TeammateScanner {
     if (!stat) { this.files.delete(file); return false; }
     let state = this.files.get(file);
     if (!state) {
-      state = { size: -1, mtimeMs: -1, tail: null };
+      state = { size: -1, mtimeMs: -1, tail: null, pending: new Set() };
       this.files.set(file, state);
     }
     // Too old to count whatever it says: stat only, no read.
@@ -185,11 +189,11 @@ export class TeammateScanner {
     if (state.teammate === undefined) state.teammate = isTeammateMeta(file);
     if (state.teammate !== true) return false;
     if (stat.size !== state.size || stat.mtimeMs !== state.mtimeMs) {
-      let tail = readTail(file, TAIL_READ_BYTES);
+      let tail = readTail(file, TAIL_READ_BYTES, state.pending);
       // Nothing meaningful in the window of a file bigger than it: the last
       // record may be one too big for the window (a long final reply), which
       // a full-size page reads whole.
-      if (tail === null && stat.size > TAIL_READ_BYTES) tail = readTail(file, TAIL_BYTES);
+      if (tail === null && stat.size > TAIL_READ_BYTES) tail = readTail(file, TAIL_BYTES, state.pending);
       if (tail === undefined) return false;
       state.size = stat.size;
       state.mtimeMs = stat.mtimeMs;

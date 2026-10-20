@@ -152,6 +152,21 @@ describe('TeammateScanner', () => {
     }
   });
 
+  it('a call still running stays pending after a sibling\'s large result pushed it out of the window', () => {
+    const now = Date.now();
+    const file = agent('mate', 'in_process_teammate', [toolUse('long', now), toolUse('quick', now), toolUse('small', now)]);
+    const scanner = new TeammateScanner(sub);
+    expect(scanner.anyWorking(now)).toBe(true);
+    const big = JSON.stringify({
+      type: 'user', isSidechain: true, timestamp: iso(now),
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'quick', content: 'q'.repeat(300 * 1024) }] },
+    });
+    fs.appendFileSync(file, `${big}\n${toolResult('small', now)}\n`);
+    fs.utimesSync(file, now / 1000, now / 1000);
+    // Past FRESH_MS, inside PENDING_TOOL_CAP_MS: 'long' has no result yet.
+    expect(scanner.anyWorking(now + FRESH_MS + 60_000)).toBe(true);
+  });
+
   it('a final reply too big for the tail window still reads as replied', () => {
     const now = Date.now();
     const long = JSON.stringify({

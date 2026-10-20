@@ -301,6 +301,10 @@ export interface PaneSlice {
   // Cleared with the activity string (pane disposal); byte-'running' has no
   // string, so it stamps the timestamp only (markSurfaceRunning).
   surfaceActivityAt: Record<string, number>;
+  // When an Agent Teams teammate of each pane's agent last reported working
+  // (markSurfaceTeammatesWorking). The roster lets this stamp, unlike any
+  // other, show a finished lead's pane as running. Transient.
+  surfaceTeammatesAt: Record<string, number>;
   // The TURN LATCH: ptyId → epoch-ms of the hook-reported turn start
   // (`UserPromptSubmit`, arriving as a METADATA_UPDATE tagged
   // hookKind:'agent.user_prompt_submit').
@@ -729,6 +733,10 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
     if (evidenceBefore !== undefined && at !== undefined && at <= evidenceBefore) {
       delete state.surfaceActivityAt[ptyId];
     }
+    const mates = state.surfaceTeammatesAt[ptyId];
+    if (evidenceBefore !== undefined && mates !== undefined && mates <= evidenceBefore) {
+      delete state.surfaceTeammatesAt[ptyId];
+    }
   }),
 
   paneLabel: {},
@@ -787,6 +795,7 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
   surfaceActivity: {},
   surfaceLastActivity: {},
   surfaceActivityAt: {},
+  surfaceTeammatesAt: {},
   surfaceTurnOpenAt: {},
   surfaceTurnEndAt: {},
   surfacePendingQuestion: {},
@@ -888,7 +897,9 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
 
   markSurfaceTeammatesWorking: (ptyId) => set((state: StoreState) => {
     if (!ptyId) return;
-    state.surfaceActivityAt[ptyId] = Date.now();
+    const now = Date.now();
+    state.surfaceActivityAt[ptyId] = now;
+    state.surfaceTeammatesAt[ptyId] = now;
   }),
 
   markSurfaceTurnOpen: (ptyId) => set((state: StoreState) => {
@@ -1144,6 +1155,7 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
             delete state.surfaceQuestionSeen[s.ptyId];
             delete state.surfaceDismissedQuestion[s.ptyId];
             delete state.surfaceActivityAt[s.ptyId];
+            delete state.surfaceTeammatesAt[s.ptyId];
             // A reused ptyId must not inherit a dead pane's open turn — the
             // latch outranks the byte heuristic, so a leaked one would pin the
             // new pane at 'running' with nothing left alive to withdraw it.
