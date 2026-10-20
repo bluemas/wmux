@@ -32,9 +32,11 @@
 //     or a closed pane can never leak a watcher.
 //   - Subagent count (subagentCount.ts). An agent with a counter (Claude,
 //     Codex) is read even while hook-fed, for the count only. A count is sent
-//     on change, and a watch that ends (agent death, session start, closed
-//     pane, replaced file) sends 0 if it had sent more, so a stale count never
-//     sticks.
+//     on change and, while not 0, again every SUBAGENT_COUNT_REFRESH_MS (the
+//     renderer drops one it stopped hearing). A watch that ends (agent death,
+//     session start, closed pane, replaced file) sends 0 if it had sent more.
+//     A read that skips ahead still feeds the counter every skipped line, up
+//     to SUBAGENT_CATCHUP_BYTES, so a start or end in them is not lost.
 
 import type { ResumeBinding } from '../../shared/agentResume';
 import type { TurnEvent } from '../../shared/transcript/turnEvents';
@@ -45,9 +47,12 @@ import { HOOK_ACTIVITY_KINDS } from '../../shared/hooks/hookActivityKinds';
 import { MAX_RAW_LEN, summarizeActivity } from '../../shared/activitySummary';
 import { agentRow } from '../../shared/agentIdentity';
 import { SUBAGENT_COUNTERS, type SubagentCounter } from './subagentCount';
+import { SUBAGENT_COUNT_REFRESH_MS } from '../../shared/subagentCount';
 
 /** Most bytes read for one session in one tick. */
 export const READ_CAP_BYTES = 256 * 1024;
+/** Most skipped bytes the subagent counter reads in one tick; past it, it starts afresh. */
+export const SUBAGENT_CATCHUP_BYTES = 4 * 1024 * 1024;
 /** When further behind than READ_CAP_BYTES, resume from this tail window. */
 export const JUMP_WINDOW_BYTES = 64 * 1024;
 const DEFAULT_POLL_MS = 1500;
@@ -170,6 +175,10 @@ interface Watch {
   subagents?: SubagentCounter;
   /** The count last sent (0 before any). */
   subagentsSent: number;
+  /** When the count was last sent (0 before any). */
+  subagentsSentAt: number;
+  /** `parse` without the counter, for lines the counter has already read. */
+  plain: ParseLine;
 }
 
 /**
@@ -339,9 +348,30 @@ export class TranscriptActivityWatcher {
 
   private flushSubagents(id: string, watch: Watch): void {
     const count = watch.subagents?.count ?? 0;
-    if (count === watch.subagentsSent) return;
+    const now = this.now();
+    if (count === watch.subagentsSent && (count === 0 || now - watch.subagentsSentAt < SUBAGENT_COUNT_REFRESH_MS)) return;
     watch.subagentsSent = count;
+    watch.subagentsSentAt = now;
     this.deps.emitSubagents?.(id, count);
+  }
+
+  /**
+   * Feeds `counter` every complete line from `from` toward `size`, at most
+   * SUBAGENT_CATCHUP_BYTES. Returns the line boundary it reached, or null when
+   * the budget ran out (or the file changed under it) before the end.
+   */
+  private catchUpSubagents(counter: SubagentCounter, path: string, from: number, size: number): number | null {
+    const feed: ParseLine = (line) => { counter.noteLine(line); return []; };
+    let offset = from;
+    while (offset < size) {
+      if (offset - from >= SUBAGENT_CATCHUP_BYTES) return null;
+      const delta = readTranscriptDelta(path, offset, READ_CAP_BYTES, feed);
+      if (!delta || delta.reset) return null;
+      // A record still being written: the next tick reads it.
+      if (delta.cursor.tailOffset <= offset) break;
+      offset = delta.cursor.tailOffset;
+    }
+    return offset;
   }
 
   /** One transcript, one pane: the pane whose agent spoke last keeps it. */
@@ -388,7 +418,7 @@ export class TranscriptActivityWatcher {
     const subagents = binding ? SUBAGENT_COUNTERS[binding.agent]?.() : undefined;
     const counted: ParseLine = subagents ? (line, offset) => { subagents.noteLine(line); return parse(line, offset); } : parse;
     // Start at the end: only what the agent writes from now on.
-    this.watches.set(id, { path, parse: counted, ino: stat.ino, offset: stat.size, sentAt: 0, lines: !!onLine, linesOnly: this.hookFed.has(id), replay: !!onLine, subagents, subagentsSent: 0 });
+    this.watches.set(id, { path, parse: counted, ino: stat.ino, offset: stat.size, sentAt: 0, lines: !!onLine, linesOnly: this.hookFed.has(id), replay: !!onLine, subagents, subagentsSent: 0, subagentsSentAt: 0, plain: parse });
   }
 
   /** The one-time `onClaudeLine` replay a watch owes, if it owes one. */
@@ -431,13 +461,16 @@ export class TranscriptActivityWatcher {
       this.replayLines(id, watch);
     } else if (stat.size - watch.offset > READ_CAP_BYTES) {
       if (watch.lines) this.deps.onClaudeGap?.(id);
-      // Skipped lines may have started or ended subagents: count afresh from
-      // the window read below.
-      watch.subagents?.reset();
-      const page = readTranscriptPage(watch.path, { maxBytes: JUMP_WINDOW_BYTES, parseLine: watch.parse });
+      // The counter reads the skipped lines too, so the window below parses
+      // without it; past its budget it starts afresh from the window.
+      const caughtUp = watch.subagents ? this.catchUpSubagents(watch.subagents, watch.path, watch.offset, stat.size) : undefined;
+      if (caughtUp === null) watch.subagents?.reset();
+      const page = readTranscriptPage(watch.path, { maxBytes: JUMP_WINDOW_BYTES, parseLine: typeof caughtUp === 'number' ? watch.plain : watch.parse });
       if (!page) { this.dropWatch(id); return; }
       events = page.events;
-      watch.offset = page.cursor.tailOffset;
+      // The counter stopped at a line boundary; the window's cursor can sit
+      // inside a record still being written.
+      watch.offset = typeof caughtUp === 'number' ? caughtUp : page.cursor.tailOffset;
     } else if (stat.size > watch.offset) {
       const delta = readTranscriptDelta(watch.path, watch.offset, READ_CAP_BYTES, watch.parse);
       if (!delta) { this.dropWatch(id); return; }

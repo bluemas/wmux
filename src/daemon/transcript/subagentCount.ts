@@ -142,7 +142,8 @@ export class ClaudeSubagentCounter implements SubagentCounter {
 
   noteLine(line: string): void {
     const notification = line.includes('<task-notification>');
-    if (!notification && !line.includes('"tool_use"') && !line.includes('"tool_result"') && !line.includes('"type":"user"')) return;
+    const turnEnd = this.foreground.size > 0 && line.includes('"stop_reason":"');
+    if (!notification && !turnEnd && !line.includes('"tool_use"') && !line.includes('"tool_result"') && !line.includes('"type":"user"')) return;
     const entry = parse(line);
     if (!entry) return;
     const message = record(entry.message);
@@ -154,6 +155,12 @@ export class ClaudeSubagentCounter implements SubagentCounter {
     if (entry.type === 'user' && entry.isMeta !== true && entry.isCompactSummary !== true
       && record(entry.origin).kind !== 'task-notification'
       && (typeof message.content === 'string' || (content && !content.some((b) => record(b).type === 'tool_result')))) {
+      this.foreground.clear();
+    }
+    // The lead's turn ended: no foreground call of it still runs (one left
+    // without a result by an interrupt, say).
+    if (entry.type === 'assistant' && typeof message.stop_reason === 'string' && message.stop_reason !== 'tool_use'
+      && !(content ?? []).some((b) => record(b).type === 'tool_use')) {
       this.foreground.clear();
     }
     for (const raw of content ?? []) {

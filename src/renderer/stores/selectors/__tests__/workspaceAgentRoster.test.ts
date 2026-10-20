@@ -5,6 +5,7 @@ import {
   buildRosterChip,
   type WorkspaceAgentRosterRow,
 } from '../workspaceAgentRoster';
+import { SUBAGENT_COUNT_STALE_MS } from '../../../../shared/subagentCount';
 import { HOOK_RUNNING_TTL_MS } from '../fleet';
 import { BRAIN_PTY_ID_PREFIX } from '../../../../shared/constants';
 import type { StoreState } from '../../index';
@@ -38,6 +39,7 @@ interface StateOverrides {
   surfaceActivityAt?: Record<string, number>;
   surfaceTurnOpenAt?: Record<string, number>;
   surfaceSubagents?: Record<string, number>;
+  surfaceSubagentsAt?: Record<string, number>;
   paneLabel?: Record<string, string>;
   agentClockMs?: number;
   remoteWorkspaces?: StoreState['remoteWorkspaces'];
@@ -584,6 +586,16 @@ describe('createWorkspaceAgentRosterSelector memoization', () => {
     expect(third.rows[0].subagents).toBe(1);
     const same = select(state({ workspaces: [ws], surfaceAgent: agents, surfaceSubagents: { 'pty-1': 1 } }));
     expect(same).toBe(third);
+  });
+
+  it('hides a count the daemon stopped refreshing (a 0 that never arrived)', () => {
+    const at = { 'pty-1': NOW - SUBAGENT_COUNT_STALE_MS + 1_000 };
+    const fresh = selectWorkspaceAgentRoster(state({ workspaces: [ws], surfaceAgent: agents, surfaceSubagents: { 'pty-1': 2 }, surfaceSubagentsAt: at }), 'ws-1');
+    expect(fresh.rows[0].subagents).toBe(2);
+    const stale = selectWorkspaceAgentRoster(state({
+      workspaces: [ws], surfaceAgent: agents, surfaceSubagents: { 'pty-1': 2 }, surfaceSubagentsAt: at, agentClockMs: NOW + 2_000,
+    }), 'ws-1');
+    expect(stale.rows[0].subagents).toBeUndefined();
   });
 
   it('a stashed pane carries its subagent count too', () => {

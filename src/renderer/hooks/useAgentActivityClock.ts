@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import { useStore } from '../stores';
 import { HOOK_RUNNING_TTL_MS } from '../stores/selectors/fleet';
+import { SUBAGENT_COUNT_STALE_MS } from '../../shared/subagentCount';
 
 /** Bump cadence — matches the competitor's 2 s status tick. */
 const TICK_MS = 2_000;
@@ -39,7 +40,7 @@ export function useAgentActivityClock(): void {
   useEffect(() => {
     let lastSlowBumpAt = 0;
     const id = setInterval(() => {
-      const { surfaceActivityAt, surfaceTurnOpenAt } = useStore.getState();
+      const { surfaceActivityAt, surfaceTurnOpenAt, surfaceSubagentsAt } = useStore.getState();
       const now = Date.now();
       let anyFresh = false;
       for (const ptyId in surfaceActivityAt) {
@@ -47,6 +48,12 @@ export function useAgentActivityClock(): void {
           anyFresh = true;
           break;
         }
+      }
+      // A subagent count the roster shows until it goes stale (a 0 that
+      // never arrived), so the clock must still move when it does.
+      for (const ptyId in surfaceSubagentsAt ?? {}) {
+        if (anyFresh) break;
+        if (now - surfaceSubagentsAt[ptyId] <= SUBAGENT_COUNT_STALE_MS + DECAY_GRACE_MS) anyFresh = true;
       }
       if (anyFresh) {
         bumpAgentClock();

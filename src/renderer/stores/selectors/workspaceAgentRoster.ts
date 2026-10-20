@@ -7,6 +7,16 @@ import { agentDisplayToSlug } from '../../../shared/agentIdentity';
 import type { StoreState } from '../index';
 import { computePaneAutoName, paneDisplayName } from '../../utils/paneNaming';
 import { HOOK_RUNNING_TTL_MS, isHookRunning, isQuietUsageLimitError, pickStashedRepresentativeSurface, resolveRemoteAgent } from './fleet';
+import { SUBAGENT_COUNT_STALE_MS } from '../../../shared/subagentCount';
+
+/** The pane's subagent count while the daemon keeps refreshing it; undefined for none. */
+function liveSubagents(state: StoreState, ptyId: string): number | undefined {
+  // Optional-chained: partial test stores build without these maps.
+  const count = state.surfaceSubagents?.[ptyId];
+  if (!count) return undefined;
+  const at = state.surfaceSubagentsAt?.[ptyId];
+  return at !== undefined && state.agentClockMs - at > SUBAGENT_COUNT_STALE_MS ? undefined : count;
+}
 
 /** One detected agent session, kept attached to the terminal surface that owns it. */
 export interface WorkspaceAgentRosterRow {
@@ -257,8 +267,7 @@ export function selectWorkspaceAgentRoster(
         // states (dotRosterParity) build partial stores without this map.
         questionSeen: pendingQuestion !== undefined && state.surfaceQuestionSeen?.[ptyId] === pendingQuestion,
         activity,
-        // Optional-chained: partial test stores build without this map.
-        subagents: state.surfaceSubagents?.[ptyId] || undefined,
+        subagents: liveSubagents(state, ptyId),
         hasAttention: attentionStatus !== undefined || pendingQuestion !== undefined,
         needsAttention: needsAttention(status),
         isFocused:
@@ -348,7 +357,7 @@ export function selectWorkspaceAgentRoster(
       activity: status === 'running' && activityIsFresh && ptyId
         ? nonEmpty(state.surfaceActivity[ptyId])
         : undefined,
-      subagents: ptyId && liveness !== 'exited' ? state.surfaceSubagents?.[ptyId] || undefined : undefined,
+      subagents: ptyId && liveness !== 'exited' ? liveSubagents(state, ptyId) : undefined,
       hasAttention: attentionStatus !== undefined || pendingQuestion !== undefined,
       needsAttention: liveness === 'exited' || needsAttention(status),
       isFocused: false,

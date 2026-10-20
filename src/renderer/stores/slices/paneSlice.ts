@@ -264,6 +264,10 @@ export interface PaneSlice {
   // transcript and resets to 0 when its watch ends. Absent means 0. Cleared
   // at the same teardown sites as surfaceActivity. Transient — never persisted.
   surfaceSubagents: Record<string, number>;
+  // When each count last arrived. The daemon re-sends a count that is not 0
+  // (SUBAGENT_COUNT_REFRESH_MS), and the roster hides one it stopped hearing
+  // (SUBAGENT_COUNT_STALE_MS): a 0 that never arrived must not stick.
+  surfaceSubagentsAt: Record<string, number>;
   setSurfaceSubagents: (ptyId: string, count: number) => void;
   /**
    * #1176 — the pendingQuestion text the user has already laid eyes on (they
@@ -795,6 +799,7 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
   surfacePendingQuestion: {},
   surfaceLastMessage: {},
   surfaceSubagents: {},
+  surfaceSubagentsAt: {},
   surfaceQuestionSeen: {},
   surfaceDismissedQuestion: {},
   agentClockMs: Date.now(),
@@ -861,8 +866,13 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
 
   setSurfaceSubagents: (ptyId, count) => set((state: StoreState) => {
     if (!ptyId) return;
-    if (count > 0) state.surfaceSubagents[ptyId] = count;
-    else delete state.surfaceSubagents[ptyId];
+    if (count > 0) {
+      state.surfaceSubagents[ptyId] = count;
+      state.surfaceSubagentsAt[ptyId] = Date.now();
+    } else {
+      delete state.surfaceSubagents[ptyId];
+      delete state.surfaceSubagentsAt[ptyId];
+    }
   }),
 
   markSurfaceQuestionSeen: (ptyId) => set((state: StoreState) => {
@@ -1147,6 +1157,7 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
             delete state.surfacePendingQuestion[s.ptyId];
             delete state.surfaceLastMessage[s.ptyId];
             delete state.surfaceSubagents[s.ptyId];
+            delete state.surfaceSubagentsAt[s.ptyId];
             delete state.surfaceQuestionSeen[s.ptyId];
             delete state.surfaceDismissedQuestion[s.ptyId];
             delete state.surfaceActivityAt[s.ptyId];

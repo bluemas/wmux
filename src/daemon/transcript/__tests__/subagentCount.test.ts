@@ -4,7 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import type { ResumeBinding } from '../../../shared/agentResume';
 import { ClaudeSubagentCounter, CodexSubagentCounter } from '../subagentCount';
-import { TranscriptActivityWatcher } from '../TranscriptActivityWatcher';
+import { READ_CAP_BYTES, TranscriptActivityWatcher } from '../TranscriptActivityWatcher';
+import { SUBAGENT_COUNT_REFRESH_MS } from '../../../shared/subagentCount';
 
 const ts = '2026-10-20T12:00:00.000Z';
 
@@ -185,7 +186,7 @@ describe('TranscriptActivityWatcher — subagent count', () => {
   function harness(agent: 'claude' | 'codex') {
     const file = path.join(dir, `${agent}.jsonl`);
     fs.writeFileSync(file, `${JSON.stringify({ type: 'summary', summary: 'old' })}\n`);
-    const state = { alive: true as boolean | undefined };
+    const state = { alive: true as boolean | undefined, now: 1_000_000 };
     const counts: Array<[string, number]> = [];
     const binding: ResumeBinding = { agent, sessionId: 's', cwd: dir, transcriptPath: file, ts: 0 };
     const watcher = new TranscriptActivityWatcher({
@@ -195,6 +196,7 @@ describe('TranscriptActivityWatcher — subagent count', () => {
       emit: () => { /* the activity line is not under test here */ },
       emitSubagents: (id, count) => counts.push([id, count]),
       minGapMs: 0,
+      now: () => state.now,
     });
     const append = (...lines: string[]) => fs.appendFileSync(file, lines.map((l) => `${l}\n`).join(''));
     return { file, watcher, counts, state, append };
@@ -232,6 +234,61 @@ describe('TranscriptActivityWatcher — subagent count', () => {
     expect(h.counts).toEqual([['pty-1', 1]]);
     h.watcher.noteHookSignal('pty-1', 'agent.session_start');
     expect(h.counts.at(-1)).toEqual(['pty-1', 0]);
+  });
+
+  it('re-sends a count that is not 0 while it stands, so a client that missed it gets it back', () => {
+    const h = harness('codex');
+    h.watcher.tick();
+    h.append(codexSub('started', 'c1', 'thread-a'));
+    h.watcher.tick();
+    h.state.now += SUBAGENT_COUNT_REFRESH_MS - 1;
+    h.watcher.tick();
+    expect(h.counts).toEqual([['pty-1', 1]]);
+    h.state.now += 1;
+    h.watcher.tick();
+    expect(h.counts).toEqual([['pty-1', 1], ['pty-1', 1]]);
+    h.append(codexSub('completed', 'x', 'thread-a'));
+    h.watcher.tick();
+    h.state.now += SUBAGENT_COUNT_REFRESH_MS * 3;
+    h.watcher.tick();
+    expect(h.counts.at(-1)).toEqual(['pty-1', 0]);
+    expect(h.counts).toHaveLength(3);
+  });
+
+  it('a large tool output between two reads keeps a subagent that still runs', () => {
+    const h = harness('claude');
+    h.watcher.tick();
+    h.append(claudeToolUse('toolu_1', 'Agent'), claudeToolResult('toolu_1', asyncLaunched('a111')));
+    h.watcher.tick();
+    expect(h.counts).toEqual([['pty-1', 1]]);
+    h.append(claudeToolUse('toolu_2', 'Read'), claudeToolResult('toolu_2', 'x'.repeat(READ_CAP_BYTES + 50_000)));
+    h.watcher.tick();
+    expect(h.counts).toEqual([['pty-1', 1]]);
+  });
+
+  it('an end written just before a large tool output is still read', () => {
+    const h = harness('claude');
+    h.watcher.tick();
+    h.append(claudeToolUse('toolu_1', 'Agent'), claudeToolResult('toolu_1', asyncLaunched('a111')));
+    h.watcher.tick();
+    h.append(queueNotification('a111', 'toolu_1'), claudeToolUse('toolu_2', 'Read'), claudeToolResult('toolu_2', 'x'.repeat(READ_CAP_BYTES + 50_000)));
+    h.watcher.tick();
+    expect(h.counts.at(-1)).toEqual(['pty-1', 0]);
+  });
+
+  it('a large record still being written does not lose the count', () => {
+    const h = harness('claude');
+    h.watcher.tick();
+    h.append(claudeToolUse('toolu_1', 'Agent'), claudeToolResult('toolu_1', asyncLaunched('a111')));
+    h.watcher.tick();
+    // The writer pauses inside a record bigger than the read cap.
+    const big = claudeToolResult('toolu_2', 'x'.repeat(READ_CAP_BYTES + 50_000));
+    fs.appendFileSync(h.file, big.slice(0, READ_CAP_BYTES + 20_000));
+    h.watcher.tick();
+    h.watcher.tick();
+    fs.appendFileSync(h.file, `${big.slice(READ_CAP_BYTES + 20_000)}\n`);
+    h.watcher.tick();
+    expect(h.counts).toEqual([['pty-1', 1]]);
   });
 
   it('a closed pane sends 0 for a count it had sent', () => {
