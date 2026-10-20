@@ -4,6 +4,7 @@ import { getLeafPanes } from '../../../shared/paneUtils';
 import type { PaneLeaf, Workspace } from '../../../shared/types';
 import { paneTag as paneTagOf } from '../../utils/paneNaming';
 import { selectWorkspaceAgentRoster, type WorkspaceAgentRosterRow } from './workspaceAgentRoster';
+import { surfaceAttentionStatus } from './fleet';
 
 export type OfficeState = 'working' | 'needs_you' | 'finished' | 'resting';
 export type OfficeNeed = 'question' | 'error' | 'usage_limit';
@@ -65,10 +66,16 @@ function agentKind(row: WorkspaceAgentRosterRow): OfficeEmployee['kind'] {
   return agentRow(row.slug)?.officeLook ? (row.slug as AgentSlugWith<'officeLook'>) : 'other';
 }
 
-function needOf(row: WorkspaceAgentRosterRow): OfficeNeed | undefined {
+/**
+ * Read from the Fleet board's attention status, not the roster's `status`:
+ * that one falls back to the lifecycle status once the owner looks at the
+ * pane, and a seen `waiting` or `error` would keep its bubble forever.
+ */
+function needOf(state: StoreState, row: WorkspaceAgentRosterRow): OfficeNeed | undefined {
   if (row.usageLimitWaiting) return 'usage_limit';
-  if (row.status === 'awaiting_input' || row.status === 'waiting') return 'question';
-  if (row.status === 'error') return 'error';
+  const attention = surfaceAttentionStatus(state, row.ptyId);
+  if (attention === 'awaiting_input' || attention === 'waiting') return 'question';
+  if (attention === 'error') return 'error';
   return undefined;
 }
 
@@ -135,7 +142,7 @@ export function selectOfficeEmployees(state: StoreState, _now: number): OfficeEm
       if (row.stashed && row.stashedLiveness === 'exited') continue;
 
       const teammates = state.surfaceTeammates?.[row.ptyId] ?? [];
-      const need = needOf(row);
+      const need = needOf(state, row);
       let officeState: OfficeState;
       if (need) {
         officeState = 'needs_you';

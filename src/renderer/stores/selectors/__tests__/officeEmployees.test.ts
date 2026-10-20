@@ -201,6 +201,30 @@ describe('selectOfficeEmployees', () => {
     expect(selectOfficeEmployees(seen, NOW)[0].state).toBe('resting');
   });
 
+  it('a waiting turn needs you until the owner looks, like the Fleet board', () => {
+    const s = state({
+      workspaces: oneWs(),
+      surfaceAgent: { 'pty-1': claude('waiting') },
+      surfaceAgentStatus: { 'pty-1': 'waiting' },
+    });
+    expect(selectOfficeEmployees(s, NOW)[0]).toMatchObject({ state: 'needs_you', need: 'question' });
+    // Focusing the pane clears the attention status; the lifecycle stays 'waiting'.
+    const seen = state({ workspaces: oneWs(), surfaceAgent: { 'pty-1': claude('waiting') } });
+    expect(selectWorkspaceAgentRoster(seen, 'ws-1').rows[0].status).toBe('waiting');
+    expect(selectOfficeEmployees(seen, NOW)[0].state).toBe('resting');
+    expect(selectOfficeEmployees(seen, NOW)[0].need).toBeUndefined();
+  });
+
+  it('an open dialog still needs you after the owner looks', () => {
+    const seen = state({ workspaces: oneWs(), surfaceAgent: { 'pty-1': claude('awaiting_input') } });
+    expect(selectOfficeEmployees(seen, NOW)[0]).toMatchObject({ state: 'needs_you', need: 'question' });
+  });
+
+  it('a viewed lifecycle error does not need you', () => {
+    const seen = state({ workspaces: oneWs(), surfaceAgent: { 'pty-1': claude('error') } });
+    expect(selectOfficeEmployees(seen, NOW)[0].need).toBeUndefined();
+  });
+
   it('a stale lifecycle complete does not count', () => {
     const s = state({ workspaces: oneWs(), surfaceAgent: { 'pty-1': claude('complete') } });
     expect(selectWorkspaceAgentRoster(s, 'ws-1').rows[0].status).toBe('complete');
