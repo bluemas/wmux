@@ -14,9 +14,12 @@
 //   at an empty desk.
 // - Characters are anchored at `STATION.seatX/seatY` (the chair's centre on
 //   the floor). A resting character goes on a sofa seat (`SOFA_SEATS`).
+// - The boss desk (`OFFICE_EXTRAS.bossDesk`) and the seated boss (`BOSS`)
+//   share one frame: draw the desk, then the boss at the same top-left.
 import charactersUrl from './characters.png';
 import furnitureUrl from './furniture.png';
 import {
+  BOSS_LAYOUT,
   CHARACTER_LAYOUT,
   FURNITURE_LAYOUT,
   GENERIC_LOOK_ID,
@@ -33,7 +36,7 @@ export interface SpriteRef {
   h: number;
 }
 
-export const CHARACTER_POSES = ['sit', 'type1', 'type2', 'raiseHand', 'rest1', 'rest2', 'walk1', 'walk2'] as const;
+export const CHARACTER_POSES = ['sit', 'type1', 'type2', 'raiseHand', 'rest1', 'rest2', 'walk1', 'walk2', 'standRaise'] as const;
 export type CharacterPose = (typeof CHARACTER_POSES)[number];
 
 export interface CharacterSheet {
@@ -53,8 +56,8 @@ export type FurnitureKey =
   | 'sofa'
   | 'shelf';
 
-/** Room pieces beyond the required set: the left wall, a carpet tile, lounge props. */
-export type OfficeExtraKey = 'wallLeft' | 'windowLeft' | 'carpet' | 'rug' | 'coffeeTable';
+/** Room pieces beyond the required set: the left wall, a carpet tile, lounge props, the boss desk. */
+export type OfficeExtraKey = 'wallLeft' | 'windowLeft' | 'carpet' | 'rug' | 'coffeeTable' | 'bossDesk';
 
 /** Isometric floor tile size in px (2:1). */
 export const OFFICE_TILE: { w: number; h: number } = { w: TILE_LAYOUT.w, h: TILE_LAYOUT.h };
@@ -85,6 +88,7 @@ export const OFFICE_EXTRAS: Record<OfficeExtraKey, SpriteRef> = {
   carpet: furnitureRef('carpet'),
   rug: furnitureRef('rug'),
   coffeeTable: furnitureRef('coffeeTable'),
+  bossDesk: furnitureRef('bossDesk'),
 };
 
 /** Per sprite: the pixel (in the sprite) that sits on its floor reference point. */
@@ -128,3 +132,14 @@ export const CHARACTERS: CharacterSheet[] = LOOK_IDS.filter((id) => id !== GENER
 
 /** The look for agents that are neither Claude Code nor Codex (hood up). */
 export const GENERIC_CHARACTER: CharacterSheet = sheetFor(GENERIC_LOOK_ID);
+
+/**
+ * The boss, seated in a high-backed chair behind the boss desk (pixels the
+ * desk covers are already cleared). Shares the bossDesk sprite's frame:
+ * `deskX/deskY` is the north corner of the desk's footprint (the desk's
+ * anchor), `seatX/seatY` the boss chair's centre on the floor.
+ */
+export const BOSS: SpriteRef & { deskX: number; deskY: number; seatX: number; seatY: number } = {
+  src: charactersUrl,
+  ...BOSS_LAYOUT,
+};

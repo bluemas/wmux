@@ -118,6 +118,10 @@ const charRows = (scale) =>
         `<tr><th>${l.id}</th>${POSES.map((p) => `<td>${img(charFrame(l.id, p), scale, `${l.id} ${p}`)}</td>`).join('')}</tr>`,
     )
     .join('\n');
+const bossAtDesk = compose(
+  compose(new Layer(built.boss.w, built.boss.h), F.bossDesk.layer),
+  crop(built.cSheet, built.boss.x, built.boss.y, built.boss.w, built.boss.h),
+);
 const head = `<tr><th></th>${POSES.map((p) => `<th>${p}</th>`).join('')}</tr>`;
 const html = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -146,6 +150,8 @@ td { padding: 2px; }
 <div class="scroll"><table>${head}${charRows(2)}</table></div>
 <h2>Characters at 3x</h2>
 <div class="scroll"><table>${head}${charRows(3)}</table></div>
+<h2>The boss at the boss desk (2x and 3x)</h2>
+<div class="grid"><figure>${img(bossAtDesk, 2, 'boss')}${img(bossAtDesk, 3, 'boss')}<figcaption>bossDesk + boss ¡¤ one frame, ${bossAtDesk.w}¡¿${bossAtDesk.h}</figcaption></figure></div>
 <h2>Furniture and room pieces (2x and 3x)</h2>
 <p>Desk, monitors and chair share the 64Ã—56 station frame with the characters: draw desk, monitor, then the character (seated frames already include the chair) at one origin.</p>
 <div class="grid">${furnitureCards}</div>

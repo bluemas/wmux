@@ -21,6 +21,9 @@ export const RAMPS = {
   screenOff: ['#73839b', '#5a6981', '#465369', '#374156', '#222838'],
   screenOn: ['#f2fdff', '#d2f1fb', '#abe2f4', '#7cc8e8', '#3a8bb8'],
   chair: ['#a7c0cb', '#86a3b1', '#6a8593', '#516875', '#32444e'],
+  // The boss's desk and chair: dark walnut, oxblood leather.
+  walnut: ['#b98a63', '#996a47', '#7b5136', '#5f3c28', '#3a2318'],
+  leather: ['#c97a6c', '#a95a50', '#8a4340', '#6c3133', '#3f1b1e'],
   sofa: ['#cde5dc', '#afd3c6', '#90bcab', '#71998b', '#47695b'],
   cushion: ['#ffeab0', '#f9d683', '#eabd5f', '#c99a47', '#896530'],
   leaf: ['#d3f0a8', '#a9d980', '#7fbb63', '#5a944c', '#325d33'],
@@ -44,6 +47,7 @@ export const RAMPS = {
   charcoal: ['#9295a3', '#757887', '#5c5f6e', '#474956', '#2b2c36'],
   khaki: ['#f0dfb7', '#dec894', '#c9ad76', '#ab8e5a', '#6f5a37'],
   black: ['#777a88', '#5b5d6b', '#474956', '#353741', '#1e1f27'],
+  suit: ['#8e95b0', '#6d7593', '#545b78', '#40465f', '#262a3c'],
   shoe: ['#908d9c', '#686574', '#4b4956', '#383641', '#1f1e26'],
   sneaker: ['#ffffff', '#f3f4f8', '#e0e3ec', '#c4c8d6', '#7d8295'],
   // Skin
@@ -59,6 +63,7 @@ export const RAMPS = {
   hairLilac: ['#f8d0ec', '#e2aad7', '#c286be', '#9c6599', '#5f3b5d'],
   hairTeal: ['#a8ebe5', '#69c9cc', '#43a2ad', '#2f7988', '#1c4754'],
   hairDark: ['#8f6447', '#6c4731', '#523424', '#3c251a', '#22140e'],
+  hairSilver: ['#ffffff', '#e8eaf0', '#c9cdd8', '#a2a7b6', '#6b7080'],
   // Faces and props
   eye: ['#ffffff', '#4a3f5c', '#352c45', '#2b2338', '#221b2d'],
   white: ['#ffffff', '#ffffff', '#ffffff', '#f2f2f2', '#bdbdbd'],

@@ -492,3 +492,85 @@ export function drawRug() {
   fillPoly(L, [P(24, 13), P(29, 16), P(24, 19), P(19, 16)], 'rug', BASE);
   return L;
 }
+
+// ---------------------------------------------------------------------------
+// The boss's desk (at the head of the room, facing the viewer)
+
+/**
+ * Boss frame: the boss desk, and the boss in a high-backed chair behind it,
+ * share this frame and origin. (ox, oy) is the north corner of the desk's
+ * footprint (a 0..48, b 0..20); the chair stands behind it at negative b.
+ */
+export const BOSS_FRAME = { w: 96, h: 88, ox: 24, oy: 50 };
+/** The boss desk's floor footprint from its north corner. */
+export const BOSS_DESK_SIZE = { a: 48, b: 20 };
+/** The boss chair's centre on the floor (the boss's anchor), in world units from the desk's north corner. */
+export const BOSS_SEAT = { a: 24, b: -10 };
+
+export function drawBossDesk() {
+  const L = new Layer(BOSS_FRAME.w, BOSS_FRAME.h);
+  const P = iso(BOSS_FRAME.ox, BOSS_FRAME.oy);
+  const px = (a, b, z) => P(a, b, z).map(Math.floor);
+  // Two drawer pedestals and a recessed modesty panel between them.
+  box(L, P, 16, 32, 3, 6, 1, 10, 'walnut', { rim: false });
+  box(L, P, 1, 15, 1, 19, 0, 10, 'walnut');
+  box(L, P, 33, 47, 1, 19, 0, 10, 'walnut');
+  // Drawer seams on the pedestals' fronts (b = 19), each drawer with a brass pull.
+  for (const [a0, a1] of [
+    [1, 15],
+    [33, 47],
+  ]) {
+    for (const z of [3.5, 6.5]) {
+      const [x0, y0] = px(a0 + 1, 19, z);
+      const [x1, y1] = px(a1 - 1, 19, z);
+      line(L, x0, y0, x1, y1, 'walnut', SHADE);
+    }
+    for (const z of [2, 5, 8]) {
+      const [hx, hy] = px((a0 + a1) / 2 - 1, 19, z);
+      rect(L, hx, hy, 2, 1, 'mustard', LIGHT);
+    }
+  }
+  // The top: a thick slab with a small overhang, and a leather writing pad.
+  box(L, P, 0, 48, 0, 20, 10, 12, 'walnut');
+  fillPoly(L, [P(13, 4, 12), P(35, 4, 12), P(35, 14, 12), P(13, 14, 12)], 'leather', BASE);
+  fillPoly(L, [P(14, 5, 12), P(34, 5, 12), P(34, 13, 12), P(14, 13, 12)], 'leather', LIGHT);
+  // A paper stack at the front right and a pen beside it.
+  box(L, P, 37, 45, 9, 17, 12, 15, 'paper');
+  {
+    const [x0, y0] = px(30, 16, 12.5);
+    line(L, x0, y0, x0 + 4, y0 + 2, 'navy', BASE);
+  }
+  // A green banker's lamp at the back left.
+  box(L, P, 2, 8, 2, 7, 12, 13, 'mustard', { rim: false });
+  {
+    const [sx, sy] = px(5, 4.5, 13);
+    rect(L, sx, sy - 8, 1, 8, 'mustard', SHADE);
+  }
+  box(L, P, 0, 10, 2, 7, 20, 23, 'teal');
+  return outline(L, RAMPS);
+}
+
+/** The boss's high-backed leather chair, in the boss frame. */
+export function drawBossChair() {
+  const L = new Layer(BOSS_FRAME.w, BOSS_FRAME.h);
+  const P = iso(BOSS_FRAME.ox, BOSS_FRAME.oy);
+  const { a, b } = BOSS_SEAT;
+  // Seat, then the tall back behind it, then the armrests.
+  box(L, P, a - 9, a + 9, b - 6, b + 6, 6, 10, 'leather');
+  box(L, P, a - 10, a + 10, b - 9, b - 6, 8, 40, 'leather');
+  // Tufting: a grid of buttons on the back's front face (b - 6).
+  for (const z of [18, 26, 34]) for (const da of [-6, 0, 6]) {
+    const [x, y] = P(a + da, b - 6, z).map(Math.floor);
+    L.set(x, y, 'leather', SHADE);
+  }
+  // Round the back's top corners.
+  const [lx, ly] = P(a - 10, b - 6, 40).map(Math.round);
+  L.clear(lx, ly);
+  L.clear(lx + 1, ly);
+  const [rx, ry] = P(a + 10, b - 9, 40).map(Math.round);
+  L.clear(rx - 1, ry);
+  L.clear(rx - 2, ry);
+  box(L, P, a - 11, a - 8, b - 6, b + 5, 10, 16, 'leather');
+  box(L, P, a + 8, a + 11, b - 6, b + 5, 10, 16, 'leather');
+  return outline(L, RAMPS);
+}

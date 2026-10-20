@@ -5,9 +5,9 @@
 // material); lower-case and the extra letters pin a tone by hand.
 import { BASE, DARK, HI, LIGHT, Layer, SHADE, compose, outline } from './raster.mjs';
 import { RAMPS } from './palette.mjs';
-import { STATION, drawChair } from './furniture.mjs';
+import { BOSS_FRAME, BOSS_SEAT, STATION, drawBossChair, drawBossDesk, drawChair, iso } from './furniture.mjs';
 
-export const POSES = ['sit', 'type1', 'type2', 'raiseHand', 'rest1', 'rest2', 'walk1', 'walk2'];
+export const POSES = ['sit', 'type1', 'type2', 'raiseHand', 'rest1', 'rest2', 'walk1', 'walk2', 'standRaise'];
 
 /** letter -> [role, tone | 'auto'] */
 const LETTERS = {
@@ -446,6 +446,23 @@ const HAIR = {
       '...hhhhhhhh.........',
     ],
   },
+  // The boss: combed back with a side part (front view only; the boss faces the room).
+  slick: {
+    front: [
+      '....................',
+      '......iiHHHHH.......',
+      '....HjjjjHHHHHH.....',
+      '...HjjHHHHHHHHHH....',
+      '..HjjHHHHHHHHHHHH...',
+      '..HjHHHHHHHHHHHHHh..',
+      '.HjHHHHHHHHHHHHHHHh.',
+      '.HHHHHHHHHHHHHHHHHh.',
+      '.HHHHHHHHHHHHHHHHHh.',
+      '.HHHhhhhhhHHHHHHHhh.',
+      '.HHh......hhhhhHHh..',
+      '.hh.............hh..',
+    ],
+  },
   // The generic look: hood up. Uses the top's colours, with a lock of hair.
   hood: {
     front: [
@@ -614,6 +631,52 @@ const WALK2 = [
   '....zzzz..........',
 ];
 
+// Standing still with the right arm (screen right) raised beside the head.
+const STAND_RAISE = [
+  '.......KkKK.......',
+  '.....TTTUUTTT.....',
+  '....TTTTTUTTTTT...',
+  '...TTTTTTTTTTTT...',
+  '...TTtTTTTTTTt....',
+  '...TTtTTTTTTTt....',
+  '...TTtTTTTTTTt....',
+  '...KKtTTTTTTTt....',
+  '...KKtTTTTTTTt....',
+  '.....PPPPPPPPP....',
+  '.....PPPPPPPPP....',
+  '.....PPPp.PPPP....',
+  '.....PPPp.PPPp....',
+  '.....PPPp.PPPp....',
+  '.....PPPp.PPPp....',
+  '....ZZZZ..ZZZZ....',
+  '....zzzz..zzzz....',
+];
+const RAISED_ARM_FRONT = {
+  x: 27,
+  y: 15,
+  rows: [
+    '.....K.K.',
+    '....KKKKK',
+    '....KKKKK',
+    '.....KKKk',
+    '.....TTTt',
+    '.....TTTt',
+    '.....TTTt',
+    '.....TTTt',
+    '....TTTTt',
+    '....TTTt.',
+    '...TTTTt.',
+    '...TTTt..',
+    '..TTTTt..',
+    '..TTTt...',
+    '.TTTTt...',
+    '.TTTt....',
+    'TTTTt....',
+    'TTTt.....',
+    'TTt......',
+  ],
+};
+
 const REST_ORIGIN = { x: 14, y: 30 };
 const REST1 = [
   '.......KkKK.......',
@@ -769,6 +832,11 @@ export function drawCharacter(look, pose) {
     rl.stamp(pose === 'rest1' ? REST1 : REST2, REST_ORIGIN.x, REST_ORIGIN.y);
     stampHead(rl, look, 'front', HEAD_FRONT_REST, { closed: pose === 'rest2' });
     stampPart(rl, pose === 'rest1' ? REST1_OVER : REST2_OVER);
+  } else if (pose === 'standRaise') {
+    stampBehind(rl, look, HEAD_FRONT_WALK);
+    rl.stamp(STAND_RAISE, WALK_ORIGIN.x, WALK_ORIGIN.y);
+    stampHead(rl, look, 'front', HEAD_FRONT_WALK);
+    stampPart(rl, RAISED_ARM_FRONT);
   } else {
     const head = { x: HEAD_FRONT_WALK.x, y: HEAD_FRONT_WALK.y + (pose === 'walk2' ? 1 : 0) };
     stampBehind(rl, look, head);
@@ -779,6 +847,54 @@ export function drawCharacter(look, pose) {
   if (seated) {
     chairLayer ??= drawChair();
     L = compose(L, chairLayer);
+  }
+  return L;
+}
+
+// ---------------------------------------------------------------------------
+// The boss: seated behind the boss desk in a suit, facing the room.
+
+export const BOSS_LOOK = {
+  id: 'boss',
+  hair: 'slick',
+  ramps: { hair: 'hairSilver', skin: 'skin2', top: 'suit', top2: 'shirt', pants: 'suit', shoes: 'shoe', acc: 'red' },
+};
+
+// Jacket with lapels (`y`), a white shirt collar (`U`) and a red tie (`R`);
+// the hands rest on the desk edge. Below the hands the desk hides the body.
+const BOSS_TORSO = [
+  '.......KkKK.......',
+  '.....TTUUUUTT.....',
+  '....TTTyURUyTTT...',
+  '...TTTTTyRyTTTTT..',
+  '...TTtTTURUTTtTT..',
+  '...TTtTTtRtTTtTT..',
+  '...TTtTTTrTTTtTT..',
+  '...TTtTTTTTTTtTT..',
+  '..KKKtTTTTTTTtKKK.',
+  '..KKKTTTTTTTTTKKk.',
+  '...TTTTTTTTTTTTT..',
+  '...PPPPPPPPPPPPP..',
+  '..PPPPPPPPPPPPPPP.',
+  '..PPPPPPPPPPPPPPp.',
+];
+
+/**
+ * The boss frame's character layer: the chair, then the boss, with every
+ * pixel the desk covers cleared, so drawing it over the desk sprite at the
+ * same origin puts the boss behind the desk.
+ */
+export function drawBoss() {
+  const rl = new RoleLayer(BOSS_FRAME.w, BOSS_FRAME.h);
+  const [ax, ay] = iso(BOSS_FRAME.ox, BOSS_FRAME.oy)(BOSS_SEAT.a, BOSS_SEAT.b, 0);
+  // Same offsets from the anchor as a standing front view; seated on the
+  // chair the hips sit about where a standing figure's do.
+  rl.stamp(BOSS_TORSO, ax - 8, ay - 18);
+  stampHead(rl, BOSS_LOOK, 'front', { x: ax - 10, y: ay - 35 });
+  const L = compose(drawBossChair(), outline(resolve(rl, BOSS_LOOK), RAMPS));
+  const desk = drawBossDesk();
+  for (let y = 0; y < L.h; y++) for (let x = 0; x < L.w; x++) {
+    if (desk.filled(x, y)) L.clear(x, y);
   }
   return L;
 }

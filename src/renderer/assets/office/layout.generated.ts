@@ -18,19 +18,20 @@ export const FURNITURE_LAYOUT = {
   sofa: { x: 0, y: 126, w: 72, h: 52, anchorX: 18, anchorY: 24 },
   coffeeTable: { x: 74, y: 126, w: 36, h: 30, anchorX: 14, anchorY: 12 },
   rug: { x: 112, y: 126, w: 80, h: 41, anchorX: 32, anchorY: 0 },
+  bossDesk: { x: 0, y: 180, w: 96, h: 88, anchorX: 24, anchorY: 50 },
 } as const;
 
 /** Character frames in characters.png: one row per look, one column per pose. */
 export const CHARACTER_LAYOUT = {
-  spiky: { sit: { x: 0, y: 0, w: 64, h: 56 }, type1: { x: 64, y: 0, w: 64, h: 56 }, type2: { x: 128, y: 0, w: 64, h: 56 }, raiseHand: { x: 192, y: 0, w: 64, h: 56 }, rest1: { x: 256, y: 0, w: 64, h: 56 }, rest2: { x: 320, y: 0, w: 64, h: 56 }, walk1: { x: 384, y: 0, w: 64, h: 56 }, walk2: { x: 448, y: 0, w: 64, h: 56 } },
-  bob: { sit: { x: 0, y: 56, w: 64, h: 56 }, type1: { x: 64, y: 56, w: 64, h: 56 }, type2: { x: 128, y: 56, w: 64, h: 56 }, raiseHand: { x: 192, y: 56, w: 64, h: 56 }, rest1: { x: 256, y: 56, w: 64, h: 56 }, rest2: { x: 320, y: 56, w: 64, h: 56 }, walk1: { x: 384, y: 56, w: 64, h: 56 }, walk2: { x: 448, y: 56, w: 64, h: 56 } },
-  curly: { sit: { x: 0, y: 112, w: 64, h: 56 }, type1: { x: 64, y: 112, w: 64, h: 56 }, type2: { x: 128, y: 112, w: 64, h: 56 }, raiseHand: { x: 192, y: 112, w: 64, h: 56 }, rest1: { x: 256, y: 112, w: 64, h: 56 }, rest2: { x: 320, y: 112, w: 64, h: 56 }, walk1: { x: 384, y: 112, w: 64, h: 56 }, walk2: { x: 448, y: 112, w: 64, h: 56 } },
-  long: { sit: { x: 0, y: 168, w: 64, h: 56 }, type1: { x: 64, y: 168, w: 64, h: 56 }, type2: { x: 128, y: 168, w: 64, h: 56 }, raiseHand: { x: 192, y: 168, w: 64, h: 56 }, rest1: { x: 256, y: 168, w: 64, h: 56 }, rest2: { x: 320, y: 168, w: 64, h: 56 }, walk1: { x: 384, y: 168, w: 64, h: 56 }, walk2: { x: 448, y: 168, w: 64, h: 56 } },
-  bun: { sit: { x: 0, y: 224, w: 64, h: 56 }, type1: { x: 64, y: 224, w: 64, h: 56 }, type2: { x: 128, y: 224, w: 64, h: 56 }, raiseHand: { x: 192, y: 224, w: 64, h: 56 }, rest1: { x: 256, y: 224, w: 64, h: 56 }, rest2: { x: 320, y: 224, w: 64, h: 56 }, walk1: { x: 384, y: 224, w: 64, h: 56 }, walk2: { x: 448, y: 224, w: 64, h: 56 } },
-  ponytail: { sit: { x: 0, y: 280, w: 64, h: 56 }, type1: { x: 64, y: 280, w: 64, h: 56 }, type2: { x: 128, y: 280, w: 64, h: 56 }, raiseHand: { x: 192, y: 280, w: 64, h: 56 }, rest1: { x: 256, y: 280, w: 64, h: 56 }, rest2: { x: 320, y: 280, w: 64, h: 56 }, walk1: { x: 384, y: 280, w: 64, h: 56 }, walk2: { x: 448, y: 280, w: 64, h: 56 } },
-  beanie: { sit: { x: 0, y: 336, w: 64, h: 56 }, type1: { x: 64, y: 336, w: 64, h: 56 }, type2: { x: 128, y: 336, w: 64, h: 56 }, raiseHand: { x: 192, y: 336, w: 64, h: 56 }, rest1: { x: 256, y: 336, w: 64, h: 56 }, rest2: { x: 320, y: 336, w: 64, h: 56 }, walk1: { x: 384, y: 336, w: 64, h: 56 }, walk2: { x: 448, y: 336, w: 64, h: 56 } },
-  sidepart: { sit: { x: 0, y: 392, w: 64, h: 56 }, type1: { x: 64, y: 392, w: 64, h: 56 }, type2: { x: 128, y: 392, w: 64, h: 56 }, raiseHand: { x: 192, y: 392, w: 64, h: 56 }, rest1: { x: 256, y: 392, w: 64, h: 56 }, rest2: { x: 320, y: 392, w: 64, h: 56 }, walk1: { x: 384, y: 392, w: 64, h: 56 }, walk2: { x: 448, y: 392, w: 64, h: 56 } },
-  hood: { sit: { x: 0, y: 448, w: 64, h: 56 }, type1: { x: 64, y: 448, w: 64, h: 56 }, type2: { x: 128, y: 448, w: 64, h: 56 }, raiseHand: { x: 192, y: 448, w: 64, h: 56 }, rest1: { x: 256, y: 448, w: 64, h: 56 }, rest2: { x: 320, y: 448, w: 64, h: 56 }, walk1: { x: 384, y: 448, w: 64, h: 56 }, walk2: { x: 448, y: 448, w: 64, h: 56 } },
+  spiky: { sit: { x: 0, y: 0, w: 64, h: 56 }, type1: { x: 64, y: 0, w: 64, h: 56 }, type2: { x: 128, y: 0, w: 64, h: 56 }, raiseHand: { x: 192, y: 0, w: 64, h: 56 }, rest1: { x: 256, y: 0, w: 64, h: 56 }, rest2: { x: 320, y: 0, w: 64, h: 56 }, walk1: { x: 384, y: 0, w: 64, h: 56 }, walk2: { x: 448, y: 0, w: 64, h: 56 }, standRaise: { x: 512, y: 0, w: 64, h: 56 } },
+  bob: { sit: { x: 0, y: 56, w: 64, h: 56 }, type1: { x: 64, y: 56, w: 64, h: 56 }, type2: { x: 128, y: 56, w: 64, h: 56 }, raiseHand: { x: 192, y: 56, w: 64, h: 56 }, rest1: { x: 256, y: 56, w: 64, h: 56 }, rest2: { x: 320, y: 56, w: 64, h: 56 }, walk1: { x: 384, y: 56, w: 64, h: 56 }, walk2: { x: 448, y: 56, w: 64, h: 56 }, standRaise: { x: 512, y: 56, w: 64, h: 56 } },
+  curly: { sit: { x: 0, y: 112, w: 64, h: 56 }, type1: { x: 64, y: 112, w: 64, h: 56 }, type2: { x: 128, y: 112, w: 64, h: 56 }, raiseHand: { x: 192, y: 112, w: 64, h: 56 }, rest1: { x: 256, y: 112, w: 64, h: 56 }, rest2: { x: 320, y: 112, w: 64, h: 56 }, walk1: { x: 384, y: 112, w: 64, h: 56 }, walk2: { x: 448, y: 112, w: 64, h: 56 }, standRaise: { x: 512, y: 112, w: 64, h: 56 } },
+  long: { sit: { x: 0, y: 168, w: 64, h: 56 }, type1: { x: 64, y: 168, w: 64, h: 56 }, type2: { x: 128, y: 168, w: 64, h: 56 }, raiseHand: { x: 192, y: 168, w: 64, h: 56 }, rest1: { x: 256, y: 168, w: 64, h: 56 }, rest2: { x: 320, y: 168, w: 64, h: 56 }, walk1: { x: 384, y: 168, w: 64, h: 56 }, walk2: { x: 448, y: 168, w: 64, h: 56 }, standRaise: { x: 512, y: 168, w: 64, h: 56 } },
+  bun: { sit: { x: 0, y: 224, w: 64, h: 56 }, type1: { x: 64, y: 224, w: 64, h: 56 }, type2: { x: 128, y: 224, w: 64, h: 56 }, raiseHand: { x: 192, y: 224, w: 64, h: 56 }, rest1: { x: 256, y: 224, w: 64, h: 56 }, rest2: { x: 320, y: 224, w: 64, h: 56 }, walk1: { x: 384, y: 224, w: 64, h: 56 }, walk2: { x: 448, y: 224, w: 64, h: 56 }, standRaise: { x: 512, y: 224, w: 64, h: 56 } },
+  ponytail: { sit: { x: 0, y: 280, w: 64, h: 56 }, type1: { x: 64, y: 280, w: 64, h: 56 }, type2: { x: 128, y: 280, w: 64, h: 56 }, raiseHand: { x: 192, y: 280, w: 64, h: 56 }, rest1: { x: 256, y: 280, w: 64, h: 56 }, rest2: { x: 320, y: 280, w: 64, h: 56 }, walk1: { x: 384, y: 280, w: 64, h: 56 }, walk2: { x: 448, y: 280, w: 64, h: 56 }, standRaise: { x: 512, y: 280, w: 64, h: 56 } },
+  beanie: { sit: { x: 0, y: 336, w: 64, h: 56 }, type1: { x: 64, y: 336, w: 64, h: 56 }, type2: { x: 128, y: 336, w: 64, h: 56 }, raiseHand: { x: 192, y: 336, w: 64, h: 56 }, rest1: { x: 256, y: 336, w: 64, h: 56 }, rest2: { x: 320, y: 336, w: 64, h: 56 }, walk1: { x: 384, y: 336, w: 64, h: 56 }, walk2: { x: 448, y: 336, w: 64, h: 56 }, standRaise: { x: 512, y: 336, w: 64, h: 56 } },
+  sidepart: { sit: { x: 0, y: 392, w: 64, h: 56 }, type1: { x: 64, y: 392, w: 64, h: 56 }, type2: { x: 128, y: 392, w: 64, h: 56 }, raiseHand: { x: 192, y: 392, w: 64, h: 56 }, rest1: { x: 256, y: 392, w: 64, h: 56 }, rest2: { x: 320, y: 392, w: 64, h: 56 }, walk1: { x: 384, y: 392, w: 64, h: 56 }, walk2: { x: 448, y: 392, w: 64, h: 56 }, standRaise: { x: 512, y: 392, w: 64, h: 56 } },
+  hood: { sit: { x: 0, y: 448, w: 64, h: 56 }, type1: { x: 64, y: 448, w: 64, h: 56 }, type2: { x: 128, y: 448, w: 64, h: 56 }, raiseHand: { x: 192, y: 448, w: 64, h: 56 }, rest1: { x: 256, y: 448, w: 64, h: 56 }, rest2: { x: 320, y: 448, w: 64, h: 56 }, walk1: { x: 384, y: 448, w: 64, h: 56 }, walk2: { x: 448, y: 448, w: 64, h: 56 }, standRaise: { x: 512, y: 448, w: 64, h: 56 } },
 } as const;
 
 export const GENERIC_LOOK_ID = 'hood';
@@ -42,3 +43,10 @@ export const STATION_LAYOUT = { w: 64, h: 56, deskX: 28, deskY: 26, seatX: 22, s
 export const SOFA_SEAT_LAYOUT = [{ x: 20, y: 36 }, { x: 42, y: 47 }] as const;
 
 export const TILE_LAYOUT = { w: 32, h: 16 } as const;
+
+/**
+ * The boss in characters.png. It shares its frame and origin with the
+ * bossDesk sprite: deskX/deskY is the desk footprint's north corner, seatX/seatY
+ * the boss chair's centre on the floor. Draw it over the desk at the same top-left.
+ */
+export const BOSS_LAYOUT = { x: 0, y: 504, w: 96, h: 88, deskX: 24, deskY: 50, seatX: 58, seatY: 57 } as const;

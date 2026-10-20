@@ -50,28 +50,42 @@ room (`floor`, `carpet`, `rug`, `wall`, `wallSide`, `baseboard`, `glass`,
 `pot`, `soil`, `paper`), accents and clothes (`coral`, `navy`, `mustard`,
 `sage`, `teal`, `purple`, `olive`, `hoodie`, `shirt`, `red`, `denim`,
 `charcoal`, `khaki`, `black`, `shoe`, `sneaker`), four skin ramps
-(`skin1`..`skin4`) and seven hair ramps. Add a colour as a new ramp here
+(`skin1`..`skin4`), eight hair ramps (`hairSilver` is the boss's), and the
+boss desk's `walnut`, its chair's `leather` and the boss's `suit`. Add a colour as a new ramp here
 rather than as a one-off hex value elsewhere.
 
 ## Sheets and frame layout
 
-`furniture.png` (262x178) packs every room piece; rectangles and anchors are
+`furniture.png` (262x268) packs every room piece; rectangles and anchors are
 in `layout.generated.ts` and exported from `index.ts`:
 
 - `FURNITURE`: `floor`, `wall`, `window`, `desk`, `monitorOff`, `monitorOn`,
   `chair`, `plant`, `sofa`, `shelf`.
 - `OFFICE_EXTRAS`: `wallLeft`, `windowLeft` (the left wall, mirrored and
   shaded darker), `carpet` (a floor tile for the work area), `rug`,
-  `coffeeTable`.
+  `coffeeTable`, `bossDesk` (a 3-tile walnut executive desk, 96x88 frame).
 - `FURNITURE_ANCHORS`: per sprite, the pixel that sits on its floor reference
   point (tile top corner for floors; the segment's north corner on the floor
   for walls; the north corner of the footprint for furniture).
 
-`characters.png` (512x504) holds one row per look and one column per pose,
+`characters.png` (576x592) holds one row per look and one column per pose,
 each frame 64x56: `sit`, `type1`, `type2`, `raiseHand`, `rest1`, `rest2`,
-`walk1`, `walk2`. The rows are the eight `CHARACTERS` (`spiky`, `bob`,
-`curly`, `long`, `bun`, `ponytail`, `beanie`, `sidepart`) and then
-`GENERIC_CHARACTER` (`hood`) for agents that are neither Claude Code nor Codex.
+`walk1`, `walk2`, `standRaise` (standing, a hand up: waiting at the boss
+desk). The rows are the eight `CHARACTERS` (`spiky`, `bob`, `curly`, `long`,
+`bun`, `ponytail`, `beanie`, `sidepart`) and then `GENERIC_CHARACTER`
+(`hood`) for agents that are neither Claude Code nor Codex. Below them is
+`BOSS`: one 96x88 frame of the boss (silver hair, suit and red tie) seated in
+a high-backed leather chair.
+
+### The boss frame
+
+The `bossDesk` sprite and `BOSS` share one 96x88 frame. Draw the desk, then
+the boss at the same top-left: the generator already cleared every boss pixel
+the desk covers, so the boss sits behind it. `deskX/deskY` is the north corner
+of the desk's footprint (48 along `a`, 20 along `b`; the desk's anchor) and
+`seatX/seatY` the boss chair's centre on the floor, 10 units behind the desk.
+The boss faces the room (south-west) and is the only front-facing seated
+figure.
 
 ### The station frame
 
