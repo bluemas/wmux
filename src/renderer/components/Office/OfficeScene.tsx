@@ -218,7 +218,7 @@ function Employee({ employee, layout, t, now, locale, onJump }: EmployeeProps) {
         name: employee.label,
         workspace: employee.workspaceName,
         agent: employee.agent,
-        tag: employee.paneTag,
+        tag: employee.paneTag ?? '',
         state: stateText,
       })}
       style={{ left: left * OFFICE_SCALE, top: top * OFFICE_SCALE, width: STATION.w * OFFICE_SCALE, height: STATION.h * OFFICE_SCALE }}
@@ -238,7 +238,7 @@ function Employee({ employee, layout, t, now, locale, onJump }: EmployeeProps) {
       >
         <span className="wmux-office-employee__name">{employee.label}</span>
         <span className="wmux-office-employee__workspace">
-          {` · ${employee.workspaceName} · ${employee.agent} · ${employee.paneTag}`}
+          {` · ${[employee.workspaceName, employee.agent, employee.paneTag].filter(Boolean).join(' · ')}`}
         </span>
       </span>
       {(alert || done || activity) && (

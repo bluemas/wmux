@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { selectOfficeEmployees, createOfficeEmployeesSelector } from '../officeEmployees';
 import { selectWorkspaceAgentRoster } from '../workspaceAgentRoster';
 import type { StoreState } from '../../index';
+import { agentRow } from '../../../../shared/agentIdentity';
 import type { Workspace, Pane, PaneLeaf, Surface, AgentStatus, TeammateInfo } from '../../../../shared/types';
 
 function surface(id: string, ptyId: string, extra: Partial<Surface> = {}): Surface {
@@ -300,6 +301,43 @@ describe('selectOfficeEmployees', () => {
       'PowerCraft · w30-3',
       'Docs',
     ]);
+  });
+
+  it('two agent tabs in one pane add the tab position', () => {
+    const s = state({
+      workspaces: [named('ws-a', 30, [ordinal(leaf('p2', [surface('s1', 'pty-1'), surface('s2', 'pty-2')]), 2)])],
+      surfaceAgent: { 'pty-1': claude(), 'pty-2': claude() },
+    });
+    expect(selectOfficeEmployees(s, NOW).map((e) => e.label)).toEqual(['PowerCraft · w30-2 · 1', 'PowerCraft · w30-2 · 2']);
+  });
+
+  it('a blank pane label falls through to the leaf label', () => {
+    const p1 = { ...ordinal(leaf('p1', [surface('s1', 'pty-1')]), 1), metadata: { label: ' backend ' } } as PaneLeaf;
+    const s = state({ workspaces: [named('ws-a', 30, [p1])], surfaceAgent: { 'pty-1': claude() }, paneLabel: { p1: '  ' } });
+    expect(selectOfficeEmployees(s, NOW)[0].label).toBe('backend');
+  });
+
+  it('a pane with no coordinate has no tag, never w0-0', () => {
+    const leaves = [leaf('p1', [surface('s1', 'pty-1')]), leaf('p2', [surface('s2', 'pty-2')])];
+    const s = state({
+      workspaces: [workspace('ws-a', { id: 'split', type: 'branch', direction: 'horizontal', children: leaves } as Pane, 'p1', { name: 'PowerCraft' })],
+      surfaceAgent: { 'pty-1': claude(), 'pty-2': claude() },
+    });
+    const out = selectOfficeEmployees(s, NOW);
+    expect(out.map((e) => e.paneTag)).toEqual([undefined, undefined]);
+    for (const e of out) expect(e.label).not.toContain('w0-0');
+  });
+
+  it('the agent name is the registry short name, else its display name', () => {
+    const leaves = [1, 2].map((n) => ordinal(leaf(`p${n}`, [surface(`s${n}`, `pty-${n}`)]), n));
+    const s = state({
+      workspaces: [named('ws-a', 30, leaves)],
+      surfaceAgent: { 'pty-1': { name: 'Gemini CLI', status: 'idle' }, 'pty-2': { name: 'Aider', status: 'idle' } },
+    });
+    expect(selectOfficeEmployees(s, NOW).map((e) => e.agent)).toEqual(['Gemini', 'Aider']);
+    // Read from the registry row, not trimmed off the display name.
+    expect(agentRow('gemini')?.short).toBe('Gemini');
+    expect(agentRow('aider')?.short).toBeUndefined();
   });
 
   it('teammates keep their own name', () => {

@@ -117,6 +117,9 @@ export interface AgentTerminalChatSpec {
 export interface AgentIdentityRow {
   readonly slug: string;
   readonly display: string;
+  /** A shorter name where the display name is long (`Codex CLI` → `Codex`),
+   *  for tight labels such as the Office page; `display` otherwise. */
+  readonly short?: string;
   /** Launcher stem typed in a pane, when it differs from the slug (kiro ships
    *  `kiro-cli`). Read by `KNOWN_AGENT_STEMS` and the model-flag table. */
   readonly launcher?: string;
@@ -198,6 +201,7 @@ export const AGENT_IDENTITIES = [
   {
     slug: 'claude',
     display: 'Claude Code',
+    short: 'Claude',
     modelFlag: '--model',
     resume: { picker: '--resume', exact: '--resume {id}', pin: '--session-id', idFormat: 'uuid' },
     permissions: 'permission-mode',
@@ -220,6 +224,7 @@ export const AGENT_IDENTITIES = [
   {
     slug: 'codex',
     display: 'Codex CLI',
+    short: 'Codex',
     modelFlag: '--model',
     resume: { picker: 'resume', exact: 'resume {id}', idFormat: 'uuid' },
     detect: 'screen',
@@ -243,6 +248,7 @@ export const AGENT_IDENTITIES = [
   {
     slug: 'gemini',
     display: 'Gemini CLI',
+    short: 'Gemini',
     process: { packages: ['gemini-cli', '@google/gemini-cli'] },
     detect: 'screen',
     hooks: 'gemini',
@@ -257,11 +263,12 @@ export const AGENT_IDENTITIES = [
   },
   { slug: 'aider', display: 'Aider', detect: 'screen', tuiComposer: true },
   { slug: 'opencode', display: 'OpenCode', detect: 'screen', hooks: 'opencode', tuiComposer: true, sendQueue: true },
-  { slug: 'copilot', display: 'GitHub Copilot CLI', detect: 'screen', hooks: 'copilot', tuiComposer: true },
+  { slug: 'copilot', display: 'GitHub Copilot CLI', short: 'Copilot', detect: 'screen', hooks: 'copilot', tuiComposer: true },
   { slug: 'openclaude', display: 'OpenClaude', detect: 'screen', hooks: 'openclaude', dialogs: 'claude' },
   {
     slug: 'kiro',
     display: 'Kiro CLI',
+    short: 'Kiro',
     launcher: 'kiro-cli',
     process: { executables: ['kiro-cli'] },
     detect: 'screen',
@@ -279,6 +286,7 @@ export const AGENT_IDENTITIES = [
   {
     slug: 'agy',
     display: 'Antigravity CLI',
+    short: 'Antigravity',
     // agy answers a bare argument with "Prompts are read only from -p/--print,
     // -i/--prompt-interactive, or stdin", while `agy -i "<prompt>"` runs the
     // prompt and keeps the session open. Verified 2026-09-30, agy 1.2.14.

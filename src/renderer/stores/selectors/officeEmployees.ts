@@ -2,7 +2,7 @@ import type { StoreState } from '../index';
 import { agentRow, type AgentSlugWith } from '../../../shared/agentIdentity';
 import { getLeafPanes } from '../../../shared/paneUtils';
 import type { PaneLeaf, Workspace } from '../../../shared/types';
-import { computePaneAutoName } from '../../utils/paneNaming';
+import { paneTag as paneTagOf } from '../../utils/paneNaming';
 import { selectWorkspaceAgentRoster, type WorkspaceAgentRosterRow } from './workspaceAgentRoster';
 
 export type OfficeState = 'working' | 'needs_you' | 'finished' | 'resting';
@@ -24,8 +24,13 @@ export interface OfficeEmployee {
   label: string;
   /** The agent's short name (`Claude`, `Codex`); a teammate's is its lead's. */
   agent: string;
-  /** The pane's unique coordinate, e.g. `w30-2`; a teammate's is its lead's. */
-  paneTag: string;
+  /**
+   * The pane's unique coordinate, e.g. `w30-2`; a teammate's is its lead's.
+   * Undefined while the pane has no coordinate yet.
+   */
+  paneTag?: string;
+  /** 1-based tab position, set when the pane holds more than one tab. */
+  tab?: number;
   workspaceName: string;
   state: OfficeState;
   need?: OfficeNeed;
@@ -67,9 +72,15 @@ function needOf(row: WorkspaceAgentRosterRow): OfficeNeed | undefined {
   return undefined;
 }
 
-/** The agent's name without a trailing `CLI` / `Code`: `Codex CLI` → `Codex`. */
-function shortAgentName(agentName: string): string {
-  return agentName.replace(/\s+(CLI|Code)$/i, '') || agentName;
+/** The agent's short name from its registry row, else the name the row carries. */
+function shortAgentName(row: WorkspaceAgentRosterRow): string {
+  return agentRow(row.slug)?.short ?? row.agentName;
+}
+
+/** The pane's `w<ws>-<pane>` tag, or undefined before it has a coordinate. */
+function paneTagFor(workspace: Workspace, leaf: PaneLeaf | undefined): string | undefined {
+  if (!leaf || workspace.wsOrdinal === undefined || leaf.ordinal === undefined) return undefined;
+  return paneTagOf(workspace, leaf).replace(/^#/, '');
 }
 
 /** Every leaf of a workspace, laid out or stashed, by id. */
@@ -83,7 +94,8 @@ function leavesById(workspace: Workspace): Map<string, PaneLeaf> {
 
 /**
  * Where two pane employees would read the same, add the agent; where that
- * still collides, the pane tag instead. Teammates keep their own names.
+ * still collides, the pane tag instead, and then the tab position (two agent
+ * tabs in one pane). Teammates keep their own names.
  */
 function disambiguateLabels(employees: OfficeEmployee[]): void {
   const panes = employees.filter((e) => e.kind !== 'teammate');
@@ -94,7 +106,10 @@ function disambiguateLabels(employees: OfficeEmployee[]): void {
   };
   const base = new Map(panes.map((e) => [e, e.label]));
   step((e) => `${base.get(e)} · ${e.agent}`);
-  step((e) => `${base.get(e)} · ${e.paneTag}`);
+  const join = (...parts: Array<string | number | undefined>): string =>
+    parts.filter((p) => p !== undefined && p !== '').join(' · ');
+  step((e) => join(base.get(e), e.paneTag ?? e.agent));
+  step((e) => join(base.get(e), e.paneTag ?? e.agent, e.tab));
 }
 
 /**
@@ -136,9 +151,11 @@ export function selectOfficeEmployees(state: StoreState, _now: number): OfficeEm
       if (officeState === 'resting' && isFinished(row)) officeState = 'finished';
 
       const leaf = leaves.get(row.paneId);
-      const explicitLabel = (state.paneLabel?.[row.paneId] ?? leaf?.metadata?.label)?.trim();
-      const agent = shortAgentName(row.agentName);
-      const paneTag = computePaneAutoName(workspace.wsOrdinal ?? 0, leaf?.ordinal ?? 0);
+      // Each label trimmed on its own, so a blank pane label falls through.
+      const explicitLabel = state.paneLabel?.[row.paneId]?.trim() || leaf?.metadata?.label?.trim();
+      const agent = shortAgentName(row);
+      const paneTag = paneTagFor(workspace, leaf);
+      const tab = row.surfaceCount > 1 ? row.surfaceIndex + 1 : undefined;
 
       out.push({
         id: row.ptyId,
@@ -146,7 +163,8 @@ export function selectOfficeEmployees(state: StoreState, _now: number): OfficeEm
         name: row.paneName,
         label: explicitLabel || workspace.name,
         agent,
-        paneTag,
+        ...(paneTag ? { paneTag } : {}),
+        ...(tab !== undefined ? { tab } : {}),
         workspaceName: workspace.name,
         state: officeState,
         ...(need ? { need } : {}),
@@ -166,7 +184,7 @@ export function selectOfficeEmployees(state: StoreState, _now: number): OfficeEm
           name: mate.name,
           label: mate.name,
           agent,
-          paneTag,
+          ...(paneTag ? { paneTag } : {}),
           workspaceName: workspace.name,
           state: mate.working ? 'working' : 'resting',
           ...(mate.activity ? { bubble: mate.activity } : {}),
@@ -194,6 +212,7 @@ function employeesEqual(previous: OfficeEmployee[], next: OfficeEmployee[]): boo
       a.label !== b.label ||
       a.agent !== b.agent ||
       a.paneTag !== b.paneTag ||
+      a.tab !== b.tab ||
       a.workspaceName !== b.workspaceName ||
       a.state !== b.state ||
       a.need !== b.need ||
