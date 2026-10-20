@@ -5,6 +5,8 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as React from 'react';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { createRoot, type Root } from 'react-dom/client';
 import type { OfficeEmployee } from '../../../stores/selectors/officeEmployees';
 
@@ -55,6 +57,20 @@ function mount(employees: OfficeEmployee[]): void {
   });
 }
 
+/** Swap the employee list and let the page re-render, as a store update would. */
+function update(employees: OfficeEmployee[]): void {
+  fixture.employees = employees;
+  act(() => {
+    useStore.setState({});
+  });
+}
+
+function deskOf(id: string): HTMLElement {
+  const desk = container.querySelector<HTMLElement>(`[data-office-desk-of="${id}"]`);
+  if (!desk) throw new Error(`no desk for ${id}`);
+  return desk;
+}
+
 function employeeEl(id: string): HTMLElement {
   const el = Array.from(container.querySelectorAll<HTMLElement>('[data-office-employee]')).find(
     (node) => node.getAttribute('data-office-employee') === id,
@@ -75,6 +91,8 @@ afterEach(() => {
     root.unmount();
   });
   container.remove();
+  document.documentElement.removeAttribute('data-reduced-motion');
+  vi.useRealTimers();
 });
 
 describe('OfficePage', () => {
@@ -177,13 +195,19 @@ describe('OfficePage', () => {
     expect(activity.length).toBe(6);
     for (const b of status) expect(zOf(b)).toBeGreaterThan(Math.max(...labels));
     for (const b of activity) expect(zOf(b)).toBeLessThan(Math.min(...labels));
-    // Among themselves, status bubbles still stack by depth: the nearer one wins.
-    const q = zOf(employeeEl('q').querySelector('[data-office-bubble]'));
-    const e = zOf(employeeEl('e').querySelector('[data-office-bubble]'));
-    expect(e).toBeGreaterThan(q);
+    // Among themselves, status bubbles still stack by depth: the nearer one
+    // (lower on screen, in the boss queue) wins.
+    const queued = ['q', 'd1', 'd2', 'e'].map((id) => {
+      const el = employeeEl(id);
+      return { top: parseFloat(el.style.top), z: zOf(el.querySelector('[data-office-bubble]')) };
+    });
+    queued.sort((p, r) => p.top - r.top);
+    for (let k = 1; k < queued.length; k += 1) {
+      if (queued[k].top > queued[k - 1].top) expect(queued[k].z).toBeGreaterThan(queued[k - 1].z);
+    }
   });
 
-  it('needs-you employee shows a raised hand and a red bubble', () => {
+  it('queued needs-you renders a raised hand and a red bubble at a queue spot', () => {
     const resetsAt = new Date(2026, 9, 20, 14, 0).getTime();
     mount([
       emp('q', { state: 'needs_you', need: 'question', bubble: 'ignored activity' }),
@@ -193,6 +217,7 @@ describe('OfficePage', () => {
     ]);
     const q = employeeEl('q');
     expect(q.getAttribute('data-pose')).toBe('raiseHand');
+    expect(q.getAttribute('data-spot')).toBe('queue');
     const bubble = q.querySelector('[data-office-bubble]')!;
     expect(bubble.getAttribute('data-office-bubble')).toBe('alert');
     expect(bubble.textContent).toContain('!');
@@ -208,10 +233,11 @@ describe('OfficePage', () => {
     expect(q.getAttribute('aria-label')).toContain('Waiting for you');
   });
 
-  it('finished employee stands at its desk with a green done bubble', () => {
+  it('finished renders a ✓ bubble at a queue spot', () => {
     mount([emp('done', { state: 'finished', bubble: 'ignored activity' })]);
     const el = employeeEl('done');
     expect(el.getAttribute('data-pose')).toBe('stand');
+    expect(el.getAttribute('data-spot')).toBe('queue');
     const bubble = el.querySelector('[data-office-bubble]')!;
     expect(bubble.getAttribute('data-office-bubble')).toBe('done');
     expect(bubble.classList.contains('wmux-office-bubble--done')).toBe(true);
@@ -219,6 +245,78 @@ describe('OfficePage', () => {
     expect(bubble.textContent).toContain('Done');
     expect(bubble.textContent).not.toContain('ignored activity');
     expect(el.getAttribute('aria-label')).toContain('Finished');
+  });
+
+  it('working employees sit at their desk and resting ones on a sofa', () => {
+    mount([emp('w'), emp('r', { state: 'resting' })]);
+    expect(employeeEl('w').getAttribute('data-spot')).toBe('desk');
+    expect(employeeEl('r').getAttribute('data-spot')).toBe('sofa');
+    expect(deskOf('w').getAttribute('data-desk-state')).toBe('working');
+    expect(deskOf('r').getAttribute('data-desk-state')).toBe('empty');
+  });
+
+  it("a queued employee's desk stays reserved for it", () => {
+    mount([emp('q', { state: 'needs_you' }), emp('f', { state: 'finished' })]);
+    // Monitor on, chair empty: the owner comes back to it.
+    expect(deskOf('q').getAttribute('data-desk-state')).toBe('reserved');
+    expect(deskOf('f').getAttribute('data-desk-state')).toBe('reserved');
+  });
+
+  it('renders the boss at the boss desk with a nameplate', () => {
+    mount([emp('w')]);
+    const boss = container.querySelector('[data-office-boss]');
+    expect(boss).not.toBeNull();
+    expect(boss!.getAttribute('aria-label')).toBe('Boss desk (you)');
+    const plate = container.querySelector('[data-office-boss-nameplate]');
+    expect(plate!.textContent).toBe('Boss');
+    // The nameplate is a label like the employees' names: above every sprite.
+    const label = employeeEl('w').querySelector('.wmux-office-employee__label') as HTMLElement;
+    expect(Number((plate as HTMLElement).style.zIndex)).toBe(Number(label.style.zIndex));
+  });
+
+  it('walks to the boss desk when it needs you, then settles into its pose', () => {
+    vi.useFakeTimers();
+    mount([emp('a')]);
+    const at = (el: HTMLElement) => `${el.style.left},${el.style.top}`;
+    const desk = at(employeeEl('a'));
+    update([emp('a', { state: 'needs_you' })]);
+    const el = employeeEl('a');
+    expect(at(el)).not.toBe(desk);
+    expect(el.getAttribute('data-spot')).toBe('queue');
+    // On the way: the walk cycle; the desk shows its chair already.
+    expect(el.getAttribute('data-pose')).toBe('walk');
+    expect(el.hasAttribute('data-walking')).toBe(true);
+    expect(deskOf('a').getAttribute('data-desk-state')).toBe('reserved');
+    act(() => {
+      vi.advanceTimersByTime(2000);
+    });
+    expect(employeeEl('a').getAttribute('data-pose')).toBe('raiseHand');
+    expect(employeeEl('a').hasAttribute('data-walking')).toBe(false);
+    // Back to work: it walks to its desk, and the chair stays until it sits down.
+    update([emp('a')]);
+    expect(employeeEl('a').getAttribute('data-pose')).toBe('walk');
+    expect(deskOf('a').getAttribute('data-desk-state')).toBe('reserved');
+    act(() => {
+      vi.advanceTimersByTime(2000);
+    });
+    expect(employeeEl('a').getAttribute('data-pose')).toBe('type');
+    expect(at(employeeEl('a'))).toBe(desk);
+    expect(deskOf('a').getAttribute('data-desk-state')).toBe('working');
+  });
+
+  it('reduced motion disables the transition: the employee jumps to its spot', () => {
+    document.documentElement.setAttribute('data-reduced-motion', 'true');
+    mount([emp('a')]);
+    update([emp('a', { state: 'finished' })]);
+    const el = employeeEl('a');
+    expect(el.getAttribute('data-spot')).toBe('queue');
+    expect(el.getAttribute('data-pose')).toBe('stand');
+    expect(el.hasAttribute('data-walking')).toBe(false);
+    // The CSS transition is off under both reduced-motion sources.
+    const css = readFileSync(join(__dirname, '..', 'office.css'), 'utf8').replace(/\s+/g, ' ');
+    expect(css).toMatch(/\.wmux-office-employee \{[^}]*transition: left/);
+    expect(css).toMatch(/@media \(prefers-reduced-motion: reduce\) \{[^@]*\.wmux-office-employee \{ transition: none; \}/);
+    expect(css).toContain(':root[data-reduced-motion] .wmux-office-employee { transition: none; }');
   });
 
   it("click jumps to the employee's pane", () => {

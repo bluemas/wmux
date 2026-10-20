@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { layoutOffice, DESK_COLUMNS, BASE_DESK_ROWS } from '../officeLayout';
+import { layoutOffice, DESK_COLUMNS, BASE_DESK_ROWS, BOSS_DESK } from '../officeLayout';
 import type { OfficeEmployee } from '../../../stores/selectors/officeEmployees';
 
 function emp(id: string, extra: Partial<OfficeEmployee> = {}): OfficeEmployee {
@@ -16,6 +16,13 @@ function emp(id: string, extra: Partial<OfficeEmployee> = {}): OfficeEmployee {
     look: 0,
     ...extra,
   };
+}
+
+/** Screen delta from `from` to `to`, back in floor units (dx = da - db, dy = (da + db) / 2). */
+function floor(to: { x: number; y: number }, from: { x: number; y: number }): { da: number; db: number } {
+  const dx = to.x - from.x;
+  const dy = to.y - from.y;
+  return { da: dy + dx / 2, db: dy - dx / 2 };
 }
 
 function deskCell(index: number): { row: number; col: number } {
@@ -150,39 +157,158 @@ describe('layoutOffice', () => {
     expect(sofaAt(second, 'r9')).toEqual(sofaAt(first, 'r9'));
   });
 
-  it('a finished employee keeps its desk and stands beside it', () => {
-    const first = layoutOffice([emp('a'), emp('b')]);
-    const second = layoutOffice([emp('a', { state: 'finished' }), emp('b')], first);
-    expect(second.deskFor.a).toBe(first.deskFor.a);
-    expect(second.loungeFor.a).toBeUndefined();
-    expect(second.stands.length).toBe(second.desks.length);
-    expect(second.stands[second.deskFor.a].spot).toBe('stand');
+  it('queues needs-you and finished employees in front of the boss desk', () => {
+    const layout = layoutOffice([
+      emp('w'),
+      emp('q', { state: 'needs_you', need: 'question' }),
+      emp('f', { state: 'finished' }),
+      emp('r', { state: 'resting' }),
+    ]);
+    for (const id of ['q', 'f']) {
+      const spot = layout.queue[layout.queueFor[id]];
+      expect(spot.spot).toBe('queue');
+      // In floor units from the boss desk's anchor: in front of its footprint
+      // (larger b), and level with it along a.
+      const { da, db } = floor(spot, layout.boss);
+      expect(db).toBeGreaterThanOrEqual(BOSS_DESK.b + 6);
+      expect(da).toBeGreaterThan(-BOSS_DESK.a);
+      expect(da).toBeLessThan(2 * BOSS_DESK.a);
+      // Nearer the boss than the first row of desks.
+      expect(floor(spot, layout.desks[0]).db).toBeLessThan(-6);
+    }
+    expect(layout.queueFor.w).toBeUndefined();
+    expect(layout.queueFor.r).toBeUndefined();
+    expect(layout.loungeFor.f).toBeUndefined();
+    expect(layout.loungeFor.r).toBeDefined();
   });
 
-  it('no stand spot falls on a station or another stand spot at 30 employees', () => {
-    const layout = layoutOffice(Array.from({ length: 30 }, (_, i) => emp(`p${i}`, { state: 'finished' })));
+  it('needs-you are ahead of finished', () => {
+    const layout = layoutOffice([
+      emp('f1', { state: 'finished' }),
+      emp('q1', { state: 'needs_you' }),
+      emp('f2', { state: 'finished' }),
+      emp('q2', { state: 'needs_you' }),
+    ]);
+    expect([layout.queueFor.q1, layout.queueFor.q2]).toEqual([0, 1]);
+    expect([layout.queueFor.f1, layout.queueFor.f2]).toEqual([2, 3]);
+    // Spot 0 is the one nearest the boss, and the queue runs outwards from it.
+    const dist = (s: { x: number; y: number }) => {
+      const { da, db } = floor(s, layout.boss);
+      // From the boss, who sits 10 units behind the desk's back edge.
+      return Math.hypot(da - BOSS_DESK.a / 2, db + 10);
+    };
+    for (let k = 1; k < layout.queue.length; k += 1) {
+      expect(dist(layout.queue[k])).toBeGreaterThanOrEqual(dist(layout.queue[k - 1]));
+    }
+  });
+
+  it('queue order is stable across updates', () => {
+    const first = layoutOffice([
+      emp('a', { state: 'needs_you' }),
+      emp('b', { state: 'needs_you' }),
+      emp('c', { state: 'finished' }),
+    ]);
+    expect([first.queueFor.a, first.queueFor.b, first.queueFor.c]).toEqual([0, 1, 2]);
+    // The list order flips and a newcomer needs you: it joins the back of the
+    // needs-you group; everyone else keeps their place.
+    const second = layoutOffice(
+      [emp('c', { state: 'finished' }), emp('d', { state: 'needs_you' }), emp('b', { state: 'needs_you' }), emp('a', { state: 'needs_you' })],
+      first,
+    );
+    expect([second.queueFor.a, second.queueFor.b, second.queueFor.d, second.queueFor.c]).toEqual([0, 1, 2, 3]);
+    // 'a' is answered and goes back to work: the queue moves up behind it.
+    const third = layoutOffice(
+      [emp('a'), emp('b', { state: 'needs_you' }), emp('c', { state: 'finished' }), emp('d', { state: 'needs_you' })],
+      second,
+    );
+    expect(third.queueFor.a).toBeUndefined();
+    expect([third.queueFor.b, third.queueFor.d, third.queueFor.c]).toEqual([0, 1, 2]);
+    // 'a' needs you again later: it rejoins at the back of its group.
+    const fourth = layoutOffice(
+      [emp('a', { state: 'needs_you' }), emp('b', { state: 'needs_you' }), emp('c', { state: 'finished' }), emp('d', { state: 'needs_you' })],
+      third,
+    );
+    expect([fourth.queueFor.b, fourth.queueFor.d, fourth.queueFor.a, fourth.queueFor.c]).toEqual([0, 1, 2, 3]);
+    // A finished employee that needs you joins the back of the needs-you group.
+    const fifth = layoutOffice(
+      [emp('a', { state: 'needs_you' }), emp('b', { state: 'needs_you' }), emp('c', { state: 'needs_you' }), emp('d', { state: 'needs_you' })],
+      fourth,
+    );
+    expect([fifth.queueFor.b, fifth.queueFor.d, fifth.queueFor.a, fifth.queueFor.c]).toEqual([0, 1, 2, 3]);
+  });
+
+  it('queued employees keep their desk reserved', () => {
+    const first = layoutOffice([emp('a'), emp('b'), emp('c')]);
+    const second = layoutOffice(
+      [emp('a', { state: 'needs_you' }), emp('b', { state: 'finished' }), emp('c'), emp('n1'), emp('n2')],
+      first,
+    );
+    expect(second.deskFor.a).toBe(first.deskFor.a);
+    expect(second.deskFor.b).toBe(first.deskFor.b);
+    // Newcomers never take a queued employee's desk.
+    expect([second.deskFor.n1, second.deskFor.n2]).not.toContain(first.deskFor.a);
+    expect([second.deskFor.n1, second.deskFor.n2]).not.toContain(first.deskFor.b);
+    // Back to work: the same desk.
+    const third = layoutOffice([emp('a'), emp('b'), emp('c'), emp('n1'), emp('n2')], second);
+    expect(third.deskFor.a).toBe(first.deskFor.a);
+    expect(third.queueFor.a).toBeUndefined();
+  });
+
+  it('no queue spot overlaps a desk, sofa or the boss desk at 30 employees (10 queued)', () => {
+    const employees = Array.from({ length: 30 }, (_, i) =>
+      emp(`p${i}`, {
+        state: i < 5 ? 'needs_you' : i < 10 ? 'finished' : i < 20 ? 'working' : 'resting',
+      }),
+    );
+    const layout = layoutOffice(employees);
+    const queued = employees.slice(0, 10).map((e) => layout.queueFor[e.id]);
+    expect(new Set(queued).size).toBe(10);
     // A standing character takes about 12x12 floor units around its anchor.
     const R = 6;
-    for (const s of layout.stands) {
-      for (const d of layout.desks) {
-        const dx = s.x - d.x;
-        const dy = s.y - d.y;
-        const da = dy + dx / 2;
-        const db = dy - dx / 2;
-        const inside = da > -R && da < 32 + R && db > -R && db < 32 + R;
+    const spots = queued.map((k) => layout.queue[k]);
+    const boxes = [
+      ...layout.desks.map((d) => ({ x: d.x, y: d.y, a0: 0, a1: 32, b0: 0, b1: 32 })),
+      ...layout.props
+        .filter((p) => p.key === 'sofa' || p.key === 'coffeeTable')
+        .map((p) => ({ x: p.x, y: p.y, a0: 0, a1: p.key === 'sofa' ? 48 : 20, b0: 0, b1: p.key === 'sofa' ? 16 : 12 })),
+    ];
+    // The boss desk and the boss's chair behind it.
+    const boss = { x: layout.boss.x, y: layout.boss.y, a0: 0, a1: BOSS_DESK.a, b0: -BOSS_DESK.chair, b1: BOSS_DESK.b };
+    for (const s of spots) {
+      for (const b of [...boxes, boss]) {
+        const { da, db } = floor(s, b);
+        const inside = da > b.a0 - R && da < b.a1 + R && db > b.b0 - R && db < b.b1 + R;
         expect(inside).toBe(false);
       }
-    }
-    for (let i = 0; i < layout.stands.length; i += 1) {
-      for (let j = i + 1; j < layout.stands.length; j += 1) {
-        const dx = layout.stands[j].x - layout.stands[i].x;
-        const dy = layout.stands[j].y - layout.stands[i].y;
-        expect(Math.max(Math.abs(dy + dx / 2), Math.abs(dy - dx / 2))).toBeGreaterThanOrEqual(2 * R);
-      }
-    }
-    for (const s of layout.stands) {
       expect(s.x).toBeGreaterThan(0);
       expect(s.x).toBeLessThan(layout.width);
+      expect(s.y).toBeGreaterThan(0);
+      expect(s.y).toBeLessThan(layout.height);
+    }
+    for (let i = 0; i < spots.length; i += 1) {
+      for (let j = i + 1; j < spots.length; j += 1) {
+        const { da, db } = floor(spots[j], spots[i]);
+        expect(Math.max(Math.abs(da), Math.abs(db))).toBeGreaterThanOrEqual(2 * R);
+      }
+    }
+    // The boss desk (with its chair) clears every desk and sofa.
+    for (const b of boxes) {
+      const { da, db } = floor({ x: boss.x, y: boss.y }, b);
+      const apart = da >= b.a1 || -da >= BOSS_DESK.a || db - BOSS_DESK.chair >= b.b1 || -db >= BOSS_DESK.b;
+      expect(apart).toBe(true);
+    }
+  });
+
+  it('the queue wraps into more rows and the room grows with it', () => {
+    const many = Array.from({ length: 24 }, (_, i) => emp(`q${i}`, { state: 'needs_you' }));
+    const few = layoutOffice(many.slice(0, 2));
+    const lots = layoutOffice(many);
+    expect(new Set(many.map((e) => lots.queueFor[e.id])).size).toBe(24);
+    expect(lots.height).toBeGreaterThan(few.height);
+    // Still clear of every desk.
+    for (const e of many) {
+      const s = lots.queue[lots.queueFor[e.id]];
+      for (const d of lots.desks) expect(floor(s, d).db).toBeLessThan(-6);
     }
   });
 

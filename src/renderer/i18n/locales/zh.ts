@@ -4034,4 +4034,6 @@ export const zh = {
   'office.need.error': "错误",
   'office.need.usageLimit': "用量上限",
   'office.need.usageLimitUntil': "用量上限 — {time} 恢复",
+  'office.boss.nameplate': "老板",
+  'office.boss.label': "老板办公桌（你）",
 } as const;

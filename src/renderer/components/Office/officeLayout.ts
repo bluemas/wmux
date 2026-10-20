@@ -1,6 +1,8 @@
-// Pure layout for the Office page: the room's size, one desk per employee
-// (stable across updates), lounge spots for resting employees, and the room
-// pieces to draw. No React, no DOM.
+// Pure layout for the Office page: the room's size, the boss desk at the head
+// of the room with a queue in front of it for employees who need you or have
+// finished, one desk per employee (stable across updates, kept while its
+// owner queues), lounge spots for resting employees, and the room pieces to
+// draw. No React, no DOM.
 //
 // World units follow the art (docs/office-art.md): one floor tile is 16x16
 // units, `a` runs down-right along the right (back) wall, `b` down-left along
@@ -19,10 +21,19 @@ export interface Seat {
   facing: 'left' | 'right';
   /**
    * `desk`: (x, y) is the north corner of the desk footprint (the station
-   * frame's `deskX/deskY`). `sofa` / `stand`: (x, y) is the character anchor
+   * frame's `deskX/deskY`). `sofa` / `queue`: (x, y) is the character anchor
    * (the frame's `seatX/seatY`).
    */
-  spot: 'desk' | 'sofa' | 'stand';
+  spot: 'desk' | 'sofa' | 'queue';
+}
+
+/** Queue groups, front to back: who needs you, then who has finished. */
+export type QueueGroup = 'needs_you' | 'finished';
+
+/** When an employee joined its queue group: orders the queue stably. */
+export interface QueueStamp {
+  group: QueueGroup;
+  seq: number;
 }
 
 /** A static room piece: its floor anchor at (x, y), stacked by `zIndex`. */
@@ -38,13 +49,23 @@ export interface OfficeLayout {
   width: number;
   height: number;
   desks: Seat[];
-  /** Where the employee of each desk stands to report a finished turn; same index as `desks`. */
-  stands: Seat[];
+  /** Spots in front of the boss desk, nearest the boss first. */
+  queue: Seat[];
   lounge: Seat[];
-  /** Employee id → index into `desks`. Every employee keeps a desk. */
+  /** Employee id → index into `desks`. Every employee keeps a desk, queued ones too. */
   deskFor: Record<string, number>;
+  /** Needs-you or finished employee id → index into `queue`. */
+  queueFor: Record<string, number>;
+  /** Queued employee id → when it joined its group (kept across updates). */
+  queueSince: Record<string, QueueStamp>;
+  /** The next queue stamp. */
+  queueSeq: number;
+  /** Rows of queue spots the room holds; never fewer than the previous layout's. */
+  queueRows: number;
   /** Resting employee id → index into `lounge`. */
   loungeFor: Record<string, number>;
+  /** The boss desk: (x, y) is the north corner of its footprint (the boss frame's `deskX/deskY`). */
+  boss: { x: number; y: number; z: number };
   props: OfficeProp[];
 }
 
@@ -56,17 +77,32 @@ export const BASE_DESK_ROWS = 2;
 const TILE = 16;
 const DESK_A0 = 32;
 const DESK_A_STEP = 48;
-const DESK_B0 = 18;
 const DESK_B_STEP = 56;
 /** Desk (1 tile) plus the chair's tile in front of it. */
 const STATION_DEPTH = 32;
-/**
- * A reporting employee stands beside its chair, in the gap before the next
- * desk along `a` (desks are 32 long, 48 apart), level with the chair.
- */
-const STAND_OFFSET = { a: 40, b: 26 };
 /** Room length along `a` (the back wall). */
 const ROOM_A = DESK_A0 + (DESK_COLUMNS - 1) * DESK_A_STEP + 2 * TILE + TILE;
+
+/**
+ * The boss desk's floor footprint from its north corner (`a` x `b`), and how
+ * far the boss's chair reaches behind it (towards the back wall).
+ */
+export const BOSS_DESK = { a: 48, b: 20, chair: 20 } as const;
+/** The boss desk stands centred on the back wall, under its windows, its chair against the wall. */
+const BOSS_A0 = ROOM_A / 2 - BOSS_DESK.a / 2;
+const BOSS_B0 = BOSS_DESK.chair + 4;
+/** Queue spots per row, the spacing between them, and the first row's distance from the desk. */
+export const QUEUE_COLUMNS = 5;
+// Wide enough that a status bubble never lands on the head of the one behind.
+const QUEUE_STEP = 40;
+// The first row stands far enough out that it does not hide the boss or the nameplate.
+const QUEUE_B0 = BOSS_B0 + BOSS_DESK.b + 56;
+/** Rows of queue the room always has. */
+const BASE_QUEUE_ROWS = 2;
+/** Positions along a row, in steps from its middle. */
+const QUEUE_ROW_ORDER = [0, -1, 1, -2, 2];
+/** From the last queue row to the first desk row: a standing figure clears the desks' monitors. */
+const QUEUE_TO_DESKS = 40;
 
 /** Sofas the lounge always has; it adds whole sofas until every resting employee sits. */
 const BASE_SOFAS = 3;
@@ -151,6 +187,40 @@ function assignDesks(employees: OfficeEmployee[], prev?: OfficeLayout): Record<s
   return deskFor;
 }
 
+function queueGroup(e: OfficeEmployee): QueueGroup | null {
+  return e.state === 'needs_you' || e.state === 'finished' ? e.state : null;
+}
+
+/**
+ * The queue: needs-you first, then finished; within a group, by when each
+ * joined it. An employee keeps its stamp while it stays in its group, so it
+ * keeps its place; a newcomer (or one that changed group) joins the back.
+ */
+function assignQueue(
+  employees: OfficeEmployee[],
+  prev?: OfficeLayout,
+): { queueFor: Record<string, number>; queueSince: Record<string, QueueStamp>; queueSeq: number } {
+  const queueSince: Record<string, QueueStamp> = {};
+  let queueSeq = prev?.queueSeq ?? 0;
+  for (const e of employees) {
+    const group = queueGroup(e);
+    if (!group) continue;
+    const old = prev?.queueSince[e.id];
+    queueSince[e.id] = old && old.group === group ? old : { group, seq: queueSeq++ };
+  }
+  const rank = (g: QueueGroup): number => (g === 'needs_you' ? 0 : 1);
+  const order = Object.keys(queueSince).sort((x, y) => {
+    const p = queueSince[x];
+    const q = queueSince[y];
+    return rank(p.group) - rank(q.group) || p.seq - q.seq;
+  });
+  const queueFor: Record<string, number> = {};
+  order.forEach((id, k) => {
+    queueFor[id] = k;
+  });
+  return { queueFor, queueSince, queueSeq };
+}
+
 /** Lounge spots for the resting: each keeps its previous one, newcomers fill the freed spots first. */
 function assignLounge(resting: OfficeEmployee[], prev?: OfficeLayout): Record<string, number> {
   const loungeFor: Record<string, number> = {};
@@ -212,6 +282,16 @@ export function layoutOffice(employees: OfficeEmployee[], prev?: OfficeLayout): 
   const maxDesk = Object.values(deskFor).reduce((m, d) => Math.max(m, d), -1);
   const rows = Math.max(BASE_DESK_ROWS, Math.ceil((maxDesk + 1) / DESK_COLUMNS));
 
+  const { queueFor, queueSince, queueSeq } = assignQueue(employees, prev);
+  // The queue area only grows while the page is open, so the desks behind it
+  // do not shift back and forth as people come and go.
+  const queueRows = Math.max(
+    BASE_QUEUE_ROWS,
+    Math.ceil(Object.keys(queueFor).length / QUEUE_COLUMNS),
+    prev?.queueRows ?? 0,
+  );
+  const deskB0 = QUEUE_B0 + (queueRows - 1) * QUEUE_STEP + QUEUE_TO_DESKS;
+
   const resting = employees.filter((e) => e.state === 'resting');
   const loungeFor = assignLounge(resting, prev);
   // Kept spots can leave holes, so count sofas by the highest spot: a sofa
@@ -220,7 +300,7 @@ export function layoutOffice(employees: OfficeEmployee[], prev?: OfficeLayout): 
   const sofas = Math.max(BASE_SOFAS, Math.ceil(loungeSpots / SOFA_SEAT_OFFSETS.length));
   const sofaRows = Math.ceil(sofas / SOFAS_PER_ROW);
 
-  const deskEnd = DESK_B0 + (rows - 1) * DESK_B_STEP + STATION_DEPTH;
+  const deskEnd = deskB0 + (rows - 1) * DESK_B_STEP + STATION_DEPTH;
   const loungeB = roundUp(deskEnd + 8, TILE);
   const roomA = ROOM_A;
   const roomB = roundUp(loungeB + 8 + sofaRows * SOFA_B_STEP + LOUNGE_FRONT, TILE);
@@ -231,16 +311,29 @@ export function layoutOffice(employees: OfficeEmployee[], prev?: OfficeLayout): 
   });
 
   const desks: Seat[] = [];
-  const stands: Seat[] = [];
   for (let d = 0; d < rows * DESK_COLUMNS; d += 1) {
     const { row, col } = deskCell(d);
     const a = DESK_A0 + col * DESK_A_STEP;
-    const b = DESK_B0 + row * DESK_B_STEP;
+    const b = deskB0 + row * DESK_B_STEP;
     desks.push({ ...toScreen(a, b), z: a + b + 42, facing: 'right', spot: 'desk' });
-    const sa = a + STAND_OFFSET.a;
-    const sb = b + STAND_OFFSET.b;
-    stands.push({ ...toScreen(sa, sb), z: sa + sb, facing: 'left', spot: 'stand' });
   }
+
+  // Queue rows run parallel to the boss desk's front, centred on it; spots
+  // are numbered by their distance from the desk, so the first in line
+  // stands nearest the boss.
+  const queueMidA = BOSS_A0 + BOSS_DESK.a / 2;
+  const queuePoints: Array<{ a: number; b: number }> = [];
+  for (let k = 0; k < queueRows * QUEUE_COLUMNS; k += 1) {
+    queuePoints.push({
+      a: queueMidA + QUEUE_ROW_ORDER[k % QUEUE_COLUMNS] * QUEUE_STEP,
+      b: QUEUE_B0 + Math.floor(k / QUEUE_COLUMNS) * QUEUE_STEP,
+    });
+  }
+  // From the boss in the chair (10 units behind the desk's back edge).
+  const fromBoss = (p: { a: number; b: number }): number => Math.hypot(p.a - queueMidA, p.b - (BOSS_B0 - 10));
+  queuePoints.sort((p, q) => fromBoss(p) - fromBoss(q) || p.b - q.b || p.a - q.a);
+  const queue: Seat[] = queuePoints.map(({ a, b }) => ({ ...toScreen(a, b), z: a + b, facing: 'left', spot: 'queue' }));
+  const boss = { ...toScreen(BOSS_A0, BOSS_B0), z: BOSS_A0 + BOSS_DESK.a / 2 + BOSS_B0 + BOSS_DESK.b };
 
   const props: OfficeProp[] = [];
   const prop = (key: OfficeProp['key'], a: number, b: number, zIndex: number): void => {
@@ -269,10 +362,11 @@ export function layoutOffice(employees: OfficeEmployee[], prev?: OfficeLayout): 
   // Floor: wood everywhere, a carpet under the desk area.
   const tilesA = roomA / TILE;
   const tilesB = roomB / TILE;
+  const carpetFrom = Math.floor((deskB0 - 8) / TILE);
   const carpetRows = Math.ceil((deskEnd + 8) / TILE);
   for (let j = 0; j < tilesB; j += 1) {
     for (let i = 0; i < tilesA; i += 1) {
-      const carpet = i >= 1 && i < tilesA - 1 && j < carpetRows;
+      const carpet = i >= 1 && i < tilesA - 1 && j >= carpetFrom && j < carpetRows;
       prop(carpet ? 'carpet' : 'floor', i * TILE, j * TILE, 1);
     }
   }
@@ -287,6 +381,9 @@ export function layoutOffice(employees: OfficeEmployee[], prev?: OfficeLayout): 
   // Decor.
   prop('shelf', roomA - 40, 0, stackIndex(roomA - 40 + 24 + 4, 0));
   prop('plant', 6, 6, stackIndex(12, 0));
+  // A plant on each side of the boss desk.
+  prop('plant', BOSS_A0 - 14, 10, stackIndex(BOSS_A0 - 14 + 16, 0));
+  prop('plant', BOSS_A0 + BOSS_DESK.a + 14, 10, stackIndex(BOSS_A0 + BOSS_DESK.a + 14 + 16, 0));
   prop('plant', roomA - 10, 6, stackIndex(roomA - 4, 0));
   prop('plant', 6, roomB - 10, stackIndex(roomB - 4, 0));
   prop('plant', roomA - 10, roomB - 10, stackIndex(roomA + roomB - 20, 0));
@@ -295,10 +392,15 @@ export function layoutOffice(employees: OfficeEmployee[], prev?: OfficeLayout): 
     width: roomA + roomB + 2 * PAD_X,
     height: (roomA + roomB) / 2 + PAD_TOP + PAD_BOTTOM,
     desks,
-    stands,
+    queue,
     lounge,
     deskFor,
+    queueFor,
+    queueSince,
+    queueSeq,
+    queueRows,
     loungeFor,
+    boss,
     props,
   };
 }

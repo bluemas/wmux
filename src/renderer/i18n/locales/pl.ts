@@ -4889,4 +4889,6 @@ export const pl = {
   'office.need.error': "Błąd",
   'office.need.usageLimit': "Limit użycia",
   'office.need.usageLimitUntil': "Limit użycia — wznowienie o {time}",
+  'office.boss.nameplate': "Szef",
+  'office.boss.label': "Biurko szefa (ty)",
 } as const;

@@ -1,5 +1,6 @@
-import { memo, type CSSProperties } from 'react';
+import { memo, useCallback, useEffect, useMemo, useState, type CSSProperties } from 'react';
 import {
+  BOSS,
   CHARACTERS,
   FURNITURE,
   FURNITURE_ANCHORS,
@@ -13,6 +14,7 @@ import {
 import type { OfficeEmployee } from '../../stores/selectors/officeEmployees';
 import { formatResetClock } from '../../../shared/usageLimit';
 import type { TranslationKey } from '../../i18n/locales/en';
+import { prefersReducedMotion } from '../../utils/reducedMotion';
 import { stackIndex, type OfficeLayout, type OfficeProp, type Seat } from './officeLayout';
 
 /** Display scale: the art is drawn at 1x and meant to be seen at 2x. */
@@ -28,6 +30,11 @@ const LABEL_Z = 110000;
  */
 const STATUS_BUBBLE_Z = 110001;
 const BUBBLE_MAX = 40;
+/**
+ * How long a walk between spots takes. Matches the position transition in
+ * office.css; the walk pose ends on transitionend, or after this as a fallback.
+ */
+const WALK_MS = 900;
 
 type Translate = (key: TranslationKey, vars?: Record<string, string | number>) => string;
 
@@ -114,28 +121,124 @@ const RoomProps = memo(
   (a, b) => a.desks === b.desks && a.height === b.height && a.props.length === b.props.length,
 );
 
-type DeskState = 'working' | 'needs_you' | 'finished';
+/**
+ * `working`: its employee sits at it (the seated frame brings the chair).
+ * `reserved`: its employee is queued at the boss desk or on the way: monitor
+ * on, chair empty. `empty`: its employee rests, or there is none.
+ */
+type DeskState = 'working' | 'reserved' | 'empty';
 
-function Station({ seat, occupied }: { seat: Seat; occupied: DeskState | null }) {
+function Station({ seat, state, owner }: { seat: Seat; state: DeskState; owner?: string }) {
   const left = seat.x - STATION.deskX;
   const top = seat.y - STATION.deskY;
   return (
     <>
-      <div className="wmux-office-sprite" aria-hidden="true" style={spriteStyle(FURNITURE.desk, left, top, stackIndex(seat.z, 0))} />
       <div
         className="wmux-office-sprite"
         aria-hidden="true"
-        style={spriteStyle(occupied ? FURNITURE.monitorOn : FURNITURE.monitorOff, left, top, stackIndex(seat.z, 1))}
+        data-office-desk-of={owner}
+        data-desk-state={state}
+        style={spriteStyle(FURNITURE.desk, left, top, stackIndex(seat.z, 0))}
       />
-      {/* Seated frames include the chair; draw it at an empty desk or beside a reporting employee. */}
-      {(!occupied || occupied === 'finished') && (
+      <div
+        className="wmux-office-sprite"
+        aria-hidden="true"
+        style={spriteStyle(state === 'empty' ? FURNITURE.monitorOff : FURNITURE.monitorOn, left, top, stackIndex(seat.z, 1))}
+      />
+      {state !== 'working' && (
         <div className="wmux-office-sprite" aria-hidden="true" style={spriteStyle(FURNITURE.chair, left, top, stackIndex(seat.z, 2))} />
       )}
     </>
   );
 }
 
-type PoseName = 'type' | 'raiseHand' | 'rest' | 'stand';
+/** The boss (the owner) at the boss desk, with a nameplate. */
+function BossDesk({ layout, t }: { layout: OfficeLayout; t: Translate }) {
+  const { x, y, z } = layout.boss;
+  const left = x - BOSS.deskX;
+  const top = y - BOSS.deskY;
+  // The nameplate sits above the boss's head: the queue stands in front of
+  // the desk, so its status bubbles never cover it there.
+  const plateX = x + (BOSS.seatX - BOSS.deskX);
+  const plateY = y + (BOSS.seatY - BOSS.deskY) - BOSS_PLATE_RISE;
+  return (
+    <>
+      <div
+        className="wmux-office-sprite"
+        aria-hidden="true"
+        style={spriteStyle(OFFICE_EXTRAS.bossDesk, left, top, stackIndex(z, 0))}
+      />
+      <div
+        className="wmux-office-sprite"
+        role="img"
+        data-office-boss
+        aria-label={t('office.boss.label')}
+        style={spriteStyle(BOSS, left, top, stackIndex(z, 1))}
+      />
+      <span
+        className="wmux-office-nameplate"
+        data-office-boss-nameplate
+        aria-hidden="true"
+        style={{ left: plateX * OFFICE_SCALE, top: plateY * OFFICE_SCALE, zIndex: LABEL_Z }}
+      >
+        {t('office.boss.nameplate')}
+      </span>
+    </>
+  );
+}
+
+/** From the boss's anchor (the chair's centre on the floor) up to the nameplate's top, in 1x px. */
+const BOSS_PLATE_RISE = 46;
+
+type PoseName = 'type' | 'raiseHand' | 'rest' | 'stand' | 'walk';
+
+type SpotKind = 'desk' | 'queue' | 'sofa';
+
+/** Where an employee belongs now: its desk, its place in the boss queue, or a sofa. */
+function spotFor(employee: OfficeEmployee, layout: OfficeLayout): { seat: Seat; kind: SpotKind } | null {
+  let seat: Seat | undefined;
+  if (employee.state === 'working') seat = layout.desks[layout.deskFor[employee.id]];
+  else if (employee.state === 'resting') seat = layout.lounge[layout.loungeFor[employee.id]];
+  else seat = layout.queue[layout.queueFor[employee.id]];
+  return seat ? { seat, kind: seat.spot } : null;
+}
+
+/** Frame top-left: a desk frame shares the station's origin; elsewhere the character's anchor stands on the seat point. */
+function frameOrigin(seat: Seat): { left: number; top: number } {
+  return seat.spot === 'desk'
+    ? { left: seat.x - STATION.deskX, top: seat.y - STATION.deskY }
+    : { left: seat.x - STATION.seatX, top: seat.y - STATION.seatY };
+}
+
+/**
+ * Employees on the way between spots. Derived from the spots themselves: when
+ * an employee's spot changes, it walks until its position transition ends (or
+ * WALK_MS passes). Two state changes per walk, nothing per frame.
+ */
+function useWalkers(spots: Record<string, string>): { walking: ReadonlySet<string>; arrive: (id: string) => void } {
+  const [state, setState] = useState(() => ({ spots, walking: new Set<string>() as ReadonlySet<string> }));
+  let current = state;
+  if (state.spots !== spots) {
+    const still = prefersReducedMotion();
+    const walking = new Set<string>();
+    for (const id of Object.keys(spots)) {
+      const from = state.spots[id];
+      if (still) continue;
+      if (state.walking.has(id) || (from !== undefined && from !== spots[id])) walking.add(id);
+    }
+    current = { spots, walking };
+    setState(current);
+  }
+  const arrive = useCallback((id: string) => {
+    setState((s) => {
+      if (!s.walking.has(id)) return s;
+      const walking = new Set(s.walking);
+      walking.delete(id);
+      return { spots: s.spots, walking };
+    });
+  }, []);
+  return { walking: current.walking, arrive };
+}
 
 /** Two neighbouring frames in one sheet row animate by stepping background-position-x. */
 function frameLoop(sheet: CharacterSheet, first: CharacterPose, second: CharacterPose, seconds: number, phase: number): CSSProperties | null {
@@ -153,39 +256,46 @@ function frameLoop(sheet: CharacterSheet, first: CharacterPose, second: Characte
 interface EmployeeProps {
   employee: OfficeEmployee;
   layout: OfficeLayout;
+  walking: boolean;
+  onArrive: (id: string) => void;
   t: Translate;
   now: number;
   locale?: string;
   onJump: (employee: OfficeEmployee) => void;
 }
 
-function Employee({ employee, layout, t, now, locale, onJump }: EmployeeProps) {
+function Employee({ employee, layout, walking, onArrive, t, now, locale, onJump }: EmployeeProps) {
   const sheet = characterFor(employee);
-  const seated = employee.state === 'working' || employee.state === 'needs_you';
-  const seat = seated
-    ? layout.desks[layout.deskFor[employee.id]]
-    : employee.state === 'finished'
-      ? layout.stands[layout.deskFor[employee.id]]
-      : layout.lounge[layout.loungeFor[employee.id]];
-  if (!seat) return null;
+  const id = employee.id;
+  // A walk that never fires transitionend (hidden window, same spot) still ends.
+  useEffect(() => {
+    if (!walking) return undefined;
+    const timer = setTimeout(() => onArrive(id), WALK_MS + 100);
+    return () => clearTimeout(timer);
+  }, [walking, id, onArrive]);
 
-  // Frame top-left: a desk frame shares the station's origin; elsewhere the
-  // character's anchor stands on the seat point.
-  const left = seated ? seat.x - STATION.deskX : seat.x - STATION.seatX;
-  const top = seated ? seat.y - STATION.deskY : seat.y - STATION.seatY;
+  const spot = spotFor(employee, layout);
+  if (!spot) return null;
+  const { seat } = spot;
+  const { left, top } = frameOrigin(seat);
 
   let pose: PoseName;
   let frame: CharacterPose;
   let loop: CSSProperties | null = null;
-  if (employee.state === 'working') {
+  if (walking) {
+    pose = 'walk';
+    frame = 'walk1';
+    loop = frameLoop(sheet, 'walk1', 'walk2', 0.4, employee.look);
+  } else if (employee.state === 'working') {
     pose = 'type';
     frame = 'type1';
     loop = frameLoop(sheet, 'type1', 'type2', 0.5, employee.look);
   } else if (employee.state === 'needs_you') {
+    // Standing in the boss queue with a hand up.
     pose = 'raiseHand';
-    frame = 'raiseHand';
+    frame = 'standRaise';
   } else if (employee.state === 'finished') {
-    // Standing beside the desk, facing the viewer, to report.
+    // Standing in the boss queue, facing the viewer, to report.
     pose = 'stand';
     frame = 'walk1';
   } else {
@@ -214,6 +324,8 @@ function Employee({ employee, layout, t, now, locale, onJump }: EmployeeProps) {
       data-office-employee={employee.id}
       data-state={employee.state}
       data-pose={pose}
+      data-spot={spot.kind}
+      data-walking={walking || undefined}
       aria-label={t('office.employeeLabel', {
         name: employee.label,
         workspace: employee.workspaceName,
@@ -223,6 +335,9 @@ function Employee({ employee, layout, t, now, locale, onJump }: EmployeeProps) {
       })}
       style={{ left: left * OFFICE_SCALE, top: top * OFFICE_SCALE, width: STATION.w * OFFICE_SCALE, height: STATION.h * OFFICE_SCALE }}
       onClick={() => onJump(employee)}
+      onTransitionEnd={(e) => {
+        if (e.target === e.currentTarget) onArrive(id);
+      }}
     >
       <span
         className={`wmux-office-sprite${loop ? ' wmux-office-sprite--loop' : ''}`}
@@ -276,9 +391,23 @@ interface OfficeSceneProps {
 
 /** The isometric room: layered DOM sprites, with names and bubbles as DOM text. */
 export default function OfficeScene({ employees, layout, t, now, locale, onJump, label }: OfficeSceneProps) {
-  const seatedAt = new Map<number, DeskState>();
+  const spots = useMemo(() => {
+    const out: Record<string, string> = {};
+    for (const e of employees) {
+      const spot = spotFor(e, layout);
+      if (spot) out[e.id] = `${spot.seat.x},${spot.seat.y}`;
+    }
+    return out;
+  }, [employees, layout]);
+  const { walking, arrive } = useWalkers(spots);
+
+  const deskAt = new Map<number, { state: DeskState; owner: string }>();
   for (const e of employees) {
-    if (e.state !== 'resting') seatedAt.set(layout.deskFor[e.id], e.state);
+    const desk = layout.deskFor[e.id];
+    if (desk === undefined) continue;
+    const state: DeskState =
+      e.state === 'resting' ? 'empty' : e.state === 'working' && !walking.has(e.id) ? 'working' : 'reserved';
+    deskAt.set(desk, { state, owner: e.id });
   }
   return (
     <div
@@ -288,11 +417,22 @@ export default function OfficeScene({ employees, layout, t, now, locale, onJump,
       style={{ width: layout.width * OFFICE_SCALE, height: layout.height * OFFICE_SCALE }}
     >
       <RoomProps props={layout.props} desks={layout.desks.length} height={layout.height} />
+      <BossDesk layout={layout} t={t} />
       {layout.desks.map((seat, i) => (
-        <Station key={i} seat={seat} occupied={seatedAt.get(i) ?? null} />
+        <Station key={i} seat={seat} state={deskAt.get(i)?.state ?? 'empty'} owner={deskAt.get(i)?.owner} />
       ))}
       {employees.map((e) => (
-        <Employee key={e.id} employee={e} layout={layout} t={t} now={now} locale={locale} onJump={onJump} />
+        <Employee
+          key={e.id}
+          employee={e}
+          layout={layout}
+          walking={walking.has(e.id)}
+          onArrive={arrive}
+          t={t}
+          now={now}
+          locale={locale}
+          onJump={onJump}
+        />
       ))}
     </div>
   );

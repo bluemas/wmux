@@ -4430,4 +4430,6 @@ export const ko = {
   'office.need.error': "오류",
   'office.need.usageLimit': "사용 한도",
   'office.need.usageLimitUntil': "사용 한도 — {time}에 재개",
+  'office.boss.nameplate': "보스",
+  'office.boss.label': "보스 책상 (나)",
 } as const;

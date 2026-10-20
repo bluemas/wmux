@@ -4929,6 +4929,8 @@ export const en = {
   'office.need.error': "Error",
   'office.need.usageLimit': "Usage limit",
   'office.need.usageLimitUntil': "Usage limit — resumes {time}",
+  'office.boss.nameplate': "Boss",
+  'office.boss.label': "Boss desk (you)",
 } as const;
 
 export type TranslationKey = keyof typeof en;
