@@ -10,7 +10,11 @@ import type { IPty } from 'node-pty';
 import { DaemonPTYBridge } from '../DaemonPTYBridge';
 import { PromptEventLog } from '../PromptEventLog';
 import { RingBuffer } from '../RingBuffer';
-import { RESUME_CONTINUE_MAX_QUIET_MS, recordWasMidTurn } from '../recoveryHint';
+import { RESUME_CONTINUE_MAX_QUIET_MS, recordWasMidTurn, recordedTurnStillOpen } from '../recoveryHint';
+import { transcriptTurnState } from '../transcript/chatAgentStatus';
+import { parseTranscriptLineDetailed } from '../transcript/parseEntry';
+import { parseCodexLineDetailed } from '../transcript/parseCodexEntry';
+import type { TurnEvent } from '../../shared/transcript/turnEvents';
 
 function makeFakePty(): IPty {
   return {
@@ -19,97 +23,48 @@ function makeFakePty(): IPty {
   } as unknown as IPty;
 }
 
-describe('DaemonPTYBridge — an interrupted turn is never continued', () => {
-  const ROW = '  ⎿  Interrupted · What should Claude do instead?\r\n';
-  let bridge: DaemonPTYBridge;
-  let feed: (data: string) => void;
-  let edges: Array<number | null>;
+describe('transcriptTurnState — the agent\'s own transcript says whether its last turn is open', () => {
+  const ts = '2026-10-20T12:00:00.000Z';
+  const claude = (lines: object[]): TurnEvent[] => lines.flatMap((l, i) => parseTranscriptLineDetailed(JSON.stringify({ timestamp: ts, uuid: `u${i}`, ...l }), i).events);
+  const codex = (lines: object[]): TurnEvent[] => lines.flatMap((l, i) => parseCodexLineDetailed(JSON.stringify({ timestamp: ts, ...l }), i).events);
+  const prompt = { type: 'user', message: { role: 'user', content: 'fix the build' } };
+  const toolUse = { type: 'assistant', message: { role: 'assistant', stop_reason: 'tool_use', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'npm test' } }] } };
+  const toolResult = { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] } };
+  const endTurn = { type: 'assistant', message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: 'done' }] } };
+  const interrupted = { type: 'user', message: { role: 'user', content: [{ type: 'text', text: '[Request interrupted by user]' }] } };
 
-  beforeEach(() => {
-    vi.useFakeTimers();
-    bridge = new DaemonPTYBridge();
-    let onData: ((data: string) => void) | null = null;
-    const pty = {
-      onData: (cb: (data: string) => void) => { onData = cb; return { dispose: () => { onData = null; } }; },
-      onExit: () => ({ dispose: () => undefined }),
-    } as unknown as IPty;
-    feed = (data) => onData?.(data);
-    bridge.setupDataForwarding(pty, new RingBuffer(65536), 'sess-1', new PromptEventLog());
-    feed('Claude Code v2.1.300\r\n  bypass permissions on\r\n'); // opens the Claude gate
-    vi.advanceTimersByTime(10_000);
-    edges = [];
-    bridge.on('agentTurn', (p: { runningSince: number | null }) => edges.push(p.runningSince));
-    bridge.noteInput('fix the build\r');
-    bridge.noteAgentStatus('running', true); // UserPromptSubmit
+  it('a Claude turn mid-tool, or a prompt with no reply yet, is open', () => {
+    expect(transcriptTurnState(claude([prompt, toolUse]))).toBe('open');
+    expect(transcriptTurnState(claude([prompt, toolUse, toolResult]))).toBe('open');
+    expect(transcriptTurnState(claude([endTurn, prompt]))).toBe('open');
   });
 
-  afterEach(() => {
-    bridge.cleanup();
-    vi.useRealTimers();
+  it('a Claude turn the user interrupted, or one that finished, has ended', () => {
+    expect(transcriptTurnState(claude([prompt, toolUse, interrupted]))).toBe('ended');
+    expect(transcriptTurnState(claude([prompt, toolUse, toolResult, endTurn]))).toBe('ended');
   });
 
-  it('the agent\'s interrupt row ends the mid-turn mark, though no Stop closes the episode', () => {
-    expect(bridge.isAgentMidTurn()).toBe(true);
-    bridge.noteInput('\x1b');
-    feed(ROW);
-    expect(bridge.isAgentMidTurn()).toBe(false);
-    expect(edges.at(-1)).toBeNull();
+  it('subagent rows after a finished reply do not reopen it, however many', () => {
+    const side = { type: 'user', isSidechain: true, message: { role: 'user', content: 'subagent task' } };
+    expect(transcriptTurnState(claude([prompt, endTurn, ...Array.from({ length: 60 }, () => side)]))).toBe('ended');
   });
 
-  it('an old turn\'s interrupt row, redrawn while a new turn runs, leaves that turn\'s mark', () => {
-    bridge.noteInput('\x1b');
-    feed(ROW);
-    bridge.noteInput('try another way\r');
-    bridge.noteAgentStatus('running', true); // the new turn's UserPromptSubmit
-    vi.advanceTimersByTime(1_000);
-    feed(ROW); // a full redraw prints turn A's row again
-    expect(bridge.isAgentMidTurn()).toBe(true);
-    vi.advanceTimersByTime(6_000);
-    feed(ROW);
-    expect(bridge.isAgentMidTurn()).toBe(true);
+  it('Codex: turn_aborted and task_complete end the turn, task_started opens one', () => {
+    const ev = (type: string) => ({ type: 'event_msg', payload: { type, turn_id: 'turn-1' } });
+    expect(transcriptTurnState(codex([ev('task_started')]))).toBe('open');
+    expect(transcriptTurnState(codex([ev('task_started'), ev('turn_aborted')]))).toBe('ended');
+    expect(transcriptTurnState(codex([ev('task_started'), ev('task_complete')]))).toBe('ended');
   });
 
-  it('a session start delivered after the interrupt does not bring the turn back', () => {
-    bridge.noteInput('\x1b');
-    feed(ROW);
-    bridge.noteSessionStart(Date.now(), 'resume');
-    expect(bridge.isAgentMidTurn()).toBe(false);
+  it('an empty or unreadable tail is unknown', () => {
+    expect(transcriptTurnState([])).toBe('unknown');
+    expect(transcriptTurnState(undefined)).toBe('unknown');
   });
 
-  it('an Esc and the next prompt in the same millisecond still read in order', () => {
-    bridge.noteInput('\x1b');
-    feed(ROW);
-    bridge.noteInput('try another way\r');
-    bridge.noteAgentStatus('running', true);
-    feed(ROW); // the old row, redrawn
-    expect(bridge.isAgentMidTurn()).toBe(true);
-  });
-
-  it('a double Esc in one write, or Ctrl+C, is an interrupt key too', () => {
-    bridge.noteInput('\x1b\x1b');
-    feed(ROW);
-    expect(bridge.isAgentMidTurn()).toBe(false);
-    vi.advanceTimersByTime(500);
-    bridge.noteInput('go on\r');
-    expect(bridge.isAgentMidTurn()).toBe(true);
-    vi.advanceTimersByTime(500);
-    bridge.noteInput('\x03');
-    feed(ROW);
-    expect(bridge.isAgentMidTurn()).toBe(false);
-  });
-
-  it('an interrupt row with no interrupt key before it is a redraw, not an interrupt', () => {
-    vi.advanceTimersByTime(10_000);
-    feed(ROW);
-    expect(bridge.isAgentMidTurn()).toBe(true);
-  });
-
-  it('the next prompt is a turn to continue again', () => {
-    bridge.noteInput('\x1b');
-    feed(ROW);
-    bridge.noteInput('try another way\r');
-    expect(bridge.isAgentMidTurn()).toBe(true);
-    expect(typeof edges.at(-1)).toBe('number');
+  it('recovery continues nothing without a transcript it can read', () => {
+    expect(recordedTurnStillOpen(undefined)).toBe(false);
+    expect(recordedTurnStillOpen({ agent: 'claude', sessionId: 's', cwd: '/tmp', ts: 0 })).toBe(false);
+    expect(recordedTurnStillOpen({ agent: 'claude', sessionId: '0d9c1b52-1e6a-4b8e-9f0a-1c2d3e4f5a6b', cwd: '/tmp', ts: 0, transcriptPath: '/nonexistent/x.jsonl' })).toBe(false);
   });
 });
 
@@ -242,7 +197,7 @@ describe('turnRunningSince wiring', () => {
   it('recovery reads the mark off the persisted record, never the recovered meta', () => {
     const src = read('index.ts');
     const rec = src.slice(src.indexOf('for (const recoveredId of recoveredIds) {'));
-    expect(rec).toMatch(/if \(m\.resumeContinuePending\) recoveredWasRunning\.add\(recoveredId\);/);
+    expect(rec).toMatch(/if \(m\.resumeContinuePending && recordedTurnStillOpen\(recoveredResumeBindings\.get\(recoveredId\) \?\? m\.resumeBinding, m\.env\)\) \{\s*recoveredWasRunning\.add\(recoveredId\);\s*\} else delete m\.resumeContinuePending;/);
     // The carry-forward reads the OLD record into the owed continue, before
     // the merged recovery save, and never copies the raw mark onto the new meta.
     const carry = src.slice(src.indexOf('for (const persisted of state.sessions) {'), src.indexOf('const liveState = buildState(sessionManager);'));

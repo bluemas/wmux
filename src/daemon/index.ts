@@ -126,7 +126,7 @@ import { WorkTaskService } from './worktask/WorkTaskService';
 import { isTaskState, type AgentStatus, type Task } from '../shared/types';
 import { ProcessMonitor } from './ProcessMonitor';
 import { AgentProcessTracker } from './AgentProcessTracker';
-import { liveRecoveryHint, namedAgentAlive, recordWasMidTurn, screenShowsLiveAgent, sightedRecoveredAgent } from './recoveryHint';
+import { liveRecoveryHint, namedAgentAlive, recordedTurnStillOpen, recordWasMidTurn, screenShowsLiveAgent, sightedRecoveredAgent } from './recoveryHint';
 import { checkWslAgentRunning, reportedAgentForPane, stopWslAgent, WslPidWatcher } from './wslAgentProcess';
 import { GateFlagFile } from './gateFlagFile';
 import { WSL_GATE_FLAG_FILE } from '../shared/wslIntegration';
@@ -2360,8 +2360,12 @@ async function recoverSessions(
     if (isUsableResumeBinding(m.resumeBinding) && normalizeResumeCwd(m.resumeBinding.cwd) === normalizeResumeCwd(m.cwd) && bindingTranscriptLives(m.resumeBinding)) {
       recoveredResumeBindings.set(recoveredId, m.resumeBinding);
     }
-    // Set from the OLD record in the carry-forward above.
-    if (m.resumeContinuePending) recoveredWasRunning.add(recoveredId);
+    // Set from the OLD record in the carry-forward above, and kept only while
+    // the agent's own transcript still shows that turn open: a turn the user
+    // interrupted, or one that finished, is not continued.
+    if (m.resumeContinuePending && recordedTurnStillOpen(recoveredResumeBindings.get(recoveredId) ?? m.resumeBinding, m.env)) {
+      recoveredWasRunning.add(recoveredId);
+    } else delete m.resumeContinuePending;
   }
 
   // Clean up orphaned buffer files. Preserve buffers for both the
@@ -3470,8 +3474,8 @@ function registerRpcHandlers(
           promotedSession.meta.codexRelayResume = session.codexRelayResume;
           const offer = resumeOfferForRecovered(promotedSession.meta);
           if (offer) recoveredAgentShellIds.set(sessionId, offer as AgentSlug);
-          // Read off the persisted record, as at boot recovery.
-          if (offer && recordWasMidTurn(session, Date.now())) {
+          // Read off the persisted record and the transcript, as at boot recovery.
+          if (offer && recordWasMidTurn(session, Date.now()) && recordedTurnStillOpen(session.resumeBinding, session.env)) {
             recoveredWasRunning.add(sessionId);
             promotedSession.meta.resumeContinuePending = true;
           } else delete promotedSession.meta.resumeContinuePending;

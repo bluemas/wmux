@@ -252,22 +252,6 @@ export class DaemonPTYBridge extends EventEmitter {
   private bootEpisode = false;
   /** The last `isAgentMidTurn` value reported through 'agentTurn'. */
   private reportedMidTurn = false;
-  /**
-   * The open episode was interrupted (the agent's own interrupt row, or an
-   * idle title right after an Esc). The episode may stay open (no Chat View
-   * subscriber reads the transcript end), but it is not work to continue after
-   * a restart. Cleared by the next submit, the agent's own running hook, or a
-   * new episode.
-   */
-  private interruptedEpisode = false;
-  /** When a key that interrupts a turn (Esc, Ctrl+C) or the agent's own interrupt last arrived. */
-  private lastInterruptKeyAt = 0;
-  /** The order of the last interrupt key and the last submitted prompt (not
-   *  a dialog answer), from one counter: two in the same millisecond still
-   *  tell which came first. */
-  private orderSeq = 0;
-  private lastInterruptKeySeq = 0;
-  private lastSubmitSeq = 0;
 
   /**
    * Reads the pane's transcript for the latest recorded turn end (epoch ms),
@@ -467,13 +451,6 @@ export class DaemonPTYBridge extends EventEmitter {
       // Inside a bracketed paste an ESC is text, not a key. On Windows the
       // approval answers write Esc as a win32-input-mode record (#1915).
       if ((active === '\x1b' || active === ESCAPE_WIN32) && !this.inputInBracketedPaste) this.lastEscAt = this.lastInputAt;
-      // A key that interrupts a turn, in every encoding wmux writes: an Esc
-      // (bare, kitty CSI-u, win32), a double Esc in one chunk, Ctrl+C (also
-      // as a kitty key).
-      if (!this.inputInBracketedPaste && (isEscapeChunk(active) || active === '\x1b\x1b' || active.includes('\x03') || active.startsWith('\x1b[99;5'))) {
-        this.lastInterruptKeyAt = this.lastInputAt;
-        this.lastInterruptKeySeq = ++this.orderSeq;
-      }
       if (active.length > 0) {
         this.keyInputRevision += 1;
         this.lastKeyInputAt = this.lastInputAt;
@@ -596,8 +573,6 @@ export class DaemonPTYBridge extends EventEmitter {
     // An answer resumes the episode it interrupted; a submit into a running
     // turn is queued by the agent's own composer. Anything else starts one.
     if (!wasAwaiting) {
-      this.interruptedEpisode = false;
-      this.lastSubmitSeq = ++this.orderSeq;
       // #1670 — an episode opened at boot (by the boot burst, or by the first
       // Enter after a launch, which may only have answered a dialog the
       // detector does not see, such as Codex's folder-trust prompt) is not a
@@ -700,7 +675,6 @@ export class DaemonPTYBridge extends EventEmitter {
     if (status === 'running') {
       if (authoritative) {
         this.hookSeen = true;
-        this.interruptedEpisode = false;
         this.lastTurnStartedAt = Date.now();
         // The first hook after a settle is an autonomous turn; later hooks, and
         // any hook behind an unanswered dialog, belong to the open episode.
@@ -844,7 +818,6 @@ export class DaemonPTYBridge extends EventEmitter {
       return;
     }
     this.turnSoftClosed = false;
-    this.interruptedEpisode = false;
     this.turnSeq += 1;
     this.lastFailure = null;
     this.prevTurnOpenedAt = this.turnOpenedAt;
@@ -871,20 +844,7 @@ export class DaemonPTYBridge extends EventEmitter {
    * safe side: continuing an agent idle at its composer would invent work.
    */
   isAgentMidTurn(): boolean {
-    return this.turnOpen && !this.bootEpisode && !this.interruptedEpisode && (this.hookSeen || this.trackedAgent?.alive === true);
-  }
-
-  /**
-   * The agent reported its turn interrupted: never continued after a restart.
-   * Only right after an interrupt key, and one that came after the last
-   * prompt: a redraw prints an old turn's interrupt row again, and that must
-   * not take the mark from the turn running now.
-   */
-  private noteEpisodeInterrupted(): void {
-    if (!this.turnOpen) return;
-    if (Date.now() - this.lastInterruptKeyAt >= ESC_INTERRUPT_CONFIRM_MS || this.lastInterruptKeySeq < this.lastSubmitSeq) return;
-    this.interruptedEpisode = true;
-    this.reportMidTurn();
+    return this.turnOpen && !this.bootEpisode && (this.hookSeen || this.trackedAgent?.alive === true);
   }
 
   /** Emits 'agentTurn' when `isAgentMidTurn` changed since the last report. */
@@ -1412,7 +1372,6 @@ export class DaemonPTYBridge extends EventEmitter {
     if (this.lastEscAt === this.titleEdgeEscAt) return;
     if (this.agentDetector?.getLastAgent() !== 'Claude Code') return;
     this.titleEdgeEscAt = this.lastEscAt;
-    this.noteEpisodeInterrupted();
     this.emit('turnInterrupted', { sessionId, agent: 'Claude Code' });
   }
 
@@ -1424,8 +1383,6 @@ export class DaemonPTYBridge extends EventEmitter {
    */
   noteInterrupt(): void {
     this.lastEscAt = Date.now();
-    this.lastInterruptKeyAt = this.lastEscAt;
-    this.lastInterruptKeySeq = ++this.orderSeq;
   }
 
   /** The latest window title the program set, and when (`at` 0 = never). */
@@ -1444,7 +1401,7 @@ export class DaemonPTYBridge extends EventEmitter {
    */
   noteSessionStart(signalTs: number, source: unknown): void {
     const atIdlePrompt = this.explicitTerminalStatus && this.settledStatus === 'waiting' && !this.awaitingHuman;
-    const { preTurn, turnEvidenceAt, turnOpen, turnSeq, turnOpenedAt, prevTurnOpenedAt, turnSoftClosed, codexBootWindow, bootEpisode, byteOpenedTurn, spinnerOpenedTurn, lastFailure, interruptedEpisode } = this;
+    const { preTurn, turnEvidenceAt, turnOpen, turnSeq, turnOpenedAt, prevTurnOpenedAt, turnSoftClosed, codexBootWindow, bootEpisode, byteOpenedTurn, spinnerOpenedTurn, lastFailure } = this;
     this.noteAgentStatus('running', true);
     this.codexBootWindow = codexBootWindow;
     // The session start is not turn evidence itself: a duplicate delivery of
@@ -1462,7 +1419,6 @@ export class DaemonPTYBridge extends EventEmitter {
     this.bootEpisode = bootEpisode;
     this.byteOpenedTurn = byteOpenedTurn;
     this.spinnerOpenedTurn = spinnerOpenedTurn;
-    this.interruptedEpisode = interruptedEpisode;
     this.reportMidTurn();
     if (!isFreshSessionSource(source)) {
       this.preTurn = false;
@@ -1833,7 +1789,6 @@ export class DaemonPTYBridge extends EventEmitter {
     // recovery replay prints it again for a turn that is long over.
     this.interruptedUnsubscribe = agentDetector.onInterrupted(({ agent }) => {
       if (this.muted || Date.now() - this.lastResizeAtMs < RESIZE_REDRAW_GUARD_MS) return;
-      this.noteEpisodeInterrupted();
       this.emit('turnInterrupted', { sessionId, agent });
     });
 
@@ -2167,7 +2122,6 @@ export class DaemonPTYBridge extends EventEmitter {
     this.turnSoftClosed = false;
     this.bootEpisode = false;
     this.reportedMidTurn = false;
-    this.interruptedEpisode = false;
     this.byteOpenedTurn = false;
     this.heldBurstAt = 0;
     this.spinnerArmedCycle = false;
