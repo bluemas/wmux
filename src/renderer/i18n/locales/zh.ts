@@ -4018,4 +4018,15 @@ export const zh = {
   'botsPage.models.saveFailed': "无法保存模型。",
   'botsPage.models.workersOn': "工作者 {model}",
   'botsPage.profile.workersUnavailable': "{name}（此系统不可用）",
+  // Office page
+  'office.empty': "还没有智能体会话",
+  'office.emptyHint': "在窗格中启动 Claude Code 或 Codex，它会在这里坐到一张办公桌前。",
+  'office.roomLabel': "办公室，{count} 个智能体",
+  'office.employeeLabel': "{name}，{workspace}：{state}",
+  'office.state.working': "工作中",
+  'office.state.resting': "休息中",
+  'office.need.question': "等待你的回应",
+  'office.need.error': "错误",
+  'office.need.usageLimit': "用量上限",
+  'office.need.usageLimitUntil': "用量上限 — {time} 恢复",
 } as const;

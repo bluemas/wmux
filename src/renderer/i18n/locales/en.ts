@@ -4913,6 +4913,17 @@ export const en = {
   'botsPage.teamName.issue': "Issues",
   'botsPage.teamName.reviewer': "Reviewer",
   'room.composer.toLead': "To {name}",
+  // Office page
+  'office.empty': "No agent sessions yet",
+  'office.emptyHint': "Start Claude Code or Codex in a pane and it takes a desk here.",
+  'office.roomLabel': "Office, {count} agents",
+  'office.employeeLabel': "{name}, {workspace}: {state}",
+  'office.state.working': "Working",
+  'office.state.resting': "Resting",
+  'office.need.question': "Waiting for you",
+  'office.need.error': "Error",
+  'office.need.usageLimit': "Usage limit",
+  'office.need.usageLimitUntil': "Usage limit — resumes {time}",
 } as const;
 
 export type TranslationKey = keyof typeof en;

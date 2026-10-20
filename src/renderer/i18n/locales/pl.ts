@@ -4873,4 +4873,15 @@ export const pl = {
   'botsPage.teamName.issue': "Zgłoszenia",
   'botsPage.teamName.reviewer': "Recenzent",
   'room.composer.toLead': "Do {name}",
+  // Office page
+  'office.empty': "Brak sesji agentów",
+  'office.emptyHint': "Uruchom Claude Code lub Codex w panelu, a zajmie tu biurko.",
+  'office.roomLabel': "Biuro, agenci: {count}",
+  'office.employeeLabel': "{name}, {workspace}: {state}",
+  'office.state.working': "Pracuje",
+  'office.state.resting': "Odpoczywa",
+  'office.need.question': "Czeka na Ciebie",
+  'office.need.error': "Błąd",
+  'office.need.usageLimit': "Limit użycia",
+  'office.need.usageLimitUntil': "Limit użycia — wznowienie o {time}",
 } as const;

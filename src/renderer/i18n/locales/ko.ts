@@ -4414,4 +4414,15 @@ export const ko = {
   'botsPage.teamName.issue': "이슈처리",
   'botsPage.teamName.reviewer': "리뷰어",
   'room.composer.toLead': "{name}에게",
+  // Office page
+  'office.empty': "아직 에이전트 세션이 없습니다",
+  'office.emptyHint': "패널에서 Claude Code나 Codex를 시작하면 여기 책상에 앉습니다.",
+  'office.roomLabel': "사무실, 에이전트 {count}명",
+  'office.employeeLabel': "{name}, {workspace}: {state}",
+  'office.state.working': "작업 중",
+  'office.state.resting': "휴식 중",
+  'office.need.question': "응답을 기다리는 중",
+  'office.need.error': "오류",
+  'office.need.usageLimit': "사용 한도",
+  'office.need.usageLimitUntil': "사용 한도 — {time}에 재개",
 } as const;
