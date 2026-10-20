@@ -162,6 +162,18 @@ describe('selectOfficeEmployees', () => {
     expect(tm.state).toBe('working');
   });
 
+  it('lead rests once its last teammate stops, even while the roster still reads running', () => {
+    const s = state({
+      workspaces: leadWs(),
+      surfaceAgent: { 'pty-lead': claude('running') },
+      surfaceActivityAt: { 'pty-lead': NOW },
+      surfaceTeammates: { 'pty-lead': [mate('reviewer', false)] },
+    });
+    const [lead, tm] = selectOfficeEmployees(s, NOW);
+    expect(lead).toMatchObject({ id: 'pty-lead', state: 'resting' });
+    expect(tm.state).toBe('resting');
+  });
+
   it('teammate jumps to its lead', () => {
     const s = state({
       workspaces: leadWs(),

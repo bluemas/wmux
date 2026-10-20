@@ -322,6 +322,30 @@ describe('TranscriptActivityWatcher — Agent Teams teammates', () => {
     expect(h.rosters[1][1]).toMatchObject([{ name: 'mate', working: false }]);
   });
 
+  it('resendTeammates re-emits an unchanged non-empty list on the next tick', () => {
+    const h = teammates();
+    h.watcher.tick();
+    expect(h.rosters).toHaveLength(1);
+    h.watcher.resendTeammates();
+    h.watcher.tick(); // same instant: the resend must not wait for the poll interval
+    expect(h.rosters).toHaveLength(2);
+    expect(h.rosters[1][1]).toMatchObject([{ name: 'mate', working: true }]);
+    h.advance(15_000);
+    h.watcher.tick();
+    expect(h.rosters).toHaveLength(2); // back to change-only
+  });
+
+  it('resendTeammates sends nothing for a pane that never had teammates', () => {
+    const h = teammates();
+    fs.rmSync(path.join(dir, 'claude', 'subagents'), { recursive: true, force: true });
+    h.watcher.tick();
+    expect(h.rosters).toHaveLength(0);
+    h.watcher.resendTeammates();
+    h.advance(15_000);
+    h.watcher.tick();
+    expect(h.rosters).toHaveLength(0);
+  });
+
   it('drop sends an empty list once a non-empty list was sent', () => {
     const h = teammates();
     h.watcher.tick();

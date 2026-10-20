@@ -144,6 +144,29 @@ function assignDesks(employees: OfficeEmployee[], prev?: OfficeLayout): Record<s
   return deskFor;
 }
 
+/** Lounge spots for the resting: each keeps its previous one, newcomers fill the freed spots first. */
+function assignLounge(resting: OfficeEmployee[], prev?: OfficeLayout): Record<string, number> {
+  const loungeFor: Record<string, number> = {};
+  const taken = new Set<number>();
+  if (prev) {
+    for (const e of resting) {
+      const spot = prev.loungeFor[e.id];
+      if (spot !== undefined && !taken.has(spot)) {
+        loungeFor[e.id] = spot;
+        taken.add(spot);
+      }
+    }
+  }
+  let next = 0;
+  for (const e of resting) {
+    if (loungeFor[e.id] !== undefined) continue;
+    while (taken.has(next)) next += 1;
+    loungeFor[e.id] = next;
+    taken.add(next);
+  }
+  return loungeFor;
+}
+
 function firstFreeRun(taken: Set<number>, run: number): number {
   for (let start = 0; ; start += 1) {
     const { col } = deskCell(start);
@@ -184,7 +207,10 @@ export function layoutOffice(employees: OfficeEmployee[], prev?: OfficeLayout): 
 
   const resting = employees.filter((e) => e.state === 'resting');
   const sofaSeats = SOFA_COUNT * SOFA_SEAT_OFFSETS.length;
-  const standRows = Math.max(1, Math.ceil(Math.max(0, resting.length - sofaSeats) / STAND_PER_ROW));
+  const loungeFor = assignLounge(resting, prev);
+  // Kept spots can leave holes, so size the standing rows by the highest spot.
+  const loungeSpots = Object.values(loungeFor).reduce((m, spot) => Math.max(m, spot + 1), 0);
+  const standRows = Math.max(1, Math.ceil(Math.max(0, loungeSpots - sofaSeats) / STAND_PER_ROW));
 
   const deskEnd = DESK_B0 + (rows - 1) * DESK_B_STEP + STATION_DEPTH;
   const loungeB = roundUp(deskEnd + 8, TILE);
@@ -230,11 +256,6 @@ export function layoutOffice(employees: OfficeEmployee[], prev?: OfficeLayout): 
       lounge.push({ ...toScreen(a, b), z: a + b, facing: 'left', spot: 'floor' });
     }
   }
-
-  const loungeFor: Record<string, number> = {};
-  resting.forEach((e, i) => {
-    loungeFor[e.id] = i;
-  });
 
   // Floor: wood everywhere, a carpet under the desk area.
   const tilesA = roomA / TILE;

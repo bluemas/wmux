@@ -82,6 +82,18 @@ describe('layoutOffice', () => {
     expect(second.deskFor.e).toBe(first.deskFor.b);
   });
 
+  it("keeps each resting employee's lounge spot across updates", () => {
+    const rest = (id: string): OfficeEmployee => emp(id, { state: 'resting' });
+    const first = layoutOffice([rest('a'), rest('b'), rest('c'), emp('d')]);
+    // 'a' goes back to work, so 'b' and 'c' move up the list; 'd' sits down.
+    const second = layoutOffice([emp('a'), rest('b'), rest('c'), rest('d')], first);
+    expect(second.loungeFor.b).toBe(first.loungeFor.b);
+    expect(second.loungeFor.c).toBe(first.loungeFor.c);
+    // The newcomer takes the spot 'a' freed.
+    expect(second.loungeFor.d).toBe(first.loungeFor.a);
+    expect(second.loungeFor.a).toBeUndefined();
+  });
+
   it('seats teammates next to their lead', () => {
     const employees = [
       emp('lead-1'),

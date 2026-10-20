@@ -65,6 +65,8 @@ const DEFAULT_MIN_GAP_MS = 2000;
  *  finds one working refreshes main's 120 s activity stamp, so a refresh that
  *  lands inside main's 3 s settle guard right after a Stop is retried soon. */
 export const TEAMMATE_POLL_MS = 15_000;
+/** Marks a watch whose teammate list must be sent again, whatever it says. */
+const RESEND_TEAMMATES = '<resend>';
 
 type ParseLine = (line: string, offset: number) => TurnEvent[];
 
@@ -369,6 +371,20 @@ export class TranscriptActivityWatcher {
     this.watches.delete(id);
     if (watch.subagentsSent > 0) this.deps.emitSubagents?.(id, 0);
     if (watch.teammatesSent !== '') this.deps.emitTeammates?.(id, []);
+  }
+
+  /**
+   * Makes every watch send its teammate list again on the next tick, even if it
+   * is unchanged. The daemon outlives the app, and a freshly subscribed app has
+   * an empty roster that would otherwise only fill when a list changes.
+   */
+  resendTeammates(): void {
+    for (const watch of this.watches.values()) {
+      // A sentinel no real key equals (those are "" or JSON), so an empty list
+      // still sends nothing for a pane that never had teammates.
+      if (watch.teammatesSent !== '') watch.teammatesSent = RESEND_TEAMMATES;
+      watch.teammatesAt = 0;
+    }
   }
 
   private flushSubagents(id: string, watch: Watch): void {

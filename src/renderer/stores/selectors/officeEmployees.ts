@@ -69,9 +69,10 @@ export function selectOfficeEmployees(state: StoreState, _now: number): OfficeEm
       let officeState: OfficeState;
       if (need) {
         officeState = 'needs_you';
-      } else if (teammates.some((mate) => mate.working)) {
-        // The roster reads a pane as running while a teammate works; the lead
-        // itself only works inside its own hook turn.
+      } else if (teammates.length > 0) {
+        // The roster reads a pane as running while a teammate works, and keeps
+        // doing so for up to the hook TTL after the last one stops; a lead with
+        // a team works only inside its own hook turn.
         officeState = (state.surfaceTurnOpenAt?.[row.ptyId] ?? 0) > 0 ? 'working' : 'resting';
       } else {
         officeState = row.status === 'running' ? 'working' : 'resting';

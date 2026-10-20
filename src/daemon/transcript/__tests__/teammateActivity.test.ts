@@ -158,6 +158,16 @@ describe('TeammateScanner', () => {
     expect(list[1].activity).toBeUndefined();
   });
 
+  it('list keeps only the newest of two teammates sharing a name', () => {
+    const now = Date.now();
+    const older = agent('twin-1', 'in_process_teammate', [reply('end_turn', now - 60_000)], now - 60_000);
+    const newer = agent('twin-2', 'in_process_teammate', [toolUse('a', now)], now);
+    expect(older).not.toBe(newer);
+    const list = new TeammateScanner(sub).list(now);
+    expect(list).toHaveLength(1);
+    expect(list[0]).toMatchObject({ name: 'twin', working: true });
+  });
+
   it('list prefers the meta name when present', () => {
     const now = Date.now();
     const file = agent('mate-1', 'in_process_teammate', [toolUse('a', now)]);

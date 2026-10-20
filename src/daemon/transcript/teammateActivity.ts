@@ -178,7 +178,13 @@ export class TeammateScanner {
       const info = this.check(path.join(this.dir, file), now);
       if (info) found.push(info);
     }
-    return found.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    // Two fresh teammates of one name would share an id downstream: keep the newest.
+    const newest = new Map<string, TeammateInfo>();
+    for (const info of found) {
+      const seen = newest.get(info.name);
+      if (!seen || info.at > seen.at) newest.set(info.name, info);
+    }
+    return [...newest.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   }
 
   private refresh(): void {

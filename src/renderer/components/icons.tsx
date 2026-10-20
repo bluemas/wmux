@@ -30,8 +30,6 @@ export function IconX({ size = 14 }: { size?: number }) {
   return <Icon size={size}><line x1="3" y1="3" x2="11" y2="11" /><line x1="11" y1="3" x2="3" y2="11" /></Icon>;
 }
 
-/** Two overlapping figures — channel member roster count. Replaces the 👥 glyph
- *  (the Unicode members emoji that issue #145 set out to eliminate). */
 /** A desk with a monitor on it — the Office rail page. */
 export function IconOffice({ size = 14 }: { size?: number }) {
   return (
@@ -44,6 +42,8 @@ export function IconOffice({ size = 14 }: { size?: number }) {
   );
 }
 
+/** Two overlapping figures — channel member roster count. Replaces the 👥 glyph
+ *  (the Unicode members emoji that issue #145 set out to eliminate). */
 export function IconUsers({ size = 14 }: { size?: number }) {
   return (
     <Icon size={size}>

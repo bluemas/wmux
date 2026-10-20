@@ -4384,6 +4384,9 @@ function registerRpcHandlers(
     // port sets so an already-listening dev server shows up without waiting
     // for it to change.
     if (ok) { try { resyncContextWatchers?.(); } catch { /* best effort */ } }
+    // The same holds for the Office page's teammate rosters: they are sent on
+    // change only, so a fresh app would show none until a list changes.
+    if (ok) { try { transcriptActivity?.resendTeammates(); } catch { /* best effort */ } }
     return { ok };
   });
 
