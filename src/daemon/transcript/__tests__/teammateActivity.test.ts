@@ -201,6 +201,17 @@ describe('TeammateScanner', () => {
     expect(scanner.anyWorking(now + 1000)).toBe(false);
   });
 
+  it('a turn end written before a burst of bookkeeping is still read', () => {
+    const now = Date.now();
+    const file = agent('mate', 'in_process_teammate', [prompt(now), toolUse('a', now)]);
+    const scanner = new TeammateScanner(sub);
+    expect(scanner.anyWorking(now)).toBe(true);
+    const filler = JSON.stringify({ type: 'api-request', timestamp: iso(now), body: 'b'.repeat(300 * 1024) });
+    fs.appendFileSync(file, `${toolResult('a', now)}\n${reply('end_turn', now)}\n${filler}\n`);
+    fs.utimesSync(file, (now + 1000) / 1000, (now + 1000) / 1000);
+    expect(scanner.anyWorking(now + 1000)).toBe(false);
+  });
+
   it('a final reply too big for the tail window still reads as replied', () => {
     const now = Date.now();
     const long = JSON.stringify({

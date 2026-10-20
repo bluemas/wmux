@@ -286,6 +286,8 @@ export interface PaneSlice {
   /** An Agent Teams teammate still works: its own stamp, nothing else (the
    *  lead's activity stamp, question and status stay). */
   markSurfaceTeammatesWorking: (ptyId: string) => void;
+  /** A fresh session in the pane: no teammate of the old one counts. */
+  clearSurfaceTeammates: (ptyId: string) => void;
   // "running" freshness (orca-style): epoch-ms of each pane's last activity
   // signal. The fleet selector treats a fresh stamp (within HOOK_RUNNING_TTL_MS)
   // as 'running' even when the terminal has gone quiet — so an agent thinking
@@ -900,6 +902,11 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
     // Its own stamp only (see isTeammateRunning): the activity stamp and the
     // lead's status and question are left as they are.
     state.surfaceTeammatesAt[ptyId] = Date.now();
+  }),
+
+  clearSurfaceTeammates: (ptyId) => set((state: StoreState) => {
+    if (!ptyId) return;
+    delete state.surfaceTeammatesAt[ptyId];
   }),
 
   markSurfaceTurnOpen: (ptyId) => set((state: StoreState) => {

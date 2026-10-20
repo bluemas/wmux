@@ -30,7 +30,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { TAIL_BYTES, readTranscriptPage, statTranscript } from './readTail';
+import { TAIL_BYTES, readRange, readTranscriptPage, statTranscript } from './readTail';
 
 /** A pending tool call stops counting after this long without a record or file growth. */
 export const PENDING_TOOL_CAP_MS = 30 * 60_000;
@@ -39,6 +39,8 @@ export const FRESH_MS = 10 * 60_000;
 /** Tail read per changed transcript. Below TAIL_BYTES on purpose: a full-size
  *  window makes readTranscriptPage read a straddling oversized record whole. */
 const TAIL_READ_BYTES = 192 * 1024;
+/** Most bytes read in one go to catch up with a transcript; further behind, it is read again from its tail. */
+const CATCHUP_BYTES = 4 * 1024 * 1024;
 /** The meta files Claude Code writes are a few hundred bytes. */
 const META_MAX_BYTES = 64 * 1024;
 
@@ -53,13 +55,12 @@ export interface TeammateTail {
 const record = (v: unknown): Record<string, unknown> => (v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : {});
 
 /**
- * What a teammate transcript's tail lines (oldest first) say. Null when no
- * meaningful record is among them (a tail of bookkeeping lines only).
- * `pending` carries the calls still without a result from earlier reads of
- * the same file: a large result of a sibling call can push a call out of the
- * window while it still runs.
+ * What a teammate transcript's lines (oldest first) say, after `previous`:
+ * the verdict of the last meaningful record among them, or `previous` when
+ * there is none (bookkeeping lines only). `pending` carries the calls still
+ * without a result from earlier reads of the same file.
  */
-export function classifyTeammateTail(lines: readonly string[], pending: Set<string> = new Set()): TeammateTail | null {
+export function classifyTeammateTail(lines: readonly string[], pending: Set<string> = new Set(), previous: TeammateTail | null = null): TeammateTail | null {
   let last: { entry: Record<string, unknown>; blocks: Record<string, unknown>[] } | null = null;
   for (const line of lines) {
     // Cheap pre-filter: only conversation records matter.
@@ -83,7 +84,7 @@ export function classifyTeammateTail(lines: readonly string[], pending: Set<stri
     }
     last = { entry, blocks };
   }
-  if (!last) return null;
+  if (!last) return previous;
   const stamp = typeof last.entry.timestamp === 'string' ? Date.parse(last.entry.timestamp) : NaN;
   const at = Number.isFinite(stamp) ? { at: stamp } : {};
   const stop = record(last.entry.message).stop_reason;
@@ -124,6 +125,8 @@ interface FileState {
   pending: Set<string>;
   /** The file's inode at the last read: another one is a replaced file. */
   ino: number;
+  /** Where the next read starts: past the last complete line read (-1 before any). */
+  offset: number;
   size: number;
   mtimeMs: number;
   tail: TeammateTail | null;
@@ -134,11 +137,21 @@ export function subagentsDirFor(transcriptPath: string): string {
   return path.join(transcriptPath.replace(/\.jsonl$/, ''), 'subagents');
 }
 
-/** The classified tail of `file` read `maxBytes` back; undefined when unreadable. */
-function readTail(file: string, maxBytes: number, pending: Set<string>): TeammateTail | null | undefined {
+/** The classified tail of `file` read `maxBytes` back, and where it ends; undefined when unreadable. */
+function readTail(file: string, maxBytes: number, pending: Set<string>): { tail: TeammateTail | null; offset: number } | undefined {
   const lines: string[] = [];
   const page = readTranscriptPage(file, { maxBytes, parseLine: (line) => { lines.push(line); return []; } });
-  return page ? classifyTeammateTail(lines, pending) : undefined;
+  return page ? { tail: classifyTeammateTail(lines, pending), offset: page.cursor.tailOffset } : undefined;
+}
+
+/** The classified lines of `file` from `offset` to `size` (one read), and where they end; undefined when unreadable. */
+function readSince(file: string, offset: number, size: number, pending: Set<string>, previous: TeammateTail | null): { tail: TeammateTail | null; offset: number } | undefined {
+  const raw = readRange(file, offset, size - offset);
+  if (!raw || raw.length !== size - offset) return undefined;
+  // Complete lines only: a record still being written is read once it ends.
+  const end = raw.lastIndexOf(0x0a);
+  if (end < 0) return { tail: previous, offset };
+  return { tail: classifyTeammateTail(raw.subarray(0, end).toString('utf8').split('\n'), pending, previous), offset: offset + end + 1 };
 }
 
 /** Scans one session's `subagents/` folder; keep one per watched transcript. */
@@ -190,7 +203,7 @@ export class TeammateScanner {
     if (!stat) { this.files.delete(file); return false; }
     let state = this.files.get(file);
     if (!state) {
-      state = { size: -1, mtimeMs: -1, tail: null, pending: new Set(), ino: stat.ino };
+      state = { size: -1, mtimeMs: -1, tail: null, pending: new Set(), ino: stat.ino, offset: -1 };
       this.files.set(file, state);
     }
     // Too old to count whatever it says: stat only, no read.
@@ -198,25 +211,30 @@ export class TeammateScanner {
     if (state.teammate === undefined) state.teammate = isTeammateMeta(file);
     if (state.teammate !== true) return false;
     if (stat.size !== state.size || stat.mtimeMs !== state.mtimeMs) {
-      // A replaced or truncated file is another conversation: its calls and
-      // verdict are not the ones carried.
-      const replaced = stat.ino !== state.ino || stat.size < state.size;
-      if (replaced) {
-        state.pending.clear();
-        state.tail = null;
-      }
+      // Every record since the last read, in one bounded read, so no turn end
+      // or result is missed. The first read, a replaced or truncated file
+      // (another conversation) or one too far behind starts from the tail.
+      const fresh = state.offset < 0 || stat.ino !== state.ino || stat.size < state.offset
+        || stat.size - state.offset > CATCHUP_BYTES;
       state.ino = stat.ino;
-      let tail = readTail(file, TAIL_READ_BYTES, state.pending);
-      // Nothing meaningful in the window of a file bigger than it: the last
-      // record may be one too big for the window (a long final reply), which
-      // a full-size page reads whole.
-      if (tail === null && stat.size > TAIL_READ_BYTES) tail = readTail(file, TAIL_BYTES, state.pending);
-      if (tail === undefined) return false;
+      let read: { tail: TeammateTail | null; offset: number } | undefined;
+      if (fresh) {
+        state.pending.clear();
+        read = readTail(file, TAIL_READ_BYTES, state.pending);
+        // Nothing meaningful in the window of a file bigger than it: the last
+        // record may be one too big for the window (a long final reply), which
+        // a full-size page reads whole.
+        if (read && read.tail === null && stat.size > TAIL_READ_BYTES) read = readTail(file, TAIL_BYTES, state.pending);
+      } else {
+        // Bookkeeping lines alone (an API request, an attachment) say nothing
+        // of the conversation: the last verdict stands, aged by the mtime.
+        read = readSince(file, state.offset, stat.size, state.pending, state.tail);
+      }
+      if (read === undefined) return false;
+      state.offset = read.offset;
       state.size = stat.size;
       state.mtimeMs = stat.mtimeMs;
-      // Bookkeeping lines alone (an API request, an attachment) say nothing of
-      // the conversation: the last verdict stands, aged by the file's mtime.
-      if (tail !== null || replaced) state.tail = tail;
+      state.tail = read.tail;
     }
     return teammateWorking(state.tail, state.mtimeMs, now);
   }

@@ -879,7 +879,11 @@ export function useNotificationListener() {
         // mirrors here, where event order is known; a selector cannot compare
         // the timestamp with an attention state that carries no timestamp.
         // A session start drops the retained last-activity line (a Stop keeps it).
-        if (lastActivity === '') state.clearSurfaceLastActivity(ptyId);
+        if (lastActivity === '') {
+          state.clearSurfaceLastActivity(ptyId);
+          // Only a session start clears it: the old session's teammates go too.
+          state.clearSurfaceTeammates(ptyId);
+        }
         if (typeof activity === 'string') {
           state.setSurfaceActivity(ptyId, activity);
           // Only activity-ONLY payloads need lifecycle reconciliation. When
