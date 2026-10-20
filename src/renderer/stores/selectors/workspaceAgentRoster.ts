@@ -11,7 +11,7 @@ import { HOOK_RUNNING_TTL_MS, isHookRunning, isQuietUsageLimitError, pickStashed
 /**
  * An Agent Teams teammate of the pane's agent reported working lately, after
  * the lead's last turn end: the one stamp that shows a finished lead's pane
- * (complete or waiting, already seen) as running.
+ * (complete, already seen) as running.
  */
 function teammatesWorking(state: StoreState, ptyId: string): boolean {
   // Optional-chained: partial test stores build without these maps.
@@ -240,8 +240,7 @@ export function selectWorkspaceAgentRoster(
       if (
         !attentionStatus &&
         !pendingQuestion &&
-        (lifecycleStatus === 'idle'
-          || ((lifecycleStatus === 'complete' || lifecycleStatus === 'waiting') && teammatesWorking(state, ptyId))) &&
+        (lifecycleStatus === 'idle' || (lifecycleStatus === 'complete' && teammatesWorking(state, ptyId))) &&
         hookRunning
       ) {
         status = 'running';
@@ -335,7 +334,7 @@ export function selectWorkspaceAgentRoster(
           ? 'idle'
           : (agent?.status ?? 'idle');
       status = attentionStatus ?? lifecycle;
-      const finishedLead = (lifecycle === 'complete' || lifecycle === 'waiting') && !!ptyId && teammatesWorking(state, ptyId);
+      const finishedLead = lifecycle === 'complete' && !!ptyId && teammatesWorking(state, ptyId);
       if (!attentionStatus && (lifecycle === 'idle' || finishedLead) && hookRunning) status = 'running';
     }
 

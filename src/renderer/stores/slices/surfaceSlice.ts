@@ -366,6 +366,7 @@ export const createSurfaceSlice: StateCreator<StoreState, [['zustand/immer', nev
     // inherit a dead pane's question and read as blocked from birth.
     if (closedPtyId && state.surfacePendingQuestion) delete state.surfacePendingQuestion[closedPtyId];
     if (closedPtyId && state.surfaceLastMessage) delete state.surfaceLastMessage[closedPtyId];
+    if (closedPtyId && state.surfaceTeammatesAt) delete state.surfaceTeammatesAt[closedPtyId];
     if (closedPtyId && state.surfaceQuestionSeen) delete state.surfaceQuestionSeen[closedPtyId];
     if (closedPtyId && state.surfaceDismissedQuestion) delete state.surfaceDismissedQuestion[closedPtyId];
     // Drop per-surface ports and agent status too (fleet-activity adversarial

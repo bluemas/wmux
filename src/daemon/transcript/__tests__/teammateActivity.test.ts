@@ -167,6 +167,16 @@ describe('TeammateScanner', () => {
     expect(scanner.anyWorking(now + FRESH_MS + 60_000)).toBe(true);
   });
 
+  it('a call whose result fell outside every window is forgotten at the turn\'s end', () => {
+    const now = Date.now();
+    const pending = new Set<string>(['lost']);
+    expect(classifyTeammateTail([reply('end_turn', now)], pending)).toEqual({ state: 'replied', at: now });
+    expect(pending.size).toBe(0);
+    pending.add('lost');
+    expect(classifyTeammateTail([prompt(now)], pending)).toEqual({ state: 'busy', at: now });
+    expect(pending.size).toBe(0);
+  });
+
   it('a final reply too big for the tail window still reads as replied', () => {
     const now = Date.now();
     const long = JSON.stringify({

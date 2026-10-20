@@ -68,8 +68,15 @@ export function classifyTeammateTail(lines: readonly string[], pending: Set<stri
     try { entry = record(JSON.parse(line)); } catch { continue; }
     if (entry.type !== 'assistant' && entry.type !== 'user') continue;
     if (entry.type === 'user' && entry.isMeta === true) continue;
-    const content = record(entry.message).content;
+    const message = record(entry.message);
+    const content = message.content;
     const blocks = Array.isArray(content) ? content.map(record) : [];
+    // A reply that ended the teammate's turn, or a new prompt to it: no call
+    // of the turn before still runs (one whose result fell outside a window).
+    const turnEnded = entry.type === 'assistant' && !blocks.some((b) => b.type === 'tool_use')
+      && typeof message.stop_reason === 'string' && message.stop_reason !== 'tool_use';
+    const newPrompt = entry.type === 'user' && !blocks.some((b) => b.type === 'tool_result');
+    if (turnEnded || newPrompt) pending.clear();
     for (const block of blocks) {
       if (entry.type === 'assistant' && block.type === 'tool_use' && typeof block.id === 'string') pending.add(block.id);
       else if (entry.type === 'user' && block.type === 'tool_result' && typeof block.tool_use_id === 'string') pending.delete(block.tool_use_id);

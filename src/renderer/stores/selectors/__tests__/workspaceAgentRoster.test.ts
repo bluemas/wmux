@@ -315,6 +315,8 @@ describe('selectWorkspaceAgentRoster', () => {
       expect(base({ ...finished, surfaceTeammatesAt: { 'pty-1': NOW - 1_000 } }).status).toBe('running');
       // A teammate stamp from before the lead's turn ended is about that turn.
       expect(base({ ...finished, surfaceTeammatesAt: { 'pty-1': NOW - 30_000 } }).status).toBe('complete');
+      // A lead left waiting (Fleet keeps its metadata status) stays waiting.
+      expect(base({ ...finished, surfaceAgent: { 'pty-1': { name: 'A', status: 'waiting' } }, surfaceTeammatesAt: { 'pty-1': NOW - 1_000 } }).status).toBe('waiting');
       // An unseen result still outranks it.
       expect(base({ ...finished, surfaceTeammatesAt: { 'pty-1': NOW - 1_000 }, surfaceAgentStatus: { 'pty-1': 'complete' } }).status).toBe('complete');
     });

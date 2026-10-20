@@ -303,7 +303,7 @@ export interface PaneSlice {
   surfaceActivityAt: Record<string, number>;
   // When an Agent Teams teammate of each pane's agent last reported working
   // (markSurfaceTeammatesWorking). The roster lets this stamp, unlike any
-  // other, show a finished lead's pane as running. Transient.
+  // other, show a finished (complete) lead's pane as running. Transient.
   surfaceTeammatesAt: Record<string, number>;
   // The TURN LATCH: ptyId → epoch-ms of the hook-reported turn start
   // (`UserPromptSubmit`, arriving as a METADATA_UPDATE tagged
