@@ -42,7 +42,7 @@ import type { ResumeBinding } from '../../shared/agentResume';
 import type { TurnEvent } from '../../shared/transcript/turnEvents';
 import { parseTranscriptLine } from './parseEntry';
 import { parseCodexLineDetailed } from './parseCodexEntry';
-import { MAX_OVERSIZED_SCAN_BYTES, isLineBoundary, readTranscriptDelta, readTranscriptPage, statTranscript } from './readTail';
+import { isLineBoundary, readTranscriptDelta, readTranscriptPage, statTranscript } from './readTail';
 import { HOOK_ACTIVITY_KINDS } from '../../shared/hooks/hookActivityKinds';
 import { MAX_RAW_LEN, summarizeActivity } from '../../shared/activitySummary';
 import { agentRow } from '../../shared/agentIdentity';
@@ -51,7 +51,7 @@ import { SUBAGENT_COUNT_REFRESH_MS } from '../../shared/subagentCount';
 
 /** Most bytes read for one session in one tick. */
 export const READ_CAP_BYTES = 256 * 1024;
-/** Most skipped bytes the subagent counter reads in one tick; past it, it starts afresh. */
+/** Most skipped bytes the subagent counter reads; a longer skip starts it afresh. */
 export const SUBAGENT_CATCHUP_BYTES = 4 * 1024 * 1024;
 /** When further behind than READ_CAP_BYTES, resume from this tail window. */
 export const JUMP_WINDOW_BYTES = 64 * 1024;
@@ -179,6 +179,9 @@ interface Watch {
   subagentsSentAt: number;
   /** `parse` without the counter, for lines the counter has already read. */
   plain: ParseLine;
+  /** The file size at which the counter last stopped on a record still being
+   *  written: nothing to read again until the file grows. */
+  stalledSize?: number;
 }
 
 /**
@@ -356,25 +359,21 @@ export class TranscriptActivityWatcher {
   }
 
   /**
-   * Feeds `counter` every complete line from `from` toward `size`, at most
-   * SUBAGENT_CATCHUP_BYTES. Returns the line boundary it reached: the end, or
-   * the start of a record still being written. Null when it could not read
-   * them all (the budget ran out, a record too big to find its end, the file
-   * changed under it): the caller then counts afresh.
+   * Feeds `counter` every complete line from `from` to `size`, when that is
+   * at most SUBAGENT_CATCHUP_BYTES (no read, oversized records included, goes
+   * past `size`). Returns the line boundary it reached: the end, or the start
+   * of a record still being written. Null when it could not read them all (a
+   * longer skip, the file changed under it): the caller then counts afresh.
    */
   private catchUpSubagents(counter: SubagentCounter, path: string, from: number, size: number): number | null {
+    if (size - from > SUBAGENT_CATCHUP_BYTES) return null;
     const feed: ParseLine = (line) => { counter.noteLine(line); return []; };
     let offset = from;
     while (offset < size) {
-      if (offset - from >= SUBAGENT_CATCHUP_BYTES) return null;
       const delta = readTranscriptDelta(path, offset, READ_CAP_BYTES, feed);
       if (!delta || delta.reset) return null;
-      if (delta.cursor.tailOffset <= offset) {
-        // No line end ahead: a record still being written, which the next
-        // tick reads, unless the reader could not look far enough to tell.
-        if (size - offset > MAX_OVERSIZED_SCAN_BYTES) return null;
-        break;
-      }
+      // No line end ahead: a record still being written, read once it grows.
+      if (delta.cursor.tailOffset <= offset) break;
       offset = delta.cursor.tailOffset;
     }
     return offset;
@@ -460,11 +459,15 @@ export class TranscriptActivityWatcher {
       watch.ino = stat.ino;
       watch.offset = stat.size;
       watch.pending = undefined;
+      watch.stalledSize = undefined;
       watch.subagents?.reset();
       // In this tick, before afterTick settles a pending error the new file
       // may already have moved past.
       watch.replay = watch.lines;
       this.replayLines(id, watch);
+    } else if (stat.size - watch.offset > READ_CAP_BYTES && stat.size === watch.stalledSize) {
+      // Still the record the counter stopped on, and nothing appended: the
+      // bytes after the cursor were all read last tick.
     } else if (stat.size - watch.offset > READ_CAP_BYTES) {
       if (watch.lines) this.deps.onClaudeGap?.(id);
       // The counter reads the skipped lines too, so the window below parses
@@ -477,12 +480,14 @@ export class TranscriptActivityWatcher {
       // The counter stopped at a line boundary; the window's cursor can sit
       // inside a record still being written.
       watch.offset = typeof caughtUp === 'number' ? caughtUp : page.cursor.tailOffset;
+      watch.stalledSize = typeof caughtUp === 'number' && caughtUp < stat.size ? stat.size : undefined;
     } else if (stat.size > watch.offset) {
       const delta = readTranscriptDelta(watch.path, watch.offset, READ_CAP_BYTES, watch.parse);
       if (!delta) { this.dropWatch(id); return; }
       if (delta.reset) {
         // Rewritten under the read: like a replacement, a gap then one replay.
         watch.offset = stat.size;
+        watch.stalledSize = undefined;
         watch.subagents?.reset();
         watch.replay = watch.lines;
         this.replayLines(id, watch);

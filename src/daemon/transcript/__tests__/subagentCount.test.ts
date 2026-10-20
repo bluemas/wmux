@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -314,6 +314,30 @@ describe('TranscriptActivityWatcher — subagent count', () => {
     h.append(claudeToolUse('toolu_3', 'Agent'));
     h.watcher.tick();
     expect(h.counts.at(-1)).toEqual(['pty-1', 1]);
+  });
+
+  it('a large record still being written is not read again until the file grows', () => {
+    const h = harness('claude');
+    h.watcher.tick();
+    h.append(claudeToolUse('toolu_1', 'Agent'));
+    h.watcher.tick();
+    const big = claudeToolResult('toolu_2', 'x'.repeat(1024 * 1024));
+    fs.appendFileSync(h.file, big.slice(0, 900 * 1024));
+    h.watcher.tick();
+    const reads = vi.spyOn(fs, 'readSync');
+    try {
+      h.watcher.tick();
+      h.watcher.tick();
+      // Only the per-tick line-boundary probe, never the record again.
+      const bytes = reads.mock.calls.reduce((sum, call) => sum + Number(call[3] ?? 0), 0);
+      expect(bytes).toBeLessThan(1024);
+    } finally {
+      reads.mockRestore();
+    }
+    fs.appendFileSync(h.file, `${big.slice(900 * 1024)}\n`);
+    h.append(claudeToolResult('toolu_1', 'done'));
+    h.watcher.tick();
+    expect(h.counts.at(-1)).toEqual(['pty-1', 0]);
   });
 
   it('a closed pane sends 0 for a count it had sent', () => {
