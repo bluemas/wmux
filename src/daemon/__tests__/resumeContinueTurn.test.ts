@@ -56,6 +56,26 @@ describe('DaemonPTYBridge — an interrupted turn is never continued', () => {
     expect(edges.at(-1)).toBeNull();
   });
 
+  it('an old turn\'s interrupt row, redrawn while a new turn runs, leaves that turn\'s mark', () => {
+    bridge.noteInput('\x1b');
+    feed(ROW);
+    vi.advanceTimersByTime(800);
+    bridge.noteInput('try another way\r');
+    bridge.noteAgentStatus('running', true); // the new turn's UserPromptSubmit
+    vi.advanceTimersByTime(1_000);
+    feed(ROW); // a full redraw prints turn A's row again
+    expect(bridge.isAgentMidTurn()).toBe(true);
+    vi.advanceTimersByTime(6_000);
+    feed(ROW);
+    expect(bridge.isAgentMidTurn()).toBe(true);
+  });
+
+  it('an interrupt row with no interrupt key before it is a redraw, not an interrupt', () => {
+    vi.advanceTimersByTime(10_000);
+    feed(ROW);
+    expect(bridge.isAgentMidTurn()).toBe(true);
+  });
+
   it('the next prompt is a turn to continue again', () => {
     bridge.noteInput('\x1b');
     feed(ROW);
@@ -194,20 +214,21 @@ describe('turnRunningSince wiring', () => {
   it('recovery reads the mark off the persisted record, never the recovered meta', () => {
     const src = read('index.ts');
     const rec = src.slice(src.indexOf('for (const recoveredId of recoveredIds) {'));
-    expect(rec).toMatch(/const persisted = state\.sessions\.find\(\(s\) => s\.id === recoveredId\);\s*if \(persisted && recordWasMidTurn\(persisted, Date\.now\(\)\)\) recoveredWasRunning\.add\(recoveredId\);/);
-    // The carry-forward of the other markers must not copy it onto the new meta.
+    expect(rec).toMatch(/if \(m\.resumeContinuePending\) recoveredWasRunning\.add\(recoveredId\);/);
+    // The carry-forward reads the OLD record into the owed continue, before
+    // the merged recovery save, and never copies the raw mark onto the new meta.
     const carry = src.slice(src.indexOf('for (const persisted of state.sessions) {'), src.indexOf('const liveState = buildState(sessionManager);'));
     expect(carry).not.toMatch(/turnRunningSince/);
-    expect(carry).not.toMatch(/resumeContinuePending/);
+    expect(carry).toMatch(/if \(recordWasMidTurn\(persisted, Date\.now\(\)\)\) managed\.meta\.resumeContinuePending = true;/);
   });
 
-  it('an owed continue is persisted until spent, and never sent to clients', () => {
+  it('an owed continue lives on the meta, so every save keeps it until spent, and never reaches clients', () => {
     const src = read('index.ts');
-    const build = src.slice(src.indexOf('function buildState(sessionManager: DaemonSessionManager): DaemonState {'));
-    expect(build.slice(0, 900)).toMatch(/recoveredWasRunning\.has\(s\.id\) \? \{ \.\.\.s, resumeContinuePending: true as const \} : s/);
-    // The boot recovery save runs before the marks: they are saved after them.
-    const rec = src.slice(src.indexOf('for (const recoveredId of recoveredIds) {'));
-    expect(rec.slice(0, 4000)).toMatch(/if \(recoveredWasRunning\.size > 0\) void stateWriter\.saveAsap\(buildState\(sessionManager\)\);/);
+    const spend = src.slice(src.indexOf('function spendContinue('), src.indexOf('function spendContinue(') + 600);
+    expect(spend).toMatch(/recoveredWasRunning\.delete\(id\);/);
+    expect(spend).toMatch(/delete meta\.resumeContinuePending;\s*void stateWriter\.saveAsap\(buildState\(sessionManager\)\);/);
+    // No other path forgets the in-memory mark without the record.
+    expect(src.match(/recoveredWasRunning\.delete\(/g)).toHaveLength(1);
     const at = src.indexOf("pipeServer.onRpc('daemon.listSessions'");
     expect(src.slice(at, at + 9000)).toMatch(/delete base\.resumeContinuePending;/);
   });
@@ -217,7 +238,7 @@ describe('turnRunningSince wiring', () => {
     const at = src.indexOf("pipeServer.onRpc('daemon.listSessions'");
     const body = src.slice(at, src.indexOf("pipeServer.onRpc('daemon.promoteSession'", at) > 0 ? src.indexOf("pipeServer.onRpc('daemon.promoteSession'", at) : at + 9000);
     expect(body).toMatch(/delete base\.turnRunningSince;/);
-    expect(body).toMatch(/if \(!resumeAgent\) recoveredWasRunning\.delete\(s\.id\);/);
+    expect(body).toMatch(/if \(!resumeAgent\) spendContinue\(sessionManager, stateWriter, s\.id\);/);
     const withAgent = body.slice(body.indexOf('const withAgent = resumeAgent'), body.indexOf(': withRuntime;'));
     expect(withAgent).toMatch(/recoveredWasRunning\.has\(s\.id\) \? \{ resumeWasRunning: true as const \}/);
   });
@@ -225,10 +246,10 @@ describe('turnRunningSince wiring', () => {
   it('the mark is spent wherever the offer is, and by the first submit', () => {
     const src = read('index.ts');
     // Every place that drops a recovered binding drops the mark with it.
-    const bindingDeletes = src.match(/recoveredResumeBindings\.delete\(([\w.]+)\);[^\n]*\n\s*recoveredWasRunning\.delete\(\1\);/g) ?? [];
+    const bindingDeletes = src.match(/recoveredResumeBindings\.delete\(([\w.]+)\);[^\n]*\n\s*spendContinue\(sessionManager, stateWriter, \1\);/g) ?? [];
     expect(bindingDeletes).toHaveLength(5);
     const at = src.indexOf("sessionManager.on('session:inputSubmitted', (payload: { sessionId: string }) => {");
     expect(at).toBeGreaterThan(-1);
-    expect(src.slice(at, at + 200)).toMatch(/recoveredWasRunning\.delete\(payload\.sessionId\);/);
+    expect(src.slice(at, at + 200)).toMatch(/spendContinue\(sessionManager, stateWriter, payload\.sessionId\);/);
   });
 });

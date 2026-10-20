@@ -260,6 +260,10 @@ export class DaemonPTYBridge extends EventEmitter {
    * new episode.
    */
   private interruptedEpisode = false;
+  /** When a key that interrupts a turn (Esc, Ctrl+C) or the agent's own interrupt last arrived. */
+  private lastInterruptKeyAt = 0;
+  /** When a prompt was last submitted (not a dialog answer). */
+  private lastSubmitAt = 0;
 
   /**
    * Reads the pane's transcript for the latest recorded turn end (epoch ms),
@@ -459,6 +463,7 @@ export class DaemonPTYBridge extends EventEmitter {
       // Inside a bracketed paste an ESC is text, not a key. On Windows the
       // approval answers write Esc as a win32-input-mode record (#1915).
       if ((active === '\x1b' || active === ESCAPE_WIN32) && !this.inputInBracketedPaste) this.lastEscAt = this.lastInputAt;
+      if ((active === '\x1b' || active === ESCAPE_WIN32 || active === '\x03') && !this.inputInBracketedPaste) this.lastInterruptKeyAt = this.lastInputAt;
       if (active.length > 0) {
         this.keyInputRevision += 1;
         this.lastKeyInputAt = this.lastInputAt;
@@ -582,6 +587,7 @@ export class DaemonPTYBridge extends EventEmitter {
     // turn is queued by the agent's own composer. Anything else starts one.
     if (!wasAwaiting) {
       this.interruptedEpisode = false;
+      this.lastSubmitAt = Date.now();
       // #1670 — an episode opened at boot (by the boot burst, or by the first
       // Enter after a launch, which may only have answered a dialog the
       // detector does not see, such as Codex's folder-trust prompt) is not a
@@ -858,9 +864,16 @@ export class DaemonPTYBridge extends EventEmitter {
     return this.turnOpen && !this.bootEpisode && !this.interruptedEpisode && (this.hookSeen || this.trackedAgent?.alive === true);
   }
 
-  /** The agent reported its turn interrupted: never continued after a restart. */
+  /**
+   * The agent reported its turn interrupted: never continued after a restart.
+   * Only right after an interrupt key, and one that came after the last
+   * prompt: a redraw prints an old turn's interrupt row again, and that must
+   * not take the mark from the turn running now.
+   */
   private noteEpisodeInterrupted(): void {
     if (!this.turnOpen) return;
+    const at = this.lastInterruptKeyAt;
+    if (Date.now() - at >= ESC_INTERRUPT_CONFIRM_MS || at < this.lastSubmitAt) return;
     this.interruptedEpisode = true;
     this.reportMidTurn();
   }
@@ -1402,6 +1415,7 @@ export class DaemonPTYBridge extends EventEmitter {
    */
   noteInterrupt(): void {
     this.lastEscAt = Date.now();
+    this.lastInterruptKeyAt = this.lastEscAt;
   }
 
   /** The latest window title the program set, and when (`at` 0 = never). */
