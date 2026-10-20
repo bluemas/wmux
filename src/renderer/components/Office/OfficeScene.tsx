@@ -94,7 +94,7 @@ function Prop({ prop }: { prop: OfficeProp }) {
   );
 }
 
-/** Floor, walls and decor: redrawn only when the room changes size. */
+/** Floor, walls and decor: redrawn only when the room or its sofa count changes. */
 const RoomProps = memo(
   function RoomProps({ props }: { props: OfficeProp[]; desks: number; height: number }) {
     return (
@@ -105,7 +105,7 @@ const RoomProps = memo(
       </>
     );
   },
-  (a, b) => a.desks === b.desks && a.height === b.height,
+  (a, b) => a.desks === b.desks && a.height === b.height && a.props.length === b.props.length,
 );
 
 function Station({ seat, occupied }: { seat: Seat; occupied: 'working' | 'needs_you' | null }) {
@@ -127,7 +127,7 @@ function Station({ seat, occupied }: { seat: Seat; occupied: 'working' | 'needs_
   );
 }
 
-type PoseName = 'type' | 'raiseHand' | 'rest' | 'stand';
+type PoseName = 'type' | 'raiseHand' | 'rest';
 
 /** Two neighbouring frames in one sheet row animate by stepping background-position-x. */
 function frameLoop(sheet: CharacterSheet, first: CharacterPose, second: CharacterPose, seconds: number, phase: number): CSSProperties | null {
@@ -173,13 +173,10 @@ function Employee({ employee, layout, t, now, locale, onJump }: EmployeeProps) {
   } else if (employee.state === 'needs_you') {
     pose = 'raiseHand';
     frame = 'raiseHand';
-  } else if (seat.spot === 'sofa') {
+  } else {
     pose = 'rest';
     frame = 'rest1';
     loop = frameLoop(sheet, 'rest1', 'rest2', 2.4, employee.look);
-  } else {
-    pose = 'stand';
-    frame = 'walk1';
   }
 
   const alert = employee.state === 'needs_you' ? needText(employee, t, now, locale) : '';

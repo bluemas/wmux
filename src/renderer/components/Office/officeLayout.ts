@@ -19,10 +19,10 @@ export interface Seat {
   facing: 'left' | 'right';
   /**
    * `desk`: (x, y) is the north corner of the desk footprint (the station
-   * frame's `deskX/deskY`). `sofa` / `floor`: (x, y) is the character anchor
-   * (the frame's `seatX/seatY`).
+   * frame's `deskX/deskY`). `sofa`: (x, y) is the character anchor (the
+   * frame's `seatX/seatY`).
    */
-  spot: 'desk' | 'sofa' | 'floor';
+  spot: 'desk' | 'sofa';
 }
 
 /** A static room piece: its floor anchor at (x, y), stacked by `zIndex`. */
@@ -61,20 +61,20 @@ const STATION_DEPTH = 32;
 /** Room length along `a` (the back wall). */
 const ROOM_A = DESK_A0 + (DESK_COLUMNS - 1) * DESK_A_STEP + 2 * TILE + TILE;
 
-const SOFA_COUNT = 3;
+/** Sofas the lounge always has; it adds whole sofas until every resting employee sits. */
+const BASE_SOFAS = 3;
+const SOFAS_PER_ROW = 3;
 const SOFA_A0 = 40;
 const SOFA_A_STEP = 80;
+/** One sofa row: the sofa, the rug and coffee table in front, and a gap. */
+const SOFA_B_STEP = 64;
+/** From the last sofa row to the front wall: the rug and the front plants. */
+const LOUNGE_FRONT = 36;
 /** Sofa-seat world offsets from the sofa's anchor (from the art's SOFA_SEATS). */
 const SOFA_SEAT_OFFSETS: ReadonlyArray<{ a: number; b: number }> = [
   { a: 13, b: 11 },
   { a: 35, b: 11 },
 ];
-const STAND_A0 = 36;
-const STAND_A_STEP = 28;
-const STAND_PER_ROW = 8;
-const STAND_B_STEP = 28;
-/** From the lounge's start to the first standing row (sofas, table, rug). */
-const STAND_B0 = 72;
 
 const PAD_X = 24;
 /** Above the back corner: wall height plus room for the back row's bubbles. */
@@ -206,16 +206,17 @@ export function layoutOffice(employees: OfficeEmployee[], prev?: OfficeLayout): 
   const rows = Math.max(BASE_DESK_ROWS, Math.ceil((maxDesk + 1) / DESK_COLUMNS));
 
   const resting = employees.filter((e) => e.state === 'resting');
-  const sofaSeats = SOFA_COUNT * SOFA_SEAT_OFFSETS.length;
   const loungeFor = assignLounge(resting, prev);
-  // Kept spots can leave holes, so size the standing rows by the highest spot.
+  // Kept spots can leave holes, so count sofas by the highest spot: a sofa
+  // stays while anyone sits on it, and each sofa keeps its place.
   const loungeSpots = Object.values(loungeFor).reduce((m, spot) => Math.max(m, spot + 1), 0);
-  const standRows = Math.max(1, Math.ceil(Math.max(0, loungeSpots - sofaSeats) / STAND_PER_ROW));
+  const sofas = Math.max(BASE_SOFAS, Math.ceil(loungeSpots / SOFA_SEAT_OFFSETS.length));
+  const sofaRows = Math.ceil(sofas / SOFAS_PER_ROW);
 
   const deskEnd = DESK_B0 + (rows - 1) * DESK_B_STEP + STATION_DEPTH;
   const loungeB = roundUp(deskEnd + 8, TILE);
   const roomA = ROOM_A;
-  const roomB = roundUp(loungeB + STAND_B0 + standRows * STAND_B_STEP + 8, TILE);
+  const roomB = roundUp(loungeB + 8 + sofaRows * SOFA_B_STEP + LOUNGE_FRONT, TILE);
 
   const toScreen = (a: number, b: number): { x: number; y: number } => ({
     x: a - b + roomB + PAD_X,
@@ -236,24 +237,21 @@ export function layoutOffice(employees: OfficeEmployee[], prev?: OfficeLayout): 
   };
 
   const lounge: Seat[] = [];
-  for (let s = 0; s < SOFA_COUNT; s += 1) {
-    const a = SOFA_A0 + s * SOFA_A_STEP;
-    const b = loungeB + 8;
+  // Sofas in rows of three; each row has a rug and coffee table at its middle
+  // sofa (at its only sofa while the last row has one).
+  for (let s = 0; s < sofas; s += 1) {
+    const col = s % SOFAS_PER_ROW;
+    const rowLength = Math.min(SOFAS_PER_ROW, sofas - (s - col));
+    const a = SOFA_A0 + col * SOFA_A_STEP;
+    const b = loungeB + 8 + Math.floor(s / SOFAS_PER_ROW) * SOFA_B_STEP;
     const depth = a + 20 + b + 4;
     prop('sofa', a, b, stackIndex(depth, 0));
     SOFA_SEAT_OFFSETS.forEach((o, k) => {
       lounge.push({ ...toScreen(a + o.a, b + o.b), z: depth + k + 1, facing: 'left', spot: 'sofa' });
     });
-    if (s === 1) {
+    if (col === Math.min(1, rowLength - 1)) {
       prop('rug', a - 4, b + 16, 3);
       prop('coffeeTable', a + 6, b + 24, stackIndex(a + 14 + b + 30, 0));
-    }
-  }
-  for (let r = 0; r < standRows; r += 1) {
-    for (let m = 0; m < STAND_PER_ROW; m += 1) {
-      const a = STAND_A0 + m * STAND_A_STEP + (r % 2) * (STAND_A_STEP / 2);
-      const b = loungeB + STAND_B0 + r * STAND_B_STEP;
-      lounge.push({ ...toScreen(a, b), z: a + b, facing: 'left', spot: 'floor' });
     }
   }
 

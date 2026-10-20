@@ -94,6 +94,59 @@ describe('layoutOffice', () => {
     expect(second.loungeFor.a).toBeUndefined();
   });
 
+  it('seats every resting employee on a sofa', () => {
+    const employees = Array.from({ length: 25 }, (_, i) => emp(`r${i}`, { state: 'resting' }));
+    const layout = layoutOffice(employees);
+    expect(layout.props.filter((p) => p.key === 'sofa').length).toBe(13);
+    const seats = employees.map((e) => layout.loungeFor[e.id]);
+    expect(new Set(seats).size).toBe(25);
+    for (const s of seats) expect(layout.lounge[s].spot).toBe('sofa');
+  });
+
+  it('no sofa overlaps a desk or another sofa at 30 employees', () => {
+    const employees = Array.from({ length: 30 }, (_, i) => emp(`p${i}`, { state: 'resting' }));
+    const layout = layoutOffice(employees);
+    // Floor footprints relative to each piece's anchor (docs/office-art.md):
+    // a station is the desk plus its chair tile, a sofa 48x16, a coffee table 20x12.
+    const boxes = [
+      ...layout.desks.map((d) => ({ x: d.x, y: d.y, a: 32, b: 32 })),
+      ...layout.props
+        .filter((p) => p.key === 'sofa' || p.key === 'coffeeTable')
+        .map((p) => ({ x: p.x, y: p.y, a: p.key === 'sofa' ? 48 : 20, b: p.key === 'sofa' ? 16 : 12 })),
+    ];
+    expect(boxes.filter((b) => b.a === 48).length).toBe(15);
+    // Screen deltas back to floor deltas: dx = da - db, dy = (da + db) / 2.
+    for (let i = 0; i < boxes.length; i += 1) {
+      for (let j = i + 1; j < boxes.length; j += 1) {
+        const p = boxes[i];
+        const q = boxes[j];
+        const dx = q.x - p.x;
+        const dy = q.y - p.y;
+        const da = dy + dx / 2;
+        const db = dy - dx / 2;
+        const apart = da >= p.a || -da >= q.a || db >= p.b || -db >= q.b;
+        expect(apart).toBe(true);
+      }
+    }
+    // Every sofa lies inside the room.
+    for (const p of layout.props.filter((x) => x.key === 'sofa')) {
+      expect(p.x).toBeGreaterThan(0);
+      expect(p.y + 24).toBeLessThan(layout.height);
+    }
+  });
+
+  it('keeps a sofa drawn while someone sits on it after others leave', () => {
+    const rest = (id: string): OfficeEmployee => emp(id, { state: 'resting' });
+    const first = layoutOffice(Array.from({ length: 10 }, (_, i) => rest(`r${i}`)));
+    const sofaAt = (l: typeof first, id: string) => l.lounge[l.loungeFor[id]];
+    // Everyone but the last one goes back to work.
+    const second = layoutOffice(
+      Array.from({ length: 10 }, (_, i) => (i === 9 ? rest(`r${i}`) : emp(`r${i}`))),
+      first,
+    );
+    expect(sofaAt(second, 'r9')).toEqual(sofaAt(first, 'r9'));
+  });
+
   it('seats teammates next to their lead', () => {
     const employees = [
       emp('lead-1'),
