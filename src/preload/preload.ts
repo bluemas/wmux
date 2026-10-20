@@ -1,3 +1,4 @@
+import { WORKFLOW_OWNER_IPC } from '../shared/botWorkflow';
 import type { TerminalCoreSettings, TerminalEngine } from '../shared/terminalCoreSettings';
 import { CHAT_IPC } from '../shared/transcript/chatIpc';
 import type { ChatBridgeApi } from '../shared/transcript/turnEvents';
@@ -1243,6 +1244,10 @@ const electronAPI = {
     // (`hue`: its colour slot, kept for the cards it wrote).
     removeBot: (botId: string, hue?: number) =>
       factoryBotCall('bot.remove', { botId, ...(hue !== undefined ? { hue } : {}) }),
+    readWorkflows: (req: import('../shared/botWorkflow').OwnerWorkflowRequest) =>
+      ipcRenderer.invoke(WORKFLOW_OWNER_IPC.read, req) as Promise<import('../shared/botWorkflow').OwnerWorkflowReadResult>,
+    cancelWorkflow: (req: import('../shared/botWorkflow').OwnerWorkflowCancelRequest) =>
+      ipcRenderer.invoke(WORKFLOW_OWNER_IPC.cancel, req) as Promise<import('../shared/botWorkflow').OwnerWorkflowCancelResult>,
     createBot: (req: import('../shared/botCreate').FactoryBotCreateRequest) =>
       ipcRenderer.invoke(IPC.FACTORY_BOT_CREATE, req) as Promise<import('../shared/botCreate').FactoryBotCreateResult>,
     createBotTeam: (req: import('../shared/botCreate').FactoryBotCreateTeamRequest) =>
@@ -1272,7 +1277,7 @@ const electronAPI = {
     // Start the Claude sign-in (`claude auth login` in a terminal tab of the
     // active workspace); rejects when no tab could be opened. Poll
     // factoryEngineReadiness to see it land.
-    factoryEngineLogin: () => ipcRenderer.invoke(IPC.FACTORY_ENGINE_LOGIN) as Promise<void>,
+    factoryEngineLogin: (req?: { botId: string }) => ipcRenderer.invoke(IPC.FACTORY_ENGINE_LOGIN, req) as Promise<void>,
     // The engines a bot's workers may run on, and which are installed here.
     workerAgents: () =>
       ipcRenderer.invoke(IPC.FACTORY_WORKER_AGENTS) as Promise<import('../shared/botWorkerAgent').BotWorkerAgentOption[]>,
@@ -1429,6 +1434,11 @@ const electronAPI = {
       ipcRenderer.invoke(IPC.DIFF_RESOLVE_REPO, cwd) as Promise<
         { ok: true; repoPath: string } | { ok: false }
       >,
+    // Git page — the repos in a non-repo folder's subfolders (#2438).
+    scanRepos: (cwd: string) =>
+      ipcRenderer.invoke(IPC.DIFF_SCAN_REPOS, cwd) as Promise<
+        { ok: true; repoPaths: string[] } | { ok: false }
+      >,
     // mode='workspace'는 cwd repo/worktree 자신의 미커밋 변경만(본 repo 매핑 없음).
     read: (worktreePath: string, targetHeadOid?: string, mode?: 'task' | 'workspace') =>
       ipcRenderer.invoke(IPC.DIFF_READ, worktreePath, targetHeadOid ?? '', mode ?? 'task') as Promise<
@@ -1446,8 +1456,10 @@ const electronAPI = {
   // 미발사 재발사. 물질화 필드는 main이 데몬 projection에서 역참조하므로 렌더러는
   // taskId + verifiedWorkspaceId만 싣는다.
   workTask: {
-    close: (taskId: string, verifiedWorkspaceId: string) =>
-      ipcRenderer.invoke(IPC.TASK_CLOSE, { taskId, verifiedWorkspaceId }) as Promise<
+    /** `keepFolder`: Close and keep folder — the task closes and its folder
+     *  stays on disk as it is (#2388). */
+    close: (taskId: string, verifiedWorkspaceId: string, opts?: { keepFolder?: boolean }) =>
+      ipcRenderer.invoke(IPC.TASK_CLOSE, { taskId, verifiedWorkspaceId, ...(opts?.keepFolder === true ? { keepFolder: true } : {}) }) as Promise<
         import('../shared/workTask').CloseTaskResultWire
       >,
     createPr: (taskId: string, verifiedWorkspaceId: string) =>

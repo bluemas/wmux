@@ -27,11 +27,12 @@ import { removeTaskRelay } from '../../worktask/taskPush';
 import { getWmuxDir } from '../../../daemon/config';
 import { taskPushRecordOf } from '../../worktask/taskPushRecord';
 import { TaskCloseService } from '../../worktask/TaskCloseService';
-import { PendingWorktreeRemovals, sweepPendingRemovals } from '../../worktask/pendingWorktreeRemovals';
+import { PendingWorktreeRemovals, setActivePendingRemovals, sweepPendingRemovals } from '../../worktask/pendingWorktreeRemovals';
 import { getTaskLedger } from '../../deck/taskLedgerHost';
 import { noteTaskPanesStopped } from '../../factory/agentGoneFacts';
+import { holdTaskFolderToKeep } from '../../factory/taskFolderCleanup';
 import { beginPaneRelaunch, startsAgent } from '../../factory/workerSlots';
-import { TREE_DESTROY_TIMEOUT_MS, assertNothingRunsIn, destroyedTreeOf, isPidAlive, sessionsStartedIn, stopSessionsInDir } from '../../worktask/stopSessionsInDir';
+import { TREE_DESTROY_TIMEOUT_MS, assertNothingRunsIn, destroyedTreeOf, forgetFolderStops, isPidAlive, sessionsStartedIn, stopSessionsInDir } from '../../worktask/stopSessionsInDir';
 import { TaskPrService } from '../../worktask/TaskPrService';
 import { WorktaskScanService, type ScanOpenTask } from '../../worktask/WorktaskScanService';
 import { deletePhoneBranch, removePhoneWorktree } from '../../worktask/PhoneWorktreeRemoval';
@@ -88,7 +89,10 @@ export function registerWorktaskHandlers(
   // 프로세스 수명 단일 인스턴스: TaskWorktreeManager는 repoHash 단위 뮤텍스 체인을
   // 유지해야 하므로(index.lock 경합 차단) 재사용한다. fan-out과는 별도 인스턴스지만
   // 크로스 인스턴스 worktree add/remove 경합은 git 자체의 index.lock이 backstop.
-  const worktrees = new TaskWorktreeManager({ onCreated: ensureSecretHook, pendingRemovals: loadPendingRemovals() });
+  const pendingRemovals = loadPendingRemovals();
+  // A folder whose removal is pending is locked against new panes.
+  setActivePendingRemovals(pendingRemovals ?? null);
+  const worktrees = new TaskWorktreeManager({ onCreated: ensureSecretHook, pendingRemovals });
   const stopPanesIn = async (worktreePath: string): Promise<string[]> => {
     const dc = getDaemonClient();
     if (!dc) throw new Error('Daemon not connected');
@@ -115,6 +119,8 @@ export function registerWorktaskHandlers(
     },
     // A pane still running inside the worktree holds files that make the removal partial on Windows.
     stopPanesIn,
+    forgetStops: (folder) => forgetFolderStops(folder),
+    holdFolder: (taskId) => holdTaskFolderToKeep(taskId),
     panesStopped: (taskId, sessionIds) => {
       const row = getTaskLedger().get(taskId);
       if (row) noteTaskPanesStopped(taskId, row.taskWorkspaceId, sessionIds);
@@ -123,6 +129,21 @@ export function registerWorktaskHandlers(
   const prService = new TaskPrService({ daemon: daemonPort, cache: prStatusCache });
   const scanService = new WorktaskScanService();
   onServices?.({ close: closeService, pr: prService });
+
+  /** The sweep's check, stopping nothing: no pane in the folder (started
+   *  there, or working there now: OSC 7) and no process an earlier stop
+   *  left. */
+  const nothingRunsIn = async (folder: string): Promise<void> => {
+    const dc = getDaemonClient();
+    if (!dc) throw new Error('Daemon not connected');
+    await assertNothingRunsIn(folder, {
+      listSessions: async () => {
+        const reply = await dc.rpc('daemon.listSessions', {});
+        const sessions = (Array.isArray(reply) ? reply : []) as Array<{ id: string; spawnCwd?: string; cwd?: string }>;
+        return sessions.flatMap((s) => (typeof s.cwd === 'string' && s.cwd ? [s, { ...s, spawnCwd: s.cwd }] : [s]));
+      },
+    });
+  };
 
   // #2388: removals a close left part way (a folder git no longer has as a
   // worktree) are finished once the daemon has recovered its sessions.
@@ -147,18 +168,8 @@ export function registerWorktaskHandlers(
         // Checked again under the repository lock, right before the removal,
         // and without stopping anything: a pane opened in the folder since,
         // or a process an earlier stop left, keeps it.
-        finish: (folder) => worktrees.finishPendingRemoval(folder, async (f) => {
-          const dc = getDaemonClient();
-          if (!dc) throw new Error('Daemon not connected');
-          await assertNothingRunsIn(f, {
-            listSessions: async () => {
-              const reply = await dc.rpc('daemon.listSessions', {});
-              const sessions = (Array.isArray(reply) ? reply : []) as Array<{ id: string; spawnCwd?: string; cwd?: string }>;
-              // Started there, or working there now (OSC 7).
-              return sessions.flatMap((s) => (typeof s.cwd === 'string' && s.cwd ? [s, { ...s, spawnCwd: s.cwd }] : [s]));
-            },
-          });
-        }),
+        // Run again right before the folder is deleted, after git's checks.
+        finish: (folder) => worktrees.finishPendingRemoval(folder, nothingRunsIn, { beforeDelete: nothingRunsIn }),
         log: (message) => console.warn(message),
       }).then((done) => {
         if (!done && attempt < PENDING_SWEEP_ATTEMPTS) sweep(attempt + 1);
@@ -178,6 +189,14 @@ export function registerWorktaskHandlers(
 
       const task = await resolveTask(daemonPort, taskId, verifiedWorkspaceId);
       if (!task) return { ok: false, taskId, reason: 'error' as const, error: 'task:close: task not found (not in the task list).' };
+
+      // Close and keep folder (#2388): the task closes, its folder stays.
+      if ((raw as { keepFolder?: unknown } | null)?.keepFolder === true) {
+        return closeService.closeTask({ taskId, verifiedWorkspaceId, keepFolder: true, ...(task.worktreePath ? { leftoverPath: task.worktreePath } : {}) });
+      }
+      // A detached task's folder is the owner's (kept, or detached): a close
+      // of it, even after a restart, removes nothing and only closes.
+      if (task.detachedAt !== undefined) return closeService.closeTask({ taskId, verifiedWorkspaceId });
 
       // F3 — close-only 라우팅: worktreePath 부재(미물질화 CX4) / 디스크 결측
       // (fs.existsSync false) / 본 repo 해석 불가(worktree 손상)면 remove 단계를
@@ -398,6 +417,7 @@ export function registerWorktaskHandlers(
 
   return () => {
     if (sweepTimer) clearTimeout(sweepTimer);
+    setActivePendingRemovals(null);
     ipcMain.removeHandler(IPC.TASK_CLOSE);
     ipcMain.removeHandler(IPC.TASK_CREATE_PR);
     ipcMain.removeHandler(IPC.WORKTASK_SCAN);

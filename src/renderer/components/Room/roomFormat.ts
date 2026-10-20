@@ -6,6 +6,7 @@ import type { CardKind, RoomCard, ThreadId, ThreadSummary } from '../../../share
 import type { FactoryBotRow } from './factoryPorts';
 import { getLocale } from '../../i18n';
 import { closesFence, fenceOpenLength } from '../../../shared/markdownFence';
+import { RESUMABLE_NOTICE_CODES } from '../../../shared/phoneRoomNotices';
 
 type T = (key: string, vars?: Record<string, string | number>) => string;
 
@@ -173,7 +174,7 @@ const NOTICE_CODES: ReadonlyMap<string, boolean> = new Map([
   ['gate.passed', false], ['gate.killed', false], ['gate.failed', false],
   ['gate.skipped', false], ['gate.busy', true], ['gate.noBase', true], ['gate.refused', false],
   ['gate.notRunNoBot', true], ['gate.notRunNoWorktree', true], ['gate.notRunNoBaseRef', true],
-  ['research.completed', true], ['research.notCompleted', false], ['task.merged', true],
+  ['research.completed', true], ['research.unverified', true], ['research.notCompleted', false], ['task.merged', true],
   ['budget.exhausted', true], ['budget.held', true], ['bot.usageLimit', false], ['workers.full', true],
   ['task.done', false], ['task.reported', false], ['task.failed', false], ['task.cancelled', false],
   ['task.stoppedByOwner', false], ['task.inputRequired', false], ['task.keptFolderCleaned', true],
@@ -197,8 +198,7 @@ const UNTITLED_NOTICE_CODES: ReadonlySet<string> = new Set([
   'worker.done', 'worker.doneResumable', 'worker.resumed',
 ]);
 
-/** The notice codes that tell the owner a stopped worker can resume. */
-export const RESUMABLE_NOTICE_CODES: ReadonlySet<string> = new Set(['worker.pausedResumable', 'worker.idlePausedResumable', 'worker.openIdlePausedResumable', 'worker.doneResumable']);
+export { RESUMABLE_NOTICE_CODES };
 
 /** The task a system card offers Resume for: a card saying a stopped
  *  worker can resume (by its notice code), whose task's worker is still
@@ -224,7 +224,7 @@ const NOTICE_WORDS: Readonly<Record<string, ReadonlySet<string>>> = {
   // Why a worker could not start (botNotices.ts START_FAILURES).
   cause: new Set(['fetch', 'worktree', 'repository', 'promptFile', 'slot', 'pane', 'setupStep', 'setup']),
   // Whose worker slots are full (roomWriter.ts `workers.full`).
-  scope: new Set(['bot', 'factory']),
+  scope: new Set(['bot', 'factory', 'wmux']),
 };
 
 /** Why wmux moved a task to input_required (roomWriter.ts inputRequiredWhy). */
@@ -321,7 +321,8 @@ export function noticeText(card: Pick<RoomCard, 'actor' | 'body' | 'notice'>, t:
   // One title per whose slots are full.
   if (notice.code === 'workers.full') {
     if (args.scope === undefined) return null;
-    return { title: t(`room.notice.workers.full.${args.scope}`, vars), body: t('room.notice.workers.full.body', vars) };
+    // Only a held request starts by itself (`held`: 1).
+    return { title: t(`room.notice.workers.full.${args.scope}`, vars), body: t(args.held === 1 ? 'room.notice.workers.full.held' : 'room.notice.workers.full.body', vars) };
   }
   // A hop says what it carried: one template per kind, forwarded by wmux
   // for a coordinator's relay.
@@ -334,7 +335,11 @@ export function noticeText(card: Pick<RoomCard, 'actor' | 'body' | 'notice'>, t:
   // A PR closed with no title known says only its number; a worker card
   // written before it named its task says what happened only.
   const titleKey = UNTITLED_NOTICE_CODES.has(notice.code) && args.title === undefined ? `${key}.untitled` : key;
-  const bodyKey = args.kind === 'research' && (RESUMABLE_NOTICE_CODES.has(notice.code) || notice.code === 'task.keptFolderCleaned') ? `${key}.body.research` : `${key}.body`;
+  const bodyKey = args.kind === 'research' && (RESUMABLE_NOTICE_CODES.has(notice.code) || notice.code === 'task.keptFolderCleaned') ? `${key}.body.research`
+    // A research report with its graded evidence says how much was verified
+    // (a card written before the grade has no counts).
+    : notice.code === 'research.completed' && typeof args.verified === 'number' && typeof args.total === 'number' && args.total > 0 ? `${key}.body.counted`
+      : `${key}.body`;
   return { title: t(titleKey, vars), body: wordedBody ? t(bodyKey, vars) : (card.body ?? '') };
 }
 

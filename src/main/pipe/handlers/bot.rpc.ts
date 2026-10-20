@@ -36,10 +36,11 @@ import { FactorySettingsStore, factorySettingsPath, onFactorySettingsChanged, se
 import { BotRuntime, BotSessionStore, botSessionsPath, setBotRuntime } from '../../factory/BotRuntime';
 import { createDefaultBotEngineFactory, runnableDefaultEngine, type BotEngineFactory } from '../../factory/botEngines';
 import { recordWorkerEnd } from '../../factory/budget';
-import { botAccountQuota, type ClaudeUsageCache } from '../../factory/botQuota';
+import { botAccountName, botAccountQuota, type ClaudeUsageCache } from '../../factory/botQuota';
 import { openBotWorkers } from '../../factory/openBotWorkers';
+import { FANOUT_LIVE_TASK_CAP } from '../../worktask/fanoutGuards';
 import { getAgentSlots, refreshSlotLiveness } from '../../factory/agentSlots';
-import { HeldFanouts, setHeldFanouts, type HeldFanoutPorts } from '../../factory/heldFanouts';
+import { HeldFanouts, heldFanoutWakesChanged, setHeldFanouts, type HeldFanoutPorts } from '../../factory/heldFanouts';
 import { BotFanoutReceipts, botFanoutReceiptsPath, setBotFanoutReceipts } from '../../factory/botFanoutReceipts';
 import { installBotFanoutWake } from '../../deck/fanoutCallerNotify';
 import { isVerifyReport } from '../../factory/verifyPreset';
@@ -52,6 +53,7 @@ import type { Handoff } from '../../../shared/handoff';
 import type { WakeItem } from '../../../shared/wake';
 import { getRoomWriter, resolveRoomPorts, runningWake, runningWakeThread, wakeReplyTo } from '../../factory/roomWriter';
 import { getFactoryStopPorts, stopFactoryWork, type FactoryStopPorts, type FactoryStopResult } from '../../factory/factoryStop';
+import { UNKNOWN_ROOT_REFUSAL } from '../../../shared/rpc';
 
 type Refusal = FactoryRefusal<'not_authorized' | 'not_started' | 'invalid_argument' | 'not_found' | 'not_running' | 'too_many_bots' | 'dropped' | 'not_owner_words' | 'not_a_repo' | 'repo_untrusted' | 'no_remote' | 'repo_mismatch' | 'stop_failed'>;
 
@@ -76,11 +78,16 @@ function botIdParam(params: Record<string, unknown>): string | null {
 }
 
 /** A status as a caller reads it: a bot does not read the owner's account
- *  and its usage limits. */
-function statusFor(caller: Caller, status: BotStatus | null): BotStatus | null {
-  if (!status || caller?.kind !== 'bot' || !status.quota) return status;
+ *  and its usage limits, nor the account a signed-out bot is on. */
+export function statusFor(caller: Caller, status: BotStatus | null): BotStatus | null {
+  if (!status || caller?.kind !== 'bot' || (!status.quota && status.lastError?.account === undefined)) return status;
   const out = { ...status };
   delete out.quota;
+  if (out.lastError?.account !== undefined) {
+    const lastError = { ...out.lastError };
+    delete lastError.account;
+    out.lastError = lastError;
+  }
   return out;
 }
 
@@ -373,7 +380,12 @@ export function registerBotRpcHandlers(
       } catch (err) {
         return refuse('stop_failed', `Some of the bot's work could not be stopped (${String(err)}); it is off now. Delete it again to retry.`);
       }
-      if (!stopped.ok) return refuse('stop_failed', 'Some of the bot\'s work could not be stopped; it is off now. Delete it again to retry.');
+      if (!stopped.ok) {
+        // #2388: a pane left running says why (a delete again is refused the same way).
+        return refuse('stop_failed', stopped.message?.includes(UNKNOWN_ROOT_REFUSAL)
+          ? `${stopped.message} The bot is off now.`
+          : 'Some of the bot\'s work could not be stopped; it is off now. Delete it again to retry.');
+      }
     }
     if (!l.runtime.remove(botId, rawHue !== undefined ? { hue: rawHue as number } : {})) return refuse('not_found', `no bot ${botId}`);
     await removePorts.afterRemove?.(botId).catch((err) => console.warn(`[factory] bot.remove: ${botId} not fully forgotten: ${String(err)}`));
@@ -485,7 +497,11 @@ export function botRuntimeModule(router: FactoryRouter, deps: FactoryHostDeps, o
       }
       const queue = new WakeQueue(wakeQueuePath(wmuxDir), {
         isBotEnabled: (botId) => store.get(botId)?.enabled === true,
-        onChange: () => runtime?.kick(),
+        // A held fan-out's wake that ends, unbooked, hands its slot back.
+        onChange: () => {
+          runtime?.kick();
+          heldFanoutWakesChanged();
+        },
       });
       queue.load();
       // Issue wakes queued for a triage bot under its old default triggers
@@ -504,6 +520,8 @@ export function botRuntimeModule(router: FactoryRouter, deps: FactoryHostDeps, o
         openWorkers: openBotWorkers,
         refreshLiveness: refreshSlotLiveness,
         wakes: () => queue,
+        liveWakes: () => queue.list({ states: ['queued', 'running'] }),
+        liveLimit: () => FANOUT_LIVE_TASK_CAP,
       };
       let held: HeldFanouts;
       try {
@@ -534,6 +552,7 @@ export function botRuntimeModule(router: FactoryRouter, deps: FactoryHostDeps, o
           };
         },
         ...(usage ? { claudeQuota: (workspaceId: string, accountId: string | null | undefined) => botAccountQuota(usage, workspaceId, accountId) } : {}),
+        claudeAccountName: botAccountName,
       });
       setFactorySettingsStore(settings);
       setBotStore(store);

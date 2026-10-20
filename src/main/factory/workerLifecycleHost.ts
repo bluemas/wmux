@@ -22,9 +22,11 @@ import { getBotRuntime } from './BotRuntime';
 import { getBotStore } from './botStore';
 import { getFactorySettings } from './factorySettings';
 import { getRoomWriter } from './roomWriter';
-import { taskFolderFromMissions } from './verifyPreset';
+import { readTaskFolder, taskFolderFromMissions } from './verifyPreset';
+import { TREE_DESTROY_TIMEOUT_MS, destroyedTreeOf, isPidAlive } from '../worktask/stopSessionsInDir';
+import { stopTaskPaneTrees } from './taskTreeStop';
 import { AgentSlots, getAgentSlots, setAgentSlots, setSlotLivenessRefresh, slotHolderArgs } from './agentSlots';
-import { releaseHeldFanouts } from './heldFanouts';
+import { installHeldFanoutReleases, releaseHeldFanouts } from './heldFanouts';
 import { checkWorkers, recordWorkerEnd, recordWorkerStart } from './budget';
 import { runningWakeTainted } from './wakeTaint';
 import { installReportNudge, submitToWorkerPane } from './workerReportNudge';
@@ -69,7 +71,7 @@ import { STOPPED_BY_OWNER } from './factoryStop';
 import { getFanOutGuards, setDormantRefresh, taskOfWorkspace } from '../worktask/fanoutGuards';
 import { createTaskWorkspaceLiveness, parseSessionRead } from './taskWorkspaceLiveness';
 import { AgentGoneFacts, setAgentGoneFacts } from './agentGoneFacts';
-import { getWorkerSlots, taskOfPane } from './workerSlots';
+import { getWorkerSlots, launchPaneOwner, setReclaimedPaneSource, taskOfPane } from './workerSlots';
 import { holderInputsRevision } from './holderInputs';
 import { holderCounts, liveHolders, setHolderSource, type HolderSnapshot, type WorkerHolder } from './workerHolders';
 import { getVerdictedTasks } from './verdictedTasks';
@@ -104,7 +106,9 @@ const TURN_SEED_READ_TIMEOUT_MS = 5_000;
 /** A workspace tree push looks for freed task folders at most this often. */
 const FOLDER_KICK_MIN_MS = 10_000;
 /** The task folder cleanup's worktree manager (its per-repository lock
- *  orders its own removals and restores). */
+ *  orders its own removals and restores). No pending-removal store (#2388):
+ *  a bot's folder is recorded in the cleanup's own store before it goes, and
+ *  a half-removed one is finished from that record (taskFolderCleanup). */
 const folderWorktrees = new TaskWorktreeManager();
 
 /** The renderer's workspace.close answers this fast or not at all. */
@@ -189,12 +193,7 @@ export function startWorkerLifecycle(deps: WorkerLifecycleDeps): () => void {
     records: () => (reclaimOn ? reclaimed.all() : []),
     recordedSessions: (taskId) => reclaimedStore?.get(taskId)?.sessions.map((x) => x.sessionId) ?? [],
     sessionRecordOf: botWorkerSessionRecord,
-    paneTask: (sessionId) => {
-      const p = launches.paneOf(sessionId);
-      if (!p) return null;
-      const botId = launches.launchOf(p.taskId)?.botId;
-      return { taskId: p.taskId, ...(botId ? { botId } : {}) };
-    },
+    paneTask: (sessionId) => launchPaneOwner(sessionId, launches),
     workspaceTask: (workspaceId) => launches.workspaceOf(workspaceId)?.taskId ?? null,
     facts: goneFacts,
     refreshMs: LIVENESS_REFRESH_MS,
@@ -225,6 +224,17 @@ export function startWorkerLifecycle(deps: WorkerLifecycleDeps): () => void {
     reclaimOn = false;
     console.warn(`[factory] worker reclaim off: ${String(err)}`);
   }
+  // A pane created before launch records were kept is known by the reclaim
+  // record that names it: the same answer for the holder set (taskOfPane)
+  // as for the liveness above (workerSlots.ts resolvePaneOwner).
+  if (reclaimOn) {
+    setReclaimedPaneSource((sessionId) => {
+      const taskId = reclaimed.taskOfSession(sessionId);
+      const botId = taskId ? reclaimed.get(taskId)?.botId : undefined;
+      return taskId ? { taskId, ...(botId ? { botId } : {}) } : null;
+    });
+    offs.push(() => setReclaimedPaneSource(null));
+  }
   // The fan-out's bounded wait for a fresh read before its live-cap check.
   setDormantRefresh(taskLiveness.refresh);
   offs.push(() => setDormantRefresh(null));
@@ -237,6 +247,28 @@ export function startWorkerLifecycle(deps: WorkerLifecycleDeps): () => void {
       (ws) => ledger.findByTaskWorkspace(ws)?.id ?? null,
       (ws) => getFanOutGuards().lineageFor([ws])[ws] ?? null,
     );
+    // #2388: an ended task's panes go with their whole process trees before
+    // the renderer closes them (taskTreeStop.ts).
+    const stopTrees = (taskId: string, ptyIds: readonly string[], stillDue: () => boolean): Promise<void> => stopTaskPaneTrees({
+      // A row the ledger pruned names no folder; a mission list that could
+      // not be read is retried by the caller.
+      folderOf: async (id) => {
+        const entry = ledger.get(id);
+        if (!entry) return null;
+        const read = await readTaskFolder((m, p) => rpc(m, (p ?? {}) as Record<string, unknown>), entry);
+        if (!read) throw new Error(`the folder of task ${id} could not be read`);
+        return read.folder;
+      },
+      listSessions,
+      destroyTree: async (id) => {
+        const c = daemon();
+        if (!c) throw new Error('the daemon is not connected');
+        return destroyedTreeOf(await c.rpc('daemon.destroySession' as never, { id, killTree: true }, { timeoutMs: TREE_DESTROY_TIMEOUT_MS }));
+      },
+      isAlive: isPidAlive,
+      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      log: (message) => console.warn(message),
+    }, taskId, ptyIds, stillDue);
     const closeWorkspace = async (workspaceId: string): Promise<boolean> => {
       const res = await sendToRenderer(() => deps.getMainWindow?.() ?? null, 'workspace.close', { id: workspaceId }, { timeoutMs: CLOSE_TIMEOUT_MS });
       return !!res && typeof res === 'object' && (res as { ok?: unknown }).ok === true;
@@ -256,6 +288,7 @@ export function startWorkerLifecycle(deps: WorkerLifecycleDeps): () => void {
       taskOpen,
       isTaskWorkspace,
       closeWorkspace,
+      stopTrees,
       changed,
     });
     const reconcile = (): void => {
@@ -614,6 +647,7 @@ export function startWorkerLifecycle(deps: WorkerLifecycleDeps): () => void {
       destroySession: async (ptyId) => {
         await rpc('daemon.destroySession', { id: ptyId });
       },
+      stopTrees,
       closePane: async (paneId) => {
         const res = await sendToRenderer(() => deps.getMainWindow?.() ?? null, 'pane.close', { id: paneId }, { timeoutMs: CLOSE_TIMEOUT_MS });
         return !!res && typeof res === 'object' && (res as { ok?: unknown }).ok === true;
@@ -752,6 +786,13 @@ export function startWorkerLifecycle(deps: WorkerLifecycleDeps): () => void {
   setHolderSource(holderSnapshot, holderKey);
   offs.push(() => setHolderSource(null));
   offs.push(ledger.onTransition(() => slots.kick()));
+  // A held fan-out waits on the wmux-wide live cap too, which the owner's own
+  // tasks fill: their row ending and their workspace closing check it again.
+  offs.push(installHeldFanoutReleases({
+    onTransition: (fn) => ledger.onTransition(fn),
+    onWorkspaces: (fn) => getWorkspaceMirror().onSnapshot(fn),
+    openWorkspaces: () => getWorkspaceMirror().getEntries()?.map((e) => e.id) ?? null,
+  }));
   offs.push(() => {
     slots.dispose();
     setAgentSlots(null);
