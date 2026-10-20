@@ -74,8 +74,10 @@ export function classifyTeammateTail(lines: readonly string[], pending: Set<stri
     const blocks = Array.isArray(content) ? content.map(record) : [];
     // A reply that ended the teammate's turn, or a new prompt to it: no call
     // of the turn before still runs (one whose result fell outside a window).
+    // An API error the teammate stopped on is a turn end too (it carries no
+    // stop_reason; see apiErrorTurnEnd).
     const turnEnded = entry.type === 'assistant' && !blocks.some((b) => b.type === 'tool_use')
-      && typeof message.stop_reason === 'string' && message.stop_reason !== 'tool_use';
+      && ((typeof message.stop_reason === 'string' && message.stop_reason !== 'tool_use') || entry.isApiErrorMessage === true);
     const newPrompt = entry.type === 'user' && !blocks.some((b) => b.type === 'tool_result');
     if (turnEnded || newPrompt) pending.clear();
     for (const block of blocks) {
@@ -89,7 +91,8 @@ export function classifyTeammateTail(lines: readonly string[], pending: Set<stri
   const at = Number.isFinite(stamp) ? { at: stamp } : {};
   const stop = record(last.entry.message).stop_reason;
   const calls = last.blocks.some((b) => b.type === 'tool_use');
-  if (last.entry.type === 'assistant' && !calls && typeof stop === 'string' && stop !== 'tool_use') return { state: 'replied', ...at };
+  if (last.entry.type === 'assistant' && !calls
+    && ((typeof stop === 'string' && stop !== 'tool_use') || last.entry.isApiErrorMessage === true)) return { state: 'replied', ...at };
   return { state: pending.size > 0 ? 'pending_tool' : 'busy', ...at };
 }
 
@@ -140,8 +143,12 @@ export function subagentsDirFor(transcriptPath: string): string {
 /** The classified tail of `file` read `maxBytes` back, and where it ends; undefined when unreadable. */
 function readTail(file: string, maxBytes: number, pending: Set<string>): { tail: TeammateTail | null; offset: number } | undefined {
   const lines: string[] = [];
-  const page = readTranscriptPage(file, { maxBytes, parseLine: (line) => { lines.push(line); return []; } });
-  return page ? { tail: classifyTeammateTail(lines, pending), offset: page.cursor.tailOffset } : undefined;
+  let lastStart = -1;
+  const page = readTranscriptPage(file, { maxBytes, parseLine: (line, offset) => { lines.push(line); lastStart = offset; return []; } });
+  // The next read starts at the last complete line read (read again, which
+  // changes nothing), never at the page's cursor: that can sit inside a
+  // record still being written. No complete line yet: read the tail again.
+  return page ? { tail: classifyTeammateTail(lines, pending), offset: lastStart } : undefined;
 }
 
 /** The classified lines of `file` from `offset` to `size` (one read), and where they end; undefined when unreadable. */
@@ -216,7 +223,6 @@ export class TeammateScanner {
       // (another conversation) or one too far behind starts from the tail.
       const fresh = state.offset < 0 || stat.ino !== state.ino || stat.size < state.offset
         || stat.size - state.offset > CATCHUP_BYTES;
-      state.ino = stat.ino;
       let read: { tail: TeammateTail | null; offset: number } | undefined;
       if (fresh) {
         state.pending.clear();
@@ -230,7 +236,10 @@ export class TeammateScanner {
         // of the conversation: the last verdict stands, aged by the mtime.
         read = readSince(file, state.offset, stat.size, state.pending, state.tail);
       }
+      // The inode is taken with what was read of it: a replacement whose read
+      // failed is read afresh next time, not appended to the old file's state.
       if (read === undefined) return false;
+      state.ino = stat.ino;
       state.offset = read.offset;
       state.size = stat.size;
       state.mtimeMs = stat.mtimeMs;

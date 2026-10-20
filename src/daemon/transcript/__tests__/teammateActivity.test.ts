@@ -212,6 +212,32 @@ describe('TeammateScanner', () => {
     expect(scanner.anyWorking(now + 1000)).toBe(false);
   });
 
+  it('an API error the teammate stopped on is a turn end', () => {
+    const now = Date.now();
+    const pending = new Set<string>(['a']);
+    const apiError = JSON.stringify({
+      type: 'assistant', isSidechain: true, isApiErrorMessage: true, timestamp: iso(now),
+      message: { role: 'assistant', content: [{ type: 'text', text: 'API Error: 529 overloaded' }] },
+    });
+    expect(classifyTeammateTail([toolUse('a', now), apiError], pending)).toEqual({ state: 'replied', at: now });
+    expect(pending.size).toBe(0);
+  });
+
+  it('a first read that lands in a record still being written reads that record once it ends', () => {
+    const now = Date.now();
+    const file = agent('mate', 'in_process_teammate', [prompt(now), toolUse('a', now), toolResult('a', now)]);
+    const long = JSON.stringify({
+      type: 'assistant', isSidechain: true, timestamp: iso(now),
+      message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: 'r'.repeat(400 * 1024) }] },
+    });
+    fs.appendFileSync(file, long.slice(0, 300 * 1024));
+    const scanner = new TeammateScanner(sub);
+    scanner.anyWorking(now);
+    fs.appendFileSync(file, `${long.slice(300 * 1024)}\n`);
+    fs.utimesSync(file, (now + 1000) / 1000, (now + 1000) / 1000);
+    expect(scanner.anyWorking(now + 1000)).toBe(false);
+  });
+
   it('a final reply too big for the tail window still reads as replied', () => {
     const now = Date.now();
     const long = JSON.stringify({
