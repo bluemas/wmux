@@ -147,6 +147,42 @@ describe('layoutOffice', () => {
     expect(sofaAt(second, 'r9')).toEqual(sofaAt(first, 'r9'));
   });
 
+  it('a finished employee keeps its desk and stands beside it', () => {
+    const first = layoutOffice([emp('a'), emp('b')]);
+    const second = layoutOffice([emp('a', { state: 'finished' }), emp('b')], first);
+    expect(second.deskFor.a).toBe(first.deskFor.a);
+    expect(second.loungeFor.a).toBeUndefined();
+    expect(second.stands.length).toBe(second.desks.length);
+    expect(second.stands[second.deskFor.a].spot).toBe('stand');
+  });
+
+  it('no stand spot falls on a station or another stand spot at 30 employees', () => {
+    const layout = layoutOffice(Array.from({ length: 30 }, (_, i) => emp(`p${i}`, { state: 'finished' })));
+    // A standing character takes about 12x12 floor units around its anchor.
+    const R = 6;
+    for (const s of layout.stands) {
+      for (const d of layout.desks) {
+        const dx = s.x - d.x;
+        const dy = s.y - d.y;
+        const da = dy + dx / 2;
+        const db = dy - dx / 2;
+        const inside = da > -R && da < 32 + R && db > -R && db < 32 + R;
+        expect(inside).toBe(false);
+      }
+    }
+    for (let i = 0; i < layout.stands.length; i += 1) {
+      for (let j = i + 1; j < layout.stands.length; j += 1) {
+        const dx = layout.stands[j].x - layout.stands[i].x;
+        const dy = layout.stands[j].y - layout.stands[i].y;
+        expect(Math.max(Math.abs(dy + dx / 2), Math.abs(dy - dx / 2))).toBeGreaterThanOrEqual(2 * R);
+      }
+    }
+    for (const s of layout.stands) {
+      expect(s.x).toBeGreaterThan(0);
+      expect(s.x).toBeLessThan(layout.width);
+    }
+  });
+
   it('seats teammates next to their lead', () => {
     const employees = [
       emp('lead-1'),

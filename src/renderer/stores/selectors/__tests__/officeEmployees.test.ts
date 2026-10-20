@@ -186,6 +186,76 @@ describe('selectOfficeEmployees', () => {
     expect(out[2]).toMatchObject({ jumpPtyId: 'pty-lead', leadId: 'pty-lead', state: 'working' });
   });
 
+  const oneWs = () => [workspace('ws-1', leaf('p1', [surface('s1', 'pty-1')]), 'p1')];
+
+  it('finished pane reports at its desk until the owner looks', () => {
+    const s = state({
+      workspaces: oneWs(),
+      surfaceAgent: { 'pty-1': claude('complete') },
+      surfaceAgentStatus: { 'pty-1': 'complete' },
+    });
+    expect(selectOfficeEmployees(s, NOW)[0].state).toBe('finished');
+    // Focusing the pane clears the attention status (Pane.tsx).
+    const seen = state({ workspaces: oneWs(), surfaceAgent: { 'pty-1': claude('complete') } });
+    expect(selectOfficeEmployees(seen, NOW)[0].state).toBe('resting');
+  });
+
+  it('a stale lifecycle complete does not count', () => {
+    const s = state({ workspaces: oneWs(), surfaceAgent: { 'pty-1': claude('complete') } });
+    expect(selectWorkspaceAgentRoster(s, 'ws-1').rows[0].status).toBe('complete');
+    expect(selectOfficeEmployees(s, NOW)[0].state).toBe('resting');
+  });
+
+  it('needs-you and working outrank finished', () => {
+    const q = state({
+      workspaces: oneWs(),
+      surfaceAgent: { 'pty-1': claude('complete') },
+      surfaceAgentStatus: { 'pty-1': 'complete' },
+      surfacePendingQuestion: { 'pty-1': 'Merge it?' },
+    });
+    expect(selectOfficeEmployees(q, NOW)[0].state).toBe('needs_you');
+    const limit = state({
+      workspaces: oneWs(),
+      surfaceAgent: { 'pty-1': claude('complete') },
+      surfaceAgentStatus: { 'pty-1': 'complete' },
+      usageLimitWaiting: { 'pty-1': true },
+    });
+    expect(selectOfficeEmployees(limit, NOW)[0].state).toBe('needs_you');
+    // A lead with a team works inside its own turn even with a finished row.
+    const lead = state({
+      workspaces: leadWs(),
+      surfaceAgent: { 'pty-lead': claude('complete') },
+      surfaceAgentStatus: { 'pty-lead': 'complete' },
+      surfaceTurnOpenAt: { 'pty-lead': NOW - 10 },
+      surfaceTeammates: { 'pty-lead': [mate('t', false)] },
+    });
+    const [l, t] = selectOfficeEmployees(lead, NOW);
+    expect(l.state).toBe('working');
+    expect(t.state).toBe('resting');
+    // Without its own turn the lead reports; a teammate never does.
+    const idleLead = state({
+      workspaces: leadWs(),
+      surfaceAgent: { 'pty-lead': claude('complete') },
+      surfaceAgentStatus: { 'pty-lead': 'complete' },
+      surfaceTeammates: { 'pty-lead': [mate('t', false)] },
+    });
+    const [l2, t2] = selectOfficeEmployees(idleLead, NOW);
+    expect(l2.state).toBe('finished');
+    expect(t2.state).toBe('resting');
+  });
+
+  it('the memoized selector sees a finished change', () => {
+    const sel = createOfficeEmployeesSelector();
+    const first = sel(state({ workspaces: oneWs(), surfaceAgent: { 'pty-1': claude('complete') } }));
+    const next = sel(state({
+      workspaces: oneWs(),
+      surfaceAgent: { 'pty-1': claude('complete') },
+      surfaceAgentStatus: { 'pty-1': 'complete' },
+    }));
+    expect(next).not.toBe(first);
+    expect(next[0].state).toBe('finished');
+  });
+
   it('returns a stable array from the memoized selector when inputs are unchanged', () => {
     const s = state({ workspaces: leadWs(), surfaceAgent: { 'pty-lead': claude() } });
     const sel = createOfficeEmployeesSelector();

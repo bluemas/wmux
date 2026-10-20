@@ -164,6 +164,19 @@ describe('OfficePage', () => {
     expect(q.getAttribute('aria-label')).toContain('Waiting for you');
   });
 
+  it('finished employee stands at its desk with a green done bubble', () => {
+    mount([emp('done', { state: 'finished', bubble: 'ignored activity' })]);
+    const el = employeeEl('done');
+    expect(el.getAttribute('data-pose')).toBe('stand');
+    const bubble = el.querySelector('[data-office-bubble]')!;
+    expect(bubble.getAttribute('data-office-bubble')).toBe('done');
+    expect(bubble.classList.contains('wmux-office-bubble--done')).toBe(true);
+    expect(bubble.textContent).toContain('✓');
+    expect(bubble.textContent).toContain('Done');
+    expect(bubble.textContent).not.toContain('ignored activity');
+    expect(el.getAttribute('aria-label')).toContain('Finished');
+  });
+
   it("click jumps to the employee's pane", () => {
     mount([emp('pty-1'), emp('pty-2')]);
     act(() => {

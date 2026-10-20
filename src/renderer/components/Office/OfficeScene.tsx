@@ -108,7 +108,9 @@ const RoomProps = memo(
   (a, b) => a.desks === b.desks && a.height === b.height && a.props.length === b.props.length,
 );
 
-function Station({ seat, occupied }: { seat: Seat; occupied: 'working' | 'needs_you' | null }) {
+type DeskState = 'working' | 'needs_you' | 'finished';
+
+function Station({ seat, occupied }: { seat: Seat; occupied: DeskState | null }) {
   const left = seat.x - STATION.deskX;
   const top = seat.y - STATION.deskY;
   return (
@@ -119,15 +121,15 @@ function Station({ seat, occupied }: { seat: Seat; occupied: 'working' | 'needs_
         aria-hidden="true"
         style={spriteStyle(occupied ? FURNITURE.monitorOn : FURNITURE.monitorOff, left, top, stackIndex(seat.z, 1))}
       />
-      {/* Seated frames include the chair; draw it only at an empty desk. */}
-      {!occupied && (
+      {/* Seated frames include the chair; draw it at an empty desk or beside a reporting employee. */}
+      {(!occupied || occupied === 'finished') && (
         <div className="wmux-office-sprite" aria-hidden="true" style={spriteStyle(FURNITURE.chair, left, top, stackIndex(seat.z, 2))} />
       )}
     </>
   );
 }
 
-type PoseName = 'type' | 'raiseHand' | 'rest';
+type PoseName = 'type' | 'raiseHand' | 'rest' | 'stand';
 
 /** Two neighbouring frames in one sheet row animate by stepping background-position-x. */
 function frameLoop(sheet: CharacterSheet, first: CharacterPose, second: CharacterPose, seconds: number, phase: number): CSSProperties | null {
@@ -153,15 +155,18 @@ interface EmployeeProps {
 
 function Employee({ employee, layout, t, now, locale, onJump }: EmployeeProps) {
   const sheet = characterFor(employee);
-  const atDesk = employee.state !== 'resting';
-  const loungeIndex = layout.loungeFor[employee.id];
-  const seat = atDesk ? layout.desks[layout.deskFor[employee.id]] : layout.lounge[loungeIndex];
+  const seated = employee.state === 'working' || employee.state === 'needs_you';
+  const seat = seated
+    ? layout.desks[layout.deskFor[employee.id]]
+    : employee.state === 'finished'
+      ? layout.stands[layout.deskFor[employee.id]]
+      : layout.lounge[layout.loungeFor[employee.id]];
   if (!seat) return null;
 
   // Frame top-left: a desk frame shares the station's origin; elsewhere the
   // character's anchor stands on the seat point.
-  const left = atDesk ? seat.x - STATION.deskX : seat.x - STATION.seatX;
-  const top = atDesk ? seat.y - STATION.deskY : seat.y - STATION.seatY;
+  const left = seated ? seat.x - STATION.deskX : seat.x - STATION.seatX;
+  const top = seated ? seat.y - STATION.deskY : seat.y - STATION.seatY;
 
   let pose: PoseName;
   let frame: CharacterPose;
@@ -173,6 +178,10 @@ function Employee({ employee, layout, t, now, locale, onJump }: EmployeeProps) {
   } else if (employee.state === 'needs_you') {
     pose = 'raiseHand';
     frame = 'raiseHand';
+  } else if (employee.state === 'finished') {
+    // Standing beside the desk, facing the viewer, to report.
+    pose = 'stand';
+    frame = 'walk1';
   } else {
     pose = 'rest';
     frame = 'rest1';
@@ -180,9 +189,16 @@ function Employee({ employee, layout, t, now, locale, onJump }: EmployeeProps) {
   }
 
   const alert = employee.state === 'needs_you' ? needText(employee, t, now, locale) : '';
+  const done = employee.state === 'finished' ? t('office.bubble.done') : '';
   const activity = employee.state === 'working' ? bubbleText(employee.bubble) : '';
   const stateText =
-    employee.state === 'working' ? t('office.state.working') : employee.state === 'resting' ? t('office.state.resting') : alert;
+    employee.state === 'working'
+      ? t('office.state.working')
+      : employee.state === 'resting'
+        ? t('office.state.resting')
+        : employee.state === 'finished'
+          ? t('office.state.finished')
+          : alert;
   const z = stackIndex(seat.z, 2);
 
   return (
@@ -211,17 +227,19 @@ function Employee({ employee, layout, t, now, locale, onJump }: EmployeeProps) {
         <span className="wmux-office-employee__name">{employee.name}</span>
         <span className="wmux-office-employee__workspace"> · {employee.workspaceName}</span>
       </span>
-      {(alert || activity) && (
+      {(alert || done || activity) && (
         <span
-          className={`wmux-office-bubble ${alert ? 'wmux-office-bubble--alert' : 'wmux-office-bubble--line'}`}
-          data-office-bubble={alert ? 'alert' : 'activity'}
+          className={`wmux-office-bubble ${
+            alert ? 'wmux-office-bubble--alert' : done ? 'wmux-office-bubble--done' : 'wmux-office-bubble--line'
+          }`}
+          data-office-bubble={alert ? 'alert' : done ? 'done' : 'activity'}
           aria-hidden="true"
           style={{ left: STATION.seatX * OFFICE_SCALE, zIndex: BUBBLE_Z + Math.round(seat.z) }}
         >
-          {alert ? (
+          {alert || done ? (
             <>
-              <span className="wmux-office-bubble__mark">!</span>
-              {alert}
+              <span className="wmux-office-bubble__mark">{alert ? '!' : '✓'}</span>
+              {alert || done}
             </>
           ) : (
             activity
@@ -244,7 +262,7 @@ interface OfficeSceneProps {
 
 /** The isometric room: layered DOM sprites, with names and bubbles as DOM text. */
 export default function OfficeScene({ employees, layout, t, now, locale, onJump, label }: OfficeSceneProps) {
-  const seatedAt = new Map<number, 'working' | 'needs_you'>();
+  const seatedAt = new Map<number, DeskState>();
   for (const e of employees) {
     if (e.state !== 'resting') seatedAt.set(layout.deskFor[e.id], e.state);
   }

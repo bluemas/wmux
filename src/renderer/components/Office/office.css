@@ -143,6 +143,14 @@
   font-family: var(--font-ui);
   font-weight: 500;
 }
+/* A finished turn waiting to be looked at: the app's success green. */
+.wmux-office-bubble--done {
+  border-color: #1f6940;
+  background: var(--accent-green, #34d399);
+  color: #0b2a1c;
+  font-family: var(--font-ui);
+  font-weight: 500;
+}
 .wmux-office-bubble__mark {
   font-weight: 700;
   margin-right: 4px;

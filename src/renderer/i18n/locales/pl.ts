@@ -4883,6 +4883,8 @@ export const pl = {
   'office.employeeLabel': "{name}, {workspace}: {state}",
   'office.state.working': "Pracuje",
   'office.state.resting': "Odpoczywa",
+  'office.state.finished': "Ukończone",
+  'office.bubble.done': "Gotowe",
   'office.need.question': "Czeka na Ciebie",
   'office.need.error': "Błąd",
   'office.need.usageLimit': "Limit użycia",

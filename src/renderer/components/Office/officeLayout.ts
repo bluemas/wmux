@@ -19,10 +19,10 @@ export interface Seat {
   facing: 'left' | 'right';
   /**
    * `desk`: (x, y) is the north corner of the desk footprint (the station
-   * frame's `deskX/deskY`). `sofa`: (x, y) is the character anchor (the
-   * frame's `seatX/seatY`).
+   * frame's `deskX/deskY`). `sofa` / `stand`: (x, y) is the character anchor
+   * (the frame's `seatX/seatY`).
    */
-  spot: 'desk' | 'sofa';
+  spot: 'desk' | 'sofa' | 'stand';
 }
 
 /** A static room piece: its floor anchor at (x, y), stacked by `zIndex`. */
@@ -38,6 +38,8 @@ export interface OfficeLayout {
   width: number;
   height: number;
   desks: Seat[];
+  /** Where the employee of each desk stands to report a finished turn; same index as `desks`. */
+  stands: Seat[];
   lounge: Seat[];
   /** Employee id → index into `desks`. Every employee keeps a desk. */
   deskFor: Record<string, number>;
@@ -58,6 +60,11 @@ const DESK_B0 = 18;
 const DESK_B_STEP = 56;
 /** Desk (1 tile) plus the chair's tile in front of it. */
 const STATION_DEPTH = 32;
+/**
+ * A reporting employee stands beside its chair, in the gap before the next
+ * desk along `a` (desks are 32 long, 48 apart), level with the chair.
+ */
+const STAND_OFFSET = { a: 40, b: 26 };
 /** Room length along `a` (the back wall). */
 const ROOM_A = DESK_A0 + (DESK_COLUMNS - 1) * DESK_A_STEP + 2 * TILE + TILE;
 
@@ -224,11 +231,15 @@ export function layoutOffice(employees: OfficeEmployee[], prev?: OfficeLayout): 
   });
 
   const desks: Seat[] = [];
+  const stands: Seat[] = [];
   for (let d = 0; d < rows * DESK_COLUMNS; d += 1) {
     const { row, col } = deskCell(d);
     const a = DESK_A0 + col * DESK_A_STEP;
     const b = DESK_B0 + row * DESK_B_STEP;
     desks.push({ ...toScreen(a, b), z: a + b + 42, facing: 'right', spot: 'desk' });
+    const sa = a + STAND_OFFSET.a;
+    const sb = b + STAND_OFFSET.b;
+    stands.push({ ...toScreen(sa, sb), z: sa + sb, facing: 'left', spot: 'stand' });
   }
 
   const props: OfficeProp[] = [];
@@ -284,6 +295,7 @@ export function layoutOffice(employees: OfficeEmployee[], prev?: OfficeLayout): 
     width: roomA + roomB + 2 * PAD_X,
     height: (roomA + roomB) / 2 + PAD_TOP + PAD_BOTTOM,
     desks,
+    stands,
     lounge,
     deskFor,
     loungeFor,

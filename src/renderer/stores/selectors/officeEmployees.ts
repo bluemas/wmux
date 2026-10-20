@@ -2,7 +2,7 @@ import type { StoreState } from '../index';
 import { agentRow, type AgentSlugWith } from '../../../shared/agentIdentity';
 import { selectWorkspaceAgentRoster, type WorkspaceAgentRosterRow } from './workspaceAgentRoster';
 
-export type OfficeState = 'working' | 'needs_you' | 'resting';
+export type OfficeState = 'working' | 'needs_you' | 'finished' | 'resting';
 export type OfficeNeed = 'question' | 'error' | 'usage_limit';
 
 /** One agent session (or Agent Teams teammate) drawn as an employee in the Office view. */
@@ -55,6 +55,15 @@ function needOf(row: WorkspaceAgentRosterRow): OfficeNeed | undefined {
 }
 
 /**
+ * Fleet's "Finished": an unseen `complete` attention status. Not the lifecycle
+ * status, which can stay 'complete' after the owner looked at the pane; the
+ * attention status clears when the pane is focused, a turn starts or it closes.
+ */
+function isFinished(row: WorkspaceAgentRosterRow): boolean {
+  return row.attentionStatus === 'complete' && !row.pendingQuestion && !row.remote && !row.stashed && !row.usageLimitWaiting;
+}
+
+/**
  * Every agent session in every workspace as an employee, in workspace order
  * then pane order, each lead followed by its Agent Teams teammates. Derived
  * from the same roster rows the sidebar draws, so the two cannot disagree.
@@ -79,6 +88,8 @@ export function selectOfficeEmployees(state: StoreState, _now: number): OfficeEm
       } else {
         officeState = row.status === 'running' ? 'working' : 'resting';
       }
+      // A finished turn the owner has not looked at yet: reporting at the desk.
+      if (officeState === 'resting' && isFinished(row)) officeState = 'finished';
 
       out.push({
         id: row.ptyId,

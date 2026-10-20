@@ -4424,6 +4424,8 @@ export const ko = {
   'office.employeeLabel': "{name}, {workspace}: {state}",
   'office.state.working': "작업 중",
   'office.state.resting': "휴식 중",
+  'office.state.finished': "완료",
+  'office.bubble.done': "완료",
   'office.need.question': "응답을 기다리는 중",
   'office.need.error': "오류",
   'office.need.usageLimit': "사용 한도",

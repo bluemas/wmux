@@ -4923,6 +4923,8 @@ export const en = {
   'office.employeeLabel': "{name}, {workspace}: {state}",
   'office.state.working': "Working",
   'office.state.resting': "Resting",
+  'office.state.finished': "Finished",
+  'office.bubble.done': "Done",
   'office.need.question': "Waiting for you",
   'office.need.error': "Error",
   'office.need.usageLimit': "Usage limit",

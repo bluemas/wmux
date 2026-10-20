@@ -4028,6 +4028,8 @@ export const zh = {
   'office.employeeLabel': "{name}，{workspace}：{state}",
   'office.state.working': "工作中",
   'office.state.resting': "休息中",
+  'office.state.finished': "已完成",
+  'office.bubble.done': "完成",
   'office.need.question': "等待你的回应",
   'office.need.error': "错误",
   'office.need.usageLimit': "用量上限",
