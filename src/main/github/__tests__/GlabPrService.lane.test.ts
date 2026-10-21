@@ -161,7 +161,8 @@ describe('laneFacts', () => {
     const r = await svc.laneFacts('/repo', KEY, 7);
     expect(r).toMatchObject({ ok: true, value: { number: 7, headRefOid: HEAD } });
     await svc.laneFacts('/repo', KEY, 7);
-    expect(calls).toHaveLength(2);
+    // Each read: the MR, then its target branch's tip.
+    expect(calls).toHaveLength(4);
     expect(calls[0].slice(0, 4)).toEqual(['api', '--hostname', 'gitlab.example.com', 'graphql']);
     expect(calls[0]).toContain('fullPath=group/sub/proj');
     expect(calls[0]).toContain('iid=7');
@@ -175,6 +176,21 @@ describe('laneFacts', () => {
     expect(calls[1]).toEqual(['api', '--hostname', 'gitlab.example.com', `projects/group%2Fsub%2Fproj/repository/commits/${MERGE_REF}`]);
     parents.mockReturnValue({ parent_ids: [OTHER, OTHER] });
     expect(await svc.laneFacts('/repo', KEY, 7)).toMatchObject({ ok: true, value: { checksHeadOid: MERGE_REF } });
+  });
+
+  it('the base tip is the target branch\'s commit now; unreadable, it is null and the read still succeeds', async () => {
+    const TIP = 'd'.repeat(40);
+    const branch = vi.fn((): unknown => ({ name: 'main', commit: { id: TIP } }));
+    const { svc, calls } = makeService((args) => (isGraphql(args) ? mrAnswer() : branch()));
+    expect(await svc.laneFacts('/repo', KEY, 7)).toMatchObject({ ok: true, value: { baseRefOid: TIP } });
+    expect(calls[1]).toEqual(['api', '--hostname', 'gitlab.example.com', 'projects/group%2Fsub%2Fproj/repository/branches/main']);
+    const SHA256 = 'e'.repeat(64);
+    branch.mockReturnValue({ name: 'main', commit: { id: SHA256 } });
+    expect(await svc.laneFacts('/repo', KEY, 7)).toMatchObject({ ok: true, value: { baseRefOid: SHA256 } });
+    branch.mockReturnValue({ name: 'main', commit: { id: 'not-a-sha' } });
+    expect(await svc.laneFacts('/repo', KEY, 7)).toMatchObject({ ok: true, value: { baseRefOid: null } });
+    branch.mockReturnValue(new Error('404'));
+    expect(await svc.laneFacts('/repo', KEY, 7)).toMatchObject({ ok: true, value: { baseRefOid: null } });
   });
 
   it('a GraphQL error beside data is a read error too', async () => {
@@ -342,5 +358,36 @@ describe('mergedOfBranch / defaultBranch', () => {
     expect(calls[0][3]).toBe('projects/group%2Fsub%2Fproj/merge_requests?state=merged&source_branch=wtask%2Fa+b&target_branch=main&per_page=20');
     expect(await svc.defaultBranch('/wmux', KEY)).toEqual({ ok: true, value: 'main' });
     expect(await svc.mergedOfBranch('/wmux', KEY, '-x', 'main')).toMatchObject({ ok: false });
+  });
+});
+
+describe('GlabPrService.watchGraphql (the factory repo watch read)', () => {
+  const svcOf = (exec: (cmd: string, args: string[]) => Promise<{ stdout: string }>) => new GlabPrService(() => 1000, exec as never);
+
+  it('names the host, and tells a missing glab and a sign-out from other failures', async () => {
+    const seen: string[][] = [];
+    const ok = svcOf(async (_c, args) => { seen.push(args); return { stdout: JSON.stringify({ data: { project: {} } }) }; });
+    expect(await ok.watchGraphql('/wmux', KEY, 'query { x }', { fullPath: 'group/sub/proj' })).toEqual({ ok: true, value: { data: { project: {} } } });
+    expect(seen[0].slice(0, 4)).toEqual(['api', '--hostname', 'gitlab.example.com', 'graphql']);
+    const missing = svcOf(async () => { throw Object.assign(new Error('spawn glab ENOENT'), { code: 'ENOENT' }); });
+    expect(await missing.watchGraphql('/wmux', KEY, 'q', {})).toMatchObject({ ok: false, code: 'cli-missing' });
+    const out = svcOf(async () => { throw Object.assign(new Error('failed'), { stderr: 'glab: 401 Unauthorized (HTTP 401)' }); });
+    expect(await out.watchGraphql('/wmux', KEY, 'q', {})).toMatchObject({ ok: false, code: 'unauthenticated' });
+    // What glab 1.108 prints for a host it holds no token for.
+    const anon = svcOf(async () => { throw Object.assign(new Error('Command failed'), { stderr: '   ERROR  \n  Unauthenticated.  \n' }); });
+    expect(await anon.watchGraphql('/wmux', KEY, 'q', {})).toMatchObject({ ok: false, code: 'unauthenticated' });
+    const down = svcOf(async () => { throw Object.assign(new Error('failed'), { stderr: 'dial tcp: i/o timeout' }); });
+    expect(await down.watchGraphql('/wmux', KEY, 'q', {})).toMatchObject({ ok: false, code: 'error' });
+    // The command line (a project path like api-403) is not glab's answer, and a 403 is no sign-out.
+    const blip = svcOf(async () => { throw Object.assign(new Error('Command failed: glab api --hostname gitlab.example.com graphql -f fullPath=group/api-403'), { stderr: 'dial tcp: i/o timeout' }); });
+    expect(await blip.watchGraphql('/wmux', 'gitlab.example.com/group/api-403', 'q', {})).toMatchObject({ ok: false, code: 'error' });
+    const forbidden = svcOf(async () => { throw Object.assign(new Error('failed'), { stderr: 'glab: 403 Forbidden (HTTP 403)' }); });
+    expect(await forbidden.watchGraphql('/wmux', KEY, 'q', {})).toMatchObject({ ok: false, code: 'error' });
+    // The owner login read tells a sign-out from a blip the same way.
+    expect(await out.loginOrSignOut('gitlab.example.com', '/wmux')).toEqual({ signedOut: true });
+    expect(await down.loginOrSignOut('gitlab.example.com', '/wmux')).toBeNull();
+    expect(await svcOf(async () => ({ stdout: JSON.stringify({ username: 'Me' }) })).loginOrSignOut('gitlab.example.com', '/wmux')).toEqual({ login: 'me' });
+    const partial = svcOf(async () => ({ stdout: JSON.stringify({ data: { project: null }, errors: [{ message: 'complexity' }] }) }));
+    expect(await partial.watchGraphql('/wmux', KEY, 'q', {})).toEqual({ ok: false, code: 'error', message: 'complexity' });
   });
 });
