@@ -162,7 +162,7 @@ export type FleetTab = 'fleet' | 'approvals' | 'remote';
  * panes and tools dock) is home; every other page covers it while the
  * terminals stay mounted underneath. Session-only, never persisted.
  */
-export type AppRoute = 'workspaces' | 'bots' | 'fleet' | 'office' | 'schedules' | 'remote' | 'git' | 'connectors' | 'settings' | `plugin:${string}`;
+export type AppRoute = 'workspaces' | 'bots' | 'fleet' | 'office' | 'schedules' | 'remote' | 'git' | 'plugins' | 'connectors' | 'settings' | `plugin:${string}`;
 
 export interface UISlice {
   // ─── Startup gate (Fix 0) ─────────────────────────────────────────────
@@ -205,6 +205,12 @@ export interface UISlice {
   // working; write the route, never the mirrors.
   appRoute: AppRoute;
   setAppRoute: (route: AppRoute) => void;
+  /** The Plugins page's selected row: a plugin name, 'connectors', or null
+   *  (the first row). Kept while the page is away; session-only. */
+  pluginsSelection: string | null;
+  setPluginsSelection: (selection: string | null) => void;
+  /** Opens the Plugins page and, pressed there, returns to Workspaces. */
+  togglePluginsView: () => void;
 
   // The sidebar's workspace filter (facet checks). Session-only: not
   // persisted, so a reload starts unfiltered.
@@ -694,6 +700,9 @@ export interface UISlice {
   /** The current theme's polarity, saved so main can start a glass window in its tone (main/window/windowGlass.ts). */
   windowAppearance: 'dark' | 'light' | null;
   setWindowAppearance: (appearance: 'dark' | 'light') => void;
+  /** Windows: the glass level last applied to the window ('off' while the theme blocks glass), saved so main starts the window the same way (main/window/windowGlass.ts). */
+  windowGlassEffective: WindowGlassLevel | null;
+  setWindowGlassEffective: (level: WindowGlassLevel) => void;
 
   // ─── Toast / ring notification UI ────────────────────────────────────────
   toastEnabled: boolean;
@@ -1113,6 +1122,8 @@ export interface AppRouteFields extends InspectStateFields {
   settingsPanelVisible: boolean;
   /** Ends on a page switch: every prefix action works on the panes. */
   prefixMode?: boolean;
+  /** The Plugins page's selected row; the connectors route writes it. */
+  pluginsSelection?: string | null;
 }
 
 /**
@@ -1121,6 +1132,12 @@ export interface AppRouteFields extends InspectStateFields {
  * Mutates an immer draft — call only inside a set() callback.
  */
 export function applyAppRoute(state: AppRouteFields, route: AppRoute): void {
+  // Connectors live on the Plugins page (owner decision 2026-10-21): the old
+  // route is a deep link to that page's Connectors row, never a page of its own.
+  if (route === 'connectors') {
+    route = 'plugins';
+    state.pluginsSelection = 'connectors';
+  }
   if (route !== 'settings' && state.inspectModeActive) resetInspectState(state);
   if (state.appRoute !== route && state.prefixMode) state.prefixMode = false;
   state.appRoute = route;
@@ -1270,6 +1287,12 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
     state.commandPaletteVisible = false;
     state.notificationPanelVisible = false;
   }),
+  pluginsSelection: null,
+  setPluginsSelection: (selection) => set((state) => { state.pluginsSelection = selection; }),
+  togglePluginsView: () => {
+    if (get().appRoute === 'plugins') set((state) => { leaveAppRoute(state, 'plugins'); });
+    else get().setAppRoute('plugins');
+  },
 
   // ─── Fleet View (S-C1 cockpit) ───────────────────────────────────────────
   fleetViewVisible: false,
@@ -1901,6 +1924,11 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
   setWindowAppearance: (appearance) => {
     if (get().windowAppearance === appearance) return;
     set((state) => { state.windowAppearance = appearance; });
+  },
+  windowGlassEffective: null,
+  setWindowGlassEffective: (level) => {
+    if (get().windowGlassEffective === level) return;
+    set((state) => { state.windowGlassEffective = level; });
   },
 
   // ─── Toast / ring notification UI ────────────────────────────────────────

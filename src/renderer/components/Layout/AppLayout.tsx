@@ -14,8 +14,7 @@ import { EmptyLeafFunnel } from './EmptyLeafFunnel';
 import { selectProjectCwdSignature } from '../../stores/selectors/appLayout';
 import { selectInboxOwnsApprovals } from '../../stores/selectors/approvalInbox';
 import { selectPcRailPersisted } from '../../stores/selectors/pcRail';
-import { shouldShowInstallError, shouldReannounceAfterError, isSmartAppControlHold, truncateReason } from './updateNoticePolicy';
-import { isInstallBlockedByWindowsReason } from '../../../shared/installAbortReasons';
+import { shouldShowInstallError, shouldReannounceAfterError, isSmartAppControlHold, refusedInstallNotice } from './updateNoticePolicy';
 import { hooksLaunchCheck, nextFirstBootSurface } from './firstBootSequence';
 import { markPrWakeNoticeSeen, prWakeNoticePending, showPrWakeNoticeOnce } from '../../hooks/prWakeNotice';
 import { openModalLayerCount, subscribeModalLayers } from '../ui/modalLayer';
@@ -89,13 +88,15 @@ import { FIRST_RUN_REOPEN_EVENT } from '../../../shared/firstRun';
 import { isFileDrag } from '../../../shared/dragDrop';
 import { terminalRegistry, watchColdFramePersistence } from '../../hooks/useTerminal';
 import { clearPersistedColdFrames, restoreColdFrames } from '../../terminal/coldFrame';
-import { resolvePtyIdsToClear } from '../../hooks/reconcileWithReQuery';
+import { heldSuspendedIds, holdsSuspendedSession, resolvePtyIdsToClear } from '../../hooks/reconcileWithReQuery';
+import { isSurfaceShown } from '../../stores/selectors/surfaceShown';
 import { runWithProgressTimeout } from '../../hooks/reconcileProgressTimeout';
 import { createLateReconcileOnConnect } from '../../hooks/lateReconcileOnConnect';
 import { applyStartupReconcileFallback } from '../../hooks/startupReconcileFallback';
 import { RECONCILE_REQUEST_COALESCE_MS, setReconcileRequester } from '../../hooks/reconcileRequest';
 import { ptyLifecycle } from '../../hooks/ptyLifecycle';
 import ProjectConfigDialog from '../Project/ProjectConfigDialog';
+import WorkspacePrepDialog from '../Project/WorkspacePrepDialog';
 import AttachRemoteModal from '../Sidebar/AttachRemoteModal';
 import { probeProjectConfig, maybeAutoApplyProjectLayout, workspaceProbeCwd } from '../../utils/projectConfigProbe';
 import { serializeTerminalBuffer } from '../../utils/scrollbackDump';
@@ -472,6 +473,9 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
     // The theme's polarity, so main can give a glass window the theme's tone
     // before this renderer loads (main/window/windowGlass.ts).
     windowAppearance: state.windowAppearance ?? undefined,
+    // The level the window last showed on Windows, so main starts a theme
+    // that blocks glass opaque rather than flipping it after this loads.
+    windowGlassEffective: state.windowGlassEffective ?? undefined,
     sidebarSortMode: state.sidebarSortMode,
     sidebarSortModeChosen: state.sidebarSortModeChosen,
     sidebarPinnedIds: state.sidebarPinnedIds,
@@ -564,10 +568,12 @@ function useRefusedInstallNotice(
           persist: true,
           // #1525 — Windows refusing to run the installer gets its own
           // sentence: the generic one's "run the installer from the releases
-          // page" is the same file Windows just blocked.
-          message: isInstallBlockedByWindowsReason(reason)
-            ? t('update.refusedInstallBlocked')
-            : t('update.refusedInstall', { detail: truncateReason(reason) }),
+          // page" is the same file Windows just blocked. So do the waiter's
+          // pre-start re-hash refusals (refusedInstallNotice).
+          message: (() => {
+            const notice = refusedInstallNotice(reason);
+            return t(notice.key, notice.vars);
+          })(),
         });
       })
       .catch((err) => {
@@ -1289,12 +1295,14 @@ export default function AppLayout() {
         // does not cover: a single snapshot can be partial (daemon
         // mid-rehydrate), so clearing on the first cycle could destroy a live
         // session. We defer the destructive decision to a 2-strike re-query.
-        const absentCandidates: { paneId: string; surfaceId: string; ptyId: string; stashed: boolean }[] = [];
+        const absentCandidates: { workspaceId: string; paneId: string; surfaceId: string; ptyId: string; stashed: boolean }[] = [];
         // Every binding this pass looks at, and those it could not settle
         // (#2398, see the end of the pass).
         const examinedPtyIds: string[] = [];
         const unsettledPtyIds = new Set<string>();
-        const collect = (pane: PaneLeaf, stashed: boolean) => {
+        // #2398 — suspended sessions this pass holds instead of promoting.
+        const heldByPass: string[] = [];
+        const collect = (workspaceId: string, pane: PaneLeaf, stashed: boolean) => {
           if (signal?.aborted) return;
           for (const surface of pane.surfaces) {
             if (signal?.aborted) return;
@@ -1311,7 +1319,7 @@ export default function AppLayout() {
             } else if (preserveUnconfirmedOnEmpty && !deadPtys.has(surface.ptyId)) {
               console.warn(`[lifecycle] reconcile preserving unconfirmed ptyId=${surface.ptyId} surface=${surface.id} while live list is empty`);
             } else {
-              absentCandidates.push({ paneId: pane.id, surfaceId: surface.id, ptyId: surface.ptyId, stashed });
+              absentCandidates.push({ workspaceId, paneId: pane.id, surfaceId: surface.id, ptyId: surface.ptyId, stashed });
             }
           }
         };
@@ -1334,7 +1342,7 @@ export default function AppLayout() {
           const visibleIds = new Set(getLeafPanes(ws.rootPane).map((l) => l.id));
           for (const leaf of getWorkspaceLeafPanes(ws)) {
             if (signal?.aborted) return;
-            collect(leaf, !visibleIds.has(leaf.id));
+            collect(ws.id, leaf, !visibleIds.has(leaf.id));
           }
         }
         // Visible panes first, ACROSS workspaces. Promotion below competes for
@@ -1357,18 +1365,28 @@ export default function AppLayout() {
           const stillAbsent: typeof absentCandidates = [];
           if (window.electronAPI?.pty?.promote) {
             // Ask the daemon for suspended sessions that match our absent ptyIds.
-            const allRes = await invokeReconcile<{ id: string; state?: string }[]>(() =>
+            const allRes = await invokeReconcile<{ id: string; state?: string; exec?: true; supervision?: unknown }[]>(() =>
               window.electronAPI.pty.list({ includeSuspended: true }),
             );
-            const suspendedIds = new Set(
+            const suspendedById = new Map(
               allRes.ok
-                ? allRes.data.filter((s) => s.state === 'suspended').map((s) => s.id)
+                ? allRes.data.filter((s) => s.state === 'suspended').map((s) => [s.id, s] as const)
                 : [],
             );
             for (const candidate of absentCandidates) {
               if (signal?.aborted) break;
-              if (!suspendedIds.has(candidate.ptyId)) {
+              const suspended = suspendedById.get(candidate.ptyId);
+              if (!suspended) {
                 stillAbsent.push(candidate);
+                continue;
+              }
+              // #2398 — a hidden pane's suspended session is held: not
+              // promoted, not cleared; its pane promotes it when first shown.
+              // An exec unit or supervised session is promoted all the same.
+              const shown = isSurfaceShown(useStore.getState(), candidate.workspaceId, candidate.surfaceId);
+              if (holdsSuspendedSession({ shown, stashed: candidate.stashed, session: suspended })) {
+                console.log(`[lifecycle] reconcile HOLDING suspended ptyId=${candidate.ptyId} surface=${candidate.surfaceId} — pane hidden, promoted when first shown`);
+                heldByPass.push(candidate.ptyId);
                 continue;
               }
               // Try to promote this suspended session.
@@ -1397,8 +1415,11 @@ export default function AppLayout() {
           let secondSnapshot: { id: string; surfaceId?: string; createdAt?: string }[] | null = null;
           const toClear = await resolvePtyIdsToClear(firstAbsent, {
             reList: async () => {
-              const r = await invokeReconcile<{ id: string; surfaceId?: string; createdAt?: string }[]>(() => window.electronAPI.pty.list());
-              if (r.ok) secondSnapshot = r.data;
+              // #2398 — suspended sessions count as present (a held one, or one
+              // the first list raced), but are never a rebind target: a rebind
+              // goes to a session that is running.
+              const r = await invokeReconcile<{ id: string; surfaceId?: string; createdAt?: string; state?: string }[]>(() => window.electronAPI.pty.list({ includeSuspended: true }));
+              if (r.ok) secondSnapshot = r.data.filter((p) => p.state !== 'suspended');
               return r.ok
                 ? { ok: true, ids: new Set(r.data.map((p: { id: string }) => p.id)) }
                 : { ok: false };
@@ -1482,6 +1503,14 @@ export default function AppLayout() {
             false,
             { markedAtOrBefore: markSeqAtStart },
           );
+          // #2398 — every suspended session a pane still holds stays in use,
+          // so the suspended TTL never prunes one whose pane is merely
+          // unopened. Best effort, as at reportViewerVisibility: a stale
+          // preload may not expose it.
+          const held = heldSuspendedIds(examinedPtyIds, listedPtys, heldByPass);
+          if (held.length > 0 && typeof window.electronAPI?.pty?.hold === 'function') {
+            void window.electronAPI.pty.hold(held).catch((err: unknown) => console.warn('[lifecycle] reconcile pty.hold failed', err));
+          }
         }
         console.log(`[AppLayout] Reconcile cycle #${reconcileCycleRef.current} complete (${absentCandidates.length} absent candidate(s))`);
       } finally {
@@ -2331,6 +2360,7 @@ export default function AppLayout() {
       {!inboxOwnsApprovals && <PermissionApprovalDialogContainer />}
       <CloseTabConfirm />
       <ProjectConfigDialog />
+      <WorkspacePrepDialog />
       {/* "Pair again" from a remote workspace whose host rejected us. Lives
           here because re-pairing removes that host's views. */}
       {remoteRepairHostId && (

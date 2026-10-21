@@ -367,6 +367,11 @@ export default function CommandPalette() {
         action: () => { useStore.getState().openBotsPage(); setVisible(false); },
       },
       {
+        label: t('palette.cmd.openPlugins'),
+        shortcut: 'togglePluginsView',
+        action: () => { useStore.getState().setAppRoute('plugins'); setVisible(false); },
+      },
+      {
         label: t('palette.cmd.openFleetView'),
         shortcut: 'toggleFleetView',
         action: () => { useStore.getState().setFleetViewVisible(true); setVisible(false); },
@@ -633,6 +638,21 @@ export default function CommandPalette() {
           },
         });
       }
+    }
+
+    // New workspace setup (wmux.json `fanout`): reachable before the project
+    // has a wmux.json at all, since saving it is what creates one.
+    if (activeWorkspaceId) {
+      items.push({
+        id: 'project-workspace-prep',
+        label: t('palette.cmd.workspacePrep'),
+        category: 'command' as PaletteCategory,
+        icon: <IconCommand />,
+        action: () => {
+          useStore.getState().setPrepDialogWsId(activeWorkspaceId);
+          setVisible(false);
+        },
+      });
     }
 
     // Layout template commands

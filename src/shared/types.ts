@@ -587,8 +587,11 @@ export interface MetadataUpdatePayload {
    * turn just started" from every other source of `agentStatus:'running'` (the
    * byte-rate heuristic, the activity reconciliation). A latch opened by a
    * heuristic guess would never decay and could never be trusted to close.
+   * `agent.teammate_wake` is main's own turn start for a lead turn an Agent
+   * Teams teammate's message woke, read from the transcript (#2494): no hook
+   * fires for it.
    */
-  hookKind?: AgentSignalKind;
+  hookKind?: AgentSignalKind | 'agent.teammate_wake';
   /**
    * This `agentStatus:'idle'` is a SETTLE — one of main's turn-end edges
    * (interrupt keystroke, OSC 133 back-at-prompt, agent process death, latch
@@ -1019,6 +1022,8 @@ export interface SessionData {
   windowGlass?: string;
   /** The theme's polarity ('dark' | 'light') at save time. Main reads it before the window exists to set the acrylic's tone on Windows. */
   windowAppearance?: string;
+  /** Windows: the glass level the renderer last applied to the window ('off' | 'soft' | 'clear'): the user's level, or 'off' while the theme cannot keep its text legible over glass (renderer/utils/glassCoverage.ts). Main starts the window from it, so such a launch is opaque from the first frame. The user's level stays in `windowGlass`. */
+  windowGlassEffective?: string;
   /** #1481 — workspace list order ('manual' | 'attention' | 'recent'). Absent in
    *  older sessions; `sidebarAttentionFirst` then decides. Whitelisted on load. */
   sidebarSortMode?: string;

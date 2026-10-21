@@ -79,6 +79,13 @@ export function isCoordinatorBot(profile: { template?: BotTemplate; role: BotRol
   return !!profile && botTemplate(profile) === 'coordinator';
 }
 
+/** Whether the bot takes a turn on what it is sent now: enabled, and not
+ *  parked by the owner or for an error (BotRuntime skips such a bot until it
+ *  is resumed; a budget park still runs the owner's messages). Pure. */
+export function botTakesTurns(profile: Pick<BotProfile, 'enabled' | 'parked'> | null | undefined): boolean {
+  return !!profile && profile.enabled && (!profile.parked || profile.parked.reason === 'budget');
+}
+
 /** The bot's new piece of work handed off from its own 1:1 or a group chat
  *  opens a request thread there (main/factory/handoffRouter.ts), which the
  *  conversation shows folded into one work card (shared/botsWork.ts): the
@@ -187,6 +194,11 @@ export interface BotProfile {
   /** The template the bot was made from. Absent only on a profile written
    *  before templates; the store fills it from `role` on read (botTemplate). */
   template?: BotTemplate;
+  /** The recipe "Add bot" started it from (shared/botRecipes.ts). Display
+   *  only: its profile lists what the recipe's connections still need. It
+   *  grants nothing and is never updated. An id this build does not know is
+   *  kept and not shown. */
+  recipe?: string;
   /** Display name, e.g. "Wmux Dev". */
   name: string;
   /** What the bot does, in the owner's words (normalizeBotJob). Part of its
@@ -279,6 +291,9 @@ export interface RemovedBot {
    *  knew it (the Bots page does). */
   hue?: number;
   removedAt: number;
+  /** The owner removed its 1:1 from the Bots page's Archive: the chat is no
+   *  longer listed, and the tombstone stays so its cards keep its name. */
+  clearedAt?: number;
 }
 
 /** Edge of the stored avatar PNG, in pixels. */
@@ -481,6 +496,8 @@ export interface BotSetJobParams {
  *  - `skills-changed`: a bot's skills changed (shared/botSkill.ts);
  *  - `memory-changed`: a bot's notes or the owner's profile changed
  *    (shared/botMemory.ts);
+ *  - `commands-changed`: a bot's command decisions, rules or switch
+ *    changed (shared/botCommand.ts);
  *  - `settings-changed`: the factory settings changed (the bots switched
  *    on or off, from any caller). */
 export type BotEventPayload =
@@ -493,6 +510,7 @@ export type BotEventPayload =
   | { type: 'groups-changed' }
   | { type: 'skills-changed'; botId?: string }
   | { type: 'memory-changed'; botId?: string }
+  | { type: 'commands-changed'; botId?: string }
   | { type: 'settings-changed' };
 
 export const BOT_EVENT = 'bot.event';

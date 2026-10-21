@@ -13,7 +13,7 @@ import { selectWorkspaceMuteRows } from '../../stores/selectors/workspaceProject
 import { LOCALE_OPTIONS, type Locale } from '../../i18n';
 import { useT } from '../../hooks/useT';
 import { useIpc } from '../../hooks/useIpc';
-import { THEME_OPTIONS, THEME_STYLES, type ThemeStyle, XTERM_PALETTE_OPTIONS, XTERM_PALETTES, builtinToCustom, DEFAULT_CUSTOM_THEME, deriveBuiltinPalette, deriveFullPalette, tokenAttrs, type BuiltinThemeId, type ThemeId, type XtermPaletteId, type UIThemeTokenKey, type TokenRole, type FullCssPalette } from '../../themes';
+import { THEME_OPTIONS, THEME_STYLES, type ThemeStyle, XTERM_PALETTE_OPTIONS, XTERM_PALETTES, builtinToCustom, DEFAULT_CUSTOM_THEME, PRE_CONTRAST_LIFT_TEXT, deriveBuiltinPalette, deriveFullPalette, tokenAttrs, type BuiltinThemeId, type ThemeId, type XtermPaletteId, type UIThemeTokenKey, type TokenRole, type FullCssPalette } from '../../themes';
 import {
   TAILWIND_PALETTE,
   TAILWIND_SHADES,
@@ -86,7 +86,7 @@ import { FanoutPresetsSection } from './FanoutPresetsSection';
 import { A2aRemoteSection } from './A2aRemoteSection';
 import { terminalFontFamilyCss } from '../../utils/terminalFont';
 import { hasBareFunctionKeyBinding } from '../../utils/functionKeyBinding';
-import { Icon, IconGrid, IconX, IconCheck, IconChevron, IconExternalLink, IconBrowser, IconComputer, IconUsers, IconRobot, IconRemoteDevices, IconPlus, IconWarning } from '../icons';
+import { Icon, IconPuzzle, IconX, IconCheck, IconChevron, IconExternalLink, IconBrowser, IconComputer, IconUsers, IconRobot, IconRemoteDevices, IconPlus, IconWarning } from '../icons';
 import { TabComputerUse } from './ComputerUseSection';
 import { QuickLaunchSection } from './QuickLaunchSection';
 import PairedDevicesModal from '../StatusBar/PairedDevicesModal';
@@ -111,6 +111,7 @@ import { MAX_WORKSPACE_IDLE_DAYS, MIN_WORKSPACE_IDLE_DAYS } from '../../../share
 import { sendWorkspaceSettleIdleDays } from '../../hooks/useWorkspaceSettleBridge';
 import { FactoryTab } from './FactoryTab';
 import { matchesShortcutQuery } from './shortcutSearch';
+import { verifyFailedAfterAvailable, verifyFailedAfterNotice, verifyFailedDisplayVersion } from './updateVerifyNotice';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -1582,11 +1583,23 @@ function UpdateStatus() {
   useEffect(() => { releaseNameRef.current = releaseName; }, [releaseName]);
   const [errorMsg, setErrorMsg] = useState<string>('');
   const [percent, setPercent] = useState<number | null>(null);
+  // In-app updates are off for this instance (it runs with a data suffix).
+  const [instanceDisabled, setInstanceDisabled] = useState(false);
+  // The published release whose installer failed verification; main does not
+  // download it again until the release changes, and this line says so.
+  const [verifyFailedVersion, setVerifyFailedVersion] = useState<string | null>(null);
+  // Live updater events seen so far, to order the mount-time getNotice reply
+  // against them.
+  const liveUpdaterEvents = useRef(0);
   // Updater-not-configured in dev is expected; don't spam toasts for UNKNOWN.
   const { invoke: ipcInvoke } = useIpc({ silent: ['UNKNOWN'] });
 
   useEffect(() => {
     const removeAvailable = window.electronAPI.updater.onUpdateAvailable((data) => {
+      liveUpdaterEvents.current++;
+      // Another release, or this one verified after all: the failure line no
+      // longer describes what is on offer.
+      setVerifyFailedVersion((prev) => verifyFailedAfterAvailable(prev, data));
       if (data.status === 'downloaded') {
         setState('downloaded');
         if (data.releaseName) setReleaseName(data.releaseName);
@@ -1612,13 +1625,23 @@ function UpdateStatus() {
       }
     });
     const removeProgress = window.electronAPI.updater.onUpdateProgress((data) => {
+      liveUpdaterEvents.current++;
       setState('downloading');
       setPercent(typeof data.percent === 'number' ? data.percent : null);
     });
     const removeNotAvailable = window.electronAPI.updater.onUpdateNotAvailable(() => {
+      liveUpdaterEvents.current++;
       setState('not-available');
+      setVerifyFailedVersion(null);
     });
     const removeError = window.electronAPI.updater.onUpdateError((data) => {
+      liveUpdaterEvents.current++;
+      // Said by its own line below, not as a generic failure with main's text.
+      if (data.code === 'verify-failed') {
+        setState('idle');
+        setVerifyFailedVersion(data.releaseName ? verifyFailedDisplayVersion(data.releaseName) : null);
+        return;
+      }
       setState('error');
       setErrorMsg(data.message || '');
     });
@@ -1649,6 +1672,26 @@ function UpdateStatus() {
     return () => { cancelled = true; };
   }, []);
 
+  // Same pull, for what no event may have reached this panel with.
+  useEffect(() => {
+    const read = window.electronAPI?.updater?.getNotice;
+    if (!read) return; // stale preload / tests
+    let cancelled = false;
+    // A live event that lands while this is in flight is fresher than the
+    // reply (verifyFailedAfterNotice).
+    const requestedAt = liveUpdaterEvents.current;
+    void read()
+      .then((notice) => {
+        if (cancelled) return;
+        setInstanceDisabled(notice.instanceDisabled);
+        setVerifyFailedVersion((prev) => verifyFailedAfterNotice(
+          prev, notice.verifyFailedVersion, requestedAt, liveUpdaterEvents.current,
+        ));
+      })
+      .catch(() => { /* the widget still works from live events */ });
+    return () => { cancelled = true; };
+  }, []);
+
   const handleCheck = async () => {
     setState('checking');
     const result = await ipcInvoke(() => window.electronAPI.updater.checkForUpdates());
@@ -1656,8 +1699,13 @@ function UpdateStatus() {
     // On an unsupported platform (or in dev) the handler answers 'not-available'
     // directly and no UPDATE_NOT_AVAILABLE event ever follows — without this the
     // widget would sit in 'checking' forever.
-    if ((result.data as { status?: string } | undefined)?.status === 'not-available') {
+    const status = (result.data as { status?: string } | undefined)?.status;
+    if (status === 'not-available') {
       setState('not-available');
+    } else if (status === 'disabled') {
+      // Nothing was checked: this instance does not update itself.
+      setState('idle');
+      setInstanceDisabled(true);
     }
   };
 
@@ -1719,6 +1767,20 @@ function UpdateStatus() {
           {state === 'error' && errorMsg && (
             <span className="ui-field-description font-mono">{errorMsg}</span>
           )}
+          {instanceDisabled && (
+            <span className="ui-field-description" data-update-instance-disabled>
+              {t('settings.updatesOffForInstance')}
+            </span>
+          )}
+          {verifyFailedVersion && !instanceDisabled && (
+            <span
+              className="ui-field-description"
+              style={{ color: 'var(--accent-yellow)' }}
+              data-update-verify-failed
+            >
+              {t('settings.updateVerifyFailed', { version: verifyFailedVersion })}
+            </span>
+          )}
           {/* #866: the Windows install has to run against a dead tree, so the
               daemon goes down with the app and live panes do not survive it.
               Said before the button is pressed, not after — the old copy
@@ -1751,7 +1813,7 @@ function UpdateStatus() {
           <Button
             variant="secondary"
             onClick={handleCheck}
-            disabled={state === 'checking' || state === 'downloading'}
+            disabled={state === 'checking' || state === 'downloading' || instanceDisabled}
             data-settings-check-update
           >
             {t('settings.checkUpdate')}
@@ -2762,16 +2824,34 @@ const TOKEN_INSPECT_ROLE: Record<UITokenSpec['key'], TokenRole> = {
  * Detect which built-in preset a CustomThemeColors most closely came from, by
  * exact-matching the 10 UI tokens. Returns null when it matches none (fully
  * hand-tuned). Used to label the header and as the per-token "overridden" base.
+ * A copy saved before a preset's text tokens were lifted for contrast
+ * (PRE_CONTRAST_LIFT_TEXT) still matches that preset, as its legacy variant.
  */
-export function detectBasePreset(colors: CustomThemeColors): BuiltinThemeId | null {
+export function detectBaseMatch(colors: CustomThemeColors): { preset: BuiltinThemeId; colors: CustomThemeColors } | null {
   for (const { value } of BASE_ON_OPTIONS) {
-    const preset = builtinToCustom(value);
-    const same = UI_TOKEN_GROUPS.every((g) =>
-      g.tokens.every(({ key }) => colors[key].toUpperCase() === preset[key].toUpperCase()),
-    );
-    if (same) return value;
+    const current = builtinToCustom(value);
+    const legacy = PRE_CONTRAST_LIFT_TEXT[value];
+    for (const preset of legacy ? [current, { ...current, ...legacy }] : [current]) {
+      const same = UI_TOKEN_GROUPS.every((g) =>
+        g.tokens.every(({ key }) => colors[key].toUpperCase() === preset[key].toUpperCase()),
+      );
+      if (same) return { preset: value, colors: preset };
+    }
   }
   return null;
+}
+
+export function detectBasePreset(colors: CustomThemeColors): BuiltinThemeId | null {
+  return detectBaseMatch(colors)?.preset ?? null;
+}
+
+/**
+ * The colours the per-token "overridden" dots compare against: the variant
+ * the live colours matched (so an untouched legacy copy shows no overrides),
+ * else the chosen preset.
+ */
+export function baseColorsFor(colors: CustomThemeColors, chosen: BuiltinThemeId): CustomThemeColors {
+  return detectBaseMatch(colors)?.colors ?? builtinToCustom(chosen);
 }
 
 function CustomThemeEditor() {
@@ -2793,7 +2873,7 @@ function CustomThemeEditor() {
   // If the live colors exactly match a built-in (e.g. just reseeded), keep the
   // comparison base in sync so nothing reads as "overridden" right after a reset.
   const effectiveBase = detected ?? basePreset;
-  const baseColors = useMemo(() => builtinToCustom(effectiveBase), [effectiveBase]);
+  const baseColors = useMemo(() => baseColorsFor(customThemeColors, effectiveBase), [customThemeColors, effectiveBase]);
   const baseLabel = BASE_ON_OPTIONS.find((o) => o.value === effectiveBase)?.label ?? effectiveBase;
 
   // Surface-aware contrast: each text/accent token vs bgBase/bgSurface/bgMantle.
@@ -5372,7 +5452,7 @@ export default function SettingsPanel({ initialTab }: { initialTab?: string }) {
     tokens:               { label: t('settings.tabTokens'),        icon: <IconAgents /> },
     browser:              { label: t('settings.tabBrowser'),       icon: <IconBrowser /> },
     'computer-use':       { label: t('settings.tabComputerUse'),   icon: <IconComputer /> },
-    plugins:              { label: t('plugins.settings.title'), icon: <IconGrid /> },
+    plugins:              { label: t('plugins.settings.title'), icon: <IconPuzzle /> },
     remote:               { label: t('settings.tabRemote'),        icon: <IconRemoteDevices /> },
     lanlink:              { label: t('settings.tabLan'),           icon: <IconLanLink /> },
     about:                { label: t('settings.tabAbout'),         icon: <IconAbout /> },

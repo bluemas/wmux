@@ -122,6 +122,29 @@ describe('proposal cards', () => {
   });
 });
 
+describe('an html block in a long card', () => {
+  it('has no Preview while folded; Preview comes back after a fold and an unfold', async () => {
+    const body = `${'Some notes. '.repeat(40)}\n\n\`\`\`html\n<p>hi</p>\n\`\`\``;
+    const report = card(6, { kind: 'report', title: 'Page', body, actor: { kind: 'bot', workspaceId: WS, botId: 'bot-1' } });
+    await render(createElement(RoomCard, { card: report, workspaceId: WS, t, bots: [] }));
+    const more = () => container.querySelector<HTMLButtonElement>('[data-card-more]')!;
+    const toggle = () => container.querySelector('[data-testid="brain-md-html-view"]');
+    const radio = (n: number) => toggle()!.querySelectorAll<HTMLButtonElement>('[role="radio"]')[n];
+    // Folded: the block is clamped, so it shows its source only.
+    expect(toggle()).toBeNull();
+    act(() => more().click());
+    expect(container.querySelector('[data-brain-md-code-view]')?.getAttribute('data-brain-md-code-view')).toBe('code');
+    act(() => radio(0).click());
+    expect(container.querySelector('[data-card-body] iframe')).not.toBeNull();
+    act(() => more().click());
+    expect(toggle()).toBeNull();
+    expect(container.querySelector('[data-card-body] iframe')).toBeNull();
+    act(() => more().click());
+    expect(container.querySelector('[data-brain-md-code-view]')?.getAttribute('data-brain-md-code-view')).toBe('preview');
+    expect(container.querySelector('[data-card-body] iframe')).not.toBeNull();
+  });
+});
+
 describe('composer: the real bot it queued for', () => {
   const lead: FactoryBotRow = { bot: bot('bot-lead', { name: 'Ada' }), status: running('bot-lead', 'w-other') };
   const moa: FactoryBotRow = { bot: bot('bot-moa', { name: 'Moa HQ', role: 'moa', workspaceId: HQ }), status: null };
@@ -227,6 +250,15 @@ describe('Settings › Factory merge lane rows', () => {
     expect(port.set).not.toHaveBeenCalledWith({ laneAutoMerge: true });
     await act(async () => sw.click());
     expect(port.set).toHaveBeenLastCalledWith({ laneAutoMerge: true });
+  });
+
+  it('the command reviewer switch is on by default and saves the owner\'s choice', async () => {
+    const port = settingsPort();
+    await render(createElement(FactoryTab, { settingsPort: port, botPort: NO_BOTS }));
+    const sw = container.querySelector<HTMLButtonElement>('[data-testid="factory-command-reviewer"]')!;
+    expect(sw.getAttribute('aria-checked')).toBe('true');
+    await act(async () => sw.click());
+    expect(port.set).toHaveBeenLastCalledWith({ botCommandReviewer: false });
   });
 
   it('lists bot names as the bot port reports them', async () => {

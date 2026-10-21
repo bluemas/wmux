@@ -17,6 +17,7 @@ import { persistCodexThreadOwner, invalidateCodexThreadOwner, trackCodexPaneOwne
 import { codexCdOperand, recoverCodexPane, withCodexRemote } from './web/recoverCodexPane';
 import { CodexRelayUnavailableError } from './web/codexTuiRelay';
 import { paneCodexSettings } from './web/paneCodexSettings';
+import { createPaneJob } from './paneJob';
 import { CodexPaneRelays, paneCodexHome } from './web/codexPaneRelays';
 import { createCodexAccountStatusReader } from './web/codexAccountStatus';
 import { buildAgentLaunch, installedAgentLaunchOptions, pinnedAgentLaunch } from './web/agentLaunch';
@@ -35,6 +36,8 @@ import { recordedRunPtyIds } from './automation/store';
 import { AUTOMATION_EVENT } from '../shared/automation';
 import { InputReceiptStore } from './web/InputReceiptStore';
 import { PhoneWorktreeService } from './web/phoneWorktree';
+import { ProjectConfigStore } from '../main/project/ProjectConfigStore';
+import { phonePrepSummary, prepareNewWorktree } from '../main/worktask/workspacePrep';
 import { PhoneGitWriteGate } from './web/phoneGitWriteGate';
 import { startPushRecovery } from './web/phoneGitPush';
 import { AnswerReceiptStore } from './approvals/AnswerReceiptStore';
@@ -125,6 +128,7 @@ import { DEFAULT_COMPANY_ID, CHANNELS_EPOCH } from '../shared/channels';
 import { A2aTaskService } from './a2a/A2aTaskService';
 import { parsePublicCreateTask } from './a2a/publicCreateParams';
 import { WorkTaskService } from './worktask/WorkTaskService';
+import { listMissionsBatch } from './worktask/missionListBatch';
 import { isTaskState, type AgentStatus, type Task } from '../shared/types';
 import { ProcessMonitor } from './ProcessMonitor';
 import { AgentProcessTracker } from './AgentProcessTracker';
@@ -138,7 +142,7 @@ import { inspectLaunchPresence } from './launchPresence';
 import { promptLineState } from '../shared/promptLineState';
 import { parseWriteExpectation, writeIfUnchanged } from './writeIfUnchanged';
 import { Watchdog } from './Watchdog';
-import { selectRecoverableSessions, startLeftoverShellReaps } from './recoverySelector';
+import { recoversInBackground, selectRecoverableSessions, startLeftoverShellReaps } from './recoverySelector';
 import { isShutdownKillExit, SHUTDOWN_KILL_RECLASSIFY_MS } from './shutdownKill';
 import {
   classifyReapIdentity,
@@ -162,10 +166,13 @@ import { RingBuffer } from './RingBuffer';
 import { GitContextWatcher } from '../main/pty/gitContextWatch';
 import { PortWatcher } from '../main/pty/portWatch';
 import { initDaemonLogSink, isBrokenPipeError, stdioErrorsConsumed } from './util/logSink';
-import { installExitEvidence, noteExitReason, STATUS_CONTROL_C_EXIT } from './exitEvidence';
+import { installExitEvidence, noteExitReason } from './exitEvidence';
 import { newerTimestamp } from './util/idleAnchor';
 import type { DaemonSession, DaemonState } from './types';
 import { retireAdopted, withDiskOnlySessions } from './diskOnlySessions';
+import { stampHeld } from './heldSessions';
+import { suspendedListEntry } from './suspendedListEntry';
+import { createPromoteOnce, type PromoteResult } from './promoteOnce';
 import type { DaemonEvent, DaemonCreateSessionParams, DaemonDestroySessionParams, DaemonSessionIdParams, DaemonResizeParams, DaemonSetResumeBindingParams } from '../shared/rpc';
 import { isWslDistroSpawnArgs } from '../shared/wslDistro';
 import { gitDirMapperFor, gitWatchCwdFor } from './gitWatchCwd';
@@ -187,6 +194,7 @@ import { checkNativeTranscriptPath } from './transcript/providers';
 import { TranscriptProjector } from './transcript/TranscriptProjector';
 import { TranscriptActivityWatcher } from './transcript/TranscriptActivityWatcher';
 import { ApiErrorTurnEnds, stopFailureSignal } from './transcript/apiErrorTurnEnd';
+import { TeammateWakes, turnEndAt } from './transcript/teammateWake';
 import { TranscriptDiscovery, DISCOVERABLE_AGENT } from './transcript/TranscriptDiscovery';
 import { admitCodexCapture, gateCodexStop } from './transcript/codexCapture';
 import { CodexCwdBinder, codexLiveFor, describeCodexPane, readProcessStartMs, type CodexPaneFacts } from './transcript/codexRolloutByCwd';
@@ -275,6 +283,14 @@ function getPhoneWorktrees(sessionManager: DaemonSessionManager): PhoneWorktreeS
     liveCwds: () => sessionManager.listSessions().flatMap((s) => [s.cwd, s.spawnCwd].filter((c): c is string => typeof c === 'string' && c.length > 0)),
     audit: (deviceId, reason) => getDeviceStore().recordGitWorktree(deviceId, reason),
     log: (level, msg) => log(level, msg),
+    // A person asked for this worktree from the phone: it is prepared like one
+    // opened on the desktop. A fresh store per job, so trust the desktop has
+    // just granted (or revoked) is read from disk, not from a stale cache.
+    prepare: async (sourceCwd, worktreeDir) => {
+      const store = new ProjectConfigStore();
+      const result = await prepareNewWorktree({ sourceCwd, worktreePath: worktreeDir, origin: 'human' }, { getState: (cwd) => store.getState(cwd) });
+      return phonePrepSummary(result);
+    },
   });
 }
 // Phone git write actions: one gate for the daemon's lifetime, shared by every
@@ -344,6 +360,7 @@ let transcriptProjector: TranscriptProjector | null = null;
 // Codex): tails the agent's own transcript. Guarded like the projector.
 let transcriptActivity: TranscriptActivityWatcher | null = null;
 let apiErrorTurnEnds: ApiErrorTurnEnds | null = null;
+let teammateWakes: TeammateWakes | null = null;
 // Phone native chat bridge (contract v0.3.1). Built in registerRpcHandlers next
 // to the services it wraps; the web server reads it lazily per request.
 let chatBridge: ChatBridge | null = null;
@@ -431,6 +448,8 @@ const codexSharedRuntime = createCodexSharedRuntime({
   notice: (paneId, title, body) => broadcastCodexNotice?.(paneId, title, body),
   log: (level, message) => log(level, message),
 });
+// #2398: one kill-on-close job for every pane shell this daemon spawns.
+const paneJob = createPaneJob({ log: (level, message) => log(level, message) });
 const codexPaneRelays = new CodexPaneRelays(undefined,()=>log('warn','[phone] Codex relay cleanup failed'),
   (id,owner)=>persistCodexRelayState?.(id,owner),
   {
@@ -2933,10 +2952,29 @@ function registerRpcHandlers(
     stateWriter.saveImmediate(next);
   };
 
+  // #2398 — daemon.holdSession: a pane that attached without promoting (it is
+  // hidden) still holds this suspended session; keep it from aging out (see
+  // heldSessions.ts). Stamped on the record the next save writes; the save is
+  // debounced, so a boot that holds many panes writes once.
+  pipeServer.onRpc('daemon.holdSession', (params) => {
+    const ids = Array.isArray(params?.['ids']) ? (params['ids'] as unknown[]).filter((id): id is string => typeof id === 'string') : [];
+    const now = Date.now();
+    let stamped = 0;
+    for (const id of ids) {
+      const record = sessionManager.getPendingRecovery(id) ?? diskOnlySessions.find((s) => s.id === id);
+      if (stampHeld(record, now)) stamped++;
+    }
+    if (stamped > 0) stateWriter.saveDebounced(buildState(sessionManager));
+    return Promise.resolve({ ok: true, stamped });
+  });
+
   // daemon.attachSession
   pipeServer.onRpc('daemon.attachSession', async (params) => {
-    const p = params as unknown as DaemonSessionIdParams;
+    const p = params as unknown as DaemonSessionIdParams & { promote?: boolean };
     if (sessionManager.getPendingRecovery(p.id)) {
+      // #2398 — `promote: false` (a pane not on screen) leaves a pending
+      // recovery pending: nothing is spawned until the pane is shown.
+      if (p.promote === false) return { ok: false, pending: true };
       touchPendingRecovery(p.id);
       const result = await promoteOnce(p.id);
       if (!result.ok) throw new Error(result.error?.message || 'WSL recovery failed; retry after checking the target');
@@ -3354,22 +3392,15 @@ function registerRpcHandlers(
 
     // Fix B: when includeSuspended is requested, append cap-skipped suspended
     // sessions from the persisted state that aren't already in the active set.
+    // #2398 — with their exec and supervision (suspendedListEntry), so main's
+    // pty:reconnect and the renderer's reconcile start a cap-skipped unit
+    // instead of holding it as a plain shell.
     if (includeSuspended) {
       const activeIdSet = new Set(activeSessions.map((s: { id: string }) => s.id));
       const persistedState = stateWriter.load();
       const suspendedEntries = persistedState.sessions
         .filter((s) => s.state === 'suspended' && !activeIdSet.has(s.id))
-        .map((s) => ({
-          id: s.id,
-          // `cmd` as every live entry has it (pty:reconnect records and returns
-          // it after a promote, #2398); `shell` kept for older readers.
-          cmd: s.cmd,
-          shell: s.cmd,
-          state: 'suspended' as const,
-          cwd: s.cwd,
-          createdAt: s.createdAt,
-          lastActivity: s.lastActivity,
-        }));
+        .map((s) => suspendedListEntry(s, isUsableResumeBinding(s.resumeBinding) && bindingTranscriptLives(s.resumeBinding)));
       return reply([...activeSessions, ...suspendedEntries]);
     }
     return reply(activeSessions);
@@ -3380,10 +3411,7 @@ function registerRpcHandlers(
   // came back with its ptyId absent and reconcile destructively cleared it. This
   // lets the renderer spawn exactly the one session it still needs, keeping the
   // ptyId stable so scrollback restores from the daemon's ring buffer.
-  /** What a promote attempt answers — see `promoteSession`. */
-  type PromoteResult = { ok: boolean; alreadyActive?: boolean; error?: { code: string; message: string } };
-  const promotionInFlight = new Map<string, { operation: Promise<PromoteResult>; startFresh: boolean }>();
-  const promoteSession = async (rawParams: Record<string, unknown>) => {
+  const promoteSession = async (rawParams: Record<string, unknown>): Promise<PromoteResult> => {
     if (shuttingDown) return { ok: false, error: { code: 'SHUTTING_DOWN', message: 'Daemon is shutting down; retry after reconnect.' } };
     const params = (rawParams ?? {}) as Record<string, unknown>;
     const sessionId = typeof params['id'] === 'string' ? params['id'] : '';
@@ -3534,25 +3562,16 @@ function registerRpcHandlers(
       return { ok: false, error: { code: isWslCwdMissingError(err) ? 'CWD_MISSING' : 'SPAWN_FAILED', message: msg } };
     }
   };
-  const promoteOnce = (id: string, startFresh = false) => {
-    const existing = promotionInFlight.get(id);
-    // Same intent → one attempt, as before. A DIFFERENT intent must not be
-    // answered by the one already running: start-fresh exists because the
-    // ordinary promote fails, so handing back that promote's result would
-    // answer a question the user did not ask (#1305). Queue behind it instead —
-    // and if the one in flight happens to succeed, the idempotent
-    // already-active check makes the second a no-op.
-    if (existing && existing.startFresh === startFresh) return existing.operation;
-    const run = () => promoteSession({ id, fresh: startFresh });
-    const operation: Promise<PromoteResult> = (existing ? existing.operation.catch(() => undefined).then(run) : run())
-      .finally(() => {
-        if (promotionInFlight.get(id)?.operation === operation) promotionInFlight.delete(id);
-      });
-    promotionInFlight.set(id, { operation, startFresh });
-    return operation;
-  };
+  // #2398 — answers `joined` to a caller that joined the background start.
+  const promoteOnce = createPromoteOnce((p) => promoteSession(p), (id) => !!sessionManager.getSession(id));
+  sessionManager.on('session:died', (payload: { id: string }) => promoteOnce.forget(payload.id));
+  sessionManager.on('session:destroyed', (payload: { id: string }) => promoteOnce.forget(payload.id));
   pipeServer.onRpc('daemon.promoteSession', (params) => {
     const id = String(params?.id ?? '');
+    // #2398 — `joinOnly` (a stop key, a repaint): join an attempt in flight,
+    // never start one (see createPromoteOnce for the answer when none is).
+    // Not a retry, so the pending entry is not renewed.
+    if (params?.['joinOnly'] === true) return promoteOnce(id, false, 'rpc', true);
     // Before the attempt, so an attempt that fails on a path with no save
     // still records that the user is actively retrying this pane (#1305).
     touchPendingRecovery(id);
@@ -3561,14 +3580,22 @@ function registerRpcHandlers(
   // Defer cold WSL starts until RPC registration/event wiring can finish.
   // Independent panes recover concurrently; foreground attach shares the same
   // in-flight promotion. Exec units also resume when no GUI is attached.
+  // #2398 (owner decision §6-4) — only exec units and supervised sessions,
+  // which must run whether or not anyone looks at them. A plain WSL shell
+  // starts when its pane is first shown (the renderer's attach promotes it),
+  // so a cold start with many restored workspaces does not start one per
+  // pane nobody opened.
   setImmediate(() => {
     if (shuttingDown) return;
     const promotions: Array<Promise<unknown>> = [];
     try {
-      const pending = sessionManager.listSessions().filter(s => sessionManager.getPendingRecovery(s.id));
+      const pending = sessionManager.listSessions().filter(s => {
+        const placeholder = sessionManager.getPendingRecovery(s.id);
+        return !!placeholder && recoversInBackground(placeholder);
+      });
       const selected = selectRecoverableSessions(pending, Math.min(loadConfig().session.maxSessions, MAX_RECOVER_SESSIONS));
       for (const session of pending.filter(s => selected.recoverableIds.has(s.id))) {
-        promotions.push(promoteOnce(session.id).catch(err => log('error', `WSL background recovery ${session.id}:`, err)));
+        promotions.push(promoteOnce(session.id, false, 'background').catch(err => log('error', `WSL background recovery ${session.id}:`, err)));
       }
     } catch (err) {
       log('error', 'WSL background recovery could not start:', err);
@@ -4222,6 +4249,34 @@ function registerRpcHandlers(
     });
   }
   const turnEnds = apiErrorTurnEnds;
+  // A Claude lead turn an Agent Teams teammate's message woke (#2494): no
+  // prompt hook fires for it, so its start is read from the same tail, and the
+  // pane's turn opens the way a running hook opens it. Its Stop (or a
+  // StopFailure, or the API-error stand-in above) closes it as usual.
+  if (!teammateWakes) {
+    teammateWakes = new TeammateWakes({
+      isReader: (id, path) => transcriptActivity?.readsLines(id, path) === true,
+      mayOpen: (id, path) => {
+        const session = sessionManager.getSession(id);
+        const binding = resolveTranscriptBinding(id);
+        if (!session || isBrainPty({ id, env: session.meta.env })) return false;
+        const agent = agentRow(binding?.agent);
+        if (!binding || !agent?.apiErrorTurnEnd || binding.transcriptPath !== path) return false;
+        if (!checkNativeTranscriptPath(agent.slug, path, binding.sessionId, session.meta.env).ok) return false;
+        // A dialog the turn waits on belongs to a person; it is not a new turn.
+        return !session.bridge.isAwaitingHuman();
+      },
+      emit: (id, at) => {
+        const bridge = sessionManager.getSession(id)?.bridge;
+        if (!bridge) return;
+        log('info', `[hooks] ${id}: lead turn woken by a teammate's message, read from the transcript`);
+        bridge.noteAgentStatus('running', true, undefined, false, at);
+        const event: DaemonEvent = { type: 'agent.teammateWake', sessionId: id, data: { at } };
+        pipeServer.broadcast(event);
+      },
+    });
+  }
+  const wakes = teammateWakes;
   if (!transcriptActivity) {
     transcriptActivity = new TranscriptActivityWatcher({
       listSessionIds: () => sessionManager.listLiveSessions().map((s) => s.id),
@@ -4257,7 +4312,10 @@ function registerRpcHandlers(
         const event: DaemonEvent = { type: 'agent.subagents', sessionId, data: { count } };
         pipeServer.broadcast(event);
       },
-      onClaudeLine: (sessionId, path, line) => turnEnds.noteLine(sessionId, path, line),
+      onClaudeLine: (sessionId, path, line) => {
+        turnEnds.noteLine(sessionId, path, line);
+        wakes.noteLine(sessionId, path, line);
+      },
       onClaudeGap: (sessionId) => turnEnds.noteGap(sessionId),
       afterTick: () => turnEnds.settle(),
     });
@@ -4827,6 +4885,10 @@ function registerRpcHandlers(
         detectionAgreementLog?.noteHook(sessionId, data, { provisionalStop: codexStopUnconfirmed });
         const event: DaemonEvent = { type: 'agent.event', sessionId, data };
         pipeServer.broadcast(event);
+        // #2494 — a woken lead turn waits for the turn end it follows to be
+        // applied, held Stops included (see teammateWake.ts).
+        const turnEnd = turnEndAt(data);
+        if (turnEnd !== undefined) teammateWakes?.noteTurnEnd(sessionId, turnEnd);
         // Phone liveness header. The desktop reads pane state off this same
         // broadcast; the phone has no pipe, so the web server gets the projected
         // state (non-recording, coalesced, watchers only — see
@@ -4898,6 +4960,7 @@ function registerRpcHandlers(
         // A hook-fed session's own activity line wins over the transcript.
         transcriptActivity?.noteHookSignal(sessionId, kind);
         apiErrorTurnEnds?.noteHookSignal(sessionId, kind, ts, promptId);
+        teammateWakes?.noteHookSignal(sessionId, kind, ts);
         // #782 — phone turn-view nudge. Non-recording: bypasses attentionLog so
         // a busy pane cannot evict a pending approval and blank the badge on
         // replay (CRITICAL 3). Delivered only to devices watching this pane; a
@@ -5914,6 +5977,9 @@ function registerRpcHandlers(
       pid: process.pid,
       uptime,
       sessions: sessions.length,
+      // #2398: how pane shells join the kill-on-close job ('inherit': the
+      // daemon is in it), shells in it, and ones it could not take.
+      paneJob: paneJob.stats(),
       // Sessions with a running PTY (attached or detached). An upgrade over SSH
       // restarts the daemon only when this is 0.
       liveSessions: sessionManager.listLiveSessions().length,
@@ -6606,6 +6672,12 @@ function registerRpcHandlers(
     if (!workTaskService) {
       return { ok: false, error: { code: 'NOT_AVAILABLE', message: 'task.mission.list: mission log unavailable' } };
     }
+    // Batched form (#2372): many owners in one call, checked before the
+    // caller stamp so a pane caller cannot batch (missionListBatch.ts).
+    if (rawParams['verifiedWorkspaceIds'] !== undefined) {
+      const service = workTaskService;
+      return listMissionsBatch(rawParams, (owner) => service.listMissions(owner));
+    }
     const stamped = stampCaller(rawParams, { kind: 'none' });
     if (!stamped.ok) return stamped;
     const p = stamped.params;
@@ -6976,6 +7048,7 @@ function wireEvents(
     transcriptProjector?.dropPty(payload.id);
     transcriptActivity?.dropSession(payload.id);
     apiErrorTurnEnds?.dropSession(payload.id);
+    teammateWakes?.dropSession(payload.id);
     terminalChat?.dropPty(payload.id);
     // …and nothing left to discover a transcript FOR.
     transcriptDiscovery?.cancel(payload.id);
@@ -7641,6 +7714,7 @@ function wireEvents(
     transcriptProjector?.dropPty(payload.id);
     transcriptActivity?.dropSession(payload.id);
     apiErrorTurnEnds?.dropSession(payload.id);
+    teammateWakes?.dropSession(payload.id);
     terminalChat?.dropPty(payload.id);
     // …and nothing left to discover a transcript FOR.
     transcriptDiscovery?.cancel(payload.id);
@@ -7878,6 +7952,12 @@ async function shutdown(
 ): Promise<{ stateSaved: boolean }> {
   if (shuttingDown) return { stateSaved: false };
   shuttingDown = true;
+  // #2398: a clean exit keeps what panes started on purpose (paneJob.ts).
+  // Disarmed here, where the exit is decided: every caller's kill budget (the
+  // tray's full shutdown, Quit and Stop Sessions, an update, the 10s guard
+  // below) can end the phases that follow, and a kill-on-close job still armed
+  // then would take every pane's tree with it.
+  paneJob.disarm();
   noteExitReason(`shutdown (${signal})`);
   gateFlag?.stop();
   stopPushRecovery?.();
@@ -8124,6 +8204,11 @@ async function main(): Promise<void> {
     process.exit(lockHeldByLiveDaemon && process.env[DAEMON_SUPERVISED_ENV] === '1' ? DAEMON_EXIT_ALREADY_RUNNING : 1);
   }
   markDaemonBoot('lock-acquired');
+  // #2398: the daemon joins its kill-on-close job before it spawns anything,
+  // so every process it creates, pane shells first, is in the job from
+  // CreateProcess (paneJob.ts). After the lock: a daemon that lost it exits
+  // without shutdown(), and must not take what it spawned with it.
+  paneJob.enter();
 
   // Cache boot ID early (async) so buildState() never needs to block
   await initBootId();
@@ -8165,6 +8250,8 @@ async function main(): Promise<void> {
 
   const sessionManager = new DaemonSessionManager();
   sessionManager.setConfig(config);
+  // #2398: pane shells end with the daemon when it crashes or is killed.
+  sessionManager.setPaneJob(paneJob);
   // Opt-in, local-only detection agreement log — see
   // daemon/diagnostics/detectionAgreementLog.ts. Built before any session can
   // emit; the hook authority is read lazily because HookIngest is created later
@@ -9788,13 +9875,12 @@ async function main(): Promise<void> {
   process.on('SIGINT', () => { onExitSignal('SIGINT'); void doShutdown('SIGINT'); });
   if (process.platform === 'win32') {
     // Ctrl+Break. With no listener Windows ends the process with
-    // STATUS_CONTROL_C_EXIT; a listener suppresses that, so this one logs and
-    // then exits with the same code. Only a daemon run in a console (a
-    // foreground `wmux daemon`) can receive it — the launcher's is detached.
-    process.on('SIGBREAK', () => {
-      onExitSignal('SIGBREAK');
-      process.exit(STATUS_CONTROL_C_EXIT);
-    });
+    // STATUS_CONTROL_C_EXIT; a listener suppresses that, so it takes the same
+    // clean exit as Ctrl+C, which disarms the pane job first (#2398): a plain
+    // process.exit here would end everything the panes started. Only a daemon
+    // run in a console (a foreground `wmux daemon`) can receive it — the
+    // launcher's is detached.
+    process.on('SIGBREAK', () => { onExitSignal('SIGBREAK'); void doShutdown('SIGBREAK'); });
   }
 
   // Last-resort synchronous save on process exit — registered on ALL platforms.

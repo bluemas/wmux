@@ -12,6 +12,8 @@ import { useStore } from '../../stores';
 import { useT } from '../../hooks/useT';
 import type { Toast, ToastLevel } from '../../stores/slices/toastSlice';
 import { focusNotificationTarget } from '../../hooks/useNotificationListener';
+import { prepNoticeToast } from '../../../shared/gitHandoff';
+import { prepCardToast, type WorkspacePrepCardStatus } from '../../../shared/workspacePrepCard';
 
 const AUTO_DISMISS_MS = 5_000;
 
@@ -131,6 +133,29 @@ export default function ToastContainer() {
   // titlebar (40px) AND the page's 44px header band, whose right end holds the
   // narrow layout's workers button and the worker panel's controls (#2231).
   const top = useStore((s) => s.appRoute === 'bots');
+
+  // A new worktree's preparation notice from main (Quick Launch): one toast.
+  useEffect(() => {
+    const off = window.electronAPI?.workspacePrepNotice?.on((notice) => {
+      const toast = prepNoticeToast(notice);
+      if (toast) useStore.getState().pushToast({ level: 'warn', message: t(toast.key, toast.values) });
+    });
+    return () => off?.();
+  }, [t]);
+
+  // A "Preparing" card that failed, was skipped or left files out: a toast
+  // too, so it is seen from any page (the card in the sidebar is where to
+  // answer it).
+  useEffect(() => {
+    const seen = new Map<string, WorkspacePrepCardStatus>();
+    const off = window.electronAPI?.workspacePrep?.onCard((card) => {
+      const toast = prepCardToast(seen.get(card.id), card);
+      if (card.status === 'closed') seen.delete(card.id);
+      else seen.set(card.id, card.status);
+      if (toast) useStore.getState().pushToast({ level: 'warn', message: t(toast.key, toast.values) });
+    });
+    return () => off?.();
+  }, [t]);
 
   if (toasts.length === 0) return null;
 

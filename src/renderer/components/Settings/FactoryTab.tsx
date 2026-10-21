@@ -9,8 +9,8 @@
 // them, each with its avatar and template), with a
 // small profile editor when the bot port can update them (name, job,
 // picture, switch and budget; the repository is shown, not changed), and
-// "Add bot" (workspace and name; optionally a picture, a template chip that
-// prefills the job, the job and a repository) when the bot port can create
+// "Add bot" (workspace and name; optionally a picture, a recipe or a
+// template chip that prefills the job, the job and a repository) when the bot port can create
 // them. A workspace works on one repository: once a bot there has one, a new
 // bot takes it; before that, main suggests the workspace's own folder, shown
 // as "Works on <repo>" with Change and None (nothing is attached unseen).
@@ -24,7 +24,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useStore } from '../../stores';
 import { useT } from '../../hooks/useT';
 import { BOT_JOB_MAX, BOT_NAME_MAX, TEMPLATE_LEGACY_ROLE, isCoordinatorBot, normalizeBotJob, normalizeBotName, type BotProfile, type BotRole, type BotTemplate } from '../../../shared/bot';
-import { TEAM_TEMPLATES, type FactoryBotAvatarPickResult, type FactoryBotRepoSuggestion } from '../../../shared/botCreate';
+import { TEAM_TEMPLATES, teamTemplatesPresent, type FactoryBotAvatarPickResult, type FactoryBotRepoSuggestion } from '../../../shared/botCreate';
 import { FACTORY_LANE_DAILY_CAP_MAX } from '../../../shared/factorySettings';
 import type { FactoryTaskFolderUsage } from '../../../shared/botTask';
 import { getLocale } from '../../i18n';
@@ -54,11 +54,13 @@ import { BotConnectionsSection } from './BotConnectionsSection';
 import { ClaudeAuthSection, bridgeClaudeAuthPort, type ClaudeAuthPort } from './ClaudeAuthSection';
 import { InlineConfirm } from '../Bots/InlineConfirm';
 import { selectBotTaskOwners, withoutBotTasks } from '../Sidebar/botTasks';
-import { listedWorkspaces } from '../../stores/slices/moaSlice';
+import { listedWorkspaces } from '../../../shared/pcRail';
 import { createBot, turnBotsOn, type TurnBotsOnResult } from '../Bots/botsAddBot';
 import { botsOnPatch, useBotsPlanConsent } from '../Bots/BotsPlanConsent';
 import { botsStopPort, toastStoppedWork } from '../Bots/botsStop';
 import { botModelSummary } from '../Bots/botsProfile';
+import { RecipePicker, recipeJob } from '../Bots/BotRecipes';
+import type { BotRecipe } from '../../../shared/botRecipes';
 
 type T = (key: string, vars?: Record<string, string | number>) => string;
 
@@ -326,8 +328,9 @@ type Workspaces = readonly { id: string; name: string }[];
 const NO_LIST_PORT: FactoryBotPort = { available: false, list: async () => [], subscribe: () => () => undefined, act: async () => ({ ok: false }) };
 
 export interface AddBotFormProps {
-  /** Called with the new bot after it was added (a team: its lead, and the
-   *  whole team), and with nothing on Cancel. */
+  /** Called with the new bot after it was added (a team: the lead made
+   *  here, or none when the lead was there already, and the whole team, its
+   *  lead first), and with nothing on Cancel. */
   onDone: (bot?: BotProfile, team?: readonly BotProfile[]) => void;
   /** The rest default to the app's own: the bot port, its bots, the store's
    *  workspaces (the active one first picked) and the folder dialog. */
@@ -342,6 +345,9 @@ export interface AddBotFormProps {
   /** Turns the bots on, asking the plan consent when needed (default: the
    *  factory settings port, which turns them on only with consent stored). */
   turnOn?: () => Promise<TurnBotsOnResult>;
+  /** 'team': only the workspace and the repository, and Add team as the
+   *  primary (the Bots page's "+" › Add team). Default: one bot. */
+  mode?: 'bot' | 'team';
 }
 
 /** Why Add cannot be pressed, as one line's key, or null. Pure. */
@@ -390,8 +396,11 @@ export function AddBotRepoRow({ view, t, busy, onChoose, onNone }: {
 }
 
 /** What "Add bot" shows for a workspace's repository and what it sends:
- *  main's suggestion (asked again when the workspace's bots' repo or its
- *  folder changes), a picked folder, or None. Shared with the first screen. */
+ *  main's suggestion (the chosen workspace's folder, asked again when the
+ *  workspace, its bots' repo or its folder changes), a picked folder, or
+ *  None. A folder the owner picked (or None) is theirs: it stays when the
+ *  workspace changes; until then the folder follows the workspace. Shared
+ *  with the first screen. */
 export function useAddBotRepo(port: FactoryBotPort, rows: readonly FactoryBotRow[], workspaceId: string, pickFolder: () => Promise<string | null>) {
   const [folder, setFolder] = useState<string | null>(null);
   const [none, setNone] = useState(false);
@@ -399,8 +408,6 @@ export function useAddBotRepo(port: FactoryBotPort, rows: readonly FactoryBotRow
   const [error, setError] = useState<string | null>(null);
   const own = workspaceRepoOf(rows, workspaceId);
   const ownKey = own ? `${own.repoKey}\n${own.repoPath}` : '';
-  // A folder picked (or None pressed) for one workspace is not another's.
-  useEffect(() => { setFolder(null); setNone(false); }, [workspaceId]);
   // Main's suggestion for the workspace, asked again when its bots' repo or
   // its folder changes (the folder only triggers the ask; main reads its own).
   const shownCwd = useStore((s) => s.workspaces.find((w) => w.id === workspaceId)?.metadata?.cwd ?? '');
@@ -429,6 +436,36 @@ export function teamNames(t: T): Record<string, string> {
   return Object.fromEntries(TEAM_TEMPLATES.map((tpl) => [tpl, t(`botsPage.teamName.${tpl}`)]));
 }
 
+/** What "Add team" makes in a workspace: the team templates none of its
+ *  enabled bots has yet (`missing`; main skips the `present` ones by the
+ *  same rule). Every template is named in the owner's language, with a
+ *  number when a bot there already has that name ("Developer 2"): main uses
+ *  the missing ones' names, and a role gone meanwhile still has one. The
+ *  missing ones are named first. Pure. */
+export function teamPlan(rows: readonly FactoryBotRow[], workspaceId: string, t: T): { missing: BotTemplate[]; present: BotTemplate[]; names: Record<string, string> } {
+  const here = rows.filter((r) => r.bot.workspaceId === workspaceId).map((r) => r.bot);
+  const present = teamTemplatesPresent(here);
+  const missing = TEAM_TEMPLATES.filter((tpl) => !present.includes(tpl));
+  const taken = new Set(here.map((b) => b.name.toLocaleLowerCase()));
+  const names: Record<string, string> = {};
+  for (const tpl of [...missing, ...present]) {
+    const base = t(`botsPage.teamName.${tpl}`);
+    let name = base;
+    for (let n = 2; taken.has(name.toLocaleLowerCase()); n++) name = `${base} ${n}`;
+    taken.add(name.toLocaleLowerCase());
+    names[tpl] = name;
+  }
+  return { missing, present, names };
+}
+
+/** The workspace's whole team after "Add team" made `made`: its bots of a
+ *  team template, the coordinator first (what the group chat offer ticks). */
+function teamAfter(rows: readonly FactoryBotRow[], workspaceId: string, made: readonly BotProfile[]): BotProfile[] {
+  const madeIds = new Set(made.map((b) => b.id));
+  const all = [...rows.map((r) => r.bot).filter((b) => b.workspaceId === workspaceId && !madeIds.has(b.id)), ...made];
+  return TEAM_TEMPLATES.flatMap((tpl) => all.filter((b) => teamTemplatesPresent([b])[0] === tpl));
+}
+
 /** "Add bot": a workspace and a name, optionally a picture, a template
  *  chip that prefills the job, the job itself and the repository
  *  (addBotRepoView; optional, always shown). Main derives the repo from the
@@ -449,6 +486,8 @@ export function AddBotForm(props: AddBotFormProps): React.ReactElement {
   const onDone = props.onDone;
   const [workspaceId, setWorkspaceId] = useState(defaultWorkspaceId);
   const [template, setTemplate] = useState<BotTemplate | null>(null);
+  // A recipe sets the template and prefills the job; it grants nothing.
+  const [recipe, setRecipe] = useState<BotRecipe | null>(null);
   const [job, setJob] = useState('');
   // The text the last chip put in the job field: a chip replaces the job
   // only while the owner has not written their own.
@@ -465,19 +504,28 @@ export function AddBotForm(props: AddBotFormProps): React.ReactElement {
   const typedJob = normalizeBotJob(job);
   const jobOk = job.trim() === '' || typedJob !== undefined;
   const blocked = addBotBlockedReason({ canCreate: !!port.create, workspaceId, name, jobOk });
-  // "Add team": the five team bots in this workspace, offered while it has no
-  // coordinator (the team's lead is its first bot).
-  const hasLead = rows.some((r) => r.bot.workspaceId === workspaceId && r.bot.enabled && isCoordinatorBot(r.bot));
-  const canTeam = !!port.createTeam && !!workspaceId && !hasLead;
+  // "Add team": the team bots this workspace is missing (all five for a
+  // new team, the lead first), offered while one is missing.
+  const teamMode = props.mode === 'team';
+  const plan = teamPlan(rows, workspaceId, t);
+  const canTeam = !!port.createTeam && !!workspaceId && plan.missing.length > 0;
 
-  const pickTemplate = (next: BotTemplate) => {
-    const picked = template === next ? null : next;
-    setTemplate(picked);
+  const prefill = (fill: string) => {
     if (job.trim() === '' || job === prefilled.current) {
-      const fill = templateJob(picked, t);
       setJob(fill);
       prefilled.current = fill;
     }
+  };
+  const pickTemplate = (next: BotTemplate) => {
+    const picked = template === next ? null : next;
+    setTemplate(picked);
+    setRecipe(null);
+    prefill(templateJob(picked, t));
+  };
+  const pickRecipe = (next: BotRecipe | null) => {
+    setRecipe(next);
+    setTemplate(null);
+    prefill(next ? recipeJob(next, t) : '');
   };
 
   // An edit that makes the form invalid closes the turn-on confirm.
@@ -497,7 +545,7 @@ export function AddBotForm(props: AddBotFormProps): React.ReactElement {
       const r = await createBot(port, {
         workspaceId,
         name: typedName,
-        ...(template ? { template } : {}),
+        ...(recipe ? { template: recipe.template, recipe: recipe.id } : template ? { template } : {}),
         ...(typedJob ? { job: typedJob } : {}),
         ...(repo.repoFolder ? { repoFolder: repo.repoFolder } : {}),
         ...(avatar ? { avatar } : {}),
@@ -522,10 +570,22 @@ export function AddBotForm(props: AddBotFormProps): React.ReactElement {
         if (on === 'declined') return;
         if (on !== 'on') { setError(t('settings.factory.notStarted')); return; }
       }
-      const r = await port.createTeam({ workspaceId, names: teamNames(t), ...(repo.repoFolder ? { repoFolder: repo.repoFolder } : {}) });
-      // The team's lead is the one to talk to: its chat opens.
-      if (r.ok) onDone(r.bots[0], r.bots);
-      else setError(r.message || t('settings.factory.addTeamFailed'));
+      const r = await port.createTeam({ workspaceId, names: plan.names, ...(repo.repoFolder ? { repoFolder: repo.repoFolder } : {}) });
+      if (!r.ok) setError(r.message || t('settings.factory.addTeamFailed'));
+      else if (r.bots.length === 0) setError(t('settings.factory.addTeamWhole'));
+      else {
+        // The bots that were there already are named once, in a toast.
+        if (r.skipped && r.skipped.length > 0) {
+          useStore.getState().pushToast({
+            message: t('settings.factory.addTeamPartial', { added: r.bots.map((b) => b.name).join(', '), kept: r.skipped.map((tpl) => templateLabel(tpl, t)).join(', ') }),
+            level: 'info',
+          });
+        }
+        // The team's lead is the one to talk to: a lead made here greets and
+        // its chat opens; else the page opens the lead it had.
+        const lead = r.bots.find((b) => isCoordinatorBot(b));
+        onDone(lead, teamAfter(rows, workspaceId, r.bots));
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -535,9 +595,18 @@ export function AddBotForm(props: AddBotFormProps): React.ReactElement {
   };
   const shownError = error ?? repo.error;
   const names = teamNames(t);
+  const teamHint = t('settings.factory.addTeamHint', { names: TEAM_TEMPLATES.map((tpl) => names[tpl]).join(', '), lead: names.coordinator });
+  // The team form's one line: what Add team makes here, and what is there.
+  const teamLine = !workspaceId
+    ? ''
+    : plan.missing.length === 0
+      ? t('settings.factory.addTeamWhole')
+      : plan.present.length === 0
+        ? teamHint
+        : t('settings.factory.addTeamMissing', { names: plan.missing.map((tpl) => plan.names[tpl]).join(', '), kept: plan.present.map((tpl) => templateLabel(tpl, t)).join(', ') });
 
   return (
-    <div data-testid="factory-add-bot" className="flex flex-col gap-2 px-3 py-2">
+    <div data-testid="factory-add-bot" data-mode={teamMode ? 'team' : 'bot'} className="flex flex-col gap-2 px-3 py-2">
       <label className="flex items-center gap-2 text-[12px] text-[var(--text-sub)]">
         <span className="w-[120px] shrink-0">{t('settings.factory.addBotWorkspace')}</span>
         <Select
@@ -548,6 +617,7 @@ export function AddBotForm(props: AddBotFormProps): React.ReactElement {
           {workspaces.map((w) => <option key={w.id} value={w.id}>{w.name}</option>)}
         </Select>
       </label>
+      {!teamMode && (<>
       <label className="flex items-center gap-2 text-[12px] text-[var(--text-sub)]">
         <span className="w-[120px] shrink-0">{t('settings.factory.botName')}</span>
         <Input
@@ -574,6 +644,7 @@ export function AddBotForm(props: AddBotFormProps): React.ReactElement {
           removeLabel={t('settings.factory.removePicture')}
         />
       )}
+      <RecipePicker value={recipe?.id ?? null} onChange={pickRecipe} t={t} platform={window.electronAPI?.platform} />
       <div className="flex items-start gap-2 text-[12px] text-[var(--text-sub)]">
         <span className="w-[120px] shrink-0 pt-[3px]">{t('settings.factory.addBotTemplate')}</span>
         <div role="group" aria-label={t('settings.factory.addBotTemplate')} className="flex flex-1 flex-wrap items-center gap-1">
@@ -605,6 +676,7 @@ export function AddBotForm(props: AddBotFormProps): React.ReactElement {
         />
       </label>
       <div className="pl-[128px] text-[11px] text-[var(--text-muted)]">{t('settings.factory.addBotJobHint')}</div>
+      </>)}
       <div className="flex items-center gap-2 text-[12px] text-[var(--text-sub)]">
         <span className="w-[120px] shrink-0">{t('settings.factory.addBotRepo')}</span>
         <AddBotRepoRow view={repo.view} t={t} busy={busy} onChoose={() => void repo.choose()} onNone={repo.chooseNone} />
@@ -612,6 +684,7 @@ export function AddBotForm(props: AddBotFormProps): React.ReactElement {
       <div className="text-[11px] text-[var(--text-muted)]">
         {t(repo.view.kind === 'inherited' ? 'settings.factory.addBotRepoInherited' : 'settings.factory.addBotRepoHint')}
       </div>
+      {teamMode && teamLine && <p data-testid="factory-add-team-plan" className="text-[12px] leading-snug text-[var(--text-sub)]">{teamLine}</p>}
       {shownError && <SettingNote tone="danger" role="alert" data-testid="factory-add-bot-error">{shownError}</SettingNote>}
       {confirmOn ? (
         <InlineConfirm
@@ -624,6 +697,20 @@ export function AddBotForm(props: AddBotFormProps): React.ReactElement {
           onCancel={() => setConfirmOn(null)}
           testId="factory-add-bot-on"
         />
+      ) : teamMode ? (
+        <div className="flex items-center justify-end gap-1.5">
+          <Button size="sm" variant="ghost" onClick={() => onDone()} disabled={busy}>{t('settings.factory.cancel')}</Button>
+          <Button
+            size="sm"
+            variant="primary"
+            data-testid="factory-add-team"
+            title={teamHint}
+            onClick={() => (props.botsOff ? setConfirmOn('team') : void addTeam(false))}
+            disabled={busy || !canTeam}
+          >
+            {t('settings.factory.addTeam')}
+          </Button>
+        </div>
       ) : (
         <div className="flex items-center justify-end gap-1.5">
           {blocked && <span data-testid="factory-add-bot-blocked" className="mr-auto min-w-0 truncate text-[11px] text-[var(--text-muted)]">{t(blocked, { max: BOT_NAME_MAX })}</span>}
@@ -632,7 +719,7 @@ export function AddBotForm(props: AddBotFormProps): React.ReactElement {
               size="sm"
               variant="ghost"
               data-testid="factory-add-team"
-              title={t('settings.factory.addTeamHint', { names: TEAM_TEMPLATES.map((tpl) => names[tpl]).join(', '), lead: names.coordinator })}
+              title={teamLine}
               onClick={() => (props.botsOff ? setConfirmOn('team') : void addTeam(false))}
               disabled={busy}
             >
@@ -935,6 +1022,9 @@ export function FactoryTab({ settingsPort, botPort, pickFolder, claudeAuthPort }
         </SettingRow>
         <SettingRow id="factoryverifierownprs" label={t('settings.factory.verifierOwnPrs')} description={t('settings.factory.verifierOwnPrsDesc')}>
           <Switch checked={settings?.verifierOnOwnerPrs === true} disabled={off} onCheckedChange={(v) => void patch({ verifierOnOwnerPrs: v })} />
+        </SettingRow>
+        <SettingRow id="factorycommandreviewer" label={t('bots.commands.reviewerSetting')}>
+          <Switch checked={settings?.botCommandReviewer !== false} disabled={off} onCheckedChange={(v) => void patch({ botCommandReviewer: v })} data-testid="factory-command-reviewer" aria-label={t('bots.commands.reviewerSetting')} />
         </SettingRow>
         <SettingRow id="factoryengine" label={t('settings.factory.engine')} description={t('settings.factory.engineDesc')}>
           <span data-testid="factory-engine" className="text-[13px] text-[var(--text-main)]">{t('settings.factory.engineSdk')}</span>

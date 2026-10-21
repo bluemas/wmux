@@ -148,6 +148,10 @@ export interface TaskWorktreePlan {
    *  plain https or ssh address. Recorded on the task's ledger row
    *  (LedgerDispatch.originPin). */
   originPin?: string;
+  /** Set by the fan-out once createWorktree made the branch: the commit it
+   *  was created at, which a rollback deletes it at (never a branch that
+   *  existed before, which createWorktree refuses). */
+  createdBranchOid?: string;
 }
 
 export type PreflightResult =
@@ -155,7 +159,15 @@ export type PreflightResult =
   | { ok: false; error: string };
 
 export type CreateResult =
-  | { ok: true; worktreePath: string; branch: string; gitWorktreeDir?: string }
+  | {
+      ok: true;
+      worktreePath: string;
+      branch: string;
+      gitWorktreeDir?: string;
+      /** The commit the new branch was created at (read right after `-b`), so a
+       *  rollback can delete exactly that branch even when no base was given. */
+      branchOid?: string;
+    }
   | { ok: false; error: string };
 
 /**
@@ -483,7 +495,7 @@ export class TaskWorktreeManager {
       try {
         await this.runGit(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], realRoot);
         // 성공 = 브랜치 존재 → 충돌.
-        return { ok: false, error: `preflight: branch already exists: ${branch}` };
+        return { ok: false, error: await this.branchExistsError('preflight', realRoot, branch) };
       } catch {
         // 실패 = 브랜치 부재 → 정상.
       }
@@ -714,7 +726,7 @@ export class TaskWorktreeManager {
       try {
         await this.runGit(['rev-parse', '--verify', '--quiet', `refs/heads/${safeBranch}`], plan.repoRoot);
         // 성공 = 브랜치 존재 → 충돌.
-        return { ok: false, error: `createWorktree: branch already exists: ${safeBranch}` };
+        return { ok: false, error: await this.branchExistsError('createWorktree', plan.repoRoot, safeBranch) };
       } catch {
         // 실패 = 브랜치 부재 → 정상 진행.
       }
@@ -728,12 +740,17 @@ export class TaskWorktreeManager {
         return { ok: false, error: `createWorktree: git worktree add failed: ${(err as Error).message}` };
       }
       const gitWorktreeDir = await this.worktreeGitDir(safePath);
+      const branchOid = await this.commitOf(`refs/heads/${safeBranch}`, plan.repoRoot);
       try {
         this.onCreated?.(plan.repoRoot);
       } catch {
         /* best-effort: never fails a created worktree */
       }
-      return { ok: true, worktreePath: safePath, branch: safeBranch, ...(gitWorktreeDir ? { gitWorktreeDir } : {}) };
+      return {
+        ok: true, worktreePath: safePath, branch: safeBranch,
+        ...(gitWorktreeDir ? { gitWorktreeDir } : {}),
+        ...(branchOid ? { branchOid } : {}),
+      };
     });
   }
 
@@ -1026,6 +1043,33 @@ export class TaskWorktreeManager {
       /* the record is gone already; prune only tidies */
     }
     return { ok: true };
+  }
+
+  /**
+   * "branch already exists", naming the linked worktree that has it checked
+   * out (a start whose setup failed and was kept), so starting again is never
+   * blocked without saying where and what to do.
+   */
+  private async branchExistsError(step: string, repoRoot: string, branch: string): Promise<string> {
+    const plain = `${step}: branch already exists: ${branch}`;
+    let out: string;
+    try {
+      out = (await this.runGit(['worktree', 'list', '--porcelain'], repoRoot)).stdout;
+    } catch {
+      return plain;
+    }
+    // The first entry is the main checkout: a branch there is the person's own.
+    let current: string | undefined;
+    let index = -1;
+    for (const line of out.split(/\r?\n/)) {
+      if (line.startsWith('worktree ')) {
+        current = line.slice('worktree '.length);
+        index += 1;
+      } else if (line === `branch refs/heads/${branch}` && index > 0 && current) {
+        return `${plain} (it is checked out in the worktree at ${current}: discard it from its Preparing card, or remove it from the task cleanup list, then start again)`;
+      }
+    }
+    return plain;
   }
 
   /** Whether git lists `folder` as a worktree of the repository, compared by

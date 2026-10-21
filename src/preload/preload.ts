@@ -20,6 +20,7 @@ import { CONNECTOR_IPC } from '../shared/botConnector';
 import { GUEST_BOT_IPC } from '../shared/guestBots';
 import { BOT_SKILL_IPC } from '../shared/botSkill';
 import { BOT_MEMORY_IPC } from '../shared/botMemory';
+import { BOT_COMMAND_IPC } from '../shared/botCommand';
 import { BOT_GROUP_IPC } from '../shared/botGroup';
 import type { PaneLabelRejection } from '../shared/paneLabelRules';
 import { CHROME_PANE_IPC, type ChromePaneBindings } from '../shared/chromePaneBinding';
@@ -242,6 +243,20 @@ function storedStartPolarity(): string | null {
 const startPolarity = resolveStartPolarity(storedStartPolarity(), process.argv);
 if (startPolarity) void webFrame.insertCSS(startPaintCss(startPolarity));
 
+// Every Bots view subscribes to BOT_EVENT. One ipcRenderer listener fans the
+// push out to them, so a page with many views does not trip Node's
+// eleven-listener warning on the channel.
+const botEventSubscribers = new Set<() => void>();
+const onBotEventPush = (): void => {
+  for (const notify of [...botEventSubscribers]) {
+    try {
+      notify();
+    } catch (err) {
+      console.error('[preload] a bot event subscriber failed', err);
+    }
+  }
+};
+
 const electronAPI = {
   chat,
   chatv2,
@@ -351,8 +366,8 @@ const electronAPI = {
       // WITH a WMUX_SURFACE_ID (Terminal self-create path); reconcile uses it to
       // rebind a stale ptyId to the surviving session after a reboot.
       // `workspaceId`/`agentName` (#1101): origin identity for the orphaned
-      // session list.
-      ipcRenderer.invoke(IPC.PTY_LIST, opts) as Promise<{ id: string; shell: string; surfaceId?: string; createdAt?: string; state?: string; cwd?: string; spawnCwd?: string; workspaceId?: string; agentName?: string; supervision?: { status: 'armed' | 'stopped'; restartCount: number }; resumeAgent?: AgentSlug; resumeAgentOnScreen?: boolean; resumeWasRunning?: boolean; resumeBinding?: ResumeBinding; commandRunning?: boolean; agentProcessAlive?: boolean; liveAgent?: AgentSlug }[]>,
+      // session list. `exec` (#2398): an exec unit.
+      ipcRenderer.invoke(IPC.PTY_LIST, opts) as Promise<{ id: string; shell: string; surfaceId?: string; createdAt?: string; state?: string; cwd?: string; spawnCwd?: string; workspaceId?: string; agentName?: string; supervision?: { status: 'armed' | 'stopped'; restartCount: number }; exec?: true; resumeAgent?: AgentSlug; resumeAgentOnScreen?: boolean; resumeWasRunning?: boolean; resumeBinding?: ResumeBinding; commandRunning?: boolean; agentProcessAlive?: boolean; liveAgent?: AgentSlug }[]>,
     // TASK-6 — per-pane agent RAM for the Fleet View cockpit. Given the ptyIds
     // currently shown as cards, returns { [ptyId]: { rss (bytes), image? } } by
     // walking each pane shell's descendant process tree from ONE CIM snapshot.
@@ -362,7 +377,7 @@ const electronAPI = {
     // process name (e.g. "claude.exe").
     resources: (ptyIds: string[]) =>
       ipcRenderer.invoke(IPC.PANE_RESOURCES, ptyIds) as Promise<Record<string, { rss: number; image?: string }>>,
-    reconnect: (id: string) =>
+    reconnect: (id: string, opts: { promote: boolean; joinOnly?: boolean }) =>
       // RCA A1 — `transient` distinguishes a recoverable failure (pipe not
       // writable yet, RPC threw during a handler-swap window) from a permanent
       // one (session genuinely dead). The renderer retries transient failures
@@ -370,7 +385,15 @@ const electronAPI = {
       // `cwdMissing` (#1305) rides the recoveryPending shape: the WSL directory
       // itself is gone, so Retry cannot succeed until it is restored and the
       // pane is offered a fresh start in the home directory instead.
-      ipcRenderer.invoke(IPC.PTY_RECONNECT, id) as Promise<{ success: boolean; id?: string; shell?: string; cols?: number; rows?: number; error?: string; code?: string; transient?: boolean; recoveryPending?: boolean; cwdMissing?: boolean; recovery?: DeadPaneRecovery }>,
+      // #2398 — `promote` is required: false (a hidden pane, a repaint) still
+      // attaches a live session but holds a suspended one, answered
+      // `deferred`; only true starts it. `joinOnly` (a stop key, a repaint)
+      // also never starts the exec or supervised unit a promote:false
+      // reconnect otherwise starts: it joins only a start in flight.
+      ipcRenderer.invoke(IPC.PTY_RECONNECT, id, opts) as Promise<{ success: boolean; id?: string; shell?: string; cols?: number; rows?: number; error?: string; code?: string; transient?: boolean; recoveryPending?: boolean; cwdMissing?: boolean; deferred?: boolean; promoted?: boolean; resumeAgent?: string; resumeBinding?: ResumeBinding; recovery?: DeadPaneRecovery }>,
+    // #2398 — the suspended sessions panes hold without promoting (their
+    // panes are hidden or not mounted): the daemon keeps them from aging out.
+    hold: (ids: string[]) => ipcRenderer.invoke(IPC.PTY_HOLD, ids) as Promise<void>,
     // Fix B — on-demand promote of a cap-skipped suspended session.
     // #1305 — `fresh` promotes it in the home directory WITHOUT resuming the
     // recorded conversation: the way out when its own directory is gone.
@@ -1268,9 +1291,13 @@ const electronAPI = {
     listBots: (req?: { workspaceId?: string }) =>
       ipcRenderer.invoke(IPC.FACTORY_BOT_LIST, req ?? {}) as Promise<{ bots: import('../main/ipc/handlers/factory.handler').FactoryBotRow[] }>,
     onBotEvent: (callback: () => void) => {
-      const listener = () => callback();
-      ipcRenderer.on(BOT_EVENT, listener);
-      return () => { ipcRenderer.removeListener(BOT_EVENT, listener); };
+      const notify = () => callback();
+      if (botEventSubscribers.size === 0) ipcRenderer.on(BOT_EVENT, onBotEventPush);
+      botEventSubscribers.add(notify);
+      return () => {
+        if (!botEventSubscribers.delete(notify)) return;
+        if (botEventSubscribers.size === 0) ipcRenderer.removeListener(BOT_EVENT, onBotEventPush);
+      };
     },
     botAction: (action: 'wake' | 'park' | 'resume' | 'interrupt', botId: string) =>
       factoryBotCall(`bot.${action}`, { botId }),
@@ -1294,6 +1321,8 @@ const electronAPI = {
       ipcRenderer.invoke(IPC.FACTORY_BOT_SET_AVATAR, { botId, avatar }) as Promise<import('../shared/botCreate').FactoryBotAvatarSetResult>,
     suggestBotRepo: (workspaceId: string) =>
       ipcRenderer.invoke(IPC.FACTORY_BOT_SUGGEST_REPO, { workspaceId }) as Promise<import('../shared/botCreate').FactoryBotRepoSuggestion>,
+    clearRemovedBot: (botId: string) =>
+      ipcRenderer.invoke(IPC.FACTORY_BOT_CLEAR_REMOVED, { botId }) as Promise<import('../shared/botCreate').FactoryBotClearRemovedResult>,
     getSettings: () => ipcRenderer.invoke(IPC.FACTORY_SETTINGS_GET) as Promise<import('../shared/factorySettings').FactorySettings>,
     setSettings: (patch: Partial<import('../shared/factorySettings').FactorySettings>) =>
       ipcRenderer.invoke(IPC.FACTORY_SETTINGS_SET, patch) as Promise<import('../shared/factorySettings').FactorySettings | null>,
@@ -1377,6 +1406,18 @@ const electronAPI = {
         ipcRenderer.invoke(BOT_MEMORY_IPC.remove, req) as Promise<import('../shared/botMemory').MemorySimpleResult>,
       clear: (req: import('../shared/botMemory').MemoryClearRequest) =>
         ipcRenderer.invoke(BOT_MEMORY_IPC.clear, req) as Promise<import('../shared/botMemory').MemorySimpleResult>,
+    },
+    // A bot's commands (renderer/components/Bots/BotCommands.tsx): the
+    // owner's switch, the decision log, Always allow and the rules; changes
+    // arrive as BOT_EVENT {type:'commands-changed'}.
+    commands: {
+      read: (botId: string) => ipcRenderer.invoke(BOT_COMMAND_IPC.read, { botId }) as Promise<import('../shared/botCommand').BotCommandReadResult>,
+      setEnabled: (req: import('../shared/botCommand').BotCommandSetEnabledRequest) =>
+        ipcRenderer.invoke(BOT_COMMAND_IPC.setEnabled, req) as Promise<import('../shared/botCommand').BotCommandSimpleResult>,
+      allow: (req: import('../shared/botCommand').BotCommandAllowRequest) =>
+        ipcRenderer.invoke(BOT_COMMAND_IPC.allow, req) as Promise<import('../shared/botCommand').BotCommandSimpleResult>,
+      removeRule: (req: import('../shared/botCommand').BotCommandRemoveRuleRequest) =>
+        ipcRenderer.invoke(BOT_COMMAND_IPC.removeRule, req) as Promise<import('../shared/botCommand').BotCommandSimpleResult>,
     },
     // Guest bots (renderer/components/Bots/guestBots.ts): an outside agent's
     // token comes back once, from create; nothing reads one back.
@@ -1565,6 +1606,33 @@ const electronAPI = {
       ipcRenderer.invoke(IPC.PROJECT_CONFIG_GET, cwd) as Promise<import('../shared/wmuxProjectConfig').ProjectConfigState>,
     setTrust: (root: string, decision: 'trusted' | 'denied' | 'clear', contentHash?: string, unattended?: boolean) =>
       ipcRenderer.invoke(IPC.PROJECT_CONFIG_SET_TRUST, root, decision, contentHash, unattended === true) as Promise<{ ok: boolean }>,
+    // New workspace setup: read the section, and save it (the save is the
+    // trust approval of the written bytes).
+    prepGet: (cwd: string) =>
+      ipcRenderer.invoke(IPC.PROJECT_PREP_GET, cwd) as Promise<import('../shared/workspacePrepSettings').WorkspacePrepSettingsView>,
+    prepSave: (cwd: string, settings: import('../shared/workspacePrepSettings').WorkspacePrepSettings, expectedHash?: string) =>
+      ipcRenderer.invoke(IPC.PROJECT_PREP_SAVE, cwd, settings, expectedHash ?? null) as Promise<import('../shared/workspacePrepSettings').WorkspacePrepSaveResult>,
+  },
+  // A new worktree's preparation notice from main (a Quick Launch worktree,
+  // whose composer closes on start): shown as a toast in this window.
+  workspacePrepNotice: {
+    on: (cb: (notice: import('../shared/gitHandoff').HandoffPrepNotice) => void) => {
+      const listener = (_e: Electron.IpcRendererEvent, notice: import('../shared/gitHandoff').HandoffPrepNotice) => cb(notice);
+      ipcRenderer.on(IPC.WORKSPACE_PREP_NOTICE, listener);
+      return () => { ipcRenderer.removeListener(IPC.WORKSPACE_PREP_NOTICE, listener); };
+    },
+  },
+  // "Preparing" cards of worktrees a person opened (main owns them; the
+  // renderer draws them and answers a failed setup).
+  workspacePrep: {
+    onCard: (cb: (card: import('../shared/workspacePrepCard').WorkspacePrepCard) => void) => {
+      const listener = (_e: Electron.IpcRendererEvent, card: import('../shared/workspacePrepCard').WorkspacePrepCard) => cb(card);
+      ipcRenderer.on(IPC.WORKSPACE_PREP_EVENT, listener);
+      return () => { ipcRenderer.removeListener(IPC.WORKSPACE_PREP_EVENT, listener); };
+    },
+    list: () => ipcRenderer.invoke(IPC.WORKSPACE_PREP_LIST) as Promise<import('../shared/workspacePrepCard').WorkspacePrepCard[]>,
+    decide: (id: string, decision: import('../shared/workspacePrepCard').WorkspacePrepDecision) =>
+      ipcRenderer.invoke(IPC.WORKSPACE_PREP_DECIDE, id, decision) as Promise<{ ok: boolean }>,
   },
   // Plugin host (B-1). `list` returns loaded UI plugin summaries + load
   // failures; `rpc` forwards a host-validated bridge request from a plugin
@@ -1969,6 +2037,12 @@ const electronAPI = {
       ipcRenderer.invoke(IPC.UPDATE_GET_PENDING_INSTALL) as Promise<
         { version: string; currentVersion: string } | null
       >,
+    // What Settings › Updates says without an event: updates off for this
+    // instance (data suffix), or a published update that failed verification.
+    getNotice: () =>
+      ipcRenderer.invoke(IPC.UPDATE_GET_NOTICE) as Promise<
+        { instanceDisabled: boolean; verifyFailedVersion: string | null }
+      >,
     onUpdateAvailable: (callback: (data: { status: string; releaseName?: string }) => void) => {
       const listener = (_event: Electron.IpcRendererEvent, data: { status: string; releaseName?: string }) =>
         callback(data);
@@ -1981,8 +2055,8 @@ const electronAPI = {
       ipcRenderer.on(IPC.UPDATE_NOT_AVAILABLE, listener);
       return () => { ipcRenderer.removeListener(IPC.UPDATE_NOT_AVAILABLE, listener); };
     },
-    onUpdateError: (callback: (data: { status: string; message: string; source?: 'install'; code?: 'in-progress' | 'smart-app-control' }) => void) => {
-      const listener = (_event: Electron.IpcRendererEvent, data: { status: string; message: string; source?: 'install'; code?: 'in-progress' | 'smart-app-control' }) =>
+    onUpdateError: (callback: (data: { status: string; message: string; source?: 'install'; code?: 'in-progress' | 'smart-app-control' | 'verify-failed'; releaseName?: string }) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, data: { status: string; message: string; source?: 'install'; code?: 'in-progress' | 'smart-app-control' | 'verify-failed'; releaseName?: string }) =>
         callback(data);
       ipcRenderer.on(IPC.UPDATE_ERROR, listener);
       return () => { ipcRenderer.removeListener(IPC.UPDATE_ERROR, listener); };

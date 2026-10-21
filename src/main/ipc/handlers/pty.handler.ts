@@ -1,6 +1,7 @@
 import { applyWmuxToolsToCommand, isWmuxToolsHint, locateWmuxMcpEntry } from '../../agents/toolSurfaceLaunch';
 import { codexConfigPath, codexHasWmuxServer } from '../../../shared/mcpRegistration';
 import { WSL_RPC_TIMEOUT_MS } from '../../../shared/wsl';
+import { heldReconnectAnswer, promoteOutcome, promoteStartedSession, suspendedReconnectAction } from '../../../shared/suspendedSession';
 import { app, ipcMain, BrowserWindow } from 'electron';
 import path from 'node:path';
 import { homedir } from 'node:os';
@@ -20,7 +21,7 @@ import { resolveSpawnEnv } from '../../pty/resolveSpawnEnv';
 import { withFreshWindowsPath } from '../../../shared/windowsPathEnv';
 import { getAccountStore } from '../../account/accountStore';
 import { withAccountQuota } from '../../account/accountQuotaGate';
-import { botWorkerForCreate, botWorkerLaunchTask, botWorkerSessionRecord, clearedLaunchLine, forgetBotWorkerSession, guardedClaudeCwdRefusal, guardedCodexCwdRefusal, guardedCodexLaunch, guardedLaunchOf, isBotWorkerSession, noteBotWorkerSession, paneLaunchFolders, setWorkerMcpResolvers, withBotWorkerMergeGuard, type BotWorkerCreate } from '../../agents/botWorkerMergeGuard';
+import { botWorkerForCreate, botWorkerLaunchTask, botWorkerSessionRecord, clearedLaunchLine, forgetBotWorkerSession, guardedClaudeCwdRefusal, guardedCodexCwdRefusal, guardedCodexLaunch, guardedLaunchOf, isBotWorkerSession, noteBotWorkerSession, paneLaunchFolders, setWorkerMcpResolvers, taskConnectors, taskGatewayNames, withBotWorkerMergeGuard, type BotWorkerCreate, type WorkerGatewayLaunch } from '../../agents/botWorkerMergeGuard';
 import { isPlainCmdLaunchLine, namesClaude } from '../../../shared/botWorkerGuard';
 import { namesCodex } from '../../../shared/codexWorkerGuard';
 import { getMcpTarget } from '../../../shared/mcpTargets';
@@ -39,6 +40,9 @@ import { resolveWslWorkerGit, withWslWorkerGit } from '../../agents/wslWorkerGit
 import { withDaemonCreateRollback } from './daemonCreateRollback';
 import { getWorkspaceMirror } from '../../workspace/WorkspaceMirror';
 import { getWmuxDir } from '../../../daemon/config';
+import { getWorkerGateways, watchWorkerGatewaySessions, workerGatewaySandbox, type WorkerGatewayOpen } from '../../connectors/workerGateway';
+import { probeBotExecSupport } from '../../factory/botExecSandbox';
+import { resolveClaudeExecutable } from '../../claude/resolveClaudeExecutable';
 import { scheduleInitialCommand } from './scheduleInitialCommand';
 import { verifyLaunchLine, type LaunchLineRead } from './verifyLaunchLine';
 import { LAUNCH_PROBE_CONFIRM_TIMEOUT_MS } from '../../worktask/fanoutLaunchProbe';
@@ -216,7 +220,7 @@ function registeredClaudeLevel(): string | null {
  * its wmux level) instead of being spliced on its own, and the hint is
  * dropped. Returns what the guarded launch carried, for its session record.
  */
-async function stageCreate(options: PtyCreateOptions | undefined, botWorker: BotWorkerCreate | null): Promise<{ options: PtyCreateOptions | undefined; launch: ReturnType<typeof guardedLaunchOf> & ReturnType<typeof launchOfCodex> & { conversation?: ReturnType<typeof launchedConversation> } }> {
+async function stageCreate(options: PtyCreateOptions | undefined, botWorker: BotWorkerCreate | null, gateway?: WorkerGatewayLaunch): Promise<{ options: PtyCreateOptions | undefined; launch: ReturnType<typeof guardedLaunchOf> & ReturnType<typeof launchOfCodex> & { conversation?: ReturnType<typeof launchedConversation> } }> {
   // A fan-out line's prompt argument was built for the platform; the pane's
   // shell decides its form (a WSL pane runs bash).
   const shellPath = createShell(options);
@@ -242,7 +246,7 @@ async function stageCreate(options: PtyCreateOptions | undefined, botWorker: Bot
   } else {
     staged = withWmuxTools(staged);
   }
-  const guarded = withBotWorkerMergeGuard(await guardCodexBotWorker(staged, botWorker), botWorker, {}, { wsl, ...(level ? { level } : {}) });
+  const guarded = withBotWorkerMergeGuard(await guardCodexBotWorker(staged, botWorker), botWorker, {}, { wsl, ...(level ? { level } : {}), ...(gateway ? { gateway } : {}) });
   // A bot worker's line in a cmd.exe pane is read by cmd's own rules.
   if (botWorker && process.platform === 'win32' && isCmdShellPath(shellPath) && guarded?.initialCommand && !isPlainCmdLaunchLine(guarded.initialCommand)) {
     throw new Error('PTY_CREATE: a bot\'s worker line for a Command Prompt pane holds characters cmd would read as more than one command');
@@ -252,6 +256,43 @@ async function stageCreate(options: PtyCreateOptions | undefined, botWorker: Bot
   // that line starts it in (workerReclaim.ts: a resume with no hook-recorded mode).
   const conversation = botWorker && pinned?.initialCommand ? launchedConversation(splitModelEnvMarker(pinned.initialCommand).command) : null;
   return { options: pinned, launch: { ...launchOfCodex(guarded), ...guardedLaunchOf(guarded), ...(conversation ? { conversation } : {}) } };
+}
+
+/** A bot worker create's signed-in connections (main/connectors/
+ *  workerGateway.ts): one gateway lease each, opened before the launch files
+ *  are written (they name the leases' URLs), with the worker's sandbox block.
+ *  Null for a create that carries none; throws (nothing opened) when they
+ *  cannot all be opened. */
+async function openCreateGateway(botWorker: BotWorkerCreate | null, options: PtyCreateOptions | undefined): Promise<{ open: WorkerGatewayOpen; launch: WorkerGatewayLaunch } | null> {
+  const names = botWorker ? taskGatewayNames(botWorker) : [];
+  if (!botWorker || names.length === 0) return null;
+  const connectors = taskConnectors(botWorker).filter((c) => names.includes(c.name));
+  const spawn = botWorker.spawns?.[0];
+  if (!spawn || connectors.length !== names.length) throw new Error('PTY_CREATE: a signed-in connection of the task is not among its connections');
+  const cwd = typeof options?.cwd === 'string' && options.cwd ? options.cwd : '';
+  if (!cwd) throw new Error('PTY_CREATE: no folder for a worker with a signed-in connection');
+  const registry = getWorkerGateways();
+  if (!registry) throw new Error('PTY_CREATE: signed-in connections are not running');
+  // The worker runs exactly the claude its command sandbox is checked on.
+  const claudeExe = resolveClaudeExecutable();
+  const support = await probeBotExecSupport(claudeExe);
+  if (!claudeExe || !support.ok) throw new Error(`PTY_CREATE: a worker with a signed-in connection runs only in the command sandbox, which is not available (${support.ok ? 'no claude executable' : support.reason})`);
+  const open = await registry.open({ botId: spawn.botId, taskId: spawn.taskId, connectors });
+  try {
+    // Every name the pane's env may hold: unset for the worker's commands.
+    const names = [
+      ...Object.keys(open.env), ...Object.values(ENV_KEYS), FANOUT_TASK_PORT_ENV, 'WMUX_PTY_ID', 'CLAUDE_CONFIG_DIR',
+      ...taskConnectors(botWorker).flatMap((c) => c.secrets.map((s) => s.secret)),
+    ];
+    const env: Record<string, string | undefined> = { ...globalThis.process.env, ...(options?.env ?? {}) };
+    for (const n of names) if (typeof n === 'string' && !(n in env)) env[n] = '';
+    const tmpDir = options?.env?.TMPDIR;
+    const sandbox = workerGatewaySandbox({ cwd, tmpDir, wmuxDir: getWmuxDir(), env });
+    return { open, launch: { routes: open.routes, sandbox, runtime: process.execPath, claudeExe } };
+  } catch (err) {
+    open.close();
+    throw err;
+  }
 }
 
 /** A guarded codex launch's folder and repository, for its session record. */
@@ -535,9 +576,32 @@ export function registerPTYHandlers(
       const botWorker = botWorkerForCreate(options);
       // A bot worker's named secrets, from its single-use grant: they go to
       // the daemon apart from `env` (DaemonCreateSessionParams.secretEnv).
-      const secretEnv = secretEnvForCreate(options, botWorker);
+      const grantEnv = secretEnvForCreate(options, botWorker);
       const grantedCwd = options?.cwd;
-      const staged = await stageCreate(options, botWorker);
+      // Its signed-in connections' gateway leases: their bearers join the
+      // same spawn-only field; they close if this create does not finish.
+      const gateway = await openCreateGateway(botWorker, options);
+      const secretEnv = gateway ? { ...(grantEnv ?? {}), ...gateway.open.env } : grantEnv;
+      const failCreate = (message: string): Error => {
+        gateway?.open.close();
+        return new Error(message);
+      };
+      // A step before the daemon create that throws closes the leases too.
+      const closingLeases = <T>(step: () => T): T => {
+        try {
+          return step();
+        } catch (err) {
+          gateway?.open.close();
+          throw err;
+        }
+      };
+      let staged: Awaited<ReturnType<typeof stageCreate>>;
+      try {
+        staged = await stageCreate(options, botWorker, gateway?.launch);
+      } catch (err) {
+        gateway?.open.close();
+        throw err;
+      }
       options = staged.options;
 
       // X8 exec-style unit: a supervised wmux.json leaf runs its command as the
@@ -558,13 +622,13 @@ export function registerPTYHandlers(
       const cwdResolution = resolvePtyCreateCwdForShell(options?.cwd, options?.recoveryCwds, shell);
       // A bot's worker starts in the folder its rules or settings were checked in.
       const codexCwdRefusal = guardedCodexCwdRefusal(options, cwdResolution) ?? guardedClaudeCwdRefusal(staged.launch, cwdResolution);
-      if (codexCwdRefusal) throw new Error(codexCwdRefusal);
+      if (codexCwdRefusal) throw failCreate(codexCwdRefusal);
       // #2388: a task folder whose removal did not finish is locked.
       const pendingRefusal = pendingRemovalRefusal(cwdResolution.safeCwd);
-      if (pendingRefusal) throw new Error(pendingRefusal);
+      if (pendingRefusal) throw failCreate(pendingRefusal);
       if (secretEnv) {
         const refusal = secretCreateCwdRefusal(grantedCwd, cwdResolution);
-        if (refusal) throw new Error(refusal);
+        if (refusal) throw failCreate(refusal);
       }
       const safeCwd = cwdResolution.safeCwd;
       let effectiveCwd = safeCwd ?? (isWslShell(shell) ? '~' : homedir());
@@ -587,16 +651,20 @@ export function registerPTYHandlers(
       // Generate a unique session ID
       const crypto = require('crypto');
       const sessionId = `daemon-${crypto.randomUUID().slice(0, 8)}`;
+      // The leases are this pane's: they end with its session.
+      gateway?.open.bind(sessionId);
       logCwdResolution(sessionId, cwdResolution.incomingCwd, safeCwd, cwdResolution.source);
       // Recorded before the session exists, so a restart always knows it.
-      if (botWorker) {
-        const launchTask = botWorkerLaunchTask(botWorker);
-        noteBotWorkerSession(sessionId, botWorker.workspaceId, undefined, { ...staged.launch, ...launchTask });
-        // A new worker session for the task (a respawn or a resume): its agent runs again.
-        if (launchTask.taskId) noteTaskWorkerLaunched(launchTask.taskId);
-      }
-      // A fan-out task pane's task and launch generation, bot or owner.
-      recordFanoutTaskPane(options, sessionId);
+      closingLeases(() => {
+        if (botWorker) {
+          const launchTask = botWorkerLaunchTask(botWorker);
+          noteBotWorkerSession(sessionId, botWorker.workspaceId, undefined, { ...staged.launch, ...launchTask });
+          // A new worker session for the task (a respawn or a resume): its agent runs again.
+          if (launchTask.taskId) noteTaskWorkerLaunched(launchTask.taskId);
+        }
+        // A fan-out task pane's task and launch generation, bot or owner.
+        recordFanoutTaskPane(options, sessionId);
+      });
 
       // Identity env vars for the spawned shell. The daemon's
       // `buildSafeChildEnv` passes WMUX_WORKSPACE_ID / WMUX_SURFACE_ID
@@ -688,7 +756,7 @@ export function registerPTYHandlers(
       // env is assembled HERE in main, finds tools installed after main started —
       // native-terminal freshness. No-op off win32 / on failure. (Recovery replays
       // the persisted create-time env verbatim; refreshing that is a follow-up.)
-      const resolvedEnv = resolveSpawnEnv(withFreshWindowsPath(globalThis.process.env), options?.env, identity, getShellUtf8Locale(), envPolicy, accountEnv);
+      const resolvedEnv = closingLeases(() => resolveSpawnEnv(withFreshWindowsPath(globalThis.process.env), options?.env, identity, getShellUtf8Locale(), envPolicy, accountEnv));
       // #2231 — a fan-out task pane in WSL on a Windows-drive worktree: Linux
       // git gets the worktree's gitdir by its Linux path (wslWorkerGit.ts).
       if ((botWorker || options?.fanoutTaskOf) && isWslShell(shell) && safeCwd) {
@@ -719,6 +787,7 @@ export function registerPTYHandlers(
         undoLocal: () => {
           daemonClient.disconnectSessionPipe(sessionId).catch(() => undefined);
           forgetPtyShell(sessionId);
+          gateway?.open.close();
         },
       }, async () => {
         result = await daemonClient.rpc('daemon.createSession', {
@@ -1356,6 +1425,8 @@ export function registerPTYHandlers(
         // additive volatile runtime joined by the daemon's listSessions handler.
         supervision?: { restart: string; limit: unknown; status: 'armed' | 'stopped' };
         supervisionRuntime?: { status: 'armed' | 'stopped'; restartCount: number };
+        // An exec unit's command (#2398: read only for whether it is one).
+        exec?: unknown;
         // #1101 — origin identity for the orphaned-session list: the workspace
         // the session was spawned in (env-stamped by main force-stamps) and
         // the agent identity the daemon already derives for /api/sessions.
@@ -1433,6 +1504,10 @@ export function registerPTYHandlers(
                 },
               }
             : {}),
+          // #2398 — an exec unit, like a supervised session, starts whether
+          // or not its pane is shown (recoversInBackground): the reconcile
+          // must not hold a cap-skipped one as a plain shell.
+          ...(s.exec ? { exec: true as const } : {}),
           // X6 ② — carry the resume hint (agent slug) for the renderer pill.
           ...(s.resumeAgent ? { resumeAgent: s.resumeAgent } : {}),
           ...(s.resumeAgent && typeof s.resumeAgentOnScreen === 'boolean' ? { resumeAgentOnScreen: s.resumeAgentOnScreen } : {}),
@@ -1490,7 +1565,23 @@ export function registerPTYHandlers(
       return { success: false, error: res.error?.message ?? 'promote failed', cwdMissing: res.error?.code === 'CWD_MISSING' };
     }));
 
-    ipcMain.handle(IPC.PTY_RECONNECT, wrapHandler(IPC.PTY_RECONNECT, async (_event: Electron.IpcMainInvokeEvent, id: string) => {
+    // #2398 — pty:hold: the suspended sessions the renderer's panes hold
+    // without promoting them. The daemon stamps each as in use so the
+    // suspended TTL does not prune a session whose pane is merely unopened.
+    ipcMain.removeHandler(IPC.PTY_HOLD);
+    ipcMain.handle(IPC.PTY_HOLD, wrapHandler(IPC.PTY_HOLD, async (_event: Electron.IpcMainInvokeEvent, ids: unknown) => {
+      const held = Array.isArray(ids) ? ids.filter((id): id is string => typeof id === 'string' && id.length > 0) : [];
+      if (held.length > 0) await daemonClient.rpc('daemon.holdSession', { ids: held });
+    }));
+
+    ipcMain.handle(IPC.PTY_RECONNECT, wrapHandler(IPC.PTY_RECONNECT, async (_event: Electron.IpcMainInvokeEvent, id: string, opts?: { promote?: boolean; joinOnly?: boolean }) => {
+      // #2398 — whether this reconnect started the session (promoted a
+      // suspended one) rather than attaching one that was running: a stop
+      // key that joined it has nothing of its own to stop there. Carried on
+      // every answer after the promote, a failed attach's included: the
+      // renderer's retry then finds the session running and must still know.
+      let promoted = false;
+      const startedHere = () => (promoted ? { promoted: true } : {});
       try {
         // #2398 — a cap-skipped session lives only in sessions.json, which
         // includeSuspended parses on the daemon thread: only an id the live
@@ -1508,6 +1599,8 @@ export function registerPTYHandlers(
           args?: string[];
           wslTarget?: WslTarget;
           resumeBinding?: ResumeBinding;
+          exec?: unknown;
+          supervision?: unknown;
         }>;
         if (!sessions.some(s => s.id === id)) {
           sessions = await daemonClient.rpc('daemon.listSessions', { includeSuspended: true }) as typeof sessions;
@@ -1527,17 +1620,49 @@ export function registerPTYHandlers(
           };
         }
 
+        // #2398 — what this caller may do with the session if it is (or, after
+        // a daemon restart since the list, is again) suspended; see below.
+        const action = suspendedReconnectAction(session, opts);
+        const listed = session;
+        const held = (why: string) => {
+          console.log(`[lifecycle] pty.reconnect id=${id} result=deferred (suspended, ${why})`);
+          void daemonClient.rpc('daemon.holdSession', { ids: [id] }).catch((err: unknown) => {
+            console.warn(`[lifecycle] daemon.holdSession ${id} failed: ${err instanceof Error ? err.message : String(err)}`);
+          });
+          return heldReconnectAnswer(listed);
+        };
+
         if (session.state === 'suspended') {
+          // #2398 — a suspended session (cap-skipped, or a WSL placeholder)
+          // is promoted only when the caller says so (a shown pane, a raw
+          // write, a resume on start) or when the daemon starts it in the
+          // background anyway (an exec unit or supervised session: the promote
+          // below joins that start when one is in flight, or spawns the unit
+          // when none is, and `promoted` then reports it started; either way
+          // its pane attaches once it runs instead of staying deferred).
+          // A join-only caller (a stop key, a repaint) only joins a start in
+          // flight: it never spawns the unit, and finding none is held.
+          // Otherwise it is held: the id is kept, the daemon
+          // keeps the record from aging out, and the pane's first show
+          // reattaches with promote.
+          if (action === 'hold') return held('held');
           try {
-            const result = await daemonClient.rpc('daemon.promoteSession', { id }, { timeoutMs: WSL_RPC_TIMEOUT_MS }) as { ok: boolean; error?: { code?: string; message: string } };
+            const result = await daemonClient.rpc('daemon.promoteSession', { id, ...(action === 'join-only' ? { joinOnly: true } : {}) }, { timeoutMs: WSL_RPC_TIMEOUT_MS }) as { ok: boolean; alreadyActive?: boolean; joined?: boolean; notInFlight?: boolean; error?: { code?: string; message: string } };
+            const outcome = promoteOutcome(result);
+            if (outcome === 'held') return held('join-only, no start in flight');
             // #1305 — carry WHY it stayed pending, not just that it did. The
             // banner's Retry is the right and only offer for every other
             // failure; a missing directory additionally gets "start fresh".
-            if (!result.ok) return { success: false, recoveryPending: true, error: result.error?.message || 'WSL recovery failed. Check the target and retry.', cwdMissing: result.error?.code === 'CWD_MISSING' };
+            if (outcome === 'failed') return { success: false, recoveryPending: true, error: result.error?.message || 'WSL recovery failed. Check the target and retry.', cwdMissing: result.error?.code === 'CWD_MISSING' };
+            // From what the daemon did, not why this call was made: a join of
+            // the daemon's own background start did not start the unit (a
+            // stop key to it is a real stop request and is delivered), but a
+            // 'join' that found nothing in flight spawned it here.
+            promoted = promoteStartedSession(result);
             const refreshed = await daemonClient.rpc('daemon.listSessions', {}) as typeof sessions;
             session = refreshed.find(s => s.id === id) ?? session;
           } catch (err) {
-            return { success: false, recoveryPending: true, error: err instanceof Error ? err.message : String(err) };
+            return { success: false, recoveryPending: true, error: err instanceof Error ? err.message : String(err), ...startedHere() };
           }
         }
 
@@ -1581,7 +1706,11 @@ export function registerPTYHandlers(
         // Without this, attach+connect can return success while the
         // underlying socket is moments away from receiving its close
         // event, and every subsequent write silently disappears.
-        await daemonClient.rpc('daemon.attachSession', { id });
+        // #2398 — the attach promotes only as `action` says: a daemon that
+        // restarted since the list holds a WSL session as a pending recovery
+        // again, and a caller that may not start it leaves it pending (held).
+        const attached = await daemonClient.rpc('daemon.attachSession', { id, promote: action === 'promote' || action === 'join' }) as { pending?: boolean } | undefined;
+        if (attached?.pending) return held('pending again at attach');
         await daemonClient.connectSessionPipe(id, { forceFresh: true });
 
         // Health probe: confirm the freshly connected pipe is actually
@@ -1597,7 +1726,7 @@ export function registerPTYHandlers(
           // — it should retry, otherwise a live session gets replaced by an
           // empty one. transient:true signals "retry".
           console.log(`[lifecycle] pty.reconnect id=${id} result=fail code=pipe-not-writable (transient=true)`);
-          return { success: false, error: 'Session pipe not writable after reconnect', code: 'pipe-not-writable', transient: true };
+          return { success: false, error: 'Session pipe not writable after reconnect', code: 'pipe-not-writable', transient: true, ...startedHere() };
         }
 
         // Re-anchor the PID → ptyId identity map. A surviving shell keeps its
@@ -1620,7 +1749,7 @@ export function registerPTYHandlers(
         recordPtyShell(session.id, session.cmd);
         // The session's stored geometry: a hidden pane cannot measure its own,
         // so it adopts this one instead (see the reattach in useTerminal).
-        return { success: true, id: session.id, shell: session.cmd, cols: session.cols, rows: session.rows };
+        return { success: true, id: session.id, shell: session.cmd, cols: session.cols, rows: session.rows, ...startedHere() };
       } catch (err) {
         // RCA A1 — RPC threw (timeout, ECONNRESET, handler swap mid-call).
         // This is a transient infrastructure failure, NOT proof the session is
@@ -1628,7 +1757,7 @@ export function registerPTYHandlers(
         // the session.
         const msg = err instanceof Error ? err.message : String(err);
         console.log(`[lifecycle] pty.reconnect id=${id} result=fail code=rpc-error transient=true err=${msg}`);
-        return { success: false, error: msg, code: 'rpc-error', transient: true };
+        return { success: false, error: msg, code: 'rpc-error', transient: true, ...startedHere() };
       }
     }));
   } else {
@@ -1812,6 +1941,8 @@ export function registerPTYHandlers(
     };
     daemonClient.on('session:died', onDaemonSessionDied);
   }
+  // A bot worker's gateway leases end with its session or the daemon.
+  const offWorkerGatewaySessions = useDaemon && daemonClient ? watchWorkerGatewaySessions(daemonClient) : null;
 
   // X8 — supervised restart forwarder. A SEPARATE listener from session:died on
   // purpose: a restart re-created the SAME session id with a fresh PTY, so it
@@ -1899,6 +2030,7 @@ export function registerPTYHandlers(
     ipcMain.removeHandler(IPC.PTY_CANCEL_CREATE);
     ipcMain.removeHandler(IPC.PTY_LIST);
     ipcMain.removeHandler(IPC.PTY_PROMOTE);
+    ipcMain.removeHandler(IPC.PTY_HOLD);
     ipcMain.removeHandler(IPC.PTY_RECONNECT);
     ipcMain.removeHandler(IPC.PTY_RESYNC);
     ipcMain.removeHandler(IPC.SUPERVISE_REARM);
@@ -1923,6 +2055,7 @@ export function registerPTYHandlers(
       if (onDaemonSessionDied) {
         daemonClient.removeListener('session:died', onDaemonSessionDied);
       }
+      offWorkerGatewaySessions?.();
       if (onDaemonSessionRestarted) {
         daemonClient.removeListener('session:restarted', onDaemonSessionRestarted);
       }

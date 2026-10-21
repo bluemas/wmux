@@ -574,17 +574,17 @@ describe('main-owned cards — no brain resolves or raises one', () => {
     __resetCommanderTrustForTesting();
   });
 
-  it('deck.resolveDecision refuses a Moa hand-off card even in danger mode with a lease', async () => {
+  it('deck.resolveDecision refuses a bot\'s ask_person card even in danger mode with a lease', async () => {
     decisionRef.current = {
-      id: 'dec-h', question: 'Moa proposes…', options: ['Hand off', 'Edit', 'Cancel'], context: '',
-      status: 'pending', raisedAt: Date.now() - 3 * 60 * 60_000, origin: 'moa-handoff', ref: 'h1',
+      id: 'dec-h', question: 'Which branch?', options: ['main', 'dev'], context: '',
+      status: 'pending', raisedAt: Date.now() - 3 * 60 * 60_000, origin: 'ask_person', ref: 'h1', handoffId: 'h1',
     };
     modeMock.mockReturnValue('danger');
     const token = mintCommanderToken('ws-1');
     grantReExamineLease('ws-1', 'dec-h');
     const res = (await setup().dispatch({
       id: '1', method: 'deck.resolveDecision',
-      params: { token, id: 'dec-h', resolution: 'Hand off — a binding rule settles this hand-off.' },
+      params: { token, id: 'dec-h', resolution: 'main — a binding rule settles this.' },
     })) as { result?: { ok: boolean; error?: string } };
     expect(res.result).toEqual({ ok: false, error: 'main_owned' });
     expect(resolveDecisionMock).not.toHaveBeenCalled();
@@ -596,7 +596,7 @@ describe('main-owned cards — no brain resolves or raises one', () => {
     const token = mintCommanderToken('ws-1');
     await setup().dispatch({
       id: '1', method: 'deck.requestDecision',
-      params: { token, question: 'q', origin: 'moa-handoff', ref: 'x' },
+      params: { token, question: 'q', origin: 'ask_person', ref: 'x' },
     });
     const args = raiseDecisionMock.mock.calls[0][1] as Record<string, unknown>;
     expect(args).not.toHaveProperty('origin');
@@ -610,10 +610,10 @@ describe('main-owned cards — a stale one is never replaced by a brain question
     __resetCommanderTrustForTesting();
   });
 
-  it('deck.requestDecision refuses to replace a TTL-expired moa-handoff card', async () => {
+  it('deck.requestDecision refuses to replace a TTL-expired ask_person card', async () => {
     decisionRef.current = {
-      id: 'dec-h', question: 'Moa proposes…', options: ['Hand off', 'Edit', 'Cancel'], context: '',
-      status: 'pending', raisedAt: Date.now() - 24 * 60 * 60_000, origin: 'moa-handoff', ref: 'h1',
+      id: 'dec-h', question: 'Which branch?', options: ['main', 'dev'], context: '',
+      status: 'pending', raisedAt: Date.now() - 24 * 60 * 60_000, origin: 'ask_person', ref: 'h1', handoffId: 'h1',
     };
     ttlMock.mockReturnValue(60_000);
     const token = mintCommanderToken('ws-1');
@@ -623,5 +623,41 @@ describe('main-owned cards — a stale one is never replaced by a brain question
     expect(res.result).toEqual({ ok: false, error: 'decision_pending', id: 'dec-h' });
     expect(replaceStaleDecisionMock).not.toHaveBeenCalled();
     expect(raiseDecisionMock).not.toHaveBeenCalled();
+  });
+});
+
+// #2398 — a pane whose terminal has not started has no pty: a commander's or
+// bot's raw write to it is routed by surface, under the same rules as a pty.
+describe('deck.resolvePaneRoute by surface (#2398)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    __resetCommanderTrustForTesting();
+  });
+
+  const route = (router: RpcRouter, token: string) =>
+    router.dispatch({ id: '1', method: 'deck.resolvePaneRoute', params: { token, surfaceId: 'surf-9' } });
+
+  it('resolves a surface owned by the token workspace, asking the renderer by surface', async () => {
+    const token = mintCommanderToken('ws-owner');
+    sendToRendererMock.mockResolvedValue({ workspaceId: 'ws-owner' });
+    const res = await route(setup(), token);
+    expect(res.ok).toBe(true);
+    expect((res as { result: unknown }).result).toEqual({ workspaceId: 'ws-owner' });
+    expect(sendToRendererMock).toHaveBeenCalledWith(expect.anything(), 'input.findOwnerWorkspace', { surfaceId: 'surf-9' });
+  });
+
+  it("routes a surface of an open task of this brain to the brain's own workspace", async () => {
+    const token = mintCommanderToken('ws-mine');
+    sendToRendererMock.mockResolvedValue({ workspaceId: 'ws-task' });
+    const res = await route(setup([{ ownerWorkspaceId: 'ws-mine', taskWorkspaceId: 'ws-task', status: 'working' }]), token);
+    expect(res.ok).toBe(true);
+    expect((res as { result: unknown }).result).toEqual({ workspaceId: 'ws-mine' });
+  });
+
+  it('fails closed on a surface of another workspace', async () => {
+    const token = mintCommanderToken('ws-mine');
+    sendToRendererMock.mockResolvedValue({ workspaceId: 'ws-other' });
+    const res = await route(setup(), token);
+    expect(res.ok).toBe(false);
   });
 });

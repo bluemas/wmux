@@ -21,6 +21,7 @@ export const IPC = {
   PTY_EXIT: 'pty:exit',
   PTY_LIST: 'pty:list',
   PTY_PROMOTE: 'pty:promote',
+  PTY_HOLD: 'pty:hold',
   // TASK-6 — per-pane agent resource attribution for the Fleet View cockpit.
   // Renderer → main invoke: takes a list of ptyIds, resolves each to its shell
   // PID (via daemon.listSessions), takes ONE Win32_Process CIM snapshot, walks
@@ -321,6 +322,10 @@ export const IPC = {
   // the user. Pulled by an always-mounted surface for the same reason the
   // refused-install notice is: the push fires once, into the Settings panel.
   UPDATE_GET_PENDING_INSTALL: 'update:get-pending-install',
+  // Read what Settings › Updates must say even when no event reached it:
+  // in-app updates are off for this instance (a data suffix), or the
+  // published update failed verification and is not retried until it changes.
+  UPDATE_GET_NOTICE: 'update:get-notice',
   // Settings sync (renderer → main)
   TOAST_ENABLED: 'settings:toast-enabled',
   // #516 — renderer mirrors the muted notification categories so the
@@ -466,6 +471,9 @@ export const IPC = {
   FACTORY_BOT_SET_AVATAR: 'factory:bot:setAvatar',
   // "Add bot"'s repository for a workspace (shared/botCreate.ts); main window only.
   FACTORY_BOT_SUGGEST_REPO: 'factory:bot:suggestRepo',
+  // Take a deleted bot's 1:1 out of the Bots page's Archive
+  // (shared/botCreate.ts); main window only.
+  FACTORY_BOT_CLEAR_REMOVED: 'factory:bot:clearRemoved',
   // Stop the running work of every bot / of one bot (main/factory/
   // factoryStop.ts): turns, gates, workers; main window only.
   FACTORY_STOP_ALL: 'factory:stop:all',
@@ -805,6 +813,12 @@ export const IPC = {
   // user decision bound to the content hash the approval UI displayed.
   PROJECT_CONFIG_GET: 'project-config:get',
   PROJECT_CONFIG_SET_TRUST: 'project-config:set-trust',
+  WORKSPACE_PREP_NOTICE: 'workspace-prep:notice',
+  PROJECT_PREP_GET: 'project-config:prep-get',
+  PROJECT_PREP_SAVE: 'project-config:prep-save',
+  WORKSPACE_PREP_EVENT: 'workspace-prep:event',
+  WORKSPACE_PREP_LIST: 'workspace-prep:list',
+  WORKSPACE_PREP_DECIDE: 'workspace-prep:decide',
   // Remote workspace attach (see src/shared/remoteHosts.ts)
   REMOTE_HOSTS_LIST: 'remote:hosts:list',
   REMOTE_HOSTS_ADD: 'remote:hosts:add',

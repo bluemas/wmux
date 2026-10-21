@@ -22,7 +22,7 @@ beforeEach(() => {
   useStore.setState({
     commandPaletteVisible: false, fleetViewVisible: false, settingsPanelVisible: false,
     schedulesViewOpen: false, appRoute: 'workspaces', schedulesAvailable: true, readOnly: false, sidebarVisible: true,
-    moa: null, roomStatus: { running: true, enabled: true, hqWorkspaceId: null },
+    roomStatus: { running: true, enabled: true, hqWorkspaceId: null },
   });
 });
 afterEach(() => {
@@ -35,10 +35,10 @@ const rail = () => container.querySelector<HTMLDivElement>('[data-sidebar-rail]'
 const navIds = () => [...container.querySelectorAll('[data-sidebar-nav]')].map((el) => el.getAttribute('data-sidebar-nav'));
 
 describe('sidebar icon rail', () => {
-  it('lists only pages — Workspaces, Bots, Fleet, Office, Schedules, Remote and Git — each named', async () => {
+  it('lists only pages — Workspaces, Bots, Fleet, Office, Schedules, Remote, Git and Plugins — each named', async () => {
     await act(async () => root.render(<MiniSidebar rail collapsed={false} />));
     // Search & commands is a palette (the titlebar pill), not a page.
-    expect(navIds()).toEqual(['home', 'bots', 'fleet', 'office', 'schedules', 'remote', 'git', 'connectors']);
+    expect(navIds()).toEqual(['home', 'bots', 'fleet', 'office', 'schedules', 'remote', 'git', 'plugins']);
     // Home is the current page until another is chosen.
     expect(container.querySelector('[data-sidebar-nav="home"]')?.getAttribute('aria-current')).toBe('page');
     for (const b of rail().querySelectorAll('button')) {
@@ -49,15 +49,15 @@ describe('sidebar icon rail', () => {
   it('lists Bots only while the bots are on, appearing and going without a restart', async () => {
     act(() => useStore.setState({ roomStatus: { running: false, enabled: false, hqWorkspaceId: null } }));
     await act(async () => root.render(<MiniSidebar rail collapsed={false} />));
-    expect(navIds()).toEqual(['home', 'fleet', 'office', 'schedules', 'remote', 'git', 'connectors']);
+    expect(navIds()).toEqual(['home', 'fleet', 'office', 'schedules', 'remote', 'git', 'plugins']);
     // Settings › Bots' switch writes the setting and re-reads this status.
     act(() => useStore.setState({ roomStatus: { running: true, enabled: true, hqWorkspaceId: null } }));
-    expect(navIds()).toEqual(['home', 'bots', 'fleet', 'office', 'schedules', 'remote', 'git', 'connectors']);
+    expect(navIds()).toEqual(['home', 'bots', 'fleet', 'office', 'schedules', 'remote', 'git', 'plugins']);
     act(() => useStore.setState({ roomStatus: { running: false, enabled: false, hqWorkspaceId: null } }));
-    expect(navIds()).toEqual(['home', 'fleet', 'office', 'schedules', 'remote', 'git', 'connectors']);
+    expect(navIds()).toEqual(['home', 'fleet', 'office', 'schedules', 'remote', 'git', 'plugins']);
     // No status read yet (or no bot runtime): not listed either.
     act(() => useStore.setState({ roomStatus: null }));
-    expect(navIds()).toEqual(['home', 'fleet', 'office', 'schedules', 'remote', 'git', 'connectors']);
+    expect(navIds()).toEqual(['home', 'fleet', 'office', 'schedules', 'remote', 'git', 'plugins']);
   });
 
   describe('kept in step with main by useRoomSync, with no window focus', () => {
@@ -95,18 +95,18 @@ describe('sidebar icon rail', () => {
 
     it('lists Bots once main says the bots were switched on elsewhere (a script), on its push', async () => {
       await act(async () => root.render(<App />));
-      expect(navIds()).toEqual(['home', 'fleet', 'office', 'schedules', 'remote', 'git', 'connectors']);
+      expect(navIds()).toEqual(['home', 'fleet', 'office', 'schedules', 'remote', 'git', 'plugins']);
       // Switched on by a caller other than Settings: main pushes a bot event.
       enabled = true;
       await act(async () => { for (const fn of botEvents) fn(); });
-      expect(navIds()).toEqual(['home', 'bots', 'fleet', 'office', 'schedules', 'remote', 'git', 'connectors']);
+      expect(navIds()).toEqual(['home', 'bots', 'fleet', 'office', 'schedules', 'remote', 'git', 'plugins']);
       expect(focusEvents).toBe(0);
     });
 
     it('lists Bots on a fresh mount (a reload) while the bots are already on', async () => {
       enabled = true;
       await act(async () => root.render(<App />));
-      expect(navIds()).toEqual(['home', 'bots', 'fleet', 'office', 'schedules', 'remote', 'git', 'connectors']);
+      expect(navIds()).toEqual(['home', 'bots', 'fleet', 'office', 'schedules', 'remote', 'git', 'plugins']);
       expect(focusEvents).toBe(0);
     });
   });
@@ -244,7 +244,7 @@ describe('sidebar icon rail', () => {
     await act(async () => root.render(<MiniSidebar rail collapsed={false} />));
     const pressed = () => [...container.querySelectorAll('[data-sidebar-nav][aria-current="page"]')]
       .map((el) => el.getAttribute('data-sidebar-nav'));
-    for (const page of ['fleet', 'office', 'schedules', 'remote', 'connectors'] as const) {
+    for (const page of ['fleet', 'office', 'schedules', 'remote', 'plugins'] as const) {
       act(() => container.querySelector<HTMLButtonElement>(`[data-sidebar-nav="${page}"]`)!.click());
       expect(useStore.getState().appRoute).toBe(page);
       expect(pressed()).toEqual([page]);
@@ -271,23 +271,18 @@ describe('sidebar icon rail', () => {
 });
 
 describe('Moa and the rail', () => {
-  const moa = (enabled: boolean, state: 'ok' | 'hq-missing' | 'unset' = 'ok') => ({
-    config: { enabled, onboarded: true, level: 1 as const, maxTurnsPerHour: 20, bubbles: true, reduceMotion: false, defaultReason: null },
-    hq: { workspaceId: state === 'unset' ? null : 'hq', state },
-    archive: { unacked: 0, total: 0 },
-  });
   const ws = (id: string) => ({ id, name: id, rootPane: { id: `${id}-p`, type: 'leaf' as const, surfaces: [], activeSurfaceId: '' }, activePaneId: `${id}-p` });
   const current = () => [...container.querySelectorAll('[data-sidebar-nav][aria-current="page"]')].map((el) => el.getAttribute('data-sidebar-nav'));
 
   it('has no Moa entry: the panel is its home', async () => {
-    useStore.setState({ workspaces: [ws('a'), ws('hq')], activeWorkspaceId: 'a', activeRemoteKey: null, moa: moa(true) } as never);
+    useStore.setState({ workspaces: [ws('a'), ws('hq')], activeWorkspaceId: 'a', activeRemoteKey: null } as never);
     await act(async () => root.render(<MiniSidebar rail collapsed={false} />));
-    expect(navIds()).toEqual(['home', 'bots', 'fleet', 'office', 'schedules', 'remote', 'git', 'connectors']);
+    expect(navIds()).toEqual(['home', 'bots', 'fleet', 'office', 'schedules', 'remote', 'git', 'plugins']);
     expect(container.querySelector('[data-sidebar-nav="moa"]')).toBeNull();
   });
 
   it('Workspaces keeps an earlier version\'s HQ workspace active: it is an ordinary one', async () => {
-    useStore.setState({ workspaces: [ws('hq'), ws('a')], activeWorkspaceId: 'hq', activeRemoteKey: null, appRoute: 'workspaces', moa: null } as never);
+    useStore.setState({ workspaces: [ws('hq'), ws('a')], activeWorkspaceId: 'hq', activeRemoteKey: null, appRoute: 'workspaces' } as never);
     await act(async () => root.render(<MiniSidebar rail collapsed={false} />));
     act(() => container.querySelector<HTMLButtonElement>('[data-sidebar-nav="home"]')!.click());
     expect(useStore.getState().activeWorkspaceId).toBe('hq');

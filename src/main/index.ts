@@ -62,6 +62,7 @@ import { pruneDaemonPidMapAtConnect } from './pty/pidMap';
 import { registerAllHandlers } from './ipc/registerHandlers';
 import { registerConnectorTerminalHandlers } from './ipc/handlers/connectorTerminal.handler';
 import { registerConnectorOAuthHandlers } from './ipc/handlers/connectorOAuth.handler';
+import { setWorkerGatewayOAuth } from './connectors/workerGateway';
 import { registerConnectorCatalogHandlers } from './ipc/handlers/connectorCatalog.handler';
 import { registerConnectorCheckHandlers } from './ipc/handlers/connectorCheck.handler';
 import { RpcRouter } from './pipe/RpcRouter';
@@ -114,6 +115,7 @@ import { isHtmlPreviewContents, registerHtmlPreview } from './preview/previewHtm
 import { pageZoomKey, stepPageZoom } from '../shared/browserZoom';
 import { registerPluginHostHandlers } from './ipc/handlers/pluginHost.handler';
 import { registerProjectConfigHandlers } from './ipc/handlers/projectConfig.handler';
+import { getWorkspacePrepCards } from './worktask/workspacePrepCards';
 import { registerChannelLocalHandlers } from './ipc/handlers/channelLocal.handler';
 import { registerRemoteSurfaces } from './ipc/handlers/remoteRegistration';
 import { RemoteHostsStore } from './remote/RemoteHostsStore';
@@ -223,7 +225,15 @@ import { terminateRunningAppInstances } from './squirrelTeardown';
 import * as autostart from './autostart';
 import * as cliShim from './cliShim';
 import * as shortcutHygiene from './shortcutHygiene';
-import { isFreshProfile, runPostInstallReconcile } from './postInstallReconcile';
+import { runPostInstallReconcile } from './postInstallReconcile';
+import {
+  hookUserDataDir,
+  isExistingProfile,
+  markProfileActive,
+  markProfileUninstalled,
+  planInstallHook,
+} from './installProfile';
+import { requestRendererSessionSave } from './quit/rendererSessionSave';
 import {
   refreshStatuslineScriptAtBoot,
   defaultPaths as defaultStatuslinePaths,
@@ -308,12 +318,33 @@ if (process.platform === 'win32') {
       } catch { /* best-effort */ }
     }
 
+    // Where this profile's userData is: the hook runs before appInit applies
+    // WMUX_DATA_SUFFIX, so installProfile adds it the same way.
+    let hookUserData: string | null = null;
+    try { hookUserData = hookUserDataDir(app.getPath('userData'), process.env); } catch { /* best-effort */ }
+
     if (squirrelCmd === '--squirrel-install') {
+      // Every in-app update is a Squirrel full install, so this branch runs on
+      // updates too, not only on a first install. A profile that already uses
+      // wmux keeps the autostart and Desktop shortcut choices its user made;
+      // see installProfile.ts.
+      let existingProfile = false;
+      try { existingProfile = hookUserData !== null && isExistingProfile(hookUserData); } catch { /* best-effort */ }
+      const hookPlan = planInstallHook(existingProfile);
+      console.log(
+        `[Squirrel] install hook: ${existingProfile ? 'existing profile (update)' : 'first install'} — ` +
+        `autostart ${hookPlan.autostart}, shortcuts ${hookPlan.shortcutLocations}`,
+      );
+
       // Register Windows startup entry so wmux survives reboot. Autostart
-      // defaults ON at install time; users can turn it off in Settings →
+      // defaults ON at a first install; users can turn it off in Settings →
       // General (Settings toggle + squirrel-updated both go through
-      // ./autostart, which treats the Run key as the source of truth).
-      try { autostart.enableAutostart(process.execPath); } catch { /* best-effort */ }
+      // ./autostart, which treats the Run key as the source of truth). On an
+      // existing profile only the path is refreshed, and only if it is on.
+      try {
+        if (hookPlan.autostart === 'enable') autostart.enableAutostart(process.execPath);
+        else autostart.refreshAutostartEntry(process.execPath);
+      } catch { /* best-effort */ }
 
       // X4: drop the `wmux` CLI shim into <root>\bin and register it on the
       // user PATH. Internally best-effort — never blocks the install.
@@ -324,7 +355,7 @@ if (process.platform === 'win32') {
       let installIcon: string | null = null;
       try { installIcon = shortcutHygiene.stageRootIcon(process.execPath); } catch { /* best-effort */ }
 
-      const installShortcutArgs = ['--createShortcut', target, '--shortcut-locations', 'Desktop,StartMenu'];
+      const installShortcutArgs = ['--createShortcut', target, '--shortcut-locations', hookPlan.shortcutLocations];
       if (installIcon) installShortcutArgs.push('--icon', installIcon);
       spawn(updateExe, installShortcutArgs, { detached: true, windowsHide: true })
         .on('close', () => {
@@ -355,7 +386,10 @@ if (process.platform === 'win32') {
       let updateIcon: string | null = null;
       try { updateIcon = shortcutHygiene.stageRootIcon(process.execPath); } catch { /* best-effort */ }
 
-      const updateShortcutArgs = ['--createShortcut', target];
+      // Start Menu only, named explicitly: an update must not bring back a
+      // Desktop shortcut the user deleted (same rule as the install branch on
+      // an existing profile).
+      const updateShortcutArgs = ['--createShortcut', target, '--shortcut-locations', 'StartMenu'];
       if (updateIcon) updateShortcutArgs.push('--icon', updateIcon);
       spawn(updateExe, updateShortcutArgs, { detached: true, windowsHide: true })
         .on('close', () => {
@@ -373,6 +407,10 @@ if (process.platform === 'win32') {
     } else if (squirrelCmd === '--squirrel-uninstall') {
       // Remove startup registry entry
       try { autostart.disableAutostart(); } catch { /* best-effort */ }
+
+      // userData outlives the uninstall, so say so in it: a later install is
+      // a first install again (autostart on, Desktop shortcut).
+      try { if (hookUserData !== null) markProfileUninstalled(hookUserData); } catch { /* best-effort */ }
 
       // X4: remove the CLI shim + strip <root>\bin from the user PATH.
       try { cliShim.uninstallCliShim(process.execPath); } catch { /* best-effort */ }
@@ -585,7 +623,16 @@ const autoUpdater = new AutoUpdater(() => mainWindow, {
   // out of it. Flip the same flag the tray's "Shut down wmux" item uses so
   // before-quit takes the daemon.shutdown branch instead of detaching.
   onInstallRequiresFullShutdown: () => { fullShutdownRequested = true; },
-  getDaemonPid: () => readDaemonPid(getWmuxDir()),
+  // The daemon this app is connected to: the install spares exactly that one
+  // from its kill lists, because before-quit's full shutdown stops exactly
+  // that one. Its pid is the one recorded when the connection was made (the
+  // connect-time ping's answer), so nothing is asked of a daemon that may be
+  // too busy to answer at install time. The pid file is the fallback.
+  getDaemon: () => ({
+    connected: daemonRespawnController?.isHealthy ?? false,
+    connectedPid: daemonRespawnController?.connectedDaemonPid ?? null,
+    pidFilePid: readDaemonPid(getWmuxDir()),
+  }),
   // #1250: seed the updater's enabled flag from session.json. The renderer
   // sends the toggle during loadSession, but that send races this module's
   // own ready sequence; a locked session.json can stop it from ever arriving.
@@ -840,6 +887,8 @@ registerSessionHandlers(() => daemonClient?.isConnected === true);
 // OAuth consent and terminal gateway leases belong to the app, not a daemon
 // connection. Keep them alive across registerAllHandlers teardown/reconnect.
 const connectorOAuth = registerConnectorOAuthHandlers(() => mainWindow);
+// Bots' workers reach signed-in connections only through main's gateway.
+setWorkerGatewayOAuth(connectorOAuth.service);
 const cleanupConnectorTerminal = registerConnectorTerminalHandlers(() => mainWindow, connectorOAuth.service, () => daemonClient);
 const cleanupConnectorChecks = registerConnectorCheckHandlers(() => mainWindow, connectorOAuth.service);
 const cleanupConnectorCatalog = registerConnectorCatalogHandlers(() => mainWindow);
@@ -1194,12 +1243,16 @@ registerMcpPluginRpc(rpcRouter);
 // Plugin host IPC (B-1): plugins:list + the iframe bridge forwarder. Same
 // RpcRouter instance, so plugin-iframe RPCs hit the identical enforcement
 // stack as pipe clients. Registered once, outside the handler swap cycle.
-registerPluginHostHandlers(rpcRouter, () => pluginHostLoader, () => approvalQueue);
+registerPluginHostHandlers(rpcRouter, () => pluginHostLoader, () => approvalQueue, (name) => uiPluginManager?.isManaged(name) === true);
 registerPluginManagementHandlers(() => mainWindow, () => uiPluginManager);
 // Project config IPC (X5 wmux.json): discovery + trust gate. Renderer-only
 // surface — never exposed on the pipe RPC (external clients must not be able
 // to read project files or grant trust). Registered once, like plugin host.
 registerProjectConfigHandlers();
+// "Preparing" cards reach whichever window is open now.
+getWorkspacePrepCards().setSink((card) => {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(IPC.WORKSPACE_PREP_EVENT, card);
+});
 // Renderer-only channel-mutation surface (D5). Lets the in-app channels UI
 // (create + composer post) mutate channel state — the pipe-facing a2a.channel
 // handler fails a no-senderPtyId mutation closed, and this ipcMain.handle
@@ -1902,10 +1955,15 @@ app.on('ready', async () => {
 
   // Windows: redo whatever a cancelled Squirrel install hook left undone (CLI
   // shim, autostart, shortcuts). See postInstallReconcile.ts. `freshInstall`
-  // must be read here, before this boot's first session save creates the file.
+  // must be read here, before this boot's first session save creates the file
+  // and before the profile marker below is written. It is the install hook's
+  // own question (installProfile.ts), so both give the same answer.
   if (process.platform === 'win32' && app.isPackaged) {
     const firstRun = process.argv.includes('--squirrel-firstrun');
-    const freshInstall = isFreshProfile(app.getPath('userData'));
+    const freshInstall = !isExistingProfile(app.getPath('userData'));
+    // The marker the next install hook reads to tell an update from a first
+    // install. userData survives Setup.exe's wipe of the install root.
+    markProfileActive(app.getPath('userData'));
     // getPath throws when the shell folder cannot be resolved; unknown means
     // "do not create a Desktop shortcut", never "stop booting".
     let desktopDir: string | undefined;
@@ -2054,7 +2112,7 @@ app.on('ready', async () => {
   registerHtmlPreview();
   markBoot('plugins-loaded');
 
-  mainWindow = createWindow({ deferLoad: true, windowGlass: sessionManager.readWindowGlass(), windowAppearance: sessionManager.readWindowAppearance() });
+  mainWindow = createWindow({ deferLoad: true, windowGlass: sessionManager.readWindowGlass(), windowGlassEffective: sessionManager.readWindowGlassEffective(), windowAppearance: sessionManager.readWindowAppearance() });
   // Global quick launch: needs `ready` for globalShortcut, and registers from
   // its own settings file so the chord works before the renderer has loaded.
   quickLaunch = initQuickLaunch({
@@ -2994,7 +3052,7 @@ async function abortInstallQuit(): Promise<void> {
   // its renderer, or the caller's error IPC lands before any listener exists.
   // deferLoad so the reload backoff and console wiring are attached before the
   // navigation starts — this window's whole job is to render the failure.
-  const win = createWindow({ deferLoad: true, windowGlass: sessionManager.readWindowGlass(), windowAppearance: sessionManager.readWindowAppearance() });
+  const win = createWindow({ deferLoad: true, windowGlass: sessionManager.readWindowGlass(), windowGlassEffective: sessionManager.readWindowGlassEffective(), windowAppearance: sessionManager.readWindowAppearance() });
   mainWindow = win;
   adoptMainWindow(win);
   loadMainRenderer(win);
@@ -3017,13 +3075,6 @@ async function abortInstallQuit(): Promise<void> {
  * performance knob — it is the guarantee that a quit ALWAYS ends in an exit.
  */
 const QUIT_HARD_DEADLINE_MS = 20_000;
-
-/**
- * #980 — how long the renderer gets to run its beforeunload save. Short: the
- * save is a synchronous dispatch, so anything past this is a renderer that is
- * not going to answer at all.
- */
-const RENDERER_SAVE_TIMEOUT_MS = 3_000;
 
 /** How long the agent factory's modules get to dispose on quit. */
 const FACTORY_DISPOSE_TIMEOUT_MS = 3_000;
@@ -3108,14 +3159,7 @@ app.on('before-quit', async (e) => {
   // than the save itself needs buys nothing and risks everything.
   if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.webContents.isCrashed()) {
     try {
-      await Promise.race([
-        mainWindow.webContents.executeJavaScript(
-          `try { window.dispatchEvent(new Event('beforeunload')); } catch(e) {}`
-        ),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('renderer session-save timed out')), RENDERER_SAVE_TIMEOUT_MS),
-        ),
-      ]);
+      await requestRendererSessionSave(mainWindow.webContents);
       await new Promise(resolve => setTimeout(resolve, 500));
     } catch {
       // Renderer unavailable, or too slow to answer — rely on last periodic save
@@ -3418,7 +3462,7 @@ app.on('activate', () => {
   // hidden window too, and must neither count as the app window nor be the
   // one a Dock click brings back.
   if (!mainWindow || mainWindow.isDestroyed()) {
-    mainWindow = createWindow({ windowGlass: sessionManager.readWindowGlass(), windowAppearance: sessionManager.readWindowAppearance() });
+    mainWindow = createWindow({ windowGlass: sessionManager.readWindowGlass(), windowGlassEffective: sessionManager.readWindowGlassEffective(), windowAppearance: sessionManager.readWindowAppearance() });
     adoptMainWindow(mainWindow);
     return;
   }

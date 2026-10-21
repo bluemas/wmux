@@ -34,7 +34,9 @@
 // A removed bot leaves a tombstone (`removed`, shared/bot.ts RemovedBot: its
 // id, name, role, picture and colour slot), so the cards it wrote keep its
 // name and face after a restart. A build without it drops the list on its
-// next write; bots.json stays version 1.
+// next write; bots.json stays version 1. A tombstone's `clearedAt` (its 1:1
+// taken out of the Bots page's Archive) is dropped by an older build on its
+// next write, so after a downgrade those 1:1s show in the Archive again.
 
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
@@ -71,6 +73,7 @@ import { emptyUsage, pruneUsage, sanitizeUsage, type BotUsage } from './budget';
 import { createFilePersister, readVersionedFile, type FilePersister } from './versionedFile';
 import { LEGACY_TRIAGE_TRIGGERS, LEGACY_VERIFIER_TRIGGERS, defaultTriggers } from './roleDefaults';
 import { parseBotAvatar } from './botAvatar';
+import { BOT_RECIPE_ID_RE, botRecipe } from '../../shared/botRecipes';
 import { validateBotWorkerAgent } from '../../shared/botWorkerAgent';
 import { BOT_BRAIN_MODEL_MAX, validateBotBrainModel, validateFanoutModel } from '../../shared/fanoutPreset';
 import { ROLE_BINDING_MODEL_MAX } from '../../shared/orchestratorRole';
@@ -282,6 +285,7 @@ export function parseRemovedBot(raw: unknown): RemovedBot | null {
     ...(avatar ? { avatar } : {}),
     ...(hue !== undefined ? { hue } : {}),
     removedAt: raw.removedAt as number,
+    ...(Number.isSafeInteger(raw.clearedAt) ? { clearedAt: raw.clearedAt as number } : {}),
   };
 }
 
@@ -315,6 +319,9 @@ export function parseBotProfile(raw: unknown): BotProfile | null {
     workspaceId: r.workspaceId as string,
     role: r.role,
     template,
+    // A recipe id this build does not know is kept (a newer build wrote it,
+    // and a save here must not erase it); the profile just does not show it.
+    ...(typeof r.recipe === 'string' && BOT_RECIPE_ID_RE.test(r.recipe) ? { recipe: r.recipe } : {}),
     name,
     ...(job ? { job } : {}),
     engine,
@@ -402,6 +409,8 @@ export interface BotCreateInput {
   enabled?: unknown;
   /** Settings' Add bot only (botCreate.ts); bot.create never passes it. */
   avatar?: unknown;
+  /** Add bot's recipe (shared/botRecipes.ts), display only; Add bot only. */
+  recipe?: unknown;
 }
 
 /** The fields `update` may change (identity — id, workspace, role — never).
@@ -649,6 +658,9 @@ export class BotStore implements BotDirectoryApi {
     if (input.enabled !== undefined && typeof input.enabled !== 'boolean') return refuse('invalid_argument', 'enabled must be a boolean');
     const avatar = input.avatar === undefined ? undefined : parseBotAvatar(input.avatar);
     if (avatar === null) return refuse('invalid_argument', 'avatar must be a square PNG picture');
+    const recipe = input.recipe === undefined ? undefined : botRecipe(input.recipe);
+    if (input.recipe !== undefined && !recipe) return refuse('invalid_argument', 'recipe must be one of the bot recipes');
+    if (recipe && recipe.template !== template) return refuse('invalid_argument', `the recipe ${recipe.id} makes a ${recipe.template} bot`);
     let id = this.newId();
     for (let i = 0; this.bots.has(id) && i < 8; i++) id = this.newId();
     if (!BOT_ID_RE.test(id) || this.bots.has(id)) return refuse('invalid_argument', 'could not mint a bot id');
@@ -665,6 +677,7 @@ export class BotStore implements BotDirectoryApi {
       workspaceId,
       role,
       template,
+      ...(recipe ? { recipe: recipe.id } : {}),
       name,
       ...(job ? { job } : {}),
       engine,
@@ -802,6 +815,19 @@ export class BotStore implements BotDirectoryApi {
     });
     this.removed = this.removed.filter((r) => r.id !== botId);
     if (tomb) this.removed = [...this.removed, tomb].slice(-REMOVED_BOTS_MAX);
+    this.changed();
+    return true;
+  }
+
+  /** Take a removed bot's 1:1 out of the Archive (`clearedAt`); its
+   *  tombstone stays, so the cards it wrote keep its name. False when no
+   *  tombstone of that id is kept. */
+  clearRemoved(botId: string): boolean {
+    const tomb = this.removed.find((r) => r.id === botId);
+    if (!tomb) return false;
+    if (tomb.clearedAt !== undefined) return true;
+    const at = this.now();
+    this.removed = this.removed.map((r) => (r.id === botId ? { ...r, clearedAt: at } : r));
     this.changed();
     return true;
   }

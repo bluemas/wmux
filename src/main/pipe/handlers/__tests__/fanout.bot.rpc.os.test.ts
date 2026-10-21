@@ -22,7 +22,7 @@ vi.mock('../../../deck/deckDecisionStore', async (actual) => ({
 
 import { sendToRenderer } from '../_bridge';
 import { git } from '../../../git/git';
-import { BOT_FANOUT_STARTING_NOTE, botLaunchRefusal, countOpenBotWorkers, registerFanOutRpc, verdictedTaskIds, workersHeldNote, type FanOutBotPort, type HeldFanoutRequest } from '../fanout.rpc';
+import { BOT_FANOUT_STARTING_NOTE, botLaunchRefusal, countOpenBotWorkers, parseCheckout, registerFanOutRpc, verdictedTaskIds, workersHeldNote, type FanOutBotPort, type HeldFanoutRequest } from '../fanout.rpc';
 import type { FanOutRequest, FanOutResult, FanOutService, FanOutStatus } from '../../../worktask/FanOutService';
 import type { RpcRouter } from '../../RpcRouter';
 import { FANOUT_LIVE_TASK_CAP, FanOutGuards } from '../../../worktask/fanoutGuards';
@@ -38,6 +38,9 @@ import type { BotWorkerStartOutcome } from '../../../factory/botNotices';
 import { SecretStore, setSecretStore } from '../../../factory/secretStore';
 import { ConnectorStore } from '../../../factory/connectorStore';
 import { setSecretGrantSource } from '../../../factory/secretGrants';
+import type { GatewayOAuth } from '../../../connectors/workerGateway';
+import type { Connector } from '../../../../shared/botConnector';
+import type { ConnectorCheckResult } from '../../../../shared/connectorCheck';
 
 const REPO = nodePath.resolve('/repo');
 const WMUX_DIR = nodePath.resolve('/wmux-data');
@@ -81,7 +84,14 @@ interface Rig {
   setDefaultBranchNote: (n: { name: string | null; recorded: boolean }) => void;
 }
 
-function rig(role: BotRole, over: Partial<BotProfile> = {}, opts: { builtinPresets?: boolean; connectors?: () => ConnectorStore | null; platform?: NodeJS.Platform; presets?: FanoutPreset[] } = {}): Rig {
+function rig(role: BotRole, over: Partial<BotProfile> = {}, opts: {
+  builtinPresets?: boolean; connectors?: () => ConnectorStore | null; platform?: NodeJS.Platform; presets?: FanoutPreset[];
+  /** Signed-in connections: the OAuth service, the sandbox probe, the conversation's mark and the service's tool list. */
+  gateway?: {
+    oauth: () => GatewayOAuth | null; sandbox: () => Promise<{ ok: true } | { ok: false; reason: string }>; conversationTainted: (botId: string) => boolean;
+    listTools?: (c: Connector, headers: Record<string, string>) => Promise<ConnectorCheckResult>;
+  };
+} = {}): Rig {
   const handlers = new Map<string, Handler>();
   const router = { register: (m: string, h: Handler) => handlers.set(m, h) } as unknown as RpcRouter;
   const state = new Map<string, FanOutStatus>();
@@ -167,6 +177,8 @@ function rig(role: BotRole, over: Partial<BotProfile> = {}, opts: { builtinPrese
     ...(opts.builtinPresets ? {} : { botPresets: () => opts.presets ?? PRESETS }),
     ...(opts.connectors ? { connectors: opts.connectors } : {}),
     ...(opts.platform ? { workerPlatform: opts.platform } : {}),
+    ...(opts.gateway ? { gatewayOAuth: opts.gateway.oauth, gatewaySandbox: opts.gateway.sandbox, conversationTainted: opts.gateway.conversationTainted } : {}),
+    ...(opts.gateway?.listTools ? { gatewayListTools: opts.gateway.listTools } : {}),
     bot: () => port,
     wmuxDir: () => WMUX_DIR,
     botDefaultBranch: async (root) => {
@@ -313,6 +325,77 @@ describe('task.fanout.start — bot origin', () => {
       expect(errorOf(await call(gemini, ['shared'])).message).toMatch(/claude and codex workers only/);
       expect(r.start).not.toHaveBeenCalled();
       expect(gemini.start).not.toHaveBeenCalled();
+      await lib.flush();
+    });
+
+    it('a signed-in connection: research only, alone, from a clean wake and conversation, with tools the service marks read-only', async () => {
+      const lib = library(fs.mkdtempSync(nodePath.join(os.tmpdir(), 'wp2-conn-')));
+      const saved = lib.save({ transport: 'http', remote: { url: 'https://mcp.notion.example/mcp', headers: {} }, secrets: [], tools: { mode: 'listed', allowed: ['read_page'] }, enabled: true, name: 'notion', scope: { kind: 'all' } });
+      if (!saved.ok) throw new Error('not saved');
+      let token: string | undefined = 'vendor-token';
+      const oauth: GatewayOAuth = {
+        hasRecord: (id) => id === saved.connector.id,
+        accessToken: async () => token,
+        revision: () => 0,
+        awaitingConsent: () => false,
+        onRevision: () => () => undefined,
+      };
+      let sandbox: { ok: true } | { ok: false; reason: string } = { ok: true };
+      let conversationTainted = false;
+      let listed: ConnectorCheckResult = { status: 'ready', toolCount: 2, toolNames: ['read_page', 'delete_page'], readOnlyToolNames: ['read_page'], checkedAt: 1 };
+      const listHeaders: Array<Record<string, string>> = [];
+      const r = rig('lead', {}, {
+        builtinPresets: true, connectors: () => lib, platform: 'darwin',
+        gateway: {
+          oauth: () => oauth, sandbox: async () => sandbox, conversationTainted: () => conversationTainted,
+          listTools: async (_c, headers) => {
+            listHeaders.push(headers);
+            return listed;
+          },
+        },
+      });
+      r.setTainted(false);
+      let n = 0;
+      const ask = (preset: string, connectors: string[] = ['notion']) =>
+        r.call({ idempotencyKey: `wake:w-1:${++n}`, titles: ['read the page'], prompt: 'read it', preset, connectors }, botCtx('lead'));
+      // Code presets never carry one.
+      expect(errorOf(await ask('repro')).message).toMatch(/preset "research"/);
+      // From a clean wake and conversation: accepted.
+      expect(await ask('research')).toMatchObject({ ok: true });
+      await r.flush();
+      expect(r.start.mock.calls[0][0] as FanOutRequest).toMatchObject({ gatewayConnectors: ['notion'] });
+      // The service's tool list was read with the owner's token, in main.
+      expect(listHeaders[0]).toEqual({ Authorization: 'Bearer vendor-token' });
+      // Never beside another connection.
+      expect(errorOf(await ask('research', ['notion', 'shared'])).message).toMatch(/only signed-in connections; start shared/);
+      // Outside text in the conversation, or a wake that started from it: none.
+      conversationTainted = true;
+      expect(errorOf(await ask('research')).message).toMatch(/conversation has taken in outside text/);
+      conversationTainted = false;
+      r.setTainted(true);
+      expect(errorOf(await ask('research')).message).toMatch(/outside text/);
+      r.setTainted(false);
+      // A picked tool the service does not mark read-only, or no list now.
+      listed = { status: 'ready', toolCount: 1, toolNames: ['read_page'], readOnlyToolNames: [], checkedAt: 1 };
+      expect(errorOf(await ask('research')).message).toMatch(/does not mark these read-only: read_page/);
+      listed = { status: 'timeout' };
+      expect(errorOf(await ask('research')).message).toMatch(/could not be listed now \(timeout\)/);
+      listed = { status: 'ready', toolCount: 1, toolNames: ['read_page'], readOnlyToolNames: ['read_page'], checkedAt: 1 };
+      // Not signed in now, or no command sandbox: nothing starts.
+      token = undefined;
+      expect(errorOf(await ask('research')).message).toMatch(/sign in again/);
+      token = 'vendor-token';
+      sandbox = { ok: false, reason: 'macOS sandbox-exec is missing' };
+      expect(errorOf(await ask('research')).message).toMatch(/command sandbox/);
+      sandbox = { ok: true };
+      // A connection with no sign-in keeps today's direct path.
+      expect(await ask('research', ['shared'])).toMatchObject({ ok: true });
+      await r.flush();
+      expect(r.start.mock.calls[1][0] as FanOutRequest).not.toHaveProperty('gatewayConnectors');
+      expect(r.start).toHaveBeenCalledTimes(2);
+      // On Windows, nothing.
+      const win = rig('lead', {}, { builtinPresets: true, connectors: () => lib, platform: 'win32', gateway: { oauth: () => oauth, sandbox: async () => sandbox, conversationTainted: () => false } });
+      expect(errorOf(await win.call({ idempotencyKey: 'wake:w-1:1', titles: ['x'], prompt: 'x', preset: 'research', connectors: ['notion'] }, botCtx('lead'))).message).toMatch(/Windows/);
       await lib.flush();
     });
 
@@ -717,6 +800,20 @@ describe('task.fanout.start — bot origin', () => {
     // A pane caller may not name a checkout at all.
     const pane = await v.call({ idempotencyKey: 'k', senderPtyId: 'pty-1', titles: ['x'], checkout: { sha: SHA } }, { origin: 'local' });
     expect(pane.ok).toBe(false);
+  });
+
+  it('checkout.fetchRef is the review head ref of the bot\'s host: pull/<n>/head on GitHub, merge-requests/<n>/head on GitLab', () => {
+    const GL = 'gitlab.example.com/group/proj';
+    expect(parseCheckout({ sha: SHA, fetchRef: 'merge-requests/12/head' }, GL)).toEqual({ sha: SHA, detached: true, fetchRef: 'merge-requests/12/head' });
+    expect(parseCheckout({ sha: SHA, fetchRef: 'pull/12/head' }, 'github.com/o/r')).toEqual({ sha: SHA, detached: true, fetchRef: 'pull/12/head' });
+    // The other host's ref style, and an unknown host, are refused.
+    expect(parseCheckout({ sha: SHA, fetchRef: 'pull/12/head' }, GL)).toEqual({ error: expect.stringMatching(/merge-requests\/<number>\/head/) });
+    expect(parseCheckout({ sha: SHA, fetchRef: 'merge-requests/12/head' }, 'github.com/o/r')).toEqual({ error: expect.stringMatching(/pull\/<number>\/head/) });
+    expect(parseCheckout({ sha: SHA, fetchRef: 'merge-requests/12/head' })).toHaveProperty('error');
+    for (const bad of ['merge-requests/0/head', 'merge-requests/12/merge', 'merge-requests/12/head:x', 'refs/merge-requests/12/head', 'merge-requests/1234567890/head', '+merge-requests/12/head']) {
+      expect(parseCheckout({ sha: SHA, fetchRef: bad }, GL)).toHaveProperty('error');
+    }
+    expect(parseCheckout({ sha: SHA }, GL)).toEqual({ sha: SHA, detached: true });
   });
 
   it('a full worker slot (the bot\'s or the factory\'s) is reported as workers_full and held, not as an exhausted budget', async () => {

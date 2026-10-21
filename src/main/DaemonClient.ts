@@ -40,6 +40,7 @@ import { stripReplayQuerySequences } from '../shared/replayQuerySanitizer';
 import { createSessionPipeMarkers } from '../daemon/sessionPipeMarkers';
 import { SessionPipeStreamScanner } from './daemon/sessionPipeStreamScanner';
 import { DAEMON_RPC_TIMEOUT_MS } from '../shared/timeouts';
+import { DAEMON_CONTROL_LINE_MAX_CHARS } from '../shared/daemonControlLine';
 import { sanitizeTitle } from './pty/titleDetect';
 import {
   getDaemonAuthTokenPath,
@@ -56,7 +57,7 @@ import type { SessionPromptScheduleResult } from '../shared/sessionPromptSchedul
 // RCA A2 — single source of truth in shared/timeouts.ts so the renderer's
 // RECONCILE_TIMEOUT_MS can be derived from (and stay greater than) this value.
 const RPC_TIMEOUT_MS = DAEMON_RPC_TIMEOUT_MS;
-const MAX_LINE_BUFFER = 1024 * 1024; // 1 MB
+const MAX_LINE_BUFFER = DAEMON_CONTROL_LINE_MAX_CHARS; // 1 MB
 
 interface PendingRequest {
   resolve: (value: unknown) => void;
@@ -1142,6 +1143,9 @@ export class DaemonClient extends EventEmitter {
         }
         case 'agent.teammates':
           this.emit('session:teammates', { sessionId: event.sessionId });
+          break;
+        case 'agent.teammateWake':
+          this.emit('session:teammateWake', { sessionId: event.sessionId });
           break;
         case 'agent.subagents': {
           // How many subagents the pane's agent has running, from its transcript.
