@@ -19,6 +19,7 @@
 
 import { isCredentialEnvKey } from './envFilter';
 import { isBotSecretName } from './botSecret';
+import { parseTerminalAccess, type ConnectorTerminalAccess } from './connectorAccess';
 
 export type ConnectorTransport = 'stdio' | 'http' | 'sse';
 
@@ -57,6 +58,8 @@ export interface Connector {
   secrets: ConnectorSecret[];
   tools: ConnectorTools;
   scope: ConnectorScope;
+  /** Absent on legacy records: ordinary terminal access is off until reviewed. */
+  terminalAccess?: ConnectorTerminalAccess;
   /** Bots an every-bot connection is switched off for. */
   offFor: string[];
   /** Library-wide on/off. */
@@ -103,7 +106,7 @@ export const CONNECTOR_ID_RE = /^con-[0-9a-f]{8}$/;
 /** Lower-case words joined by single hyphens: no `_`, so a tool name
  *  `mcp__<name>__<tool>` splits one way only. */
 export const CONNECTOR_NAME_RE = /^[a-z][a-z0-9-]{0,30}[a-z0-9]$/;
-export const CONNECTOR_TOOL_RE = /^[A-Za-z0-9_-]{1,64}$/;
+export const CONNECTOR_TOOL_RE = /^[A-Za-z0-9_.-]{1,64}$/;
 const ENV_KEY_RE = /^[A-Z_][A-Z0-9_]*$/;
 /** An HTTP header field name (RFC 9110 token). */
 const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}$/;
@@ -318,9 +321,14 @@ export function parseConnectorShape(
     remote = { url: raw.remote.url as string, headers };
   }
   const tools = toolsOf(raw.tools);
-  if (!tools) return refuse('tools', `Tool names are letters, digits, _ and - (at most ${CONNECTOR_LIMITS.TOOLS}).`);
+  if (!tools) return refuse('tools', `Tool names are letters, digits, _, . and - (at most ${CONNECTOR_LIMITS.TOOLS}).`);
   const scope = scopeOf(raw.scope ?? { kind: 'all' });
   if (!scope) return refuse('scope', 'The bots picked are malformed.');
+  const terminalAccess = raw.terminalAccess === undefined ? undefined : parseTerminalAccess(raw.terminalAccess);
+  if (terminalAccess === null) return refuse('terminalAccess', 'The terminal access selection is malformed.');
+  if (hasDottedToolPolicy(tools) && (transport !== 'http' || scope.kind !== 'bots' || scope.botIds.length !== 0)) {
+    return refuse('tools', 'Dotted tool names require an HTTP connection with no bots selected; use the terminal gateway.');
+  }
   const offFor = raw.offFor === undefined ? [] : stringList(raw.offFor, CONNECTOR_LIMITS.BOTS, (s) => BOT_ID_RE.test(s));
   if (!offFor) return refuse('scope', 'The bots it is off for are malformed.');
   if (typeof raw.enabled !== 'boolean') return refuse('enabled', 'On or off is missing.');
@@ -337,6 +345,7 @@ export function parseConnectorShape(
       secrets,
       tools,
       scope,
+      ...(terminalAccess ? { terminalAccess } : {}),
       // Off-for applies to an every-bot connection only.
       offFor: scope.kind === 'all' ? [...new Set(offFor)] : [],
       enabled: raw.enabled,
@@ -374,7 +383,14 @@ export function libraryRefusal(
 /** What one bot gets, in library order: the enabled connections scoped to
  *  every bot that it was not switched off for, and those scoped to it. Pure. */
 export function connectorsForBot(lib: readonly Connector[], botId: string): Connector[] {
-  return lib.filter((c) => c.enabled && (c.scope.kind === 'all' ? !c.offFor.includes(botId) : c.scope.botIds.includes(botId)));
+  return lib.filter((c) => c.enabled && !hasDottedToolPolicy(c.tools)
+    && (c.scope.kind === 'all' ? !c.offFor.includes(botId) : c.scope.botIds.includes(botId)));
+}
+
+/** Worker adapters require literal CLI-safe names; the HTTP gateway uses exact
+ * upstream names and can safely expose namespaced tools to ordinary terminals. */
+function hasDottedToolPolicy(tools: ConnectorTools): boolean {
+  return (tools.mode === 'all' ? tools.blocked : tools.allowed).some((name) => name.includes('.'));
 }
 
 /** Every key name a connection in `lib` uses. Pure. */

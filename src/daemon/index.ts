@@ -126,7 +126,7 @@ import { WorkTaskService } from './worktask/WorkTaskService';
 import { isTaskState, type AgentStatus, type Task } from '../shared/types';
 import { ProcessMonitor } from './ProcessMonitor';
 import { AgentProcessTracker } from './AgentProcessTracker';
-import { liveRecoveryHint, namedAgentAlive, recordWasMidTurn, screenShowsLiveAgent, sightedRecoveredAgent } from './recoveryHint';
+import { liveRecoveryHint, namedAgentAlive, recordedTurnStillOpen, recordWasMidTurn, screenShowsLiveAgent, sightedRecoveredAgent } from './recoveryHint';
 import { checkWslAgentRunning, reportedAgentForPane, stopWslAgent, WslPidWatcher } from './wslAgentProcess';
 import { GateFlagFile } from './gateFlagFile';
 import { WSL_GATE_FLAG_FILE } from '../shared/wslIntegration';
@@ -140,12 +140,15 @@ import { selectRecoverableSessions, startLeftoverShellReaps } from './recoverySe
 import { isShutdownKillExit, SHUTDOWN_KILL_RECLASSIFY_MS } from './shutdownKill';
 import {
   classifyReapIdentity,
+  comparableBootId,
   getProcessStartTime,
   getWin32BootId,
   getWin32BootIdSync,
   isPidAlive,
   isSameBootProven,
+  leftoverReapEligible,
   mayReap,
+  parseDarwinBootId,
   readPosixStartTime,
   readWin32ReapIdentity,
   setNativeProcessReadWarn,
@@ -159,7 +162,8 @@ import { PortWatcher } from '../main/pty/portWatch';
 import { initDaemonLogSink, isBrokenPipeError, stdioErrorsConsumed } from './util/logSink';
 import { installExitEvidence, noteExitReason, STATUS_CONTROL_C_EXIT } from './exitEvidence';
 import { newerTimestamp } from './util/idleAnchor';
-import type { DaemonState } from './types';
+import type { DaemonSession, DaemonState } from './types';
+import { retireAdopted, withDiskOnlySessions } from './diskOnlySessions';
 import type { DaemonEvent, DaemonCreateSessionParams, DaemonDestroySessionParams, DaemonSessionIdParams, DaemonResizeParams, DaemonSetResumeBindingParams } from '../shared/rpc';
 import { isWslDistroSpawnArgs } from '../shared/wslDistro';
 import { gitDirMapperFor, gitWatchCwdFor } from './gitWatchCwd';
@@ -211,6 +215,8 @@ import { parseApprovalResolveRequest, parsePlanAnswerRequest, planDetailOnly } f
 import { GateBroker } from './approvals/GateBroker';
 import { coerceGate } from './approvals/gateConfig';
 import { DeviceStore, type DeviceBatchRevocationCause } from './web/DeviceStore';
+import { GuestBotStore, GuestStoreError } from './web/GuestBotStore';
+import { GUEST_BOT_RPC } from '../shared/guestBots';
 import { revokeDeviceAndDisconnect } from './web/deviceRevoke';
 import { withActivity, withViewingSessions } from './web/deviceActivity';
 import { buildWebPaneEnv } from './web/webPaneEnv';
@@ -223,6 +229,7 @@ import { deliverScheduledPrompt, deliveryInputFence, type ScheduledPromptDeliver
 import { deliverCallerNudge } from './callerNudgeDelivery';
 import { paneTurnClosed, stopAgentTree } from './agentStop';
 import { continueOnAccount } from './continueOnAccount';
+import { paneFree } from './paneFree';
 import { classifyShell } from './shell-integration';
 import { UsageLimitRegistry } from './usageLimit/UsageLimitRegistry';
 import type { SessionPromptScheduleResult } from '../shared/sessionPromptSchedule';
@@ -507,6 +514,15 @@ function canonicalIdentityFor(
  * in-memory view of the same file: a revoke applied to one would leave the
  * other still authenticating that device until the next restart.
  */
+let guestBotStore: GuestBotStore | null = null;
+/** The owner's guest bots (shared/guestBots.ts), next to the device roster. */
+function getGuestBotStore(): GuestBotStore {
+  if (!guestBotStore) {
+    guestBotStore = new GuestBotStore({ dir: wmuxDir, log: (level, msg) => log(level, msg) });
+  }
+  return guestBotStore;
+}
+
 function getDeviceStore(): DeviceStore {
   if (!deviceStore) {
     deviceStore = new DeviceStore({ wmuxDir, log: (level, msg) => log(level, msg) });
@@ -892,6 +908,8 @@ async function restoreWebServer(sessionManager: DaemonSessionManager): Promise<v
         // construction sites: a restored server serves paired phones on their
         // own credentials, exactly like one the operator just started.
         devices: getDeviceStore(),
+        // Guest bots: injected at both construction sites, like the roster.
+        guests: getGuestBotStore(),
         runHistory: getRunHistory,
         turnFailure: (id) => sessionManager.getSession(id)?.bridge.getLastFailure(),
         inputReceipts: getInputReceipts,
@@ -1071,6 +1089,19 @@ const recoveredResumeBindings = new Map<string, ResumeBinding>();
 // pane (the automatic resume line itself, or anything typed before it).
 const recoveredWasRunning = new Set<string>();
 
+/**
+ * Spends a recovered pane's owed continue, in memory and on its record
+ * (`resumeContinuePending`), and saves when the record changed: a daemon that
+ * dies before the next snapshot must not bring a spent continue back.
+ */
+function spendContinue(sessionManager: DaemonSessionManager, stateWriter: StateWriter, id: string): void {
+  recoveredWasRunning.delete(id);
+  const meta = sessionManager.getSession(id)?.meta;
+  if (!meta?.resumeContinuePending) return;
+  delete meta.resumeContinuePending;
+  void stateWriter.saveAsap(buildState(sessionManager));
+}
+
 // X6 ③: closed set of resumable agent slugs, used to validate a hook-supplied
 // binding agent before it is written to `lastDetectedAgent` (an AgentSlug).
 // Derived from the shared identity table, so it cannot drift.
@@ -1155,8 +1186,7 @@ async function getBootId(): Promise<string> {
       // #1493: CIM LastBootUpTime, not wmic.exe (gone on current Windows 11).
       return await getWin32BootId();
     } else if (process.platform === 'darwin') {
-      // macOS: sysctl exposes the boot timestamp; encode it as a stable string.
-      // Format: "{ sec = 1745678901, usec = 123456 } Mon Apr 28 ..."
+      // macOS: a UUID minted per boot (see parseDarwinBootId).
       // eslint-disable-next-line @typescript-eslint/no-var-requires -- keep this optional dependency lazy
       const { execFile } = require('child_process');
       // eslint-disable-next-line @typescript-eslint/no-var-requires -- keep this optional dependency lazy
@@ -1164,11 +1194,10 @@ async function getBootId(): Promise<string> {
       const execFileAsync = promisify(execFile);
       const { stdout } = await execFileAsync(
         'sysctl',
-        ['-n', 'kern.boottime'],
+        ['-n', 'kern.bootsessionuuid'],
         { encoding: 'utf-8', timeout: 5000 },
       );
-      const match = (stdout as string).match(/sec\s*=\s*(\d+)/);
-      return match ? `darwin-${match[1]}` : `fallback-${os.uptime()}`;
+      return parseDarwinBootId(stdout as string) ?? `fallback-${os.uptime()}`;
     } else {
       // Linux: /proc/sys/kernel/random/boot_id
       return fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf-8').trim();
@@ -1189,11 +1218,10 @@ function getBootIdSync(): string {
       const { execFileSync } = require('child_process');
       const result = execFileSync(
         'sysctl',
-        ['-n', 'kern.boottime'],
+        ['-n', 'kern.bootsessionuuid'],
         { encoding: 'utf-8', timeout: 5000 },
       );
-      const match = (result as string).match(/sec\s*=\s*(\d+)/);
-      return match ? `darwin-${match[1]}` : `fallback-${os.uptime()}`;
+      return parseDarwinBootId(result as string) ?? `fallback-${os.uptime()}`;
     } else {
       return fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf-8').trim();
     }
@@ -1318,7 +1346,9 @@ function settledForReplay(
   pane: { env?: Record<string, string>; cmd?: string; wslTarget?: unknown },
 ): ResumeBinding | undefined {
   if (!binding || pane.wslTarget || isWslShell(pane.cmd)) return binding;
-  const settled = settleStoppedBinding(binding, pane.env ?? {});
+  // A record without its environment is respawned with the daemon's: say so
+  // (undefined), rather than an empty environment that names no account.
+  const settled = settleStoppedBinding(binding, pane.env);
   if (settled !== binding) {
     log('info', `[resume] ${id}: ${binding.agent} conversation ${binding.sessionId} ${settled ? 'has its transcript now' : 'was never written; not resuming it'}`);
   }
@@ -1898,14 +1928,16 @@ async function recoverSessions(
 
   // Detect reboot: if bootId changed, all old PIDs are stale — skip kill attempts
   const currentBootId = await getBootId();
-  const rebooted = state.bootId != null && state.bootId !== currentBootId;
+  const storedBootId = comparableBootId(state.bootId);
+  const liveBootId = comparableBootId(currentBootId);
+  const rebooted = storedBootId != null && liveBootId != null && storedBootId !== liveBootId;
   // #646: `rebooted` is "we can prove a reboot happened", so a state file with
   // no bootId at all (written by a pre-bootId build, or lost) reads as false —
   // fine for the kill-stale-pid paths it was written for, fatal for tombstone
   // reconciliation, which would then taskkill a recycled pid after a real
   // reboot. Reconciliation needs the opposite claim: proof that we are on the
   // SAME boot, which requires the bootId to exist AND match.
-  const sameBootProven = isSameBootProven(state.bootId, currentBootId);
+  const sameBootProven = isSameBootProven(storedBootId, liveBootId);
   if (rebooted) {
     log('info', `Boot ID changed (${state.bootId} → ${currentBootId}) — reboot detected, skipping PID kills`);
   }
@@ -1954,7 +1986,8 @@ async function recoverSessions(
     : startLeftoverShellReaps(
       state.sessions.filter((s) =>
         s.state !== 'dead' && s.state !== 'suspended' && recoverableIds.has(s.id)
-        && !automationRunPtyIds.has(s.id) && !isWslShell(s.cmd)),
+        && !automationRunPtyIds.has(s.id) && !isWslShell(s.cmd)
+        && leftoverReapEligible(s, sameBootProven)),
       {
         limit: 6,
         isAlive: (pid) => ProcessMonitor.isAlive(pid),
@@ -2021,7 +2054,8 @@ async function recoverSessions(
     // waiting for a cold distro, and one unavailable target must not lose its
     // identity, binding or snapshot. Attach/promote retries asynchronously.
     if (isWslShell(session.cmd)) {
-      if (!rebooted && session.state !== 'suspended' && recoverableIds.has(session.id)) {
+      if (!rebooted && session.state !== 'suspended' && recoverableIds.has(session.id)
+        && leftoverReapEligible(session, sameBootProven)) {
         await reapIfIdentityConfirmed({ pid: session.pid, cmd: session.cmd,
           storedCreatedAtFt: session.pidCreatedAtFt, storedStartTime: session.pidStartTime,
           reason: `WSL recovery of ${session.id}` });
@@ -2295,16 +2329,20 @@ async function recoverSessions(
       if (persisted.handoffFrom && !managed.meta.handoffFrom) managed.meta.handoffFrom = persisted.handoffFrom;
       if (persisted.paneAccount && !managed.meta.paneAccount) managed.meta.paneAccount = persisted.paneAccount;
       if (persisted.remoteDurable) managed.meta.remoteDurable = true;
+      // The dead daemon's last word on the turn, read off the OLD record (its
+      // raw mid-turn mark is never carried), or a continue an earlier recovery
+      // still owed. On the meta, so every save keeps it until spent.
+      if (recordWasMidTurn(persisted, Date.now())) managed.meta.resumeContinuePending = true;
     }
-    // Build combined state: recovered (live) sessions + everything we
-    // intentionally left untouched (originally-dead within TTL, plus
-    // any session the recovery cap excluded — which stays suspended).
-    const liveState = buildState(sessionManager);
-    const preservedFromState = state.sessions.filter(
-      (s) => !liveState.sessions.some((live) => live.id === s.id),
-    );
-    liveState.sessions.push(...preservedFromState);
-    stateWriter.saveImmediate(liveState);
+  }
+  // Everything recovery left untouched (originally-dead within TTL, plus any
+  // session the recovery cap excluded — which stays suspended) stays on disk
+  // through every later save, not only this one (#2493).
+  const managedIds = new Set(sessionManager.listSessions().map((s) => s.id));
+  diskOnlySessions = state.sessions.filter((s) => !managedIds.has(s.id));
+  if (changed) {
+    // Build combined state: recovered (live) sessions + the disk-only ones.
+    stateWriter.saveImmediate(buildState(sessionManager));
   }
 
   // X6 ③ (Rung 3): reconcile the durable hook spool onto the recovered sessions
@@ -2331,7 +2369,10 @@ async function recoverSessions(
     if (settledBinding) m.resumeBinding = settledBinding;
     else delete m.resumeBinding;
     const offer = resumeOfferForRecovered(m);
-    if (!offer) continue;
+    if (!offer) {
+      delete m.resumeContinuePending;
+      continue;
+    }
     recoveredAgentShellIds.set(recoveredId, offer as AgentSlug);
     // Surface the EXACT-session binding ONLY when its captured cwd still matches
     // the recovered session's cwd (F7 — `--resume` is cwd-scoped) AND its origin
@@ -2340,11 +2381,12 @@ async function recoverSessions(
     if (isUsableResumeBinding(m.resumeBinding) && normalizeResumeCwd(m.resumeBinding.cwd) === normalizeResumeCwd(m.cwd) && bindingTranscriptLives(m.resumeBinding)) {
       recoveredResumeBindings.set(recoveredId, m.resumeBinding);
     }
-    // The mid-turn mark is read off the OLD record, unlike the markers above:
-    // it describes the dead daemon's last moment, and the recovered meta's own
-    // mark belongs to the new shell (set again only by a turn it runs).
-    const persisted = state.sessions.find((s) => s.id === recoveredId);
-    if (persisted && recordWasMidTurn(persisted, Date.now())) recoveredWasRunning.add(recoveredId);
+    // Set from the OLD record in the carry-forward above, and kept only while
+    // the agent's own transcript still shows that turn open: a turn the user
+    // interrupted, or one that finished, is not continued.
+    if (m.resumeContinuePending && recordedTurnStillOpen(recoveredResumeBindings.get(recoveredId) ?? m.resumeBinding, m.env)) {
+      recoveredWasRunning.add(recoveredId);
+    } else delete m.resumeContinuePending;
   }
 
   // Clean up orphaned buffer files. Preserve buffers for both the
@@ -2653,6 +2695,10 @@ function registerRpcHandlers(
         throw new Error(refusal);
       }
     }
+
+    // #2493: closing a pane whose session recovery left on disk only (the
+    // manager emits no session:destroyed for it) ends that record too.
+    diskOnlySessions = diskOnlySessions.filter((s) => s.id !== p.id);
 
     // Remove data listener to prevent leak
     const tracked = sessionDataListeners.get(p.id);
@@ -3226,7 +3272,8 @@ function registerRpcHandlers(
       // The live mid-turn mark is internal too: clients get only the recovered
       // pane's one-shot `resumeWasRunning` below, read off the old record.
       delete base.turnRunningSince;
-      if (!resumeAgent) recoveredWasRunning.delete(s.id);
+      delete base.resumeContinuePending;
+      if (!resumeAgent) spendContinue(sessionManager, stateWriter, s.id);
       const withRuntime = base.supervision
         ? { ...base, supervisionRuntime: paneSupervisor.getRuntime(s.id) }
         : base;
@@ -3452,8 +3499,11 @@ function registerRpcHandlers(
           promotedSession.meta.codexRelayResume = session.codexRelayResume;
           const offer = resumeOfferForRecovered(promotedSession.meta);
           if (offer) recoveredAgentShellIds.set(sessionId, offer as AgentSlug);
-          // Read off the persisted record, as at boot recovery.
-          if (offer && recordWasMidTurn(session, Date.now())) recoveredWasRunning.add(sessionId);
+          // Read off the persisted record and the transcript, as at boot recovery.
+          if (offer && recordWasMidTurn(session, Date.now()) && recordedTurnStillOpen(session.resumeBinding, session.env)) {
+            recoveredWasRunning.add(sessionId);
+            promotedSession.meta.resumeContinuePending = true;
+          } else delete promotedSession.meta.resumeContinuePending;
           if (isUsableResumeBinding(session.resumeBinding) && normalizeResumeCwd(session.resumeBinding.cwd) === normalizeResumeCwd(promotedSession.meta.cwd)
             && (isWslShell(session.cmd) || bindingTranscriptLives(session.resumeBinding))) {
             recoveredResumeBindings.set(sessionId, session.resumeBinding);
@@ -3548,6 +3598,8 @@ function registerRpcHandlers(
       sessionText: sessionTextReader(sessionManager),
       // M3 — see the restore path for why the roster is injected at both sites.
       devices: getDeviceStore(),
+      // Guest bots: injected at both construction sites, like the roster.
+      guests: getGuestBotStore(),
       runHistory: getRunHistory,
       turnFailure: (id) => sessionManager.getSession(id)?.bridge.getLastFailure(),
       inputReceipts: getInputReceipts,
@@ -3846,6 +3898,60 @@ function registerRpcHandlers(
     return result;
   });
 
+  // Guest bots (shared/guestBots.ts): the owner's Bots page, through main.
+  // Token-only like the device roster RPCs above. A token leaves only in
+  // `create`'s answer, once.
+  pipeServer.onRpc(GUEST_BOT_RPC.list, async () => {
+    await afterRestore();
+    try {
+      const store = getGuestBotStore();
+      return { ok: true, guests: store.list(), gates: { enabled: store.enabled(), ...webServer.guestGates() } };
+    } catch {
+      return { ok: false, code: 'unavailable' };
+    }
+  });
+
+  pipeServer.onRpc(GUEST_BOT_RPC.create, async (params) => {
+    await afterRestore();
+    try {
+      const { guest, token } = await getGuestBotStore().create({ name: params['name'], scope: params['scope'], joinSeq: params['joinSeq'] });
+      log('info', `[web] guest bot ${guest.guestId} added for ${guest.scope.threadId}`);
+      return { ok: true, guest, token };
+    } catch (err) {
+      if (err instanceof GuestStoreError) return { ok: false, code: err.code };
+      log('warn', `[web] guest bot not added: ${err instanceof Error ? err.message : String(err)}`);
+      return { ok: false, code: 'persist-failed' };
+    }
+  });
+
+  pipeServer.onRpc(GUEST_BOT_RPC.revoke, async (params) => {
+    await afterRestore();
+    const guestId = typeof params['guestId'] === 'string' ? params['guestId'] : '';
+    try {
+      const revoked = getGuestBotStore().revoke(guestId);
+      webServer.forgetGuest(guestId);
+      if (revoked) log('info', `[web] guest bot ${guestId} revoked`);
+      return revoked ? { ok: true } : { ok: false, code: 'not-found' };
+    } catch {
+      // Revoked in memory (refused from now on), not on disk.
+      webServer.forgetGuest(guestId);
+      return { ok: false, code: 'persist-failed' };
+    }
+  });
+
+  pipeServer.onRpc(GUEST_BOT_RPC.setEnabled, async (params) => {
+    await afterRestore();
+    // Explicit boolean only: a malformed call never turns the feature on.
+    if (typeof params['enabled'] !== 'boolean') return { ok: false, code: 'invalid' };
+    try {
+      getGuestBotStore().setEnabled(params['enabled']);
+      log('info', `[web] guest bots ${params['enabled'] ? 'on' : 'off'}`);
+      return { ok: true };
+    } catch {
+      return { ok: false, code: 'persist-failed' };
+    }
+  });
+
   pipeServer.onRpc('daemon.web.deviceRevoke', async (params) => {
     await afterRestore();
     const deviceId = typeof params['deviceId'] === 'string' ? params['deviceId'] : '';
@@ -4128,23 +4234,25 @@ function registerRpcHandlers(
         const event: DaemonEvent = { type: 'agent.transcriptActivity', sessionId, data: { activity } };
         pipeServer.broadcast(event);
       },
-      emitSubagents: (sessionId, count) => {
-        const event: DaemonEvent = { type: 'agent.subagents', sessionId, data: { count } };
-        pipeServer.broadcast(event);
-      },
-      emitTeammates: (sessionId, teammates) => {
-        const event: DaemonEvent = { type: 'agent.teammates', sessionId, data: { teammates } };
-        pipeServer.broadcast(event);
-      },
-      // An Agent Teams teammate or a background shell of the pane's Claude
-      // still works after the lead's turn ended. Straight to main as `activity.active` (its onActive
-      // keeps its hook-latch and settle guards and refreshes the renderer's
-      // 120 s running stamp). Deliberately NOT through the bridge's 'active' /
-      // session:active: that also feeds the completion alarm's working evidence
+      // Background work of the pane's Claude (an Agent Teams teammate, or a
+      // background shell it launched) still runs after the lead's turn ended.
+      // Its own event, not `activity.active`: main relays it
+      // to the renderer's running stamp and leaves the pane's status (the
+      // lead's) alone. Not through the bridge's 'active' / session:active
+      // either: that also feeds the completion alarm's working evidence
       // (notePaneWorking), the usage-limit hold and the awaiting verifier, and
       // the lead's turn really did end.
-      emitBackgroundWorking: (sessionId) => {
-        const event: DaemonEvent = { type: 'activity.active', sessionId, data: null };
+      emitTeammatesWorking: (sessionId) => {
+        const event: DaemonEvent = { type: 'agent.teammates', sessionId, data: null };
+        pipeServer.broadcast(event);
+      },
+      // The pane's Agent Teams teammates by name (the Office view's roster).
+      emitTeammates: (sessionId, teammates) => {
+        const event: DaemonEvent = { type: 'agent.teammateList', sessionId, data: { teammates } };
+        pipeServer.broadcast(event);
+      },
+      emitSubagents: (sessionId, count) => {
+        const event: DaemonEvent = { type: 'agent.subagents', sessionId, data: { count } };
         pipeServer.broadcast(event);
       },
       onClaudeLine: (sessionId, path, line) => turnEnds.noteLine(sessionId, path, line),
@@ -4322,13 +4430,7 @@ function registerRpcHandlers(
       approvals: () => approvalRegistry,
       // Single writer: a tracked agent can miss a TUI that just started or a
       // reused pid, so the anchor shell must also have no children at all.
-      paneFree: async (id) => {
-        const pane = sessionManager.getSession(id);
-        if (!pane) return false;
-        const pid = agentProcessTracker.pidFor(id);
-        if (pid !== undefined && await ProcessMonitor.isRunning(pid)) return false;
-        return (await agentProcessTracker.idleShellState(pane.meta.pid, pane.meta.env, true)).ok;
-      },
+      paneFree: (id) => sessionPaneFree(sessionManager, agentProcessTracker, id),
       writeToPane: (id, data) => {
         const pane = sessionManager.getSession(id);
         if (!pane) return false;
@@ -4850,7 +4952,7 @@ function registerRpcHandlers(
         if (canonical && canonical.source !== 'screen') {
           recoveredAgentShellIds.delete(sessionId);
           recoveredResumeBindings.delete(sessionId);
-          recoveredWasRunning.delete(sessionId);
+          spendContinue(sessionManager, stateWriter, sessionId);
         }
         const wslTarget = managed.meta.wslTarget;
         if (!wslTarget) {
@@ -5616,6 +5718,9 @@ function registerRpcHandlers(
     try {
       return {
         written: writeIfUnchanged({
+          keyInputRevision: managed.bridge.getKeyInputRevision(),
+          incarnationId: managed.meta.incarnationId,
+          emptyShellPrompt: managed.bridge.isEmptyShellPrompt(),
           ringBuffer: managed.ringBuffer,
           promptLog: managed.promptLog,
           write: (input) => {
@@ -5673,6 +5778,9 @@ function registerRpcHandlers(
       // The whole log's size, not just this page: daemon.writeIfUnchanged
       // compares against it.
       eventCount: managed.promptLog.size,
+      keyInputRevision: managed.bridge.getKeyInputRevision(),
+      incarnationId: managed.meta.incarnationId,
+      emptyShellPrompt: managed.bridge.isEmptyShellPrompt(),
       lastCompletedRange,
       totalBytesWritten,
       sessionFound: true,
@@ -6850,7 +6958,7 @@ function wireEvents(
     log('info', `[lifecycle] session:died id=${payload.id} reason=${payload.reason ?? 'pty-exit'} exitCode=${payload.exitCode ?? 'null'} signal=${payload.signal ?? 'none'} cmd=${payload.cmd ?? '?'} idleMsBeforeExit=${payload.lastActivityMsAgo ?? '?'} liveTotal=${sessionManager.listSessions().length}`);
     recoveredAgentShellIds.delete(payload.id); // X6 ②: drop a stale resume hint
     recoveredResumeBindings.delete(payload.id); // X6 ③: ...and its exact binding (id reuse, CodeRabbit)
-    recoveredWasRunning.delete(payload.id);
+    spendContinue(sessionManager, stateWriter, payload.id);
     // M1: drop the dedup ledger + hook authority for the dead pane. Without
     // this the ledger accrues dead-id entries over a long daemon lifetime, and
     // a reused id would inherit a hook veto that suppresses its detector.
@@ -7294,7 +7402,7 @@ function wireEvents(
     if (slug && canonical && canonical.source !== 'screen') {
       recoveredAgentShellIds.delete(payload.sessionId);
       recoveredResumeBindings.delete(payload.sessionId);
-      recoveredWasRunning.delete(payload.sessionId);
+      spendContinue(sessionManager, stateWriter, payload.sessionId);
     }
     // M1: the daemon owns hook-vs-detector arbitration now — the hook lands
     // here, not in main, so main can no longer run it and reads the outcome
@@ -7500,7 +7608,7 @@ function wireEvents(
   // automatic resume line itself, or anything typed before it, after which the
   // pane is the user's and its old turn is not continued on its own.
   sessionManager.on('session:inputSubmitted', (payload: { sessionId: string }) => {
-    recoveredWasRunning.delete(payload.sessionId);
+    spendContinue(sessionManager, stateWriter, payload.sessionId);
   });
 
   // Window-title change (OSC 0/2, detected in the daemon bridge). Broadcast so
@@ -7521,7 +7629,9 @@ function wireEvents(
   sessionManager.on('session:destroyed', (payload: { id: string }) => {
     recoveredAgentShellIds.delete(payload.id); // X6 ②: drop hint on explicit close too (CodeRabbit #2)
     recoveredResumeBindings.delete(payload.id); // X6 ③: drop the exact binding too (id reuse, CodeRabbit)
-    recoveredWasRunning.delete(payload.id);
+    spendContinue(sessionManager, stateWriter, payload.id);
+    // #2493: a closed pane's old disk-only record must not come back on the next save.
+    diskOnlySessions = diskOnlySessions.filter((s) => s.id !== payload.id);
     hookIngest?.dropPty(payload.id); // M1: ...and the dedup ledger / hook authority
     // Transcript projection: the pane is gone, so its watch has no reader left…
     chatSessions?.drop(payload.id);
@@ -7682,6 +7792,28 @@ let activeEventLogFormatVersion: number | undefined = undefined;
 
 /** Cached boot ID — populated at startup via initBootId() */
 let cachedBootId: string | undefined;
+/** Records recovery left on disk without managing them (see diskOnlySessions.ts). */
+let diskOnlySessions: DaemonSession[] = [];
+
+/** What every save writes: the managed sessions, then the disk-only records they have not taken. */
+/** A pane runs nothing, so a writer may type into it (chat v2's launch, the
+ *  Continue on another account resume line). See paneFree.ts. */
+async function sessionPaneFree(sessionManager: DaemonSessionManager, agentProcessTracker: AgentProcessTracker, id: string): Promise<boolean> {
+  const pane = sessionManager.getSession(id);
+  if (!pane) return false;
+  return paneFree({
+    shellIdle: async () => (await agentProcessTracker.idleShellState(pane.meta.pid, pane.meta.env, true)).ok,
+    trackedAgentPid: () => agentProcessTracker.pidFor(id),
+    isDefinitelyDead: (pid) => ProcessMonitor.isDefinitelyDead(pid),
+    isRunning: (pid) => ProcessMonitor.isRunning(pid),
+  });
+}
+
+function sessionsToSave(sessionManager: DaemonSessionManager): DaemonSession[] {
+  const managed = sessionManager.listSessions();
+  diskOnlySessions = retireAdopted(managed, diskOnlySessions);
+  return withDiskOnlySessions(managed, diskOnlySessions);
+}
 
 /** Initialize the cached boot ID (call once at startup). */
 async function initBootId(): Promise<void> {
@@ -7704,7 +7836,7 @@ function buildState(sessionManager: DaemonSessionManager): DaemonState {
   if (!cachedBootId) cachedBootId = getBootIdSync();
   return {
     version: 1,
-    sessions: sessionManager.listSessions(),
+    sessions: sessionsToSave(sessionManager),
     bootId: cachedBootId,
   };
 }
@@ -7895,7 +8027,7 @@ async function shutdown(
   const stateSaveStart = phaseStartedAt();
   const suspendState: DaemonState = {
     version: 1,
-    sessions: sessionManager.listSessions(),
+    sessions: sessionsToSave(sessionManager),
     bootId: cachedBootId,
   };
   // saveImmediate is non-throwing (returns false on write failure). Capture
@@ -8853,7 +8985,11 @@ async function main(): Promise<void> {
       if (!wslAgent) return { ok: false, code: 'unsupported' };
       if (stillIdle && !stillIdle()) return { ok: false, code: 'turn_open' };
       try {
-        return await stopWslAgent(wslAgent);
+        const r = await stopWslAgent(wslAgent);
+        // Gone (stopped now, or before the stop found it): the next session
+        // list reports it so, not the WSL watcher's next poll.
+        if (r.ok) agentProcessTracker.noteWslAgentGone(id, wslAgent);
+        return r;
       } catch {
         return { ok: false, code: 'unknown' };
       }
@@ -8912,13 +9048,7 @@ async function main(): Promise<void> {
           kill: (pid, signal) => process.kill(pid, signal),
           stillIdle,
         }),
-        paneFree: async (sid) => {
-          const pane = sessionManager.getSession(sid);
-          if (!pane) return false;
-          const pid = agentProcessTracker.pidFor(sid);
-          if (pid !== undefined && await ProcessMonitor.isRunning(pid)) return false;
-          return (await agentProcessTracker.idleShellState(pane.meta.pid, pane.meta.env, true)).ok;
-        },
+        paneFree: (sid) => sessionPaneFree(sessionManager, agentProcessTracker, sid),
         promptRevision: (sid) => {
           const pane = sessionManager.getSession(sid);
           if (!pane || pane.promptLog.size === 0 || pane.promptLog.isCommandRunning()) return null;
@@ -9015,7 +9145,7 @@ async function main(): Promise<void> {
     if (state.alive && state.slug) {
       recoveredAgentShellIds.delete(sessionId);
       recoveredResumeBindings.delete(sessionId);
-      recoveredWasRunning.delete(sessionId);
+      spendContinue(sessionManager, stateWriter, sessionId);
     }
     const managed = sessionManager.getSession(sessionId);
     if (!managed) return;
@@ -9672,7 +9802,7 @@ async function main(): Promise<void> {
         if (!cachedBootId) cachedBootId = getBootIdSync();
         const suspendState: DaemonState = {
           version: 1,
-          sessions: sessionManager.listSessions(),
+          sessions: sessionsToSave(sessionManager),
           bootId: cachedBootId,
         };
         stateWriter.saveImmediate(suspendState);

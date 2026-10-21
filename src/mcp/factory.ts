@@ -1,4 +1,4 @@
-// room_post / room_read / handoff_send / ask_person / question_close — the
+// room_post / room_read / room_search / handoff_send / ask_person / question_close — the
 // bot tools over `room.*`, `handoff.send`, `ask.person` and
 // `bot.questionClose` (shared/room.ts, shared/handoff.ts, shared/bot.ts), registered with registerToolModule
 // (src/mcp/toolModules.ts). Every call carries the bot's token; main takes
@@ -46,7 +46,7 @@ function compact(o: Record<string, unknown>): Record<string, unknown> {
 
 registerToolModule({
   name: 'factory-rooms',
-  tools: ['room_post', 'room_read', 'handoff_send', 'ask_person', 'question_close'],
+  tools: ['room_post', 'room_read', 'room_search', 'handoff_send', 'ask_person', 'question_close'],
   register(host, deps) {
     // A fresh object literal: the SDK's result type has an index signature.
     const call = async (method: Parameters<typeof deps.callRpc>[0], params: Record<string, unknown>) => ({
@@ -80,15 +80,32 @@ registerToolModule({
       'room_read',
       'Read cards from your workspace\'s room in arrival order: every thread (the default), or one thread_id '
         + '("general" is the general thread only). Without since_seq you get the newest page; pass back nextSinceSeq '
-        + 'to read what came after, hasMore says there is more. The HQ bot may read another workspace\'s room.',
+        + 'to read what came after, hasMore says there is more. The HQ bot may read another workspace\'s room. '
+        + 'Cards an external guest agent wrote (and cards written in a turn one started) are left out; include_guest returns '
+        + 'them only in a turn an external guest\'s message started, and is refused in any other.',
       {
         thread_id: THREAD_ID.optional(),
         since_seq: z.number().int().min(0).optional().describe('Cards after this seq.'),
         limit: z.number().int().min(1).max(ROOM_LIMITS.PAGE).optional(),
         workspace_id: z.string().min(1).max(80).optional().describe('HQ bot: another workspace\'s room.'),
+        include_guest: z.boolean().optional().describe('Also return external guest agents\' cards: only in a turn a guest\'s message started.'),
       },
-      async ({ thread_id, since_seq, limit, workspace_id }) =>
-        call(ROOM_RPC.read, { threadId: thread_id, sinceSeq: since_seq, limit, workspaceId: workspace_id }),
+      async ({ thread_id, since_seq, limit, workspace_id, include_guest }) =>
+        call(ROOM_RPC.read, { threadId: thread_id, sinceSeq: since_seq, limit, workspaceId: workspace_id, ...(include_guest === true ? { includeGuest: true } : {}) }),
+    );
+
+    host.tool(
+      'room_search',
+      'Search your workspace\'s room for earlier cards by words: a card matches when its title or body holds every '
+        + 'term (case-insensitive). Search before asking the owner to repeat something. Hits come newest first with seq, '
+        + 'threadId, actor, time and a snippet; pass nextBefore back as before for older hits. To read around a hit, '
+        + 'room_read its thread_id with since_seq a few below its seq. External guest agents\' cards are left out.',
+      {
+        query: z.string().min(1).max(ROOM_LIMITS.SEARCH_QUERY_MAX).describe('Words to find, separated by spaces.'),
+        before: z.number().int().min(1).optional().describe('Only cards with a seq below this.'),
+        limit: z.number().int().min(1).max(ROOM_LIMITS.SEARCH_MAX).optional().describe(`Default ${ROOM_LIMITS.SEARCH_DEFAULT}.`),
+      },
+      async ({ query, before, limit }) => call(ROOM_RPC.search, { query, before, limit }),
     );
 
     host.tool(

@@ -6,7 +6,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { atomicWriteJSON } from '../../daemon/util/atomicWrite';
 import { createSerialChain } from '../deck/serialChain';
-import { WORKFLOW_LIMITS, type BotWorkflow, type WorkflowCreateParams, type WorkflowResultBinding } from '../../shared/botWorkflow';
+import { WORKFLOW_BLOCK, WORKFLOW_LIMITS, workflowTaskBlocked, type BotWorkflow, type WorkflowCreateParams, type WorkflowResultBinding } from '../../shared/botWorkflow';
 import type { LedgerEntry } from '../../shared/ledger';
 import { isSystemGatePass } from '../../shared/botTask';
 import { parseThreadId } from '../../shared/room';
@@ -42,7 +42,8 @@ function validSteps(w: Record<string, unknown>): boolean {
       if (!object(r) || r.taskId !== s.taskId || !Number.isSafeInteger(r.rev) || Number(r.rev) < 1
         || typeof r.summary !== 'string' || r.summary.length > 4_000
         || !((typeof r.headSha === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(r.headSha))
-          !== (Number.isSafeInteger(r.mergedPr) && Number(r.mergedPr) > 0))) return false;
+          !== (Number.isSafeInteger(r.mergedPr) && Number(r.mergedPr) > 0))
+        || (r.at !== undefined && !Number.isFinite(r.at))) return false;
     } else if (s.result !== undefined) return false;
   }
   if (w.stoppedByOwner !== undefined && (w.stoppedByOwner !== true || w.state !== 'blocked')) return false;
@@ -55,12 +56,19 @@ function validSteps(w: Record<string, unknown>): boolean {
 export function workflowTaskResult(row: LedgerEntry): WorkflowResultBinding | null {
   if (row.status !== 'completed' || row.updatedBy.kind !== 'brain') return null;
   if (row.completion?.source === 'merge') {
-    return { taskId: row.id, rev: row.rev, mergedPr: row.completion.pr, summary: (row.summary ?? '').slice(0, 4_000) };
+    return { taskId: row.id, rev: row.rev, mergedPr: row.completion.pr, summary: (row.summary ?? '').slice(0, 4_000), at: row.updatedAt };
   }
   if (row.completion?.source !== 'gate' || !isSystemGatePass(row.gate)
     || !row.gate?.headSha || row.completion.headSha !== row.gate.headSha
     || row.completion.reportRev !== row.reportedAtRev || row.gate.reportRev !== row.reportedAtRev) return null;
-  return { taskId: row.id, rev: row.rev, headSha: row.gate.headSha, summary: (row.summary ?? '').slice(0, 4_000) };
+  return { taskId: row.id, rev: row.rev, headSha: row.gate.headSha, summary: (row.summary ?? '').slice(0, 4_000), at: row.updatedAt };
+}
+
+const changeListeners = new Set<() => void>();
+/** Told after any store persists a change; returns the unsubscribe. */
+export function onBotWorkflowsChanged(fn: () => void): () => void {
+  changeListeners.add(fn);
+  return () => { changeListeners.delete(fn); };
 }
 
 export class BotWorkflowStore {
@@ -85,7 +93,7 @@ export class BotWorkflowStore {
       || !raw.workflows.every((w) => object(w) && validateWorkflowInput(w)
         && typeof w.id === 'string' && /^wf-[a-f0-9]{24}$/.test(w.id)
         && bounded(w.botId, 100) && bounded(w.workspaceId, 200) && bounded(w.repoKey, 300)
-        && parseThreadId(w.threadId) !== null && typeof w.tainted === 'boolean'
+        && parseThreadId(w.threadId) !== null && typeof w.tainted === 'boolean' && (w.guest === undefined || typeof w.guest === 'boolean')
         && ['active', 'blocked', 'completed'].includes(String(w.state))
         && Number.isSafeInteger(w.revision) && Number(w.revision) > 0
         && Number.isFinite(w.createdAt) && Number.isFinite(w.updatedAt)
@@ -112,9 +120,9 @@ export class BotWorkflowStore {
   }
 
   /** Main's provenance lookup for synthetic ready facts; no plan text leaves here. */
-  provenance(id: string): Pick<BotWorkflow, 'revision' | 'tainted'> | null {
+  provenance(id: string): Pick<BotWorkflow, 'revision' | 'tainted' | 'guest'> | null {
     const workflow = this.records.find((w) => w.id === id);
-    return workflow ? { revision: workflow.revision, tainted: workflow.tainted } : null;
+    return workflow ? { revision: workflow.revision, tainted: workflow.tainted, ...(typeof workflow.guest === 'boolean' ? { guest: workflow.guest } : {}) } : null;
   }
 
   private async update<T>(fn: (records: BotWorkflow[]) => T): Promise<T> {
@@ -124,16 +132,22 @@ export class BotWorkflowStore {
       if (JSON.stringify(next) !== JSON.stringify(this.records)) {
         await this.write(this.file, { version: 1, workflows: next });
         this.records = next;
+        // A listener never fails the write that already landed.
+        for (const fn of changeListeners) { try { fn(); } catch { /* ignored */ } }
       }
       return copy(result);
     });
   }
 
-  create(owner: Pick<BotWorkflow, 'botId' | 'workspaceId' | 'repoKey' | 'threadId' | 'tainted'>, input: WorkflowCreateParams): Promise<BotWorkflow> {
+  /** `refusal`, when given, is asked inside the serialized write, right
+   *  before anything is stored; a reason refuses the create with it. */
+  create(owner: Pick<BotWorkflow, 'botId' | 'workspaceId' | 'repoKey' | 'threadId' | 'tainted' | 'guest'>, input: WorkflowCreateParams, refusal?: () => string | null): Promise<BotWorkflow> {
     if (!validateWorkflowInput(input)) return Promise.reject(new Error('invalid workflow definition'));
     input = redactStoredSecretsDeep({ clientWorkflowId: input.clientWorkflowId, title: input.title, steps: input.steps.map(({ title, prompt }) => ({ title, prompt })) });
     if (!validateWorkflowInput(input)) return Promise.reject(new Error('redacted workflow definition exceeds its limits'));
     return this.update((records) => {
+      const refused = refusal?.() ?? null;
+      if (refused) throw new Error(refused);
       const id = `wf-${createHash('sha256').update(`${owner.botId}\0${owner.workspaceId}\0${input.clientWorkflowId}`).digest('hex').slice(0, 24)}`;
       const existing = records.find((w) => w.id === id);
       if (existing) {
@@ -180,7 +194,7 @@ export class BotWorkflowStore {
       const step = w.steps.find((s) => s.state !== 'completed')!;
       if (step.state !== 'blocked') {
         step.state = 'blocked';
-        step.error = 'Cancelled by owner; remaining steps will not run. Any dispatched worker is left running.';
+        step.error = WORKFLOW_BLOCK.cancelled;
       }
       w.state = 'blocked'; w.stoppedByOwner = true;
       this.changed(w);
@@ -208,7 +222,7 @@ export class BotWorkflowStore {
         if (w.state !== 'active' || (botId !== undefined && w.botId !== botId)) continue;
         const step = w.steps.find((s) => s.state !== 'completed');
         if (!step) continue;
-        step.state = 'blocked'; step.error = 'Stopped by owner; this workflow will not resume automatically.';
+        step.state = 'blocked'; step.error = WORKFLOW_BLOCK.stopped;
         w.state = 'blocked'; w.stoppedByOwner = true;
         this.changed(w); count++;
       }
@@ -231,7 +245,7 @@ export class BotWorkflowStore {
           && r.dispatch.repoKey === w.repoKey);
         if (matches.length !== 1) {
           if (matches.length > 1 || (recovering && s.state !== 'pending')) {
-            s.state = 'blocked'; s.error = matches.length > 1 ? 'More than one task claims this step; inspect tasks before continuing.' : 'Dispatch outcome is unknown after restart. Inspect tasks; this step will not be resent automatically.';
+            s.state = 'blocked'; s.error = matches.length > 1 ? WORKFLOW_BLOCK.multipleTasks : WORKFLOW_BLOCK.unknownDispatch;
             w.state = 'blocked'; this.changed(w);
           }
           // A prior ready wake may have finished before the pending step was
@@ -242,7 +256,7 @@ export class BotWorkflowStore {
         const row = matches[0];
         if (!w.tainted && row.dispatch?.origin.tainted !== false) { w.tainted = true; this.changed(w); }
         if (s.taskId && s.taskId !== row.id) {
-          s.state = 'blocked'; s.error = 'The step task binding changed.'; w.state = 'blocked'; this.changed(w); continue;
+          s.state = 'blocked'; s.error = WORKFLOW_BLOCK.bindingChanged; w.state = 'blocked'; this.changed(w); continue;
         }
         const result = workflowTaskResult(row);
         const blocked = row.status === 'failed' || row.status === 'cancelled'
@@ -252,7 +266,7 @@ export class BotWorkflowStore {
           s.dispatchKey ??= `reconciled:${row.id}`;
           s.taskId = row.id; s.state = state;
           if (result) s.result = result;
-          if (blocked) { s.error = `Task ${row.id} is ${row.status}; no verified result permits the next step.`; w.state = 'blocked'; }
+          if (blocked) { s.error = workflowTaskBlocked(row.id, row.status); w.state = 'blocked'; }
           if (w.steps.every((v) => v.state === 'completed')) w.state = 'completed';
           this.changed(w);
         }

@@ -8,7 +8,7 @@ import * as path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { BotStore, botsFilePath, parseBotProfile } from '../botStore';
 import { LEGACY_TRIAGE_TRIGGERS, LEGACY_VERIFIER_TRIGGERS, defaultTriggers } from '../roleDefaults';
-import { WakeQueue, sanitizeWakeReason, wakeQueuePath, WAKE_RECORD_MAX, WAKE_RECORD_RETAIN_MS, HUMAN_RETRY_WINDOW_MS, OVER_CAP_RESERVE, setWakeQueue, currentWakeId, currentWakeThread } from '../wakeQueue';
+import { WakeQueue, sanitizeWakeReason, wakeQueuePath, WAKE_RECORD_MAX, WAKE_RECORD_RETAIN_MS, HUMAN_RETRY_WINDOW_MS, OVER_CAP_RESERVE, GUEST_WAKES_QUEUED_PER_BOT, dropQueuedGuestWakes, setWakeQueue, currentWakeId, currentWakeThread } from '../wakeQueue';
 import {
   budgetLeft,
   checkTurn,
@@ -18,6 +18,7 @@ import {
   recordTurn,
   recordWorkerEnd,
   recordWorkerStart,
+  recordWorkerStateChange,
   workerHoursDay,
   HOUR_MS,
   hourlyCap,
@@ -627,6 +628,49 @@ describe('budget windows', () => {
   });
 });
 
+describe('worker time across a pause (recordWorkerStateChange)', () => {
+  it('a pause stops the clock of a first run, and a resume starts a new interval', () => {
+    const u = emptyUsage();
+    recordWorkerStart(u, 't1', 0);
+    // Paused for its report after one hour: stopping, then stopped.
+    recordWorkerStateChange(u, 't1', 'stopping', 'stopped', HOUR_MS);
+    expect(workerHoursDay(u, 3 * HOUR_MS)).toBe(1);
+    // Resumed two hours later: a new interval, counted from the resume.
+    recordWorkerStateChange(u, 't1', 'stopped', 'resumed', 3 * HOUR_MS);
+    expect(u.workers.filter((w) => w.taskId === 't1')).toHaveLength(2);
+    expect(workerHoursDay(u, 4 * HOUR_MS)).toBe(2);
+    // Stopped again: the clock stops again.
+    recordWorkerStateChange(u, 't1', 'resumed', 'stopped', 4 * HOUR_MS);
+    expect(workerHoursDay(u, 6 * HOUR_MS)).toBe(2);
+  });
+
+  it('a resumed run keeps counting while its stop is under way, and ends at the confirmed stop', () => {
+    const u = emptyUsage();
+    recordWorkerStateChange(u, 't1', 'stopped', 'resumed', 0);
+    // The reclaim records `stopping` before it signals the agent.
+    recordWorkerStateChange(u, 't1', 'resumed', 'stopping', HOUR_MS);
+    expect(workerHoursDay(u, 2 * HOUR_MS)).toBe(2);
+    recordWorkerStateChange(u, 't1', 'stopping', 'stopped', 2 * HOUR_MS);
+    expect(workerHoursDay(u, 4 * HOUR_MS)).toBe(2);
+  });
+
+  it('a stop that stopped nothing goes back to resumed without a gap or a second run', () => {
+    const u = emptyUsage();
+    recordWorkerStateChange(u, 't1', 'stopped', 'resumed', 0);
+    recordWorkerStateChange(u, 't1', 'resumed', 'stopping', HOUR_MS);
+    recordWorkerStateChange(u, 't1', 'stopping', 'resumed', HOUR_MS);
+    expect(u.workers.filter((w) => w.taskId === 't1')).toHaveLength(1);
+    expect(workerHoursDay(u, 3 * HOUR_MS)).toBe(3);
+  });
+
+  it('a stop still under way leaves the run counting', () => {
+    const u = emptyUsage();
+    recordWorkerStart(u, 't1', 0);
+    recordWorkerStateChange(u, 't1', 'stopped', 'stopping', HOUR_MS);
+    expect(workerHoursDay(u, 2 * HOUR_MS)).toBe(2);
+  });
+});
+
 describe('WakeQueue', () => {
   const trigger = { kind: 'pr.opened' as const, batch: { windowMs: 20_000, max: 3 } };
   let n = 0;
@@ -635,6 +679,20 @@ describe('WakeQueue', () => {
     pendingFlush.push(() => q.flush());
     return q;
   };
+
+  it('drops a wake that names a workspace other than its bot\'s own (cross_workspace) and keeps its record', async () => {
+    const q = new WakeQueue(wakeQueuePath(dir), { now, newId: () => `w-${n++}`, botWorkspace: (id) => (id === 'bot-1' ? 'ws-g' : null) });
+    pendingFlush.push(() => q.flush());
+    expect(q.enqueue({ botId: 'bot-1', workspaceId: 'ws-a', reason: { kind: 'human', text: 'hi', source: 'desktop' }, priority: 0 })).toBeNull();
+    expect(q.enqueue({ botId: 'bot-9', workspaceId: 'ws-a', reason: { kind: 'human', text: 'hi', source: 'desktop' }, priority: 0 })).toBeNull();
+    expect(q.list().map((i) => i.dropped?.code)).toEqual(['cross_workspace', 'cross_workspace']);
+    expect(q.enqueue({ botId: 'bot-1', workspaceId: 'ws-g', reason: { kind: 'human', text: 'hi', source: 'desktop' }, priority: 0 })?.state).toBe('queued');
+    // The record reads back after a restart.
+    await q.flush();
+    const again = new WakeQueue(wakeQueuePath(dir), { now });
+    again.load();
+    expect(again.list().filter((i) => i.dropped?.code === 'cross_workspace')).toHaveLength(2);
+  });
 
   it('orders by priority then age, holding batched facts until their window closes', () => {
     const q = newQueue();
@@ -816,9 +874,12 @@ describe('WakeQueue', () => {
     }
   });
 
-  it('a taken human message keeps its record past the count cap for the retry window, so a retry finds it; then it counts', () => {
+  it.each([
+    ['human', { kind: 'human' as const, text: 'hi', source: 'phone' as const, clientMessageId: 'cm-old' }],
+    ['guest', { kind: 'guest' as const, guestId: '0b5f6a7e-1c2d-4e3f-8a9b-0c1d2e3f4a5b', guestName: 'G', cardId: 'c-old', text: 'hi' }],
+  ])('a taken %s message keeps its record past the count cap for the retry window, so a retry finds it; then it counts', (_kind, reason) => {
     const q = newQueue();
-    const human = { botId: 'bot-h', workspaceId: 'ws', reason: { kind: 'human' as const, text: 'hi', source: 'phone' as const, clientMessageId: 'cm-old' }, priority: 0 as const };
+    const human = { botId: 'bot-h', workspaceId: 'ws', reason, priority: 0 as const };
     const first = q.enqueue(human)!;
     q.start(first.id);
     q.finish(first.id);
@@ -833,6 +894,65 @@ describe('WakeQueue', () => {
     clock += HUMAN_RETRY_WINDOW_MS + 1;
     q.enqueue({ botId: 'bot-x', workspaceId: 'ws', reason: { kind: 'manual', by: 'human' }, priority: 1 });
     expect(q.get(first.id)).toBeNull();
+  });
+
+  it('a guest flood holds at most GUEST_WAKES_QUEUED_PER_BOT; the bot\'s fact and handoff wakes still queue', () => {
+    const q = newQueue();
+    const guest = (n: number) => ({ botId: 'bot-g', workspaceId: 'ws', priority: 2 as const,
+      reason: { kind: 'guest' as const, guestId: '0b5f6a7e-1c2d-4e3f-8a9b-0c1d2e3f4a5b', guestName: 'G', cardId: `c-${n}`, text: 'hi' } });
+    for (let i = 0; i < WAKE_LIMITS.PER_BOT_QUEUE_CAP + 5; i++) q.enqueue(guest(i));
+    expect(q.queuedGuestWakes('bot-g')).toBe(GUEST_WAKES_QUEUED_PER_BOT);
+    expect(q.enqueue({ botId: 'bot-g', workspaceId: 'ws', priority: 1, reason: { kind: 'handoff', handoffId: 'h-1' } })).not.toBeNull();
+    expect(q.enqueue({ botId: 'bot-g', workspaceId: 'ws', priority: 1, reason: { kind: 'facts', factIds: ['f-1'], trigger: { kind: 'task.done' } } })).not.toBeNull();
+  });
+
+  it('dropQueuedGuestWakes drops one guest\'s wakes, or every guest\'s', () => {
+    const q = newQueue();
+    setWakeQueue(q);
+    try {
+      const wake = (guestId: string, cardId: string, botId: string) => q.enqueue({ botId, workspaceId: 'ws', priority: 2, reason: { kind: 'guest', guestId, guestName: 'G', cardId, text: 'hi' } });
+      const G1 = '0b5f6a7e-1c2d-4e3f-8a9b-0c1d2e3f4a5b';
+      const G2 = '1b5f6a7e-1c2d-4e3f-8a9b-0c1d2e3f4a5b';
+      wake(G1, 'c-1', 'bot-a');
+      const other = wake(G2, 'c-2', 'bot-a')!;
+      wake(G1, 'c-3', 'bot-b');
+      q.enqueue({ botId: 'bot-a', workspaceId: 'ws', priority: 1, reason: { kind: 'handoff', handoffId: 'h-1' } });
+      expect(dropQueuedGuestWakes(G1)).toBe(2);
+      expect(q.list({ states: ['queued'] }).map((i) => i.id).filter((id) => q.get(id)?.reason.kind === 'guest')).toEqual([other.id]);
+      expect(dropQueuedGuestWakes()).toBe(1);
+      expect(q.list({ states: ['queued'] }).map((i) => i.reason.kind)).toEqual(['handoff']);
+    } finally {
+      setWakeQueue(null);
+    }
+  });
+
+  it('a guest wake running at a revoke runs no attempt more; a retry or park past the guest cap drops it', () => {
+    const q = newQueue();
+    setWakeQueue(q);
+    try {
+      const G = '0b5f6a7e-1c2d-4e3f-8a9b-0c1d2e3f4a5b';
+      const wake = (cardId: string) => q.enqueue({ botId: 'bot-r', workspaceId: 'ws', priority: 2, reason: { kind: 'guest', guestId: G, guestName: 'G', cardId, text: 'hi' } })!;
+      const running = wake('c-0');
+      q.start(running.id);
+      dropQueuedGuestWakes(G);
+      expect(q.retry(running.id)?.state).toBe('dropped');
+      expect(q.next('bot-r')).toBeNull();
+      // Three queued and one running: its retry, or a park lifted later, does not make four.
+      const again = wake('c-1');
+      q.start(again.id);
+      for (const c of ['c-2', 'c-3', 'c-4']) wake(c);
+      expect(q.retry(again.id)).toMatchObject({ state: 'dropped', dropped: { code: 'queue_full' } });
+      expect(q.queuedGuestWakes('bot-r')).toBe(GUEST_WAKES_QUEUED_PER_BOT);
+      const parked = q.next('bot-r')!;
+      q.start(parked.id);
+      q.park(parked.id);
+      wake('c-5');
+      q.unparkAll('bot-r');
+      expect(q.queuedGuestWakes('bot-r')).toBe(GUEST_WAKES_QUEUED_PER_BOT);
+      expect(q.get(parked.id)).toMatchObject({ state: 'dropped', dropped: { code: 'queue_full' } });
+    } finally {
+      setWakeQueue(null);
+    }
   });
 
   it('prunes finished records past the cap', () => {

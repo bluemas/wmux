@@ -33,6 +33,8 @@ const act = React.act;
 let container: HTMLDivElement;
 let root: Root;
 let rpc: ReturnType<typeof vi.fn>;
+let frameReady: ReturnType<typeof vi.fn>;
+let notifyNavigation: (name: string) => void;
 
 /** The port the host transferred to the frame, i.e. the plugin's own end. */
 function pluginPort(postMessage: ReturnType<typeof vi.fn>): MessagePort {
@@ -64,7 +66,19 @@ function settledOrTimedOut(p: Promise<unknown>, ms = 50): Promise<unknown | 'no-
 
 beforeEach(() => {
   rpc = vi.fn(async () => ({ ok: true, result: { id: 'ws-1' } }));
-  (window as unknown as { electronAPI: unknown }).electronAPI = { plugins: { rpc } };
+  frameReady = vi.fn(async (_plugin, frameName, nonce) => {
+    const iframe = container.querySelector('iframe')!;
+    expect(iframe.name).toBe(frameName);
+    const source = iframe.contentWindow;
+    const channel = new MessageChannel();
+    // Simulate main's document-local bootstrap; this is not a host transfer.
+    source!.postMessage({ v: 1, kind: 'init' }, '*', [channel.port2]);
+    window.dispatchEvent(new MessageEvent('message', { source, data: { kind: 'wmux-plugin-bridge', nonce }, ports: [channel.port1] }));
+    return true;
+  });
+  (window as unknown as { electronAPI: unknown }).electronAPI = { plugins: {
+    rpc, frameReady, onFrameNavigation: (fn: (name: string) => void) => { notifyNavigation = fn; return () => { /* test subscription cleanup */ }; },
+  } };
   useStore.setState({ activeWorkspaceId: 'ws-1' });
   container = document.createElement('div');
   document.body.appendChild(container);
@@ -96,7 +110,7 @@ describe('PluginFrame — bridge lifetime across a workspace switch', () => {
     const framePostMessage = vi.fn();
     Object.defineProperty(iframe!, 'contentWindow', {
       configurable: true,
-      get: () => ({ postMessage: framePostMessage }),
+      value: { postMessage: framePostMessage },
     });
 
     await act(async () => { iframe!.dispatchEvent(new Event('load')); });
@@ -133,7 +147,7 @@ describe('PluginFrame — bridge lifetime across a workspace switch', () => {
     const framePostMessage = vi.fn();
     Object.defineProperty(iframe, 'contentWindow', {
       configurable: true,
-      get: () => ({ postMessage: framePostMessage }),
+      value: { postMessage: framePostMessage },
     });
 
     await act(async () => { iframe.dispatchEvent(new Event('load')); });
@@ -172,7 +186,7 @@ describe('PluginFrame — bridge lifetime across a workspace switch', () => {
     const framePostMessage = vi.fn();
     Object.defineProperty(iframe, 'contentWindow', {
       configurable: true,
-      get: () => ({ postMessage: framePostMessage }),
+      value: { postMessage: framePostMessage },
     });
 
     await act(async () => { iframe.dispatchEvent(new Event('load')); });
@@ -232,7 +246,7 @@ describe('PluginFrame — bridge lifetime across a workspace switch', () => {
       const iframe = container.querySelector('iframe')!;
       Object.defineProperty(iframe, 'contentWindow', {
         configurable: true,
-        get: () => ({ postMessage: vi.fn() }),
+        value: { postMessage: vi.fn() },
       });
       rpc.mockResolvedValue({ ok: true, result: { events: [], nextCursor: 7 } });
 
@@ -255,11 +269,7 @@ describe('PluginFrame — bridge lifetime across a workspace switch', () => {
     }
   });
 
-  // `bridgeEpoch === 0` is the poll's "there is nowhere to deliver" gate. It
-  // has to go back to 0 when the bridge is torn down, or the gate only works
-  // once: swapping the plugin nulls the port but leaves the epoch high, and
-  // the loop spends the window before the new `load` polling into nothing —
-  // events fetched from the ring and dropped, with no way to notice.
+  // A retired bridge must stop polling until the next document offers a port.
   it('stops polling between a plugin swap and the new frame load', async () => {
     vi.useFakeTimers();
     try {
@@ -273,7 +283,7 @@ describe('PluginFrame — bridge lifetime across a workspace switch', () => {
       const iframe = container.querySelector('iframe')!;
       Object.defineProperty(iframe, 'contentWindow', {
         configurable: true,
-        get: () => ({ postMessage: vi.fn() }),
+        value: { postMessage: vi.fn() },
       });
       rpc.mockResolvedValue({ ok: true, result: { events: [], nextCursor: 7 } });
 
@@ -302,4 +312,120 @@ describe('PluginFrame — bridge lifetime across a workspace switch', () => {
       vi.useRealTimers();
     }
   });
+});
+
+
+it('refuses an explicit agent-state response after switching away and back', async () => {
+  let release!: (value: unknown) => void;
+  let entered!: () => void;
+  const started = new Promise<void>((r) => { entered = r; });
+  rpc.mockImplementation(() => new Promise((resolve) => { release = resolve; entered(); }));
+  act(() => root.render(<PluginFrame pluginName="demo" entry="index.html" />));
+  const frame = container.querySelector('iframe')!;
+  const post = vi.fn();
+  Object.defineProperty(frame, 'contentWindow', { configurable: true, value: { postMessage: post } });
+  await act(async () => { frame.dispatchEvent(new Event('load')); });
+  const port = pluginPort(post); port.start();
+  const response = request(port, 'slow', 'agent.state');
+  await started;
+  act(() => { useStore.setState({ activeWorkspaceId: 'ws-2' }); useStore.setState({ activeWorkspaceId: 'ws-1' }); });
+  release({ ok: true, result: { activity: 'private old workspace' } });
+  expect(await settledOrTimedOut(response)).toMatchObject({ error: { code: 'scope-changed' } });
+});
+
+
+it('does not navigate for a focus response from an earlier workspace epoch', async () => {
+  let release!: (value: unknown) => void;
+  let entered!: () => void;
+  const started = new Promise<void>((r) => { entered = r; });
+  rpc.mockImplementation(() => new Promise((resolve) => { release = resolve; entered(); }));
+  useStore.setState({ appRoute: 'plugin:demo' });
+  act(() => root.render(<PluginFrame pluginName="demo" entry="index.html" railPage />));
+  const frame = container.querySelector('iframe')!;
+  const post = vi.fn();
+  Object.defineProperty(frame, 'contentWindow', { configurable: true, value: { postMessage: post } });
+  await act(async () => { frame.dispatchEvent(new Event('load')); });
+  const port = pluginPort(post); port.start();
+  const response = request(port, 'focus-slow', 'pane.focus');
+  await started;
+  act(() => { useStore.setState({ activeWorkspaceId: 'ws-2' }); useStore.setState({ activeWorkspaceId: 'ws-1' }); });
+  release({ ok: true, result: { ok: true } });
+  await settledOrTimedOut(response);
+  expect(useStore.getState().appRoute).toBe('plugin:demo');
+});
+
+it('forwards the retryable startup flag on an explicit read failure', async () => {
+  rpc.mockResolvedValue({ ok: false, error: 'Still starting', retryable: true });
+  act(() => root.render(React.createElement(PluginFrame, { pluginName: 'demo', entry: 'index.html' })));
+  const iframe = container.querySelector('iframe')!;
+  const framePostMessage = vi.fn();
+  Object.defineProperty(iframe, 'contentWindow', { configurable: true, value: { postMessage: framePostMessage } });
+  await act(async () => { iframe.dispatchEvent(new Event('load')); });
+  const port = pluginPort(framePostMessage);
+  port.start();
+  expect(await settledOrTimedOut(request(port, 'retry', 'agent.state'))).toMatchObject({
+    kind: 'response', error: { code: 'rpc-rejected', message: 'Still starting', retryable: true },
+  });
+  port.close();
+});
+
+it('does not transfer a bridge when the committed document is refused', async () => {
+  frameReady.mockResolvedValue(false);
+  await act(async () => root.render(React.createElement(PluginFrame, { pluginName: 'demo', entry: 'index.html' })));
+  const frame = container.querySelector('iframe')!;
+  const post = vi.fn();
+  Object.defineProperty(frame, 'contentWindow', { configurable: true, value: { postMessage: post } });
+  await act(async () => { frame.dispatchEvent(new Event('load')); });
+  expect(frameReady).toHaveBeenCalledWith('demo', frame.name, expect.any(String));
+  expect(post).not.toHaveBeenCalled();
+  expect(container.querySelector('iframe')).toBeNull();
+  expect(container.querySelector('[role="status"]')).not.toBeNull();
+});
+
+it('drops a pending handshake when navigation starts', async () => {
+  let finish!: (ready: boolean) => void;
+  frameReady.mockImplementation(() => new Promise<boolean>((resolve) => { finish = resolve; }));
+  await act(async () => root.render(React.createElement(PluginFrame, { pluginName: 'demo', entry: 'index.html' })));
+  const frame = container.querySelector('iframe')!;
+  const post = vi.fn();
+  Object.defineProperty(frame, 'contentWindow', { configurable: true, value: { postMessage: post } });
+  await act(async () => { frame.dispatchEvent(new Event('load')); });
+  await act(async () => { notifyNavigation(frame.name); finish(true); });
+  expect(post).not.toHaveBeenCalled();
+});
+
+it('closes the active bridge on document navigation', async () => {
+  await act(async () => root.render(React.createElement(PluginFrame, { pluginName: 'demo', entry: 'index.html' })));
+  const frame = container.querySelector('iframe')!;
+  const post = vi.fn();
+  Object.defineProperty(frame, 'contentWindow', { configurable: true, value: { postMessage: post } });
+  await act(async () => { frame.dispatchEvent(new Event('load')); });
+  const port = pluginPort(post);
+  await act(async () => { notifyNavigation(frame.name); });
+  expect(await settledOrTimedOut(request(port, 'after-navigation', 'workspace.current'))).toBe('no-reply');
+  expect(rpc).not.toHaveBeenCalled();
+  port.close();
+});
+
+it('restarts agent-state streaming after a batched reload handshake', async () => {
+  useStore.setState({ appRoute: 'plugin:demo' });
+  rpc.mockResolvedValue({ ok: true, result: { workspaceId: 'ws-1', panes: [], truncated: false } });
+  await act(async () => root.render(<PluginFrame pluginName="demo" entry="index.html" railPage agentStateEvents />));
+  const frame = container.querySelector('iframe')!;
+  const post = vi.fn();
+  const received: Array<Array<{ kind?: string; status?: string }>> = [];
+  post.mockImplementation((_message, _origin, ports: MessagePort[]) => {
+    const events: Array<{ kind?: string; status?: string }> = [];
+    received.push(events);
+    ports[0].onmessage = (event) => events.push(event.data);
+    ports[0].start();
+  });
+  Object.defineProperty(frame, 'contentWindow', { configurable: true, value: { postMessage: post } });
+  await act(async () => { frame.dispatchEvent(new Event('load')); });
+  await vi.waitFor(() => expect(received[0]).toContainEqual(expect.objectContaining({ kind: 'agent-state', status: 'ready' })), { timeout: 5000 });
+  rpc.mockClear();
+  await act(async () => { frame.dispatchEvent(new Event('load')); });
+  await vi.waitFor(() => expect(received[1]).toContainEqual(expect.objectContaining({ kind: 'agent-state', status: 'ready' })), { timeout: 5000 });
+  expect(rpc).toHaveBeenCalledWith('demo', 'agent.state', {}, 'ws-1');
+  for (const call of post.mock.calls) (call[2] as MessagePort[])[0].close();
 });

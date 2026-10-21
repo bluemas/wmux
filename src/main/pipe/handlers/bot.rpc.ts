@@ -25,17 +25,20 @@
 // wake queue, and publishes the singletons the other factory modules use
 // (getBotDirectory, getWakeQueue, getBotRuntime, getFactorySettings).
 
+import path from 'node:path';
 import type { RpcContext, RpcMethod } from '../../../shared/rpc';
 import { BOT_EVENT, BOT_ID_RE, BOT_IDENTITY_SLOTS, BOT_JOB_MAX, BOT_RPC, type BotProfile, type BotStatus } from '../../../shared/bot';
 import type { FactoryRefusal } from '../../../shared/botSurface';
 import { parseThreadId, type ThreadId } from '../../../shared/room';
 import { registerFactoryRpcModule, type FactoryHostDeps, type FactoryRouter } from '../../factory/factoryHost';
 import { BotStore, botsFilePath, setBotStore } from '../../factory/botStore';
+import { GuestWorkspaceStore, crossesGuestBoundary, expectGuestWorkspaces, guestWorkspacesPath, setGuestWorkspaceStore } from '../../factory/guestWorkspaces';
 import { WakeQueue, wakeQueuePath, setWakeQueue } from '../../factory/wakeQueue';
 import { FactorySettingsStore, factorySettingsPath, onFactorySettingsChanged, setFactorySettingsStore } from '../../factory/factorySettings';
 import { BotRuntime, BotSessionStore, botSessionsPath, setBotRuntime } from '../../factory/BotRuntime';
 import { createDefaultBotEngineFactory, runnableDefaultEngine, type BotEngineFactory } from '../../factory/botEngines';
 import { recordWorkerEnd } from '../../factory/budget';
+import { workerStopsConfirmed } from '../../factory/workerRunEnds';
 import { botAccountName, botAccountQuota, type ClaudeUsageCache } from '../../factory/botQuota';
 import { openBotWorkers } from '../../factory/openBotWorkers';
 import { FANOUT_LIVE_TASK_CAP } from '../../worktask/fanoutGuards';
@@ -48,10 +51,11 @@ import { getTaskLedger } from '../../deck/taskLedgerHost';
 import type { WakeTaskSummary } from '../../factory/wakePrompt';
 import { botRepoFromFolder, greetNewBot } from '../../factory/botCreate';
 import { DISMISSED_ANSWER, getHandoffRouter } from '../../factory/handoffRouter';
-import { getWakeTaint, type WakeTaint } from '../../factory/wakeTaint';
+import { getWakeTaint, guestGateProvenance, type GuestProvenance, type WakeTaint } from '../../factory/wakeTaint';
+import { conversationBotIds } from '../../factory/guestMessage';
 import type { Handoff } from '../../../shared/handoff';
 import type { WakeItem } from '../../../shared/wake';
-import { getRoomWriter, resolveRoomPorts, runningWake, runningWakeThread, wakeReplyTo } from '../../factory/roomWriter';
+import { ROOMS_DIRNAME, getRoomWriter, resolveRoomPorts, runningWake, runningWakeThread, wakeReplyTo } from '../../factory/roomWriter';
 import { getFactoryStopPorts, stopFactoryWork, type FactoryStopPorts, type FactoryStopResult } from '../../factory/factoryStop';
 import { UNKNOWN_ROOT_REFUSAL } from '../../../shared/rpc';
 
@@ -126,6 +130,8 @@ export interface SetJobPorts {
   /** The running wake carries the owner's own answer to this bot's
    *  question (wakeOnOwnerAnswer). Missing: no wake does. */
   ownerAnswer?: (botId: string, wake: Pick<WakeItem, 'reason'>) => boolean;
+  /** That wake's guest provenance (wakeTaint.ts wakeGuest). Missing: clean. */
+  wakeGuest?: (wake: Pick<WakeItem, 'reason' | 'botId' | 'workspaceId'>) => GuestProvenance;
 }
 
 /** The wake carries the owner's own answer to the bot's question: an
@@ -156,6 +162,7 @@ const defaultSetJobPorts: SetJobPorts = {
   runningWakeId: (botId) => runningWake(resolveRoomPorts(), botId)?.wakeId ?? null,
   runningThread: (botId) => runningWakeThread(resolveRoomPorts(), botId),
   ownerCardId: (botId) => runningWake(resolveRoomPorts(), botId)?.ownerCardId ?? null,
+  wakeGuest: (wake) => getWakeTaint()?.wakeGuest(wake) ?? 'unknown',
   post: ({ replyTo: candidate, ...card }) => {
     const writer = getRoomWriter();
     if (!writer) return;
@@ -196,12 +203,22 @@ export async function forgetRemovedBot(botId: string): Promise<void> {
   }
 }
 
+/** In a wake not known clean, a bot lists only the bots of the conversation
+ *  that wake is in. */
+function defaultListScope(botId: string): ReadonlySet<string> | undefined {
+  if (guestGateProvenance(botId) === false) return undefined;
+  return conversationBotIds(resolveRoomPorts(), botId);
+}
+
 /** The bot.* handlers over a live-runtime getter. Exported for tests. */
 export function registerBotRpcHandlers(
   router: FactoryRouter,
   live: () => Live | null,
   setJobPorts: SetJobPorts = defaultSetJobPorts,
   removePorts: RemovePorts = { stopPorts: getFactoryStopPorts, afterRemove: forgetRemovedBot },
+  /** The bots a bot may list now: undefined for all (a clean wake), else
+   *  those of its running wake's conversation (guestMessage.ts). */
+  listScope: (botId: string) => ReadonlySet<string> | undefined = defaultListScope,
 ): void {
   const NOT_STARTED = refuse('not_started', 'the bot runtime is not running');
 
@@ -211,7 +228,12 @@ export function registerBotRpcHandlers(
     const l = live();
     if (!l) return NOT_STARTED;
     const workspaceId = typeof params['workspaceId'] === 'string' ? params['workspaceId'] : undefined;
-    const bots = l.store.list(workspaceId ? { workspaceId } : {});
+    const scope = caller.kind === 'bot' ? listScope(caller.botId) : undefined;
+    // A bot lists only its side of a guest workspace's boundary: inside one,
+    // its own workspace's bots; elsewhere, none of a guest workspace's.
+    const ownWs = caller.kind === 'bot' ? l.store.get(caller.botId)?.workspaceId ?? ctx?.bot?.workspaceId ?? null : null;
+    const bots = l.store.list(workspaceId ? { workspaceId } : {}).filter((b) => (!scope || scope.has(b.id))
+      && (caller.kind !== 'bot' || (ownWs !== null && !crossesGuestBoundary(ownWs, b.workspaceId))));
     return {
       ok: true,
       bots: bots.map((bot) => ({ bot: pipeProfile(bot), status: statusFor(caller, l.runtime.status(bot.id)) })),
@@ -255,8 +277,11 @@ export function registerBotRpcHandlers(
       // handoff or a schedule.
       const wakeId = setJobPorts.runningWakeId(botId);
       const wake = wakeId ? l.queue?.get(wakeId) ?? null : null;
+      // A job runs in every later wake: never one from a guest-sourced wake
+      // (or one whose provenance is unknown).
       const ownerWords = !!wake && wake.botId === botId && wake.state === 'running'
-        && (wake.reason.kind === 'human' || setJobPorts.ownerAnswer?.(botId, wake) === true);
+        && (wake.reason.kind === 'human' || setJobPorts.ownerAnswer?.(botId, wake) === true)
+        && (setJobPorts.wakeGuest?.(wake) ?? false) === false;
       if (!ownerWords) {
         return refuse('not_owner_words', 'a bot sets its job only while it answers the owner\'s own message, or their answer to its question');
       }
@@ -482,6 +507,12 @@ export function botRuntimeModule(router: FactoryRouter, deps: FactoryHostDeps, o
       const wmuxDir = deps.wmuxDir();
       const settings = new FactorySettingsStore(factorySettingsPath(wmuxDir));
       settings.load();
+      // The guest workspaces first: the bot store's load checks its bots
+      // against them, and every check reads 'unknown' until they are set.
+      expectGuestWorkspaces();
+      const guestWorkspaces = new GuestWorkspaceStore({ file: guestWorkspacesPath(wmuxDir), roomsDir: path.join(wmuxDir, 'factory', ROOMS_DIRNAME) });
+      guestWorkspaces.load();
+      setGuestWorkspaceStore(guestWorkspaces);
       const store = new BotStore(botsFilePath(wmuxDir), { defaultEngine: () => runnableDefaultEngine(settings.get().defaultEngine) });
       store.load();
       const sessions = new BotSessionStore(botSessionsPath(wmuxDir));
@@ -497,6 +528,7 @@ export function botRuntimeModule(router: FactoryRouter, deps: FactoryHostDeps, o
       }
       const queue = new WakeQueue(wakeQueuePath(wmuxDir), {
         isBotEnabled: (botId) => store.get(botId)?.enabled === true,
+        botWorkspace: (botId) => store.get(botId)?.workspaceId ?? null,
         // A held fan-out's wake that ends, unbooked, hands its slot back.
         onChange: () => {
           runtime?.kick();
@@ -568,9 +600,12 @@ export function botRuntimeModule(router: FactoryRouter, deps: FactoryHostDeps, o
         send({ type: 'bots-changed' });
       });
       // Every settings write reschedules: switching the factory off, from any
-      // caller, cancels the running turns at once.
+      // caller, cancels the running turns at once. The window is told too:
+      // its Bots gate (ROOM_STATUS) is re-read on the push, so a switch
+      // written by any caller shows on the rail without a focus change.
       offSettings = onFactorySettingsChanged(() => {
         runtime?.kick();
+        send({ type: 'settings-changed' });
       });
       // A new usage reading moves the bots' quota lines: tell the window, at
       // most once per few seconds (live statusline samples come in bursts).
@@ -585,11 +620,15 @@ export function botRuntimeModule(router: FactoryRouter, deps: FactoryHostDeps, o
         offWake = installBotFanoutWake({
           enqueue: (input) => queue.enqueue(input),
           // A usage change alone sends no event: tell the window, so the
-          // profile's running workers and worker time move on.
+          // profile's running workers and worker time move on. The run
+          // itself ends once its worker stopped (workerRunEnds.ts); only
+          // while nothing tells that does the row's end end it.
           onWorkerEnded: (botId, taskId) => {
-            store.mutateUsage(botId, (u) => {
-              recordWorkerEnd(u, taskId, Date.now());
-            });
+            if (!workerStopsConfirmed()) {
+              store.mutateUsage(botId, (u) => {
+                recordWorkerEnd(u, taskId, Date.now());
+              });
+            }
             send({ type: 'bots-changed' });
           },
           // A verify task's report wakes its verifier once, from the verify
@@ -624,6 +663,7 @@ export function botRuntimeModule(router: FactoryRouter, deps: FactoryHostDeps, o
       setHeldFanouts(null);
       setWakeQueue(null);
       setBotStore(null);
+      setGuestWorkspaceStore(null);
       setFactorySettingsStore(null);
       await l?.store.flush().catch(() => undefined);
     },

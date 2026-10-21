@@ -5,6 +5,7 @@ import {
   buildRosterChip,
   type WorkspaceAgentRosterRow,
 } from '../workspaceAgentRoster';
+import { SUBAGENT_COUNT_STALE_MS } from '../../../../shared/subagentCount';
 import { HOOK_RUNNING_TTL_MS } from '../fleet';
 import { BRAIN_PTY_ID_PREFIX } from '../../../../shared/constants';
 import type { StoreState } from '../../index';
@@ -37,7 +38,10 @@ interface StateOverrides {
   surfaceActivity?: Record<string, string>;
   surfaceActivityAt?: Record<string, number>;
   surfaceTurnOpenAt?: Record<string, number>;
+  surfaceTurnEndAt?: Record<string, number>;
+  surfaceTeammatesAt?: Record<string, number>;
   surfaceSubagents?: Record<string, number>;
+  surfaceSubagentsAt?: Record<string, number>;
   paneLabel?: Record<string, string>;
   agentClockMs?: number;
   remoteWorkspaces?: StoreState['remoteWorkspaces'];
@@ -302,6 +306,22 @@ describe('selectWorkspaceAgentRoster', () => {
       });
       expect(row.status).toBe('running');
       expect(row.activity).toBe('✎ fleet.ts');
+    });
+
+    it('a finished, seen lead reads running while its Agent Teams teammate works, and only then', () => {
+      const finished = {
+        surfaceAgent: { 'pty-1': { name: 'A', status: 'complete' as AgentStatus } },
+        surfaceTurnEndAt: { 'pty-1': NOW - 20_000 },
+        surfaceActivityAt: { 'pty-1': NOW - 1_000 },
+      };
+      expect(base(finished).status).toBe('complete');
+      expect(base({ ...finished, surfaceTeammatesAt: { 'pty-1': NOW - 1_000 } }).status).toBe('running');
+      // A teammate stamp from before the lead's turn ended is about that turn.
+      expect(base({ ...finished, surfaceTeammatesAt: { 'pty-1': NOW - 30_000 } }).status).toBe('complete');
+      // A lead left waiting (Fleet keeps its metadata status) stays waiting.
+      expect(base({ ...finished, surfaceAgent: { 'pty-1': { name: 'A', status: 'waiting' } }, surfaceTeammatesAt: { 'pty-1': NOW - 1_000 } }).status).toBe('waiting');
+      // An unseen result still outranks it.
+      expect(base({ ...finished, surfaceTeammatesAt: { 'pty-1': NOW - 1_000 }, surfaceAgentStatus: { 'pty-1': 'complete' } }).status).toBe('complete');
     });
 
     it('does NOT promote on a STALE activity stamp (older than the TTL)', () => {
@@ -584,6 +604,16 @@ describe('createWorkspaceAgentRosterSelector memoization', () => {
     expect(third.rows[0].subagents).toBe(1);
     const same = select(state({ workspaces: [ws], surfaceAgent: agents, surfaceSubagents: { 'pty-1': 1 } }));
     expect(same).toBe(third);
+  });
+
+  it('hides a count the daemon stopped refreshing (a 0 that never arrived)', () => {
+    const at = { 'pty-1': NOW - SUBAGENT_COUNT_STALE_MS + 1_000 };
+    const fresh = selectWorkspaceAgentRoster(state({ workspaces: [ws], surfaceAgent: agents, surfaceSubagents: { 'pty-1': 2 }, surfaceSubagentsAt: at }), 'ws-1');
+    expect(fresh.rows[0].subagents).toBe(2);
+    const stale = selectWorkspaceAgentRoster(state({
+      workspaces: [ws], surfaceAgent: agents, surfaceSubagents: { 'pty-1': 2 }, surfaceSubagentsAt: at, agentClockMs: NOW + 2_000,
+    }), 'ws-1');
+    expect(stale.rows[0].subagents).toBeUndefined();
   });
 
   it('a stashed pane carries its subagent count too', () => {

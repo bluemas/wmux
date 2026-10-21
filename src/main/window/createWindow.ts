@@ -1,11 +1,17 @@
-import { app, BrowserWindow, powerMonitor, screen, shell } from 'electron';
+import { app, BrowserWindow, nativeTheme, powerMonitor, screen, shell } from 'electron';
+import os from 'node:os';
 import path from 'node:path';
 import { platformChoice } from '../../shared/platform';
 import { IPC } from '../../shared/constants';
+import { attachPluginFrameNavigation } from '../plugins/pluginFrameNavigation';
+import { PLUGIN_PAGE_CSP } from '../plugins/pluginProtocol';
 import { PLUGIN_PROTOCOL_SCHEME } from '../../shared/pluginHost';
 import { PREVIEW_PROTOCOL_SCHEME } from '../../shared/filePreview';
 import { attachFlashFrameAutoClear } from './flashFrame';
 import { windowDisplayedReporter } from './windowDisplayed';
+import { initialWindowsAppearance, initialWindowsGlass, markWindowGlass, windowsGlassSupported, winWindowOptions } from './windowGlass';
+import { revealWhenPainted } from './revealWhenPainted';
+import { WINDOW_START_COLORS, startPolarity, startPolarityArg } from '../../shared/windowStartPaint';
 import {
   DEFAULT_WINDOW_SIZE,
   MIN_WINDOW_SIZE,
@@ -39,6 +45,15 @@ export const MAIN_WINDOW_PRODUCTION_CSP = [
   "font-src 'self'",
   `frame-src 'self' https: http: ${PLUGIN_PROTOCOL_SCHEME}:`,
 ].join('; ');
+
+/** The session hook also sees plugin responses; preserve their isolated policy. */
+export function productionResponseHeaders(url: string, headers: Record<string, string[]> = {}): Record<string, string[]> {
+  const result = Object.fromEntries(Object.entries(headers).filter(([key]) => key.toLowerCase() !== 'content-security-policy'));
+  const existing = Object.entries(headers).filter(([key]) => key.toLowerCase() === 'content-security-policy').flatMap(([, values]) => values);
+  const policies = new URL(url).protocol === `${PLUGIN_PROTOCOL_SCHEME}:`
+    ? [PLUGIN_PAGE_CSP] : [...existing, MAIN_WINDOW_PRODUCTION_CSP];
+  return { ...result, 'Content-Security-Policy': policies };
+}
 
 /**
  * Load the main renderer (Vite dev server in development, packaged HTML file
@@ -170,7 +185,17 @@ function attachWindowStatePersistence(win: BrowserWindow): void {
   win.on('closed', stop);
 }
 
-export function createWindow(opts: { deferLoad?: boolean } = {}): BrowserWindow {
+export function createWindow(opts: { deferLoad?: boolean; windowGlass?: unknown; windowAppearance?: unknown } = {}): BrowserWindow {
+  // Windows window glass (windowGlass.ts): acrylic on Windows 11 22H2+ unless
+  // the persisted level is Off; the renderer switches it at runtime after.
+  const winGlass = initialWindowsGlass(windowsGlassSupported(process.platform, os.release()), opts.windowGlass);
+  // The acrylic's tone follows the app appearance; set it before the window
+  // exists, not when the renderer loads, so the first frames match the theme.
+  const bootAppearance = process.platform === 'win32' ? initialWindowsAppearance(winGlass, opts.windowAppearance) : null;
+  if (bootAppearance) nativeTheme.themeSource = bootAppearance;
+  // The saved theme's polarity, for what the window paints before the
+  // renderer applies the theme (shared/windowStartPaint.ts).
+  const polarity = startPolarity(opts.windowAppearance);
   // #1362 — restore the placement the user left the window in. Off-screen or
   // corrupt saved state yields an empty plan and the 1280x800 default.
   let plan: RestorePlan = { maximized: false, fullScreen: false };
@@ -215,18 +240,15 @@ export function createWindow(opts: { deferLoad?: boolean } = {}): BrowserWindow 
     autoHideMenuBar: true,
     // Adapted from MonoCode (hardbeat920/monocode@6bd432ca, src/app/shell/TitleBar.tsx), MIT License, Copyright (c) 2026 Nick
     ...platformChoice<Partial<Electron.BrowserWindowConstructorOptions>>({
-      win: {
-        titleBarStyle: 'hidden',
-        // The overlay strip sits on the window frame, so it starts in the
-        // default (Tint) theme's frame colour, --frame-bg #121015 — the
-        // renderer re-pushes the live theme's painted frame colour on
-        // boot/theme-change via window:setTitleBarOverlay (overlayColors()).
-        // The first paint uses the same colour so the controls never sit on
-        // a different shade before the renderer paints.
-        // Height 40 = uiZoom's CHROME_H at zoom 1 (the scaled resync uses it).
-        titleBarOverlay: { color: '#121015', symbolColor: '#C2BDC9', height: 40 },
-        backgroundColor: '#121015',
-      },
+      // The overlay strip sits on the window frame, so the opaque window
+      // starts it in the default (Tint) theme's frame colour, --frame-bg
+      // #121015 — the renderer re-pushes the live theme's painted frame colour
+      // on boot/theme-change via window:setTitleBarOverlay (overlayColors()).
+      // The first paint uses the same colour so the controls never sit on a
+      // different shade before the renderer paints. With glass the strip, the
+      // background and the material are the acrylic set instead
+      // (winWindowOptions in windowGlass.ts).
+      win: winWindowOptions(winGlass, polarity),
       mac: {
         titleBarStyle: 'hidden',
         // Centered in the 40px bar: macTrafficLightPosition(1) in uiZoom.ts.
@@ -244,9 +266,9 @@ export function createWindow(opts: { deferLoad?: boolean } = {}): BrowserWindow 
         backgroundColor: '#00000000',
       },
       default: {
-        // Matches the Tint (default) theme's bgBase so the first paint
-        // doesn't flash a foreign color behind the renderer.
-        backgroundColor: '#1A171D',
+        // The saved polarity's start colour, the one the page paints before
+        // its theme is set, so a light theme does not start dark (#2512).
+        backgroundColor: WINDOW_START_COLORS[polarity].background,
       },
     }),
     webPreferences: {
@@ -254,15 +276,23 @@ export function createWindow(opts: { deferLoad?: boolean } = {}): BrowserWindow 
       contextIsolation: true,
       nodeIntegration: false,
       webviewTag: true,
+      // The preload paints the page in this polarity until the theme is set.
+      additionalArguments: [startPolarityArg(polarity)],
     },
   });
 
   // Fullscreen is requested through the constructor (above) — calling
   // setFullScreen() on a window that has not been shown yet is unreliable
-  // across platforms. Maximize has no constructor option and is safe here.
-  if (!plan.fullScreen && plan.maximized) {
-    mainWindow.maximize();
+  // across platforms. Maximize has no constructor option. It also shows a
+  // hidden window, so a window built hidden (the opaque Windows one) is
+  // maximized when it is revealed instead.
+  const maximize = !plan.fullScreen && plan.maximized;
+  if (mainWindow.isVisible()) {
+    if (maximize) mainWindow.maximize();
+  } else {
+    revealWhenPainted(mainWindow, { maximize });
   }
+  if (process.platform === 'win32') markWindowGlass(mainWindow, winGlass);
   attachWindowStatePersistence(mainWindow);
 
   // macOS: native fullscreen hides the traffic lights, so the renderer's
@@ -277,6 +307,15 @@ export function createWindow(opts: { deferLoad?: boolean } = {}): BrowserWindow 
   };
   mainWindow.on('enter-full-screen', () => pushFullscreen(true));
   mainWindow.on('leave-full-screen', () => pushFullscreen(false));
+  // A maximized window has square corners on Windows, so the sheet drops its
+  // margin and radius there (DESIGN.md "Window: frame and sheet").
+  const pushMaximized = (maximized: boolean): void => {
+    if (!mainWindow.isDestroyed()) {
+      mainWindow.webContents.send(IPC.WINDOW_MAXIMIZED_CHANGED, { maximized });
+    }
+  };
+  mainWindow.on('maximize', () => pushMaximized(true));
+  mainWindow.on('unmaximize', () => pushMaximized(false));
 
   // #882 — "is anyone looking at this window" (minimized / hidden to tray /
   // screen locked), pushed on the same window-event → renderer pattern. The
@@ -289,6 +328,8 @@ export function createWindow(opts: { deferLoad?: boolean } = {}): BrowserWindow 
   // UI zoom (#822) is now renderer-driven: the persisted factor lives in the
   // renderer store and is pushed via the window:setUiScale IPC on hydration
   // and on Settings changes. See src/renderer/components/Layout/AppLayout.tsx.
+
+  attachPluginFrameNavigation(mainWindow.webContents);
 
   if (!opts.deferLoad) {
     loadMainRenderer(mainWindow);
@@ -311,10 +352,7 @@ export function createWindow(opts: { deferLoad?: boolean } = {}): BrowserWindow 
   if (!MAIN_WINDOW_VITE_DEV_SERVER_URL) {
     mainWindow.webContents.session.webRequest.onHeadersReceived((details, callback) => {
       callback({
-        responseHeaders: {
-          ...details.responseHeaders,
-          'Content-Security-Policy': [MAIN_WINDOW_PRODUCTION_CSP],
-        },
+        responseHeaders: productionResponseHeaders(details.url, details.responseHeaders),
       });
     });
   }

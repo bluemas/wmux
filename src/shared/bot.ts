@@ -5,8 +5,9 @@
 // part of its system prompt). Every bot holds the same powers
 // (shared/botSurface.ts SHARED_SURFACE); a bot made from the Coordinator
 // template may also read other workspaces' rooms and facts. Any number of
-// bots, of any template, may share a workspace. It never holds a shell. Its
-// identity on the pipe is a main-minted token bound to a BotBinding
+// bots, of any template, may share a workspace. Bots may run sandboxed
+// commands in their own folder (main/factory/botExec.ts), never a terminal
+// pane or the repository. Its identity on the pipe is a main-minted token bound to a BotBinding
 // (main/deck/commanderTrust.ts `mintBotToken`), carried in the existing
 // `commanderToken` envelope field; RpcRouter resolves it onto
 // `RpcContext.bot`.
@@ -109,6 +110,17 @@ export type BotEngine =
   | { kind: 'acp'; command: string; args: string[] };
 
 export const DEFAULT_BOT_ENGINE: BotEngine = { kind: 'claude-sdk' };
+
+/** Whether a bot's engine refuses its built-in tools per call in a wake not
+ *  known clean of a guest's words (ClaudeSdkAdapter's guest gate). A bot on
+ *  any other engine takes no such wake. Pure. */
+export function botEngineGatesTools(engine: BotEngine | undefined): boolean {
+  return (engine?.kind ?? DEFAULT_BOT_ENGINE.kind) === 'claude-sdk';
+}
+
+/** Why a bot on such an engine is not woken from a guest's message, or from
+ *  anything that follows from one. */
+export const BOT_TAKES_NO_GUEST_WAKES = 'this bot can\'t take guest messages: its engine cannot hold its tools back for them';
 
 /** The models a NEW bot of a template starts on (main/factory/botStore.ts
  *  `create`, when the caller names no engine or worker agent): `brain` is
@@ -338,7 +350,7 @@ export interface BotStatus {
     message: string;
     at: number;
     /** A stable cause when the park came from engine_unavailable (engineError.ts). */
-    code?: 'not_installed' | 'not_logged_in' | 'mcp_missing' | 'acp_test_only' | 'unusable' | 'other';
+    code?: 'not_installed' | 'not_logged_in' | 'mcp_missing' | 'acp_test_only' | 'unusable' | 'api_key_missing' | 'subscription_refused' | 'other';
     /** `not_logged_in` on a registered account (not the default sign-in):
      *  that account's name. */
     account?: string;
@@ -466,7 +478,11 @@ export interface BotSetJobParams {
  *  - `connectors-changed`: the connection library changed
  *    (shared/botConnector.ts);
  *  - `groups-changed`: the owner's group chats changed (shared/botGroup.ts);
- *  - `skills-changed`: a bot's skills changed (shared/botSkill.ts). */
+ *  - `skills-changed`: a bot's skills changed (shared/botSkill.ts);
+ *  - `memory-changed`: a bot's notes or the owner's profile changed
+ *    (shared/botMemory.ts);
+ *  - `settings-changed`: the factory settings changed (the bots switched
+ *    on or off, from any caller). */
 export type BotEventPayload =
   | { type: 'bot.status'; status: BotStatus }
   | { type: 'bots-changed' }
@@ -475,7 +491,9 @@ export type BotEventPayload =
   | { type: 'secrets-changed' }
   | { type: 'connectors-changed' }
   | { type: 'groups-changed' }
-  | { type: 'skills-changed'; botId?: string };
+  | { type: 'skills-changed'; botId?: string }
+  | { type: 'memory-changed'; botId?: string }
+  | { type: 'settings-changed' };
 
 export const BOT_EVENT = 'bot.event';
 

@@ -1,3 +1,6 @@
+import { normalizeUrl } from '../../../shared/connectorUrl';
+import { noTerminalAccess, type ConnectorTerminalAccess } from '../../../shared/connectorAccess';
+import ConnectorAccess from '../Connectors/ConnectorAccess';
 // ─── The connection dialog — add or edit one library connection ────────────
 //
 // Opened from Settings › Bots › Connections and from a bot's profile. A
@@ -46,8 +49,9 @@ interface Form {
   keys: KeyRow[];
   toolMode: 'listed' | 'all';
   tools: string;
-  scope: 'all' | 'bots';
+  scope: 'all' | 'bots' | 'none';
   botIds: string[];
+  terminalAccess: ConnectorTerminalAccess;
   enabled: boolean;
 }
 
@@ -66,8 +70,9 @@ function formOf(d: ConnectorDraft, presetId: string): Form {
     keys: d.secrets.map((s) => ({ secret: s.secret, header: s.as === 'header' ? s.header : 'Authorization', scheme: s.as === 'header' ? s.scheme : 'bearer', value: '', replacing: false })),
     toolMode: d.tools.mode,
     tools: (d.tools.mode === 'all' ? d.tools.blocked : d.tools.allowed).join('\n'),
-    scope: d.scope.kind,
+    scope: d.scope.kind === 'bots' && d.scope.botIds.length === 0 ? 'none' : d.scope.kind,
     botIds: d.scope.kind === 'bots' ? [...d.scope.botIds] : [],
+    terminalAccess: d.terminalAccess ?? noTerminalAccess(),
     enabled: d.enabled,
   };
 }
@@ -100,16 +105,18 @@ export function draftOf(f: Form, id?: string): ConnectorDraft {
       : { remote: { url: f.url.trim(), headers: pairs(f.headers, ':') } }),
     secrets,
     tools: f.toolMode === 'all' ? { mode: 'all', blocked: toolNames } : { mode: 'listed', allowed: toolNames },
-    scope: f.scope === 'all' ? { kind: 'all' } : { kind: 'bots', botIds: [...f.botIds] },
+    scope: f.scope === 'all' ? { kind: 'all' } : { kind: 'bots', botIds: f.scope === 'none' ? [] : [...f.botIds] },
+    terminalAccess: f.terminalAccess,
     enabled: f.enabled,
   };
 }
 
-export function ConnectionDialog({ t, bots, editing, presetBotId, onClose, port = getBotConnectorPort() }: {
+export function ConnectionDialog({ t, bots, editing, initialDraft, presetBotId, onClose, port = getBotConnectorPort() }: {
   t: T;
   bots: readonly FactoryBotRow[];
   /** The connection to edit; absent to add one. */
   editing?: ConnectorView;
+  initialDraft?: ConnectorDraft;
   /** Add from a bot's profile: the scope starts as that bot. */
   presetBotId?: string;
   onClose: () => void;
@@ -117,7 +124,7 @@ export function ConnectionDialog({ t, bots, editing, presetBotId, onClose, port 
 }): React.ReactElement {
   const start = (): Form => {
     if (editing) return formOf(editing, editing.preset ?? 'custom');
-    const f = formOf(customConnectorDraft(), 'custom');
+    const f = formOf(initialDraft ?? customConnectorDraft(), initialDraft?.preset ?? 'custom');
     return presetBotId ? { ...f, scope: 'bots', botIds: [presetBotId] } : f;
   };
   const [form, setForm] = useState<Form>(start);
@@ -131,11 +138,11 @@ export function ConnectionDialog({ t, bots, editing, presetBotId, onClose, port 
   const pickPreset = (id: string) => {
     if (id === 'custom') {
       const f = formOf(customConnectorDraft(), 'custom');
-      setForm({ ...f, scope: form.scope, botIds: form.botIds });
+      setForm({ ...f, scope: form.scope, botIds: form.botIds, terminalAccess: form.terminalAccess });
       return;
     }
     const p = CONNECTOR_PRESETS.find((x) => x.id === id);
-    if (p) setForm({ ...formOf(p.draft, id), scope: form.scope, botIds: form.botIds });
+    if (p) setForm({ ...formOf(p.draft, id), scope: form.scope, botIds: form.botIds, terminalAccess: form.terminalAccess });
   };
 
   const clearValues = () => setForm((cur) => ({ ...cur, keys: cur.keys.map((k) => ({ ...k, value: '' })) }));
@@ -162,7 +169,7 @@ export function ConnectionDialog({ t, bots, editing, presetBotId, onClose, port 
   };
 
   const shortValue = form.keys.some((k) => k.value.length > 0 && k.value.length < BOT_SECRET_LIMITS.VALUE_MIN);
-  const canSave = !busy && form.name.trim().length > 0 && !shortValue && (form.scope === 'all' || form.botIds.length > 0);
+  const canSave = !busy && form.name.trim().length > 0 && !shortValue && (form.scope !== 'bots' || form.botIds.length > 0);
   const preset = CONNECTOR_PRESETS.find((p) => p.id === form.presetId);
   const area = `w-full rounded-[6px] border border-[var(--line)] focus:border-[var(--line-strong)] bg-transparent px-2 py-1.5 font-mono text-[12px] text-[var(--text-main)] outline-none ${FOCUS_RING}`;
 
@@ -221,7 +228,7 @@ export function ConnectionDialog({ t, bots, editing, presetBotId, onClose, port 
           ) : (
             <>
               <Field label={t('settings.factory.connections.url')} layout="stacked">
-                <Input data-testid="connection-url" value={form.url} spellCheck={false} onChange={(e) => set('url', e.target.value)} className="w-full font-mono text-[12px]" />
+                <Input data-testid="connection-url" value={form.url} spellCheck={false} onChange={(e) => set('url', e.target.value)} onBlur={() => set('url', normalizeUrl(form.url))} className="w-full font-mono text-[12px]" />
               </Field>
               <SegmentedControl
                 ariaLabel={t('settings.factory.connections.protocol')}
@@ -299,16 +306,19 @@ export function ConnectionDialog({ t, bots, editing, presetBotId, onClose, port 
               <textarea data-testid="connection-tools" aria-label={t('settings.factory.connections.tools')} rows={3} value={form.tools} spellCheck={false} onChange={(e) => set('tools', e.target.value)} onKeyDown={(e) => e.stopPropagation()} className={area} />
             </div>
           </Field>
+          {editing && !editing.terminalAccess && <p className="text-[11px] text-[var(--text-sub)]">{t('connectors.access.legacy')}</p>}
+          <ConnectorAccess value={form.terminalAccess} onChange={(value) => set('terminalAccess', value)} />
           <Field label={t('settings.factory.connections.scope')} layout="stacked">
             <div className="flex flex-col gap-1.5">
               <SegmentedControl
                 ariaLabel={t('settings.factory.connections.scope')}
                 value={form.scope}
-                options={[{ value: 'all', label: t('settings.factory.connections.scopeAll') }, { value: 'bots', label: t('settings.factory.connections.scopeBots') }]}
+                options={[{ value: 'all', label: t('settings.factory.connections.scopeAll') }, { value: 'bots', label: t('settings.factory.connections.scopeBots') }, { value: 'none', label: t('connectors.scope.none') }]}
                 onValueChange={(v) => set('scope', v)}
                 data-testid="connection-scope"
               />
               {form.scope === 'all' && <p className="text-[11px] text-[var(--text-sub)]">{t('settings.factory.connections.scopeAllHint', { count: bots.length })}</p>}
+              {form.scope === 'none' && <p className="text-[11px] text-[var(--text-sub)]">{t('connectors.scope.noneHint')}</p>}
               {form.scope === 'bots' && (
                 <FieldOwnIds>
                   <div className="flex flex-col gap-1" data-testid="connection-scope-bots">

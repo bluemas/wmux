@@ -186,6 +186,13 @@ export class DaemonPTYBridge extends EventEmitter {
    */
   private oscCwdSeen = false;
 
+  /**
+   * A WSL distro's shell names the distro's own hostname in OSC 7, which can
+   * differ from this machine's (wsl.conf), so its reports skip the host check.
+   * The path rules still apply.
+   */
+  private wslDistro = false;
+
   /** Last cwd emitted by the prompt-scrape fallback (shells without OSC 7). */
   private lastDetectedPromptCwd = '';
 
@@ -326,6 +333,8 @@ export class DaemonPTYBridge extends EventEmitter {
   private emptyShellPrompt = false;
   private completedShellCommand = false;
   private shellCommandRunning = false;
+  private shellSubmittedKeyRevision: number | undefined;
+  private shellCommandKeyRevision = 0;
   /**
    * At least one full activity window. A shorter one would let bytes banked
    * before a keystroke combine, inside the same 3 s measurement window, with
@@ -495,6 +504,11 @@ export class DaemonPTYBridge extends EventEmitter {
     // eslint-disable-next-line no-control-regex
     const clearsComposer = /[\x03\x15]/.test(data);
     if (forceSubmitted || hasSubmitBoundary) {
+      if (!this.shellCommandRunning) {
+        // A single write can contain Enter followed by queued history/draft
+        // input. One chunk revision cannot distinguish those trailing bytes.
+        this.shellSubmittedKeyRevision = /^[^\r\n]*[\r\n]$/.test(data) ? this.keyInputRevision : -1;
+      }
       this.draftPending = false;
       if (this.sessionId) this.emit('inputSubmitted', { sessionId: this.sessionId });
     } else if (clearsComposer) {
@@ -1719,8 +1733,10 @@ export class DaemonPTYBridge extends EventEmitter {
         // OSC 7 on every prompt redraw, so an idle pane would otherwise spam
         // the same cwd across daemon→main→renderer on each redraw. Mirrors
         // the prompt-detect guard (lastDetectedPromptCwd) below; the first OSC 7
-        // after spawn always emits because the cache starts null.
-        const cwd = parseOsc7Cwd(event.data);
+        // after spawn always emits because the cache starts null. A report
+        // that is not a local folder is ignored and the previous cwd stays.
+        const cwd = this.wslDistro ? parseOsc7Cwd(event.data, null) : parseOsc7Cwd(event.data);
+        if (cwd === null) return;
         // OSC 7-sticky (2026-07-21): this shell has the integration hook — the
         // authoritative cwd source. Disable prompt scraping for the session's
         // lifetime so screen text that happens to match a prompt regex (agent
@@ -1743,8 +1759,17 @@ export class DaemonPTYBridge extends EventEmitter {
       if (event.code === 133 && promptLog) {
         const parsed = parseOsc133Payload(event.data, Date.now(), ringBuffer.totalBytesWritten);
         if (parsed) {
-          if (parsed.type === 'command_end') { this.completedShellCommand = this.shellCommandRunning; this.shellCommandRunning = false; }
-          if (parsed.type === 'command_start') { this.shellCommandRunning = true; this.completedShellCommand = false; this.emptyShellPrompt = false; }
+          if (parsed.type === 'command_end') {
+            // Input queued while a command runs can become history or a draft
+            // at the next prompt. Completion must not erase that invalidation.
+            this.completedShellCommand = this.shellCommandRunning && this.keyInputRevision === this.shellCommandKeyRevision;
+            this.shellCommandRunning = false;
+          }
+          if (parsed.type === 'command_start') {
+            this.shellCommandKeyRevision = this.shellSubmittedKeyRevision ?? this.keyInputRevision;
+            this.shellSubmittedKeyRevision = undefined;
+            this.shellCommandRunning = true; this.completedShellCommand = false; this.emptyShellPrompt = false;
+          }
           // The shell's foreground program changed hands: whatever episode was
           // open (an agent's, or the Enter that launched the next one) is over.
           if (parsed.type === 'command_start' || parsed.type === 'command_end') this.noteAgentEnded();
@@ -1963,6 +1988,11 @@ export class DaemonPTYBridge extends EventEmitter {
    * it is not user input, and nothing that tracks input (drafts, submits,
    * detector dedup, typed-input or fence events) may see it.
    */
+  /** The shell runs in a WSL distro on this machine (see wslDistro). */
+  markWslDistro(): void {
+    this.wslDistro = true;
+  }
+
   armStartupDa1Reply(canAnswer: () => boolean, onAnswered?: () => void): void {
     this.startupDa1 = { scanned: '', canAnswer, onAnswered };
   }
@@ -2107,6 +2137,8 @@ export class DaemonPTYBridge extends EventEmitter {
     this.keyInputRevision = 0;
     this.lastKeyInputAt = 0;
     this.shellCommandRunning = false;
+    this.shellSubmittedKeyRevision = undefined;
+    this.shellCommandKeyRevision = 0;
     this.emptyShellPrompt = false;
     this.completedShellCommand = false;
     this.settledStatus = null;

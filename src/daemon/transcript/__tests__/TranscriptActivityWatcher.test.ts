@@ -253,9 +253,11 @@ describe('TranscriptActivityWatcher — Agent Teams teammates', () => {
       listSessionIds: () => state.sessions,
       getBinding: () => binding,
       isAgentAlive: () => state.alive,
-      emit: () => {},
-      emitBackgroundWorking: (id) => working.push(id),
+      emit: () => { /* the activity line is not under test here */ },
+      emitTeammatesWorking: (id) => working.push(id),
       emitTeammates: (id, list) => rosters.push([id, list]),
+      // As in the daemon: a hook-fed Claude pane keeps its watch for its lines.
+      onClaudeLine: () => { /* read, not under test */ },
       now: () => Date.now() + offset,
       teammatePollMs: 15_000,
     });
@@ -387,7 +389,7 @@ describe('TranscriptActivityWatcher — Claude background shells', () => {
       getBinding: () => binding,
       isAgentAlive: () => state.alive,
       emit: () => {},
-      emitBackgroundWorking: (id) => working.push(id),
+      emitTeammatesWorking: (id) => working.push(id),
       now: () => Date.now() + offset,
       teammatePollMs: 15_000,
     });

@@ -163,6 +163,12 @@ export interface DaemonSession {
    * never carried onto the recovered meta and never sent to clients raw.
    */
   turnRunningSince?: number;
+  /**
+   * A recovered pane whose continue prompt is still owed (its one-shot mark,
+   * not yet spent). Written only into the persisted state, so a daemon that
+   * dies again before the pane resumed still continues the turn.
+   */
+  resumeContinuePending?: true;
   /** Exact thread observed on this pane's owned Codex TUI relay. Never hook-derived. */
   codexRelayResume?: {threadId:string;cwd:string;codeHome:string;transcriptPath:string};
   /**

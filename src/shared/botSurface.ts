@@ -18,9 +18,11 @@
 // and only a Coordinator-template bot may name another workspace on the
 // reads listed in COORDINATOR_READ_EXTENSION.
 //
-// No bot holds a shell, terminal input, pane/surface/workspace teardown, the
-// browser or computer use: code is written only by fan-out workers in their
-// own worktrees. No bot parks another bot (`bot_park` is on no surface). The
+// Bots may run sandboxed commands in their own folder (the engine's Bash,
+// Write and Edit, each call decided by main: main/factory/botExec.ts), and
+// nowhere else. No bot holds terminal input, pane/surface/workspace teardown,
+// the browser or computer use: repository code is written only by fan-out
+// workers in their own worktrees. No bot parks another bot (`bot_park` is on no surface). The
 // fleet-wide pane and event reads (pane_list, fleet_triage, wmux_events_poll,
 // a2a_task_query) are on no surface either: every read a bot holds is scoped
 // to its binding, and a bot sees its workers through their ledger rows and
@@ -38,6 +40,7 @@ import { BOT_SECRET_RPC } from './botSecret';
 import { ROUTINE_RPC } from './botRoutine';
 import { WORKFLOW_RPC } from './botWorkflow';
 import { BOT_SKILL_RPC } from './botSkill';
+import { BOT_MEMORY_RPC } from './botMemory';
 
 /** Read-side factory RPCs behind the role tools (handlers: main/factory/roles). */
 export const FACTORY_READ_RPC = {
@@ -59,7 +62,7 @@ export const FACTORY_RPC_METHODS: readonly RpcMethod[] = [
   FACT_RPC.poll, FACT_RPC.emit,
   BOT_RPC.list, BOT_RPC.create, BOT_RPC.update, BOT_RPC.remove, BOT_RPC.status,
   BOT_RPC.wake, BOT_RPC.park, BOT_RPC.resume, BOT_RPC.interrupt,
-  ROOM_RPC.post, ROOM_RPC.read, ROOM_RPC.threads, ROOM_RPC.resolve,
+  ROOM_RPC.post, ROOM_RPC.read, ROOM_RPC.search, ROOM_RPC.threads, ROOM_RPC.resolve,
   HANDOFF_RPC.send, HANDOFF_RPC.answer, HANDOFF_RPC.list,
   ASK_PERSON_RPC,
   FACTORY_READ_RPC.prRead, FACTORY_READ_RPC.issueRead, FACTORY_READ_RPC.ciRead,
@@ -76,6 +79,8 @@ export const FACTORY_RPC_METHODS: readonly RpcMethod[] = [
   BOT_SECRET_RPC.request, BOT_SECRET_RPC.list, BOT_SECRET_RPC.loginRequest,
   // A bot's own skills (shared/botSkill.ts).
   BOT_SKILL_RPC.propose, BOT_SKILL_RPC.read,
+  // A bot's own notes and the owner's profile (shared/botMemory.ts).
+  BOT_MEMORY_RPC.update,
 ];
 
 /** Every tool a bot surface may list, with the RPC methods it invokes (the
@@ -96,6 +101,7 @@ export const BOT_TOOL_RPC = {
   fact_poll: [FACT_RPC.poll],
   room_post: [ROOM_RPC.post],
   room_read: [ROOM_RPC.read],
+  room_search: [ROOM_RPC.search],
   handoff_send: [HANDOFF_RPC.send],
   ask_person: [ASK_PERSON_RPC],
   pr_read: [FACTORY_READ_RPC.prRead],
@@ -126,6 +132,7 @@ export const BOT_TOOL_RPC = {
   login_request: [BOT_SECRET_RPC.loginRequest],
   skill_propose: [BOT_SKILL_RPC.propose],
   skill_read: [BOT_SKILL_RPC.read],
+  memory_update: [BOT_MEMORY_RPC.update],
 } as const satisfies Readonly<Record<string, readonly [RpcMethod, ...RpcMethod[]]>>;
 
 export type BotToolName = keyof typeof BOT_TOOL_RPC;
@@ -142,6 +149,34 @@ export const BOT_BASE_RPC: readonly RpcMethod[] = [
   'pane.resolveName',
 ];
 
+/** What a bot may call in a wake not known clean of a guest's words
+ *  (main/factory/wakeTaint.ts): RpcRouter refuses every other method on the
+ *  bot surface there, whatever the method's own checks say. Only what the
+ *  guest conversation needs: talk in the room (each write is stamped
+ *  guest-sourced), reads filtered by provenance (room.read, fact.poll,
+ *  approval.list), and bot.list, scoped there to the bots of the wake's own
+ *  conversation. Everything else (repository, CI, verdict, trust, terminal
+ *  and pane reads, the bot's routines, workflows and skills) is left out. */
+export const GUEST_SAFE_RPC: ReadonlySet<string> = new Set<string>([
+  ...BOT_BASE_RPC,
+  ROOM_RPC.post,
+  ROOM_RPC.read,
+  HANDOFF_RPC.send,
+  ASK_PERSON_RPC,
+  BOT_RPC.questionClose,
+  BOT_RPC.list,
+  FACT_RPC.poll,
+  BOT_APPROVAL_RPC.list,
+]);
+
+/** The engine's built-in tools a bot may use in a wake not known clean
+ *  (ClaudeSdkAdapter's per-call gate): none. A guest's reply needs only the
+ *  wmux tools (room.post). */
+export const GUEST_SAFE_BUILTIN_TOOLS: ReadonlySet<string> = new Set<string>();
+
+/** What RpcRouter answers a bot call refused by GUEST_SAFE_RPC. */
+export const GUEST_TURN_SURFACE_REFUSAL = 'this turn comes from an external guest\'s message (or wmux cannot tell where it came from); in such a turn a bot talks in its room and reads what the turn may see, and nothing else; tell the owner what you would do';
+
 export interface BotSurface {
   tools: ReadonlySet<string>;
   rpc: ReadonlySet<string>;
@@ -156,12 +191,14 @@ export type RoleSurface = BotSurface;
 /** Every bot's tools, in the order the system prompt lists them. */
 export const SHARED_SURFACE_TOOLS: readonly BotToolName[] = [
   // talk
-  'room_post', 'room_read', 'handoff_send', 'ask_person', 'question_close', 'bot_list',
+  'room_post', 'room_read', 'room_search', 'handoff_send', 'ask_person', 'question_close', 'bot_list',
   // own profile and work
   'job_set', 'routine_set', 'routine_list', 'routine_pause', 'stop_my_work',
   'workflow_create', 'workflow_read', 'workflow_advance',
   // own skills (proposals wait for the owner's approval)
   'skill_propose', 'skill_read',
+  // own memory and the owner's profile (loaded when a session starts)
+  'memory_update',
   // workers (terminal_read reaches only the bot's own task panes, main-scoped)
   'fanout_start', 'ledger_update', 'terminal_read', 'workspace_list', 'worker_resume', 'worker_message',
   // repository reads
@@ -238,7 +275,9 @@ export interface BotRefusal {
   at: number;
   bot: BotBinding;
   method: string;
-  reason: 'teardown' | 'surface';
+  /** `guest`: the method is not in GUEST_SAFE_RPC and the bot's wake is not
+   *  known clean. */
+  reason: 'teardown' | 'surface' | 'guest';
 }
 
 // ── Typed refusals of factory RPC handlers ──────────────────────────────────

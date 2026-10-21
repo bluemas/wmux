@@ -112,15 +112,18 @@ reads as a second, differently tinted panel.
 │l │           │                                                     │ │
 │48│           │  [agent bar — overlay, on approach]                 │ │
 │  │╰───────────────────────────────────────────────────────────────────┤
-└──┴── sheet flush with the window's edges on macOS (8px elsewhere) ───┘
+└──┴── sheet flush with round window corners (8px in square ones) ─────┘
 ```
 
 - **Frame:** the titlebar row and the 48px rail, painted `--frame-bg` — a
-  step darker than the sheet in the dark looks, a soft grey in Paper. On
-  macOS, whose windows have rounded corners, the sheet has no margin: it
-  meets the window's edges, its own rounded corners kept. Windows and Linux
-  keep an 8px margin (`--sheet-inset`) on the sides away from the rail and
-  the bottom, so no frame notch shows in a square window corner.
+  step darker than the sheet in the dark looks, a soft grey in Paper. Where
+  the window has rounded corners — macOS, and Windows 11 (build 22000 and
+  later) — the sheet has no margin: it meets the window's edges, its own
+  rounded corners kept. Square-cornered windows — Windows 10, Linux, and a
+  Windows build that could not be read — keep an 8px margin
+  (`--sheet-inset`) on the sides away from the rail and the bottom, so no
+  frame notch shows in a square window corner. `data-window-corners` on
+  `<html>` carries the decision (`shared/windowCorners.ts`).
 - **Sheet:** one rounded panel (`--sheet-radius` 12px) flush under the
   titlebar, holding the sidebar and the panes (and the file tree column
   when it is shown). Nothing docks opposite the sidebar (the Bots page's
@@ -132,12 +135,16 @@ reads as a second, differently tinted panel.
   corners) with a 1px `--sheet-edge` hairline along the curve, and that
   line is the one seam. With the sidebar hidden the pane column drops both,
   leaving the sheet's own edge as the only boundary.
-- **Native fullscreen** (any platform): the sheet drops its margins and
+- **Native fullscreen** (any platform) and **maximized on Windows** (whose
+  maximized windows have square corners): the sheet drops its margins and
   radius. The rail stays.
 - **Terminal geometry is untouched** by the frame: margin changes, a sidebar
-  collapse and fullscreen each refit the terminals once, never per frame.
-- **Window glass (macOS, every theme, `--theme-glass: 1`):** the window gets
-  the `sidebar` vibrancy material behind a transparent background. The
+  collapse, maximize and fullscreen each refit the terminals once, never per
+  frame.
+- **Window glass (macOS and Windows 11, every theme, `--theme-glass: 1`):**
+  on macOS the window gets the `sidebar` vibrancy material behind a
+  transparent background; on Windows 11 22H2 and later (build 22621+) it gets
+  the acrylic backdrop the same way. The
   renderer sets the app's appearance from the theme (a dark theme, the dark
   material; a light theme, the light one — app-wide, so native menus and the
   in-app browser's `prefers-color-scheme` follow the theme), and `data-glass`
@@ -150,15 +157,26 @@ reads as a second, differently tinted panel.
   about 29% Soft / 14% Clear; strongly hued themes (Stars & Stripes, Red
   Dynasty, Catppuccin) about 64% / 43% so their colour survives the grey
   material; light themes, whose material is milkier, about 14% / 3%.
-  Windows and Linux are opaque. The page fades through
+  Windows has its own numbers, because acrylic is a different material:
+  dark themes about 34% / 16%; strongly hued themes the macOS 64% / 43%;
+  light themes, whose acrylic reads grey rather than milky, about 60% / 40%
+  so they stay clean. On Windows the level switches the material at
+  runtime: Off sets the material to none, the opaque frame background and
+  a solid `titleBarOverlay` strip; Soft or Clear sets acrylic, a transparent
+  background and a transparent strip (a solid one would sit as a band behind
+  the caption buttons). Mica is not offered: it reads almost opaque. Windows
+  10, Windows 11 before 22H2 and Linux are opaque; on those Windows builds
+  the setting reads Off, disabled, with the reason. The page fades through
   `color-mix(… 0%, transparent)`, never the `transparent` keyword (which
   interpolates through black). `data-glass` carries the material's
   appearance (`dark` or `light`), which is how the light tuning applies to
   any light theme, custom ones included. With glass Off the app returns to
   the system appearance, and glass is only installed once the saved theme
   and level are loaded, so a launch never flips the appearance twice.
-- `BrowserWindow.backgroundColor` follows the default look so the first
-  frame never flashes white; no native menu bar is visible
+- `BrowserWindow.backgroundColor` and the page's pre-theme paint follow the
+  saved theme's polarity, and the opaque Windows window is shown once it has
+  painted, so the first frame is never the system's blank colour or the
+  other polarity; no native menu bar is visible
   (`autoHideMenuBar`; accelerators keep working).
 
 ## Titlebar
@@ -224,7 +242,7 @@ commands, sidebar links, toast and notification jumps, schedule deep links —
 navigates through it.
 
 - **Pages, in order:** Workspaces (home: the sidebar and the panes)
-  · Bots · Fleet · Schedules · Remote · Git. Bots is listed only while the
+  · Bots · Fleet · Schedules · Remote · Git · Connectors. Bots is listed only while the
   bots are on (Settings › Bots); off, its shortcut and palette command open
   Settings › Bots instead. Settings is a page too,
   opened from the rail's More menu or ⌘,.
@@ -478,7 +496,7 @@ status bar badges, `fleet_triage` or the phone's sidebar.
   its routines, its connections — each library connection that applies to
   it, an every-bot one with a switch that turns it off for this bot alone,
   a picked one with Edit and Remove from this bot, then Add connection and
-  Manage (Settings › Bots › Connections); its skills (Skills, below); then, read-only, what it can do in the owner's words — one phrase per power of
+  Manage (Settings › Bots › Connections); its skills and memory (Skills, Memory, below); then, read-only, what it can do in the owner's words — one phrase per power of
   the shared surface, plus a Coordinator's reads in every workspace, never
   per-bot settings — whom it reports to (You), and its workers now; last,
   Pause — a neutral secondary that parks the bot at once, with no confirm
@@ -505,7 +523,12 @@ status bar badges, `fleet_triage` or the phone's sidebar.
   or after "approved 1.0.0" the muted note that it changed since approval
   and does not load until the bot proposes it again);
   an approved skill's name is in the main text colour, every other one
-  muted, and the description is the row's tooltip. Each one not archived
+  muted, and the description is the row's tooltip. An approved skill adds,
+  muted, when the bot last read it ("last used 3d ago", or "not used
+  yet"); one approved and unused for 30 days carries a neutral **Stale**
+  tag (`--selection`, `--chip-radius`, 11px; no colour — it still loads,
+  its tooltip says so) and stale ones sort first, longest unused first, so
+  the owner can archive them. Each one not archived
   has a muted text button, Archive, which acts at once (a skill is
   proposed again by the bot, never restored by hand); a failure is one red
   line under the list. With none, one muted line says when a bot proposes
@@ -517,6 +540,20 @@ status bar badges, `fleet_triage` or the phone's sidebar.
   Approve and Deny do, then the change as a `diff` code block (removed
   lines `- `, added `+ `), always whole: a proposal whose change would not
   fit the card is refused to the bot, never cut.
+- **Memory (2026-10-21):** under Skills, a Memory row shows what the bot
+  keeps for its later sessions in two lists: its own notes, and About you
+  (the owner's profile, shared by every bot). Each list's muted title
+  carries how much of its limit is used ("312 of 2200 characters"); its
+  entries are main-text lines, each with a muted Remove that acts at once;
+  a list with entries has a muted Clear that asks in place (InlineConfirm,
+  the solid red only on its confirm, which says whose sessions start
+  without it). An empty list is one muted line; a muted hint under both
+  says changes apply from the bot's next session; a failure is one red
+  line. There is no Add or Edit: a bot writes its own notes, and a change
+  to About you comes as an approval card (its title "Add this to your
+  profile?", "Change this in your profile?" or "Remove this from your
+  profile?", the exact entry fenced, replace showing Now and Becomes),
+  approved on the card only, as a skill is.
 - **Messages are bubbles in runs (owner decision 2026-10-14, the reference
   messenger's look; replaces the same day's flat rows):** a bot's messages
   on the left in soft `--selection-subtle` bubbles (18px radius, fill only,
@@ -1442,7 +1479,7 @@ primitives plus `Settings/SettingsLayout.tsx` (`SettingsSection`,
   order: General · Appearance (theme, interface, sidebar, panes, terminal
   text, agent toolbar) · Terminal · Keyboard · Notifications. Group
   **Agents**: Claude Code · Accounts · Factory · Roles & fan-out ·
-  Token usage · Browser · Computer use. Group **Connections**: Remote & phone · LAN. Then
+  Token usage · Browser · Computer use. Group **Connections**: Plugins · Remote & phone · LAN. Then
   About. Each tab answers one question; a setting lives on exactly one tab
   and the search catalog (`settings/catalog.ts`) names that tab. Retired tab
   ids resolve through `resolveSettingsTab` (Orchestrator, Agents and Moa all
@@ -1614,6 +1651,7 @@ primitives plus `Settings/SettingsLayout.tsx` (`SettingsSection`,
 | 2026-10-16 | Owner decision: per-bot models. A bot's profile picks the model and effort it thinks on and its workers' model and effort, each a text value with a muted Change (model combobox + effort Select, Cancel and Save), between the repository and on/off lines; Settings › Bots' list rows and the group dialog's bot rows add one muted, truncated note of what is set (e.g. "haiku (latest) · workers opus (latest)"), nothing when both are on the defaults. New Coordinator, Issue and Researcher bots think on a fast model, new Developer and Reviewer bots' workers on the strongest; existing bots keep theirs. Amends the profile's item list only | The owner could not choose models per bot; a one-line note keeps the list scannable without a column, and the profile stays a list of lines with no new control style |
 | 2026-10-16 | Owner decision: a bot's profile shows Today — each of its limits (turns per hour and day, worker time, running workers, the queue) with what is used of it, and one line on top naming the first that stops it, in a fixed order | A bot has four separate limits plus a queue cap, and the owner could not tell which stopped it: the reviewer had 26 turns left but no worker time and a full queue, and looked simply stuck. The limits stay as they are; they are made visible |
 | 2026-10-18 | Owner decision: photos in Bots messages, from the desktop composer and the phone. A muted picture button beside "+", staged chips and sent thumbnails in Chat view's 2026-09-25 grammar, the full photo in a dialog; no new colour or control style | The owner sends screenshots and photos to bots from the phone; the bot sees the photo itself in its turn, and the desktop draws what was sent the way Chat view already does |
+| 2026-10-20 | Owner decision: window glass on Windows 11 (acrylic). Windows 11 22H2+ gets the acrylic backdrop under the same Off / Soft / Clear setting, switched at runtime, with its own coverage numbers (light looks paint more so acrylic does not read grey) and a transparent caption-button strip; Windows 10, older Windows 11 builds and Linux stay opaque, and the setting says why there. Amends Window glass | A live prototype on Windows 11 showed acrylic blurring the desktop much like macOS vibrancy, staying on while unfocused, with clean caption buttons over a transparent strip; Mica read almost opaque. |
 
 ### Desktop conversation view
 

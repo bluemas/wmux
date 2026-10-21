@@ -487,6 +487,13 @@ export const IPC = {
   // (main/factory/taskFolderCleanup.ts); main window only.
   FACTORY_TASK_FOLDERS_USAGE: 'factory:taskFolders:usage',
   FACTORY_TASK_FOLDERS_CLEAN: 'factory:taskFolders:clean',
+  // How bots sign in to Claude (main/factory/claudeApiKey.ts): the saved API
+  // key's status (never the key), saving and removing it, and the connection
+  // check; main window only.
+  FACTORY_CLAUDE_AUTH_STATUS: 'factory:claudeAuth:status',
+  FACTORY_CLAUDE_KEY_SET: 'factory:claudeAuth:setKey',
+  FACTORY_CLAUDE_KEY_REMOVE: 'factory:claudeAuth:removeKey',
+  FACTORY_CLAUDE_KEY_CHECK: 'factory:claudeAuth:check',
   TRACK_RECORD_CHANGED: 'trackRecord:changed',
   // The Fleet approvals tab's Plan card (shared/planApproval.ts): Claude's
   // ExitPlanMode dialogs, answered from the main window only.
@@ -622,10 +629,16 @@ export const IPC = {
   // native min/max/close) so the controls never clash with the theme.
   // Windows-only no-op elsewhere (see registerHandlers).
   WINDOW_SET_TITLEBAR_OVERLAY: 'window:setTitleBarOverlay',
-  // macOS window glass: the renderer asks main to set the app's appearance
-  // ('dark' | 'light') from the theme, so the vibrancy material behind the
-  // window matches it. macOS-only no-op elsewhere (see registerHandlers).
+  // Window glass: the renderer asks main to set the app's appearance
+  // ('dark' | 'light') from the theme, so the material behind the window
+  // (macOS vibrancy, Windows 11 acrylic) matches it. A no-op on Linux and on
+  // Windows builds without glass (see registerHandlers).
   WINDOW_SET_APPEARANCE: 'window:setAppearance',
+  // Windows window glass: the renderer sends the glass level (plus its solid
+  // overlay colour pair) and main switches the acrylic material, the window
+  // background and the titleBarOverlay colour together. A no-op off Windows
+  // and on Windows builds without glass (see registerHandlers).
+  WINDOW_SET_GLASS: 'window:setGlass',
   // Whole-interface zoom (#822): the renderer asks main to scale the
   // BrowserWindow with setZoomFactor and re-place the native chrome to match.
   // One-way send — the persisted factor lives in the renderer store.
@@ -637,6 +650,10 @@ export const IPC = {
   // time initial state.
   WINDOW_FULLSCREEN_CHANGED: 'window:fullscreen-changed',
   WINDOW_IS_FULLSCREEN: 'window:isFullScreen',
+  // Maximized state, same push + pull shape: a maximized Windows window has
+  // square corners, so the sheet drops its margin and radius as in fullscreen.
+  WINDOW_MAXIMIZED_CHANGED: 'window:maximized-changed',
+  WINDOW_IS_MAXIMIZED: 'window:isMaximized',
   // #882 — "is anyone looking at this window": minimized / hidden to tray /
   // screen locked. Same push + pull shape as fullscreen above. Feeds the #766
   // viewer-visibility report, because `document.visibilityState` never reports
@@ -754,6 +771,12 @@ export const IPC = {
   FIRST_RUN_REOPEN: 'first-run:reopen',
   FIRST_RUN_REGISTER_MCP: 'first-run:register-mcp',
   FIRST_RUN_START_SAMPLE_TASK: 'first-run:start-sample-task',
+  /** Agent-ready step: installed / version / signed in, per agent (spawns probes). */
+  FIRST_RUN_AGENT_STATUS: 'first-run:agent-status',
+  /** Agent-ready step: the bundled install line and the sign-in line for one agent. */
+  FIRST_RUN_AGENT_PLAN: 'first-run:agent-plan',
+  /** Agent-ready step: remember (or forget) a typed path for an agent wmux did not find. */
+  FIRST_RUN_AGENT_SET_PATH: 'first-run:agent-set-path',
   // First-run wizard event channels (renderer-side `on()` listeners)
   FIRST_RUN_SAMPLE_TASK_READY: 'first-run:sample-task-ready',
   FIRST_RUN_SAMPLE_TASK_TIMEOUT: 'first-run:sample-task-timeout',

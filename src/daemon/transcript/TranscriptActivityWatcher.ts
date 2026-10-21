@@ -30,17 +30,21 @@
 //   - Lifecycle by reconcile. One unref'd timer; each tick re-derives the set
 //     of sessions that should be watched and drops the rest, so an agent exit
 //     or a closed pane can never leak a watcher.
-//   - Subagent count (subagentCount.ts). An agent with a counter (Claude,
-//     Codex) is read even while hook-fed, for the count only. A count is sent
-//     on change, and a watch that ends (agent death, session start, closed
-//     pane, replaced file) sends 0 if it had sent more, so a stale count never
-//     sticks.
 //   - Agent Teams teammates (teammateActivity.ts). A Claude watch, hook-fed or
 //     not, also scans its session's subagents/ folder every TEAMMATE_POLL_MS
 //     and reports the pane working on every scan that finds an in-process
 //     teammate still working, so the pane reads running after the lead's turn
 //     ended. Nothing is sent when none works: main's activity stamp decays on
 //     its own. The scanner lives on the watch, so it ends with it.
+//     The same scan also lists the teammates (name, colour, working, its
+//     activity line) for the Office view and sends the list on change.
+//   - Subagent count (subagentCount.ts). An agent with a counter (Claude,
+//     Codex) is read even while hook-fed, for the count only. A count is sent
+//     on change and, while not 0, again every SUBAGENT_COUNT_REFRESH_MS (the
+//     renderer drops one it stopped hearing). A watch that ends (agent death,
+//     session start, closed pane, replaced file) sends 0 if it had sent more.
+//     A read that skips ahead still feeds the counter every skipped line, up
+//     to SUBAGENT_CATCHUP_BYTES, so a start or end in them is not lost.
 //   - Claude background shells (subagentCount.ts `shells()`). The same scan
 //     also reports the pane working while a shell it launched still works
 //     (shellWorking: output written within SHELL_FRESH_MS, launch younger
@@ -53,16 +57,19 @@ import type { ResumeBinding } from '../../shared/agentResume';
 import type { TurnEvent } from '../../shared/transcript/turnEvents';
 import { parseTranscriptLine } from './parseEntry';
 import { parseCodexLineDetailed } from './parseCodexEntry';
-import { isLineBoundary, readTranscriptDelta, readTranscriptPage, statTranscript } from './readTail';
+import { isLineBoundary, readRange, readTranscriptDelta, readTranscriptPage, statTranscript } from './readTail';
 import { HOOK_ACTIVITY_KINDS } from '../../shared/hooks/hookActivityKinds';
 import { MAX_RAW_LEN, summarizeActivity } from '../../shared/activitySummary';
 import { agentRow } from '../../shared/agentIdentity';
-import { SUBAGENT_COUNTERS, type ShellEntry, type SubagentCounter } from './subagentCount';
 import { TEAMMATE_SCANNERS, type TeammateScanner } from './teammateActivity';
+import { SUBAGENT_COUNTERS, type ShellEntry, type SubagentCounter } from './subagentCount';
+import { SUBAGENT_COUNT_REFRESH_MS } from '../../shared/subagentCount';
 import type { TeammateInfo } from '../../shared/types';
 
 /** Most bytes read for one session in one tick. */
 export const READ_CAP_BYTES = 256 * 1024;
+/** Most skipped bytes the subagent counter reads; a longer skip starts it afresh. */
+export const SUBAGENT_CATCHUP_BYTES = 4 * 1024 * 1024;
 /** When further behind than READ_CAP_BYTES, resume from this tail window. */
 export const JUMP_WINDOW_BYTES = 64 * 1024;
 const DEFAULT_POLL_MS = 1500;
@@ -176,7 +183,7 @@ export interface TranscriptActivityDeps {
    * Teams teammate, or a background shell): a running-state refresh, sent on
    * every scan that finds some (never a turn start, never a count).
    */
-  emitBackgroundWorking?: (sessionId: string) => void;
+  emitTeammatesWorking?: (sessionId: string) => void;
   /**
    * The session's Claude Code Agent Teams teammates (fresh ones, by name), sent
    * on every teammate scan whose list differs from the last one sent (the
@@ -219,16 +226,23 @@ interface Watch {
   linesOnly: boolean;
   /** The one-time `onClaudeLine` replay of the window before `offset` is still owed. */
   replay?: boolean;
-  /** Counts the agent's running subagents from the lines `parse` reads. */
-  subagents?: SubagentCounter;
-  /** The count last sent (0 before any). */
-  subagentsSent: number;
   /** Scans the session's subagents/ folder for working teammates (Claude). */
   teammates?: TeammateScanner;
   /** When the background scan (teammates, then shells) last ran (0 before any). */
   teammatesAt: number;
   /** The last teammate list sent, as its comparison key ('' while none was). */
   teammatesSent: string;
+  /** Counts the agent's running subagents from the lines `parse` reads. */
+  subagents?: SubagentCounter;
+  /** The count last sent (0 before any). */
+  subagentsSent: number;
+  /** When the count was last sent (0 before any). */
+  subagentsSentAt: number;
+  /** `parse` without the counter, for lines the counter has already read. */
+  plain: ParseLine;
+  /** The file size at which the counter last stopped on a record still being
+   *  written: nothing to read again until the file grows. */
+  stalledSize?: number;
 }
 
 /**
@@ -383,10 +397,32 @@ export class TranscriptActivityWatcher {
         // One unreadable transcript must never stop the others.
         this.dropWatch(id);
       }
-      if (this.watches.get(id) === watch) this.flushSubagents(id, watch);
       if (this.watches.get(id) === watch) this.scanBackground(id, watch);
+      if (this.watches.get(id) === watch) this.flushSubagents(id, watch);
     }
     this.deps.afterTick?.();
+  }
+
+  private scanBackground(id: string, watch: Watch): void {
+    if (!watch.teammates) return;
+    const now = this.now();
+    if (watch.teammatesAt > 0 && now - watch.teammatesAt < (this.deps.teammatePollMs ?? TEAMMATE_POLL_MS)) return;
+    watch.teammatesAt = now;
+    let list: TeammateInfo[] = [];
+    try {
+      list = watch.teammates.list(now);
+    } catch {
+      // An unreadable folder says nothing; the activity line is unaffected.
+    }
+    if (list.some((t) => t.working) || (watch.subagents?.shells?.() ?? []).some((shell) => shellWorking(shell, now))) {
+      this.deps.emitTeammatesWorking?.(id);
+    }
+    // The roster is sent on change only; an empty one is "" so that a list
+    // that never had a teammate sends nothing, and one that emptied sends [].
+    const key = list.length ? JSON.stringify(list.map(({ name, color, working, activity }) => ({ name, color, working, activity }))) : '';
+    if (key === watch.teammatesSent) return;
+    watch.teammatesSent = key;
+    this.deps.emitTeammates?.(id, list);
   }
 
   /** Ends a watch; a subagent count it had sent goes back to 0. */
@@ -414,31 +450,31 @@ export class TranscriptActivityWatcher {
 
   private flushSubagents(id: string, watch: Watch): void {
     const count = watch.subagents?.count ?? 0;
-    if (count === watch.subagentsSent) return;
+    const now = this.now();
+    if (count === watch.subagentsSent && (count === 0 || now - watch.subagentsSentAt < SUBAGENT_COUNT_REFRESH_MS)) return;
     watch.subagentsSent = count;
+    watch.subagentsSentAt = now;
     this.deps.emitSubagents?.(id, count);
   }
 
-  private scanBackground(id: string, watch: Watch): void {
-    if (!watch.teammates) return;
-    const now = this.now();
-    if (watch.teammatesAt > 0 && now - watch.teammatesAt < (this.deps.teammatePollMs ?? TEAMMATE_POLL_MS)) return;
-    watch.teammatesAt = now;
-    let list: TeammateInfo[] = [];
-    try {
-      list = watch.teammates.list(now);
-    } catch {
-      // An unreadable folder says nothing; the activity line is unaffected.
+  /**
+   * Feeds `counter` every complete line in [`from`, `size`) with one read,
+   * when that range is at most SUBAGENT_CATCHUP_BYTES: nothing past `size`
+   * is read, however the file grows meanwhile. Returns the line boundary it
+   * reached: past the last complete line (a record still being written after
+   * it is read once it ends). Null for a longer range or a failed read: the
+   * caller then counts afresh.
+   */
+  private catchUpSubagents(counter: SubagentCounter, path: string, from: number, size: number): number | null {
+    if (size - from > SUBAGENT_CATCHUP_BYTES) return null;
+    const raw = readRange(path, from, size - from);
+    if (!raw || raw.length !== size - from) return null;
+    const end = raw.lastIndexOf(0x0a);
+    if (end < 0) return from;
+    for (const line of raw.subarray(0, end).toString('utf8').split('\n')) {
+      if (line) counter.noteLine(line);
     }
-    if (list.some((t) => t.working) || (watch.subagents?.shells?.() ?? []).some((shell) => shellWorking(shell, now))) {
-      this.deps.emitBackgroundWorking?.(id);
-    }
-    // The roster is sent on change only; an empty one is "" so that a list
-    // that never had a teammate sends nothing, and one that emptied sends [].
-    const key = list.length ? JSON.stringify(list.map(({ name, color, working, activity }) => ({ name, color, working, activity }))) : '';
-    if (key === watch.teammatesSent) return;
-    watch.teammatesSent = key;
-    this.deps.emitTeammates?.(id, list);
+    return from + end + 1;
   }
 
   /** One transcript, one pane: the pane whose agent spoke last keeps it. */
@@ -483,11 +519,12 @@ export class TranscriptActivityWatcher {
     const stat = statTranscript(path);
     if (!stat) return;
     const subagents = binding ? SUBAGENT_COUNTERS[binding.agent]?.() : undefined;
-    const scanTeammates = binding && (this.deps.emitBackgroundWorking || this.deps.emitTeammates) ? TEAMMATE_SCANNERS[binding.agent] : undefined;
-    const teammates = scanTeammates?.(path);
     const counted: ParseLine = subagents ? (line, offset) => { subagents.noteLine(line); return parse(line, offset); } : parse;
+    const scanTeammates = binding && agentRow(binding.agent)?.teammateTranscripts && (this.deps.emitTeammatesWorking || this.deps.emitTeammates)
+      ? TEAMMATE_SCANNERS[binding.agent] : undefined;
+    const teammates = scanTeammates?.(path);
     // Start at the end: only what the agent writes from now on.
-    this.watches.set(id, { path, parse: counted, ino: stat.ino, offset: stat.size, sentAt: 0, lines: !!onLine, linesOnly: this.hookFed.has(id), replay: !!onLine, subagents, subagentsSent: 0, teammates, teammatesAt: 0, teammatesSent: '' });
+    this.watches.set(id, { path, parse: counted, ino: stat.ino, offset: stat.size, sentAt: 0, lines: !!onLine, linesOnly: this.hookFed.has(id), replay: !!onLine, subagents, subagentsSent: 0, subagentsSentAt: 0, plain: parse, teammates, teammatesAt: 0, teammatesSent: '' });
   }
 
   /** The one-time `onClaudeLine` replay a watch owes, if it owes one. */
@@ -523,26 +560,35 @@ export class TranscriptActivityWatcher {
       watch.ino = stat.ino;
       watch.offset = stat.size;
       watch.pending = undefined;
+      watch.stalledSize = undefined;
       watch.subagents?.reset();
       // In this tick, before afterTick settles a pending error the new file
       // may already have moved past.
       watch.replay = watch.lines;
       this.replayLines(id, watch);
+    } else if (stat.size > watch.offset && stat.size === watch.stalledSize) {
+      // Still the record the counter stopped on, and nothing appended: the
+      // bytes after the cursor were all read last tick.
     } else if (stat.size - watch.offset > READ_CAP_BYTES) {
       if (watch.lines) this.deps.onClaudeGap?.(id);
-      // Skipped lines may have started or ended subagents: count afresh from
-      // the window read below.
-      watch.subagents?.reset();
-      const page = readTranscriptPage(watch.path, { maxBytes: JUMP_WINDOW_BYTES, parseLine: watch.parse });
+      // The counter reads the skipped lines too, so the window below parses
+      // without it; past its budget it starts afresh from the window.
+      const caughtUp = watch.subagents ? this.catchUpSubagents(watch.subagents, watch.path, watch.offset, stat.size) : undefined;
+      if (caughtUp === null) watch.subagents?.reset();
+      const page = readTranscriptPage(watch.path, { maxBytes: JUMP_WINDOW_BYTES, parseLine: typeof caughtUp === 'number' ? watch.plain : watch.parse });
       if (!page) { this.dropWatch(id); return; }
       events = page.events;
-      watch.offset = page.cursor.tailOffset;
+      // The counter stopped at a line boundary; the window's cursor can sit
+      // inside a record still being written.
+      watch.offset = typeof caughtUp === 'number' ? caughtUp : page.cursor.tailOffset;
+      watch.stalledSize = typeof caughtUp === 'number' && caughtUp < stat.size ? stat.size : undefined;
     } else if (stat.size > watch.offset) {
       const delta = readTranscriptDelta(watch.path, watch.offset, READ_CAP_BYTES, watch.parse);
       if (!delta) { this.dropWatch(id); return; }
       if (delta.reset) {
         // Rewritten under the read: like a replacement, a gap then one replay.
         watch.offset = stat.size;
+        watch.stalledSize = undefined;
         watch.subagents?.reset();
         watch.replay = watch.lines;
         this.replayLines(id, watch);

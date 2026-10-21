@@ -81,7 +81,7 @@ import { pickFolderDialog, templateJob } from '../Settings/FactoryTab';
 import BotAvatar, { botHueIndex, botIdentityColor, noteRemovedBotHues } from '../Room/BotAvatar';
 import { RoomAvatar } from './BotsAvatar';
 import { awaitsApproval, conversationCards, groupViewCards, livePlanIds, taskBubbles, conversationTurns, type BotTreeRow, type BotWorker, type Conversation, type RoomEntry } from './botsModel';
-import BotsWorkerTree, { treeRowLabel } from './BotsWorkerTree';
+import BotsWorkerTree, { TaskVerification, treeRowLabel } from './BotsWorkerTree';
 import { loadWholeThread } from './useBots';
 import { loadRoomActors } from '../../hooks/useRoomSync';
 import { useShallow } from 'zustand/react/shallow';
@@ -89,6 +89,7 @@ import type { BotTaskView } from '../../../shared/botTask';
 import { botCanDo } from './botsProfile';
 import { BotConnections } from './BotConnections';
 import { BotSkills } from './BotSkills';
+import { BotMemory } from './BotMemory';
 import { BotToday } from './BotToday';
 import { BrainModelLine, WorkerModelLine } from './BotModelLines';
 import { stopBotSummary, useWorkerStopUnfinished, type BotsStopPort } from './botsStop';
@@ -100,6 +101,9 @@ import { routineScheduleText, routineStateText, useBotRoutines } from '../Schedu
 import { buildTimeline, clockTime, elapsed, fullTime, hasKindWord, liveNewAfter, separatorLabel, splitThreads, threadCards, type ThreadView, type TimelineItem } from './botsTimeline';
 import { conversationStartedThreads, workView } from './botsWork';
 import BotsWorkCard from './BotsWorkCard';
+import BotsWorkflowCard from './BotsWorkflowCard';
+import { countNewWorkflows, withWorkflows, type WorkflowTimelineItem } from './botsWorkflow';
+import { useConversationWorkflows } from './useBotWorkflows';
 import '../Chat/chatMono.css';
 
 const EMPTY_TREE: readonly BotTreeRow[] = [];
@@ -445,8 +449,13 @@ function MessageRow({ item, ctx, group }: { item: Extract<TimelineItem, { kind: 
   const botId = card.actor.kind === 'bot' ? card.actor.botId : '';
   const botRow = ctx.bots.find((b) => b.bot.id === botId);
   const role = botRow?.bot.role ?? ctx.actors[botId]?.role;
-  const showName = group || (!!ctx.selfBot && !!botId && botId !== ctx.selfBot);
-  const name = human ? t('room.actor.you') : actorLabel(card.actor, t, ctx.bots, ctx.actors);
+  // An outside agent the owner let in (shared/guestBots.ts): always named,
+  // always marked external.
+  const guest = card.kind === 'guest';
+  const showName = guest || group || (!!ctx.selfBot && !!botId && botId !== ctx.selfBot);
+  const name = human ? t('room.actor.you')
+    : guest ? t('botsPage.guest.author', { name: card.guest?.name ?? t('botsPage.guest.unnamed') })
+    : actorLabel(card.actor, t, ctx.bots, ctx.actors);
   // A bot the runtime no longer lists still gets a face: its name, picture
   // and colour as the room knows them (a removed bot's from its tombstone).
   const known = ctx.actors[botId];
@@ -504,6 +513,7 @@ function MessageRow({ item, ctx, group }: { item: Extract<TimelineItem, { kind: 
       data-room-card-id={question ? undefined : card.id}
       data-bots-bubble={question ? 'card' : 'bot'}
       data-card-kind={card.kind}
+      data-bots-guest={guest ? 'true' : undefined}
       data-continuation={continuation ? 'true' : undefined}
       data-run-end={runEnd ? 'true' : undefined}
       data-waits-on-owner={waiting && !question ? 'true' : undefined}
@@ -663,7 +673,27 @@ function DayDivider({ at, ctx }: { at: number; ctx: RowCtx }) {
 }
 
 /** A timeline's rows. */
-function TimelineView({ items, ctx, group = false }: { items: readonly TimelineItem[]; ctx: RowCtx; group?: boolean }) {
+/** A bot's saved workflow as one card at the time it was saved, its bot's
+ *  avatar beside it and, in a group, its name above (botsWorkflow.ts). */
+function WorkflowRow({ item, ctx, group, onCancel }: { item: Extract<WorkflowTimelineItem, { kind: 'workflow' }>; ctx: RowCtx; group: boolean; onCancel?: React.ComponentProps<typeof BotsWorkflowCard>['onCancel'] }) {
+  const { workflow } = item;
+  const face = botFace(workflow.botId, ctx);
+  return (
+    <div className="wmux-bots-msg" data-bots-bubble="workflow" data-run-end="true">
+      <div className="wmux-bots-msg-gutter">{face ? <BotAvatar bot={face} size={28} /> : null}</div>
+      <div className="wmux-bots-msg-main">
+        {group && (
+          <div className="wmux-bots-msg-head" data-bots-msg-head>
+            <span className="truncate" style={botNameStyle(workflow.botId)}>{actorLabel({ kind: 'bot', workspaceId: workflow.workspaceId, botId: workflow.botId }, ctx.t, ctx.bots, ctx.actors)}</span>
+          </div>
+        )}
+        <BotsWorkflowCard workflow={workflow} t={ctx.t} onCancel={ctx.readOnly ? undefined : onCancel} />
+      </div>
+    </div>
+  );
+}
+
+function TimelineView({ items, ctx, group = false, onCancelWorkflow }: { items: readonly WorkflowTimelineItem[]; ctx: RowCtx; group?: boolean; onCancelWorkflow?: React.ComponentProps<typeof BotsWorkflowCard>['onCancel'] }) {
   return (
     <>
       {items.map((item) => {
@@ -673,6 +703,7 @@ function TimelineView({ items, ctx, group = false }: { items: readonly TimelineI
           case 'system': return <SystemGroup key={item.key} cards={item.cards} thread={item.thread} ctx={ctx} />;
           case 'message': return <MessageRow key={item.key} item={item} ctx={ctx} group={group} />;
           case 'work': return <WorkRow key={item.key} item={item} ctx={ctx} group={group} />;
+          case 'workflow': return <WorkflowRow key={item.key} item={item} ctx={ctx} group={group} onCancel={onCancelWorkflow} />;
         }
       })}
     </>
@@ -784,12 +815,7 @@ function TaskRow({ task, t, resumePort, readOnly, shownId, onOpen }: { task: Bot
       <span className="min-w-0 flex-1 truncate text-[12px]">
         <span className="text-[var(--text-main)]">{task.title}</span>
         <span className="text-[var(--text-muted)]">{` · ${error ?? taskRailState(task, t)}`}</span>
-        {!waiting && task.verification && task.verification.state !== 'verified' && (
-          <span
-            data-bots-task-verification={task.verification.state}
-            className="text-[var(--accent-yellow)]"
-          >{` · ${t(task.verification.state === 'partial' ? 'botsPage.task.evidencePartial' : 'botsPage.task.notVerified', { verified: task.verification.verified, total: task.verification.total })}`}</span>
-        )}
+        {!waiting && <TaskVerification verification={task.verification} t={t} className="text-[var(--accent-yellow)]" prefix=" · " />}
         {!waiting && task.folder === 'kept_dirty' && <span data-bots-task-folder-kept className="text-[var(--text-muted)]">{` · ${t('botsPage.worker.folderKept')}`}</span>}
       </span>
       {!waiting && paneOpen && (
@@ -2019,7 +2045,7 @@ function BotProfile({ row, workers, workspaceName, t, stopPort, jobPort, adminPo
           <span className="w-[112px] shrink-0 text-[var(--text-muted)]">{t('botsPage.profile.routines')}</span>
           <ul className="min-w-0 flex-1 space-y-0.5">
             {routines.map((r) => (
-              <li key={r.id} data-bot-routine={r.id} className={`truncate ${r.state === 'paused' ? 'text-[var(--text-muted)]' : 'text-[var(--text-main)]'}`}>
+              <li key={r.id} data-bot-routine={r.id} className={`truncate ${r.state !== 'active' ? 'text-[var(--text-muted)]' : 'text-[var(--text-main)]'}`}>
                 {`${r.title} · ${routineScheduleText(r.schedule)} · ${routineStateText(r)}`}
               </li>
             ))}
@@ -2028,6 +2054,7 @@ function BotProfile({ row, workers, workspaceName, t, stopPort, jobPort, adminPo
       )}
       <BotConnections row={row} t={t} />
       <BotSkills row={row} t={t} />
+      <BotMemory row={row} t={t} />
       <div className="mt-1 border-t border-[var(--stroke)] pt-1">
         <div className="flex items-baseline gap-3 py-1 text-[12px]" data-bots-profile-can-do>
           <span className="w-[112px] shrink-0 text-[var(--text-muted)]">{t('botsPage.profile.canDo')}</span>
@@ -2197,6 +2224,8 @@ export function BotsChat({ conversation, roomCards, bots, title, workspaceName, 
     const entries: RoomEntry[] = main.map((card) => ({ kind: 'card' as const, card }));
     return buildTimeline(entries, { waits, threads, surfaced, newAfter, work, ...(workAuthor ? { workAuthor } : coordinators ? { workCandidates: coordinators } : {}) });
   }, [main, threads, surfaced, waits, newAfter, work, workAuthor, coordinators]);
+  const flows = useConversationWorkflows(conversation, cards);
+  const shownItems = useMemo(() => withWorkflows(items, flows.workflows), [items, flows.workflows]);
   const botNames = useMemo(() => bots.map((b) => b.bot.name), [bots]);
   const taskTitle = useMemo(() => {
     const byId = new Map<string, string>();
@@ -2235,26 +2264,31 @@ export function BotsChat({ conversation, roomCards, bots, title, workspaceName, 
     useStore.getState().markBotsSeen(conversationId, newestAt);
   }, [conversationId, newestAt, inView]);
   // "N new" while scrolled up: the cards from others newer than any seen
-  // before (older history read in later is not new).
+  // before (older history read in later is not new), and the workflows saved
+  // since the chat opened.
   const [newCount, setNewCount] = useState(0);
   const newestSeen = useRef(cards.reduce((m, c) => Math.max(m, c.at), 0));
+  const openedAt = useRef(Date.now());
+  const countedFlows = useRef(new Set<string>());
   useEffect(() => {
     const before = newestSeen.current;
     const added = cards.filter((c) => c.actor.kind !== 'human' && c.at > before).length;
+    const addedFlows = countNewWorkflows(flows.workflows, countedFlows.current, openedAt.current);
     newestSeen.current = cards.reduce((m, c) => Math.max(m, c.at), before);
     if (added > 0) {
       const visible = inView();
       const at = Date.now();
       setNewAfter((cur) => liveNewAfter(cards, cur, before, visible, at));
     }
+    // A workflow card read in later (flows.workflows) is pinned the same way.
     const el = scrollRef.current;
     if (el && atBottom.current) {
       // A hidden window draws no frames, and Blink keeps a scroll event (with
       // the whole chat, once it unmounts) until the next one: pin on return.
       if (document.visibilityState !== 'hidden') el.scrollTop = el.scrollHeight;
-    } else if (added > 0) setNewCount((n) => n + added);
+    } else if (added + addedFlows > 0) setNewCount((n) => n + added + addedFlows);
     markSeen();
-  }, [lastId, workers.length, markSeen, cards, inView]);
+  }, [lastId, workers.length, markSeen, cards, inView, flows.workflows]);
   useEffect(() => {
     const onVisible = () => {
       const el = scrollRef.current;
@@ -2453,7 +2487,7 @@ export function BotsChat({ conversation, roomCards, bots, title, workspaceName, 
     if (openThread) void loadWholeThread(openThread.workspaceId, openThread.threadId);
   }, [openThread]);
   const threadShown = openThread ? threadCards(roomCards, openThread.workspaceId, openThread.threadId) : null;
-  const empty = items.length === 0;
+  const empty = shownItems.length === 0;
 
   return (
     <div ref={areaRef} className="wmux-bots-chat-area" data-worker-open={shownId || openThread || openFile ? 'true' : undefined}>
@@ -2508,7 +2542,7 @@ export function BotsChat({ conversation, roomCards, bots, title, workspaceName, 
             {empty && conversation.kind === 'room' && (
               <p data-bots-empty-chat className="py-8 text-center text-[12px] text-[var(--text-muted)]">{t('botsPage.group.empty')}</p>
             )}
-            <TimelineView items={items} ctx={ctx} group={group} />
+            <TimelineView items={shownItems} ctx={ctx} group={group} onCancelWorkflow={flows.cancel} />
           </div>
         </div>
         {newCount > 0 && (

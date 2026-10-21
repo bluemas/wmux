@@ -29,6 +29,7 @@ registerFactoryRpcModule('approvals', (router, deps: FactoryHostDeps) => {
         import('../../shared/bot'),
       ]);
       const { getSkillApprovalHost } = await import('../pipe/handlers/skill.rpc');
+      const { getOwnerProfileApprovalHost } = await import('../pipe/handlers/memory.rpc');
       const { noticeBot } = await import('./botNotices');
       let service: ApprovalService;
       try {
@@ -43,7 +44,7 @@ registerFactoryRpcModule('approvals', (router, deps: FactoryHostDeps) => {
             const room = roomWake(resolveRoomPorts(), botId);
             return {
               wakeId: item.id, attempt: Math.max(1, item.attempts), threadId: item.threadId ?? null,
-              tainted: taint ? taint.wakeTainted(item) : true, ownerWords: item.reason.kind === 'human',
+              tainted: taint ? taint.wakeTainted(item) : true, guest: taint ? taint.wakeGuest(item) : 'unknown', ownerWords: item.reason.kind === 'human',
               ...(room?.wakeId === item.id && room.ownerCardId ? { ownerCardId: room.ownerCardId } : {}),
             };
           },
@@ -61,6 +62,7 @@ registerFactoryRpcModule('approvals', (router, deps: FactoryHostDeps) => {
             if (win && !win.isDestroyed()) win.webContents.send(BOT_EVENT, payload);
           },
           skills: getSkillApprovalHost,
+          ownerProfile: getOwnerProfileApprovalHost,
         });
       } catch (err) {
         startFailure = String(err);

@@ -1,3 +1,5 @@
+import PluginRailPage from '../../plugins/PluginRailPage';
+import ConnectorsPage from '../Connectors/ConnectorsPage';
 import { lazy, Suspense, useEffect } from 'react';
 import { useStore } from '../../stores';
 import { ErrorBoundary } from '../ErrorBoundary';
@@ -13,7 +15,7 @@ import { selectSelectedRemotePcName } from '../Git/thisComputerOnly';
 const SettingsPanel = lazy(() => import('../Settings/SettingsPanel'));
 
 /** Rail pages that show this computer only (Remote is about the others). */
-const THIS_COMPUTER_PAGES: ReadonlySet<string> = new Set(['bots', 'fleet', 'office', 'schedules', 'git']);
+const THIS_COMPUTER_PAGES: ReadonlySet<string> = new Set(['bots', 'fleet', 'office', 'schedules', 'git', 'connectors']);
 
 /**
  * The muted line a rail page shows while another computer is selected in the
@@ -21,7 +23,7 @@ const THIS_COMPUTER_PAGES: ReadonlySet<string> = new Set(['bots', 'fleet', 'offi
  * roster has not named yet gets no line rather than an empty name. Pure.
  */
 export function thisComputerOnlyLine(route: string, remotePcName: string | null, t: (key: string, vars?: Record<string, string | number>) => string): string | null {
-  if (!remotePcName || !THIS_COMPUTER_PAGES.has(route)) return null;
+  if (!remotePcName || (!THIS_COMPUTER_PAGES.has(route) && !route.startsWith('plugin:'))) return null;
   return t('pcRail.thisComputerOnly', { name: remotePcName });
 }
 
@@ -67,6 +69,8 @@ export default function RailPage() {
         {route === 'office' && <ErrorBoundary name="OfficePage"><OfficePage /></ErrorBoundary>}
         {route === 'schedules' && <ErrorBoundary name="SchedulesView"><SchedulesView /></ErrorBoundary>}
         {route === 'remote' && <ErrorBoundary name="RemotePage"><RemotePage /></ErrorBoundary>}
+        {route.startsWith('plugin:') && <ErrorBoundary key={route} name="PluginRailPage"><PluginRailPage name={route.slice(7)} /></ErrorBoundary>}
+        {route === 'connectors' && <ErrorBoundary name="ConnectorsPage"><ConnectorsPage /></ErrorBoundary>}
         {route === 'git' && <ErrorBoundary name="GitPage"><GitPage /></ErrorBoundary>}
       </div>
     </div>

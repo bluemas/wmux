@@ -14,6 +14,7 @@ export type SettingsTabId =
   | 'browser'
   | 'computer-use'
   | 'remote'
+  | 'plugins'
   | 'lanlink'
   | 'about';
 
@@ -26,8 +27,15 @@ export interface SettingsCatalogEntry {
   descKey?: TranslationKey;
   /** Extra search terms (English + native-language synonyms). Space-separated. */
   synonyms: string;
-  /** Rendered only on this platform; search leaves it out elsewhere. */
-  platform?: NodeJS.Platform;
+  /** Rendered only on these platforms; search leaves it out elsewhere. */
+  platform?: NodeJS.Platform | readonly NodeJS.Platform[];
+}
+
+/** Whether an entry is rendered on this platform (no `platform` means everywhere). */
+export function catalogEntryOnPlatform(entry: SettingsCatalogEntry, platform: string | undefined): boolean {
+  if (!entry.platform) return true;
+  const list: readonly string[] = typeof entry.platform === 'string' ? [entry.platform] : entry.platform;
+  return platform !== undefined && list.includes(platform);
 }
 
 /**
@@ -52,7 +60,7 @@ export const SETTINGS_NAV_GROUPS: {
   {
     id: 'connections',
     labelKey: 'settings.navGroupConnections',
-    tabs: ['remote', 'lanlink'],
+    tabs: ['plugins', 'remote', 'lanlink'],
   },
   {
     id: 'about',
@@ -90,6 +98,7 @@ export function resolveSettingsTab(id: string | null | undefined): SettingsTabId
  * "언어" finds Language while the UI is still in English).
  */
 export const SETTINGS_CATALOG: SettingsCatalogEntry[] = [
+  { id: 'plugins', tab: 'plugins', labelKey: 'plugins.settings.title', descKey: 'plugins.settings.description', synonyms: 'connector extension install Gmail GitHub MCP 플러그인 커넥터 插件 wtyczki' },
   { id: 'language', tab: 'general', labelKey: 'settings.language', synonyms: 'locale 언어 language 日本語 中文 idioma' },
   { id: 'autoupdate', tab: 'general', labelKey: 'settings.autoUpdate', descKey: 'settings.autoUpdateDesc', synonyms: 'update upgrade version' },
   { id: 'checkupdate', tab: 'general', labelKey: 'settings.checkUpdate', synonyms: 'update now latest release' },
@@ -117,7 +126,7 @@ export const SETTINGS_CATALOG: SettingsCatalogEntry[] = [
   { id: 'fontsize', tab: 'appearance', labelKey: 'settings.fontSize', synonyms: 'type size zoom text 글자' },
   { id: 'fontfamily', tab: 'appearance', labelKey: 'settings.fontFamily', descKey: 'settings.fontFamilyDesc', synonyms: 'typeface mono cascadia jetbrains 폰트' },
   { id: 'cursorshape', tab: 'appearance', labelKey: 'settings.cursorShape', descKey: 'settings.cursorShapeDesc', synonyms: 'cursor caret bar block underline beam 커서 캐럿 막대 블록 shape type style' },
-  { id: 'windowglass', tab: 'appearance', labelKey: 'settings.windowGlass', descKey: 'settings.windowGlassDesc', synonyms: 'transparent translucent transparency vibrancy blur glass opacity 투명 반투명 투명도 유리 블러', platform: 'darwin' },
+  { id: 'windowglass', tab: 'appearance', labelKey: 'settings.windowGlass', descKey: 'settings.windowGlassDesc', synonyms: 'transparent translucent transparency vibrancy acrylic blur glass opacity 투명 반투명 투명도 유리 블러', platform: ['darwin', 'win32'] },
   { id: 'chrome', tab: 'appearance', labelKey: 'settings.chromePreset', descKey: 'settings.chromePresetDesc', synonyms: 'density compact comfortable' },
   { id: 'sidebarpos', tab: 'appearance', labelKey: 'settings.sidebarPosition', descKey: 'settings.sidebarPositionDesc', synonyms: 'sidebar left right dock' },
   { id: 'sidebarattention', tab: 'appearance', labelKey: 'settings.sidebarSort', descKey: 'settings.sidebarSortDesc', synonyms: 'needs you waiting attention sort order recent activity manual pin top 대기 정렬 순서 최근' },
@@ -160,6 +169,7 @@ export const SETTINGS_CATALOG: SettingsCatalogEntry[] = [
   { id: 'factorymorning', tab: 'factory', labelKey: 'settings.factory.morning', descKey: 'settings.factory.morningDesc', synonyms: 'morning report time schedule weekday wake 아침 보고' },
   { id: 'factoryverifierownprs', tab: 'factory', labelKey: 'settings.factory.verifierOwnPrs', descKey: 'settings.factory.verifierOwnPrsDesc', synonyms: 'verifier own pull request owner verify' },
   { id: 'factoryengine', tab: 'factory', labelKey: 'settings.factory.engine', descKey: 'settings.factory.engineDesc', synonyms: 'engine claude sdk pty acp hermes command bot runtime' },
+  { id: 'factoryclaudeauth', tab: 'factory', labelKey: 'settings.factory.claudeAuth.mode', descKey: 'settings.factory.claudeAuth.modeDesc', synonyms: 'api key anthropic claude subscription sign in login billing connection check 연결 키 구독 로그인' },
   { id: 'factoryconcurrency', tab: 'factory', labelKey: 'settings.factory.concurrency', descKey: 'settings.factory.concurrencyDesc', synonyms: 'concurrent bots limit cap parallel turn' },
   { id: 'factorymaxagents', tab: 'factory', labelKey: 'settings.factory.maxAgents', descKey: 'settings.factory.maxAgentsDesc', synonyms: 'agents workers memory budget slots limit cap queue' },
   { id: 'factorylaneautomerge', tab: 'factory', labelKey: 'settings.factory.laneAutoMerge', descKey: 'settings.factory.laneAutoMergeDesc', synonyms: 'merge lane auto merge automatic pull request verifier ci 자동 머지' },

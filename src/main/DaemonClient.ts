@@ -1109,6 +1109,9 @@ export class DaemonClient extends EventEmitter {
           }
           break;
         }
+        case 'agent.teammates':
+          this.emit('session:teammates', { sessionId: event.sessionId });
+          break;
         case 'agent.subagents': {
           // How many subagents the pane's agent has running, from its transcript.
           const data = event.data as { count?: unknown } | null;
@@ -1117,11 +1120,11 @@ export class DaemonClient extends EventEmitter {
           }
           break;
         }
-        case 'agent.teammates': {
+        case 'agent.teammateList': {
           // The pane's Agent Teams teammates, from its session's subagents/ folder.
           const data = event.data as { teammates?: unknown } | null;
           if (Array.isArray(data?.teammates)) {
-            this.emit('session:teammates', { sessionId: event.sessionId, teammates: data.teammates });
+            this.emit('session:teammateList', { sessionId: event.sessionId, teammates: data.teammates });
           }
           break;
         }

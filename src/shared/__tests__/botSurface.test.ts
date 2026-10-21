@@ -5,6 +5,7 @@ import {
   BOT_TOOL_RPC,
   COORDINATOR_READ_EXTENSION,
   FACTORY_RPC_METHODS,
+  GUEST_SAFE_RPC,
   ROLE_SURFACES,
   SHARED_SURFACE,
   SHARED_SURFACE_TOOLS,
@@ -19,7 +20,7 @@ import { FIRST_PARTY_METHODS } from '../../main/mcp/firstParty';
 import { METHOD_CAPABILITY, resolveRequiredCapability } from '../../main/mcp/methodCapabilityMap';
 import type { RpcMethod } from '../rpc';
 
-const COMMON = ['ask_person', 'room_post', 'room_read', 'handoff_send', 'fact_poll'];
+const COMMON = ['ask_person', 'room_post', 'room_read', 'room_search', 'handoff_send', 'fact_poll', 'memory_update'];
 
 describe('ROLE_SURFACES', () => {
   it('defines every role', () => {
@@ -30,7 +31,9 @@ describe('ROLE_SURFACES', () => {
     for (const tool of COMMON) expect(ROLE_SURFACES[role].tools.has(tool), `${role} lacks ${tool}`).toBe(true);
   });
 
-  it.each(BOT_ROLES)('%s holds no shell, terminal input, teardown, browser or computer tool', (role) => {
+  // A bot's own commands are the engine's sandboxed Bash in its folder
+  // (main/factory/botExec.ts), never a wmux terminal: no pane input here.
+  it.each(BOT_ROLES)('%s holds no terminal input, teardown, browser or computer tool', (role) => {
     for (const tool of ROLE_SURFACES[role].tools) {
       expect(tool).not.toMatch(/^(terminal_send|terminal_send_key|send_message|pane_close|surface_close|workspace_close|pane_split|surface_new|computer|approval_press|task_close|task_pr|task_adopt)$/);
       expect(tool).not.toMatch(/^(browser_|repl_|company_)/);
@@ -66,6 +69,21 @@ describe('ROLE_SURFACES', () => {
     expect('bot_park' in BOT_TOOL_RPC).toBe(true);
     expect(SHARED_SURFACE.tools.has('bot_park')).toBe(false);
     expect(SHARED_SURFACE.rpc.has('bot.park')).toBe(false);
+  });
+
+  it('room.search is every bot\'s, in its own room only: no Coordinator extension covers it', () => {
+    expect(BOT_TOOL_RPC.room_search).toEqual(['room.search']);
+    expect(SHARED_SURFACE.rpc.has('room.search')).toBe(true);
+    expect(FACTORY_RPC_METHODS).toContain('room.search');
+    expect('room.search' in COORDINATOR_READ_EXTENSION).toBe(false);
+  });
+
+  it('memory.update is every bot\'s, for its own notes only: no Coordinator extension, never guest-safe', () => {
+    expect(BOT_TOOL_RPC.memory_update).toEqual(['memory.update']);
+    expect(SHARED_SURFACE.rpc.has('memory.update')).toBe(true);
+    expect(FACTORY_RPC_METHODS).toContain('memory.update');
+    expect('memory.update' in COORDINATOR_READ_EXTENSION).toBe(false);
+    expect(GUEST_SAFE_RPC.has('memory.update')).toBe(false);
   });
 
   it('the Coordinator extension names only read methods already on the surface (and plan.propose)', () => {

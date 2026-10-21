@@ -4314,7 +4314,8 @@ arrival order (`seq`, increasing; never sort by `at`).
   no buttons. Absent when the desktop no longer has the request.
 - `resumable: true` — on a system card whose `notice.code` is one of
   `worker.pausedResumable`, `worker.idlePausedResumable`,
-  `worker.openIdlePausedResumable` or `worker.doneResumable`, and whose
+  `worker.openIdlePausedResumable`, `worker.stopResolvedResumable` or
+  `worker.doneResumable`, and whose
   task's worker can resume **now** (the desktop's own rule for its card's
   Resume button). Omitted otherwise: an older card for a worker resumed since
   has none, and a worker stopped again after a resume brings it back without
@@ -4378,6 +4379,9 @@ worded (the values listed); a value not listed means the English `title`.
 | `worker.idlePausedResumable` | `title` string, `kind` string | `Worker paused (resumable): {title}`<br>`Worker paused (resumable)` | As `worker.pausedResumable`. |
 | `worker.openIdlePaused` | `title` string | `Worker paused: {title}`<br>`Worker paused` | As `worker.paused`; the task was still working or needing input. |
 | `worker.openIdlePausedResumable` | `title` string, `kind` string | `Worker paused (resumable): {title}`<br>`Worker paused (resumable)` | As `worker.pausedResumable`; the task was still working or needing input. |
+| `worker.stopUnconfirmed` | `title` string | `Worker stop unconfirmed: {title}`<br>`Worker stop unconfirmed` | The stop was not confirmed; the worker still holds its slot. `title` as `worker.paused`. |
+| `worker.stopResolved` | `title` string | `Worker slot freed: {title}`<br>`Worker slot freed` | Follow-up to an unconfirmed stop: the worker has stopped and its slot is free. `title` as `worker.paused`. |
+| `worker.stopResolvedResumable` | `title` string, `kind` string | `Worker slot freed (resumable): {title}`<br>`Worker slot freed (resumable)` | As `worker.stopResolved`; the conversation is kept and the worker can resume. `kind` as `worker.pausedResumable`. |
 | `worker.done` | `title` string, `status` string | `Worker done: {title}`<br>`Worker done` | `title` as `worker.paused`. `status`: `completed`, `cancelled` or `failed`. |
 | `worker.doneResumable` | `title` string, `status` string, `kind` string | `Worker done (resumable): {title}`<br>`Worker done (resumable)` | As `worker.done`; `kind` as `worker.pausedResumable`. |
 | `worker.resumed` | `title` string, `by` string, `where` string | `Worker resumed: {title}`<br>`Worker resumed` | `title` as `worker.paused`. `by`: `owner` or `bot`. `where`: `folder` or `newPane`. |
@@ -4391,7 +4395,7 @@ worded (the values listed); a value not listed means the English `title`.
 | `gate.passed` | — | `Gate passed: task left open` | — |
 | `gate.killed` | — | `Gate was killed: task left open` | — |
 | `gate.failed` | `exit` number | `Gate failed (exit {exit}): task left open` | — |
-| `gate.skipped` | `reason` string | `Gate skipped ({reason}): task left open` | `reason`: `deps_missing`, `no_gate_command`, `gate_unavailable` or `no_changes`. |
+| `gate.skipped` | `reason` string, `title` string | `Gate skipped ({reason}): task left open`<br>`Gate skipped for {title} ({reason}): task left open` | `reason`: `deps_missing`, `no_gate_command`, `gate_unavailable` or `no_changes`. `title`: the task's title, on a `no_changes` skip only (the second template); a card without it uses the first. |
 | `gate.busy` | — | `Gate already running: task left open` | — |
 | `gate.noBase` | `detail` string | `No gate on the default branch yet: task left open` | `detail`: the error, in English. |
 | `gate.refused` | — | `Gate refused: task left open` | — |
@@ -4497,6 +4501,10 @@ a client that calls these routes reads replies as room cards by definition.
   - `avatar.picture` — the owner set a picture for the bot, which the desktop
     draws instead of the character. The picture itself is not served; draw
     the character.
+  - `guestWorkspace` — `true` when the bot is in a guest workspace: external
+    guest bots may join its conversations, and its turns run under guest
+    rules. Absent otherwise. Mark the bot (and its conversations) as guest;
+    the owner may read and post there as anywhere.
 - `conversations` — at most 200, newest first: by `lastAt`, a tie by the
   row's key (`bot:<botId>` or `group:<groupId>`) in string order, as the
   desktop sorts them. Fewer when
@@ -4512,6 +4520,10 @@ a client that calls these routes reads replies as room cards by definition.
     group made from a room has none and is named after its workspace (empty
     when the workspace is not open on the desktop).
   - `workspaceName` — the workspace's name, when it is open on the desktop.
+  - `guestWorkspace` — `true` when the conversation is in a guest workspace
+    (as on `bots`). A message the owner posts in one names only that
+    workspace's bots, and a message elsewhere names none of its bots: such a
+    post answers `409 no-recipient` with `reason: "room-refused"`.
   - `botId` (a 1:1) / `groupId` (a group). `memberBotIds` — a 1:1: its bot;
     a group: its bots in the owner's order.
   - `lastAt` — the newest card's time in the conversation (its own thread

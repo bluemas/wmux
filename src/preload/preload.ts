@@ -1,16 +1,25 @@
+import { PLUGIN_MANAGEMENT_IPC, type UiPluginInventory } from '../shared/pluginManagement';
+import { PLUGIN_FRAME_IPC } from '../shared/pluginHost';
+import { CONNECTOR_TERMINAL_IPC, type ConnectorTerminalResult, type ConnectorTerminalContext } from '../shared/connectorTerminal';
+import { CONNECTOR_OAUTH_IPC, type ConnectorOAuthAction, type ConnectorOAuthClient, type ConnectorOAuthResult } from '../shared/connectorOAuth';
+import { CONNECTOR_CATALOG_IPC, type ConnectorCatalogResult } from '../shared/connectorCatalog';
+import { CONNECTOR_CHECK_IPC, type ConnectorCheckResult } from '../shared/connectorCheck';
 import { WORKFLOW_OWNER_IPC } from '../shared/botWorkflow';
 import type { TerminalCoreSettings, TerminalEngine } from '../shared/terminalCoreSettings';
 import { CHAT_IPC } from '../shared/transcript/chatIpc';
 import type { ChatBridgeApi } from '../shared/transcript/turnEvents';
 import { CHATV2_IPC, type ChatV2BridgeApi, type ChatV2EventsPush, type ChatV2ResyncPush } from '../shared/chatv2/ipc';
-import { contextBridge, ipcRenderer, webUtils } from 'electron';
+import { contextBridge, ipcRenderer, webFrame, webUtils } from 'electron';
+import { START_POLARITY_STORAGE_KEY, resolveStartPolarity, startPaintCss } from '../shared/windowStartPaint';
 import { IPC } from '../shared/constants';
 import { ROOM_EVENT } from '../shared/room';
 import { BOT_EVENT } from '../shared/bot';
 import { BOT_APPROVAL_IPC } from '../shared/botApproval';
 import { BOT_SECRET_IPC } from '../shared/botSecret';
 import { CONNECTOR_IPC } from '../shared/botConnector';
+import { GUEST_BOT_IPC } from '../shared/guestBots';
 import { BOT_SKILL_IPC } from '../shared/botSkill';
+import { BOT_MEMORY_IPC } from '../shared/botMemory';
 import { BOT_GROUP_IPC } from '../shared/botGroup';
 import type { PaneLabelRejection } from '../shared/paneLabelRules';
 import { CHROME_PANE_IPC, type ChromePaneBindings } from '../shared/chromePaneBinding';
@@ -50,6 +59,8 @@ import type {
   RegisterMcpResult,
   SampleTaskStartPayload,
 } from '../shared/firstRun';
+import type { AgentId, AgentSetupStatus } from '../shared/agentSetup';
+import type { AgentSetupPlan, SetAgentPathResult } from '../shared/agentInstall';
 import { isFileDrag } from '../shared/dragDrop';
 import { parseWindowsBuildNumber } from '../shared/platform';
 import type { NotificationCategory } from '../shared/types';
@@ -209,6 +220,21 @@ const chatv2: ChatV2BridgeApi = {
   },
 };
 
+// The page's first paint comes before any script, from the stylesheet's dark
+// `:root` block; main passes the saved theme's polarity so that paint is the
+// window's start colour instead, and a light theme does not start dark (#2512).
+// A reload takes the polarity the renderer last recorded, which follows a
+// theme changed since the window was built.
+function storedStartPolarity(): string | null {
+  try {
+    return window.sessionStorage.getItem(START_POLARITY_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+const startPolarity = resolveStartPolarity(storedStartPolarity(), process.argv);
+if (startPolarity) void webFrame.insertCSS(startPaintCss(startPolarity));
+
 const electronAPI = {
   chat,
   chatv2,
@@ -216,6 +242,9 @@ const electronAPI = {
   // directly under sandbox + contextIsolation, so expose it here.
   // 'win32' | 'darwin' | 'linux' | 'aix' | 'freebsd' | 'openbsd' | 'sunos' | 'cygwin' | 'netbsd'
   platform: process.platform as NodeJS.Platform,
+  // The saved theme's polarity main started the window in, or null: index.tsx
+  // shows that polarity's default theme until the session's loads (#2512).
+  startPolarity,
   // The Windows build number (eg. 19045), or null off Windows / when it cannot
   // be read. xterm needs this SYNCHRONOUSLY at Terminal construction to pick
   // its ConPTY behaviour, so it is a static value here rather than an IPC call.
@@ -245,7 +274,7 @@ const electronAPI = {
     // wmux.json leaf — `exec` runs the command as the pane's ROOT process and
     // `supervision` arms the daemon's PaneSupervisor (daemon mode only; the
     // local branch ignores them with a one-time warning toast).
-    create: (options?: { shell?: string; cwd?: string; recoveryCwds?: Pick<DeadPaneRecovery, 'spawnCwd' | 'cwd' | 'sourceSessionId'>; cols?: number; rows?: number; workspaceId?: string; surfaceId?: string; env?: Record<string, string>; wslAccountLoginEnvKey?: 'CLAUDE_CONFIG_DIR' | 'CODEX_HOME'; initialCommand?: string; exec?: string; supervision?: { restart: 'on-failure' | 'always'; limit?: { burst?: number; healthyUptimeSec?: number }; restorePermissionMode?: boolean }; fanoutTaskOf?: string; fanoutOrigin?: import('../shared/fanoutOrigin').FanoutOrigin; secretGrant?: string; fanoutLaunch?: { taskId: string; gen: number } }) =>
+    create: (options?: { shell?: string; cwd?: string; recoveryCwds?: Pick<DeadPaneRecovery, 'spawnCwd' | 'cwd' | 'sourceSessionId'>; cols?: number; rows?: number; workspaceId?: string; surfaceId?: string; env?: Record<string, string>; wslAccountLoginEnvKey?: 'CLAUDE_CONFIG_DIR' | 'CODEX_HOME'; ignoreAccountBinding?: boolean; initialCommand?: string; exec?: string; supervision?: { restart: 'on-failure' | 'always'; limit?: { burst?: number; healthyUptimeSec?: number }; restorePermissionMode?: boolean }; fanoutTaskOf?: string; fanoutOrigin?: import('../shared/fanoutOrigin').FanoutOrigin; secretGrant?: string; fanoutLaunch?: { taskId: string; gen: number } }) =>
       ipcRenderer.invoke(IPC.PTY_CREATE, options),
     write: (id: string, data: string) => {
       ipcRenderer.send(IPC.PTY_WRITE, id, data);
@@ -584,8 +613,8 @@ const electronAPI = {
     // progress) flow through this one shape. Renderer routes by ptyId
     // (preferred) or workspaceId (for surface-less updates like
     // meta.setStatus on the active workspace).
-    onUpdate: (callback: (payload: { ptyId?: string; workspaceId?: string; gitBranch?: string; cwd?: string; listeningPorts?: number[]; agentStatus?: string; agentName?: string; status?: string; progress?: number; gitIsWorktree?: boolean; pr?: { number: number; state: 'open' | 'draft' | 'merged' | 'closed'; checks: 'pending' | 'passing' | 'failing' | null; url: string } | null; gitSync?: { dirty: number; ahead: number; behind: number; hasUpstream: boolean } | null; lastNotificationText?: { ts: number; title: string | null; body: string; source: 'osc9' | 'osc777' | 'osc99' }; activity?: string; subagents?: number; teammates?: Array<{ name: string; color?: string; working: boolean; activity?: string; at: number }>; pendingQuestion?: string; lastMessage?: string; lastActivity?: ''; paneId?: string; paneLabel?: string; paneRole?: string; agentSlug?: string | null; hookKind?: string; settled?: boolean }) => void) => {
-      const listener = (_event: Electron.IpcRendererEvent, payload: { ptyId?: string; workspaceId?: string; gitBranch?: string; cwd?: string; listeningPorts?: number[]; agentStatus?: string; agentName?: string; status?: string; progress?: number; gitIsWorktree?: boolean; pr?: { number: number; state: 'open' | 'draft' | 'merged' | 'closed'; checks: 'pending' | 'passing' | 'failing' | null; url: string } | null; gitSync?: { dirty: number; ahead: number; behind: number; hasUpstream: boolean } | null; lastNotificationText?: { ts: number; title: string | null; body: string; source: 'osc9' | 'osc777' | 'osc99' }; activity?: string; subagents?: number; teammates?: Array<{ name: string; color?: string; working: boolean; activity?: string; at: number }>; pendingQuestion?: string; lastMessage?: string; lastActivity?: ''; paneId?: string; paneLabel?: string; paneRole?: string; agentSlug?: string | null; hookKind?: string; settled?: boolean }) =>
+    onUpdate: (callback: (payload: { ptyId?: string; workspaceId?: string; gitBranch?: string; cwd?: string; listeningPorts?: number[]; agentStatus?: string; agentName?: string; status?: string; progress?: number; gitIsWorktree?: boolean; pr?: { number: number; state: 'open' | 'draft' | 'merged' | 'closed'; checks: 'pending' | 'passing' | 'failing' | null; url: string } | null; gitSync?: { dirty: number; ahead: number; behind: number; hasUpstream: boolean } | null; lastNotificationText?: { ts: number; title: string | null; body: string; source: 'osc9' | 'osc777' | 'osc99' }; activity?: string; teammatesWorking?: true; subagents?: number; teammates?: Array<{ name: string; color?: string; working: boolean; activity?: string; at: number }>; pendingQuestion?: string; lastMessage?: string; lastActivity?: ''; paneId?: string; paneLabel?: string; paneRole?: string; agentSlug?: string | null; hookKind?: string; settled?: boolean }) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, payload: { ptyId?: string; workspaceId?: string; gitBranch?: string; cwd?: string; listeningPorts?: number[]; agentStatus?: string; agentName?: string; status?: string; progress?: number; gitIsWorktree?: boolean; pr?: { number: number; state: 'open' | 'draft' | 'merged' | 'closed'; checks: 'pending' | 'passing' | 'failing' | null; url: string } | null; gitSync?: { dirty: number; ahead: number; behind: number; hasUpstream: boolean } | null; lastNotificationText?: { ts: number; title: string | null; body: string; source: 'osc9' | 'osc777' | 'osc99' }; activity?: string; teammatesWorking?: true; subagents?: number; teammates?: Array<{ name: string; color?: string; working: boolean; activity?: string; at: number }>; pendingQuestion?: string; lastMessage?: string; lastActivity?: ''; paneId?: string; paneLabel?: string; paneRole?: string; agentSlug?: string | null; hookKind?: string; settled?: boolean }) =>
         callback(payload);
       ipcRenderer.on(IPC.METADATA_UPDATE, listener);
       return () => { ipcRenderer.removeListener(IPC.METADATA_UPDATE, listener); };
@@ -1261,6 +1290,16 @@ const electronAPI = {
     getSettings: () => ipcRenderer.invoke(IPC.FACTORY_SETTINGS_GET) as Promise<import('../shared/factorySettings').FactorySettings>,
     setSettings: (patch: Partial<import('../shared/factorySettings').FactorySettings>) =>
       ipcRenderer.invoke(IPC.FACTORY_SETTINGS_SET, patch) as Promise<import('../shared/factorySettings').FactorySettings | null>,
+    // How bots sign in to Claude (Settings › Bots): the saved API key's
+    // status (set, last four characters), never the key; the key goes out
+    // once, in setKey.
+    claudeAuth: {
+      status: () => ipcRenderer.invoke(IPC.FACTORY_CLAUDE_AUTH_STATUS) as Promise<import('../main/factory/claudeApiKey').ClaudeApiKeyStatus | null>,
+      setKey: (key: string) =>
+        ipcRenderer.invoke(IPC.FACTORY_CLAUDE_KEY_SET, { key }) as Promise<import('../main/factory/claudeApiKey').ClaudeApiKeySetResult | { ok: false; code: string; message: string }>,
+      removeKey: () => ipcRenderer.invoke(IPC.FACTORY_CLAUDE_KEY_REMOVE) as Promise<{ ok: boolean; status?: import('../main/factory/claudeApiKey').ClaudeApiKeyStatus }>,
+      check: () => ipcRenderer.invoke(IPC.FACTORY_CLAUDE_KEY_CHECK) as Promise<import('../main/factory/claudeApiKey').ClaudeApiKeyCheck | { ok: false; code: string; message: string }>,
+    },
     // The owner's stop of running bot work: every bot, or one bot.
     stopAll: () => ipcRenderer.invoke(IPC.FACTORY_STOP_ALL) as Promise<import('../main/factory/factoryStop').FactoryStopResult>,
     stopBot: (botId: string) =>
@@ -1321,6 +1360,26 @@ const electronAPI = {
       list: (botId: string) => ipcRenderer.invoke(BOT_SKILL_IPC.list, { botId }) as Promise<import('../shared/botSkill').SkillListResult>,
       archive: (req: import('../shared/botSkill').SkillArchiveRequest) =>
         ipcRenderer.invoke(BOT_SKILL_IPC.archive, req) as Promise<import('../shared/botSkill').SkillArchiveResult>,
+    },
+    // A bot's notes and the owner's profile (renderer/components/Bots/
+    // BotMemory.tsx): read, and the owner's Remove and Clear; changes arrive
+    // as BOT_EVENT {type:'memory-changed'}.
+    memory: {
+      read: (botId: string) => ipcRenderer.invoke(BOT_MEMORY_IPC.read, { botId }) as Promise<import('../shared/botMemory').MemoryReadResult>,
+      remove: (req: import('../shared/botMemory').MemoryRemoveRequest) =>
+        ipcRenderer.invoke(BOT_MEMORY_IPC.remove, req) as Promise<import('../shared/botMemory').MemorySimpleResult>,
+      clear: (req: import('../shared/botMemory').MemoryClearRequest) =>
+        ipcRenderer.invoke(BOT_MEMORY_IPC.clear, req) as Promise<import('../shared/botMemory').MemorySimpleResult>,
+    },
+    // Guest bots (renderer/components/Bots/guestBots.ts): an outside agent's
+    // token comes back once, from create; nothing reads one back.
+    guestBots: {
+      list: () => ipcRenderer.invoke(GUEST_BOT_IPC.list) as Promise<import('../shared/guestBots').GuestBotListResult>,
+      create: (req: { name: string; scope: import('../shared/guestBots').GuestScope }) =>
+        ipcRenderer.invoke(GUEST_BOT_IPC.create, req) as Promise<import('../shared/guestBots').GuestBotCreateResult>,
+      revoke: (guestId: string) => ipcRenderer.invoke(GUEST_BOT_IPC.revoke, { guestId }) as Promise<import('../shared/guestBots').GuestBotSimpleResult>,
+      setEnabled: (enabled: boolean) => ipcRenderer.invoke(GUEST_BOT_IPC.setEnabled, { enabled }) as Promise<import('../shared/guestBots').GuestBotSimpleResult>,
+      markWorkspace: (workspaceId: string) => ipcRenderer.invoke(GUEST_BOT_IPC.markWorkspace, { workspaceId }) as Promise<import('../shared/guestBots').GuestWorkspaceMarkResult>,
     },
     // The owner's group chats (shared/botGroup.ts); changes arrive as
     // BOT_EVENT {type:'groups-changed'}.
@@ -1504,7 +1563,38 @@ const electronAPI = {
   // failures; `rpc` forwards a host-validated bridge request from a plugin
   // iframe to main, where it dispatches through the shared RpcRouter with
   // clientName pinned to the plugin (full permission enforcement applies).
+  connectorTerminal: {
+    launch: (id: string, agent: 'claude' | 'codex', ptyId: string) => ipcRenderer.invoke(CONNECTOR_TERMINAL_IPC, id, agent, ptyId) as Promise<ConnectorTerminalResult>,
+    targets: () => ipcRenderer.invoke(`${CONNECTOR_TERMINAL_IPC}:targets`) as Promise<ConnectorTerminalContext | null>,
+  },
+  connectorOAuth: {
+    action: (action: ConnectorOAuthAction, id: string, consentId?: string, client?: ConnectorOAuthClient) => ipcRenderer.invoke(CONNECTOR_OAUTH_IPC, action, id, consentId, client) as Promise<ConnectorOAuthResult>,
+  },
+  connectorCatalog: {
+    list: (search: string, cursor?: string) => ipcRenderer.invoke(CONNECTOR_CATALOG_IPC, search, cursor) as Promise<ConnectorCatalogResult>,
+  },
+  connectorChecks: {
+    check: (id: string) => ipcRenderer.invoke(CONNECTOR_CHECK_IPC, id) as Promise<ConnectorCheckResult>,
+  },
+  pluginManagement: {
+    list: () => ipcRenderer.invoke(PLUGIN_MANAGEMENT_IPC.list) as Promise<UiPluginInventory>,
+    install: (id: string) => ipcRenderer.invoke(PLUGIN_MANAGEMENT_IPC.install, id) as Promise<void>,
+    setEnabled: (name: string, enabled: boolean) => ipcRenderer.invoke(PLUGIN_MANAGEMENT_IPC.enabled, name, enabled) as Promise<void>,
+    remove: (name: string) => ipcRenderer.invoke(PLUGIN_MANAGEMENT_IPC.remove, name) as Promise<void>,
+    onChanged: (callback: (name: string) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, name: string) => callback(name);
+      ipcRenderer.on(PLUGIN_MANAGEMENT_IPC.changed, listener);
+      return () => { ipcRenderer.removeListener(PLUGIN_MANAGEMENT_IPC.changed, listener); };
+    },
+  },
   plugins: {
+    frameReady: (pluginName: string, frameName: string, nonce: string) =>
+      ipcRenderer.invoke(PLUGIN_FRAME_IPC.ready, pluginName, frameName, nonce) as Promise<boolean>,
+    onFrameNavigation: (callback: (frameName: string) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, frameName: string) => callback(frameName);
+      ipcRenderer.on(PLUGIN_FRAME_IPC.navigated, listener);
+      return () => { ipcRenderer.removeListener(PLUGIN_FRAME_IPC.navigated, listener); };
+    },
     list: () => ipcRenderer.invoke(IPC.PLUGINS_LIST) as Promise<{
       plugins: unknown[];
       failures: Array<{ name: string; errors: string[] }>;
@@ -1643,6 +1733,11 @@ const electronAPI = {
     dismiss: () => ipcRenderer.invoke(IPC.FIRST_RUN_DISMISS) as Promise<void>,
     reopen: () => ipcRenderer.invoke(IPC.FIRST_RUN_REOPEN) as Promise<FirstRunCheckResult>,
     registerMcp: () => ipcRenderer.invoke(IPC.FIRST_RUN_REGISTER_MCP) as Promise<RegisterMcpResult>,
+    agentStatus: () => ipcRenderer.invoke(IPC.FIRST_RUN_AGENT_STATUS) as Promise<AgentSetupStatus[]>,
+    agentPlan: (agent: AgentId, paneShell?: string) =>
+      ipcRenderer.invoke(IPC.FIRST_RUN_AGENT_PLAN, agent, paneShell) as Promise<AgentSetupPlan>,
+    setAgentPath: (agent: AgentId, input: string | null) =>
+      ipcRenderer.invoke(IPC.FIRST_RUN_AGENT_SET_PATH, agent, input) as Promise<SetAgentPathResult>,
     startSampleTask: (payload: SampleTaskStartPayload) =>
       ipcRenderer.invoke(IPC.FIRST_RUN_START_SAMPLE_TASK, payload) as Promise<void>,
     onSampleTaskReady: (callback: () => void) => {
@@ -1781,11 +1876,17 @@ const electronAPI = {
     setTitleBarOverlay: (opts: { color: string; symbolColor: string }) => {
       ipcRenderer.send(IPC.WINDOW_SET_TITLEBAR_OVERLAY, opts);
     },
-    // macOS window glass: match the app's appearance to the theme so the
-    // material behind the window has the theme's tone, or 'system' with glass
-    // off. Main validates it.
+    // Window glass: match the app's appearance to the theme so the material
+    // behind the window has the theme's tone, or 'system' with glass off.
+    // Main validates it.
     setAppearance: (appearance: 'dark' | 'light' | 'system') => {
       ipcRenderer.send(IPC.WINDOW_SET_APPEARANCE, appearance);
+    },
+    // Windows window glass: switch the acrylic material for a glass level.
+    // The colour pair is the solid overlay colour the frame paints with glass
+    // off (overlayColors()). Main validates it and no-ops off Windows.
+    setGlass: (opts: { level: 'off' | 'soft' | 'clear'; color?: string; symbolColor?: string }) => {
+      ipcRenderer.send(IPC.WINDOW_SET_GLASS, opts);
     },
     // Whole-interface zoom (#822): push the persisted factor to main, which
     // scales the renderer and re-places the native chrome. The overlay color
@@ -1801,6 +1902,15 @@ const electronAPI = {
         cb(payload?.fullscreen === true);
       ipcRenderer.on(IPC.WINDOW_FULLSCREEN_CHANGED, listener);
       return () => ipcRenderer.removeListener(IPC.WINDOW_FULLSCREEN_CHANGED, listener);
+    },
+    /** Sheet frame: mount-time maximized state (pull). */
+    isMaximized: () => ipcRenderer.invoke(IPC.WINDOW_IS_MAXIMIZED) as Promise<boolean>,
+    /** Sheet frame: live maximize / unmaximize transitions (push). */
+    onMaximizedChanged: (cb: (maximized: boolean) => void) => {
+      const listener = (_e: Electron.IpcRendererEvent, payload: { maximized?: boolean }) =>
+        cb(payload?.maximized === true);
+      ipcRenderer.on(IPC.WINDOW_MAXIMIZED_CHANGED, listener);
+      return () => ipcRenderer.removeListener(IPC.WINDOW_MAXIMIZED_CHANGED, listener);
     },
     /**
      * #882 — is anyone looking at this window (not minimized, not hidden to

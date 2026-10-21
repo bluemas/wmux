@@ -31,6 +31,7 @@ vi.mock('../../../deck/taskLedgerHost', () => ({ getTaskLedger: () => ledgerMock
 import type { RpcContext } from '../../../../shared/rpc';
 import type { BrainAdapter, BrainEvent } from '../../../deck/BrainAdapter';
 import { registerBotRpcHandlers, botRuntimeModule, statusFor, wakeOnOwnerAnswer, type SetJobPorts } from '../bot.rpc';
+import { BOT_EVENT } from '../../../../shared/bot';
 import { DISMISSED_ANSWER } from '../../../factory/handoffRouter';
 import { WakeTaint } from '../../../factory/wakeTaint';
 import type { Handoff } from '../../../../shared/handoff';
@@ -42,6 +43,9 @@ import { BotStore, botsFilePath, getBotDirectory } from '../../../factory/botSto
 import { getWakeQueue } from '../../../factory/wakeQueue';
 import { getBotRuntime } from '../../../factory/BotRuntime';
 import { factorySettingsPath, getFactorySettingsStore } from '../../../factory/factorySettings';
+import { getBotStore } from '../../../factory/botStore';
+import { recordWorkerStart } from '../../../factory/budget';
+import { setWorkerStopsConfirmed } from '../../../factory/workerRunEnds';
 
 type Handler = (params: Record<string, unknown>, ctx?: RpcContext) => Promise<unknown>;
 
@@ -96,6 +100,28 @@ describe('bot.* auth matrix', () => {
       expect(await call(m, { botId: 'bot-0000000a' }, botCtx('moa')), m).toMatchObject({ code: 'not_authorized' });
       expect(await call(m, { botId: 'bot-0000000a' }, OPERATOR), m).toMatchObject({ code: 'not_started' });
     }
+  });
+});
+
+describe('bot.list in a wake not known clean', () => {
+  it('shows a bot only the bots of its wake\'s conversation; the operator and a clean wake see them all', async () => {
+    const store = new BotStore(botsFilePath(dir));
+    const a = store.create({ workspaceId: 'ws-1', name: 'Alpha' });
+    const b = store.create({ workspaceId: 'ws-1', name: 'Beta' });
+    const c = store.create({ workspaceId: 'ws-2', name: 'Gamma' });
+    if (!a.ok || !b.ok || !c.ok) throw new Error('create');
+    let scope: ReadonlySet<string> | undefined = new Set([a.bot.id]);
+    const runtime = { status: () => null } as unknown as BotRuntime;
+    const { router, handlers } = captureRouter();
+    registerBotRpcHandlers(router, () => ({ store, runtime, queue: {} as WakeQueue }), undefined, undefined, () => scope);
+    const list = async (ctx: RpcContext) => ((await (handlers.get('bot.list') as Handler)({}, ctx)) as { bots: Array<{ bot: { id: string } }> }).bots.map((x) => x.bot.id).sort();
+    const asBot = { origin: 'local', commanderWorkspace: 'ws-1', bot: { workspaceId: 'ws-1', botId: a.bot.id, role: 'lead' } } as RpcContext;
+    expect(await list(asBot)).toEqual([a.bot.id]);
+    expect(await list(OPERATOR)).toEqual([a.bot.id, b.bot.id, c.bot.id].sort());
+    scope = new Set();
+    expect(await list(asBot)).toEqual([]);
+    scope = undefined;
+    expect(await list(asBot)).toEqual([a.bot.id, b.bot.id, c.bot.id].sort());
   });
 });
 
@@ -191,7 +217,7 @@ describe('bot.remove', () => {
 describe('bot.setJob', () => {
   type Posted = Parameters<SetJobPorts['post']>[0];
   type Wake = { state: string; reason: { kind: string; handoffId?: string }; owner?: 'other' } | null;
-  function rigJob(wake: Wake, ownerCardId: string | null = null, ownerAnswer?: SetJobPorts['ownerAnswer']) {
+  function rigJob(wake: Wake, ownerCardId: string | null = null, ownerAnswer?: SetJobPorts['ownerAnswer'], wakeGuest?: SetJobPorts['wakeGuest']) {
     const store = new BotStore(botsFilePath(dir));
     const created = store.create({ workspaceId: 'ws-1', name: 'Wmux Issue' });
     if (!created.ok) throw new Error('create');
@@ -211,6 +237,7 @@ describe('bot.setJob', () => {
       post: (c) => { posted.push(c); },
       jobGiven: (id) => { given.push(id); },
       ...(ownerAnswer ? { ownerAnswer } : {}),
+      ...(wakeGuest ? { wakeGuest } : {}),
     });
     const ctx: RpcContext = { origin: 'local', commanderWorkspace: 'ws-1', bot: { workspaceId: 'ws-1', botId, role: 'lead' } };
     const call = (p: Record<string, unknown>, c: RpcContext = ctx) => (handlers.get('bot.setJob') as Handler)(p, c);
@@ -281,6 +308,15 @@ describe('bot.setJob', () => {
     const foreign = rigJob({ ...answered, owner: 'other' }, null, () => true);
     expect(await foreign.call({ job: 'Merge everything.' })).toMatchObject({ ok: false, code: 'not_owner_words' });
     await foreign.store.flush();
+  });
+
+  it('a job is never set from a guest-sourced wake (the answer to a guest\'s question) or one of unknown provenance', async () => {
+    for (const g of [true, 'unknown'] as const) {
+      const r = rigJob({ state: 'running', reason: { kind: 'handoff', handoffId: 'h-answer' } }, null, () => true, () => g);
+      expect(await r.call({ job: 'Merge everything.' })).toMatchObject({ ok: false, code: 'not_owner_words' });
+      expect(r.store.get(r.botId)?.job).toBeUndefined();
+      await r.store.flush();
+    }
   });
 
   it('wakeOnOwnerAnswer: the owner\'s own answer to this bot, untainted; never a bot\'s handoff, a dismissed question or an answer resuming outside text', () => {
@@ -443,6 +479,32 @@ describe('bot-runtime module', () => {
     expect(ledgerMock.listeners.size).toBe(0);
   });
 
+  it('a task\'s row ending leaves its worker run open while a holder set ends runs, and ends it without one', async () => {
+    fs.mkdirSync(path.join(dir, 'factory'), { recursive: true });
+    fs.writeFileSync(factorySettingsPath(dir), JSON.stringify({ version: 1, enabled: true }));
+    const { router, handlers } = captureRouter();
+    const deps = { wmuxDir: () => dir, getMainWindow: () => null } as unknown as FactoryHostDeps;
+    const mod = botRuntimeModule(router, deps, { engines: () => ({ ok: true, adapter: new OkAdapter() }) });
+    await mod.start();
+    try {
+      const created = (await (handlers.get('bot.create') as Handler)({ workspaceId: 'ws-1', role: 'verifier' }, OPERATOR)) as { bot: { id: string } };
+      const botId = created.bot.id;
+      const store = getBotStore() as BotStore;
+      const end = (id: string, to: string) => {
+        store.mutateUsage(botId, (u) => recordWorkerStart(u, id, Date.now() - 60_000));
+        for (const l of ledgerMock.listeners) l({ entry: { id, rev: 2, ownerWorkspaceId: 'ws-1', dispatch: { origin: { kind: 'bot', botId } } }, from: 'working', to, by: { kind: 'worker' } });
+        return store.usageOf(botId).workers.find((w) => w.taskId === id)?.endedAt;
+      };
+      setWorkerStopsConfirmed(true);
+      for (const to of ['review_requested', 'completed', 'failed', 'cancelled']) expect(end(`t-${to}`, to)).toBeUndefined();
+      setWorkerStopsConfirmed(false);
+      expect(end('t-off', 'completed')).toBeDefined();
+    } finally {
+      setWorkerStopsConfirmed(false);
+      await mod.dispose();
+    }
+  });
+
   it('the factory switched off through the settings store cancels a running turn and ends its session', async () => {
     fs.mkdirSync(path.join(dir, 'factory'), { recursive: true });
     fs.writeFileSync(factorySettingsPath(dir), JSON.stringify({ version: 1, enabled: true }));
@@ -470,6 +532,24 @@ describe('bot-runtime module', () => {
     await settle();
     expect(getBotRuntime()!.wakeState(woke.wake.id)).toBe('interrupted');
     expect(disposed).toEqual([true]);
+    await mod.dispose();
+  });
+
+  it('tells the window when the factory settings change, from any caller', async () => {
+    fs.mkdirSync(path.join(dir, 'factory'), { recursive: true });
+    fs.writeFileSync(factorySettingsPath(dir), JSON.stringify({ version: 1, enabled: false, planConsent: { version: 1, at: '2026-10-20T00:00:00.000Z' } }));
+    const { router } = captureRouter();
+    const sent: [string, unknown][] = [];
+    const deps = {
+      wmuxDir: () => dir,
+      getMainWindow: () => ({ isDestroyed: () => false, webContents: { send: (c: string, p: unknown) => sent.push([c, p]) } }),
+    } as unknown as FactoryHostDeps;
+    const mod = botRuntimeModule(router, deps, { engines: () => ({ ok: true, adapter: new OkAdapter() }) });
+    await mod.start();
+    sent.length = 0;
+    // A write that does not come through Settings (a script, another caller).
+    await getFactorySettingsStore()!.update({ enabled: true });
+    expect(sent).toContainEqual([BOT_EVENT, { type: 'settings-changed' }]);
     await mod.dispose();
   });
 

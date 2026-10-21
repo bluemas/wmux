@@ -264,6 +264,10 @@ export interface PaneSlice {
   // transcript and resets to 0 when its watch ends. Absent means 0. Cleared
   // at the same teardown sites as surfaceActivity. Transient — never persisted.
   surfaceSubagents: Record<string, number>;
+  // When each count last arrived. The daemon re-sends a count that is not 0
+  // (SUBAGENT_COUNT_REFRESH_MS), and the roster hides one it stopped hearing
+  // (SUBAGENT_COUNT_STALE_MS): a 0 that never arrived must not stick.
+  surfaceSubagentsAt: Record<string, number>;
   setSurfaceSubagents: (ptyId: string, count: number) => void;
   // Each pane's Agent Teams teammates, keyed by ptyId. From
   // METADATA_UPDATE.teammates; an empty list deletes the entry. Cleared at the
@@ -294,6 +298,11 @@ export interface PaneSlice {
   // the byte-based per-PTY 'running' broadcast has no tool name. Same 120s-TTL
   // decay as setSurfaceActivity's stamp; lights background dots from bytes.
   markSurfaceRunning: (ptyId: string) => void;
+  /** An Agent Teams teammate still works: its own stamp, nothing else (the
+   *  lead's activity stamp, question and status stay). */
+  markSurfaceTeammatesWorking: (ptyId: string) => void;
+  /** A fresh session in the pane: no teammate of the old one counts. */
+  clearSurfaceTeammates: (ptyId: string) => void;
   // "running" freshness (orca-style): epoch-ms of each pane's last activity
   // signal. The fleet selector treats a fresh stamp (within HOOK_RUNNING_TTL_MS)
   // as 'running' even when the terminal has gone quiet — so an agent thinking
@@ -309,6 +318,10 @@ export interface PaneSlice {
   // Cleared with the activity string (pane disposal); byte-'running' has no
   // string, so it stamps the timestamp only (markSurfaceRunning).
   surfaceActivityAt: Record<string, number>;
+  // When an Agent Teams teammate of each pane's agent last reported working
+  // (markSurfaceTeammatesWorking). Fleet and the roster read it through
+  // isTeammateRunning; it is never the activity stamp. Transient.
+  surfaceTeammatesAt: Record<string, number>;
   // The TURN LATCH: ptyId → epoch-ms of the hook-reported turn start
   // (`UserPromptSubmit`, arriving as a METADATA_UPDATE tagged
   // hookKind:'agent.user_prompt_submit').
@@ -737,6 +750,10 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
     if (evidenceBefore !== undefined && at !== undefined && at <= evidenceBefore) {
       delete state.surfaceActivityAt[ptyId];
     }
+    const mates = state.surfaceTeammatesAt[ptyId];
+    if (evidenceBefore !== undefined && mates !== undefined && mates <= evidenceBefore) {
+      delete state.surfaceTeammatesAt[ptyId];
+    }
   }),
 
   paneLabel: {},
@@ -795,11 +812,13 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
   surfaceActivity: {},
   surfaceLastActivity: {},
   surfaceActivityAt: {},
+  surfaceTeammatesAt: {},
   surfaceTurnOpenAt: {},
   surfaceTurnEndAt: {},
   surfacePendingQuestion: {},
   surfaceLastMessage: {},
   surfaceSubagents: {},
+  surfaceSubagentsAt: {},
   surfaceTeammates: {},
   surfaceQuestionSeen: {},
   surfaceDismissedQuestion: {},
@@ -867,8 +886,13 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
 
   setSurfaceSubagents: (ptyId, count) => set((state: StoreState) => {
     if (!ptyId) return;
-    if (count > 0) state.surfaceSubagents[ptyId] = count;
-    else delete state.surfaceSubagents[ptyId];
+    if (count > 0) {
+      state.surfaceSubagents[ptyId] = count;
+      state.surfaceSubagentsAt[ptyId] = Date.now();
+    } else {
+      delete state.surfaceSubagents[ptyId];
+      delete state.surfaceSubagentsAt[ptyId];
+    }
   }),
 
   setSurfaceTeammates: (ptyId, teammates) => set((state: StoreState) => {
@@ -906,6 +930,18 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
     // covers agents with no tool hooks at all.
     delete state.surfacePendingQuestion[ptyId];
     delete state.surfaceQuestionSeen[ptyId];
+  }),
+
+  markSurfaceTeammatesWorking: (ptyId) => set((state: StoreState) => {
+    if (!ptyId) return;
+    // Its own stamp only (see isTeammateRunning): the activity stamp and the
+    // lead's status and question are left as they are.
+    state.surfaceTeammatesAt[ptyId] = Date.now();
+  }),
+
+  clearSurfaceTeammates: (ptyId) => set((state: StoreState) => {
+    if (!ptyId) return;
+    delete state.surfaceTeammatesAt[ptyId];
   }),
 
   markSurfaceTurnOpen: (ptyId) => set((state: StoreState) => {
@@ -1159,10 +1195,12 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
             delete state.surfacePendingQuestion[s.ptyId];
             delete state.surfaceLastMessage[s.ptyId];
             delete state.surfaceSubagents[s.ptyId];
+            delete state.surfaceSubagentsAt[s.ptyId];
             delete state.surfaceTeammates[s.ptyId];
             delete state.surfaceQuestionSeen[s.ptyId];
             delete state.surfaceDismissedQuestion[s.ptyId];
             delete state.surfaceActivityAt[s.ptyId];
+            delete state.surfaceTeammatesAt[s.ptyId];
             // A reused ptyId must not inherit a dead pane's open turn — the
             // latch outranks the byte heuristic, so a leaked one would pin the
             // new pane at 'running' with nothing left alive to withdraw it.

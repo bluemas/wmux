@@ -18,6 +18,9 @@
 // refusal, never a 30-second request timeout). The MCP child is always the
 // bundled server run by wmux's own binary in Node mode, in bot mode, with the
 // token handed over in a file (ClaudeSdkAdapter / AcpBrainAdapter `bot`).
+// A `claude-sdk` bot signs in to Claude as Settings › Bots says (the
+// subscription, or a saved API key: claudeApiKey.ts); chosen without a
+// usable key, it is refused with `engine_unavailable` before it starts.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -31,6 +34,8 @@ import { AcpBrainAdapter } from '../deck/AcpBrainAdapter';
 import { dataSuffix } from '../../shared/constants';
 import { isExecutableFile, resolveClaudeExecutable } from '../claude/resolveClaudeExecutable';
 import { botRepoReadRoot } from './botRepoRead';
+import { recordBotAuthSource, resolveBotClaudeAuth, type BotClaudeAuth } from './claudeApiKey';
+import { markBotExecFailed, probeBotExecSupport, type BotExecSupport } from './botExecSandbox';
 
 export interface BotEngineSpawnInput {
   profile: BotProfile;
@@ -109,6 +114,13 @@ export interface DefaultBotEngineDeps {
   acpStubPath?: () => string | null;
   /** Whether ACP engines may run (default `acpEnginesAllowed`). */
   acpAllowed?: () => boolean;
+  /** How a Claude (SDK) bot signs in (default `resolveBotClaudeAuth`). */
+  claudeAuth?: () => BotClaudeAuth;
+  /** Told the sign-in a session reported (default `recordBotAuthSource`). */
+  onAuthSeen?: (apiKeySource: string) => void;
+  /** Whether a Claude (SDK) bot's commands can run in the OS sandbox, for
+   *  the claude it runs on (default `probeBotExecSupport`). */
+  execSupport?: (exe: string | null) => Promise<BotExecSupport>;
 }
 
 /** ACP bots may start: an unpackaged build on isolated data (a test
@@ -140,6 +152,9 @@ export function createDefaultBotEngineFactory(deps: DefaultBotEngineDeps = {}): 
   const resolveCommand = deps.resolveCommand ?? ((c: string) => resolveOnPath(c));
   const acpStubPath = deps.acpStubPath ?? defaultAcpStubPath;
   const acpAllowed = deps.acpAllowed ?? acpEnginesAllowed;
+  const claudeAuth = deps.claudeAuth ?? (() => resolveBotClaudeAuth());
+  const onAuthSeen = deps.onAuthSeen ?? recordBotAuthSource;
+  const execSupport = deps.execSupport ?? ((exe: string | null) => probeBotExecSupport(exe));
   const refuse = (message: string): BotEngineSpawn => ({ ok: false, code: 'engine_unavailable', message });
 
   return (input) => {
@@ -164,11 +179,17 @@ export function createDefaultBotEngineFactory(deps: DefaultBotEngineDeps = {}): 
     switch (engine.kind) {
       case 'claude-sdk': {
         if (!claudeExecutable()) return refuse('Claude Code is not installed (no claude executable found)');
+        // The adapter reads it again every turn; checked here so a bot set
+        // to an API key with none saved never starts.
+        const auth = claudeAuth();
+        if (auth.mode === 'refused') return refuse(auth.message);
         return {
           ok: true,
           adapter: new ClaudeSdkAdapter({
-            // A bot with a repository reads it (Read / Grep / Glob, decided by main).
-            bot: { ...bot, repoRoot: botRepoReadRoot(input.profile) },
+            // A bot with a repository reads it (Read / Grep / Glob, decided by
+            // main); where the OS sandbox runs, it also runs commands in its
+            // own folder (botExec.ts), checked again on every turn.
+            bot: { ...bot, repoRoot: botRepoReadRoot(input.profile), auth: claudeAuth, onAuthSeen, exec: () => execSupport(claudeExecutable()), onExecFailed: (version) => markBotExecFailed(claudeExecutable(), version) },
             mcpBundlePath: bundle,
             // No model set (or 'default', or a stored id that fails the brain
             // model rule): pass none, so claude picks its own default and an

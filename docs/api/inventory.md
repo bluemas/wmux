@@ -456,6 +456,8 @@ calling bot's workflows, step states, and task/result bindings. Each readback
 includes `blockedReason` and `lastVerifiedResult` (both nullable). The latter
 is the last system-verified result recorded in the workflow, not a worker's
 unverified report or a promise that an in-flight task has finished.
+A result recorded from this version on carries `at`, the epoch-ms time its
+task's verified completion was recorded.
 
 The desktop owner can use `factory.readWorkflows({botId, workspaceId, workflowId?})`
 and `factory.cancelWorkflow({botId, workspaceId, workflowId, expectedRevision})`
@@ -503,3 +505,9 @@ The initial version supports sequential code steps using the default worker
 preset. It does not add research steps, parallel dependencies, or automatic
 retries of blocked steps. All three RPC methods are internal bot tools and scope
 access to the caller's binding.
+
+### Hosted UI plugin agent state (experimental)
+
+| Method | Params | Tier | Notes |
+|---|---|---|---|
+| `agent.state` | `workspaceId?`, `includeActivity?` | experimental | Hosted UI plugins only, bound to the host workspace. Requires `agent.state.read`; activity also requires unrestricted `terminal.read`. See [UI plugin pages](ui-plugin-pages.md). |

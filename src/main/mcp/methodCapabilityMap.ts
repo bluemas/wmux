@@ -76,6 +76,7 @@ export type RiskClass =
   | 'a2a'              // agent-to-agent messaging
   | 'ui'               // plugin host UI contribution points (B-1)
   | 'notifications'    // terminal desktop-notification text (OSC 9/777/99)
+  | 'agent-state'
   | 'internal';        // wmux.internal — never surfaced
 
 /**
@@ -114,7 +115,7 @@ export function resolveRequiredCapability(
  * and injects input into them, so an unapproved named client must never reach
  * it just because a build (or `mcp.mode: "shadow"`) runs the enforcer advisory.
  */
-const ALWAYS_ENFORCED_RISK_CLASSES: ReadonlySet<RiskClass> = new Set<RiskClass>(['computer']);
+const ALWAYS_ENFORCED_RISK_CLASSES: ReadonlySet<RiskClass> = new Set<RiskClass>(['computer', 'agent-state']);
 
 /** Whether a non-allow verdict on `method` is refused even in shadow mode. */
 export function isAlwaysEnforcedMethod(method: string): boolean {
@@ -206,6 +207,7 @@ export const METHOD_CAPABILITY: Record<RpcMethod, RequiredCapability> = {
   // The answer carries agent-authored output (last message, tool activity)
   // for every pane, so it is terminal content, not a pane listing: a
   // third-party plugin needs the same grant input.readScreen does.
+  'agent.state': { capability: 'agent.state.read', riskClass: 'agent-state' },
   'fleet.triage': { capability: 'terminal.read', riskClass: 'terminal-content' },
   'pane.focus':  { capability: 'pane.read', riskClass: 'pane-lifecycle' },
   'pane.split':  { capability: 'pane.create', riskClass: 'pane-lifecycle' },
@@ -604,6 +606,7 @@ export const METHOD_CAPABILITY: Record<RpcMethod, RequiredCapability> = {
   'bot.interrupt':     { capability: 'wmux.internal' },
   'room.post':         { capability: 'wmux.internal' },
   'room.read':         { capability: 'wmux.internal' },
+  'room.search':       { capability: 'wmux.internal' },
   'room.threads':      { capability: 'wmux.internal' },
   'room.resolve':      { capability: 'wmux.internal' },
   'handoff.send':      { capability: 'wmux.internal' },
@@ -634,6 +637,7 @@ export const METHOD_CAPABILITY: Record<RpcMethod, RequiredCapability> = {
   'botLogin.request':    { capability: 'wmux.internal' },
   'skill.propose':       { capability: 'wmux.internal' },
   'skill.read':          { capability: 'wmux.internal' },
+  'memory.update':       { capability: 'wmux.internal' },
 
   // --- Task lifecycle (pipe/handlers/worktask.rpc.ts) ---
   // The reads answer "what did this task produce"; the writes run the task's
@@ -772,6 +776,8 @@ export const CAPABILITY_RISK_CLASS: Record<string, RiskClass> = {
   // Plugin host UI contribution points (B-1) — enforced at mount time by
   // the renderer host, not per-RPC; classed here so the approval dialog
   // renders real copy instead of fallback text.
+  'ui.rail-page':       'ui',
+  'agent.state.read':   'agent-state',
   'ui.sidebar':         'ui',
   'ui.statusbar':       'ui',
   'ui.pane-decoration': 'ui',
@@ -862,6 +868,8 @@ export const CAPABILITY_EFFECT: Record<string, 'read' | 'write'> = {
   // Plugin host UI contribution points — enforced at mount time, never a
   // per-RPC gate, so the classification is nominal. Listed so the
   // completeness test covers the whole vocabulary.
+  'ui.rail-page':       'read',
+  'agent.state.read':   'read',
   'ui.sidebar':         'read',
   'ui.statusbar':       'read',
   'ui.pane-decoration': 'read',
@@ -894,6 +902,11 @@ export interface RiskClassCopy {
 }
 
 export const RISK_CLASS_COPY: Record<RiskClass, RiskClassCopy> = {
+  'agent-state': {
+    severity: 'caution',
+    summary: 'Can read agent status in the current workspace',
+    detail: 'Includes agent names, your pane labels and whether agents need attention. Labels may contain information you entered. Terminal content and activity require a separate terminal.read permission.',
+  },
   'terminal-content': {
     severity: 'critical',
     summary: 'Can read what is on your screen',
@@ -950,9 +963,9 @@ export const RISK_CLASS_COPY: Record<RiskClass, RiskClassCopy> = {
   },
   'ui': {
     severity: 'neutral',
-    summary: 'Can add panels and widgets to the wmux UI',
+    summary: 'Can add pages, panels, and widgets to the wmux UI',
     detail:
-      'The plugin renders its own interface in a sandboxed frame (sidebar panel, status-bar widget, pane badges, or command-palette entries). The frame cannot read your terminal or other UI — any data access requires the capabilities listed separately.',
+      'The plugin renders its own interface in a sandboxed frame (rail page, sidebar panel, status-bar widget, pane badges, or command-palette entries). The frame cannot read your terminal or other UI — any data access requires the capabilities listed separately.',
   },
   'notifications': {
     severity: 'caution',

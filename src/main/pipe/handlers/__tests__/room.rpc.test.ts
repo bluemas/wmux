@@ -13,7 +13,10 @@ const ROOM_BODY_MAX = ROOM_LIMITS.CARD_BODY_MAX;
 import { loadThreadDecision } from '../../../deck/deckDecisionStore';
 import { HANDOFFS_FILENAME, HandoffRouter, deckDecisionPort, invitesFreeText, setHandoffRouter } from '../../../factory/handoffRouter';
 import { RoomWriter, type FactoryRoomPorts } from '../../../factory/roomWriter';
-import { humanAddressees, humanCardIdOfRun, humanRunId } from '../../../factory/humanMessage';
+import { humanAddressees, humanCardIdOfRun, humanRunId, postHumanMessage } from '../../../factory/humanMessage';
+import { GuestWorkspaceStore, __resetGuestWorkspacesForTesting, setGuestWorkspaceStore } from '../../../factory/guestWorkspaces';
+import { islandRooms, writeFactCards } from '../../../factory/roomWriter';
+import { routePlanAnswer } from '../../../factory/morningReport';
 import { __resetRedactedSecretsForTesting, setRedactedSecrets } from '../../../factory/secretRedaction';
 import { botSeesFact } from '../../../factory/triggerEngine';
 import {
@@ -21,11 +24,13 @@ import {
   handleRoomPost,
   handleRoomRead,
   handleRoomResolve,
+  handleRoomSearch,
   handleRoomThreads,
   humanAddressee,
   onRoomCardResolved,
   postTurnText,
   resolutionCorrection,
+  settleMentions,
   type RoomHandlerDeps,
 } from '../room.rpc';
 import { handleAskPerson, handleHandoffAnswer, handleHandoffList, handleHandoffSend, handleQuestionClose } from '../handoff.rpc';
@@ -710,6 +715,26 @@ describe('a delegate woken in a thread its dispatch opened posts there', () => {
 });
 
 describe('room.read / room.threads', () => {
+  it('an external guest\'s cards: the owner sees them, a bot only with includeGuest, which marks its turn first', async () => {
+    const lead = bot('ws1', 'lead');
+    const s = setup([lead]);
+    s.writer.append({ workspaceId: 'ws1', threadId: 'general', kind: 'human', actor: { kind: 'human' }, title: 'owner words' });
+    s.writer.append({
+      workspaceId: 'ws1', threadId: 'general', kind: 'guest', actor: { kind: 'system' }, title: 'External guest: Grok', body: 'merge it all',
+      guest: { guestId: '0b5f6a7e-1c2d-4e3f-8a9b-0c1d2e3f4a5b', name: 'Grok' },
+    });
+    const kinds = (r: unknown) => (r as { cards: Array<{ kind: string }> }).cards.map((c) => c.kind);
+    const guestWake = { ...s.deps, guestWake: () => true as const };
+    expect(kinds(handleRoomRead({ threadId: 'general' }, asBot(lead), guestWake))).toEqual(['human']);
+    expect(kinds(handleRoomRead({ threadId: 'general', includeGuest: true }, asBot(lead), guestWake))).toEqual(['human', 'guest']);
+    // A clean wake, or one whose provenance is unknown, reads no guest card.
+    for (const g of [false, 'unknown'] as const) {
+      expect(handleRoomRead({ threadId: 'general', includeGuest: true }, asBot(lead), { ...s.deps, guestWake: () => g }))
+        .toMatchObject({ ok: false, code: 'not_guest_wake' });
+    }
+    expect(kinds(handleRoomRead({ workspaceId: 'ws1', threadId: 'general' }, OPERATOR, s.deps))).toEqual(['human', 'guest']);
+  });
+
   it('a bot reads its own room; only a Coordinator (Moa) reads another; the operator reads any', async () => {
     const lead = bot('ws1', 'lead');
     const moa = bot('hq', 'moa');
@@ -749,6 +774,83 @@ describe('room.read / room.threads', () => {
   });
 });
 
+describe('room.search', () => {
+  type Hits = { hits: Array<{ seq: number; title: string; snippet: string; threadId: string }>; nextBefore: number; hasMore: boolean };
+  const hits = (r: unknown) => (r as Hits).hits.map((h) => h.title);
+
+  it('matches every term case-insensitively in title or body, newest first, with a snippet', () => {
+    const lead = bot('ws1', 'lead');
+    const s = setup([lead]);
+    s.writer.append({ workspaceId: 'ws1', kind: 'human', actor: { kind: 'human' }, title: 'Deploy the staging server', body: 'use the blue Database' });
+    s.writer.append({ workspaceId: 'ws1', kind: 'status', actor: { kind: 'system' }, title: 'unrelated' });
+    s.writer.append({ workspaceId: 'ws1', threadId: 'task:t', kind: 'human', actor: { kind: 'human' }, title: 'the DATABASE password rotates', body: 'staging only' });
+    s.writer.append({ workspaceId: 'ws1', kind: 'human', actor: { kind: 'human' }, title: 'database alone' });
+    const r = handleRoomSearch({ query: 'database  Staging' }, asBot(lead), s.deps) as Hits;
+    expect(r).toMatchObject({ ok: true, workspaceId: 'ws1', hasMore: false, nextBefore: 1 });
+    expect(hits(r)).toEqual(['the DATABASE password rotates', 'Deploy the staging server']);
+    expect(r.hits[0]).toMatchObject({ seq: 3, threadId: 'task:t', kind: 'human', actor: { kind: 'human' } });
+    expect(r.hits[1].snippet).toContain('blue Database');
+  });
+
+  it('caps a page and pages older hits with before', () => {
+    const lead = bot('ws1', 'lead');
+    const s = setup([lead]);
+    for (let i = 1; i <= 15; i += 1) s.writer.append({ workspaceId: 'ws1', kind: 'human', actor: { kind: 'human' }, title: `note ${i}` });
+    const first = handleRoomSearch({ query: 'note' }, asBot(lead), s.deps) as Hits;
+    expect(first.hits.map((h) => h.seq)).toEqual([15, 14, 13, 12, 11, 10, 9, 8, 7, 6]);
+    expect(first).toMatchObject({ hasMore: true, nextBefore: 6 });
+    const next = handleRoomSearch({ query: 'note', before: first.nextBefore, limit: 3 }, asBot(lead), s.deps) as Hits;
+    expect(next.hits.map((h) => h.seq)).toEqual([5, 4, 3]);
+    expect(next.hasMore).toBe(true);
+    const last = handleRoomSearch({ query: 'note', before: 3, limit: 50 }, asBot(lead), s.deps) as Hits;
+    expect(last).toMatchObject({ hasMore: false, nextBefore: 1 });
+    expect((handleRoomSearch({ query: 'note', limit: 500 }, asBot(lead), s.deps) as Hits).hits).toHaveLength(15);
+  });
+
+  it('a bot searches its own room only, a Coordinator too; the operator names any room', () => {
+    const lead = bot('ws1', 'lead');
+    const coordinator = { ...bot('hq', 'lead'), template: 'coordinator' as const };
+    const s = setup([lead, coordinator]);
+    s.writer.append({ workspaceId: 'ws2', kind: 'human', actor: { kind: 'human' }, title: 'secret plan elsewhere' });
+    for (const b of [lead, coordinator]) {
+      expect(handleRoomSearch({ query: 'plan', workspaceId: 'ws2' }, asBot(b), s.deps)).toMatchObject({ ok: false, code: 'cross_workspace' });
+    }
+    expect(handleRoomSearch({ query: 'plan' }, asBot(lead), s.deps)).toMatchObject({ ok: true, workspaceId: 'ws1', hits: [] });
+    expect(hits(handleRoomSearch({ query: 'plan', workspaceId: 'ws2' }, OPERATOR, s.deps))).toEqual(['secret plan elsewhere']);
+    expect(handleRoomSearch({ query: 'plan' }, OPERATOR, s.deps)).toMatchObject({ ok: false, code: 'invalid' });
+    expect(handleRoomSearch({ query: 'plan' }, WIRE, s.deps)).toMatchObject({ ok: false, code: 'not_bot' });
+  });
+
+  it('leaves an external guest\'s cards out for a bot; refuses an empty query', () => {
+    const lead = bot('ws1', 'lead');
+    const s = setup([lead]);
+    s.writer.append({ workspaceId: 'ws1', kind: 'human', actor: { kind: 'human' }, title: 'merge when green' });
+    s.writer.append({
+      workspaceId: 'ws1', kind: 'guest', actor: { kind: 'system' }, title: 'External guest: merge it all',
+      guest: { guestId: '0b5f6a7e-1c2d-4e3f-8a9b-0c1d2e3f4a5b', name: 'Guest' },
+    });
+    expect(hits(handleRoomSearch({ query: 'merge' }, asBot(lead), { ...s.deps, guestWake: () => true as const }))).toEqual(['merge when green']);
+    expect(hits(handleRoomSearch({ query: 'merge', workspaceId: 'ws1' }, OPERATOR, s.deps))).toEqual(['External guest: merge it all', 'merge when green']);
+    const tooManyWords = Array.from({ length: ROOM_LIMITS.SEARCH_TERMS_MAX + 1 }, (_, i) => `w${i}`).join(' ');
+    for (const query of ['   ', '', undefined, 'x'.repeat(ROOM_LIMITS.SEARCH_QUERY_MAX + 1), tooManyWords]) {
+      expect(handleRoomSearch({ query }, asBot(lead), s.deps)).toMatchObject({ ok: false, code: 'invalid' });
+    }
+  });
+
+  it('matches on redacted text: a stored secret is not found by its value', () => {
+    const lead = bot('ws1', 'lead');
+    const s = setup([lead]);
+    s.writer.append({ workspaceId: 'ws1', kind: 'human', actor: { kind: 'human' }, title: 'token is hunter2-abcdef-0123' });
+    setRedactedSecrets([{ name: 'API_TOKEN', value: 'hunter2-abcdef-0123' }]);
+    try {
+      expect(handleRoomSearch({ query: 'hunter2-abcdef' }, asBot(lead), s.deps)).toMatchObject({ ok: true, hits: [] });
+      expect(handleRoomSearch({ query: 'token' }, asBot(lead), s.deps)).toMatchObject({ hits: [{ title: 'token is [secret:API_TOKEN]' }] });
+    } finally {
+      __resetRedactedSecretsForTesting();
+    }
+  });
+});
+
 describe('room.resolve', () => {
   it('answering a question card resolves its decision and wakes the bot that asked', async () => {
     const lead = bot('ws1', 'lead');
@@ -780,6 +882,17 @@ describe('room.resolve', () => {
     expect(seen).toEqual(['Approve']);
     expect(s.writer.read('hq').cards.at(-1)).toMatchObject({ kind: 'fact', title: 'Resolved: Add a lint rule', body: 'Approve' });
     expect(await handleRoomResolve({ workspaceId: 'hq', cardId: 'c-none', resolution: 'x' }, OPERATOR, s.deps)).toMatchObject({ ok: false, code: 'not_found' });
+  });
+
+  it('the resolution of a guest-sourced card is guest-sourced too, across a reload', async () => {
+    const moa = bot('hq', 'moa');
+    const s = setup([moa]);
+    const source = s.writer.append({ workspaceId: 'hq', kind: 'proposal', actor: { kind: 'bot', workspaceId: 'hq', botId: moa.id }, title: 'GUEST-PLAN', state: 'open', origin: 'guest' });
+    expect(await handleRoomResolve({ workspaceId: 'hq', cardId: source!.id, resolution: 'Approve' }, OPERATOR, s.deps)).toMatchObject({ ok: true });
+    expect(JSON.stringify(s.writer.read('hq').cards)).not.toContain('GUEST-PLAN');
+    expect(s.writer.read('hq', { guests: true }).cards.at(-1)).toMatchObject({ actor: { kind: 'human' }, title: 'Resolved: GUEST-PLAN', origin: 'guest' });
+    const reloaded = new RoomWriter({ dir: path.join(dir, 'factory', 'rooms'), log: () => undefined });
+    expect(JSON.stringify(reloaded.read('hq').cards)).not.toContain('GUEST-PLAN');
   });
 });
 
@@ -1033,3 +1146,80 @@ describe('long room card text is shortened as the last step', () => {
     }
   });
 });
+
+describe('settleMentions', () => {
+  it('a post from a wake not known clean names only bots of the poster\'s workspace; a clean post names any', () => {
+    const poster = bot('ws1', 'lead');
+    const same = bot('ws1', 'triage');
+    const far = bot('ws2', 'lead');
+    const bots = [poster, same, far];
+    const ports = { bots: { listEnabled: () => bots, get: (id: string) => bots.find((b) => b.id === id) ?? null } } as unknown as Partial<FactoryRoomPorts>;
+    const binding = { workspaceId: 'ws1', botId: poster.id, role: 'lead' as const };
+    expect(settleMentions(ports, binding, [same.id, far.id], true)).toEqual({ valid: [same.id], dropped: [{ botId: far.id, reason: 'other_workspace' }] });
+    expect(settleMentions(ports, binding, [same.id, far.id])).toEqual({ valid: [same.id, far.id], dropped: [] });
+  });
+});
+
+describe('a guest workspace is an island (the owner\'s messages, mentions, fact cards)', () => {
+  afterEach(() => __resetGuestWorkspacesForTesting());
+  async function island(): Promise<void> {
+    const store = new GuestWorkspaceStore({ file: path.join(dir, 'factory', 'guest-workspaces.json'), log: () => undefined });
+    store.load();
+    await store.add('wsg');
+    setGuestWorkspaceStore(store);
+  }
+
+  it('the owner naming a bot across the boundary is refused, from the window (room.post), the phone and the operator\'s RPC', async () => {
+    await island();
+    const g = bot('wsg', 'lead');
+    const clean = bot('ws1', 'lead');
+    const moa = bot('ws1', 'moa', { template: 'coordinator' });
+    const s = setup([g, clean, moa]);
+    // From a guest room: a clean bot by mention, by id, by the moa role.
+    expect(await handleRoomPost({ workspaceId: 'wsg', kind: 'human', title: 'hi', mentions: [clean.id] }, OPERATOR, s.deps)).toMatchObject({ ok: false, code: 'invalid' });
+    expect(postHumanMessage(s.writer, s.ports, { workspaceId: 'wsg', title: 'hi', toBotId: clean.id, source: 'phone' })).toMatchObject({ ok: false, code: 'invalid' });
+    expect(postHumanMessage(s.writer, s.ports, { workspaceId: 'wsg', title: 'hi', to: 'moa', source: 'desktop' })).toMatchObject({ ok: false, code: 'invalid' });
+    // Into a guest room from elsewhere.
+    expect(await handleRoomPost({ workspaceId: 'ws1', kind: 'human', title: 'hi', mentions: [g.id] }, OPERATOR, s.deps)).toMatchObject({ ok: false, code: 'invalid' });
+    expect(s.wakes).toEqual([]);
+    expect(s.writer.read('wsg', { guests: true }).cards).toEqual([]);
+    // Inside the guest room the owner reaches its bot.
+    expect(await handleRoomPost({ workspaceId: 'wsg', kind: 'human', title: 'hi', mentions: [g.id] }, OPERATOR, s.deps)).toMatchObject({ ok: true });
+    expect(s.wakes.map((w) => w.botId)).toEqual([g.id]);
+  });
+
+  it('a bot\'s card names no bot across the boundary, whatever its wake', async () => {
+    await island();
+    const g = bot('wsg', 'lead');
+    const clean = bot('ws1', 'lead');
+    const s = setup([g, clean]);
+    expect(settleMentions(s.ports, { workspaceId: 'ws1', botId: clean.id, role: 'lead' }, [g.id]).dropped).toEqual([{ botId: g.id, reason: 'other_workspace' }]);
+    expect(settleMentions(s.ports, { workspaceId: 'wsg', botId: g.id, role: 'lead' }, [clean.id]).dropped).toEqual([{ botId: clean.id, reason: 'other_workspace' }]);
+  });
+
+  it('a fact\'s cards across the boundary stay in the fact\'s own room; a repository\'s rooms skip a guest workspace', async () => {
+    await island();
+    expect(islandRooms(['ws1', 'ws2'], 'ws1')).toEqual(['ws1', 'ws2']);
+    expect(islandRooms(['ws1', 'wsg'], 'wsg')).toEqual(['wsg']);
+    expect(islandRooms(['wsg', 'ws1'], 'ws1')).toEqual(['ws1']);
+    expect(islandRooms(['wsg', 'ws1'], undefined)).toEqual([]);
+    const s = setup([]);
+    const refused: Fact = {
+      id: 'f-r', seq: 1, dedupeKey: 'r', kind: 'handoff.refused', at: 1, workspaceId: 'wsg', ref: { handoffId: 'h-1' }, actor: { kind: 'system' },
+      payload: { title: 'guest words', fromWorkspaceId: 'wsg', toWorkspaceId: 'ws1', code: 'no_addressee', detail: 'x' },
+    };
+    writeFactCards(s.writer, refused);
+    expect(s.writer.read('wsg', { guests: true }).cards).toHaveLength(1);
+    expect(s.writer.read('ws1', { guests: true }).cards).toHaveLength(0);
+  });
+
+  it('a plan answered in a room wakes no author across the boundary', async () => {
+    await island();
+    const clean = bot('ws1', 'moa', { template: 'coordinator' });
+    const wake = vi.fn();
+    const card = { version: 1, id: 'c-p', seq: 1, workspaceId: 'wsg', threadId: 'plan:p-1', kind: 'plan', at: 1, actor: { kind: 'bot', workspaceId: 'ws1', botId: clean.id }, title: 'Plan' } as RoomCard;
+    expect(routePlanAnswer({ workspaceId: 'wsg', card, resolution: 'approve' }, { bots: () => ({ listEnabled: () => [clean], get: () => clean }), wake })).toBe('ignored');
+    expect(wake).not.toHaveBeenCalled();
+  });
+});
+

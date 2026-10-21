@@ -128,6 +128,10 @@ export interface ReclaimedWorker {
    *  tries again; it still counts as live); stopped: the agent was stopped
    *  (or none ran); resumed: relaunched. */
   state: 'stopping' | 'stopped' | 'resumed';
+  /** An unconfirmed stop was reported to the owner for this attempt. */
+  stopUnconfirmed?: true;
+  /** The follow-up confirming the slot was freed was written. */
+  stopResolved?: true;
   at: number;
   /** The workspace the worker's pane lives in when a resume opened a new
    *  one (absent: taskWorkspaceId). */
@@ -287,7 +291,9 @@ function isRecord(v: unknown): v is ReclaimedWorker {
     && r.sessions.every((s) => !!s && typeof (s as ReclaimedSession).sessionId === 'string' && typeof (s as ReclaimedSession).cwd === 'string')
     && (r.paneWorkspaceId === undefined || typeof r.paneWorkspaceId === 'string')
     && (r.seenAt === undefined || typeof r.seenAt === 'number')
-    && (r.endRev === undefined || typeof r.endRev === 'number');
+    && (r.endRev === undefined || typeof r.endRev === 'number')
+    && (r.stopUnconfirmed === undefined || r.stopUnconfirmed === true)
+    && (r.stopResolved === undefined || r.stopResolved === true);
 }
 
 /** The reclaimed workers, persisted under `<wmuxDir>/factory/`. */
@@ -327,10 +333,24 @@ export class ReclaimedWorkers {
   }
 
   put(rec: ReclaimedWorker): Promise<void> {
+    return this.write(rec, rec.at);
+  }
+
+  /** Put back the record a put whose write failed replaced (`rec`, as get()
+   *  gave it before). The state change it makes is told as happening `at`
+   *  (now), never at the record's own older time: the listeners date what
+   *  they record by it (the bot's worker time). */
+  restore(rec: ReclaimedWorker, at: number): Promise<void> {
+    return this.write(rec, at);
+  }
+
+  private write(rec: ReclaimedWorker, at: number): Promise<void> {
     const prior = this.records.get(rec.taskId);
     this.records.delete(rec.taskId);
     this.records.set(rec.taskId, rec);
-    if (prior && prior.state !== rec.state) this.notifyState(rec, prior.state, rec.state, rec.at);
+    // A first record is a change too: one written `stopped` at once (no
+    // pane left to stop, a dead pane) ends its worker's first run.
+    if (prior?.state !== rec.state) this.notifyState(rec, prior?.state ?? null, rec.state, at);
     // Oldest first, never a live worker (resumed, or not yet stopped).
     for (const [id, r] of this.records) {
       if (this.records.size <= RECLAIMED_WORKERS_MAX) break;
@@ -350,11 +370,12 @@ export class ReclaimedWorkers {
     return this.persister.settled();
   }
 
-  /** Told of every state change made through setState (the agent budget
-   *  counts a resumed worker's run from these). */
-  onStateChange: ((rec: { taskId: string; botId: string }, from: ReclaimedWorker['state'], to: ReclaimedWorker['state'], at: number) => void) | null = null;
+  /** Told of every state change made through put, restore and setState,
+   *  a first record's included (`from` null), as of the time it happened
+   *  (the agent budget counts a worker's runs from these). */
+  onStateChange: ((rec: { taskId: string; botId: string }, from: ReclaimedWorker['state'] | null, to: ReclaimedWorker['state'], at: number) => void) | null = null;
 
-  private notifyState(r: ReclaimedWorker, from: ReclaimedWorker['state'], to: ReclaimedWorker['state'], at: number): void {
+  private notifyState(r: ReclaimedWorker, from: ReclaimedWorker['state'] | null, to: ReclaimedWorker['state'], at: number): void {
     try {
       this.onStateChange?.({ taskId: r.taskId, botId: r.botId }, from, to, at);
     } catch (err) {
@@ -1046,22 +1067,27 @@ export async function reclaimWorker(
       sessions: [...panes, ...kept.filter((k) => !panes.some((p) => p.sessionId === k.sessionId))],
       // No pane left in the worktree: nothing to stop.
       state: panes.length === 0 ? 'stopped' : 'stopping',
+      ...(prior?.state === 'stopping' && prior.stopUnconfirmed ? { stopUnconfirmed: true as const } : {}),
       at: now(),
       endRev: entry.rev,
       ...(prior?.paneWorkspaceId ? { paneWorkspaceId: prior.paneWorkspaceId } : {}),
     };
     // On disk before anything is stopped: a stopped worker always has its
-    // conversation recorded. A write that fails stops nothing.
+    // conversation recorded. A write that fails stops nothing, and an
+    // earlier record (a resumed worker's, still running) stays as it was.
     try {
       await ports.store.put(rec);
     } catch (err) {
-      await ports.store.remove(entry.id).catch(() => undefined);
+      await (prior ? ports.store.restore(prior, now()) : ports.store.remove(entry.id)).catch(() => undefined);
       log(`[factory] reclaim: ${entry.id} not recorded, its worker keeps running: ${String(err)}`);
       return null;
     }
     // No pane left in the worktree: recorded so it no longer counts as a
     // live worker.
-    if (panes.length === 0) return rec;
+    if (panes.length === 0) {
+      await noteStopResolved(ports, rec, entry);
+      return ports.store.get(entry.id);
+    }
     let failed = 0;
     let attempted = 0;
     // Failed stops that may have signalled the agent (not refused before).
@@ -1077,6 +1103,7 @@ export async function reclaimWorker(
     // A pane whose stop was held back (its turn is not over after all):
     // the record stays `stopping`, live, for a later look.
     let heldBack = false;
+    let unconfirmed = false;
     for (const p of panes) {
       // The task reopened (or moved on from its report) meanwhile: what
       // still runs is its worker again.
@@ -1121,6 +1148,21 @@ export async function reclaimWorker(
           if (out) out.deferred = true;
           break;
         }
+        // A successful lookup can find no matching agent and stop nothing.
+        // Only a fresh liveness read can then prove this worker is gone.
+        if (r.ok === true && r.stopped !== true) {
+          let gone = false;
+          try {
+            const fresh = await ports.listSessions();
+            gone = !endedTaskAgentRuns([p.sessionId], entry.id, [p.sessionId], new Map(fresh.map((s) => [s.id, s])), ports.sessionRecordOf);
+          } catch { /* an unreadable process state proves no stop */ }
+          if (!gone) {
+            failed++;
+            unconfirmed = true;
+            log(`[factory] reclaim: the stop of ${p.sessionId} (task ${entry.id}) was not confirmed`);
+            continue;
+          }
+        }
         // A pane gone since the read took its agent with it: no failed stop
         // (counted as one, it kept the record `stopping` for good).
         if (r.ok !== true && r.code !== 'no_session') {
@@ -1137,13 +1179,26 @@ export async function reclaimWorker(
     }
     if (attempted === 0) {
       // Reopened before any stop: nothing was stopped, the record is as it was.
-      await (prior ? ports.store.put(prior) : ports.store.remove(entry.id)).catch(() => undefined);
+      await (prior ? ports.store.restore(prior, now()) : ports.store.remove(entry.id)).catch(() => undefined);
       return null;
     }
     // An open task's stop that signalled its agent stays recorded
     // (`stopping`): its agent may be gone, and the settle pass then marks it
     // stopped with its cards.
-    if (failed === attempted && !prior && !(ended === 'reported' && signalled > 0)) {
+    if (unconfirmed && ports.note && (prior?.state !== 'stopping' || !prior.stopUnconfirmed)) {
+      try {
+        const task = lifecycleCardTask(entry.title, entry.id);
+        ports.note(
+          entry.ownerWorkspaceId, taskThreadOf(entry), `Worker stop unconfirmed: ${task}`,
+          'wmux could not stop the worker or confirm its exit. Its slot is still in use. Open its terminal to check it and stop it if needed.',
+          { code: 'worker.stopUnconfirmed', args: { title: task } }, entry.id,
+        );
+        await ports.store.put({ ...(ports.store.get(entry.id) ?? rec), stopUnconfirmed: true });
+      } catch (err) {
+        log(`[factory] reclaim: the unconfirmed-stop notice for ${entry.id} was not recorded: ${String(err)}`);
+      }
+    }
+    if (failed === attempted && !prior && !unconfirmed && !(ended === 'reported' && signalled > 0)) {
       // Nothing was stopped: no record, so a later look tries again.
       await ports.store.remove(entry.id).catch(() => undefined);
       return null;
@@ -1161,6 +1216,12 @@ export async function reclaimWorker(
       return ports.store.get(entry.id);
     }
     ports.store.setState(entry.id, 'stopped', now());
+    // An unconfirmed stop ends with its own card only: the cards below say
+    // wmux stopped the agent, which it did not show.
+    if (await noteStopResolved(ports, ports.store.get(entry.id), entry)) {
+      ports.changed?.();
+      return ports.store.get(entry.id);
+    }
     // Reopened part way: the conversation stays recorded, no card (the
     // task is open again, and its open row counts what still runs).
     if (attempted < panes.length) return ports.store.get(entry.id);
@@ -1237,8 +1298,16 @@ function noteOpenPause(ports: Pick<WorkerReclaimPorts, 'note' | 'noticeBot'>, en
   } catch {
     /* the card is best effort */
   }
+  noticePausedBot(ports, entry, resumable, at, false);
+}
+
+/** The notice to the bot that started an open task whose worker was paused,
+ *  which resumes or settles it (`exited`: the stop was not confirmed and its
+ *  agent exited since). Best effort, never throws. */
+function noticePausedBot(ports: Pick<WorkerReclaimPorts, 'noticeBot'>, entry: LedgerEntry, resumable: boolean, at: number, exited: boolean): void {
   const botId = entry.dispatch?.origin.botId;
   if (!botId) return;
+  const task = lifecycleCardTask(entry.title, entry.id);
   try {
     ports.noticeBot?.({
       botId,
@@ -1246,7 +1315,10 @@ function noteOpenPause(ports: Pick<WorkerReclaimPorts, 'note' | 'noticeBot'>, en
       key: `worker.paused:${entry.id}:${at}`,
       topic: 'worker.paused',
       title: `Your worker for "${task}" was paused (task ${entry.id})`,
-      body: `It sat idle with the task still ${entry.status} and no report, so main stopped its Claude to free its agent slot. The ledger row is unchanged. `
+      body: (exited
+        ? `It sat idle with the task still ${entry.status} and no report; main's stop to free its agent slot was not confirmed, and its Claude has exited since. `
+        : `It sat idle with the task still ${entry.status} and no report, so main stopped its Claude to free its agent slot. `)
+        + 'The ledger row is unchanged. '
         + (resumable
           ? 'To continue, resume it with worker_resume (its message is what it acts on); if its work is done or not needed, settle the task with ledger_update.'
           : 'No conversation was recorded to resume: settle the task with ledger_update, or start a new task for the rest of the work.'),
@@ -1292,6 +1364,37 @@ async function stopOrClose(
 export function isReclaimedSince(rec: ReclaimedWorker | null, entry: Pick<LedgerEntry, 'updatedAt' | 'rev'>): boolean {
   if (!rec || rec.state === 'stopping') return false;
   return rec.endRev !== undefined ? rec.endRev >= entry.rev : rec.at >= entry.updatedAt;
+}
+
+/** The one end of an unconfirmed stop, whichever path sees the record
+ *  stopped (the reclaim's retry, the settle sweep): the owner, told the stop
+ *  was not confirmed, gets one card saying the slot is free, with Resume when
+ *  a conversation was kept, in place of the stop's usual card; an open
+ *  task's bot is told its worker is gone. A card that fails to write is tried
+ *  again by the settle sweep. Whether `rec` is an unconfirmed stop: the
+ *  caller then posts no card of its own. */
+async function noteStopResolved(ports: WorkerReclaimPorts, rec: ReclaimedWorker | null, row: LedgerEntry | null): Promise<boolean> {
+  if (!rec?.stopUnconfirmed) return false;
+  if (rec.state !== 'stopped' || rec.stopResolved || !ports.note) return true;
+  const resumable = rec.sessions.some((p) => resumeLineFor(p) !== null);
+  // A research task works in a task folder, not a worktree.
+  const research = resumable && isResearchDispatch(row?.dispatch);
+  const task = lifecycleCardTask(rec.title, rec.taskId);
+  try {
+    ports.note(
+      rec.ownerWorkspaceId, rec.threadId, `${resumable ? 'Worker slot freed (resumable)' : 'Worker slot freed'}: ${task}`,
+      resumable
+        ? `The worker has stopped; its slot is free. The ${research ? 'task folder' : 'worktree'} and the conversation are kept, and Resume continues the same conversation.`
+        : 'The worker has stopped; its slot is free.',
+      { code: resumable ? 'worker.stopResolvedResumable' : 'worker.stopResolved', args: { title: task, ...(research ? { kind: 'research' } : {}) } }, rec.taskId,
+    );
+    await ports.store.put({ ...rec, stopResolved: true });
+  } catch (err) {
+    ports.log?.(`[factory] reclaim: the stop-resolution notice for ${rec.taskId} was not recorded: ${String(err)}`);
+    return true;
+  }
+  if (rec.ended === 'reported' && row && (row.status === 'working' || row.status === 'input_required')) noticePausedBot(ports, row, resumable, rec.at, true);
+  return true;
 }
 
 /** Install the reclaim on bot task ends. Returns the unsubscribe. */
@@ -1358,11 +1461,22 @@ export function installWorkerReclaim(ports: WorkerReclaimPorts): () => void {
   const settleStopping = async (): Promise<void> => {
     if (settling || !ports.row) return;
     const at = now();
+    const pending = ports.store.all().filter((r) => r.state === 'stopped' && r.stopUnconfirmed && !r.stopResolved && !inFlight.has(r.taskId));
     const stale = ports.store.all().filter((r) => r.state === 'stopping' && !inFlight.has(r.taskId)
       && (r.at < installedAt || at - r.at >= STOPPING_SETTLE_MS));
-    if (stale.length === 0) return;
+    if (stale.length === 0 && pending.length === 0) return;
     settling = true;
     try {
+      for (const rec of pending) {
+        let row: LedgerEntry | null = null;
+        try {
+          row = ports.row(rec.taskId);
+        } catch {
+          row = null;
+        }
+        await noteStopResolved(ports, ports.store.get(rec.taskId), row);
+      }
+      if (stale.length === 0) return;
       const byId = new Map((await ports.listSessions()).map((x) => [x.id, x]));
       let moved = false;
       for (const rec of stale) {
@@ -1397,8 +1511,10 @@ export function installWorkerReclaim(ports: WorkerReclaimPorts): () => void {
           if (ports.store.setState(rec.taskId, 'stopped', at)) {
             moved = true;
             log(`[factory] reclaim: ${rec.taskId} was left stopping with no agent running; marked stopped`);
-            // An open task's idle stop cut off before its cards: they go now.
-            if (cur.ended === 'reported' && row && (row.status === 'working' || row.status === 'input_required')) noteOpenPause(ports, row, cur.sessions, at);
+            // An unconfirmed stop ends with its own card only; an open task's
+            // idle stop cut off before its cards: they go now.
+            if (!(await noteStopResolved(ports, ports.store.get(rec.taskId), row))
+              && cur.ended === 'reported' && row && (row.status === 'working' || row.status === 'input_required')) noteOpenPause(ports, row, cur.sessions, at);
           }
           continue;
         }
@@ -1490,7 +1606,7 @@ export interface WorkerResumePorts {
   /** Whether the pane's agent runs (process truth), for a message. */
   agentAlive?: (sessionId: string) => Promise<boolean>;
   /** Deliver a message to the relaunched agent (waits while someone types). */
-  submit?: (sessionId: string, text: string) => Promise<boolean>;
+  submit?: (sessionId: string, text: string, stillOk?: () => string | null) => Promise<boolean>;
   /** daemon `session.stopAgent`, for the stop of a resumed worker. */
   stopAgent?: (sessionId: string) => Promise<{ ok?: boolean; stopped?: boolean; code?: string }>;
   /** Close a pane whose agent the daemon cannot stop (WorkerReclaimPorts.closePane). */
@@ -1594,6 +1710,9 @@ export async function resumeWorker(
   /** Called once the line is typed (a launch slot hands over to the
    *  resumed-worker count here). */
   onLaunched?: () => void,
+  /** Asked in the same tick as the launch (the line typed, the pane
+   *  respawned): why it may no longer go ahead, or null. */
+  stillOk?: () => string | null,
 ): Promise<WorkerResumeResult> {
   if (resuming.has(taskId)) return refuse('busy', 'this worker is being resumed already');
   if (clearing.has(taskId)) return refuse('busy', 'this worker\'s pane is being closed; try again in a moment');
@@ -1622,7 +1741,7 @@ export async function resumeWorker(
       booking.botId = botId;
       booking.done = false;
       botStarting.set(botId, (botStarting.get(botId) ?? 0) + 1);
-    });
+    }, stillOk);
   } finally {
     unbook();
     release?.();
@@ -1673,6 +1792,7 @@ async function resumeOnce(
   message: string | undefined,
   onLaunched: (() => void) | undefined,
   book: (botId: string) => void,
+  stillOk?: () => string | null,
 ): Promise<WorkerResumeResult> {
   const rec = ports.store.get(taskId);
   if (!rec) return refuse('not_reclaimed', 'this task\'s worker was not stopped by wmux, so there is nothing to resume');
@@ -1707,7 +1827,7 @@ async function resumeOnce(
   const sessions = await ports.listSessions();
   if (stopped()) return refuse('not_now', 'the bot\'s work was stopped while this resume was under way');
   const live = sessions.find((s) => s.id === pane.sessionId);
-  if (!live) return respawnOnce(ports, rec, pane, line, sessions, by, message, onLaunched, stopped);
+  if (!live) return respawnOnce(ports, rec, pane, line, sessions, by, message, onLaunched, stopped, stillOk);
   // Both the folder the pane was started in and the one its shell is in now
   // (a `cd` moves where a typed line runs) must be the task folder.
   const here = [live.spawnCwd, live.cwd].filter((d): d is string => typeof d === 'string' && d.length > 0);
@@ -1729,6 +1849,8 @@ async function resumeOnce(
     return refuse('not_reopened', 'the task could not be moved to the worker\'s pane; try again');
   }
   if (stopped()) return refuse('not_now', 'the bot\'s work was stopped while this resume was under way');
+  const late = stillOk?.() ?? null;
+  if (late) return refuse('not_now', late);
   // A new launch of the task, on disk before the line is typed.
   let gen: number | null = null;
   try {
@@ -1750,7 +1872,7 @@ async function resumeOnce(
     else ports.launches?.released(rec.taskId, gen);
   }
   if (!typed) return refuse('not_typed', 'the resume line could not be typed into the worker\'s pane');
-  return launched(ports, rec, pane.sessionId, pane.resumeSessionId, workerWorkspaceOf(rec), by, message, onLaunched, 'folder');
+  return launched(ports, rec, pane.sessionId, pane.resumeSessionId, workerWorkspaceOf(rec), by, message, onLaunched, 'folder', stillOk);
 }
 
 /** The worker's pane is gone: open a new task workspace in the worktree. */
@@ -1764,6 +1886,7 @@ async function respawnOnce(
   message: string | undefined,
   onLaunched: (() => void) | undefined,
   stopped: () => boolean,
+  stillOk?: () => string | null,
 ): Promise<WorkerResumeResult> {
   if (!ports.respawn || !pane.resumeSessionId) return refuse('pane_gone', 'the worker\'s pane is closed');
   // A WSL pane recorded the Linux path of its folder (/mnt/c/…): the folder
@@ -1792,6 +1915,8 @@ async function respawnOnce(
     && [s.spawnCwd, s.cwd].some((d) => typeof d === 'string' && d.length > 0 && normalizeResumeCwd(sessionHostDir(d, s, platform)) === home));
   if (busy) return refuse('already_running', 'an agent is already running in the task\'s worktree');
   if (stopped()) return refuse('not_now', 'the bot\'s work was stopped while this resume was under way');
+  const late = stillOk?.() ?? null;
+  if (late) return refuse('not_now', late);
   let r: Awaited<ReturnType<NonNullable<WorkerResumePorts['respawn']>>>;
   try {
     r = await ports.respawn({
@@ -1822,7 +1947,7 @@ async function respawnOnce(
     await stopRelaunched(ports, rec.taskId, r.sessionId);
     return refuse('not_now', 'the bot\'s work was stopped while this resume was under way');
   }
-  return launched(ports, rec, r.sessionId, pane.resumeSessionId, r.workspaceId, by, message, onLaunched, 'newPane');
+  return launched(ports, rec, r.sessionId, pane.resumeSessionId, r.workspaceId, by, message, onLaunched, 'newPane', stillOk);
 }
 
 /** The task's ledger row names `workspaceId` (written now when it named
@@ -1867,6 +1992,7 @@ async function launched(
   message: string | undefined,
   onLaunched: (() => void) | undefined,
   where: 'folder' | 'newPane',
+  stillOk?: () => string | null,
 ): Promise<WorkerResumeResult> {
   const now = ports.now ?? Date.now;
   ports.store.setState(rec.taskId, 'resumed', now());
@@ -1896,7 +2022,11 @@ async function launched(
     }
     await sleep(1000);
   }
-  const delivered = up ? await ports.submit(sessionId, text.slice(0, RESUME_MESSAGE_MAX)).catch(() => false) : false;
+  // Asked again after the wait, in the tick that sends the message.
+  if (up && (stillOk?.() ?? null)) return { ...out, messageDelivered: false };
+  // ... and again right before the paste and the Enter.
+  const body = text.slice(0, RESUME_MESSAGE_MAX);
+  const delivered = up ? await (stillOk ? ports.submit(sessionId, body, stillOk) : ports.submit(sessionId, body)).catch(() => false) : false;
   return { ...out, messageDelivered: delivered };
 }
 

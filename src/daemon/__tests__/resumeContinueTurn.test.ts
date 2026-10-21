@@ -10,7 +10,11 @@ import type { IPty } from 'node-pty';
 import { DaemonPTYBridge } from '../DaemonPTYBridge';
 import { PromptEventLog } from '../PromptEventLog';
 import { RingBuffer } from '../RingBuffer';
-import { RESUME_CONTINUE_MAX_QUIET_MS, recordWasMidTurn } from '../recoveryHint';
+import { RESUME_CONTINUE_MAX_QUIET_MS, recordWasMidTurn, recordedTurnStillOpen } from '../recoveryHint';
+import { transcriptTurnState } from '../transcript/chatAgentStatus';
+import { parseTranscriptLineDetailed } from '../transcript/parseEntry';
+import { parseCodexLineDetailed } from '../transcript/parseCodexEntry';
+import type { TurnEvent } from '../../shared/transcript/turnEvents';
 
 function makeFakePty(): IPty {
   return {
@@ -18,6 +22,51 @@ function makeFakePty(): IPty {
     onExit: () => ({ dispose: () => undefined }),
   } as unknown as IPty;
 }
+
+describe('transcriptTurnState — the agent\'s own transcript says whether its last turn is open', () => {
+  const ts = '2026-10-20T12:00:00.000Z';
+  const claude = (lines: object[]): TurnEvent[] => lines.flatMap((l, i) => parseTranscriptLineDetailed(JSON.stringify({ timestamp: ts, uuid: `u${i}`, ...l }), i).events);
+  const codex = (lines: object[]): TurnEvent[] => lines.flatMap((l, i) => parseCodexLineDetailed(JSON.stringify({ timestamp: ts, ...l }), i).events);
+  const prompt = { type: 'user', message: { role: 'user', content: 'fix the build' } };
+  const toolUse = { type: 'assistant', message: { role: 'assistant', stop_reason: 'tool_use', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'npm test' } }] } };
+  const toolResult = { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] } };
+  const endTurn = { type: 'assistant', message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: 'done' }] } };
+  const interrupted = { type: 'user', message: { role: 'user', content: [{ type: 'text', text: '[Request interrupted by user]' }] } };
+
+  it('a Claude turn mid-tool, or a prompt with no reply yet, is open', () => {
+    expect(transcriptTurnState(claude([prompt, toolUse]))).toBe('open');
+    expect(transcriptTurnState(claude([prompt, toolUse, toolResult]))).toBe('open');
+    expect(transcriptTurnState(claude([endTurn, prompt]))).toBe('open');
+  });
+
+  it('a Claude turn the user interrupted, or one that finished, has ended', () => {
+    expect(transcriptTurnState(claude([prompt, toolUse, interrupted]))).toBe('ended');
+    expect(transcriptTurnState(claude([prompt, toolUse, toolResult, endTurn]))).toBe('ended');
+  });
+
+  it('subagent rows after a finished reply do not reopen it, however many', () => {
+    const side = { type: 'user', isSidechain: true, message: { role: 'user', content: 'subagent task' } };
+    expect(transcriptTurnState(claude([prompt, endTurn, ...Array.from({ length: 60 }, () => side)]))).toBe('ended');
+  });
+
+  it('Codex: turn_aborted and task_complete end the turn, task_started opens one', () => {
+    const ev = (type: string) => ({ type: 'event_msg', payload: { type, turn_id: 'turn-1' } });
+    expect(transcriptTurnState(codex([ev('task_started')]))).toBe('open');
+    expect(transcriptTurnState(codex([ev('task_started'), ev('turn_aborted')]))).toBe('ended');
+    expect(transcriptTurnState(codex([ev('task_started'), ev('task_complete')]))).toBe('ended');
+  });
+
+  it('an empty or unreadable tail is unknown', () => {
+    expect(transcriptTurnState([])).toBe('unknown');
+    expect(transcriptTurnState(undefined)).toBe('unknown');
+  });
+
+  it('recovery continues nothing without a transcript it can read', () => {
+    expect(recordedTurnStillOpen(undefined)).toBe(false);
+    expect(recordedTurnStillOpen({ agent: 'claude', sessionId: 's', cwd: '/tmp', ts: 0 })).toBe(false);
+    expect(recordedTurnStillOpen({ agent: 'claude', sessionId: '0d9c1b52-1e6a-4b8e-9f0a-1c2d3e4f5a6b', cwd: '/tmp', ts: 0, transcriptPath: '/nonexistent/x.jsonl' })).toBe(false);
+  });
+});
 
 describe('DaemonPTYBridge — agentTurn edges', () => {
   let bridge: DaemonPTYBridge;
@@ -108,6 +157,11 @@ describe('recordWasMidTurn — the old record says the agent was mid-turn', () =
     expect(recordWasMidTurn({ turnRunningSince: 0, lastActivity: recent }, now)).toBe(false);
   });
 
+  it('true for a continue an earlier recovery still owed (a second death before the resume)', () => {
+    expect(recordWasMidTurn({ resumeContinuePending: true, lastActivity: recent }, now)).toBe(true);
+    expect(recordWasMidTurn({ resumeContinuePending: 'yes', lastActivity: recent }, now)).toBe(false);
+  });
+
   it('false when the pane was quiet for longer than the bound', () => {
     const stale = new Date(now - RESUME_CONTINUE_MAX_QUIET_MS - 1).toISOString();
     expect(recordWasMidTurn({ turnRunningSince: now - RESUME_CONTINUE_MAX_QUIET_MS - 60_000, lastActivity: stale }, now)).toBe(false);
@@ -143,10 +197,23 @@ describe('turnRunningSince wiring', () => {
   it('recovery reads the mark off the persisted record, never the recovered meta', () => {
     const src = read('index.ts');
     const rec = src.slice(src.indexOf('for (const recoveredId of recoveredIds) {'));
-    expect(rec).toMatch(/const persisted = state\.sessions\.find\(\(s\) => s\.id === recoveredId\);\s*if \(persisted && recordWasMidTurn\(persisted, Date\.now\(\)\)\) recoveredWasRunning\.add\(recoveredId\);/);
-    // The carry-forward of the other markers must not copy it onto the new meta.
-    const carry = src.slice(src.indexOf('for (const persisted of state.sessions) {'), src.indexOf('const liveState = buildState(sessionManager);'));
+    expect(rec).toMatch(/if \(m\.resumeContinuePending && recordedTurnStillOpen\(recoveredResumeBindings\.get\(recoveredId\) \?\? m\.resumeBinding, m\.env\)\) \{\s*recoveredWasRunning\.add\(recoveredId\);\s*\} else delete m\.resumeContinuePending;/);
+    // The carry-forward reads the OLD record into the owed continue, before
+    // the merged recovery save, and never copies the raw mark onto the new meta.
+    const carry = src.slice(src.indexOf('for (const persisted of state.sessions) {'), src.indexOf('diskOnlySessions = state.sessions.filter('));
     expect(carry).not.toMatch(/turnRunningSince/);
+    expect(carry).toMatch(/if \(recordWasMidTurn\(persisted, Date\.now\(\)\)\) managed\.meta\.resumeContinuePending = true;/);
+  });
+
+  it('an owed continue lives on the meta, so every save keeps it until spent, and never reaches clients', () => {
+    const src = read('index.ts');
+    const spend = src.slice(src.indexOf('function spendContinue('), src.indexOf('function spendContinue(') + 600);
+    expect(spend).toMatch(/recoveredWasRunning\.delete\(id\);/);
+    expect(spend).toMatch(/delete meta\.resumeContinuePending;\s*void stateWriter\.saveAsap\(buildState\(sessionManager\)\);/);
+    // No other path forgets the in-memory mark without the record.
+    expect(src.match(/recoveredWasRunning\.delete\(/g)).toHaveLength(1);
+    const at = src.indexOf("pipeServer.onRpc('daemon.listSessions'");
+    expect(src.slice(at, at + 9000)).toMatch(/delete base\.resumeContinuePending;/);
   });
 
   it('listSessions strips the raw field and surfaces the one-shot mark with the offer only', () => {
@@ -154,7 +221,7 @@ describe('turnRunningSince wiring', () => {
     const at = src.indexOf("pipeServer.onRpc('daemon.listSessions'");
     const body = src.slice(at, src.indexOf("pipeServer.onRpc('daemon.promoteSession'", at) > 0 ? src.indexOf("pipeServer.onRpc('daemon.promoteSession'", at) : at + 9000);
     expect(body).toMatch(/delete base\.turnRunningSince;/);
-    expect(body).toMatch(/if \(!resumeAgent\) recoveredWasRunning\.delete\(s\.id\);/);
+    expect(body).toMatch(/if \(!resumeAgent\) spendContinue\(sessionManager, stateWriter, s\.id\);/);
     const withAgent = body.slice(body.indexOf('const withAgent = resumeAgent'), body.indexOf(': withRuntime;'));
     expect(withAgent).toMatch(/recoveredWasRunning\.has\(s\.id\) \? \{ resumeWasRunning: true as const \}/);
   });
@@ -162,10 +229,10 @@ describe('turnRunningSince wiring', () => {
   it('the mark is spent wherever the offer is, and by the first submit', () => {
     const src = read('index.ts');
     // Every place that drops a recovered binding drops the mark with it.
-    const bindingDeletes = src.match(/recoveredResumeBindings\.delete\(([\w.]+)\);[^\n]*\n\s*recoveredWasRunning\.delete\(\1\);/g) ?? [];
+    const bindingDeletes = src.match(/recoveredResumeBindings\.delete\(([\w.]+)\);[^\n]*\n\s*spendContinue\(sessionManager, stateWriter, \1\);/g) ?? [];
     expect(bindingDeletes).toHaveLength(5);
     const at = src.indexOf("sessionManager.on('session:inputSubmitted', (payload: { sessionId: string }) => {");
     expect(at).toBeGreaterThan(-1);
-    expect(src.slice(at, at + 200)).toMatch(/recoveredWasRunning\.delete\(payload\.sessionId\);/);
+    expect(src.slice(at, at + 200)).toMatch(/spendContinue\(sessionManager, stateWriter, payload\.sessionId\);/);
   });
 });

@@ -9,6 +9,8 @@ import { useStore } from '../../../stores';
 import MiniSidebar from '../MiniSidebar';
 import { seedFleetTriageStore } from '../../../utils/__tests__/fleetTriageFixture';
 import { selectFleetSectionCounts } from '../../../stores/selectors/fleet';
+import { setRoomsApiForTests, useRoomSync, type RoomsApi } from '../../../hooks/useRoomSync';
+import { setFactoryBotPort } from '../../Room/factoryPorts';
 
 let container: HTMLDivElement;
 let root: Root;
@@ -36,7 +38,7 @@ describe('sidebar icon rail', () => {
   it('lists only pages — Workspaces, Bots, Fleet, Office, Schedules, Remote and Git — each named', async () => {
     await act(async () => root.render(<MiniSidebar rail collapsed={false} />));
     // Search & commands is a palette (the titlebar pill), not a page.
-    expect(navIds()).toEqual(['home', 'bots', 'fleet', 'office', 'schedules', 'remote', 'git']);
+    expect(navIds()).toEqual(['home', 'bots', 'fleet', 'office', 'schedules', 'remote', 'git', 'connectors']);
     // Home is the current page until another is chosen.
     expect(container.querySelector('[data-sidebar-nav="home"]')?.getAttribute('aria-current')).toBe('page');
     for (const b of rail().querySelectorAll('button')) {
@@ -47,15 +49,66 @@ describe('sidebar icon rail', () => {
   it('lists Bots only while the bots are on, appearing and going without a restart', async () => {
     act(() => useStore.setState({ roomStatus: { running: false, enabled: false, hqWorkspaceId: null } }));
     await act(async () => root.render(<MiniSidebar rail collapsed={false} />));
-    expect(navIds()).toEqual(['home', 'fleet', 'office', 'schedules', 'remote', 'git']);
+    expect(navIds()).toEqual(['home', 'fleet', 'office', 'schedules', 'remote', 'git', 'connectors']);
     // Settings › Bots' switch writes the setting and re-reads this status.
     act(() => useStore.setState({ roomStatus: { running: true, enabled: true, hqWorkspaceId: null } }));
-    expect(navIds()).toEqual(['home', 'bots', 'fleet', 'office', 'schedules', 'remote', 'git']);
+    expect(navIds()).toEqual(['home', 'bots', 'fleet', 'office', 'schedules', 'remote', 'git', 'connectors']);
     act(() => useStore.setState({ roomStatus: { running: false, enabled: false, hqWorkspaceId: null } }));
-    expect(navIds()).toEqual(['home', 'fleet', 'office', 'schedules', 'remote', 'git']);
+    expect(navIds()).toEqual(['home', 'fleet', 'office', 'schedules', 'remote', 'git', 'connectors']);
     // No status read yet (or no bot runtime): not listed either.
     act(() => useStore.setState({ roomStatus: null }));
-    expect(navIds()).toEqual(['home', 'fleet', 'office', 'schedules', 'remote', 'git']);
+    expect(navIds()).toEqual(['home', 'fleet', 'office', 'schedules', 'remote', 'git', 'connectors']);
+  });
+
+  describe('kept in step with main by useRoomSync, with no window focus', () => {
+    // main's answer to room:status, and the BOT_EVENT listeners the bridge holds.
+    let enabled = false;
+    let botEvents: (() => void)[] = [];
+    let focusEvents = 0;
+    const onFocus = () => { focusEvents += 1; };
+    beforeEach(() => {
+      enabled = false;
+      botEvents = [];
+      focusEvents = 0;
+      window.addEventListener('focus', onFocus);
+      useStore.setState({ roomStatus: null });
+      setRoomsApiForTests({
+        status: vi.fn(async () => ({ running: true, enabled, hqWorkspaceId: null })),
+        onEvent: vi.fn(() => () => undefined),
+      } as unknown as RoomsApi);
+      setFactoryBotPort({
+        available: true,
+        list: async () => [],
+        subscribe: (fn) => { botEvents.push(fn); return () => { botEvents = botEvents.filter((f) => f !== fn); }; },
+        act: async () => ({ ok: true }),
+      });
+    });
+    afterEach(() => {
+      window.removeEventListener('focus', onFocus);
+      setRoomsApiForTests(undefined);
+      setFactoryBotPort(null);
+    });
+    function App() {
+      useRoomSync();
+      return <MiniSidebar rail collapsed={false} />;
+    }
+
+    it('lists Bots once main says the bots were switched on elsewhere (a script), on its push', async () => {
+      await act(async () => root.render(<App />));
+      expect(navIds()).toEqual(['home', 'fleet', 'office', 'schedules', 'remote', 'git', 'connectors']);
+      // Switched on by a caller other than Settings: main pushes a bot event.
+      enabled = true;
+      await act(async () => { for (const fn of botEvents) fn(); });
+      expect(navIds()).toEqual(['home', 'bots', 'fleet', 'office', 'schedules', 'remote', 'git', 'connectors']);
+      expect(focusEvents).toBe(0);
+    });
+
+    it('lists Bots on a fresh mount (a reload) while the bots are already on', async () => {
+      enabled = true;
+      await act(async () => root.render(<App />));
+      expect(navIds()).toEqual(['home', 'bots', 'fleet', 'office', 'schedules', 'remote', 'git', 'connectors']);
+      expect(focusEvents).toBe(0);
+    });
   });
 
   it('the Bots shortcut and palette command open Settings › Bots while the bots are off', () => {
@@ -191,7 +244,7 @@ describe('sidebar icon rail', () => {
     await act(async () => root.render(<MiniSidebar rail collapsed={false} />));
     const pressed = () => [...container.querySelectorAll('[data-sidebar-nav][aria-current="page"]')]
       .map((el) => el.getAttribute('data-sidebar-nav'));
-    for (const page of ['fleet', 'office', 'schedules', 'remote'] as const) {
+    for (const page of ['fleet', 'office', 'schedules', 'remote', 'connectors'] as const) {
       act(() => container.querySelector<HTMLButtonElement>(`[data-sidebar-nav="${page}"]`)!.click());
       expect(useStore.getState().appRoute).toBe(page);
       expect(pressed()).toEqual([page]);
@@ -229,7 +282,7 @@ describe('Moa and the rail', () => {
   it('has no Moa entry: the panel is its home', async () => {
     useStore.setState({ workspaces: [ws('a'), ws('hq')], activeWorkspaceId: 'a', activeRemoteKey: null, moa: moa(true) } as never);
     await act(async () => root.render(<MiniSidebar rail collapsed={false} />));
-    expect(navIds()).toEqual(['home', 'bots', 'fleet', 'office', 'schedules', 'remote', 'git']);
+    expect(navIds()).toEqual(['home', 'bots', 'fleet', 'office', 'schedules', 'remote', 'git', 'connectors']);
     expect(container.querySelector('[data-sidebar-nav="moa"]')).toBeNull();
   });
 

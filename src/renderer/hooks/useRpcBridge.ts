@@ -1,3 +1,4 @@
+import { pluginAgentSnapshot } from '../plugins/pluginAgentSnapshot';
 import { isPhoneWorkspaceId, PHONE_WORKSPACE_REQUEST_LIMIT } from '../../shared/phoneWorkspaceRequests';
 import { useEffect } from 'react';
 import { useStore } from '../stores';
@@ -1120,6 +1121,17 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
     return buildWorkspaceListEntries(store.workspaces);
   }
 
+  // Main-only owner-state read. Never a public agent RPC or a caller claim.
+  if (method === 'connectors.terminalContext') {
+    return {
+      workspaces: store.workspaces.map((ws) => ({ id: ws.id, name: ws.name })),
+      panes: store.workspaces.flatMap((ws) => getWorkspaceLeafPanes(ws).map((pane) => ({
+        id: pane.id, workspaceId: ws.id, ptyIds: pane.surfaces.flatMap((s) => s.ptyId ? [s.ptyId] : []),
+        name: paneDisplayName(store.paneLabel[pane.id], computePaneAutoName(ws.wsOrdinal ?? 0, pane.ordinal ?? 0)),
+      }))),
+    };
+  }
+
   if (method === 'quickLaunch.context') {
     // The global quick-launch composer (main/quickLaunch): which workspaces it
     // may start an agent in, and the theme to paint itself in.
@@ -1969,6 +1981,11 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
   // -------------------------------------------------------------------------
   // pane.*
   // -------------------------------------------------------------------------
+
+  if (method === 'agent.state') {
+    if (typeof params.workspaceId !== 'string' || !params.workspaceId) return { error: 'Agent workspace required' };
+    return pluginAgentSnapshot(store, params.workspaceId, params.includeActivity === true);
+  }
 
   if (method === 'fleet.triage') {
     // The Fleet overlay's own board (selectFleetBoard), so an agent is told

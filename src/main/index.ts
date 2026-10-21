@@ -1,5 +1,8 @@
 // Must stay the first import: turns off working-directory executable lookup (Windows) before any module runs.
 import '../shared/exeSearchGuard';
+import { registerPluginManagementHandlers } from './ipc/handlers/pluginManagement.handler';
+import { UiPluginManager } from './plugins/UiPluginManager';
+import { PLUGIN_MANAGEMENT_IPC } from '../shared/pluginManagement';
 import { warmLoginShellPath } from './claude/resolveClaudeExecutable';
 import { terminalCoreSelection } from '../shared/terminalCoreSettings';
 import { randomUUID as phoneBrowserRequestId } from 'node:crypto';
@@ -57,6 +60,10 @@ import { PTYBridge } from './pty/PTYBridge';
 import { createLocalApprovalScreenReader } from './pty/localApprovalScreen';
 import { pruneDaemonPidMapAtConnect } from './pty/pidMap';
 import { registerAllHandlers } from './ipc/registerHandlers';
+import { registerConnectorTerminalHandlers } from './ipc/handlers/connectorTerminal.handler';
+import { registerConnectorOAuthHandlers } from './ipc/handlers/connectorOAuth.handler';
+import { registerConnectorCatalogHandlers } from './ipc/handlers/connectorCatalog.handler';
+import { registerConnectorCheckHandlers } from './ipc/handlers/connectorCheck.handler';
 import { RpcRouter } from './pipe/RpcRouter';
 import type { RpcMethod } from '../shared/rpc';
 import { liveNoChangesCheck } from './factory/noChangesCheck';
@@ -675,6 +682,7 @@ markBoot('pipe-server-ctor-done');
 // read it through this binding.
 registerPrivilegedSchemes();
 let pluginHostLoader: PluginHostLoader | null = null;
+let uiPluginManager: UiPluginManager | null = null;
 const mcpRegistrar = new McpRegistrar();
 // Shared MCP broker (Option A, WMUX_MCP_BROKER=1; default OFF). Started on
 // ready BEFORE mcpRegistrar.register so the broker pipe is (or is about to
@@ -828,6 +836,13 @@ const mcpHandlerOptions = {
 // handlers see every connect/disconnect transition that mutates that
 // variable (no closure snapshot).
 registerSessionHandlers(() => daemonClient?.isConnected === true);
+
+// OAuth consent and terminal gateway leases belong to the app, not a daemon
+// connection. Keep them alive across registerAllHandlers teardown/reconnect.
+const connectorOAuth = registerConnectorOAuthHandlers(() => mainWindow);
+const cleanupConnectorTerminal = registerConnectorTerminalHandlers(() => mainWindow, connectorOAuth.service, () => daemonClient);
+const cleanupConnectorChecks = registerConnectorCheckHandlers(() => mainWindow, connectorOAuth.service);
+const cleanupConnectorCatalog = registerConnectorCatalogHandlers(() => mainWindow);
 
 // Presence reporting for push suppression. Registered once on `app` (not on a
 // BrowserWindow) so it survives window recreation; the getter closes over the
@@ -1180,6 +1195,7 @@ registerMcpPluginRpc(rpcRouter);
 // RpcRouter instance, so plugin-iframe RPCs hit the identical enforcement
 // stack as pipe clients. Registered once, outside the handler swap cycle.
 registerPluginHostHandlers(rpcRouter, () => pluginHostLoader, () => approvalQueue);
+registerPluginManagementHandlers(() => mainWindow, () => uiPluginManager);
 // Project config IPC (X5 wmux.json): discovery + trust gate. Renderer-only
 // surface — never exposed on the pipe RPC (external clients must not be able
 // to read project files or grant trust). Registered once, like plugin host.
@@ -2014,7 +2030,15 @@ app.on('ready', async () => {
   // a broken plugins dir must never block app boot.
   try {
     const loader = new PluginHostLoader(getPluginTrustStore());
-    await loader.loadAll();
+    const manager = new UiPluginManager({
+      loader, trust: getPluginTrustStore(), approval: () => approvalQueue,
+      pluginsDir: path.join(getWmuxHomeDir(), 'plugins'),
+      statePath: path.join(getWmuxHomeDir(), 'ui-plugins.json'),
+      catalogDir: app.isPackaged ? process.resourcesPath : path.join(app.getAppPath(), 'examples', 'plugins'),
+      changed: (name) => { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(PLUGIN_MANAGEMENT_IPC.changed, name); },
+    });
+    await manager.initialize();
+    uiPluginManager = manager;
     pluginHostLoader = loader;
     const failures = loader.listFailures();
     logLine('info', 'main', `plugin host: ${loader.list().length} plugin(s) loaded, ${failures.length} failed`);
@@ -2030,7 +2054,7 @@ app.on('ready', async () => {
   registerHtmlPreview();
   markBoot('plugins-loaded');
 
-  mainWindow = createWindow({ deferLoad: true });
+  mainWindow = createWindow({ deferLoad: true, windowGlass: sessionManager.readWindowGlass(), windowAppearance: sessionManager.readWindowAppearance() });
   // Global quick launch: needs `ready` for globalShortcut, and registers from
   // its own settings file so the chord works before the renderer has loaded.
   quickLaunch = initQuickLaunch({
@@ -2933,7 +2957,9 @@ function prepareInstallQuit(): void {
   // The full before-quit teardown is skipped on this path — the agent Chrome
   // must not outlive the app across an update install.
   try {
-    chromeRegistry.disposeAll();
+    // Signals at once: the installer ends this process right after this
+    // returns, before a graceful Chrome quit could be waited on.
+    void chromeRegistry.disposeAll({ immediate: true });
     chromeSurfaceStore.flushSync();
     getActionCacheStore().flushSync();
   } catch (err) {
@@ -2954,6 +2980,8 @@ function prepareInstallQuit(): void {
 // reports the failure.
 async function abortInstallQuit(): Promise<void> {
   isQuitting = false;
+  // prepareInstallQuit stopped every agent Chrome and closed the registry.
+  chromeRegistry.reopen();
   // stop() latches, so start() alone would be a no-op — without resume() one
   // aborted install leaves MCP down for the rest of the session, silently.
   mcpBrokerSupervisor.resume();
@@ -2966,7 +2994,7 @@ async function abortInstallQuit(): Promise<void> {
   // its renderer, or the caller's error IPC lands before any listener exists.
   // deferLoad so the reload backoff and console wiring are attached before the
   // navigation starts — this window's whole job is to render the failure.
-  const win = createWindow({ deferLoad: true });
+  const win = createWindow({ deferLoad: true, windowGlass: sessionManager.readWindowGlass(), windowAppearance: sessionManager.readWindowAppearance() });
   mainWindow = win;
   adoptMainWindow(win);
   loadMainRenderer(win);
@@ -3048,6 +3076,15 @@ app.on('before-quit', async (e) => {
     console.error('[Main] before-quit computer-use dispose failed:', err);
   }
 
+  // The agent Chrome quits through Browser.close so a quit keeps the sign-ins
+  // Chrome holds only for the session. Started here and awaited just before
+  // app.quit(): its wait (one QUIT_GRACE_MS deadline shared by every profile,
+  // then the signal) runs alongside the session save and the daemon teardown
+  // below, so nothing waits behind a Chrome and it adds no time of its own.
+  const chromeStopped = chromeRegistry.disposeAll().catch((err) => {
+    console.error('[Main] before-quit step "chromeRegistry.disposeAll" threw — continuing:', err);
+  });
+
   // macOS 로그아웃/재시작/종료 대응(P4): win32의 'session-end' flushSync와 동등한
   // 동기 세션 flush. macOS는 WM_ENDSESSION 대신 Apple Event로 quit을 보내고
   // 이 async 핸들러가 끝까지 못 돌 수 있으므로, 어떤 await보다도 먼저 pending
@@ -3120,6 +3157,10 @@ app.on('before-quit', async (e) => {
     }
   };
 
+  safeStep('cleanupConnectorChecks', () => cleanupConnectorChecks());
+  safeStep('cleanupConnectorTerminal', () => cleanupConnectorTerminal());
+  safeStep('connectorOAuth.cleanup', () => connectorOAuth.cleanup());
+  safeStep('cleanupConnectorCatalog', () => cleanupConnectorCatalog());
   safeStep('cleanupHandlers', () => cleanupHandlers());
   safeStep('disposeFirstRunHandlers', () => disposeFirstRunHandlers());
   safeStep('disposeDeckHandler', () => disposeDeckHandler());
@@ -3252,7 +3293,8 @@ app.on('before-quit', async (e) => {
 
   safeStep('claudeWorker.stop', () => claudeWorker.stop());
   safeStep('webviewCdpManager.disposeAll', () => webviewCdpManager.disposeAll());
-  safeStep('chromeRegistry.disposeAll', () => chromeRegistry.disposeAll());
+  // Started at the top of this handler; long settled on a slow teardown.
+  await chromeStopped;
   safeStep('chromeSurfaceStore.flushSync', () => chromeSurfaceStore.flushSync());
   // Recorded browser flows are written on a debounce, so a quit inside that
   // window would drop the save the agent just made — the one it is most likely
@@ -3376,7 +3418,7 @@ app.on('activate', () => {
   // hidden window too, and must neither count as the app window nor be the
   // one a Dock click brings back.
   if (!mainWindow || mainWindow.isDestroyed()) {
-    mainWindow = createWindow();
+    mainWindow = createWindow({ windowGlass: sessionManager.readWindowGlass(), windowAppearance: sessionManager.readWindowAppearance() });
     adoptMainWindow(mainWindow);
     return;
   }

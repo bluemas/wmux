@@ -66,12 +66,14 @@ import path from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 import { atomicReadJSONSync, atomicWriteJSONSync } from '../../daemon/util/atomicWrite';
 import { botTemplate, type BotBinding, type BotEventPayload, type BotProfile } from '../../shared/bot';
+import type { MemoryChange } from '../../shared/botMemory';
 import {
   APPROVAL_ACTIONS,
   APPROVAL_ID_RE,
   APPROVAL_NEVER_BY_RULE,
   APPROVAL_UNDO_MS,
   BOT_APPROVAL_RPC,
+  CARD_ONLY_ACTIONS,
   RULE_OTHER_ASKER,
   firstRuleSkip,
   isOwnerApprovalText,
@@ -98,6 +100,8 @@ import { laneRefusalCodes, laneRefusalLine } from './laneRefusalText';
 import { wakeReplyTo, type RoomWriter } from './roomWriter';
 import type { BotNoticeInput } from './botNotices';
 import type { BotDirectoryApi } from './triggerEngine';
+import { GUEST_TURN_STARTS_NO_WORKERS, guestOfRecord } from './wakeTaint';
+import { guestSide } from './guestWorkspaces';
 
 export const APPROVALS_FILENAME = 'approvals.json';
 
@@ -132,6 +136,10 @@ export interface StoredApproval extends ApprovalRequest {
   effectId?: string;
   /** Why a covering rule did not approve it (shown on the card). */
   ruleSkipped?: string;
+  /** Its wake was not known clean of a guest's words; the bots told of its
+   *  decision are told in a guest-sourced notice. Absent (a request stored
+   *  before it was recorded): as its taint says. */
+  guest?: boolean;
 }
 
 /** A request as the main window and the bot see it (no checkout path). */
@@ -141,6 +149,7 @@ export function approvalView(r: StoredApproval): ApprovalView {
   const view: Partial<StoredApproval> = { ...r };
   delete view.repoPath;
   delete view.clientRequestId;
+  delete view.guest;
   // What the owner reads: sentences, never the raw codes.
   delete view.refusalText;
   delete view.ruleSkippedText;
@@ -157,6 +166,20 @@ export function approvalView(r: StoredApproval): ApprovalView {
   };
 }
 
+/** What a bot reads back of a request: a request not known clean of a
+ *  guest's words keeps its state but not its words, unless the reading
+ *  wake is itself guest-sourced. */
+export const GUEST_REASON_HIDDEN = '(asked in a turn that came from an external guest; not shown here)';
+
+export function botApprovalView(r: StoredApproval, readerGuest: boolean): ApprovalView {
+  const view = approvalView(r);
+  if (readerGuest || guestOfRecord(r.guest, r.tainted) === false) return view;
+  const hidden: ApprovalView = { ...view, reason: GUEST_REASON_HIDDEN };
+  delete hidden.skill;
+  delete hidden.ownerProfile;
+  return hidden;
+}
+
 /** The running wake of a bot, as main knows it. */
 export interface ApprovalWake {
   wakeId: string;
@@ -164,11 +187,20 @@ export interface ApprovalWake {
   attempt: number;
   threadId: ThreadId | null;
   tainted: boolean;
+  /** The wake's guest provenance (wakeTaint.ts). Not known clean: the
+   *  request counts as tainted (no remembered rule approves it) and its card
+   *  is guest-sourced. Absent: unknown. */
+  guest?: boolean | 'unknown';
   /** The wake carries the owner's own message. */
   ownerWords?: boolean;
   /** The owner card that started the wake (RunningWake.ownerCardId): the
    *  request's card answers it when it lands in that card's thread. */
   ownerCardId?: string;
+}
+
+/** Whether a wake is not known to be clean of a guest's words. */
+function guestSourcedWake(wake: Pick<ApprovalWake, 'guest'>): boolean {
+  return wake.guest !== false;
 }
 
 /** What the approvals reach of the merge executor (mergeLaneHost.ts). */
@@ -207,6 +239,10 @@ export interface ApprovalPorts {
    *  act. `approve` returns why the proposal on the card cannot be approved
    *  (it changed since), or null once it is the approved version. */
   skills?: () => ApprovalSkillHost | null;
+  /** The memory store, for `owner_profile` requests: `approve` applies the
+   *  change on the card, checked again, and returns why it cannot, or null
+   *  once it is written. */
+  ownerProfile?: () => ApprovalOwnerProfileHost | null;
   now?: () => number;
   log?: (line: string) => void;
 }
@@ -216,6 +252,11 @@ export interface ApprovalSkillHost {
   approve(r: StoredApproval): string | null;
   /** Denied, or expired unanswered: the proposal is archived. */
   deny(r: StoredApproval): void;
+}
+
+/** What an `owner_profile` request's Approve does to the owner's profile. */
+export interface ApprovalOwnerProfileHost {
+  approve(r: StoredApproval): string | null;
 }
 
 /** What `proposeSkill` takes (the store has written the proposal). */
@@ -230,7 +271,7 @@ export interface SkillApprovalInput {
   reason: string;
 }
 
-type Refusal = FactoryRefusal<'not_bot' | 'not_running' | 'invalid' | 'no_repo' | 'read_failed' | 'not_open' | 'too_many' | 'not_found' | 'not_pending' | 'too_late' | 'not_ruleable' | 'write_failed' | 'not_started' | 'stale'>;
+type Refusal = FactoryRefusal<'not_bot' | 'not_running' | 'not_now' | 'invalid' | 'no_repo' | 'read_failed' | 'not_open' | 'too_many' | 'not_found' | 'not_pending' | 'too_late' | 'not_ruleable' | 'write_failed' | 'not_started' | 'stale'>;
 
 function refuse(code: Refusal['code'], message: string): Refusal {
   return { ok: false, code, message };
@@ -389,10 +430,12 @@ const ACTION_TITLE: Readonly<Record<ApprovalAction, string>> = {
   comment: 'Comment on',
   release: 'Publish a release of',
   skill: 'Load the skill',
+  owner_profile: 'Change',
 };
 
 function subject(r: Pick<ApprovalRequest, 'action' | 'repoKey' | 'prNumber' | 'issueNumber' | 'skill'>): string {
   if (r.skill) return `${r.skill.name} ${r.skill.version}`;
+  if (r.action === 'owner_profile') return 'your profile';
   if (r.prNumber !== undefined) return `PR #${r.prNumber}`;
   if (r.issueNumber !== undefined) return `issue #${r.issueNumber}`;
   return r.repoKey;
@@ -415,6 +458,30 @@ export function skillCardLines(update: boolean, diff: string, room: number): str
     fence,
   ];
   return lines.join('\n').length <= room ? lines : null;
+}
+
+const OWNER_PROFILE_TITLE: Readonly<Record<MemoryChange['action'], string>> = {
+  add: 'Add this to your profile?',
+  replace: 'Change this in your profile?',
+  remove: 'Remove this from your profile?',
+};
+
+/** An owner-profile card's lines after the bot's: what Approve does, then
+ *  the exact entry (replace: as it reads, then as it would), each in a
+ *  fence no backtick run in it can close. Pure. */
+export function ownerProfileCardLines(change: MemoryChange): string[] {
+  const block = (text: string): string[] => {
+    const fence = fenceFor(text);
+    return [`${fence}text`, text, fence];
+  };
+  const shared = 'Every bot of yours reads your profile when its session starts.';
+  if (change.action === 'add') {
+    return ['', `Approve to add this entry; Deny drops it. ${shared}`, '', ...block(change.text ?? '')];
+  }
+  if (change.action === 'remove') {
+    return ['', `Approve to remove this entry; Deny keeps it. ${shared}`, '', ...block(change.old ?? '')];
+  }
+  return ['', `Approve to replace this entry; Deny keeps it as it is. ${shared}`, '', 'Now:', ...block(change.old ?? ''), '', 'Becomes:', ...block(change.text ?? '')];
 }
 
 /** The first line of an approval card's body. */
@@ -512,7 +579,7 @@ export class ApprovalService {
       return refuse('invalid', `action must be one of ${APPROVAL_ACTIONS.join(', ')}`);
     }
     const act = action as ApprovalAction;
-    if (act === 'skill') return refuse('invalid', 'a skill is proposed with skill_propose');
+    if (CARD_ONLY_ACTIONS.has(act)) return refuse('invalid', act === 'skill' ? 'a skill is proposed with skill_propose' : 'a change to the owner\'s profile is proposed with memory_update');
     const num = (v: unknown): number | undefined | null => (v === undefined ? undefined : Number.isSafeInteger(v) && (v as number) > 0 ? (v as number) : null);
     const prNumber = num(raw.prNumber);
     const issueNumber = num(raw.issueNumber);
@@ -529,6 +596,7 @@ export class ApprovalService {
 
     const wake = this.ports.runningWake(bot.botId);
     if (!wake) return refuse('not_running', 'a bot asks for approval only during a wake');
+    const readerGuest = wake.guest === true;
     let profile: BotProfile | null = null;
     try {
       profile = this.ports.bots()?.get(bot.botId) ?? null;
@@ -543,7 +611,7 @@ export class ApprovalService {
     // One request per (bot, key): a retried turn gets the first one back.
     const clientRequestId = typeof raw.clientRequestId === 'string' ? raw.clientRequestId : this.nextOrdinal(bot.botId, wake);
     const prior = [...this.requests.values()].find((r) => r.botId === bot.botId && r.clientRequestId === clientRequestId);
-    if (prior) return { ok: true, request: approvalView(prior), duplicate: true };
+    if (prior) return { ok: true, request: botApprovalView(prior, readerGuest), duplicate: true };
     const open = [...this.requests.values()].filter((r) => r.botId === bot.botId && r.state === 'pending');
     if (open.length >= APPROVAL_LIMITS.PENDING_PER_BOT) return refuse('too_many', `${open.length} requests already wait for the owner`);
 
@@ -561,7 +629,7 @@ export class ApprovalService {
       // The same head already asked about and not settled: that request.
       const same = [...this.requests.values()].find((r) => r.action === 'merge' && r.repoKey === repoKey && r.prNumber === prNumber && r.headSha === headSha
         && (r.state === 'pending' || r.state === 'approved'));
-      if (same) return { ok: true, request: approvalView(same), duplicate: true };
+      if (same) return { ok: true, request: botApprovalView(same, readerGuest), duplicate: true };
       const login = await this.ports.ghLogin({ key: repoKey, path: repoPath }).catch(() => null);
       if (!login) return refuse('read_failed', 'the gh login could not be read');
       ghLogin = login.toLowerCase();
@@ -574,7 +642,7 @@ export class ApprovalService {
     // A request stored while this one read GitHub (a retry, another bot).
     const again = [...this.requests.values()].find((r) => (r.botId === bot.botId && r.clientRequestId === clientRequestId)
       || (headSha !== undefined && r.action === 'merge' && r.repoKey === repoKey && r.prNumber === prNumber && r.headSha === headSha && (r.state === 'pending' || r.state === 'approved')));
-    if (again) return { ok: true, request: approvalView(again), duplicate: true };
+    if (again) return { ok: true, request: botApprovalView(again, readerGuest), duplicate: true };
     const openNow = [...this.requests.values()].filter((r) => r.botId === bot.botId && r.state === 'pending').length;
     if (openNow >= APPROVAL_LIMITS.PENDING_PER_BOT) return refuse('too_many', `${openNow} requests already wait for the owner`);
 
@@ -595,7 +663,10 @@ export class ApprovalService {
       // approves it; the card links the PR's (or issue's) own thread.
       threadId: this.conversationThread(bot.botId, wake),
       reason,
-      tainted: wake.tainted,
+      // As the wake reads now, after the waits, and never cleaner than when
+      // it asked.
+      tainted: wake.tainted || still.tainted || guestSourcedWake(wake) || guestSourcedWake(still),
+      guest: guestSourcedWake(wake) || guestSourcedWake(still),
       state: 'pending',
       clientRequestId,
       createdAt: at,
@@ -615,6 +686,8 @@ export class ApprovalService {
   proposeSkill(bot: BotBinding, input: SkillApprovalInput): { ok: true; request: ApprovalView } | Refusal {
     const wake = this.ports.runningWake(bot.botId);
     if (!wake) return refuse('not_running', 'a bot proposes a skill only during a wake');
+    // An approved skill is read in every later wake.
+    if (guestSourcedWake(wake)) return refuse('not_now', `skill_propose: ${GUEST_TURN_STARTS_NO_WORKERS}`);
     let profile: BotProfile | null = null;
     try {
       profile = this.ports.bots()?.get(bot.botId) ?? null;
@@ -642,7 +715,8 @@ export class ApprovalService {
       workspaceId: bot.workspaceId,
       threadId: this.conversationThread(bot.botId, wake),
       reason,
-      tainted: wake.tainted,
+      tainted: wake.tainted || guestSourcedWake(wake),
+      guest: guestSourcedWake(wake),
       state: 'pending',
       clientRequestId: `skill:${input.name}:${input.hash}`,
       createdAt: at,
@@ -655,6 +729,63 @@ export class ApprovalService {
     if (!this.put({ ...record, cardId: card.id })) {
       this.closeCard({ ...record, cardId: card.id });
       return refuse('write_failed', 'the request could not be stored; propose the skill again');
+    }
+    this.changed(record.workspaceId);
+    return { ok: true, request: approvalView(this.get(record.requestId) ?? record) };
+  }
+
+  /** A bot's change to the owner's profile (the memory module, from
+   *  `memory_update` target `user`): one `owner_profile` request whose card
+   *  shows the exact change. The same change waiting already is that
+   *  request; no rule ever approves one. */
+  proposeOwnerProfile(bot: BotBinding, change: MemoryChange): { ok: true; request: ApprovalView; duplicate?: true } | Refusal {
+    const wake = this.ports.runningWake(bot.botId);
+    if (!wake) return refuse('not_running', 'a bot proposes a change to the owner\'s profile only during a wake');
+    // Every bot reads the profile in every later session.
+    if (guestSourcedWake(wake)) return refuse('not_now', `memory_update: ${GUEST_TURN_STARTS_NO_WORKERS}`);
+    let profile: BotProfile | null = null;
+    try {
+      profile = this.ports.bots()?.get(bot.botId) ?? null;
+    } catch {
+      profile = null;
+    }
+    if (!profile || !profile.enabled || profile.workspaceId !== bot.workspaceId) return refuse('not_bot', 'this bot is not running in the factory');
+    const key = `owner_profile:${createHash('sha256').update(JSON.stringify([change.action, change.text ?? null, change.old ?? null])).digest('hex').slice(0, 32)}`;
+    const waiting = [...this.requests.values()].find((r) => r.botId === bot.botId && r.state === 'pending' && r.clientRequestId === key);
+    if (waiting) return { ok: true, request: approvalView(waiting), duplicate: true };
+    const open = [...this.requests.values()].filter((r) => r.botId === bot.botId && r.state === 'pending').length;
+    if (open >= APPROVAL_LIMITS.PENDING_PER_BOT) return refuse('too_many', `${open} requests already wait for the owner`);
+    const reason = 'Remember this about you, for every bot.';
+    const lines = ownerProfileCardLines(change);
+    // Measured as the room stores it: the owner reads all of what they approve.
+    if (redactStoredSecrets([askLine(profile, reason), ...lines].join('\n')).length > ROOM_LIMITS.CARD_BODY_MAX) {
+      return refuse('invalid', 'the change does not fit on the owner\'s card; propose a shorter entry');
+    }
+    const at = this.now();
+    const record: StoredApproval = {
+      requestId: newRequestId(),
+      action: 'owner_profile',
+      repoKey: '',
+      repoPath: '',
+      ownerProfile: { ...change },
+      botId: bot.botId,
+      workspaceId: bot.workspaceId,
+      threadId: this.conversationThread(bot.botId, wake),
+      reason,
+      tainted: wake.tainted || guestSourcedWake(wake),
+      guest: guestSourcedWake(wake),
+      state: 'pending',
+      clientRequestId: key,
+      createdAt: at,
+      updatedAt: at,
+    };
+    // Approved on its card only: the card is posted first and the request
+    // stored once, with it.
+    const card = this.postCard(record, profile, wake, lines);
+    if (!card) return refuse('write_failed', 'the approval card could not be posted; propose the change again');
+    if (!this.put({ ...record, cardId: card.id })) {
+      this.closeCard({ ...record, cardId: card.id });
+      return refuse('write_failed', 'the request could not be stored; propose the change again');
     }
     this.changed(record.workspaceId);
     return { ok: true, request: approvalView(this.get(record.requestId) ?? record) };
@@ -774,11 +905,17 @@ export class ApprovalService {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > APPROVAL_LIMITS.LIST_MAX) return refuse('invalid', `limit must be 1..${APPROVAL_LIMITS.LIST_MAX}`);
     this.expire();
     const want = states as ApprovalState[] | undefined;
+    let readerGuest = false;
+    try {
+      readerGuest = this.ports.runningWake(bot.botId)?.guest === true;
+    } catch {
+      readerGuest = false;
+    }
     const rows = [...this.requests.values()]
       .filter((r) => r.botId === bot.botId && (!want || want.includes(r.state)))
       .sort((a, b) => b.createdAt - a.createdAt)
       .slice(0, limit)
-      .map(approvalView);
+      .map((r) => botApprovalView(r, readerGuest));
     return { ok: true, requests: rows };
   }
 
@@ -879,6 +1016,8 @@ export class ApprovalService {
     }
     const skillHost = cur.action === 'skill' ? this.ports.skills?.() ?? null : null;
     if (cur.action === 'skill' && !skillHost) return refuse('not_started', 'skills are not running yet');
+    const profileHost = cur.action === 'owner_profile' ? this.ports.ownerProfile?.() ?? null : null;
+    if (cur.action === 'owner_profile' && !profileHost) return refuse('not_started', 'memory is not running yet');
     const at = this.now();
     const next: StoredApproval = {
       ...cur,
@@ -916,6 +1055,24 @@ export class ApprovalService {
         return refuse('stale', why);
       }
     }
+    if (profileHost) {
+      // The owner's answer is the act, checked again as the profile stands
+      // now (the scanner, the limit, the entry it was for). When it cannot be
+      // applied the decision is taken back and the card is moot.
+      let why: string | null;
+      try {
+        why = profileHost.approve(next);
+      } catch (err) {
+        why = `the change could not be applied: ${String(err)}`;
+      }
+      if (why) {
+        const moot: StoredApproval = { ...cur, state: 'expired', updatedAt: this.now() };
+        if (this.put(moot)) this.closeCard(moot);
+        else this.log(`[factory] approval ${cur.requestId} kept as approved though its change was not applied`);
+        this.changed(cur.workspaceId);
+        return refuse('stale', why);
+      }
+    }
     this.log(`[factory] approval ${cur.requestId} approved by ${approver} (${by})`);
     // Decided: the card stops waiting on the owner (its Undo reads the request).
     this.closeCard(next);
@@ -924,6 +1081,8 @@ export class ApprovalService {
     // A merge is told once it ran (merged, or refused); any other act now.
     if (next.action === 'skill') {
       this.tellDecided(next, `The owner approved your skill ${subject(next)}.`, 'It is listed in your wakes from now on; read it with skill_read.');
+    } else if (next.action === 'owner_profile') {
+      this.tellDecided(next, 'The owner approved the change to their profile.', 'Every bot\'s next session starts with it.');
     } else if (next.action !== 'merge') {
       this.tellDecided(next, `The owner approved: ${ACTION_TITLE[next.action]} ${subject(next)}.`, 'wmux records it but does not carry this act out yet.');
     }
@@ -951,8 +1110,9 @@ export class ApprovalService {
       this.typedSeen.delete(first);
     }
     this.expire();
-    // A skill is approved on its card only, where its diff is shown.
-    const pending = [...this.requests.values()].filter((r) => r.state === 'pending' && r.action !== 'skill');
+    // A skill or a profile change is approved on its card only, where the
+    // change is shown.
+    const pending = [...this.requests.values()].filter((r) => r.state === 'pending' && !CARD_ONLY_ACTIONS.has(r.action));
     // The thread's latest cards: what sits between the requests and the words.
     const threadCards = writer.read(stored.workspaceId, { threadId: stored.threadId }).cards;
     let message: RoomCard = stored;
@@ -1249,10 +1409,14 @@ export class ApprovalService {
   private tellDecided(r: StoredApproval, title: string, body?: string): void {
     const cardSeq = r.cardId ? this.ports.rooms()?.get(r.workspaceId, r.cardId)?.seq ?? null : null;
     const bots = new Set([r.botId, ...this.speakersAfter(r.workspaceId, r.threadId, cardSeq)]);
+    // As guest-sourced as the request (an older one without the field: as
+    // its taint says).
+    const guest = guestOfRecord(r.guest, r.tainted) !== false;
     for (const botId of [...bots].slice(0, APPROVAL_LIMITS.NOTIFY_MAX)) {
       this.notice({
         botId, workspaceId: r.workspaceId, key: `approval:${r.requestId}:${r.state}`, topic: 'approval.decided',
         title, ...(body ? { body } : {}), threadId: r.threadId, repoKey: r.repoKey,
+        ...(guest ? { guest: true, tainted: true } : {}),
         ...(r.prNumber !== undefined ? { pr: r.prNumber } : {}),
       });
     }
@@ -1281,7 +1445,8 @@ export class ApprovalService {
     }
     let watching: BotProfile[] = [];
     try {
-      watching = (this.ports.bots()?.listEnabled() ?? []).filter((b) => normalizeRepoKey(b.repo?.repoKey) === repoKey);
+      // A guest workspace has no repository; skipped all the same.
+      watching = (this.ports.bots()?.listEnabled() ?? []).filter((b) => normalizeRepoKey(b.repo?.repoKey) === repoKey && !guestSide(b.workspaceId));
     } catch {
       watching = [];
     }
@@ -1337,21 +1502,22 @@ export class ApprovalService {
 
   // ── cards ──
 
-  private postCard(r: StoredApproval, profile: BotProfile, wake: ApprovalWake, skillLines?: readonly string[]): RoomCard | null {
+  private postCard(r: StoredApproval, profile: BotProfile, wake: ApprovalWake, changeLines?: readonly string[]): RoomCard | null {
     const writer = this.ports.rooms();
     if (!writer) return null;
     const replyTo = wakeReplyTo(writer, wake, r.workspaceId, r.threadId);
     const what = r.skill
       ? `${r.skill.update ? 'Update the skill' : 'Add the skill'} ${subject(r)}?`
+      : r.ownerProfile ? OWNER_PROFILE_TITLE[r.ownerProfile.action]
       : `${ACTION_TITLE[r.action]} ${subject(r)}${r.headSha ? ` at ${r.headSha.slice(0, 7)}` : ''}?`;
     const subjectThread = r.prNumber !== undefined ? prThreadId(r.repoKey, r.prNumber) : r.issueNumber !== undefined ? issueThreadId(r.repoKey, r.issueNumber) : null;
     const lines = [
       askLine(profile, r.reason),
       // "Started from outside text" is the card's own line, from the
       // request's `tainted` (ApprovalAnswers, the phone): not in the body.
-      ...(r.action === 'merge' || r.action === 'skill' ? [] : ['wmux records your answer; it does not carry this act out yet.']),
+      ...(r.action === 'merge' || CARD_ONLY_ACTIONS.has(r.action) ? [] : ['wmux records your answer; it does not carry this act out yet.']),
     ];
-    if (skillLines) lines.push(...skillLines);
+    if (changeLines) lines.push(...changeLines);
     const res = writer.post({
       workspaceId: r.workspaceId,
       threadId: r.threadId,
@@ -1369,6 +1535,7 @@ export class ApprovalService {
       state: 'open',
       ...(replyTo ? { replyTo } : {}),
       clientPostId: `approval:${r.requestId}`,
+      ...(guestSourcedWake(wake) ? { origin: 'guest' as const } : {}),
     });
     return res.ok ? res.card : null;
   }

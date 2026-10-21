@@ -353,7 +353,7 @@ export function hostedBindingOf(ctx?: RpcContext): string | undefined {
 
 export type RpcResponse =
   | { id: string; ok: true; result: unknown }
-  | { id: string; ok: false; error: string; rejection?: RpcRejection };
+  | { id: string; ok: false; error: string; rejection?: RpcRejection; retryable?: boolean };
 
 // Structured rejection surfaced by the Phase 2.2 permission enforcer.
 //
@@ -415,6 +415,7 @@ export type RpcMethod =
   // `#w1-2` / `#backend` → the pane's ids (MCP tools accept pane names).
   | 'pane.resolveName'
   // The Fleet attention board (needs you / running / idle) as data.
+  | 'agent.state'
   | 'fleet.triage'
   | 'pane.focus'
   | 'pane.split'
@@ -691,6 +692,7 @@ export type RpcMethod =
   | 'bot.interrupt'
   | 'room.post'
   | 'room.read'
+  | 'room.search'
   | 'room.threads'
   | 'room.resolve'
   | 'handoff.send'
@@ -727,6 +729,8 @@ export type RpcMethod =
   // approval, read an approved one.
   | 'skill.propose'
   | 'skill.read'
+  // A bot's own notes and the owner's profile (shared/botMemory.ts).
+  | 'memory.update'
   // Task lifecycle on the pipe (pipe/handlers/worktask.rpc.ts) — the half of
   // fan-out that finishes a task. Local-origin only, owner-scoped against
   // `task.mission.list`, and `task.close` / `task.pr` additionally raise a
@@ -766,6 +770,7 @@ export const ALL_RPC_METHODS = [
   'surface.close',
   'pane.list',
   'pane.resolveName',
+  'agent.state',
   'fleet.triage',
   'pane.focus',
   'pane.split',
@@ -992,6 +997,7 @@ export const ALL_RPC_METHODS = [
   'bot.interrupt',
   'room.post',
   'room.read',
+  'room.search',
   'room.threads',
   'room.resolve',
   'handoff.send',
@@ -1022,6 +1028,7 @@ export const ALL_RPC_METHODS = [
   'botLogin.request',
   'skill.propose',
   'skill.read',
+  'memory.update',
   'task.gate.run',
   'task.gate.cancel',
   'task.adopt',
@@ -1101,15 +1108,21 @@ export interface DaemonEvent {
     // activity line; '' clears it.
     //   agent.transcriptActivity → { activity: string }
     | 'agent.transcriptActivity'
+    // Background work of the pane's agent still runs: an Agent Teams teammate
+    // (its own transcript, daemon/transcript/teammateActivity) or a Claude
+    // background shell. Sent on every scan that finds some; nothing when none
+    // works.
+    //   agent.teammates → null
+    | 'agent.teammates'
+    // The pane's Claude Code Agent Teams teammates (daemon/transcript/
+    // teammateActivity), sent on change; [] when the watch ends.
+    //   agent.teammateList → { teammates: TeammateInfo[] }
+    | 'agent.teammateList'
     // How many subagents the agent has running, read from its transcript
     // (daemon/transcript/subagentCount). Sent on change; 0 when the watch
     // ends, so a stale count never sticks.
     //   agent.subagents → { count: number }
     | 'agent.subagents'
-    // The pane's Claude Code Agent Teams teammates (daemon/transcript/
-    // teammateActivity), sent on change; [] when the watch ends.
-    //   agent.teammates → { teammates: TeammateInfo[] }
-    | 'agent.teammates'
     | 'prompt.event'
     | 'notification.event'
     | 'cwd.changed'

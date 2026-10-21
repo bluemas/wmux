@@ -188,9 +188,13 @@ export class ClaudeSubagentCounter implements SubagentCounter {
 
   noteLine(line: string): void {
     const notification = line.includes('<task-notification>');
-    if (!notification && !line.includes('"tool_use"') && !line.includes('"tool_result"') && !line.includes('"type":"user"')) return;
+    const turnEnd = this.foreground.size > 0 && line.includes('"stop_reason":"');
+    if (!notification && !turnEnd && !line.includes('"tool_use"') && !line.includes('"tool_result"') && !line.includes('"type":"user"')) return;
     const entry = parse(line);
-    if (!entry) return;
+    // A subagent's own records (older Claude Code wrote them into the lead's
+    // transcript) are its conversation, not the lead's: its task prompt is no
+    // human prompt, and its calls are not the lead's subagents.
+    if (!entry || entry.isSidechain === true) return;
     const message = record(entry.message);
     // Only the conversation's own records: an `api-request-blob` carries a
     // copy of earlier turns, and re-reading its tool calls would revive them.
@@ -200,6 +204,12 @@ export class ClaudeSubagentCounter implements SubagentCounter {
     if (entry.type === 'user' && entry.isMeta !== true && entry.isCompactSummary !== true
       && record(entry.origin).kind !== 'task-notification'
       && (typeof message.content === 'string' || (content && !content.some((b) => record(b).type === 'tool_result')))) {
+      this.foreground.clear();
+    }
+    // The lead's turn ended: no foreground call of it still runs (one left
+    // without a result by an interrupt, say).
+    if (entry.type === 'assistant' && typeof message.stop_reason === 'string' && message.stop_reason !== 'tool_use'
+      && !(content ?? []).some((b) => record(b).type === 'tool_use')) {
       this.foreground.clear();
     }
     const results = content ? content.filter((b) => record(b).type === 'tool_result').length : 0;

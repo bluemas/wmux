@@ -547,6 +547,12 @@ export interface MetadataUpdatePayload {
   // state). Never persisted.
   activity?: string;
   /**
+   * An Agent Teams teammate of this pane's agent still works: refreshes the
+   * pane's running stamp only, never its status. Per-ptyId, destructured out
+   * like `activity`.
+   */
+  teammatesWorking?: true;
+  /**
    * How many subagents this pane's agent has running, read by the daemon from
    * the agent's transcript (daemon/transcript/subagentCount). Per-ptyId only,
    * like `activity`: the renderer destructures it out before applying the
@@ -1009,8 +1015,10 @@ export interface SessionData {
   attentionBlink?: string;
   attentionBlinkRemindMs?: number;
   attentionBlinkFinished?: string;
-  /** macOS window glass level ('off' | 'soft' | 'clear'). Whitelisted on load (windowGlass.ts). */
+  /** Window glass level ('off' | 'soft' | 'clear'), macOS and Windows 11. Whitelisted on load (shared/windowGlass.ts). */
   windowGlass?: string;
+  /** The theme's polarity ('dark' | 'light') at save time. Main reads it before the window exists to set the acrylic's tone on Windows. */
+  windowAppearance?: string;
   /** #1481 — workspace list order ('manual' | 'attention' | 'recent'). Absent in
    *  older sessions; `sidebarAttentionFirst` then decides. Whitelisted on load. */
   sidebarSortMode?: string;
