@@ -2,6 +2,7 @@ import type { BrowserWindow, WebContents } from 'electron';
 import { Notification, nativeImage, shell, webContents } from 'electron';
 import type { RpcRouter } from '../RpcRouter';
 import { sendToRenderer } from './_bridge';
+import { logNotificationFailure } from '../../notification/notificationFailure';
 import { IPC } from '../../../shared/constants';
 import { HelpRequests } from '../../browser-session/HelpRequests';
 import {
@@ -103,6 +104,7 @@ import { PRIVATE_BROWSER_PARTITION } from '../../../shared/privateBrowser';
 import { WebviewCdpManager } from '../../browser-session/WebviewCdpManager';
 import { BrowserCaptureManager } from '../../browser-session/BrowserCaptureManager';
 import { validateResolvedNavigationUrl } from '../../security/navigationPolicy';
+import { navigationPolicyOptions, type NavigationPolicyOptions } from '../../../shared/types';
 import { parseKeyPress } from './cdpKeys';
 import {
   BROWSER_TABS_ACTIONS,
@@ -136,6 +138,9 @@ import {
 import type { EnforcementMode } from '../../mcp/enforcementMode';
 import { isFirstPartyClient } from '../../mcp/firstParty';
 import { isLocalExternalWireContext } from '../../mcp/rpcProvenance';
+import type { BrowserAgentControl } from '../../browser-session/BrowserAgentControl';
+import { heldBrowserSurfaceRefusal } from './surface.rpc';
+import { agentControlRefusal } from '../../../shared/browserAgentControl';
 
 type GetWindow = () => BrowserWindow | null;
 
@@ -158,7 +163,13 @@ export interface BrowserPolicyWiring {
 export type CallerBrowserProtection = (method: string, ctx: RpcContext | undefined) => Promise<string | null>;
 
 /** Token-addressed lease bookkeeping: no caller scope, nothing to decide. */
-const PROTECTED_GATE_EXEMPT: ReadonlySet<string> = new Set(['browser.lease.renew', 'browser.lease.release']);
+const PROTECTED_GATE_EXEMPT: ReadonlySet<string> = new Set([
+  'browser.lease.renew',
+  'browser.lease.release',
+  // An app-wide setting the MCP preflight reads before it knows any pane; no
+  // page is reached and nothing is pane-specific.
+  'browser.navigationPolicy.get',
+]);
 
 /**
  * Methods a protected pane may not call at all, with the reason. Agent-authored
@@ -286,8 +297,8 @@ function navigationRefusal(reason: Exclude<NavigationVerdict, { allowed: true }>
   return "that host is not on this pane's allowed list";
 }
 
-async function validateUrl(url: string, method: string): Promise<void> {
-  const result = await validateResolvedNavigationUrl(url);
+async function validateUrl(url: string, method: string, policy: NavigationPolicyOptions): Promise<void> {
+  const result = await validateResolvedNavigationUrl(url, policy);
   if (!result.valid) {
     throw new Error(`${method}: ${result.reason}`);
   }
@@ -877,6 +888,35 @@ const HELP_EVALUATE_TIMEOUT_MS = 2_000;
 const HELP_REVEAL_TIMEOUT_MS = 2_000;
 // Bound for the capturePage fallback — it can hang on exactly the same guests.
 const CAPTURE_PAGE_TIMEOUT_MS = 1_500;
+/** Longest a browser.lease.renew may park on its lease (`waitMs`), well inside
+ *  the lease TTL so the parked call is itself the renewal. */
+const LEASE_WATCH_MAX_MS = 8_000;
+/** How long a gone guest may take to register again (a remount after a pane
+ *  move) before its tab's agent control is forgotten as closed. */
+const AGENT_CONTROL_CLOSE_GRACE_MS = 30_000;
+
+/**
+ * Wait for `work`, or until `signal` aborts, whichever is first. The abort
+ * listener is removed either way: the signal lives as long as the caller's
+ * socket, and each parked renew would otherwise leave one behind on it.
+ */
+export async function untilAborted(work: Promise<unknown>, signal: AbortSignal | undefined): Promise<void> {
+  if (!signal) {
+    await work;
+    return;
+  }
+  if (signal.aborted) return;
+  let release = (): void => undefined;
+  const aborted = new Promise<void>((resolve) => {
+    release = () => resolve();
+    signal.addEventListener('abort', release, { once: true });
+  });
+  try {
+    await Promise.race([work, aborted]);
+  } finally {
+    signal.removeEventListener('abort', release);
+  }
+}
 
 /**
  * Caller-facing text for a refused scope decision.
@@ -968,6 +1008,11 @@ export function registerBrowserRpc(
   // below opened the request on. A store hung off module scope could not see
   // `getWindow` or the CDP manager, and a second instance would answer for
   // requests it never created.
+  //
+  // Agent control of in-app browser tabs (Stop / Take over in the pane). Asked
+  // before an agent action takes its lease on a resolved surface; absent means
+  // every tab is under agent control, as before.
+  agentControl?: Pick<BrowserAgentControl, 'refusal' | 'forget' | 'list'>,
 ): HelpRequests {
   const getActivePartition = (): string => profileManager.getActiveProfile().partition;
 
@@ -1278,6 +1323,11 @@ export function registerBrowserRpc(
    *  the default, which is the narrow grant. */
   const liveWriteScopeSetting = () => backendStore?.liveWriteScope?.() ?? DEFAULT_LIVE_WRITE_SCOPE;
 
+  /** The navigation policy's inputs, read per call like the scope above, so a
+   *  Settings toggle reaches the very next navigation. Same optional-method
+   *  posture: a store that predates the setting means the default, off. */
+  const navigationPolicy = () => navigationPolicyOptions(backendStore?.allowPrivateNetwork?.() === true);
+
   /**
    * The write-scope policy in force for this caller, or null when there is none
    * to apply: a non-chrome backend, a dedicated Chrome (where every addressable
@@ -1520,7 +1570,7 @@ export function registerBrowserRpc(
   };
 
   const delegateExternal = async (url: string, method: string): Promise<ExternalOpenResult> => {
-    await validateUrl(url, method);
+    await validateUrl(url, method, navigationPolicy());
     await shell.openExternal(url);
     return { backend: 'external', opened: true, url };
   };
@@ -1534,11 +1584,16 @@ export function registerBrowserRpc(
   const resolveTargetSurface = async (
     surfaceId: string | undefined,
     workspaceId: string | undefined,
+    method: string,
   ): Promise<string | undefined> => {
     // Non-builtin backends never own builtin surfaces: without an explicit
     // surfaceId the default-target lookup must not grab another workspace's
     // pane ('external' fire-and-forget; 'chrome' tabs live outside webviews).
     if (backend() !== 'builtin' && !surfaceId) return undefined;
+    // A named tab the user paused or took over is refused before the wake
+    // below, so a discarded tab is not reloaded just to be refused.
+    const namedHold = surfaceId ? agentControl?.refusal(surfaceId, method) : null;
+    if (namedHold) throw namedHold;
     let resolved = webviewCdpManager.getTarget(surfaceId, workspaceId)?.surfaceId;
     if (!resolved) {
       resolved = (await webviewCdpManager.ensureAwake(surfaceId, workspaceId))?.surfaceId;
@@ -1667,9 +1722,10 @@ export function registerBrowserRpc(
   // unregister() fires only on real guest departure (destroyed / different-guest
   // replacement — same-guest re-register skips it), so record it as a close for
   // the lifecycle drain.
-  webviewCdpManager.setCaptureCleanup((webContentsId) =>
-    captureManager.drop(webContentsId, { closed: true }),
-  );
+  webviewCdpManager.setCaptureCleanup((webContentsId) => {
+    captureManager.drop(webContentsId, { closed: true });
+    forgetAgentControlIfClosed(webContentsId);
+  });
 
   // Start capture as soon as a guest registers (#1081) — did-attach, before the
   // page has loaded — so the load-time error an agent goes looking for is
@@ -1682,6 +1738,22 @@ export function registerBrowserRpc(
       // handlers report the miss when someone actually reads.
     });
   });
+
+  // A tab's agent control (paused / taken over) is dropped once its guest is gone
+  // for good. unregister() also runs for a discard (the tab stays, asleep) and
+  // for a remount (a pane moved), so a discarded guest is kept, and the rest are
+  // forgotten only if the surface has not registered again after a grace.
+  function forgetAgentControlIfClosed(webContentsId: number): void {
+    if (!agentControl) return;
+    const target = webviewCdpManager.listTargets().find((t) => t.webContentsId === webContentsId);
+    if (!target || webviewCdpManager.isDiscarded(target.surfaceId)) return;
+    const surfaceId = target.surfaceId;
+    const timer = setTimeout(() => {
+      if (webviewCdpManager.getTarget(surfaceId) || webviewCdpManager.isDiscarded(surfaceId)) return;
+      agentControl.forget(surfaceId);
+    }, AGENT_CONTROL_CLOSE_GRACE_MS);
+    timer.unref?.();
+  }
 
   // browser.lifecycle.get target-tolerance: remember the last webContentsId a
   // scope drained from, so a close can still be reported after the target is
@@ -1739,7 +1811,11 @@ export function registerBrowserRpc(
       // (codex P1 — otherwise the default MCP path fails once the only pane is
       // discarded). In EXTERNAL mode the default lookup is blocked entirely —
       // see resolveTargetSurface.
-      const resolved = await resolveTargetSurface(surfaceId, scope);
+      const resolved = await resolveTargetSurface(surfaceId, scope, method);
+      // The user paused or took over this tab: refuse before the lease, so the
+      // refused call never lights the "agent is driving" marker either.
+      const userHold = resolved ? agentControl?.refusal(resolved, method) : null;
+      if (userHold) throw userHold;
       if (!resolved) {
         if (backend() === 'external') {
           if (externalFallback) return externalFallback(params);
@@ -1955,11 +2031,13 @@ export function registerBrowserRpc(
     }
     try {
       if (!Notification.isSupported()) return;
-      new Notification({
+      const notification = new Notification({
         title: 'wmux — the browser needs you',
         body: prompt,
         silent: false,
-      }).show();
+      });
+      logNotificationFailure(notification, 'browser.help.request');
+      notification.show();
     } catch {
       /* notifications are unavailable on some Linux desktops */
     }
@@ -2395,20 +2473,45 @@ export function registerBrowserRpc(
         ? { protected: true, epoch: pd.epoch, hosts: pd.hosts }
         : { protected: false };
       if (!surfaceId) return { token: null, policy };
-      const resolvedForAuth = await resolveTargetSurface(surfaceId, scope);
+      const resolvedForAuth = await resolveTargetSurface(surfaceId, scope, 'browser.lease.acquire');
+      const userHold = resolvedForAuth ? agentControl?.refusal(resolvedForAuth, 'browser.lease.acquire') : null;
+      if (userHold) throw userHold;
       return { token: resolvedForAuth ? webviewCdpManager.acquireRpcLease(resolvedForAuth) : null, policy };
     }
     // Wake a discarded guest so out-of-process (Playwright) automation gets a
     // live target under its lease (#517 slice C). Without surfaceId this
     // defaults to any discarded surface in builtin mode; external mode blocks
     // the default lookup (see resolveTargetSurface).
-    const resolved = await resolveTargetSurface(surfaceId, scope);
+    const resolved = await resolveTargetSurface(surfaceId, scope, 'browser.lease.acquire');
     if (!resolved) return { token: null };
+    const userHold = agentControl?.refusal(resolved, 'browser.lease.acquire');
+    if (userHold) throw userHold;
     return { token: webviewCdpManager.acquireRpcLease(resolved) };
   });
-  router.register('browser.lease.renew', async (params) => {
+  // `waitMs` parks the call until the lease is revoked or released (at most
+  // LEASE_WATCH_MAX_MS), so the holder hears about a Stop at once instead of
+  // polling. The reply says `watched: true` when it waited; a holder that does
+  // not see it is talking to a main that ignores waitMs and paces itself.
+  router.register('browser.lease.renew', async (params, ctx) => {
     const token = typeof params['token'] === 'string' ? params['token'] : '';
-    return { ok: webviewCdpManager.renewRpcLease(token) };
+    const waitMs = typeof params['waitMs'] === 'number' && Number.isFinite(params['waitMs'])
+      ? Math.min(Math.max(0, params['waitMs']), LEASE_WATCH_MAX_MS)
+      : 0;
+    const userEnded = () => {
+      const revoked = webviewCdpManager.rpcLeaseRevocation(token);
+      if (revoked) throw new Error(`browser.lease.renew: ${revoked.message}`);
+    };
+    userEnded();
+    const ok = webviewCdpManager.renewRpcLease(token);
+    if (!ok || waitMs === 0) return { ok };
+    const signal = ctx?.signal;
+    await untilAborted(webviewCdpManager.watchRpcLease(token, waitMs), signal);
+    // The holder hung up while parked (its process died): no final renew, so
+    // the lease lapses at the TTL the park started with instead of being
+    // carried another full TTL by a caller that is gone.
+    if (signal?.aborted) return { ok: false, watched: true };
+    userEnded();
+    return { ok: webviewCdpManager.renewRpcLease(token), watched: true };
   });
   router.register('browser.lease.release', async (params) => {
     const token = typeof params['token'] === 'string' ? params['token'] : '';
@@ -2505,7 +2608,7 @@ export function registerBrowserRpc(
       if (action === 'new') {
         if (url) {
           try {
-            await validateUrl(url, 'browser.tabs');
+            await validateUrl(url, 'browser.tabs', navigationPolicy());
           } catch (error) {
             return browserTabsError(
               'BROWSER_TAB_URL_BLOCKED',
@@ -2703,7 +2806,7 @@ export function registerBrowserRpc(
       // URL validation failure is a URL_BLOCKED error; a failed OS launch is a
       // CREATE_FAILED — the two must not share a code (agents branch on it).
       try {
-        await validateUrl(url, 'browser.tabs');
+        await validateUrl(url, 'browser.tabs', navigationPolicy());
       } catch (error) {
         return browserTabsError(
           'BROWSER_TAB_URL_BLOCKED',
@@ -2727,7 +2830,7 @@ export function registerBrowserRpc(
 
     if (action === 'new' && url !== undefined) {
       try {
-        await validateUrl(url, 'browser.tabs');
+        await validateUrl(url, 'browser.tabs', navigationPolicy());
       } catch (error) {
         return browserTabsError(
           'BROWSER_TAB_URL_BLOCKED',
@@ -2736,6 +2839,14 @@ export function registerBrowserRpc(
       }
     }
 
+    // Closing a tab the user paused or took over is an agent action on it like
+    // any other, and the one that would end the user's hold for good.
+    // Answered as a tabs error rather than thrown: the tool relabels a thrown
+    // error "temporarily unavailable", which would invite a retry.
+    if (action === 'close' && surfaceId) {
+      const userHold = agentControl?.refusal(surfaceId, 'browser_tabs close');
+      if (userHold) return browserTabsError('BROWSER_TABS_SCOPE_REFUSED', userHold.message);
+    }
     const rendered = await sendToRenderer(getWindow, 'browser.tabs', {
       action,
       workspaceId,
@@ -2830,7 +2941,7 @@ export function registerBrowserRpc(
       // 'external', about:blank is a valid open here (auto-open path). Always a
       // NEW tab, so there is no reuse question to answer on this backend.
       const { client: launcher, callerPtyId } = await resolveChromeClient('browser.open', ctx, workspaceId);
-      if (url) await validateUrl(url, 'browser.open');
+      if (url) await validateUrl(url, 'browser.open', navigationPolicy());
       const opened = await launcher.openTab(url ?? 'about:blank', workspaceId);
       if (openerKey) surfaceOpeners.note(opened.surfaceId, openerKey, callerPtyId);
       // The launcher's stable surfaceId keeps the engine's auto-open→pin
@@ -2850,7 +2961,7 @@ export function registerBrowserRpc(
       }
       return delegateExternal(url, 'browser.open');
     }
-    if (url) await validateUrl(url, 'browser.open');
+    if (url) await validateUrl(url, 'browser.open', navigationPolicy());
     // Builtin reuse, re-decided now that main knows who opened what.
     //
     // The renderer reuses the workspace's FIRST browser surface in pane-tree
@@ -3043,6 +3154,22 @@ export function registerBrowserRpc(
       surfaceOpeners.forget(newest.surfaceId);
       return { ok: true, backend: 'chrome', closed: true, surfaceId: newest.surfaceId };
     }
+    // The renderer closes the named tab, or this workspace's browser tab when
+    // none is named; refuse if that could be a tab the user paused or took over.
+    // Unnamed, the held tabs are checked against the workspace's surfaces as the
+    // renderer lists them: a discarded held tab has no live CDP target to find.
+    if (surfaceId) {
+      const userHold = agentControl?.refusal(surfaceId, 'browser.close');
+      if (userHold) throw userHold;
+    } else {
+      for (const t of webviewCdpManager.listTargets()) {
+        if (workspaceId && t.workspaceId !== workspaceId) continue;
+        const userHold = agentControl?.refusal(t.surfaceId, 'browser.close');
+        if (userHold) throw userHold;
+      }
+      const userHold = await heldBrowserSurfaceRefusal(getWindow, agentControl, 'browser.close', [workspaceId], () => true);
+      if (userHold) throw userHold;
+    }
     const closeResult = await sendToRenderer(getWindow, 'browser.close', {
       ...(surfaceId && { surfaceId }),
       // Same caller-workspace routing contract as browser.open above, and now
@@ -3150,7 +3277,7 @@ export function registerBrowserRpc(
   };
   registerLeased('browser.navigate', async (params, scope) => {
     const navUrl = requireNavigateUrl(params);
-    await validateUrl(navUrl, 'browser.navigate');
+    await validateUrl(navUrl, 'browser.navigate', navigationPolicy());
     const surfaceId = typeof params['surfaceId'] === 'string' ? params['surfaceId'] : undefined;
 
     // Try CDP direct navigation first
@@ -3213,7 +3340,7 @@ export function registerBrowserRpc(
       );
     }
     const navUrl = requireNavigateUrl(params);
-    await validateUrl(navUrl, 'browser.navigate');
+    await validateUrl(navUrl, 'browser.navigate', navigationPolicy());
     // Owner = the caller-verified scope, never a body-supplied workspaceId
     // (#810 scope-coverage guard).
     const opened = await (await chrome()).client.openTab(navUrl, scope);
@@ -3408,6 +3535,18 @@ export function registerBrowserRpc(
       port,
     };
   });
+
+  /**
+   * browser.navigationPolicy.get
+   * The navigation policy's switch as main decides it (the Settings toggle or
+   * main's environment variable). The MCP server runs the same policy as a
+   * preflight in the agent's process, which can see neither, so it asks here
+   * on every navigation — one answer for one URL (#1359), and a toggle reaches
+   * the next navigation on both sides. Nothing to scope: it is app-wide.
+   */
+  router.register('browser.navigationPolicy.get', async () => ({
+    allowPrivateNetwork: navigationPolicy().allowPrivateNetwork,
+  }));
 
   /**
    * browser.session.list
@@ -4065,17 +4204,26 @@ export function registerBrowserRpc(
         // foreign case answers instantly and the missing case costs the full
         // timeout, and that difference is itself the disclosure.
         const target = await webviewCdpManager.waitForTarget(surfaceId, 5000, scope);
+        // Refused before the target id is handed out. Page discovery attaches
+        // with it; once attached, Playwright drives the page over CDP without
+        // asking main, and only the op's own lease (revoked on Stop) and abort
+        // signal stop it. So a held tab's id is never handed to a new attach.
+        const userHold = agentControl?.refusal(target.surfaceId, 'browser.cdp.target');
+        if (userHold) throw userHold;
         return {
           targetId: target.targetId,
           surfaceId: target.surfaceId,
         };
-      } catch {
+      } catch (err) {
+        if (agentControlRefusal(err)) throw err;
         return { error: 'timeout waiting for webview CDP target' };
       }
     }
 
     const target = webviewCdpManager.getTarget(undefined, scope);
     if (!target) return { error: 'no active browser webview' };
+    const userHold = agentControl?.refusal(target.surfaceId, 'browser.cdp.target');
+    if (userHold) throw userHold;
 
     return {
       targetId: target.targetId,

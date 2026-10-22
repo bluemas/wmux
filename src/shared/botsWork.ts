@@ -64,11 +64,13 @@ export function dmStartedThreads(cards: readonly RoomCard[], threads: ThreadsByW
     if (c.actor.kind !== 'system') continue;
     const inDm = dmThreadBot(c.threadId);
     const linked = c.refs?.threadId;
-    if (inDm && linked?.startsWith('handoff:')) {
+    // An askedIn pointer links work another conversation opened: not this one's.
+    if (inDm && linked?.startsWith('handoff:') && c.refs?.pointer !== 'askedIn') {
       out.set(threadKeyOf({ workspaceId: c.workspaceId, threadId: linked }), inDm);
       continue;
     }
-    if (!c.threadId.startsWith('handoff:')) continue;
+    // Nor does one in the work's thread: it links where a follow-up asked there was sent.
+    if (!c.threadId.startsWith('handoff:') || c.refs?.pointer === 'askedIn') continue;
     const request = c.refs?.requestCardId ? byId.get(c.refs.requestCardId) : undefined;
     const owner = dmThreadBot(linked) ?? (request && request.workspaceId === c.workspaceId ? dmThreadBot(request.threadId) : null);
     if (owner) out.set(threadKeyOf(c), owner);
@@ -93,11 +95,11 @@ export function groupStartedThreads(cards: readonly RoomCard[], threads: Threads
     if (c.actor.kind !== 'system') continue;
     const inGroup = groupThreadGroup(c.threadId) ? c.threadId : null;
     const linked = c.refs?.threadId;
-    if (inGroup && linked?.startsWith('handoff:')) {
+    if (inGroup && linked?.startsWith('handoff:') && c.refs?.pointer !== 'askedIn') {
       out.set(threadKeyOf({ workspaceId: c.workspaceId, threadId: linked }), inGroup);
       continue;
     }
-    if (!c.threadId.startsWith('handoff:')) continue;
+    if (!c.threadId.startsWith('handoff:') || c.refs?.pointer === 'askedIn') continue;
     const request = c.refs?.requestCardId ? byId.get(c.refs.requestCardId) : undefined;
     const owner = groupThreadGroup(linked) ? linked as ThreadId
       : request && request.workspaceId === c.workspaceId && groupThreadGroup(request.threadId) ? request.threadId : null;

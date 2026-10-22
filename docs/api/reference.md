@@ -7,7 +7,7 @@
 
 # wmux API Reference (generated)
 
-> **Generated from wmux v4.8.0 sources.** This file is produced by
+> **Generated from wmux v4.9.0 sources.** This file is produced by
 > `scripts/gen-api-reference.mjs` directly from the code — it lists every
 > RPC method, event type, required capability, and the key event-bus
 > constants exactly as the running daemon sees them. For the hand-curated
@@ -26,7 +26,7 @@ returns `EPERM`. Wire framing: newline-delimited JSON, one object per line.
 
 ## RPC methods
 
-Total: **287** methods (`ALL_RPC_METHODS` in
+Total: **289** methods (`ALL_RPC_METHODS` in
 `src/shared/rpc.ts`). Capability and risk class are read from
 `src/main/mcp/methodCapabilityMap.ts`:
 
@@ -165,6 +165,7 @@ Total: **287** methods (`ALL_RPC_METHODS` in
 | `browser.siteMemory.record` | `browser.click` | `browser` |
 | `browser.siteMemory.forget` | `browser.click` | `browser` |
 | `browser.siteGuides.match` | `browser.read` | `browser` |
+| `browser.navigationPolicy.get` | `browser.read` | `browser` |
 | `browser.lease.acquire` | `browser.evaluate` | `browser` |
 | `browser.lease.renew` | `browser.evaluate` | `browser` |
 | `browser.lease.release` | `browser.evaluate` | `browser` |
@@ -340,6 +341,7 @@ Total: **287** methods (`ALL_RPC_METHODS` in
 | Method | Capability | Risk class |
 |---|---|---|
 | `agent.state` | `agent.state.read` | `agent-state` |
+| `agent.state.all` | `agent.state.read.all` | `agent-state-all` |
 | `fleet.triage` | `terminal.read` | `terminal-content` |
 | `ui.decoratePane` | `ui.pane-decoration` | `ui` |
 | `codex.relay.prepare` | `wmux.internal` |  |

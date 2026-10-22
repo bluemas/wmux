@@ -66,7 +66,7 @@ new MCP tool or declarable capability is exposed. Main forwards to first-party-o
 | `surface.list` | `{ workspaceId?, includeStashed? }` | stable | Surfaces (terminals/browsers) in a workspace. Omitted ⇒ active workspace. `includeStashed: true` (#977) also returns surfaces of stashed panes; every row carries an explicit `stashed` boolean either way, and a stashed pane's surfaces always report `isActive: false` (nothing off-screen is focused). |
 | `surface.new` | `{ workspaceId?, shell?, cwd? }` | stable | Opens a new surface in the active pane. External MCP callers SHOULD pass `workspaceId` to target their own workspace (#236 family); omitted ⇒ active workspace. Fails closed on an explicit unknown id. |
 | `surface.focus` | `{ id }` | stable | Focuses a surface (resolved across all workspaces). |
-| `surface.close` | `{ id }` | stable | Closes a surface by globally-unique id (all-workspace). |
+| `surface.close` | `{ id }` | stable | Closes a surface by globally-unique id (all-workspace). A browser tab the user paused or took over (Stop / Take over in the pane) is refused with `BROWSER_AGENT_PAUSED` / `BROWSER_USER_IN_CONTROL`, and so is `pane.close` / `workspace.close` on what holds it. That includes `wmux surface close <id>` typed in a terminal, on purpose: the pipe cannot tell it from an agent's shell, so the tab is closed from the pane's own controls. |
 
 ### Pane surface (the core substrate read/write)
 
@@ -511,3 +511,4 @@ access to the caller's binding.
 | Method | Params | Tier | Notes |
 |---|---|---|---|
 | `agent.state` | `workspaceId?`, `includeActivity?` | experimental | Hosted UI plugins only, bound to the host workspace. Requires `agent.state.read`; activity also requires unrestricted `terminal.read`. See [UI plugin pages](ui-plugin-pages.md). |
+| `agent.state.all` | — | experimental | Hosted UI plugins only. The same projection for every local workspace, with each workspace's id and name; no activity. Requires `agent.state.read.all`. See [UI plugin pages](ui-plugin-pages.md#every-workspace). |

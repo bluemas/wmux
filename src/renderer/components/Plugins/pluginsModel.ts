@@ -1,4 +1,5 @@
 import { TERMINAL_CONTENT_CAPABILITIES, type InstalledUiPlugin, type UiPluginGlyph } from '../../../shared/pluginManagement';
+import type { PluginPreviewId } from '../../assets/media';
 import type { TranslationKey } from '../../i18n/locales/en';
 
 /** Where a plugin stands, read from the inventory alone. */
@@ -13,6 +14,8 @@ export interface PluginCatalogItem {
   taglineKey: TranslationKey;
   signature: boolean;
   glyph: UiPluginGlyph;
+  /** A real capture of the entry's own rail page, shown in the detail. */
+  preview?: PluginPreviewId;
   capabilities: readonly string[];
   readme: string;
   publisher: string;
@@ -115,6 +118,7 @@ const CAPABILITY_LABEL_KEYS: Record<string, TranslationKey> = {
   'ui.sidebar': 'plugins.page.cap.sidebar',
   'ui.statusbar': 'plugins.page.cap.statusbar',
   'agent.state.read': 'plugins.page.cap.agentState',
+  'agent.state.read.all': 'plugins.page.cap.agentStateAll',
   'pane.read': 'plugins.page.cap.paneRead',
   'terminal.read': 'plugins.page.cap.terminalRead',
 };

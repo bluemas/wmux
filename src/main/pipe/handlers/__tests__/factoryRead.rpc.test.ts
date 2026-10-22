@@ -30,7 +30,7 @@ const SHA = 'a'.repeat(40);
 function bot(id: string, role: BotRole, workspaceId: string, repoPath?: string, createdAt = 1): BotProfile {
   return {
     version: 1, id, workspaceId, role, name: role, engine: { kind: 'claude-sdk' }, triggers: [], budget: { ...DEFAULT_BOT_BUDGETS[role] },
-    ...(repoPath ? { repo: { repoKey: 'x', repoPath } } : {}), enabled: true, createdAt, updatedAt: 1,
+    ...(repoPath ? { repo: { repoKey: 'github.com/o/x', repoPath } } : {}), enabled: true, createdAt, updatedAt: 1,
   };
 }
 
@@ -86,6 +86,7 @@ function deps(over: Partial<FactoryReadDeps> = {}): FactoryReadDeps & { roomsDir
     rooms: () => writer,
     postKey: () => 'wake:w-1:1',
     guestWake: () => false,
+    conversationTainted: () => false,
     now: () => 1_000_000,
     ...over,
   };
@@ -116,6 +117,17 @@ describe('role reads — who may call', () => {
     expect(await handlePrRead({ prNumber: 7, workspaceId: 'ws-b' }, ctxOf(MOA), d)).toMatchObject({ ok: true, repoKey: 'github.com/o/b' });
     // Moa's own workspace has no repo: it names one.
     expect(await handlePrRead({ prNumber: 7 }, ctxOf(MOA), d)).toMatchObject({ ok: false, code: 'no_repo' });
+  });
+
+  it('a coordinator with no repository reads the oldest bot\'s whose repository counts (botRepo: a repo key and a folder)', async () => {
+    const lead = { ...bot('bot-0000000a', 'moa', 'ws-c', undefined, 1), template: 'coordinator' as const };
+    // The oldest has a folder but no repo key a bot acts on: skipped.
+    const half = { ...bot('bot-0000000b', 'lead', 'ws-c', '/repo/half', 2), repo: { repoKey: 'not a key', repoPath: '/repo/half' } };
+    const dev = bot('bot-0000000c', 'lead', 'ws-c', '/repo/c', 3);
+    const all = [lead, half, dev];
+    const d = deps({ bots: () => ({ listEnabled: () => all, get: (id) => all.find((b) => b.id === id) ?? null }), repoKeyOf: async (p) => (p === '/repo/c' ? 'github.com/o/c' : p === '/repo/half' ? 'github.com/o/half' : null) });
+    expect(await handlePrRead({ prNumber: 7 }, ctxOf(lead), d)).toMatchObject({ ok: true, repoKey: 'github.com/o/c' });
+    expect(d.readPr).toHaveBeenCalledWith('/repo/c', 'github.com/o/c', 7);
   });
 
   it('pr_read names the head ref a verify checkout fetches for the repository\'s host', async () => {
@@ -305,6 +317,12 @@ describe('plan.propose', () => {
       expect(await handlePlanPropose({ title: 'Plan', items: [ITEM] }, ctxOf(MOA), d)).toMatchObject({ ok: false, code: 'not_authorized', message: expect.stringContaining('external guest') });
       expect((d.rooms() as RoomWriter).read('ws-hq', { guests: true }).cards).toHaveLength(0);
     }
+  });
+
+  it('a conversation that took in outside text proposes no plan, even when its wake is the owner\'s', async () => {
+    const d = deps({ conversationTainted: () => true });
+    expect(await handlePlanPropose({ title: 'Plan', items: [ITEM] }, ctxOf(MOA), d)).toMatchObject({ ok: false, code: 'not_authorized', message: expect.stringContaining('saves nothing that runs later') });
+    expect((d.rooms() as RoomWriter).read('ws-hq', { guests: true }).cards).toHaveLength(0);
   });
 
   it('a newer plan supersedes the bot\'s older plan still open; another bot\'s stays open', async () => {

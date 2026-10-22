@@ -20,7 +20,7 @@ import { SHARED_SURFACE } from '../shared/botSurface';
 import { installBotTools, pinToolName } from './toolModules';
 // The factory's bot tool modules register themselves on import.
 import './botModules';
-import type { RpcMethod } from '../shared/rpc';
+import { isErrorShapedResult, type RpcMethod } from '../shared/rpc';
 import { EXECUTE_SEND_CLIENT_TIMEOUT_MS } from '../shared/executeApprovalBounds';
 import { NEW_TASK_SEND_CLIENT_TIMEOUT_MS } from '../shared/freshContext';
 import { MCP_WRITE_DEADLINE_MS } from '../shared/terminalWriteBudget';
@@ -34,7 +34,7 @@ import { resolveTerminalRoute, resolveCommanderRoute, type PidMapLookup } from '
 import { classifyWorkspaceListResult, type WorkspaceLiveness } from './workspaceIdentity';
 import { PlaywrightEngine } from './playwright/PlaywrightEngine';
 import { getOpenerKey, noteOpenedSurface } from './playwright/surfaceRouting';
-import { registerNavigationTools } from './playwright/tools/navigation';
+import { describeGuardedLoad, openWithDownloadGuard, registerNavigationTools } from './playwright/tools/navigation';
 import { paneProfileRefusal } from './playwright/paneProfileRefusal';
 import { assertCodeToolAllowed } from './playwright/automationLease';
 import { registerInteractionTools } from './playwright/tools/interaction';
@@ -64,6 +64,7 @@ import { registerFleetTriageTools } from './fleetTriage';
 import { registerAutomationTools } from './automation';
 import { registerReplTools } from './repl/tools';
 import { inputSchemaDeclaresMaxBytes, wrapHandlerWithResultCap } from './resultCap';
+import { dataSuffix } from '../shared/constants';
 import { AsyncLocalStorage } from 'async_hooks';
 import {
   classifyMcpParent,
@@ -80,6 +81,7 @@ import {
 import { getBotMcpServerInstructions, getWmuxMcpServerInstructions, resolveMcpServerVersion } from './serverMetadata';
 import { unlistToolsFromListing } from './listFilter';
 import { UNLISTED_TOOLS_SET } from '../shared/unlistedTools';
+import { fromAgentPath, toAgentFileParts } from './wslPaths';
 import type { RegisterWmuxToolsOptions, WmuxToolProfile } from './toolCatalog';
 
 /**
@@ -390,7 +392,25 @@ const SEND_MESSAGE_SHAPE = {
   silent: z.boolean().optional().describe('Skip the PTY paste on the receiver; the task is still persisted and pollable via a2a_task_query. Use it to avoid injecting into a running TUI agent\'s prompt. Omitted, live TUI agents get a one-line nudge, not a full paste.'),
   data: z.record(z.string(), z.unknown()).optional().describe('Optional structured data (JSON)'),
   data_mime_type: z.string().optional().describe('MIME type for data (default: application/json)'),
+  images: z.array(z.string()).min(1).max(4).optional().describe(
+    'Up to 4 PNG, JPEG or WebP files (5 MB each, 10 MB in all) to attach, by absolute path: from your pane\'s project folder or the wmux uploads folder only (~/.wmux/uploads/ on the PC running wmux; from WSL, under /mnt/<drive>/), so copy a screenshot there first. ' +
+      'The receiver gets its own copy and reads it by the path shown in the message. Works for a pane on another PC too; one whose wmux is older gets the text with a note instead.',
+  ),
 };
+
+/**
+ * Append an advisory line to a tool result.
+ *
+ * Used where a bare success would be read as a stronger guarantee than the RPC
+ * actually makes — delivery vs. effect. The note rides as its own content block
+ * so the primary JSON payload stays machine-parseable.
+ */
+export function withNote(
+  result: { content: { type: 'text'; text: string }[]; isError?: true },
+  note: string,
+): { content: { type: 'text'; text: string }[]; isError?: true } {
+  return { ...result, content: [...result.content, { type: 'text', text: `NOTE: ${note}` }] };
+}
 
 export function createWmuxServer(ctx: WmuxServerCtx): McpServer {
 // Workspace identity.
@@ -961,7 +981,7 @@ async function callRpc(
   // it to learn which surface it got — without giving up the stale-route
   // handling every tool gets from this helper.
   onResult?: (result: unknown) => void,
-): Promise<{ content: { type: 'text'; text: string }[] }> {
+): Promise<{ content: { type: 'text'; text: string }[]; isError?: true }> {
   const pinnedRouteAtDispatch = getPinnedRoute();
   try {
     const result = timeoutMs === undefined
@@ -970,7 +990,7 @@ async function callRpc(
     if (isStaleIdentityResult(result)) invalidateStaleRoute(pinnedRouteAtDispatch);
     onResult?.(result);
     const text = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
-    return { content: [{ type: 'text', text }] };
+    return { content: [{ type: 'text', text }], ...(isErrorShapedResult(result) ? { isError: true as const } : {}) };
   } catch (err) {
     if (isStaleIdentityResult(err instanceof Error ? err.message : String(err))) {
       invalidateStaleRoute(pinnedRouteAtDispatch);
@@ -999,20 +1019,6 @@ function invalidateStaleRoute(pinnedRouteAtDispatch: PinnedRoute | null): void {
   // fresh token — the same recovery path a closed workspace already takes.
   setWorkspaceToken(undefined);
   syncCallerPtyId();
-}
-
-/**
- * Append an advisory line to a tool result.
- *
- * Used where a bare success would be read as a stronger guarantee than the RPC
- * actually makes — delivery vs. effect. The note rides as its own content block
- * so the primary JSON payload stays machine-parseable.
- */
-function withNote(
-  result: { content: { type: 'text'; text: string }[] },
-  note: string,
-): { content: { type: 'text'; text: string }[] } {
-  return { content: [...result.content, { type: 'text', text: `NOTE: ${note}` }] };
 }
 
 /**
@@ -1599,17 +1605,33 @@ server.tool(
     // when this connection opened it or nobody claims it, and records the
     // opener on what comes back, so the surface this tool reports is one the
     // caller may keep driving without naming it again.
-    return callRpc(
-      'browser.open',
-      { ...(url && { url }), ...(isPrivate === true && { private: true }), workspaceId, openerKey: getOpenerKey() },
-      undefined,
-      (result) => {
-        const surfaceId = (result as { surfaceId?: unknown } | null | undefined)?.surfaceId;
-        if (typeof surfaceId === 'string' && surfaceId) {
-          noteOpenedSurface(workspaceId, surfaceId);
-        }
-      },
+    let openedSurfaceId: string | undefined;
+    // On an unprotected Chrome pane the tab opens on about:blank and the URL
+    // loads once the download guard is armed (openWithDownloadGuard).
+    const { result, load } = await openWithDownloadGuard(
+      browserToolDeps,
+      'browser_open',
+      workspaceId,
+      url,
+      (withUrl) => callRpc(
+        'browser.open',
+        { ...(withUrl && { url: withUrl }), ...(isPrivate === true && { private: true }), workspaceId, openerKey: getOpenerKey() },
+        undefined,
+        (reply) => {
+          const surfaceId = (reply as { surfaceId?: unknown } | null | undefined)?.surfaceId;
+          if (typeof surfaceId === 'string' && surfaceId) {
+            openedSurfaceId = surfaceId;
+            noteOpenedSurface(workspaceId, surfaceId);
+          }
+        },
+      ),
+      () => openedSurfaceId,
     );
+    if (!load) return result;
+    return {
+      content: [...result.content, { type: 'text' as const, text: describeGuardedLoad(load) }],
+      ...((result.isError || !load.ok) && { isError: true as const }),
+    };
   },
 );
 
@@ -1874,7 +1896,8 @@ server.tool(
     // as working while they sat blocked on an unanswered question. There is no
     // reliable signal here to promote delivery into submission, so the honest
     // answer is to name the gap rather than imply a guarantee.
-    if (key.toLowerCase() === 'enter') {
+    // A refused key was not delivered, so it gets no delivery note.
+    if (key.toLowerCase() === 'enter' && !result.isError) {
       return withNote(
         result,
         'Enter was delivered. This does NOT confirm anything was submitted: if the pane was '
@@ -2150,8 +2173,9 @@ server.tool(
       try {
         const parsed: unknown = JSON.parse(text);
         // Leave error payloads untouched — appending elapsedMs would mutate the
-        // error object shape callers match on.
-        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && !('error' in parsed)) {
+        // error object shape callers match on, and rebuilding would drop the
+        // isError callRpc set on one (an `{ ok: false }` with no `error` key).
+        if (!res.isError && parsed && typeof parsed === 'object' && !Array.isArray(parsed) && !('error' in parsed)) {
           return {
             content: [{
               type: 'text' as const,
@@ -2166,9 +2190,9 @@ server.tool(
 );
 
 // 3. send_message — Primary tool for inter-workspace communication
-const sendMessageHandler = async ({ to, pane_id, surface_id, title, task_id, message, execute, silent, data, data_mime_type }: {
+const sendMessageHandler = async ({ to, pane_id, surface_id, title, task_id, message, execute, silent, data, data_mime_type, images }: {
   to?: string; pane_id?: string; surface_id?: string; title?: string; task_id?: string; message: string; execute?: boolean; silent?: boolean;
-  data?: Record<string, unknown>; data_mime_type?: string;
+  data?: Record<string, unknown>; data_mime_type?: string; images?: string[];
 }) => {
   const wsId = await requireWorkspaceId();
   // Pane names: `to: "#w1-2"` names the pane AND its workspace; a name in
@@ -2244,6 +2268,18 @@ const sendMessageHandler = async ({ to, pane_id, surface_id, title, task_id, mes
     params.data = data;
     params.dataMimeType = data_mime_type || 'application/json';
   }
+  if (images && images.length > 0) {
+    // A WSL agent names Linux paths; wmux opens them from Windows.
+    const hostPaths: string[] = [];
+    for (const given of images) {
+      const hostPath = fromAgentPath(given);
+      if (!hostPath) {
+        return { content: [{ type: 'text' as const, text: `send_message: images: ${JSON.stringify(given)} is not a file wmux can open (give an absolute path under /mnt/<drive>/, such as /mnt/c/Users/<you>/.wmux${dataSuffix()}/uploads/)` }], isError: true };
+      }
+      hostPaths.push(hostPath);
+    }
+    params.images = hostPaths;
+  }
   // A new execute send waits on a person (#1462): outwait main, so the agent
   // reads the verdict instead of timing out and retrying into a second prompt.
   // A new task's delivery may first wait out the target pane's fresh-context
@@ -2281,10 +2317,12 @@ server.tool(
     const wsId = await requireWorkspaceId();
     // view: 'page' has main (and each task source) page and summarize, so a
     // list never carries full histories over any hop.
+    // A received image's path is this PC's: a WSL agent is given it under
+    // the drive mount (rewritten before callRpc renders the reply).
     return callRpc('a2a.task.query', {
       workspaceId: wsId, status, role, updatedSince: updated_since,
       view: 'page', taskId: task_id, messageId: message_id, limit, cursor,
-    });
+    }, undefined, (result) => toAgentFileParts(result));
   },
 );
 

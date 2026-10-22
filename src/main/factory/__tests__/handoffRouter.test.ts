@@ -7,6 +7,7 @@ import { factDedupeKey, type Fact, type FactDraft } from '../../../shared/facts'
 import { HANDOFF_LIMITS } from '../../../shared/handoff';
 import type { RoomCard, ThreadId } from '../../../shared/room';
 import { WAKE_LIMITS, type WakeItem } from '../../../shared/wake';
+import { dmStartedThreads, groupStartedThreads, threadKey } from '../../../shared/botsWork';
 import { WakeQueue, wakeQueuePath } from '../wakeQueue';
 import { clearThreadDecision, loadThreadDecision, loadWorkspaceDecisions, raiseThreadDecisionIfFree, resolveThreadDecision } from '../../deck/deckDecisionStore';
 import {
@@ -596,7 +597,7 @@ describe('ask_person', () => {
     expect(h.wakes[0]).toMatchObject({ botId: lead.id, reason: { kind: 'handoff' }, threadId: 'pr:github.com/acme/app#5' });
     // The runtime runs that wake: its thread is the running wake's thread.
     h.wake.thread = h.wakes[0].threadId ?? null;
-    const posted = await handleRoomPost({ kind: 'status', title: 'Answer received' }, { bot: binding(lead) } as RpcContext, { writer: () => h.rooms, ports: () => h.ports, wmuxDir: () => dir }) as { ok: boolean; card?: { threadId: string } };
+    const posted = await handleRoomPost({ kind: 'status', title: 'Answer received' }, { bot: binding(lead) } as RpcContext, { writer: () => h.rooms, ports: () => h.ports, wmuxDir: () => dir, signedIn: () => false }) as { ok: boolean; card?: { threadId: string } };
     expect(posted).toMatchObject({ ok: true, card: { threadId: 'pr:github.com/acme/app#5' } });
   });
 
@@ -1006,7 +1007,7 @@ describe('messages and room mentions (group rooms)', () => {
     // A bot of another room answers in its own room, as before.
     expect(theirs).toMatchObject({ threadId: 'general' });
     // Woken there, the bot's answer lands in the 1:1 (its wake's thread).
-    const posted = await handleRoomPost({ kind: 'status', title: 'Checked' }, { bot: binding(b) } as RpcContext, { writer: () => h.rooms, ports: () => h.ports, wmuxDir: () => dir }) as { ok: boolean; card?: { threadId: string } };
+    const posted = await handleRoomPost({ kind: 'status', title: 'Checked' }, { bot: binding(b) } as RpcContext, { writer: () => h.rooms, ports: () => h.ports, wmuxDir: () => dir, signedIn: () => false }) as { ok: boolean; card?: { threadId: string } };
     expect(posted).toMatchObject({ ok: true, card: { threadId: dm } });
   });
 
@@ -1566,7 +1567,7 @@ describe('a room with a coordinator: the owner talks to it, and the work it disp
     const issue = bot('ws1', 'triage');
     const h = await harness([coordinator, reviewer, dev, issue]);
     const OPERATOR: RpcContext = { origin: 'local', operator: true, firstParty: true };
-    const posted = await handleRoomPost({ workspaceId: 'ws1', title: 'Review PR #5 please' }, OPERATOR, { writer: () => h.rooms, ports: () => h.ports, wmuxDir: () => dir }) as { ok: true; card: { id: string } };
+    const posted = await handleRoomPost({ workspaceId: 'ws1', title: 'Review PR #5 please' }, OPERATOR, { writer: () => h.rooms, ports: () => h.ports, wmuxDir: () => dir, signedIn: () => false }) as { ok: true; card: { id: string } };
     expect(posted.ok).toBe(true);
     expect(h.wakes.map((w) => [w.botId, w.reason.kind === 'human' && w.reason.lead])).toEqual([[coordinator.id, true]]);
     // The coordinator's turn on it dispatches the review.
@@ -1590,6 +1591,209 @@ describe('a room with a coordinator: the owner talks to it, and the work it disp
     expect(h.wakes.filter((w) => w.botId !== coordinator.id).map((w) => [w.botId, w.reason.kind])).toEqual([[reviewer.id, 'handoff']]);
   });
 
+  it('work on the owner\'s message sent into a PR\'s thread: its pointer lands where the owner asked, from the run, whatever the bot names', async () => {
+    const coordinator = bot('ws1', 'moa', { template: 'coordinator' });
+    const reviewer = bot('ws1', 'verifier');
+    const h = await harness([coordinator, reviewer]);
+    const OPERATOR: RpcContext = { origin: 'local', operator: true, firstParty: true };
+    const posted = await handleRoomPost({ workspaceId: 'ws1', title: 'Is PR #42 good to go?' }, OPERATOR, { writer: () => h.rooms, ports: () => h.ports, wmuxDir: () => dir }) as { ok: true; card: { id: string } };
+    const PR = 'pr:github.com/acme/app#42' as ThreadId;
+    // The coordinator's turn on it sends the review into the PR's thread.
+    h.wake.thread = 'general';
+    h.wake.id = { wakeId: 'w-owner', attempt: 1, runId: `run-${posted.card.id}` } as Harness['wake']['id'];
+    const d = h.router.send(binding(coordinator), { kind: 'dispatch', toBotId: reviewer.id, title: 'Verify PR #42', body: 'pass or fail', threadId: PR, refs: { pr: 42 } });
+    if (!d.ok) throw new Error('dispatch failed');
+    expect(h.router.get(d.handoffId)).toMatchObject({ threadId: PR, askedIn: 'general' });
+    expect(h.router.get(d.handoffId)?.opensThread).toBeUndefined();
+    // Kept across a restart.
+    const again = await harness([coordinator, reviewer]);
+    expect(again.router.get(d.handoffId)?.askedIn).toBe('general');
+    // The reviewer's result: the coordinator reports in the PR's thread and
+    // General gets the one-line pointer to it, under the owner's message.
+    h.wake.thread = null;
+    h.wake.id = { wakeId: 'w-gated', attempt: 1, handoffId: d.handoffId, reasonKind: 'facts' } as Harness['wake']['id'];
+    const r = h.router.send(binding(reviewer), { kind: 'result', title: 'PR #42 passes', body: '' });
+    expect(r).toMatchObject({ ok: true, to: { botId: coordinator.id } });
+    expect(h.wakes.filter((w) => w.botId === coordinator.id && w.reason.kind === 'handoff').map((w) => w.threadId)).toEqual([PR]);
+    const pointers = h.rooms.read('ws1', { threadId: 'general' }).cards.filter((c) => c.actor.kind === 'system' && c.refs?.threadId === PR);
+    expect(pointers).toEqual([expect.objectContaining({ title: 'Finished: Verify PR #42', replyTo: posted.card.id })]);
+    // A bot's own dispatch outside the owner's run records no askedIn.
+    h.wake.id = { wakeId: 'w-own', attempt: 1 } as Harness['wake']['id'];
+    h.wake.thread = 'general';
+    const own = h.router.send(binding(coordinator), { kind: 'dispatch', toBotId: reviewer.id, title: 'Verify PR #43', body: '', threadId: 'pr:github.com/acme/app#43' as ThreadId });
+    if (!own.ok) throw new Error('dispatch failed');
+    expect(h.router.get(own.handoffId)?.askedIn).toBeUndefined();
+  });
+
+  it('a pointer in a 1:1 or a group to a PR\'s thread leaves that thread no conversation\'s: no dmBotId or groupId on its summary', async () => {
+    for (const where of ['dm', 'group'] as const) {
+      const coordinator = bot('ws1', 'moa', { template: 'coordinator' });
+      const reviewer = bot('ws1', 'verifier');
+      const h = await harness([coordinator, reviewer]);
+      const GROUP = 'group:grp-0000c0de' as ThreadId;
+      h.ports.groups = { byThread: (ws, th) => (ws === 'ws1' && th === GROUP ? { id: 'grp-0000c0de', workspaceId: 'ws1', name: 'Ship', memberIds: [coordinator.id, reviewer.id], threadId: GROUP, createdAt: 1, updatedAt: 1 } : null) };
+      const asked = (where === 'dm' ? `dm:${coordinator.id}` : GROUP) as ThreadId;
+      const OPERATOR: RpcContext = { origin: 'local', operator: true, firstParty: true };
+      const posted = await handleRoomPost({ workspaceId: 'ws1', threadId: asked, title: 'Is PR #42 good to go?', ...(where === 'dm' ? { mentions: [coordinator.id] } : {}) }, OPERATOR, { writer: () => h.rooms, ports: () => h.ports, wmuxDir: () => dir }) as { ok: true; card: { id: string } };
+      const PR = 'pr:github.com/acme/app#42' as ThreadId;
+      h.wake.thread = asked;
+      h.wake.id = { wakeId: `w-${where}`, attempt: 1, runId: `run-${posted.card.id}` } as Harness['wake']['id'];
+      const d = h.router.send(binding(coordinator), { kind: 'dispatch', toBotId: reviewer.id, title: 'Verify PR #42', body: '', threadId: PR });
+      if (!d.ok) throw new Error('dispatch failed');
+      expect(h.router.get(d.handoffId)?.askedIn, where).toBe(asked);
+      h.wake.thread = null;
+      h.wake.id = { wakeId: `w-gated-${where}`, attempt: 1, handoffId: d.handoffId, reasonKind: 'facts' } as Harness['wake']['id'];
+      expect(h.router.send(binding(reviewer), { kind: 'result', title: 'PR #42 passes', body: '' })).toMatchObject({ ok: true });
+      // The pointer shows where the owner asked, replying to the message.
+      const pointer = h.rooms.read('ws1', { threadId: asked }).cards.filter((c) => c.actor.kind === 'system' && c.refs?.threadId === PR);
+      expect(pointer, where).toEqual([expect.objectContaining({ title: 'Finished: Verify PR #42', replyTo: posted.card.id })]);
+      // The PR's thread stays the room's: it shows in General and takes
+      // the room's messages, as before.
+      const summary = h.rooms.threads('ws1').find((th) => th.threadId === PR);
+      expect(summary?.dmBotId, where).toBeUndefined();
+      expect(summary?.groupId, where).toBeUndefined();
+      for (const r of routers.splice(0)) r.dispose();
+    }
+  });
+
+  it('a follow-up asked in a 1:1 or a group on work General or a group opened: its pointer there ties nothing, the work stays where it was opened', async () => {
+    for (const from of ['general', 'group'] as const) {
+      const coordinator = bot('ws1', 'moa', { template: 'coordinator' });
+      const reviewer = bot('ws1', 'verifier');
+      const h = await harness([coordinator, reviewer]);
+      const GROUP = 'group:grp-0000f00d' as ThreadId;
+      h.ports.groups = { byThread: (ws, th) => (ws === 'ws1' && th === GROUP ? { id: 'grp-0000f00d', workspaceId: 'ws1', name: 'Ship', memberIds: [coordinator.id, reviewer.id], threadId: GROUP, createdAt: 1, updatedAt: 1 } : null) };
+      const OPERATOR: RpcContext = { origin: 'local', operator: true, firstParty: true };
+      const deps = { writer: () => h.rooms, ports: () => h.ports, wmuxDir: () => dir };
+      const opener = (from === 'general' ? 'general' : GROUP) as ThreadId;
+      // The work is opened where the owner first asked: handoff:Y.
+      const first = await handleRoomPost({ workspaceId: 'ws1', threadId: opener, title: 'Review PR #42' }, OPERATOR, deps) as { ok: true; card: { id: string } };
+      h.wake.thread = opener;
+      h.wake.id = { wakeId: `w-open-${from}`, attempt: 1, runId: `run-${first.card.id}` } as Harness['wake']['id'];
+      const y = h.router.send(binding(coordinator), { kind: 'dispatch', toBotId: reviewer.id, title: 'Verify PR #42', body: '' });
+      if (!y.ok) throw new Error('dispatch failed');
+      const Y = h.router.get(y.handoffId)!.threadId;
+      expect(Y).toBe(`handoff:${y.handoffId}`);
+      const before = (th: ThreadId) => h.rooms.threads('ws1').find((s) => s.threadId === th);
+      const owner = from === 'general' ? { dmBotId: undefined, groupId: undefined } : { dmBotId: undefined, groupId: 'grp-0000f00d' };
+      expect({ dmBotId: before(Y)?.dmBotId, groupId: before(Y)?.groupId }, from).toEqual(owner);
+      // In the coordinator's 1:1 the owner asks for a follow-up; it sends it into Y.
+      const dm = `dm:${coordinator.id}` as ThreadId;
+      const follow = await handleRoomPost({ workspaceId: 'ws1', threadId: dm, title: 'Follow up on that review', mentions: [coordinator.id] }, OPERATOR, deps) as { ok: true; card: { id: string } };
+      h.wake.thread = dm;
+      h.wake.id = { wakeId: `w-dm-${from}`, attempt: 1, runId: `run-${follow.card.id}` } as Harness['wake']['id'];
+      const z = h.router.send(binding(coordinator), { kind: 'dispatch', toBotId: reviewer.id, title: 'Re-check PR #42', body: '', threadId: Y });
+      if (!z.ok) throw new Error('dispatch failed');
+      expect(h.router.get(z.handoffId)).toMatchObject({ threadId: Y, askedIn: dm });
+      h.wake.thread = null;
+      h.wake.id = { wakeId: `w-z-${from}`, attempt: 1, handoffId: z.handoffId, reasonKind: 'facts' } as Harness['wake']['id'];
+      expect(h.router.send(binding(reviewer), { kind: 'result', title: 'Still passes', body: '' })).toMatchObject({ ok: true });
+      // The pointer is in the 1:1, marked, and Y stays where it was opened.
+      const pointer = h.rooms.read('ws1', { threadId: dm }).cards.filter((c) => c.actor.kind === 'system' && c.refs?.threadId === Y);
+      expect(pointer, from).toEqual([expect.objectContaining({ title: 'Finished: Re-check PR #42', replyTo: follow.card.id, refs: expect.objectContaining({ pointer: 'askedIn' }) })]);
+      expect({ dmBotId: before(Y)?.dmBotId, groupId: before(Y)?.groupId }, from).toEqual(owner);
+      expect(dmStartedThreads(h.rooms.read('ws1').cards, { ws1: h.rooms.threads('ws1') }).has(threadKey('ws1', Y)), from).toBe(false);
+      // An unpicked message in Y still goes to its room's (or group's) coordinator.
+      const n = h.wakes.length;
+      await handleRoomPost({ workspaceId: 'ws1', threadId: Y, title: 'Anything else?' }, OPERATOR, deps);
+      expect(h.wakes.slice(n).map((w) => [w.botId, w.reason.kind === 'human' && w.reason.lead]), from).toEqual([[coordinator.id, true]]);
+      for (const r of routers.splice(0)) r.dispose();
+    }
+  });
+  // The reverse of the case above: the owner follows up inside the work's
+  // own thread (handoff:Y), and the bot sends that follow-up to its own 1:1
+  // or to its group. The askedIn pointer then sits in Y and links the 1:1 or
+  // the group; it must not make Y that conversation's. With openedIn
+  // 'group', the lead opens Y in its group, which the coordinator is not in.
+  const followUpInWorkSentTo = async (to: 'dm' | 'group', by: 'coordinator' | 'lead' = 'coordinator', openedIn: 'general' | 'group' = 'general') => {
+    const coordinator = bot('ws1', 'moa', { template: 'coordinator' });
+    const reviewer = bot('ws1', 'verifier');
+    const dev = bot('ws1', 'lead');
+    const h = await harness([coordinator, reviewer, dev]);
+    const sender = by === 'coordinator' ? coordinator : dev;
+    // The sender's group, or the lead's when Y opens in a group. A lead's has
+    // no coordinator: a message routed to it reaches its members, not the
+    // room's coordinator.
+    const GROUP = 'group:grp-0000f00d' as ThreadId;
+    const members = [openedIn === 'group' ? dev.id : sender.id, reviewer.id];
+    h.ports.groups = { byThread: (ws, th) => (ws === 'ws1' && th === GROUP ? { id: 'grp-0000f00d', workspaceId: 'ws1', name: 'Ship', memberIds: members, threadId: GROUP, createdAt: 1, updatedAt: 1 } : null) };
+    const OPERATOR: RpcContext = { origin: 'local', operator: true, firstParty: true };
+    const deps = { writer: () => h.rooms, ports: () => h.ports, wmuxDir: () => dir };
+    // The work is opened from General (handoff:Y, no conversation's), or by
+    // the lead in its group (handoff:Y, the group's).
+    const opener = (openedIn === 'group' ? GROUP : 'general') as ThreadId;
+    const first = await handleRoomPost({ workspaceId: 'ws1', threadId: opener, title: 'Review PR #42' }, OPERATOR, deps) as { ok: true; card: { id: string } };
+    h.wake.thread = opener;
+    h.wake.id = { wakeId: `w-open-${to}-${by}-${openedIn}`, attempt: 1, runId: `run-${first.card.id}` } as Harness['wake']['id'];
+    const y = h.router.send(binding(openedIn === 'group' ? dev : coordinator), { kind: 'dispatch', toBotId: reviewer.id, title: 'Verify PR #42', body: '' });
+    if (!y.ok) throw new Error('dispatch failed');
+    const Y = h.router.get(y.handoffId)!.threadId;
+    expect(Y).toBe(`handoff:${y.handoffId}`);
+    const opened = h.rooms.threads('ws1').find((s) => s.threadId === Y);
+    expect({ dmBotId: opened?.dmBotId, groupId: opened?.groupId }, openedIn).toEqual({ dmBotId: undefined, groupId: openedIn === 'group' ? 'grp-0000f00d' : undefined });
+    // In Y the owner asks the sender for a follow-up; it sends it to its 1:1 or its group.
+    const target = (to === 'dm' ? `dm:${sender.id}` : GROUP) as ThreadId;
+    const follow = await handleRoomPost({ workspaceId: 'ws1', threadId: Y, title: 'Follow up on that review', mentions: [sender.id] }, OPERATOR, deps) as { ok: true; card: { id: string } };
+    h.wake.thread = Y;
+    h.wake.id = { wakeId: `w-y-${to}-${by}`, attempt: 1, runId: `run-${follow.card.id}` } as Harness['wake']['id'];
+    const z = h.router.send(binding(sender), { kind: 'dispatch', toBotId: reviewer.id, title: 'Re-check PR #42', body: '', threadId: target });
+    if (!z.ok) throw new Error('dispatch failed');
+    expect(h.router.get(z.handoffId)).toMatchObject({ threadId: target, askedIn: Y });
+    h.wake.thread = null;
+    h.wake.id = { wakeId: `w-z-${to}-${by}`, attempt: 1, handoffId: z.handoffId, reasonKind: 'facts' } as Harness['wake']['id'];
+    expect(h.router.send(binding(reviewer), { kind: 'result', title: 'Still passes', body: '' })).toMatchObject({ ok: true });
+    // The pointer is in Y, links the 1:1 or the group, and is marked.
+    const pointer = h.rooms.read('ws1', { threadId: Y }).cards.filter((c) => c.actor.kind === 'system' && c.refs?.threadId === target);
+    expect(pointer, `${to} ${by}`).toEqual([expect.objectContaining({ title: 'Finished: Re-check PR #42', replyTo: follow.card.id, refs: expect.objectContaining({ pointer: 'askedIn' }) })]);
+    return { h, Y, GROUP, coordinator, reviewer, dev, OPERATOR, deps };
+  };
+
+  it('a follow-up asked in the work\'s own thread and sent to a 1:1 or a group: the thread\'s summary stays no conversation\'s, and its messages keep their routing', async () => {
+    for (const [to, by] of [['dm', 'coordinator'], ['group', 'coordinator'], ['group', 'lead']] as const) {
+      const { h, Y, coordinator, OPERATOR, deps } = await followUpInWorkSentTo(to, by);
+      const summary = h.rooms.threads('ws1').find((s) => s.threadId === Y);
+      expect({ dmBotId: summary?.dmBotId, groupId: summary?.groupId }, `${to} ${by}`).toEqual({ dmBotId: undefined, groupId: undefined });
+      // An unpicked message in Y still goes to the room's coordinator alone:
+      // the group the pointer links does not take Y's routing (linkedGroup).
+      const n = h.wakes.length;
+      await handleRoomPost({ workspaceId: 'ws1', threadId: Y, title: 'Anything else?' }, OPERATOR, deps);
+      expect(h.wakes.slice(n).map((w) => [w.botId, w.reason.kind === 'human' && w.reason.lead]), `${to} ${by}`).toEqual([[coordinator.id, true]]);
+      for (const r of routers.splice(0)) r.dispose();
+    }
+  });
+
+  it('a follow-up asked in the work\'s own thread and sent to the coordinator\'s 1:1: the 1:1 did not start the work (dmStartedThreads)', async () => {
+    const { h, Y } = await followUpInWorkSentTo('dm');
+    // Cards only: the summary's dmBotId is not what decides here.
+    expect(dmStartedThreads(h.rooms.read('ws1').cards).has(threadKey('ws1', Y))).toBe(false);
+  });
+
+  it('a follow-up asked in the work\'s own thread and sent to a group: the group did not start the work (groupStartedThreads)', async () => {
+    const { h, Y } = await followUpInWorkSentTo('group');
+    // Cards only: the summary's groupId is not what decides here.
+    expect(groupStartedThreads(h.rooms.read('ws1').cards).has(threadKey('ws1', Y))).toBe(false);
+  });
+
+  // RoomWriter.summary runs the 1:1 linker before the group linker: an
+  // askedIn pointer to the coordinator's 1:1, in a thread a group opened,
+  // must not shadow that group's link.
+  it('a follow-up asked in a thread a group opened and sent to the coordinator\'s 1:1: the thread stays the group\'s, and its messages still go to the group', async () => {
+    const { h, Y, GROUP, dev, reviewer, OPERATOR, deps } = await followUpInWorkSentTo('dm', 'coordinator', 'group');
+    const summary = h.rooms.threads('ws1').find((s) => s.threadId === Y);
+    expect({ dmBotId: summary?.dmBotId, groupId: summary?.groupId }).toEqual({ dmBotId: undefined, groupId: 'grp-0000f00d' });
+    // Cards only: the group started the work, the 1:1 did not.
+    const cards = h.rooms.read('ws1').cards;
+    expect(dmStartedThreads(cards).has(threadKey('ws1', Y))).toBe(false);
+    expect(groupStartedThreads(cards).get(threadKey('ws1', Y))).toBe(GROUP);
+    // An unpicked message in Y still goes to the group's members, as one in
+    // the group's own thread does (linkedGroup), not to the room's coordinator.
+    const n = h.wakes.length;
+    const later = await handleRoomPost({ workspaceId: 'ws1', threadId: Y, title: 'Anything else?' }, OPERATOR, deps) as { ok: true; card: RoomCard };
+    expect(later.card.routed?.lead).toBeUndefined();
+    expect([...later.card.refs?.botIds ?? []].sort()).toEqual([dev.id, reviewer.id].sort());
+    expect(h.wakes.slice(n).map((w) => w.botId).sort()).toEqual([dev.id, reviewer.id].sort());
+  });
+
   it('an unpicked reply in a thread the group\'s work opened goes to the coordinator as lead and to the bot waiting there; it closes no question elsewhere', async () => {
     const coordinator = bot('ws1', 'moa', { template: 'coordinator' });
     const dev = bot('ws1', 'lead');
@@ -1598,7 +1802,7 @@ describe('a room with a coordinator: the owner talks to it, and the work it disp
     const GROUP = 'group:grp-0000abcd' as ThreadId;
     h.ports.groups = { byThread: (ws, th) => (ws === 'ws1' && th === GROUP ? { id: 'grp-0000abcd', workspaceId: 'ws1', name: 'Ship', memberIds: [coordinator.id, dev.id, rev.id], threadId: GROUP, createdAt: 1, updatedAt: 1 } : null) };
     const OPERATOR: RpcContext = { origin: 'local', operator: true, firstParty: true };
-    const deps = { writer: () => h.rooms, ports: () => h.ports, wmuxDir: () => dir };
+    const deps = { writer: () => h.rooms, ports: () => h.ports, wmuxDir: () => dir, signedIn: () => false };
     const asked = await handleRoomPost({ workspaceId: 'ws1', threadId: GROUP, title: 'Add a --version flag' }, OPERATOR, deps) as { ok: true; card: { id: string } };
     // The coordinator takes it in the group and opens the work's thread.
     h.wake.thread = GROUP;
