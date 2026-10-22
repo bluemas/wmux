@@ -50,6 +50,19 @@ afterEach(() => {
 });
 
 describe('shortcuts on a rail page', () => {
+  it('a key given to a plugin rail page opens it from any page and toggles it back', () => {
+    act(() => useStore.getState().setShortcutOverride('plugin:office', 'Ctrl+Alt+P'));
+    const key = { ctrlKey: true, altKey: true, key: 'p', code: 'KeyP' };
+    press(key);
+    expect(useStore.getState().appRoute).toBe('plugin:office');
+    press(key);
+    expect(useStore.getState().appRoute).toBe('workspaces');
+    act(() => useStore.getState().setAppRoute('fleet'));
+    press(key);
+    expect(useStore.getState().appRoute).toBe('plugin:office');
+    act(() => useStore.getState().resetShortcut('plugin:office'));
+  });
+
   it('pane and PTY shortcuts do nothing while Fleet covers the panes', () => {
     expect(WORKSPACES_ONLY_ACTIONS.has('closeSurface')).toBe(true);
     expect(WORKSPACES_ONLY_ACTIONS.has('splitHorizontal')).toBe(true);
