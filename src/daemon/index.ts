@@ -83,12 +83,11 @@ import { scheduleTokenFileReHarden } from '../shared/security';
 import { applyTaskQueryView } from '../shared/a2aTaskQueryView';
 import { normalizeLivePaneIds } from '../shared/a2aOrphanedTask';
 import type { WebTlsConfig } from '../shared/web';
-import { generateSnapshotUnqueued, enqueueSnapshotJob, generateTextSnapshot, capTextRowsToFrameBudget, MAX_SCROLLBACK, type TextSnapshotOutcome } from './HeadlessSnapshot';
-import { readSessionTextReplay } from './sessionTextReplay';
+import { generateSnapshotUnqueued, enqueueSnapshotJob, generateTextSnapshot, capTextRowsToFrameBudget, MAX_SCROLLBACK } from './HeadlessSnapshot';
+import { queuedScreenText, queuedTextSnapshot } from './queuedSessionText';
 import type { TerminalPty } from '../shared/terminalPty';
 import { serializeSession } from './sessionSerialize';
 import { AwaitingScreenVerifier, AWAITING_NARROW_DIALOG_COLS, questionInFlight, renderPaneScreen } from './AwaitingScreenVerifier';
-import { snapshotRingTextUnqueued } from './nativeRingSnapshot';
 import { screenShowsAgentDialog, screenShowsActiveDialog, screenShowsPermissionDialog } from './transcript/chatScreenGate';
 import { ApprovalPushRouter } from './push/approvalPushRouter';
 import { readPendingToolUse } from './transcript/pendingToolUse';
@@ -113,7 +112,7 @@ import { registerA2aLinkRpc } from './a2aRemote/linkRpc';
 import { A2aOffers } from './a2aRemote/offers';
 import { OfferStore } from './a2aRemote/offerStore';
 import { A2aRemoteDelivery, shareOfferFeatures } from './a2aRemote/delivery';
-import { A2A_FEATURE_LINK_OFFER, isRemoteTaskId } from '../shared/a2aRemote';
+import { A2A_FEATURE_IMAGES, A2A_FEATURE_LINK_OFFER, isRemoteTaskId } from '../shared/a2aRemote';
 import type { A2aRemoteLinkEvent } from '../shared/rpc';
 import { ChannelService, ChannelStateWriter, ChannelWakeWorker, wakeAgentSlug, wrapChannelMessageEnvelope, wrapChannelCatalogEnvelope, stampChannelCaller, type CallerFieldSpec, type ChannelServiceEventLog } from './channels';
 import { AppendOnlyLog } from './eventlog/AppendOnlyLog';
@@ -125,11 +124,11 @@ import { isPrincipalUpsertInput } from '../shared/principals';
 import { DEFAULT_COMPANY_ID, CHANNELS_EPOCH } from '../shared/channels';
 // envelope PR4 (§5 D11): A2A 태스크 정본을 렌더러 인메모리에서 데몬 이벤트 로그로.
 // (로그·machineId는 채널 부트 게이트 산출물 공유 — 별도 개방 금지.)
-import { A2aTaskService } from './a2a/A2aTaskService';
+import { A2aTaskService, statusMessageFromWire } from './a2a/A2aTaskService';
 import { parsePublicCreateTask } from './a2a/publicCreateParams';
 import { WorkTaskService } from './worktask/WorkTaskService';
 import { listMissionsBatch } from './worktask/missionListBatch';
-import { isTaskState, type AgentStatus, type Task } from '../shared/types';
+import { isTaskState, type AgentStatus, type Message, type Task } from '../shared/types';
 import { ProcessMonitor } from './ProcessMonitor';
 import { AgentProcessTracker } from './AgentProcessTracker';
 import { liveRecoveryHint, namedAgentAlive, recordedTurnStillOpen, recordWasMidTurn, screenShowsLiveAgent, sightedRecoveredAgent } from './recoveryHint';
@@ -248,6 +247,7 @@ import { chatAgentStatus, confirmedStopAt, transcriptTurnEnd } from './transcrip
 import { DaemonPTYBridge } from './DaemonPTYBridge';
 import { createCodexSharedRuntime, runCodexDaemon } from './transcript/codexSharedRuntime';
 import { validChatAttachments } from '../shared/transcript/chatAttachments';
+import { agentStatesFor } from '../shared/agentStateBatch';
 import { ChatSessionService } from './chat/ChatSessionService';
 import { createChatV2Host } from './chat/v2/host';
 import { registerChatV2Rpc } from './chat/v2/rpc';
@@ -638,27 +638,6 @@ function syncGateAfter<A extends unknown[], R>(fn: (...args: A) => Promise<R>): 
 }
 
 /**
- * A plain-text parse of a session's ring on the shared concurrency-1 snapshot
- * queue. The ring is copied only when the job's turn comes, so a job waiting
- * behind attach snapshots pins no ring copy; the session is looked up then
- * too, so a pane closed meanwhile reads as gone.
- */
-function queuedTextSnapshot(sessionManager: DaemonSessionManager, sessionId: string, scrollback: number): Promise<TextSnapshotOutcome | null> {
-  return enqueueSnapshotJob(async () => {
-    const managed = sessionManager.getSession(sessionId);
-    if (!managed) return null;
-    return snapshotRingTextUnqueued(managed.ringBuffer, managed.bridge.outputModes, {
-      // Dims backstop parity with the attach flush (?? 80 / ?? 24): a recovered
-      // session may not have real dims yet, and a 0-wide headless terminal would
-      // fail soft instead of reading.
-      cols: managed.meta.cols ?? 80,
-      rows: managed.meta.rows ?? 24,
-      scrollback,
-    });
-  });
-}
-
-/**
  * The phone's scrollback search (`GET /api/search`) reads a pane through the
  * same headless parse `daemon.readSessionText` runs, on the same shared
  * concurrency-1 queue, keeping as many rows as that RPC does by default. The
@@ -728,15 +707,8 @@ function createApprovalRegistry(sessionManager: DaemonSessionManager): ApprovalR
       return adapters[native.adapter]?.(native, reply) ?? 'unavailable';
     },
     readScreenTail: async (sessionId) => {
-      const managed = sessionManager.getSession(sessionId);
-      if (!managed) return null;
-      const outcome = await generateTextSnapshot({
-        cols: managed.meta.cols ?? 80,
-        rows: managed.meta.rows ?? 24,
-        scrollback: 0,
-        initial: readSessionTextReplay(managed.ringBuffer, managed.bridge.outputModes),
-      });
-      if (!outcome.ok) return null;
+      const outcome = await queuedScreenText(sessionManager, sessionId);
+      if (!outcome?.ok) return null;
       return outcome.rows.map((r) => r.text);
     },
     writeToSession: (sessionId, data) => {
@@ -4663,17 +4635,9 @@ function registerRpcHandlers(
       },
     } : null,
     readScreen: async (id) => {
-      const managed = sessionManager.getSession(id);
-      if (!managed) return null;
-      const outcome = await generateTextSnapshot({
-        cols: managed.meta.cols ?? 80,
-        rows: managed.meta.rows ?? 24,
-        scrollback: 0,
-        initial: readSessionTextReplay(managed.ringBuffer, managed.bridge.outputModes),
-        // The composer check tells a dimmed suggested prompt from typed input.
-        undimmed: true,
-      });
-      return outcome.ok
+      // The composer check tells a dimmed suggested prompt from typed input.
+      const outcome = await queuedScreenText(sessionManager, id, true);
+      return outcome?.ok
         ? Object.assign(outcome.rows.map((r) => r.text), { undimmed: outcome.rows.map((r) => r.undimmed ?? r.text) })
         : null;
     },
@@ -5441,8 +5405,11 @@ function registerRpcHandlers(
       ? agentProcessTracker.idleShellState(original.meta.pid, original.meta.env, true, { fresh: true })
       : 'error');
   });
-  pipeServer.onRpc('daemon.getAgentState', async (params) => {
-    const id = typeof params['id'] === 'string' ? params['id'] : '';
+  // #2372 — `ids` reads several panes in one call (see agentStateBatch.ts).
+  pipeServer.onRpc('daemon.getAgentState', async (params) => (params['ids'] !== undefined
+    ? agentStatesFor(params['ids'], agentStateFor)
+    : agentStateFor(typeof params['id'] === 'string' ? params['id'] : '')));
+  function agentStateFor(id: string) {
     const state = readDaemonAgentState(id);
     const bridge = sessionManager.getSession(id)?.bridge;
     if (!bridge) return state;
@@ -5470,7 +5437,7 @@ function registerRpcHandlers(
       // since its agent started), so its idle window runs from that end.
       settledAgoMs: bridge.settledAgoMs(),
     };
-  });
+  }
   // #1594 — what main's terminal_send needs to paste into a session: the agent
   // and DECSET 2004 from the live output stream. A hidden pane's renderer xterm
   // may not have seen the bytes that set or cleared the mode; this stream has.
@@ -5688,15 +5655,8 @@ function registerRpcHandlers(
     isAttached: (id) => sessionManager.getSession(id)?.meta.state === 'attached',
     destroySession: async (id) => { await destroySessionRpc({ id }); },
     readScreen: async (id) => {
-      const managed = sessionManager.getSession(id);
-      if (!managed) return '';
-      const outcome = await generateTextSnapshot({
-        cols: managed.meta.cols ?? 80,
-        rows: managed.meta.rows ?? 24,
-        scrollback: 0,
-        initial: readSessionTextReplay(managed.ringBuffer, managed.bridge.outputModes),
-      });
-      return outcome.ok ? outcome.rows.map((r) => r.text).join('\n') : '';
+      const outcome = await queuedScreenText(sessionManager, id);
+      return outcome?.ok ? outcome.rows.map((r) => r.text).join('\n') : '';
     },
     sendKey: async (id, sequence) => {
       const managed = liveManaged(id);
@@ -6521,6 +6481,12 @@ function registerRpcHandlers(
     // Only the app's main process reads the pane tree; take the list from it
     // alone. Anything else leaves it unknown (no relaxation).
     const livePaneIds = pipeServer.isFirstParty(ctx.clientId) ? normalizeLivePaneIds(p.livePaneIds) : undefined;
+    let message: Message | undefined;
+    try {
+      message = statusMessageFromWire(p.message, randomUUID);
+    } catch (err) {
+      return { ok: false, error: `a2a.task.update: ${err instanceof Error ? err.message : 'invalid message'}` };
+    }
     const moved = await a2aTaskService.transition({
       taskId,
       to: status,
@@ -6541,6 +6507,7 @@ function registerRpcHandlers(
       // 완료증거 게이트(PR-B)로 판정한다 — completed/failed는 구조화 증거 강제(거부는
       // completion_evidence_* 사유코드로 호출자에 포워딩).
       ...(p.evidence !== undefined ? { evidence: p.evidence } : {}),
+      ...(message ? { message } : {}),
       ...(typeof p.idempotencyKey === 'string' ? { idempotencyKey: p.idempotencyKey } : {}),
     });
     // A cross-host task: the peer hears this state in the same call (ledger first, then outbox).
@@ -6722,6 +6689,7 @@ function registerRpcHandlers(
       ...(typeof p['worktreePath'] === 'string' ? { worktreePath: p['worktreePath'] } : {}),
       ...(typeof p['paneGroupId'] === 'string' ? { paneGroupId: p['paneGroupId'] } : {}),
       ...(typeof p['prUrl'] === 'string' ? { prUrl: p['prUrl'] } : {}),
+      ...(typeof p['prUrlGithubHost'] === 'string' ? { prUrlGithubHost: p['prUrlGithubHost'] } : {}),
       // worktree:false fan-out folder (additive; write-once like the J1 fields).
       ...(typeof p['outputDir'] === 'string' ? { outputDir: p['outputDir'] } : {}),
     });
@@ -9406,8 +9374,15 @@ async function main(): Promise<void> {
         broadcast: (event) => pipeServer.broadcast(event),
         refreshLink: (linkId) => (refresh ? refresh({ linkId }) : Promise.resolve(null)),
         offers: a2aOffersRef,
-        // This build shows and accepts share offers: tell the servers it joins.
-        features: [A2A_FEATURE_LINK_OFFER],
+        // This build shows and accepts share offers, and takes images on
+        // messages: tell the servers it joins, and the joiners in its hello.
+        features: [A2A_FEATURE_LINK_OFFER, A2A_FEATURE_IMAGES],
+        uploadsRoot: path.join(wmuxDir, 'uploads'),
+        // A live terminal of the sender's workspace (stamped at spawn by main), else none.
+        spawnCwdOf: (ptyId, workspaceId) => {
+          const meta = sessionManager.listLiveSessions().find((m) => m.id === ptyId);
+          return workspaceId && meta?.env?.[ENV_KEYS.WORKSPACE_ID] === workspaceId ? meta.spawnCwd : undefined;
+        },
         log: a2aLog,
       });
       a2aDelivery.registerRoutes(a2aRoutes);

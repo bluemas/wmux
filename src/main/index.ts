@@ -52,7 +52,7 @@ import { markBoot, emitBootSummary } from './util/bootTrace';
 import * as path from 'path';
 import * as os from 'os';
 import { app, BrowserWindow, dialog, ipcMain, powerMonitor } from 'electron';
-import { checkUserDataIsolation, claimPortableDataNotice, PORTABLE_DATA_SUFFIX, shouldUsePortableData } from './dataIsolation';
+import { checkUserDataIsolation, claimPortableDataNotice, mayInstallDarwinCliShim, PORTABLE_DATA_SUFFIX, shouldUsePortableData } from './dataIsolation';
 import { createWindow, loadMainRenderer } from './window/createWindow';
 import { attachDesktopPresenceReporter, reportDesktopPresence } from './window/desktopPresence';
 import { PTYManager } from './pty/PTYManager';
@@ -164,6 +164,9 @@ import { createBorrowApprovalRequester } from './browser-session/liveBorrowAppro
 import { DangerousActionConsent } from './browser-session/dangerousActionConsent';
 import { registerBrowserConsentRpc } from './pipe/handlers/browserConsent.rpc';
 import { registerBrowserConsentGrantsIpc } from './ipc/handlers/browserConsentGrants.handler';
+import { registerBrowserAgentControlIpc } from './ipc/handlers/browserAgentControl.handler';
+import { BrowserAgentControl } from './browser-session/BrowserAgentControl';
+import { BROWSER_AGENT_CONTROL_IPC } from '../shared/browserAgentControl';
 import type { BorrowApprovalRequester } from '../shared/liveWriteScope';
 import { resolveEnforcementMode } from './mcp/enforcementMode';
 import { setConfiguredFirstPartyClients } from './mcp/firstParty';
@@ -179,6 +182,7 @@ import { WebviewCdpManager } from './browser-session/WebviewCdpManager';
 import { claimCdpPort, probeCdpEndpointWithRetry } from './browser-session/cdpPort';
 import { clearPrivateBrowserSession, trackPrivateBrowserContents } from './browser-session/privateSession';
 import { BrowserBackendStore } from './browser-session/BrowserBackendStore';
+import { registerBrowserPrivateNetworkIpc } from './ipc/handlers/browserPrivateNetwork.handler';
 import { ChromeLauncherRegistry } from './browser-session/ChromeLauncher';
 import { ChromeProfileStore, reconcilePaneBindingsFromMirror } from './browser-session/ChromeProfileStore';
 import { CHROME_PANE_IPC } from '../shared/chromePaneBinding';
@@ -738,6 +742,21 @@ const mcpRegistrar = new McpRegistrar();
 const mcpBrokerSupervisor = new BrokerSupervisor();
 const webviewCdpManager = new WebviewCdpManager(0);
 webviewCdpManager.setCdpFailureReason(cdpEnabled ? 'CDP ownership verification pending' : 'CDP disabled by configuration');
+// "Agent is driving" marker + Stop / Take over for in-app browser tabs. Activity
+// is the surface's automation lease count; Stop and Take over end the leases in
+// flight (their holders learn why on the next renew) and stop a navigation.
+const browserAgentControl = new BrowserAgentControl({
+  emit: (state) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send(BROWSER_AGENT_CONTROL_IPC.changed, state);
+    }
+  },
+  cancelInFlight: (surfaceId, error) => {
+    webviewCdpManager.revokeRpcLeases(surfaceId, error);
+    webviewCdpManager.stopLoading(surfaceId);
+  },
+});
+webviewCdpManager.setLeaseObserver((surfaceId, leases) => browserAgentControl.noteLeases(surfaceId, leases));
 
 // Daemon client — initialized on app ready, used if daemon is available
 let daemonClient: DaemonClient | null = null;
@@ -1032,9 +1051,9 @@ localCompletionAlarm = new CompletionAlarm({
   onConfirmed: (_pane, _slug, _cls, resume) => resume(),
 });
 
-registerWorkspaceRpc(rpcRouter, () => mainWindow);
-registerSurfaceRpc(rpcRouter, () => mainWindow);
-registerPaneRpc(rpcRouter, () => mainWindow, {}, () => daemonClient);
+registerWorkspaceRpc(rpcRouter, () => mainWindow, { agentControl: browserAgentControl });
+registerSurfaceRpc(rpcRouter, () => mainWindow, browserAgentControl);
+registerPaneRpc(rpcRouter, () => mainWindow, { agentControl: browserAgentControl }, () => daemonClient);
 const inputRpc = registerInputRpc(
   rpcRouter,
   ptyManager,
@@ -1203,6 +1222,7 @@ const browserHelpRequests = registerBrowserRpc(
       computerCallerProtection = check;
     },
   },
+  browserAgentControl,
 );
 // browser_request_help — the renderer's Done / Cancel. Mirrors
 // PERMISSION_PROMPT_RESOLVE: a shape-validated invoke, and the AUTHORITATIVE
@@ -1678,10 +1698,19 @@ registerBrowserConsentRpc(rpcRouter, {
   consent: new DangerousActionConsent({
     store: browserPolicyStore,
     queue: () => approvalQueue,
+    canAsk: () => !!mainWindow && !mainWindow.isDestroyed(),
     runOwnership: (ptyId) => automationBridge.runOwnership(ptyId),
     workspaceName: (workspaceId) => getWorkspaceMirror().getEntries()?.find((e) => e.id === workspaceId)?.name,
     log: (line) => console.warn(line),
   }),
+});
+registerBrowserAgentControlIpc(ipcMain, {
+  getWindow: () => mainWindow,
+  control: browserAgentControl,
+  live: {
+    list: (workspaceId) => chromeRegistry.listLiveBorrows(workspaceId),
+    returnTab: (workspaceId, surfaceId) => chromeRegistry.returnLiveBorrow(workspaceId, surfaceId),
+  },
 });
 registerBrowserConsentGrantsIpc(ipcMain, {
   getWindow: () => mainWindow,
@@ -1767,6 +1796,8 @@ ipcMain.handle('browser:set-backend', (event, value: unknown) => {
   void browserPolicyStore.bumpEpoch().catch((err) => console.warn('[browser-policy] epoch bump failed:', err));
   return { ok: true };
 });
+// Settings → Browser → Allow private network addresses (main-owned).
+registerBrowserPrivateNetworkIpc(ipcMain, { getWindow: () => mainWindow, store: browserBackendStore });
 // Phase 2.5 — chrome-backend profiles + workspace bindings (workspace card
 // menu). Validation lives in the store; IPC only shapes the payloads.
 ipcMain.handle('browser:chrome-profiles:list', (event) => isTrustedMainFrameSender(event, () => mainWindow) ? ({
@@ -1929,8 +1960,9 @@ app.on('ready', async () => {
   // 안 가리키면"(DMG/ZIP 임시 경로에서 첫 설치 후 볼륨 제거·앱 이동으로 죽은
   // 링크가 됨, issue #505) 복구를 위해 재실행한다. 부팅 경로를 막지 않게 지연
   // 실행, 전체 best-effort.
-  // A portable copy must not repoint the installed app's shim at itself.
-  if (process.platform === 'darwin' && app.isPackaged && process.env.WMUX_DATA_SUFFIX !== PORTABLE_DATA_SUFFIX) {
+  // No isolated instance (portable copy, test run) may repoint the installed
+  // app's shim at itself: see mayInstallDarwinCliShim.
+  if (process.platform === 'darwin' && app.isPackaged && mayInstallDarwinCliShim(process.env)) {
     const shimTimer = setTimeout(() => {
       try {
         // eslint-disable-next-line @typescript-eslint/no-var-requires -- Preserve deferred CLI-shim module loading.

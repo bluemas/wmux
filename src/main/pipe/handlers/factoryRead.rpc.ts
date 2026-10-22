@@ -28,6 +28,7 @@
 
 import { randomBytes } from 'node:crypto';
 import { isCoordinatorBot, type BotBinding, type BotProfile } from '../../../shared/bot';
+import { botRepo } from '../../../shared/repoKey';
 import { FACTORY_READ_RPC, PLAN_RPC, botSurfaceRefusal, type BotToolName, type FactoryRefusal } from '../../../shared/botSurface';
 import type { RpcContext } from '../../../shared/rpc';
 import type { PrLaneFacts, PrReviewRead } from '../../../shared/prReview';
@@ -39,8 +40,9 @@ import type { BotDirectoryApi } from '../../factory/botStore';
 import type { RoomWriter } from '../../factory/roomWriter';
 import { DAY_MS, type TrustReadResult } from '../../factory/trustMetrics';
 import { GUEST_TURN_STARTS_NO_WORKERS, guestOfRunningWake, type GuestProvenance } from '../../factory/wakeTaint';
+import { TAINTED_CONVERSATION_SAVES_NOTHING, conversationTainted } from '../../factory/conversationMarks';
 import { crossesGuestBoundary } from '../../factory/guestWorkspaces';
-import { isGithubHost, type PrGate } from '../../github/PrProvider';
+import { isGithubForgeHost, type PrGate } from '../../github/PrProvider';
 import { botReviewHost } from '../../worktask/botFanoutPresets';
 
 // ── Limits ─────────────────────────────────────────────────────────────────
@@ -94,6 +96,9 @@ export interface FactoryReadDeps {
   /** The guest provenance of a bot's running wake (wakeTaint.ts); default
    *  the running tracker. */
   guestWake?: (botId: string) => GuestProvenance;
+  /** Whether a bot's live conversation took in outside text (none: yes);
+   *  default conversationMarks.ts. */
+  conversationTainted?: (botId: string) => boolean;
   /** Why the scope's host cannot be read now (a GitLab host without a
    *  usable glab: `host_not_connected`, or `read_failed` when it could not
    *  be reached just now), or null; createHostSetupGate. Absent: always
@@ -144,10 +149,11 @@ function enabledBots(bots: BotDirectoryApi | null): BotProfile[] {
   }
 }
 
-/** The repo a workspace's bots act on: the oldest enabled bot there with one. */
+/** The repo a workspace's bots act on: the oldest enabled bot there with one
+ *  (botRepo: a repo key and a checkout folder, as the wake prompt counts it). */
 export function workspaceRepo(bots: BotDirectoryApi | null, workspaceId: string): { repoPath: string } | null {
   const withRepo = enabledBots(bots)
-    .filter((b) => b.workspaceId === workspaceId && b.repo?.repoPath)
+    .filter((b) => b.workspaceId === workspaceId && botRepo(b))
     .sort((a, b) => a.createdAt - b.createdAt);
   const repoPath = withRepo[0]?.repo?.repoPath;
   return repoPath ? { repoPath } : null;
@@ -173,9 +179,8 @@ export async function repoScope(
       return refusal('cross_workspace', 'a bot reads its own workspace\'s repository; another workspace is a Coordinator\'s read');
     }
     workspaceId = (asked as string | undefined) ?? own.workspaceId;
-    repoPath = workspaceId === own.workspaceId && own.repo?.repoPath
-      ? own.repo.repoPath
-      : workspaceRepo(bots, workspaceId)?.repoPath ?? null;
+    const ownRepo = workspaceId === own.workspaceId ? botRepo(own) : null;
+    repoPath = ownRepo ? ownRepo.repoPath : workspaceRepo(bots, workspaceId)?.repoPath ?? null;
   } else {
     if (typeof asked !== 'string') return refusal('invalid', 'workspaceId is required');
     workspaceId = asked;
@@ -231,7 +236,7 @@ export function createHostSetupGate(ports: HostSetupGatePorts): (scope: RepoScop
   const asked = new Set<string>();
   return async (scope) => {
     const host = scope.repoKey.split('/')[0] ?? '';
-    if (!host || isGithubHost(host)) return null;
+    if (!host || isGithubForgeHost(host)) return null;
     let gate: HostGate;
     try {
       gate = await ports.gate(scope.repoPath, host);
@@ -461,6 +466,9 @@ export async function handlePlanPropose(raw: unknown, ctx: RpcContext | undefine
   }
   // The owner's answer to a plan wakes its bot to start the work.
   if ((deps.guestWake ?? guestOfRunningWake)(bot.botId) !== false) return refusal('not_authorized', `plan.propose: ${GUEST_TURN_STARTS_NO_WORKERS}`);
+  // A plan the owner approves starts work later: none from a conversation
+  // that took in outside text.
+  if ((deps.conversationTainted ?? conversationTainted)(bot.botId) !== false) return refusal('not_authorized', `plan.propose: ${TAINTED_CONVERSATION_SAVES_NOTHING}`);
   const anyWorkspace = isCoordinatorBot(own);
   const p = params(raw);
   const L = FACTORY_READ_LIMITS;

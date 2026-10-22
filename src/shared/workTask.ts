@@ -177,6 +177,46 @@ export const WORKTASK_CLOSED_GC_MS = 7 * 24 * 60 * 60 * 1000;
  */
 export const WORKTASK_PR_URL_RE = /^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+$/;
 
+/**
+ * prUrl's GitLab shape: a merge request page, `https://{host}/{group/…/project}/-/merge_requests/{iid}`
+ * (task_pr on a GitLab remote — any host, as self-managed GitLab is common).
+ * Whole URL, https only, plain path segments; no userinfo, query or fragment.
+ */
+export const WORKTASK_MR_URL_RE = /^https:\/\/[\w.-]+(?::\d{1,5})?(?:\/[\w.-]+){2,}\/-\/merge_requests\/\d+$/;
+
+/** Longest prUrl the daemon stores (workLink's URL cap). */
+export const WORKTASK_PR_URL_MAX = 2048;
+
+/** A pull request page on any host; the host is captured (lowercased by the caller). */
+const GITHUB_PULL_URL_RE = /^https:\/\/([\w.-]+(?::\d{1,5})?)\/[\w.-]+\/[\w.-]+\/pull\/\d+$/;
+
+/** A GitHub pull request page: on github.com, or on a host in `githubHosts`
+ *  (GitHub Enterprise on its own domain: the hosts gh is signed in to,
+ *  shared/forgeHosts.ts). Pure. */
+export function isGithubPullUrl(url: string, githubHosts: ReadonlySet<string> = new Set()): boolean {
+  if (WORKTASK_PR_URL_RE.test(url)) return true;
+  const host = githubPullUrlHost(url);
+  return host !== null && githubHosts.has(host);
+}
+
+/** The host of a pull request page as isGithubPullUrl reads it (lowercased,
+ *  a written port kept, `:443` too), or null when it is not one. Pure. */
+export function githubPullUrlHost(url: string): string | null {
+  return GITHUB_PULL_URL_RE.exec(url)?.[1]?.toLowerCase() ?? null;
+}
+
+/** A prUrl the daemon may store: a GitHub PR (github.com, or a host in
+ *  `githubHosts`) or a GitLab merge request page, at most
+ *  WORKTASK_PR_URL_MAX characters. */
+export function isWorktaskPrUrl(url: string, githubHosts?: ReadonlySet<string>): boolean {
+  return url.length <= WORKTASK_PR_URL_MAX && (isGithubPullUrl(url, githubHosts) || WORKTASK_MR_URL_RE.test(url));
+}
+
+/** Whether a task's prUrl is a GitLab merge request page (the UI says MR). Pure. */
+export function isMergeRequestUrl(url: string | undefined): boolean {
+  return typeof url === 'string' && WORKTASK_MR_URL_RE.test(url);
+}
+
 /** 미션 채널 topic 앵커 접두(§3) — 고아 reconcile의 유일 마킹. */
 export const MISSION_TOPIC_PREFIX = 'wmux:mission:';
 
@@ -263,7 +303,7 @@ export type CloseTaskResultWire =
 
 /** task:create-pr 결과(TaskPrService.CreatePrResult 미러). */
 export type CreatePrResultWire =
-  | { ok: true; prUrl: string; recovered?: boolean; commitPending?: boolean }
+  | { ok: true; prUrl: string; recovered?: boolean; commitPending?: boolean; mrIid?: number }
   | {
       ok: false;
       reason: 'gh-missing' | 'gh-unauth' | 'dirty' | 'no-origin' | 'push-failed' | 'pr-failed' | 'error';

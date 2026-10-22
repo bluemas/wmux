@@ -1,7 +1,7 @@
 {
   "name": "wmux",
   "productName": "wmux",
-  "version": "4.8.0",
+  "version": "4.9.0",
   "description": "Workspace multiplexer for AI agents — run fleets of Claude Code, Codex & Gemini in parallel on Windows & macOS, with MCP browser automation built in",
   "private": true,
   "main": ".vite/build/index.js",
@@ -43,6 +43,7 @@
     "test:rig": "npm run test:rig:sim",
     "test:harness": "vitest run --config vitest.harness.config.ts",
     "test:e2e": "node e2e/run.mjs",
+    "e2e:first-run": "node scripts/e2e-first-run.mjs",
     "harness:gen-corpus": "vitest run --config vitest.harness.config.ts core/harness/__tests__/baseline-gate.harness.test.ts",
     "build:terminal-core": "node scripts/build-native-terminal.mjs",
     "test:terminal-core": "node scripts/native-core-verify.mjs",
@@ -101,7 +102,7 @@
     "@xterm/addon-serialize": "0.15.0-beta.301",
     "@xterm/headless": "6.1.0-beta.303",
     "autoprefixer": "^10.4.27",
-    "electron": "41.10.6",
+    "electron": "42.11.3",
     "esbuild": "0.25.12",
     "eslint": "^8.57.1",
     "eslint-plugin-import": "^2.32.0",
@@ -112,7 +113,7 @@
     "tailwindcss": "^3.4.19",
     "typescript": "^5.9.3",
     "vite": "^6.4.4",
-    "vitest": "^5.0.0",
+    "vitest": "^5.0.3",
     "wasm-pack": "^0.15.0"
   },
   "dependencies": {

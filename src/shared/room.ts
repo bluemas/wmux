@@ -70,6 +70,14 @@ export function dmThreadBot(threadId: unknown): string | null {
   return BOT_ID_RE.test(botId) ? botId : null;
 }
 
+/** Whether `threadId` is another bot's 1:1 with the owner than `botId`'s:
+ *  what the owner says there reaches no other bot (its room reads, its
+ *  facts, its wake prompts). */
+export function inAnotherBotsDm(threadId: unknown, botId: string): boolean {
+  const owner = dmThreadBot(threadId);
+  return owner !== null && owner !== botId;
+}
+
 /** A group chat's own thread (an owner-made group; a group migrated from
  *  a workspace room keeps `general`, shared/botGroup.ts). */
 export function groupThreadId(groupId: string): ThreadId {
@@ -188,6 +196,11 @@ export interface RoomCard {
     requestCardId?: string;
     /** `secret_request` card: the env name asked for (never a value). */
     secretName?: string;
+    /** Main-written, on a Finished / Stopped pointer card written where the
+     *  owner asked for work that ran in a thread no conversation opened
+     *  (Handoff.askedIn): the pointer links that thread without tying it to
+     *  the conversation it sits in. */
+    pointer?: 'askedIn';
   };
   /** question / proposal / plan */
   state?: 'open' | 'resolved';

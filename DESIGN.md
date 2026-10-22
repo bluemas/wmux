@@ -80,7 +80,7 @@ theme (and a custom one) gets the same grammar.
 | `--hover-fill` | 5% | 5% | hover on rows, rail items, icon buttons |
 | `--selection-subtle` | 8% | 5% | Fleet cards at rest, header bands |
 | `--selection` | 10% | 6% | the selected row, tab, rail item, chip |
-| `--selection-hover` / `-emphasis` | 15% / 20% | 10% / 14% | hovered chip / pressed or active icon button |
+| `--selection-hover` / `-emphasis` | 15% / 20% | 10% / 14% | hovered chip / pressed or active icon button; muted text on the hover fill draws as `--text-subtle`, on the emphasis fill as `--text-sub` |
 
 **Style knobs** (`THEME_STYLES` → CSS variables on the theme's block; a knob
 left unset emits nothing and the `:root` default applies): `--font-ui`,
@@ -919,7 +919,9 @@ tests, changelog draft, issue triage) that open the composer filled in.
 ### Remote
 
 One page, Tailnet first, filling the sheet with 28px sides
-(14px under a 640px sheet). Top to bottom:
+(14px under a 640px sheet). It is the one place PCs are connected, seen and
+removed, whatever carries them (A2A, a workspace share, a LAN PIN);
+Settings › LAN keeps only the listener switches. Top to bottom:
 
 - **Header:** the 16px title, then one muted line that sums it up
   (`2 of 3 PCs connected · 1 of 1 phones connected`, or `Nothing connected
@@ -938,8 +940,8 @@ One page, Tailnet first, filling the sheet with 28px sides
   the QR survives sharing turning on.
   Details unfolds in place: the phone
   address without its token (copy), whether input is allowed, Share & pair,
-  the A2A port and the full fingerprint (plain mono values; the fingerprint
-  wraps anywhere, copy). Connecting another computer by A2A starts from
+  the A2A port and the full security code (the certificate fingerprint;
+  plain mono values; the code wraps anywhere, copy). Connecting another computer by A2A starts from
   Connect a PC…; as a workspace share it starts from Connect a PC… or from
   Share & pair's **Connect another computer**, which mints the pairing link
   and copies it in one click. Connect a PC's invite tab carries **Also let
@@ -953,18 +955,18 @@ One page, Tailnet first, filling the sheet with 28px sides
   hairlines. Rows: a link request (one sentence naming both ends — "DESK
   wants to link its Web/claude with this PC's api / build. Once accepted they
   send each other work and read the results." — its age, that the pane names
-  are the other PC's report, the other PC's fingerprint prefix when known,
+  are the other PC's report, the other PC's security code prefix when known,
   same repo or the repo-mismatch warning, the direction; Decline, Accept);
   held remote work (the quoted task, why it is held; Send back, Deliver to
-  the pane now — never re-routed on its own; a hold for Moa clears by itself,
+  the pane now — never re-routed on its own; a hold for the Coordinator clears by itself,
   so it is a quiet muted line under the block, not a row and not counted);
-  a PC whose certificate changed
+  a PC whose security code changed
   (how many links removing it ends; Remove asking twice, Pair again…, which
   opens Connect a PC on Paste when this PC joined that one and on Invite when
   it joined this one). There is no pane picker on a request: the request
   already names this PC's pane. A **pane another PC shared** is its own row
   (2026-10-21): one sentence naming that PC's pane as its report, its age,
-  the other PC's fingerprint prefix, its agent and repo, the directions it
+  the other PC's security code prefix, its agent and repo, the directions it
   offers and how long it stays open (an hour); Decline, **Accept…**. The row
   has no pane picker either: Accept… opens the link dialog with that PC and
   its pane fixed, this PC's pane picked there (the focused pane first), and
@@ -973,8 +975,14 @@ One page, Tailnet first, filling the sheet with 28px sides
 - **One list** (one hairline container, 36px rows on shared columns: icon ·
   13px/500 name · 12px muted meta · status · actions), in groups with a muted
   heading and count:
-  - **Other PCs** — every A2A-paired PC (either role): its address, link
-    counts and "Messages to send N", the status, and a ⋯ menu named after it
+  - **Other PCs** — every A2A-paired PC (either role), one row per A2A
+    hostId and never merged with another transport's record (an A2A PC and
+    a LAN peer with the same name are two rows): its address, link
+    counts and "Messages to send N", then what this PC allows that PC, one
+    slot per permission ("Can see 2 panes here" for a PC that joined this
+    one, from its exposure; empty for a PC this PC joined), with one more
+    slot kept empty for starting new agents so it lands without reshaping
+    the row; the status, and a ⋯ menu named after it
     (Link panes…, Link Moa…, What this PC can see…, Remove; portalled so the
     list's clip never cuts it, Escape on its button closes it first). Removing
     a PC says when the other PC was not told, and which side is left after a
@@ -991,19 +999,24 @@ One page, Tailnet first, filling the sheet with 28px sides
   - **Phones** — paired web devices: what each is viewing ("Viewing api /
     build", from the daemon's live streams, named here), whether it may
     type, and a direct Revoke asking twice (no ⋯ menu).
-  - **Message links** — LanLink peers, messages only.
+  - **Message links** — LanLink peers, messages only (a revoked one says
+    Revoked in its meta). Paired from Connect a PC's LAN tab.
   - Status words are three: Connected, Disconnected (with "Disconnected 3h
-    ago" when known), Waiting. The live dot is neutral, filled only while a
+    ago" when known), Waiting. A PC known only because it joined this one,
+    with no stream since wmux started, is Disconnected with its last-seen
+    time, never a standing Waiting. The live dot is neutral, filled only while a
     connection is held. With nothing anywhere, the list gives way to one line
     of explanation and Connect a PC… as the primary.
 - **Recent activity:** its own short list (paired, revoked, host added,
   connects seen while the page is open).
-- **Connect a PC dialog:** two tabs, and opening it has no side effect. It
+- **Connect a PC dialog:** three tabs, and opening it has no side effect. It
   opens on **Invite this PC** only while the A2A listener is already up;
   otherwise on **Paste an invite**, and choosing Invite is what turns the
   listener on (one muted line says so, and the page's line follows at once).
   Invite opens an invite and copies it at once (Copy reads "Copied" for
-  1.5 s, is the primary and stays for re-copying), lists the addresses the
+  1.5 s, is the primary and stays for re-copying), shows the 8-character
+  code grouped as ABCD-EFGH under it for reading out (display only: the
+  whole invite is what is copied and pasted), lists the addresses the
   other PC tries in order with "Tailscale" beside the tailnet ones, and
   counts down to expiry with Discard code. When a PC redeems the invite, the
   dialog turns into "<PC> joined. Choose what it can see" with the exposure
@@ -1014,12 +1027,18 @@ One page, Tailnet first, filling the sheet with 28px sides
   workspace share. Nothing connects before Connect.
   Under Paste, one ghost link, "No invite? Add a PC over SSH…", opens the
   Add PC over SSH dialog for a computer that cannot send an invite.
+  **LAN** pairs a message link with a PC on this network by a 6-digit PIN:
+  Generate PIN (never on open) shows the PIN in two groups of three, its
+  2-minute countdown and this PC's address, and Join takes the other PC's
+  address, port and PIN. While LAN messages are off or no network interface
+  is picked it says so and opens Settings › LAN. A PIN window the tab opened
+  survives switching tabs and is closed when the dialog closes.
 - **Link dialog from this page:** picks the PC when there is one, picks the
   other PC's pane when there is one choice or one on the same repo, and
   offers this PC's pane with the focused one preselected.
 - **Orange budget:** one event, two marks at most — the Needs you block's
   hairline and the Remote rail item's number badge (link requests + held
-  work + PCs whose certificate changed, the same count from one store
+  work + PCs whose security code changed, the same count from one store
   slice, cleared while the daemon is away). Link request toasts offer Review
   only: the repo a request names is the other PC's claim. The summary line, headings and activity stay neutral. The page's
   one primary is the first Accept, else (empty page) Connect a PC….
@@ -1252,11 +1271,17 @@ a rebindable shortcut with no default key) or the `connectors` route.
   10px `--selection` pill (plus the look's `--select-ring`); the arrow keys,
   Home and End walk the rows and select as they go. The selection is kept
   while the page is away.
-- **Detail:** no preview for now (a real one would need the plugin's own
-  page; a mock-up of it would be fake data). The name at 16px/500 with a
+- **Detail:** the name at 16px/500 with a
   neutral Signature badge for a signature entry, a 12px credit line
   (publisher · licence · version; name · version for a bundle installed by
-  hand), the description, then **What it can do**: one line per declared
+  hand), then the **preview** (owner-approved 2026-10-22): each catalog
+  entry ships one real capture of its own rail page in the light theme
+  (taken on an isolated instance with fake agents; never a mock-up), a
+  webp renderer asset. It sits on the detail background in a reserved
+  16:10 box up to 620px wide, with one `--line` hairline and the 10px card
+  radius — no fill, shadow or glass — decodes lazily, and its alt text
+  names the plugin ("Office plugin preview"). A bundle installed by hand
+  has no preview. Then the description, then **What it can do**: one line per declared
   capability with a muted check, its plain-language label and the
   capability in mono, and — when it declares nothing that reaches terminal
   text (`terminal.read`, `pane.search`, `notifications.read`,
@@ -1673,7 +1698,7 @@ primitives plus `Settings/SettingsLayout.tsx` (`SettingsSection`,
   order: General · Appearance (theme, interface, sidebar, panes, terminal
   text, agent toolbar) · Terminal · Keyboard · Notifications. Group
   **Agents**: Claude Code · Accounts · Factory · Roles & fan-out ·
-  Token usage · Browser · Computer use. Group **Connections**: Plugins (a link to the Plugins page) · Remote & phone · LAN. Then
+  Token usage · Browser · Computer use. Group **Connections**: Plugins (a link to the Plugins page) · Remote & phone · LAN (the LanLink and A2A listener switches, and a link to the Remote page where PCs are paired and removed). Then
   About. Each tab answers one question; a setting lives on exactly one tab
   and the search catalog (`settings/catalog.ts`) names that tab. Retired tab
   ids resolve through `resolveSettingsTab` (Orchestrator, Agents and Moa all
@@ -1857,6 +1882,8 @@ primitives plus `Settings/SettingsLayout.tsx` (`SettingsSection`,
 | 2026-10-21 | Orchestrator decision (owner direction, recommended option): in a room or group chat with an enabled coordinator, an owner message that names no bot goes to that coordinator alone, which hands the work on; a message that picks bots goes to exactly those, and a room or group without a coordinator still reaches every bot. The recipients chip reads "To: <lead> ▾" (no fill: it is the default) and its muted line and the empty group's line name the lead. Amends Group chats and Composer; reverses, for a group with a coordinator, the 2026-10-15 group chat row's "the coordinator-only routing of an untagged room message is gone" | Woken together, every bot answered one message (four answers, some saying they had nothing to add), the coordinator restated what the others had just posted, and the work it promised to report never came back to it because it had not dispatched it. The chip names the lead, so the owner can see who gets the message, which was the reason the earlier routing was dropped |
 | 2026-10-21 | Owner decision: a muted "Enjoying wmux? · Star on GitHub ×" row at the sidebar's foot, below "Agent not set up" in priority, plus a permanent Star row in Settings › About. It shows three days after first run and after 20 new agent sessions; each "Not now" doubles that number, restarts the count and adds a three-day cooldown (modelled on Orca and Superset). The star is one click through the user's own gh, else the repository page; no telemetry | Stars are how other developers find wmux, but a prompt that nags costs more than it earns. Asking only after real use, backing off on every no, and never asking again once starred keeps it to a few asks per user; gh makes the yes a single click without a new sign-in, and the counting stays on the machine |
 | 2026-10-22 | Owner decision: Windows glass gives muted text a glass-only value. On Paper, Amber, Catppuccin, Monochrome, Stars & Stripes, Red Dynasty, Gruvbox Dark Hard and Void, `--text-muted` under `html[data-glass][data-platform="win32"]` is the opaque token moved by lightness only, the least step that passes the coverage gate; the gate judges that value, and the worst-backdrop model is unchanged. macOS and glass Off keep the opaque token. Mono, Mono Light and Nightowl stay opaque on Windows (their `--text-sub` misses 4.5:1 at the cap) | After the opaque contrast lift, eleven themes were still opaque on Windows because muted text sized for the opaque sidebar missed 3:1 over the worst backdrop even at 90% coverage |
+| 2026-10-22 | Orchestrator decision (owner direction, recommended option): the selected row (`--selection`) joins the surfaces of the 2026-10-21 contrast floors, so muted text reads at ≥3:1 and secondary text at ≥4.5:1 on it over the sheet and the column. Paper, Mono, Mono Light, Amber, Catppuccin, Monochrome, Stars & Stripes, Red Dynasty, Nightowl, Gruvbox Dark Hard and Void were lifted again by HSL lightness only, the least that clears it (at most 4.5%); Nightowl's and Stars & Stripes' pinned `--text-sub2` moved with them so sub2 stays above subtle. The `--selection-hover` fill (a selected Fleet card, a hovered needs-you row, a hovered chip or button) draws muted text as `--text-subtle` instead, which reads at ≥3:1 there; the global tiers are not lifted for it. The stronger `--selection-emphasis` fill (an open chip, a pressed or active button) draws muted text as `--text-sub`, since subtle falls under 3:1 there on Mono, Amber, Nightowl and Gruvbox Dark Hard. The Windows glass-only muted values were re-derived from the new tokens by the same least-step rule: Amber, Catppuccin and Gruvbox Dark Hard no longer need one, and Mono now passes the Windows glass gate with its opaque tokens. Amends the 2026-10-21 contrast row and the 2026-10-22 glass row | Selected rows were never measured: on Gruvbox the selected row's muted text read 2.61:1, and on ten themes the largest selection mix that passed was the 5% hover fill itself, so lowering `--selection` alone would have merged selection into hover. Holding the 15% fill to the same floor needed lifts up to 8% and pushed muted into subtle on Amber and Gruvbox |
+| 2026-10-22 | Owner decision: the Remote page is the one place PCs are connected. Connect a PC gains a LAN tab (the LanLink PIN pairing, moved from Settings); Settings › LAN keeps the LanLink and A2A listener switches plus a link to the Remote page, and its A2A invite, join and PC lists are gone. PC rows stay keyed by the A2A hostId and never merge across transports; each says what this PC allows that PC, with a slot kept empty for starting new agents. The A2A invite stays 8 characters, shown grouped as ABCD-EFGH for reading out while the whole invite stays what is copied; a PC known only as a joiner reads Disconnected with its last-seen time | Connecting a PC lived in three Settings sections and on the Remote page at once, so it was unclear where to start or where a PC went. One page, one dialog keeps every way in together; the security limits (the 10-minute invite, attempts and backoff, the 2-minute PIN and its 5 failures) are unchanged, so the code length is too |
 
 ### Desktop conversation view
 

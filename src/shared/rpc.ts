@@ -295,6 +295,17 @@ export interface RpcContext {
    */
   hostedWorkspace?: string | null;
   /**
+   * A hosted caller whose CURRENT trust record passes the `agent.state.all`
+   * check (an approved, unrestricted `agent.state.read.all`). Written only by
+   * RpcRouter, after its own trust lookup and only for a bound hosted caller
+   * whose request came from the plugin's rail page (the host's
+   * `hostedRailPage` dispatch option; an always-mounted sidebar or status-bar
+   * frame is never widened); never from request JSON. Read by `pane.focus`, which then lets that plugin
+   * take the user to a pane in another local workspace instead of confining it
+   * to `hostedWorkspace`. Every other pane-addressed method stays confined.
+   */
+  hostedAllWorkspaces?: true;
+  /**
    * #922 PR-B — the workspace this caller CLAIMED, as resolved server-side from
    * the `workspaceToken` envelope field. Written only by `RpcRouter` from the
    * claim registry (`workspaceClaimTrust.ts`); a request envelope can supply
@@ -354,6 +365,23 @@ export function hostedBindingOf(ctx?: RpcContext): string | undefined {
 export type RpcResponse =
   | { id: string; ok: true; result: unknown }
   | { id: string; ok: false; error: string; rejection?: RpcRejection; retryable?: boolean };
+
+/**
+ * Whether an RPC reply is a refusal answered as a result rather than thrown.
+ * Many handlers return `{ error }` (or `{ ok: false, ... }`), which keeps the
+ * pipe envelope ok, so the MCP server's callRpc (src/mcp/index.ts) flags it
+ * itself: an agent that checks only `isError` otherwise reads the refusal as
+ * success. The bot tool guard (main/deck/botToolGuard.ts) reads it the same way. Only the top level counts
+ * (a per-item `error` in a list is data), `ok: false` follows the tool modules'
+ * convention (git.ts, ledger.ts, ...), and an `error` next to any other `ok` is
+ * data.
+ */
+export function isErrorShapedResult(result: unknown): boolean {
+  if (result === null || typeof result !== 'object' || Array.isArray(result)) return false;
+  const r = result as Record<string, unknown>;
+  if (r.ok === false) return true;
+  return r.ok === undefined && typeof r.error === 'string' && r.error.length > 0;
+}
 
 // Structured rejection surfaced by the Phase 2.2 permission enforcer.
 //
@@ -416,6 +444,8 @@ export type RpcMethod =
   | 'pane.resolveName'
   // The Fleet attention board (needs you / running / idle) as data.
   | 'agent.state'
+  // The same hosted-plugin projection, for every local workspace.
+  | 'agent.state.all'
   | 'fleet.triage'
   | 'pane.focus'
   | 'pane.split'
@@ -500,6 +530,7 @@ export type RpcMethod =
   | 'browser.siteMemory.record'
   | 'browser.siteMemory.forget'
   | 'browser.siteGuides.match'
+  | 'browser.navigationPolicy.get'
   | 'browser.lease.acquire'
   | 'browser.lease.renew'
   | 'browser.lease.release'
@@ -776,6 +807,7 @@ export const ALL_RPC_METHODS = [
   'pane.list',
   'pane.resolveName',
   'agent.state',
+  'agent.state.all',
   'fleet.triage',
   'pane.focus',
   'pane.split',
@@ -853,6 +885,7 @@ export const ALL_RPC_METHODS = [
   'browser.siteMemory.record',
   'browser.siteMemory.forget',
   'browser.siteGuides.match',
+  'browser.navigationPolicy.get',
   'browser.lease.acquire',
   'browser.lease.renew',
   'browser.lease.release',

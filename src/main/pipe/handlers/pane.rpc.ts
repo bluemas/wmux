@@ -1,10 +1,12 @@
 import { isHostedCaller, hostedBindingOf } from '../../../shared/rpc';
 import { RetryableRpcError } from '../RetryableRpcError';
-import { parsePluginAgentSnapshot } from '../../../shared/pluginAgentState';
+import { parsePluginAgentSnapshot, parsePluginAllAgentSnapshot } from '../../../shared/pluginAgentState';
 import type { BrowserWindow } from 'electron';
 import type { RpcRouter } from '../RpcRouter';
 import type { DaemonClient } from '../../DaemonClient';
 import { sendToRenderer } from './_bridge';
+import { heldBrowserSurfaceRefusal, type AgentControlHolds } from './surface.rpc';
+import { getWorkspaceMirror } from '../../workspace/WorkspaceMirror';
 import type { PaneMetadata } from '../../../shared/types';
 import type { RpcContext } from '../../../shared/rpc';
 import { ORCH_ROLE_KEY } from '../../../shared/orchestratorRole';
@@ -99,6 +101,8 @@ function guardRoleKey(
  */
 export interface PaneRpcOptions {
   store?: MetadataStore;
+  /** Stop / Take over on browser tabs: a pane holding a held tab is not closed. */
+  agentControl?: AgentControlHolds;
 }
 
 export function registerPaneRpc(
@@ -309,6 +313,26 @@ export function registerPaneRpc(
     return parsePluginAgentSnapshot(raw, workspaceId, params.includeActivity === true);
   });
 
+  /**
+   * agent.state.all — the agent.state projection for every local workspace,
+   * for a bound UI plugin granted `agent.state.read.all` (RpcRouter checks the
+   * grant on every call, before and after this handler). No activity: that
+   * would need terminal.read for every workspace, and no caller needs it.
+   */
+  router.register('agent.state.all', async (params, ctx) => {
+    if (!isHostedCaller(ctx) || !hostedBindingOf(ctx)) throw new Error('Agent state requires a bound UI plugin');
+    if (params.includeActivity !== undefined) throw new Error('Activity is not available for all workspaces');
+    const raw = await sendToRenderer(getWindow, 'agent.state.all', {}, {
+      timeoutError: new RetryableRpcError('Agent state responder is not ready; retry the request'),
+    });
+    const failure = raw as { error?: unknown; retryable?: unknown } | null;
+    if (failure && typeof failure.error === 'string') {
+      if (failure.retryable === true) throw new RetryableRpcError(failure.error);
+      throw new Error(failure.error);
+    }
+    return parsePluginAllAgentSnapshot(raw);
+  });
+
   router.register('fleet.triage', async (params) => {
     // A malformed scope must not widen to the whole fleet: the renderer reads
     // a non-string workspaceId as "none given".
@@ -368,6 +392,13 @@ export function registerPaneRpc(
     }
     const confinement = paneConfinement('pane.focus', ctx);
     if ('reject' in confinement) return Promise.reject(confinement.reject);
+    // A bound UI plugin whose approval covers every workspace (RpcRouter sets
+    // hostedAllWorkspaces from the current trust record, never the request)
+    // may take the user to a pane in another local workspace. Focus only:
+    // close, stash and unstash stay confined. A commander is never widened.
+    if (ctx?.hostedAllWorkspaces === true && !ctx.commanderWorkspace && hostedBindingOf(ctx)) {
+      return sendToRenderer(getWindow, 'pane.focus', { id: params['id'], revealWorkspace: true });
+    }
     return sendToRenderer(getWindow, 'pane.focus', {
       id: params['id'],
       ...(confinement.confine ? { confineWorkspaceId: confinement.confine } : {}),
@@ -423,10 +454,11 @@ export function registerPaneRpc(
    * lets an external multi-agent caller clean up a worker pane it created via
    * pane.split in its own background workspace. No active-ws fallback.
    */
-  router.register('pane.close', (params, ctx) => {
+  router.register('pane.close', async (params, ctx) => {
     if (typeof params['id'] !== 'string') {
       return Promise.reject(new Error('pane.close: missing required param "id"'));
     }
+    const paneId = params['id'];
     // No confinement id used to ride this one at all. That was consistent for
     // the commander — `pane.close` is in COMMANDER_TEARDOWN_DENY, so a brain
     // never reaches the handler — but it left the plugin lane with a teardown
@@ -434,8 +466,27 @@ export function registerPaneRpc(
     // the commander arm is unreachable and stays for the invariant.
     const confinement = paneConfinement('pane.close', ctx);
     if ('reject' in confinement) return Promise.reject(confinement.reject);
+    // Closing the pane closes its browser tabs: refuse when any of them is one
+    // the user paused or took over. Pane ids are global, so the pane's own
+    // workspace is looked up, and every workspace is asked when it is unknown.
+    // A confined caller is checked in its own workspace only: a pane anywhere
+    // else gets the renderer's "outside the calling workspace" refusal, and a
+    // hold there must not tell the caller that pane exists.
+    const mirror = getWorkspaceMirror();
+    const owner = mirror.getPaneWorkspaces()?.get(paneId);
+    const workspaces = confinement.confine
+      ? [confinement.confine]
+      : owner ? [owner] : (mirror.getEntries() ?? []).map((e) => e.id);
+    const userHold = await heldBrowserSurfaceRefusal(
+      getWindow,
+      opts.agentControl,
+      'pane.close',
+      workspaces.length > 0 ? workspaces : [undefined],
+      (s) => s.paneId === paneId,
+    );
+    if (userHold) throw userHold;
     return sendToRenderer(getWindow, 'pane.close', {
-      id: params['id'],
+      id: paneId,
       ...(confinement.confine ? { confineWorkspaceId: confinement.confine } : {}),
     });
   });

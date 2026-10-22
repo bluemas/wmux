@@ -4,6 +4,11 @@ import { CONNECTOR_TERMINAL_IPC, type ConnectorTerminalResult, type ConnectorTer
 import { CONNECTOR_OAUTH_IPC, type ConnectorOAuthAction, type ConnectorOAuthClient, type ConnectorOAuthResult } from '../shared/connectorOAuth';
 import { CONNECTOR_CATALOG_IPC, type ConnectorCatalogResult } from '../shared/connectorCatalog';
 import { CONNECTOR_CHECK_IPC, type ConnectorCheckResult } from '../shared/connectorCheck';
+import {
+  BROWSER_PRIVATE_NETWORK_IPC,
+  type AllowPrivateNetworkSetResult,
+  type AllowPrivateNetworkState,
+} from '../shared/browserBackend';
 import { WORKFLOW_OWNER_IPC } from '../shared/botWorkflow';
 import type { TerminalCoreSettings, TerminalEngine } from '../shared/terminalCoreSettings';
 import { CHAT_IPC } from '../shared/transcript/chatIpc';
@@ -24,6 +29,12 @@ import { BOT_COMMAND_IPC } from '../shared/botCommand';
 import { BOT_GROUP_IPC } from '../shared/botGroup';
 import type { PaneLabelRejection } from '../shared/paneLabelRules';
 import { CHROME_PANE_IPC, type ChromePaneBindings } from '../shared/chromePaneBinding';
+import {
+  BROWSER_AGENT_CONTROL_IPC,
+  type BrowserAgentControlIntent,
+  type BrowserAgentControlState,
+  type LentLiveTab,
+} from '../shared/browserAgentControl';
 import {
   BROWSER_POLICY_IPC,
   type BrowserPolicyReadResult,
@@ -1080,6 +1091,11 @@ const electronAPI = {
       ipcRenderer.sendSync('browser:get-backend-sync'),
     setBackend: (backend: 'builtin' | 'external' | 'chrome') =>
       ipcRenderer.invoke('browser:set-backend', backend),
+    // Settings → Browser → Allow private network addresses. Main owns it; the
+    // set resolves to the value now in force and whether the file kept it.
+    getAllowPrivateNetwork: (): Promise<AllowPrivateNetworkState> => ipcRenderer.invoke(BROWSER_PRIVATE_NETWORK_IPC.get),
+    setAllowPrivateNetwork: (allow: boolean): Promise<AllowPrivateNetworkSetResult> =>
+      ipcRenderer.invoke(BROWSER_PRIVATE_NETWORK_IPC.set, allow),
     // Phase 2.5 — chrome-backend profiles + workspace bindings.
     chromeProfiles: {
       list: (): Promise<{
@@ -1124,6 +1140,26 @@ const electronAPI = {
       const listener = (_e: Electron.IpcRendererEvent, surfaceId: string) => callback(surfaceId);
       ipcRenderer.on('browser:wake', listener);
       return () => { ipcRenderer.removeListener('browser:wake', listener); };
+    },
+    // "Agent is driving" marker + Stop / Take over (src/shared/browserAgentControl.ts).
+    // Main owns the state; the renderer reads it and sends the user's intents.
+    agentControl: {
+      list: (): Promise<BrowserAgentControlState[]> => ipcRenderer.invoke(BROWSER_AGENT_CONTROL_IPC.list),
+      intent: (
+        surfaceId: string,
+        intent: BrowserAgentControlIntent,
+      ): Promise<{ ok: boolean; changed?: boolean; state?: BrowserAgentControlState; error?: string }> =>
+        ipcRenderer.invoke(BROWSER_AGENT_CONTROL_IPC.intent, { surfaceId, intent }),
+      onChanged: (callback: (state: BrowserAgentControlState) => void) => {
+        const listener = (_e: Electron.IpcRendererEvent, state: BrowserAgentControlState) => callback(state);
+        ipcRenderer.on(BROWSER_AGENT_CONTROL_IPC.changed, listener);
+        return () => { ipcRenderer.removeListener(BROWSER_AGENT_CONTROL_IPC.changed, listener); };
+      },
+      // Live Chrome: the user's own tabs lent to a workspace, and Return to me.
+      lentTabs: (workspaceId: string): Promise<{ ok: boolean; tabs?: LentLiveTab[]; error?: string }> =>
+        ipcRenderer.invoke(BROWSER_AGENT_CONTROL_IPC.lentTabs, { workspaceId }),
+      returnTab: (workspaceId: string, surfaceId: string): Promise<{ ok: boolean; returned?: boolean; error?: string }> =>
+        ipcRenderer.invoke(BROWSER_AGENT_CONTROL_IPC.returnTab, { workspaceId, surfaceId }),
     },
   },
   fs: {
@@ -1692,14 +1728,16 @@ const electronAPI = {
     // `hostWorkspaceId` is the workspace the HOST is showing (#922) — a
     // mandatory position with a nullable value, so a future call site cannot
     // silently omit the binding, while a host that genuinely has no workspace
-    // yet can still say so.
+    // yet can still say so. `hostRailPage`: the asking frame is a rail page
+    // (the host knows which kind of frame it mounted); omitted for the others.
     rpc: (
       pluginName: string,
       method: string,
       params: Record<string, unknown> | undefined,
       hostWorkspaceId: string | undefined,
+      hostRailPage?: boolean,
     ) =>
-      ipcRenderer.invoke(IPC.PLUGINS_RPC, pluginName, method, params, hostWorkspaceId) as Promise<unknown>,
+      ipcRenderer.invoke(IPC.PLUGINS_RPC, pluginName, method, params, hostWorkspaceId, hostRailPage) as Promise<unknown>,
     requestApproval: (pluginName: string) =>
       ipcRenderer.invoke(IPC.PLUGINS_REQUEST_APPROVAL, pluginName) as Promise<{ approved: boolean }>,
     onPaneDecoration: (callback: (decoration: {

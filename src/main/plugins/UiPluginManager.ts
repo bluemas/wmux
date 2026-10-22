@@ -8,8 +8,18 @@ import type { ApprovalQueue } from '../mcp/ApprovalQueue';
 import type { PluginTrustStore } from '../mcp/PluginTrustStore';
 import type { PluginHostLoader } from './PluginHostLoader';
 import { copyCatalogBundle } from './copyCatalogBundle';
+import { compareSemver, parseSemver } from '../surfaces/safeWrite/versionRange';
 
 type SavedState = { version: 1; disabled: string[]; managed: string[] };
+
+/**
+ * Where a refresh parks the bundle it replaces until the new one is published:
+ * `.retired@<id>@<uuid>`. `@` cannot occur in a plugin name, so the id reads
+ * back unambiguously, and the leading dot keeps the loader from scanning it.
+ */
+const RETIRED_PREFIX = '.retired@';
+/** Leftovers of an interrupted install, removal or refresh. None is ever a live bundle. */
+const LEFTOVER_PREFIXES = ['.install-', '.removed-', RETIRED_PREFIX];
 
 /** Owner UI lifecycle for a finite catalog of shipped, original bundles. */
 export class UiPluginManager {
@@ -37,8 +47,119 @@ export class UiPluginManager {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
+    this.recoverInterruptedWork();
+    this.refreshManagedBundles();
     this.options.loader.setDisabled(this.state.disabled);
     await this.options.loader.loadAll();
+  }
+
+  /**
+   * A catalog-installed bundle older than the one this build ships is replaced
+   * by the shipped one before the first load. Only bundles in the install
+   * ledger are refreshed; one placed by hand is never touched. Approval is not
+   * handled here: the load that follows registers the new declaration, and a
+   * wider one drops an approved plugin back to unconfirmed (applyDeclaration),
+   * so the owner is asked again. A refresh that fails keeps the old bundle.
+   */
+  private refreshManagedBundles(): void {
+    for (const entry of UI_PLUGIN_CATALOG) {
+      if (!this.state.managed.includes(entry.id)) continue;
+      try {
+        this.refreshBundle(entry);
+      } catch (error) {
+        console.warn(`[UiPluginManager] could not update ${entry.id}:`, error);
+      }
+    }
+  }
+
+  /**
+   * A refresh that stopped between its two renames left the managed bundle's
+   * folder missing and the old bundle parked: put it back, so the refresh
+   * that follows starts over from it. Then remove what interrupted installs,
+   * removals and refreshes left behind. Only real directories are touched; a
+   * link is left alone, so nothing behind it can be deleted.
+   */
+  private recoverInterruptedWork(): void {
+    if (!fs.existsSync(this.options.pluginsDir)) return;
+    let root: string;
+    let names: string[];
+    try {
+      root = this.root();
+      names = fs.readdirSync(root);
+    } catch (error) {
+      console.warn('[UiPluginManager] could not check for interrupted plugin updates:', error);
+      return;
+    }
+    const isDirectory = (name: string) => {
+      const stat = fs.lstatSync(path.join(root, name));
+      return stat.isDirectory() && !stat.isSymbolicLink();
+    };
+    for (const id of this.state.managed) {
+      const parked = names.find((name) => name.startsWith(RETIRED_PREFIX) && name.split('@')[1] === id);
+      if (!parked) continue;
+      try {
+        if (fs.existsSync(path.join(root, id)) || !isDirectory(parked)) continue;
+        fs.renameSync(path.join(root, parked), path.join(root, id));
+      } catch (error) {
+        console.warn(`[UiPluginManager] could not restore ${id}:`, error);
+      }
+    }
+    for (const name of fs.readdirSync(root)) {
+      if (!LEFTOVER_PREFIXES.some((prefix) => name.startsWith(prefix))) continue;
+      try {
+        // A parked bundle is a leftover only once its plugin's folder is back.
+        // While it is missing (the restore above failed), the parked copy may
+        // be the only one: keep it for the next start.
+        if (name.startsWith(RETIRED_PREFIX) && !this.hasBundleFolder(root, name.split('@')[1])) continue;
+        if (isDirectory(name)) fs.rmSync(path.join(root, name), { recursive: true, force: true });
+      } catch (error) {
+        console.warn(`[UiPluginManager] could not remove ${name}:`, error);
+      }
+    }
+  }
+
+  private hasBundleFolder(root: string, id: string | undefined): boolean {
+    if (!id || !PLUGIN_NAME_REGEX.test(id)) return false;
+    try {
+      const stat = fs.lstatSync(path.join(root, id));
+      return stat.isDirectory() && !stat.isSymbolicLink();
+    } catch {
+      return false;
+    }
+  }
+
+  private refreshBundle(entry: typeof UI_PLUGIN_CATALOG[number]): void {
+    const root = this.root();
+    const destination = path.join(root, entry.id);
+    let stat: fs.Stats;
+    try { stat = fs.lstatSync(destination); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw error;
+    }
+    if (!stat.isDirectory() || stat.isSymbolicLink()) return;
+    const source = path.join(this.options.catalogDir, entry.id);
+    const installed = parseSemver(manifestVersion(path.join(destination, 'manifest.json')));
+    const shipped = parseSemver(manifestVersion(path.join(source, 'manifest.json')));
+    // Not comparable (a corrupt or hand-edited manifest): leave it be.
+    if (!installed || !shipped || compareSemver(shipped, installed) <= 0) return;
+    const staging = fs.mkdtempSync(path.join(root, '.install-'));
+    const retired = path.join(root, `${RETIRED_PREFIX}${entry.id}@${randomUUID()}`);
+    try {
+      copyCatalogBundle(source, staging, entry.files);
+      // Same publication as install: scans skip dot-prefixed directories, so a
+      // load never sees a partial bundle.
+      fs.renameSync(destination, retired);
+      try { fs.renameSync(staging, destination); } catch (error) {
+        // Put the old bundle back. If that fails too, it stays parked, and the
+        // next start restores it (recoverInterruptedWork).
+        fs.renameSync(retired, destination);
+        throw error;
+      }
+      // Only now is the parked copy no longer the only one.
+      fs.rmSync(retired, { recursive: true, force: true });
+    } finally {
+      fs.rmSync(staging, { recursive: true, force: true });
+    }
   }
 
   private serialize<T>(action: () => Promise<T>): Promise<T> {
@@ -184,5 +305,15 @@ export class UiPluginManager {
         this.notify(id);
       } finally { fs.rmSync(retired, { recursive: true, force: true }); }
     });
+  }
+}
+
+/** A bundle manifest's `version`, or undefined when it cannot be read. */
+function manifestVersion(file: string): string | undefined {
+  try {
+    const version = (JSON.parse(fs.readFileSync(file, 'utf8')) as { version?: unknown }).version;
+    return typeof version === 'string' ? version : undefined;
+  } catch {
+    return undefined;
   }
 }

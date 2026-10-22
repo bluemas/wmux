@@ -914,6 +914,48 @@ describe('J3 §2 prUrl — 비단조·closed 단독 허용·형식 검증', () =
     expect(svc.getTask(taskId)?.prUrl).toBeUndefined();
   });
 
+  it('a GitHub Enterprise PR page counts only on the host main named, and keeps the shape checks', async () => {
+    const { svc, taskId } = await started();
+    const ghe = 'https://code.acme.example/acme/repo/pull/3';
+    expect((await svc.updateMission({ taskId, verifiedWorkspaceId: 'ws-owner', prUrl: ghe })).ok).toBe(false);
+    expect((await svc.updateMission({ taskId, verifiedWorkspaceId: 'ws-owner', prUrl: ghe, prUrlGithubHost: 'other.example.com' })).ok).toBe(false);
+    for (const bad of [
+      'http://code.acme.example/acme/repo/pull/3',
+      'https://user@code.acme.example/acme/repo/pull/3',
+      'https://code.acme.example/acme/repo/pull/3?x=1',
+      'https://code.acme.example/acme/repo/pull/3#c',
+      `https://code.acme.example/acme/${'r'.repeat(2100)}/pull/3`,
+    ]) {
+      expect((await svc.updateMission({ taskId, verifiedWorkspaceId: 'ws-owner', prUrl: bad, prUrlGithubHost: 'code.acme.example' })).ok, bad.slice(0, 80)).toBe(false);
+    }
+    expect(svc.getTask(taskId)?.prUrl).toBeUndefined();
+    expect((await svc.updateMission({ taskId, verifiedWorkspaceId: 'ws-owner', prUrl: ghe, prUrlGithubHost: 'Code.Acme.Example' })).ok).toBe(true);
+    expect(svc.getTask(taskId)?.prUrl).toBe(ghe);
+  });
+
+  it('accepts a GitLab merge request page, and refuses other GitLab-looking URLs', async () => {
+    const { svc, taskId } = await started();
+    const mr = 'https://gitlab.example.com/group/sub/proj/-/merge_requests/7';
+    expect((await svc.updateMission({ taskId, verifiedWorkspaceId: 'ws-owner', prUrl: mr })).ok).toBe(true);
+    expect(svc.getTask(taskId)?.prUrl).toBe(mr);
+    const withPort = 'https://gitlab.example.com:8443/group/proj/-/merge_requests/7';
+    expect((await svc.updateMission({ taskId, verifiedWorkspaceId: 'ws-owner', prUrl: withPort })).ok).toBe(true);
+    expect(svc.getTask(taskId)?.prUrl).toBe(withPort);
+    for (const bad of [
+      'http://gitlab.example.com/group/proj/-/merge_requests/7',
+      'https://gitlab.example.com/proj/-/merge_requests/7',
+      'https://gitlab.example.com/group/proj/-/issues/7',
+      'https://gitlab.example.com/group/proj/-/merge_requests/7?x=1',
+      'https://gitlab.example.com/group/proj/-/merge_requests/7#note_1',
+      'https://user:pw@gitlab.example.com/group/proj/-/merge_requests/7',
+      'https://evil.example@gitlab.example.com/group/proj/-/merge_requests/7',
+      `https://gitlab.example.com/${'g/'.repeat(1100)}proj/-/merge_requests/7`,
+    ]) {
+      expect((await svc.updateMission({ taskId, verifiedWorkspaceId: 'ws-owner', prUrl: bad })).ok, bad.slice(0, 80)).toBe(false);
+    }
+    expect(svc.getTask(taskId)?.prUrl).toBe(withPort);
+  });
+
   it('동일 prUrl 재쓰기는 append 없는 멱등 no-op이다', async () => {
     const { svc, taskId } = await started();
     await svc.updateMission({ taskId, verifiedWorkspaceId: 'ws-owner', prUrl: PR1 });
