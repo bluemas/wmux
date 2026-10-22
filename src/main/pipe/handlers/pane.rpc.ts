@@ -316,13 +316,13 @@ export function registerPaneRpc(
   /**
    * agent.state.all — the agent.state projection for every local workspace,
    * for a bound UI plugin granted `agent.state.read.all` (RpcRouter checks the
-   * grant on every call, before and after this handler). No activity: that
-   * would need terminal.read for every workspace, and no caller needs it.
+   * grant on every call, before and after this handler). Activity takes
+   * terminal.read, checked by RpcRouter as for agent.state.
    */
   router.register('agent.state.all', async (params, ctx) => {
     if (!isHostedCaller(ctx) || !hostedBindingOf(ctx)) throw new Error('Agent state requires a bound UI plugin');
-    if (params.includeActivity !== undefined) throw new Error('Activity is not available for all workspaces');
-    const raw = await sendToRenderer(getWindow, 'agent.state.all', {}, {
+    if (params.includeActivity !== undefined && typeof params.includeActivity !== 'boolean') throw new Error('Invalid includeActivity');
+    const raw = await sendToRenderer(getWindow, 'agent.state.all', { includeActivity: params.includeActivity === true }, {
       timeoutError: new RetryableRpcError('Agent state responder is not ready; retry the request'),
     });
     const failure = raw as { error?: unknown; retryable?: unknown } | null;
@@ -330,7 +330,7 @@ export function registerPaneRpc(
       if (failure.retryable === true) throw new RetryableRpcError(failure.error);
       throw new Error(failure.error);
     }
-    return parsePluginAllAgentSnapshot(raw);
+    return parsePluginAllAgentSnapshot(raw, params.includeActivity === true);
   });
 
   router.register('fleet.triage', async (params) => {

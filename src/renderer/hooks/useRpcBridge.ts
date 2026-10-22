@@ -2084,8 +2084,8 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
   }
 
   if (method === 'agent.state.all') {
-    // Every local workspace by design; takes no workspace or activity param.
-    return pluginAllAgentSnapshot(store);
+    // Every local workspace by design; takes no workspace param.
+    return pluginAllAgentSnapshot(store, params.includeActivity === true);
   }
 
   if (method === 'fleet.triage') {

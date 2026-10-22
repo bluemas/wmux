@@ -92,7 +92,7 @@ describe('agent.state.all: a separate grant for every workspace', () => {
     read.mockResolvedValue({ ...all, private: 'x' });
     const granted = setup(['agent.state.read', 'agent.state.read.all']);
     expect(await callAll(granted.router)).toMatchObject({ ok: true, result: all });
-    expect(read).toHaveBeenCalledWith(expect.any(Function), 'agent.state.all', {}, { timeoutError: expect.any(Error) });
+    expect(read).toHaveBeenCalledWith(expect.any(Function), 'agent.state.all', { includeActivity: false }, { timeoutError: expect.any(Error) });
   });
 
   it.each(['unconfirmed', 'denied'] as const)('refuses a %s plugin even in shadow mode', async (status) => {
@@ -100,13 +100,23 @@ describe('agent.state.all: a separate grant for every workspace', () => {
     expect(read).not.toHaveBeenCalled();
   });
 
-  it('refuses a scoped grant, unbound hosts, external callers and activity', async () => {
+  it('refuses a scoped grant, unbound hosts and external callers', async () => {
     expect(await callAll(setup(['agent.state.read.all:w1']).router)).toMatchObject({ ok: false });
     const { router } = setup(['agent.state.read.all', 'terminal.read']);
     expect(await callAll(router, {}, null)).toMatchObject({ ok: false });
     expect(await router.dispatch({ id: 'x', method: 'agent.state.all', clientName: 'demo', params: {} })).toMatchObject({ ok: false });
-    expect(await callAll(router, { includeActivity: true })).toMatchObject({ ok: false });
     expect(read).not.toHaveBeenCalled();
+  });
+
+  it("gives every workspace's activity only with terminal.read, as for one workspace", async () => {
+    expect(await callAll(setup(['agent.state.read', 'agent.state.read.all']).router, { includeActivity: true })).toMatchObject({ ok: false });
+    expect(await callAll(setup(['agent.state.read', 'agent.state.read.all', 'terminal.read']).router, { includeActivity: 'yes' }))
+      .toMatchObject({ ok: false });
+    expect(read).not.toHaveBeenCalled();
+    read.mockResolvedValue(all);
+    const granted = setup(['agent.state.read', 'agent.state.read.all', 'terminal.read']);
+    expect(await callAll(granted.router, { includeActivity: true })).toMatchObject({ ok: true, result: all });
+    expect(read).toHaveBeenCalledWith(expect.any(Function), 'agent.state.all', { includeActivity: true }, { timeoutError: expect.any(Error) });
   });
 
   it('checks the grant again after the renderer answers, on every read', async () => {

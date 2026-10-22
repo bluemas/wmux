@@ -53,9 +53,10 @@ export function parsePluginAgentSnapshot(raw: unknown, workspaceId: string, acti
 
 /**
  * The all-workspaces counterpart: each workspace is rebuilt by the same rules
- * as a single snapshot, plus its name. Activity is never part of it.
+ * as a single snapshot, plus its name. Activity only when asked for, which
+ * takes the same terminal.read grant as a single workspace's (RpcRouter).
  */
-export function parsePluginAllAgentSnapshot(raw: unknown): PluginAllAgentSnapshot {
+export function parsePluginAllAgentSnapshot(raw: unknown, activity = false): PluginAllAgentSnapshot {
   if (!raw || typeof raw !== 'object') throw new Error('Invalid agent snapshot');
   const value = raw as Record<string, unknown>;
   if (!Array.isArray(value.workspaces) || value.workspaces.length > PLUGIN_AGENT_MAX_WORKSPACES
@@ -67,7 +68,7 @@ export function parsePluginAllAgentSnapshot(raw: unknown): PluginAllAgentSnapsho
     const workspaceId = str(w.workspaceId);
     if (!workspaceId || seen.has(workspaceId)) throw new Error('Invalid agent workspace');
     seen.add(workspaceId);
-    const { panes, truncated } = rebuildSnapshot(w, workspaceId, false);
+    const { panes, truncated } = rebuildSnapshot(w, workspaceId, activity);
     return { workspaceId, name: str(w.name), panes, truncated };
   });
   const result = { workspaces, truncated: value.truncated };

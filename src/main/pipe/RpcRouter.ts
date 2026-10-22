@@ -645,7 +645,8 @@ export class RpcRouter {
       trust,
       trustLookupFailed,
     });
-    if (outcome.kind === 'allow' && request.method === 'agent.state' && effectiveParams.includeActivity === true) {
+    if (outcome.kind === 'allow' && (request.method === 'agent.state' || request.method === 'agent.state.all')
+      && effectiveParams.includeActivity === true) {
       if (!trust?.declaredCapabilities?.includes('terminal.read')) {
         return { id: request.id, ok: false, error: 'Activity requires unrestricted terminal.read permission' };
       }

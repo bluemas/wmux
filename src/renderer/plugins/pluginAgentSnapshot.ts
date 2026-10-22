@@ -29,9 +29,9 @@ export function pluginAgentSnapshot(store: StoreState, workspaceId: string, incl
  * `agent.state.all`: the same per-workspace projection for every local
  * workspace, in sidebar order, from ONE board read. Bot workers are already
  * dropped by ownerFleetState and remote PC mirrors are skipped here, so this
- * covers exactly the owner's local workspaces. Never carries activity.
+ * covers exactly the owner's local workspaces. Activity only when asked for.
  */
-export function pluginAllAgentSnapshot(store: StoreState): PluginAllAgentSnapshot {
+export function pluginAllAgentSnapshot(store: StoreState, includeActivity = false): PluginAllAgentSnapshot {
   const state = ownerFleetState(store);
   const result: PluginAllAgentSnapshot = { workspaces: [], truncated: false };
   const board = selectFleetBoard(state, { now: store.agentClockMs, sortMode: 'attention' });
@@ -42,7 +42,7 @@ export function pluginAllAgentSnapshot(store: StoreState): PluginAllAgentSnapsho
     const empty = size(entry) + 1;
     if (result.workspaces.length === PLUGIN_AGENT_MAX_WORKSPACES || budget.bytes + empty > PLUGIN_AGENT_MAX_BYTES - 64) { result.truncated = true; break; }
     budget.bytes += empty;
-    fillWorkspace(store, state, board, entry, false, budget);
+    fillWorkspace(store, state, board, entry, includeActivity, budget);
     result.workspaces.push(entry);
   }
   return result;

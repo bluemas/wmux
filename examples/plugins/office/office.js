@@ -24,7 +24,7 @@
     done: 'Done',
     state: { working: 'Working', needsYou: 'Needs you', finished: 'Finished', resting: 'Resting' },
     stashed: 'stashed',
-    employee: (e, state) => `${e.label}, ${e.agent}${e.workspace ? ` in ${e.workspace}` : ''}: ${state}${e.stashed ? ` (${STRINGS.stashed})` : ''}`,
+    employee: (e, state) => `${e.label}, ${e.workspace ? `${e.pane}, ` : ''}${e.agent}: ${state}${e.stashed ? ` (${STRINGS.stashed})` : ''}${doing(e) ? `, ${doing(e)}` : ''}`,
   };
 
   /** Display scale: the art is drawn at 1x and meant to be seen at 2x. */
@@ -260,6 +260,11 @@
     if (layout) draw();
   }
 
+  /** The activity line a working employee shows, or ''. */
+  function doing(e) {
+    return e.state === 'working' && typeof e.activity === 'string' ? e.activity.trim() : '';
+  }
+
   function drawEmployee(e) {
     const spot = spotFor(e, layout);
     let parts = drawn.get(e.id);
@@ -306,11 +311,18 @@
     tag.style.top = `${(STATION.seatY + 2) * SCALE}px`;
     tag.style.zIndex = String(LABEL_Z);
     name.textContent = e.label;
-    agent.textContent = e.workspace ? ` · ${e.workspace} · ${e.agent}` : ` · ${e.agent}`;
+    agent.textContent = e.workspace ? ` · ${e.pane} · ${e.agent}` : ` · ${e.agent}`;
 
     const status = e.state === 'needsYou' ? 'alert' : e.state === 'finished' ? 'done' : '';
-    bubble.hidden = !status;
-    if (status) {
+    // A working employee says what it is doing, in a speech bubble.
+    const say = status ? '' : doing(e);
+    bubble.hidden = !status && !say;
+    if (say) {
+      bubble.className = 'bubble say';
+      bubble.style.left = `${STATION.seatX * SCALE}px`;
+      bubble.style.zIndex = String(STATUS_BUBBLE_Z + Math.round(spot.seat.z));
+      bubble.replaceChildren(say);
+    } else if (status) {
       bubble.className = `bubble ${status}`;
       bubble.style.left = `${STATION.seatX * SCALE}px`;
       bubble.style.zIndex = String(STATUS_BUBBLE_Z + Math.round(spot.seat.z));

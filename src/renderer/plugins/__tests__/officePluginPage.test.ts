@@ -62,10 +62,10 @@ describe('office page', () => {
     ] } });
 
     expect(document.querySelectorAll('#room')).toHaveLength(1);
-    expect(names()).toEqual(['p1', 'p2', 'p3']);
+    expect(names()).toEqual(['alpha · p1', 'alpha · p2', 'gamma']);
     expect(room().getAttribute('aria-label')).toBe('Office, 3 agents');
-    expect(employees()[2].getAttribute('aria-label')).toBe('p3, Claude Code in gamma: Resting');
-    expect(employees()[2].querySelector('.agent')?.textContent).toBe(' · gamma · Claude Code');
+    expect(employees()[2].getAttribute('aria-label')).toBe('gamma, p3, Claude Code: Resting');
+    expect(employees()[2].querySelector('.agent')?.textContent).toBe(' · p3 · Claude Code');
     expect(empty().hidden).toBe(true);
 
     employees()[2].click();
@@ -73,13 +73,13 @@ describe('office page', () => {
     expect(employees()[2].disabled).toBe(true);
   });
 
-  it('tells same-named panes in different workspaces apart by workspace', () => {
+  it('names each employee by its workspace, and same-workspace agents apart by pane', () => {
     const { state } = connect();
     state({ workspaceId: 'w1', allWorkspaces: { truncated: false, workspaces: [
       { workspaceId: 'w1', name: 'alpha', truncated: false, panes: [agent('p1', 's1', 'working', 'build')] },
       { workspaceId: 'w2', name: 'beta', truncated: false, panes: [agent('p2', 's2', 'working', 'build'), agent('p3', 's3', 'working', 'tests')] },
     ] } });
-    expect(names()).toEqual(['build · alpha', 'build · beta', 'tests']);
+    expect(names()).toEqual(['alpha', 'beta · build', 'beta · tests']);
   });
 
   it('keeps everyone\'s seat when the host switches workspace or another workspace changes', () => {
@@ -91,7 +91,7 @@ describe('office page', () => {
 
     const w0 = { workspaceId: 'w0', name: 'new', truncated: false, panes: [agent('p0', 's0')] };
     state({ workspaceId: 'w2', allWorkspaces: { truncated: false, workspaces: [w0, w1] } });
-    expect(names()).toEqual(['p1', 'p0']);
+    expect(names()).toEqual(['alpha', 'new']);
     expect(employees()[0].style.left).toBe(seat);
   });
 
@@ -109,6 +109,20 @@ describe('office page', () => {
 
     state({ workspaceId: 'w1', snapshot: { workspaceId: 'w1', truncated: false, panes: [] } });
     expect(document.querySelector('#empty-title')?.textContent).toBe('No local agents in this workspace');
+  });
+
+  it("shows a working employee's activity in a speech bubble, and a status bubble over it otherwise", () => {
+    const { state } = connect();
+    const doing = (paneId: string, surfaceId: string, s: string) => ({ ...agent(paneId, surfaceId, s), activity: '$ cd C:/git; npm test' });
+    state({ workspaceId: 'w1', allWorkspaces: { truncated: false, workspaces: [
+      { workspaceId: 'w1', name: 'alpha', truncated: false, panes: [doing('p1', 's1', 'working'), doing('p2', 's2', 'needsYou'), agent('p3', 's3')] },
+    ] } });
+    const bubble = (i: number) => employees()[i].lastElementChild as HTMLElement;
+    expect(bubble(0).className).toBe('bubble say');
+    expect(bubble(0).textContent).toBe('$ cd C:/git; npm test');
+    expect(employees()[0].getAttribute('aria-label')).toBe('alpha · p1, p1, Claude Code: Working, $ cd C:/git; npm test');
+    expect(bubble(1).className).toBe('bubble alert');
+    expect(bubble(2).hidden).toBe(true);
   });
 
   it('notes a size cut in any workspace', () => {
