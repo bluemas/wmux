@@ -52,6 +52,11 @@ export async function refreshPlugins(changedName?: string): Promise<void> {
   if (epoch === generation) publish(state);
 }
 
+/** Plugin `name`'s rail page title from the last list read, or null. */
+export function cachedRailPageTitle(name: string): string | null {
+  return cache?.plugins.find((p) => p.name === name)?.contributes.railPage?.title ?? null;
+}
+
 export function usePlugins(): PluginListState {
   const [state, setState] = useState<PluginListState>(cache ?? EMPTY);
   useEffect(() => {

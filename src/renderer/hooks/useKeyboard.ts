@@ -5,7 +5,7 @@ import { collectPaneTreePtyIds, findLeaf, getLeafPanes, getWorkspacePtyIds } fro
 import { terminalRegistry } from './useTerminal';
 import { t } from '../i18n';
 import { pastePtyChunked } from '../utils/clipboardChunk';
-import { isPrefixTrigger, resolveShortcut, type ShortcutActionId } from '../../shared/keymap';
+import { isPluginPageShortcut, isPrefixTrigger, resolveShortcut, type ShortcutActionId } from '../../shared/keymap';
 import { isPcRailAction, pcRailClaimsKey, pcShortcutTarget } from '../components/PcRail/pcRailModel';
 import { currentShortcutBindings, shortcutPressGuard } from '../utils/shortcutBindings';
 import { createTerminalSurface } from '../utils/createTerminalSurface';
@@ -830,7 +830,11 @@ export function useKeyboard() {
       const resolved = resolveShortcut(e, currentShortcutBindings());
       const action = resolved && (onWorkspaces || !WORKSPACES_ONLY_ACTIONS.has(resolved)
         || (resolved === 'floatingPane' && store.getState().floatingPaneVisible)) ? resolved : undefined;
-      const run = action ? builtinActions[action] : undefined;
+      // A plugin's rail page toggles like the built-in pages: open it, or
+      // back to Workspaces when it is the one showing.
+      const run = action && isPluginPageShortcut(action)
+        ? () => { const s = store.getState(); s.setAppRoute(s.appRoute === action ? 'workspaces' : action); }
+        : action ? builtinActions[action] : undefined;
       // The mention picker claims its key only while an agent pane (or Chat
       // view) has focus — whatever key it is bound to — and only when the key
       // came from that pane. In a plain shell, a floating pane or a brain
