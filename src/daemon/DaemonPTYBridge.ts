@@ -467,9 +467,12 @@ export class DaemonPTYBridge extends EventEmitter {
         // a key or click has overtaken is refreshed off this.
         if (this.sessionId) this.emit('fenceInput', { sessionId: this.sessionId });
         this.noteTyped(active);
+        // Only a key can put text on the prompt line. A terminal's replies
+        // (ConPTY's startup queries) and focus reports cannot, and a focus
+        // change (Alt-Tab) used to leave an untouched prompt reading as used.
+        this.emptyShellPrompt = false;
+        this.completedShellCommand = false;
       }
-      this.emptyShellPrompt = false;
-      this.completedShellCommand = false;
     }
 
     // A pane blocked on a human is answered by a lone option digit or a lone
@@ -1386,7 +1389,25 @@ export class DaemonPTYBridge extends EventEmitter {
     if (this.lastEscAt === this.titleEdgeEscAt) return;
     if (this.agentDetector?.getLastAgent() !== 'Claude Code') return;
     this.titleEdgeEscAt = this.lastEscAt;
+    this.closeInterruptedTurn();
     this.emit('turnInterrupted', { sessionId, agent: 'Claude Code' });
+  }
+
+  /**
+   * The agent reported its turn interrupted (its own row, or Claude Code's
+   * idle title right after a lone Esc). No Stop hook follows an interrupt, so
+   * the episode ends here: otherwise it stays open, and the pane keeps reading
+   * as mid-turn (`agent.turn`) until the next prompt. Also behind a dialog:
+   * the interrupt ended the turn the dialog belonged to, and the dialog's own
+   * state (awaitingHuman) still drives the display until it is gone. Only on
+   * this turn's own interrupt: a lone Esc (or the agent's own interrupt,
+   * noteInterrupt) since the episode opened and within the confirm window. A
+   * redraw can reprint an older turn's row, which says nothing of this one.
+   */
+  private closeInterruptedTurn(): void {
+    if (!this.turnOpen && !this.turnSoftClosed) return;
+    if (Date.now() - this.lastEscAt >= ESC_INTERRUPT_CONFIRM_MS || this.lastEscAt < this.turnOpenedAt) return;
+    this.closeTurn();
   }
 
   /**
@@ -1775,7 +1796,9 @@ export class DaemonPTYBridge extends EventEmitter {
           if (parsed.type === 'command_start' || parsed.type === 'command_end') this.noteAgentEnded();
           this.codexBootWindow = parsed.type === 'command_start' || (parsed.type !== 'command_end' && this.codexBootWindow);
           if (parsed.type === 'prompt_end') {
-            this.emptyShellPrompt = this.inputRevision === 0 || this.completedShellCommand;
+            // The first prompt is empty when no key has reached the pane;
+            // passive input (counted by inputRevision) does not type.
+            this.emptyShellPrompt = this.keyInputRevision === 0 || this.completedShellCommand;
             this.completedShellCommand = false;
           }
           promptLog.append(parsed);
@@ -1814,6 +1837,7 @@ export class DaemonPTYBridge extends EventEmitter {
     // recovery replay prints it again for a turn that is long over.
     this.interruptedUnsubscribe = agentDetector.onInterrupted(({ agent }) => {
       if (this.muted || Date.now() - this.lastResizeAtMs < RESIZE_REDRAW_GUARD_MS) return;
+      this.closeInterruptedTurn();
       this.emit('turnInterrupted', { sessionId, agent });
     });
 

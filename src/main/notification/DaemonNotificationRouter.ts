@@ -10,6 +10,7 @@ import {
   clearEscapeKey,
   clearPty as clearSuppression,
   ESC_INTERRUPT_CONFIRM_MS,
+  noteByteActivity,
   recentlyEscaped,
   recentlySettled,
   SETTLE_REDRAW_GUARD_MS,
@@ -20,7 +21,7 @@ import {
   clearLastBroadcastAgentStatus,
 } from '../ipc/handlers/metadata.handler';
 import { noteBootSettled } from './turnEvidence';
-import { settleHookTurnToIdle, broadcastSettledIdle, holdsUnreadResult, holdsUnsettledRunningClaim } from './turnSettle';
+import { settleHookTurnToIdle, broadcastSettledIdle, broadcastTurnRunning, holdsUnreadResult, holdsUnsettledRunningClaim, settleEndedDaemonTurn } from './turnSettle';
 import { eventBus } from '../events/EventBus';
 import { starPromptSessions } from './starPromptSessions';
 import {
@@ -40,6 +41,8 @@ import { getWorkspaceMirror, type WorkspaceMirror } from '../workspace/Workspace
 import { sendToRenderer } from '../pipe/handlers/_bridge';
 import { agentDisplayToSlug } from '../pty/AgentDetector';
 import type { ChannelMessage } from '../../shared/channels';
+import type { ShellPromptChange } from '../../shared/shellPrompt';
+import { noteShellPrompt } from '../shellPrompt/shellPromptMirror';
 
 // Mirrors PTYBridge.AGENT_EVENT_SUPPRESSION_MS — same dedup semantics across
 // daemon and local modes.
@@ -1226,6 +1229,7 @@ export class DaemonNotificationRouter {
     };
 
     const onActive = (payload: { sessionId: string; agentName?: string }) => {
+      noteByteActivity(payload.sessionId, false);
       try {
         // Daemon-mode twin of the PTYBridge.onActive gate: a pane whose bridge
         // reports turn starts has a better answer than this burst does, and an
@@ -1256,7 +1260,15 @@ export class DaemonNotificationRouter {
       }
     };
 
-    const onIdle = (payload: { sessionId: string; preTurn?: boolean }) => {
+    const onIdle = (payload: { sessionId: string; preTurn?: boolean; agentMidTurn?: boolean }) => {
+      noteByteActivity(payload.sessionId, true);
+      // Byte silence cannot end a daemon-owned agent turn. Also repair a
+      // missed start edge instead of relying on the activity freshness TTL.
+      // The turn's own end settles the pane if no output follows (onAgentTurn).
+      if (payload.agentMidTurn === true) {
+        broadcastTurnRunning(payload.sessionId, this.getWindow(), { daemonTurnOpen: true });
+        return;
+      }
       const now = Date.now();
       // The daemon's own word that no turn ran since the agent's SessionStart:
       // turn-end evidence for the bot workers' idle stops, whatever the dot does.
@@ -1426,6 +1438,17 @@ export class DaemonNotificationRouter {
       }
     };
 
+    // A pane with no agent waiting on stdin: per-ptyId, like `subagents`. Null clears.
+    const onShellPrompt = (payload: { sessionId: string } & ShellPromptChange) => {
+      try {
+        // An event older than what main has (the list overtook it) changes nothing.
+        if (!noteShellPrompt(payload.sessionId, payload)) return;
+        broadcastMetadataUpdate(this.getWindow(), { ptyId: payload.sessionId, shellPrompt: payload.prompt });
+      } catch (err) {
+        console.warn('[DaemonNotificationRouter] shell prompt error:', err);
+      }
+    };
+
     const onAgentProcessExit = (payload: { sessionId: string; slug?: string | null }) => {
       // The agent whose hooks owned the line is gone; the next one (a hookless
       // Codex in the same pane) may report from its transcript.
@@ -1557,6 +1580,26 @@ export class DaemonNotificationRouter {
       }
     };
 
+    // The daemon tracks submitted/hook-backed agent turns independently of
+    // output rate. Codex can work quietly without a UserPromptSubmit hook.
+    // Running goes through the one gate that never replaces a pane waiting
+    // on a human, except the edge the daemon sends with a dialog's answer
+    // (`afterAnswer`): the answer ended that wait, whether or not main has
+    // shown the answered status yet. An end clears only the latch the daemon
+    // opened (the renderer keeps a hook's) and settles a byte-idle pane, which
+    // gets no idle edge of its own; a hook-governed pane is the hook's to end.
+    const onAgentTurn = (payload: { sessionId: string; running: boolean; afterAnswer?: boolean }) => {
+      const id = payload.sessionId;
+      if (payload.running) {
+        if (payload.afterAnswer) broadcastMetadataUpdate(this.getWindow(), { ptyId: id, daemonTurnOpen: true, agentStatus: 'running' });
+        else broadcastTurnRunning(id, this.getWindow(), { daemonTurnOpen: true });
+        return;
+      }
+      broadcastMetadataUpdate(this.getWindow(), { ptyId: id, daemonTurnOpen: false });
+      if (!this.getHookRouter?.()?.governsRunningState(id, this.now())) settleEndedDaemonTurn(id, this.getWindow(), this.now());
+    };
+
+    this.daemonClient.on('session:agentTurn', onAgentTurn);
     this.daemonClient.on('session:agent', onAgent);
     this.daemonClient.on('session:active', onActive);
     this.daemonClient.on('session:idle', onIdle);
@@ -1571,6 +1614,7 @@ export class DaemonNotificationRouter {
     this.daemonClient.on('session:teammateWake', onTeammateWake);
     this.daemonClient.on('session:subagents', onSubagents);
     this.daemonClient.on('session:teammateList', onTeammateList);
+    this.daemonClient.on('session:shellPrompt', onShellPrompt);
     this.daemonClient.on('session:restarted', onRestarted);
     this.daemonClient.on('supervision:changed', onSupervisionChanged);
     // A2A channels (a2a-channels U4) — project daemon-broadcast channel
@@ -1596,6 +1640,7 @@ export class DaemonNotificationRouter {
     });
 
     this.cleanups.push(
+      () => this.daemonClient.off('session:agentTurn', onAgentTurn),
       () => this.daemonClient.off('session:agent', onAgent),
       () => this.daemonClient.off('session:active', onActive),
       () => this.daemonClient.off('session:idle', onIdle),
@@ -1610,6 +1655,7 @@ export class DaemonNotificationRouter {
       () => this.daemonClient.off('session:teammateWake', onTeammateWake),
       () => this.daemonClient.off('session:subagents', onSubagents),
       () => this.daemonClient.off('session:teammateList', onTeammateList),
+      () => this.daemonClient.off('session:shellPrompt', onShellPrompt),
       () => this.daemonClient.off('session:restarted', onRestarted),
       () => this.daemonClient.off('supervision:changed', onSupervisionChanged),
       () => this.daemonClient.off('channel:message', onChannelMessage),

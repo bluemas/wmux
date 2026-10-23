@@ -7,7 +7,7 @@ import { t } from '../i18n';
 import { pastePtyChunked } from '../utils/clipboardChunk';
 import { isPluginPageShortcut, isPrefixTrigger, resolveShortcut, type ShortcutActionId } from '../../shared/keymap';
 import { isPcRailAction, pcRailClaimsKey, pcShortcutTarget } from '../components/PcRail/pcRailModel';
-import { currentShortcutBindings, shortcutPressGuard } from '../utils/shortcutBindings';
+import { activeShortcutBindings, shortcutPressGuard } from '../utils/shortcutBindings';
 import { createTerminalSurface } from '../utils/createTerminalSurface';
 import { selectHostPickName } from '../stores/shadowWorkspace';
 import { openUrlInBrowserPane } from '../utils/browserPaneActions';
@@ -33,6 +33,7 @@ import {
   stashActivePane,
   toggleAgentToolbarPin,
 } from '../utils/commandActions';
+import { dictateIntoActivePane } from '../utils/paneDictation';
 
 // Lightweight bookmark toast — reuses the same DOM element pattern as showCopyToast
 let bookmarkToastTimer: ReturnType<typeof setTimeout> | null = null;
@@ -93,7 +94,7 @@ export const WORKSPACES_ONLY_ACTIONS: ReadonlySet<ShortcutActionId> = new Set<Sh
   'focusUpAlt', 'focusDownAlt', 'focusLeftAlt', 'focusRightAlt',
   'clearMultiview', 'openBrowser', 'openPrivateBrowser', 'addBookmark', 'zoomIn', 'zoomOut', 'zoomReset',
   'stashPane', 'movePaneLeft', 'movePaneRight', 'movePaneUp', 'movePaneDown',
-  'multiTask', 'showGitDiff', 'renameTab',
+  'multiTask', 'showGitDiff', 'renameTab', 'dictatePane',
 ]);
 
 const STOP_PROPAGATION_ACTIONS: ReadonlySet<ShortcutActionId> = new Set<ShortcutActionId>([
@@ -595,6 +596,9 @@ export function useKeyboard() {
         }
       },
       mentionAgent: () => { document.dispatchEvent(new CustomEvent(OPEN_MENTION_PICKER_EVENT)); },
+      // Toggle: one press starts dictating into the focused pane, the next
+      // stops and pastes the text (no Enter).
+      dictatePane: dictateIntoActivePane,
       // No default key (UNBOUND_SHORTCUTS) — these run only once the user
       // binds one, from the command palette or Settings → Shortcuts. Each
       // runs exactly what its palette row runs.
@@ -802,7 +806,7 @@ export function useKeyboard() {
       // A Win / Super chord has no Ctrl or Alt, so the check above would drop
       // it wherever the user types — the terminal included — and a Win+J the
       // user recorded would never run. Let it through when it is a shortcut.
-      const metaShortcut = e.metaKey && !isMac && resolveShortcut(e, currentShortcutBindings()) !== null;
+      const metaShortcut = e.metaKey && !isMac && resolveShortcut(e, activeShortcutBindings()) !== null;
       if (isEditable && !literalCtrl && !cmdOrCtrl && !alt && !isFunctionKey && !metaShortcut) return;
 
       // Ctrl+<prefixKey>: Enter prefix mode (configurable, default Ctrl+B)
@@ -827,7 +831,7 @@ export function useKeyboard() {
       // focus — useTerminal asks the same resolver and lets xterm encode it
       // for the PTY (Ctrl+T reaches Codex, Alt+Up reaches a TUI). A custom
       // macro on the combo still fires. (#1152, #1455)
-      const resolved = resolveShortcut(e, currentShortcutBindings());
+      const resolved = resolveShortcut(e, activeShortcutBindings());
       const action = resolved && (onWorkspaces || !WORKSPACES_ONLY_ACTIONS.has(resolved)
         || (resolved === 'floatingPane' && store.getState().floatingPaneVisible)) ? resolved : undefined;
       // A plugin's rail page toggles like the built-in pages: open it, or
@@ -855,8 +859,10 @@ export function useKeyboard() {
         if (mentionClaim === 'noSource') {
           // Once per press: a held chord auto-repeats, and one toast is enough.
           if (!e.repeat) store.getState().pushToast({ message: t('mention.noSource'), level: 'info' });
-        } else if (!(action === 'closeSurface' && e.repeat)) {
+        } else if (!((action === 'closeSurface' || action === 'dictatePane' || isPluginPageShortcut(action)) && e.repeat)) {
           // A held close-tab chord auto-repeats; only the first press asks.
+          // A held dictation chord would start and stop on every repeat, and a
+          // held plugin page key would flip the page back and forth.
           run();
         }
         return;

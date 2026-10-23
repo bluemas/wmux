@@ -23,9 +23,10 @@ import { handleSecrets } from './commands/secretsCheck';
 import { handleRole } from './commands/role';
 import { handleDeck } from './commands/deck';
 import { handleChannel } from './commands/channel';
+import { handleRemote } from './commands/remote';
 import { handleWeb } from './commands/web';
 import { handleDaemon } from './commands/daemon';
-import { handleCodex } from './commands/codex';
+import { CODEX_HANDOFF_FLAG, handleCodex, reportHandoffError } from './commands/codex';
 
 const HELP_TEXT = `
 wmux CLI
@@ -166,6 +167,11 @@ CHANNEL COMMANDS (agent messaging — Channels v2 durable inbox)
   Works headless (talks to the daemon directly). Typical nudged-agent loop:
   unread → read → work → post → ack. Run 'wmux channel help' for details.
 
+REMOTE COMMANDS (another paired PC)
+  remote spawn <pc> --agent <slug> --root <id> [--sub <path>] <prompt…>
+                                    Ask that PC to start an agent; replies come here
+  remote spawn-status [<spawnId>]   Your requests, and what each PC lets you ask for
+
 DIAGNOSTICS
   doctor                            Run health checks (env, daemon, boot phases,
                                     AV-tax hint, log pointers). Works even when
@@ -282,7 +288,12 @@ async function main(): Promise<void> {
     // finally closes the pane's relay lease.
     if (process.platform === 'win32') process.on('SIGBREAK', () => { /* the foreground TUI handles Ctrl+Break */ });
     try { await handleCodex(argv.slice(1)); }
-    catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
+    catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const handoff = argv.length === 2 && argv[1] === CODEX_HANDOFF_FLAG;
+      if (!(handoff && await reportHandoffError(message))) console.error(message);
+      process.exitCode = 1;
+    }
     return;
   }
 
@@ -338,6 +349,8 @@ async function main(): Promise<void> {
       await handleDeck(rest, jsonMode);
     } else if (cmd === 'channel') {
       await handleChannel(rest[0], rest.slice(1), jsonMode);
+    } else if (cmd === 'remote') {
+      await handleRemote(rest[0], rest.slice(1), jsonMode);
     } else {
       console.error(`Unknown command: "${cmd}". Run 'wmux --help' for usage.`);
       process.exit(1);

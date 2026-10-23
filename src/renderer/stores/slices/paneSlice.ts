@@ -33,6 +33,7 @@ import { panePrincipalId } from '../../../shared/principals';
 import { computePaneAutoName, paneDisplayName } from '../../utils/paneNaming';
 import { saveSessionNow } from '../../utils/sessionSaveBridge';
 import { recomputeWorkspacePorts } from './workspacePorts';
+import type { ShellPromptSignal } from '../../../shared/shellPrompt';
 
 // Per-workspace leaf cap. xterm.js + node-pty memory scales linearly with
 // pane count, and the project memory budget targets ~200 MB for 10 panes
@@ -274,6 +275,12 @@ export interface PaneSlice {
   // same teardown sites as surfaceSubagents. Transient — never persisted.
   surfaceTeammates: Record<string, TeammateInfo[]>;
   setSurfaceTeammates: (ptyId: string, teammates: TeammateInfo[]) => void;
+  // A pane with no agent whose command waits on stdin, keyed by ptyId. From
+  // METADATA_UPDATE.shellPrompt (daemon/shellPrompt); null clears. Fleet and
+  // the sidebar read it as Needs you. Cleared at the same teardown sites as
+  // surfaceSubagents. Transient — never persisted.
+  surfaceShellPrompt: Record<string, ShellPromptSignal>;
+  setSurfaceShellPrompt: (ptyId: string, prompt: ShellPromptSignal | null) => void;
   /**
    * #1176 — the pendingQuestion text the user has already laid eyes on (they
    * focused the pane while it was blocked). The dot stays red — the agent IS
@@ -322,7 +329,7 @@ export interface PaneSlice {
   // (markSurfaceTeammatesWorking). Fleet and the roster read it through
   // isTeammateRunning; it is never the activity stamp. Transient.
   surfaceTeammatesAt: Record<string, number>;
-  // The TURN LATCH: ptyId → epoch-ms of the hook-reported turn start
+  // The TURN LATCH: ptyId → epoch-ms of a daemon-owned or hook-reported turn start
   // (`UserPromptSubmit`, arriving as a METADATA_UPDATE tagged
   // hookKind:'agent.user_prompt_submit').
   //
@@ -343,6 +350,16 @@ export interface PaneSlice {
   surfaceTurnEndAt: Record<string, number>;
   markSurfaceTurnOpen: (ptyId: string) => void;
   clearSurfaceTurnOpen: (ptyId: string) => void;
+  /**
+   * The latches the daemon's own turn tracker opened (`daemonTurnOpen`), not
+   * a hook. The daemon's "no turn" (its turn end, or an attach/resync
+   * snapshot of a pane it does not track as mid-turn) withdraws only these: a
+   * turn a hook opened is the hook's to end. A hook turn start on the pane
+   * takes the latch over; every other withdrawal drops the mark with it.
+   */
+  surfaceTurnOpenByDaemon: Record<string, true>;
+  openDaemonTurn: (ptyId: string) => void;
+  closeDaemonTurn: (ptyId: string) => void;
   // A SETTLE from main (`settled:true` on an idle broadcast): the turn is over,
   // so BOTH carriers of 'running' are withdrawn — the latch and the activity
   // stamp below. Clearing the latch alone left the stamp to keep the pane amber
@@ -713,6 +730,7 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
     // the turn is still running.
     if (status && TURN_CLOSING_STATUSES.has(status)) {
       delete state.surfaceTurnOpenAt[ptyId];
+      if (state.surfaceTurnOpenByDaemon) delete state.surfaceTurnOpenByDaemon[ptyId];
     }
   }),
 
@@ -814,12 +832,14 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
   surfaceActivityAt: {},
   surfaceTeammatesAt: {},
   surfaceTurnOpenAt: {},
+  surfaceTurnOpenByDaemon: {},
   surfaceTurnEndAt: {},
   surfacePendingQuestion: {},
   surfaceLastMessage: {},
   surfaceSubagents: {},
   surfaceSubagentsAt: {},
   surfaceTeammates: {},
+  surfaceShellPrompt: {},
   surfaceQuestionSeen: {},
   surfaceDismissedQuestion: {},
   agentClockMs: Date.now(),
@@ -901,6 +921,12 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
     else delete state.surfaceTeammates[ptyId];
   }),
 
+  setSurfaceShellPrompt: (ptyId, prompt) => set((state: StoreState) => {
+    if (!ptyId) return;
+    if (prompt) state.surfaceShellPrompt[ptyId] = prompt;
+    else delete state.surfaceShellPrompt[ptyId];
+  }),
+
   markSurfaceQuestionSeen: (ptyId) => set((state: StoreState) => {
     if (!ptyId) return;
     const question = state.surfacePendingQuestion[ptyId];
@@ -950,6 +976,7 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
     // Stop between them (the human hit ESC and re-submitted) is the SAME open
     // turn, but the silence clock must run from the latest submission.
     state.surfaceTurnOpenAt[ptyId] = Date.now();
+    if (state.surfaceTurnOpenByDaemon) delete state.surfaceTurnOpenByDaemon[ptyId];
     delete state.surfaceTurnEndAt[ptyId];
     // A dismissal covers one turn's question. A new prompt starts a new turn,
     // so the same text asked at its end is a new question and must show. Only
@@ -962,6 +989,23 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
   clearSurfaceTurnOpen: (ptyId) => set((state: StoreState) => {
     if (!ptyId) return;
     delete state.surfaceTurnOpenAt[ptyId];
+    if (state.surfaceTurnOpenByDaemon) delete state.surfaceTurnOpenByDaemon[ptyId];
+  }),
+
+  openDaemonTurn: (ptyId) => set((state: StoreState) => {
+    if (!ptyId) return;
+    // A latch already open (a hook's, or this turn's from an earlier edge or
+    // a replay) is left as it is: owner and stamp stay.
+    if (state.surfaceTurnOpenAt[ptyId] !== undefined) return;
+    state.surfaceTurnOpenAt[ptyId] = Date.now();
+    (state.surfaceTurnOpenByDaemon ??= {})[ptyId] = true;
+    delete state.surfaceTurnEndAt[ptyId];
+  }),
+
+  closeDaemonTurn: (ptyId) => set((state: StoreState) => {
+    if (!ptyId || !state.surfaceTurnOpenByDaemon?.[ptyId]) return;
+    delete state.surfaceTurnOpenByDaemon[ptyId];
+    delete state.surfaceTurnOpenAt[ptyId];
   }),
 
   settleSurfaceTurn: (ptyId) => set((state: StoreState) => {
@@ -970,6 +1014,7 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
     // (activity stamp). A settle withdraws both — main has told us the turn
     // ended, which is strictly better information than a 120s freshness window.
     delete state.surfaceTurnOpenAt[ptyId];
+    if (state.surfaceTurnOpenByDaemon) delete state.surfaceTurnOpenByDaemon[ptyId];
     delete state.surfaceActivityAt[ptyId];
   }),
 
@@ -1197,6 +1242,7 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
             delete state.surfaceSubagents[s.ptyId];
             delete state.surfaceSubagentsAt[s.ptyId];
             delete state.surfaceTeammates[s.ptyId];
+            delete state.surfaceShellPrompt[s.ptyId];
             delete state.surfaceQuestionSeen[s.ptyId];
             delete state.surfaceDismissedQuestion[s.ptyId];
             delete state.surfaceActivityAt[s.ptyId];
@@ -1205,6 +1251,7 @@ export const createPaneSlice: StateCreator<StoreState, [['zustand/immer', never]
             // latch outranks the byte heuristic, so a leaked one would pin the
             // new pane at 'running' with nothing left alive to withdraw it.
             delete state.surfaceTurnOpenAt[s.ptyId];
+            if (state.surfaceTurnOpenByDaemon) delete state.surfaceTurnOpenByDaemon[s.ptyId];
             delete state.surfaceTurnEndAt[s.ptyId];
             delete state.surfaceOutputAt[s.ptyId];
             delete state.surfacePorts[s.ptyId];

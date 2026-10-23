@@ -71,6 +71,7 @@ const BOT_LIST_CALLERS: Record<string, Why> = {
   'src/main/factory/repoWatch.ts#RepoWatch.reconcile': { kind: 'guest-skip', why: 'repo-keyed; skips guest workspaces' },
   'src/main/factory/roomWriter.ts#factRooms': { kind: 'guest-skip', why: 'a repository\'s rooms skip guest workspaces' },
   'src/main/factory/triggerEngine.ts#TriggerEngine.route': { kind: 'closed', why: 'fact wakes; botSeesFact holds the island too' },
+  'src/main/firstRun/firstBot.ts#findFirstRunBot': { kind: 'owner', why: 'the owner\'s first run finds the one bot it made' },
   'src/main/factory/workerLifecycleHost.ts#runningBotNames': { kind: 'owner', why: 'names in the owner\'s quit dialog' },
   'src/main/factory/workerLifecycleHost.ts#startWorkerLifecycle': { kind: 'not-bots', why: 'bot ids for each bot\'s own worker-time runs, no profile read' },
   'src/main/ipc/handlers/factory.handler.ts#factoryBotRows': { kind: 'owner', why: 'the owner\'s Bots page' },
@@ -140,6 +141,8 @@ const ROOM_READ_CALLERS: Record<string, Why> = {
   'src/main/pipe/handlers/room.rpc.ts#handleRoomResolve': { kind: 'owner', why: 'the operator\'s resolve' },
   'src/main/pipe/handlers/room.rpc.ts#handleRoomThreads': { kind: 'owner', why: 'operator only' },
   'src/main/pipe/handlers/room.rpc.ts#postTurnText': { kind: 'one-workspace', why: 'the bot\'s own room' },
+  'src/main/pipe/handlers/room.rpc.ts#groupRoundRefusal': { kind: 'one-workspace', why: 'the poster\'s own room: its group chat\'s thread' },
+  'src/main/pipe/handlers/room.rpc.ts#endGroupTurn': { kind: 'one-workspace', why: 'the bot\'s own room: the card its wake is about' },
 };
 
 // ── The scan ───────────────────────────────────────────────────────────────

@@ -472,6 +472,17 @@ status bar badges, `fleet_triage` or the phone's sidebar.
   written in before group chats became a group named after its workspace,
   with that workspace's bots, reading on in General; a room the owner never
   wrote in is just no longer listed.
+  In a group chat a bot woken by the owner's message or another bot's
+  mention may react instead of speaking, and one that stays silent leaves
+  an acknowledgement (shared/botGroupProtocol.ts). These sit under the card
+  they answer as one row of 20px chips: one chip per emoji and kind (a
+  picked reaction and an acknowledgement of the same emoji are two chips),
+  with `--selection` fill, 11px `--text-sub` text, and a tabular count when
+  more than one bot left that chip. The chip's label names who reacted ("Lead reacted ❤️")
+  or, for acknowledgements, who saw it ("Verifier saw this"). The emoji are
+  the bots' content, like an emoji in a message, so the no-emoji rule for
+  chrome does not apply. No colour, and nothing to click: a reaction is
+  read, not answered.
 - **Avatars (owner decision 2026-10-16, the Mochi crew; replaces the
   2026-10-14 shapes):** a bot's avatar is the picture the owner set for it —
   the picture always wins — else its **Mochi character**, one of eight
@@ -797,8 +808,9 @@ status bar badges, `fleet_triage` or the phone's sidebar.
   hairline, `--line-strong` while focused): "+" on the left — a menu of
   first messages to put in the box and, in a group, the bots to address —
   a muted picture button beside it (Attach photos: a PNG/JPEG picker), the
-  text ("Message <name>"; "Reply in thread" in a thread), and the
-  round primary send on the right. No microphone. Photos (owner decision
+  text ("Message <name>"; "Reply in thread" in a thread), the muted
+  dictation mic (see Dictation under Component Rules), and the
+  round primary send on the right. Photos (owner decision
   2026-10-18) use Chat view's grammar: each staged photo is a chip above
   the pill (thumbnail, name, × or Backspace at the start of the box removes
   it), from the button, a paste or a drop on the page, at most four; a
@@ -907,6 +919,11 @@ tests, changelog draft, issue triage) that open the composer filled in.
   limit sit behind More options at their defaults. One primary action
   (Create, Save or Turn on) and Cancel; a problem shows under the part it is
   about.
+- **Missed while asleep:** after the computer slept through scheduled runs,
+  one notice under the list header on the `--selection-subtle` fill: "N runs
+  missed while asleep", a muted line that Run now starts each schedule once,
+  then Run now (secondary) and Skip (ghost) on their own row. Either answers
+  it; until then the sidebar's Schedules row counts it once as needs you.
 - **Detail:** the name, the on/off switch, the next run, Run now and Edit,
   then the run history (status dot, start, duration, result, Open for a live
   run). Dividers are `--stroke` hairlines.
@@ -1551,6 +1568,14 @@ always neutral (the fill ladder).
   idle = no mark. Selection is never painted as a status. The collapsed
   rail draws the same marks (`StatusMarkView`), never text glyphs, and names
   each workspace `name, status` for assistive tech.
+- **Usage-limit chip and card** (owner handoff 2026-10-22).
+  - **The chip.** A pane held at its provider's usage limit shows one chip in its tab strip's flow, never a new row, so the terminal does not shrink: a muted clock, "Limit" and "resets 3:16 PM · 2h 4m", then Resume once the reset has passed, and ×. The clock wears `--accent` only while the pane will resume on its own, since that is when the system acts. Clicking the chip opens the usage-limit card.
+  - **The card.** It is a padded popover anchored to the chip and placed with `placePopover`, and it closes on Escape, an outside click or a resize. It opens by itself once per limit, and only for the pane in front. It holds:
+    - Resume automatically when it reopens: a switch, on by default.
+    - Continue on another account: shown only with 2+ accounts. One ghost button per account, then the opt-in "Always switch automatically" checkbox, which is the vendor's switch-by-quota setting.
+    - Continue in another agent: shown only for agents that are installed and signed in. It opens that agent in a new tab of the same pane and types a handoff note without sending it.
+    - When every account is out, one line with the earliest time one reopens.
+  - **Colour.** None beyond the armed clock.
 - **Needs you is the attention orange everywhere** — the sidebar ring, hairline,
   labels and counts, the collapsed rail's mark, the rail badge and dot,
   Fleet's Needs you chip, section dot and row word, and the titlebar count —
@@ -1674,6 +1699,42 @@ always neutral (the fill ladder).
   so no PTY is resized when it appears. It holds Files (the file tree
   column's toggle) · Snippets · Rich Input · Schedule, then Multi Task and the
   pin (2026-10-15); a verb that duplicates another home does not get a button.
+- **Dictation** (voice to text on this computer; one dictation at a time
+  across the app):
+  - **Composer mic.** The Chat view and Bots composers carry a muted mic
+    icon button just before send, in the composer's own icon-button style.
+    One click records; the next stops and transcribes. The text goes into
+    the box at the caret (over a selection) for the owner to edit, and is
+    never sent by itself. Recording: the button reads pressed
+    (`--selection-emphasis`, never colour) with a 6px filled `--accent` dot
+    and the elapsed `m:ss` (11px, tabular) beside it; the dot is a live
+    state, never the error red. Engine starting or transcribing: a quiet
+    spinner in place of the mic, the button disabled. While another input
+    dictates, the mic is disabled. Esc cancels a recording wherever focus
+    is; nothing is written.
+  - **Consent.** The first use opens one dialog (Dialog anatomy) before
+    anything is fetched: the size (about 80 MB), the source
+    (`huggingface.co · onnx-community/whisper-base` in `ui-code`, and the
+    pinned revision), the licence (MIT), where it is kept (this computer,
+    wmux's data folder) and that audio stays in memory and is never stored
+    or sent, as one grouped-rows container. Not now (ghost) and Download
+    (the primary). While it downloads: a neutral 4px progress track
+    (`--selection` track, `--text-sub` fill), "N MB of M MB" and Cancel
+    (secondary), no primary and no ×. When the model is ready the dialog
+    says to press the mic or the shortcut again; no recording starts by
+    itself. A refused microphone is a toast that says to allow it for wmux
+    in the system's privacy settings; any other failure is a short toast.
+  - **Terminal panes** get no header button: the pane cluster keeps its
+    five buttons. "Dictate into this pane" is a rebindable shortcut
+    (⌘⇧S / Ctrl+Shift+S, a toggle: press to start, press again to stop)
+    and a command-palette entry of the same name. The text goes to the
+    focused pane as a bracketed paste with no Enter (lines joined with
+    spaces when the app has bracketed paste off); a pane in Chat view takes
+    it in its composer. While a pane is dictated into, a chip floats in its
+    top-right corner: `--bg-surface` fill and the popover shadow, full
+    round, 11px — dot, "Dictating 0:05", muted "Esc to cancel"; a spinner
+    and "Transcribing…" after. It takes no layout row (the PTY is never
+    resized) and lets the pointer through.
 
 ### Dialogs & forms
 
@@ -1913,6 +1974,7 @@ primitives plus `Settings/SettingsLayout.tsx` (`SettingsSection`,
 | 2026-10-22 | Owner decision: Windows glass gives muted text a glass-only value. On Paper, Amber, Catppuccin, Monochrome, Stars & Stripes, Red Dynasty, Gruvbox Dark Hard and Void, `--text-muted` under `html[data-glass][data-platform="win32"]` is the opaque token moved by lightness only, the least step that passes the coverage gate; the gate judges that value, and the worst-backdrop model is unchanged. macOS and glass Off keep the opaque token. Mono, Mono Light and Nightowl stay opaque on Windows (their `--text-sub` misses 4.5:1 at the cap) | After the opaque contrast lift, eleven themes were still opaque on Windows because muted text sized for the opaque sidebar missed 3:1 over the worst backdrop even at 90% coverage |
 | 2026-10-22 | Orchestrator decision (owner direction, recommended option): the selected row (`--selection`) joins the surfaces of the 2026-10-21 contrast floors, so muted text reads at ≥3:1 and secondary text at ≥4.5:1 on it over the sheet and the column. Paper, Mono, Mono Light, Amber, Catppuccin, Monochrome, Stars & Stripes, Red Dynasty, Nightowl, Gruvbox Dark Hard and Void were lifted again by HSL lightness only, the least that clears it (at most 4.5%); Nightowl's and Stars & Stripes' pinned `--text-sub2` moved with them so sub2 stays above subtle. The `--selection-hover` fill (a selected Fleet card, a hovered needs-you row, a hovered chip or button) draws muted text as `--text-subtle` instead, which reads at ≥3:1 there; the global tiers are not lifted for it. The stronger `--selection-emphasis` fill (an open chip, a pressed or active button) draws muted text as `--text-sub`, since subtle falls under 3:1 there on Mono, Amber, Nightowl and Gruvbox Dark Hard. The Windows glass-only muted values were re-derived from the new tokens by the same least-step rule: Amber, Catppuccin and Gruvbox Dark Hard no longer need one, and Mono now passes the Windows glass gate with its opaque tokens. Amends the 2026-10-21 contrast row and the 2026-10-22 glass row | Selected rows were never measured: on Gruvbox the selected row's muted text read 2.61:1, and on ten themes the largest selection mix that passed was the 5% hover fill itself, so lowering `--selection` alone would have merged selection into hover. Holding the 15% fill to the same floor needed lifts up to 8% and pushed muted into subtle on Amber and Gruvbox |
 | 2026-10-22 | Owner decision: the Remote page is the one place PCs are connected. Connect a PC gains a LAN tab (the LanLink PIN pairing, moved from Settings); Settings › LAN keeps the LanLink and A2A listener switches plus a link to the Remote page, and its A2A invite, join and PC lists are gone. PC rows stay keyed by the A2A hostId and never merge across transports; each says what this PC allows that PC, with a slot kept empty for starting new agents. The A2A invite stays 8 characters, shown grouped as ABCD-EFGH for reading out while the whole invite stays what is copied; a PC known only as a joiner reads Disconnected with its last-seen time | Connecting a PC lived in three Settings sections and on the Remote page at once, so it was unclear where to start or where a PC went. One page, one dialog keeps every way in together; the security limits (the 10-minute invite, attempts and backoff, the 2-minute PIN and its 5 failures) are unchanged, so the code length is too |
+| 2026-10-23 | Owner decision: voice dictation. A mic button in the Chat view and Bots composers (the text goes in the box, never sent), a one-time consent before the speech model is downloaded, and, for terminal panes, a rebindable "Dictate into this pane" shortcut and palette entry with an in-pane corner chip instead of a header button. Amends the Bots composer's "No microphone" | The owner dictates prompts instead of typing them. The pane cluster is fixed at five buttons, so the pane gets a key and a palette entry; a toggle rather than hold-to-talk because a held chord through a long sentence is awkward and keyup on chords is unreliable |
 | 2026-10-23 | Owner handoff: Tailscale easy connect. The Remote page's This computer band gains the four-check Tailscale checklist (installed, signed in, this PC on the tailnet, the other device visible), each failure with exactly one button that only opens the download page or the Tailscale app, or unfolds how to sign the other device in. A connection over the tailnet checks Tailscale first and fails at once with the reason and that button. A PC connection in use (an A2A PC with an active link, an attached workspace share) that drops gets one warning toast once the drop outlasts its grace (A2A 16 s, the first four redials; workspace share two failed polls in a row), naming Tailscale only when the connection's own address is surely Tailscale's (a `*.ts.net` name or a peer its status lists), and the toast goes away when it reconnects; phones are out. A silent A2A drop is seen after 40 s with nothing from the other end, on both sides of the pair (the side that was joined ends a stream whose joiner stopped pinging), so it is reported by 56 s | Getting two machines onto the tailnet was a sequence of unexplained timeouts. One glance says which step is missing and one click opens the place to fix it, while signing in and connecting stay the person's own act. The grace keeps a reconnect blip silent |
 
 ### Desktop conversation view

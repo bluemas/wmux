@@ -88,6 +88,7 @@ import { AccountsSection } from './AccountsSection';
 import { AgyAccountsSection } from './AgyAccountsSection';
 import { FanoutPresetsSection } from './FanoutPresetsSection';
 import { A2aRemoteSection } from './A2aRemoteSection';
+import { RemoteSpawnSection } from './RemoteSpawnSection';
 import { terminalFontFamilyCss } from '../../utils/terminalFont';
 import { hasBareFunctionKeyBinding } from '../../utils/functionKeyBinding';
 import { Icon, IconPuzzle, IconX, IconCheck, IconChevron, IconExternalLink, IconBrowser, IconComputer, IconUsers, IconRobot, IconRemoteDevices, IconPlus, IconWarning } from '../icons';
@@ -1548,6 +1549,32 @@ function StartupSection() {
   );
 }
 
+// Keep the computer awake (main/power/sleepPrevention.ts): off, while any
+// local agent is working (Fleet's Running), or always. The store holds the
+// choice; utils/sleepPreventionBridge.ts tells main.
+function SleepPreventionSection() {
+  const t = useT();
+  const mode = useStore((s) => s.sleepPreventionMode);
+  const setMode = useStore((s) => s.setSleepPreventionMode);
+  return (
+    <SettingsSection title={t('settings.power')}>
+      <SettingRow id="sleepprevention" label={t('settings.sleepPrevention')} description={t('settings.sleepPreventionDesc')}>
+        <SegmentedControl
+          value={mode}
+          onValueChange={setMode}
+          ariaLabel={t('settings.sleepPrevention')}
+          options={[
+            { value: 'off', label: t('settings.sleepPreventionOff') },
+            { value: 'working', label: t('settings.sleepPreventionWorking') },
+            { value: 'always', label: t('settings.sleepPreventionAlways') },
+          ]}
+          data-testid="sleep-prevention-mode"
+        />
+      </SettingRow>
+    </SettingsSection>
+  );
+}
+
 function TabGeneral() {
   const t = useT();
   const locale = useStore((s) => s.locale);
@@ -1604,6 +1631,8 @@ function TabGeneral() {
       {(window.electronAPI.platform === 'win32' || window.electronAPI.platform === 'darwin') && (
         <StartupSection />
       )}
+
+      <SleepPreventionSection />
 
       {/* Tutorial */}
       <SettingsSection title={t('settings.tutorial')}>
@@ -5427,7 +5456,7 @@ export default function SettingsPanel({ initialTab }: { initialTab?: string }) {
                     {activeTab === 'computer-use'       && <TabComputerUse />}
                     {activeTab === 'plugins'            && <PluginsSection />}
                     {activeTab === 'remote'             && <TabRemote />}
-                    {activeTab === 'lanlink'            && <><LanConnectionsLink /><LanLinkSection /><A2aRemoteSection /></>}
+                    {activeTab === 'lanlink'            && <><LanConnectionsLink /><LanLinkSection /><A2aRemoteSection /><RemoteSpawnSection /></>}
                     {activeTab === 'about'              && <TabAbout />}
                   </div>
                 </>

@@ -13,8 +13,8 @@
 // common causes it was (signing, a protected branch, a remote that moved on,
 // a refused key or sign-in, a working folder that is gone); the UI words it
 // and offers the one next step (renderer/components/Git/ShipButton.tsx).
-import { describeScanFailure, describeSecretFindings, type SecretFinding } from '../../shared/secretGuard';
-import { reviewRange, scanCommits, scanDiff, spawnGitLines, type GitLines, type SecretScanResult } from './secretScan';
+import type { SecretFinding } from '../../shared/secretGuard';
+import { reviewRange, scanCommits, scanDiff, secretRefusal, spawnGitLines, type GitLines, type SecretScanResult } from './secretScan';
 import { secretGuardEnabled } from './secretGuardSetting';
 import { spawn } from 'node:child_process';
 import { copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
@@ -141,6 +141,25 @@ export function parseSymrefHead(raw: string): string | null {
 type Run = (cmd: string, args: string[], opts: { cwd: string; env: NodeJS.ProcessEnv; timeout: number }) => Promise<{ stdout: string }>;
 
 const MAX_OUTPUT = 4 * 1024 * 1024;
+
+/**
+ * Env for a git call that can run a signer (commit, and push, which signs
+ * with push.gpgSign): an ssh-keygen that wants
+ * a passphrase asks through SSH_ASKPASS, never a terminal, and an askpass
+ * that fails (or cannot start) gives it none, so it fails at once with
+ * "incorrect passphrase supplied". Detaching is not enough on Windows: Git
+ * for Windows' `cmd\git.exe` launcher gives the real git a hidden console,
+ * and the signer would wait on it until the timeout. SSH_ASKPASS_REQUIRE is
+ * OpenSSH 8.4+, which Git for Windows bundles. A user's own SSH_ASKPASS (a GUI
+ * one) is kept and now always used; otherwise it is `false`, found on PATH
+ * (Git for Windows ships one). gpg needs nothing: its pinentry runs from
+ * gpg-agent, not on this console, and GPG_TTY is dropped by spawnRun.
+ * On a push over ssh it also covers ssh's own passphrase or host-key
+ * question: that fails at once too, as the auth error it is.
+ */
+export function signerAskEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return { SSH_ASKPASS_REQUIRE: 'force', SSH_ASKPASS: base.SSH_ASKPASS || 'false' };
+}
 
 /** Runs `cmd` with no terminal to ask on: stdin is the null device, the child
  *  is detached (a new session off Windows, so no controlling TTY; on Windows
@@ -315,9 +334,8 @@ export class ShipActions {
   /** A refusal when the secret check found secret files or key-shaped values,
    *  or could not run (fail closed); null when the change is clean. */
   private secretRefusal(scan: SecretScanResult, action: string): ShipActionResult | null {
-    if (!scan.ok) return { ok: false, error: describeScanFailure(action), secretScanFailed: true };
-    if (scan.findings.length) return { ok: false, error: describeSecretFindings(scan.findings, action), secrets: scan.findings };
-    return null;
+    const refused = secretRefusal(scan, action);
+    return refused ? { ok: false, ...refused } : null;
   }
 
   /** A merge or cherry-pick in progress in the worktree at `cwd`. */
@@ -400,6 +418,7 @@ export class ShipActions {
     if (msg.length > SHIP_TEXT_MAX) return { ok: false, error: 'the commit message is too long' };
     // `-c` on this invocation only: the user's git config is never written.
     const commitArgs = [...(opts.noSign ? ['-c', 'commit.gpgsign=false'] : []), 'commit', '-m', msg];
+    const signer = signerAskEnv(getExecEnv());
     try {
       await this.verify(cwd, expect);
       if (secretGuardEnabled()) {
@@ -411,7 +430,7 @@ export class ShipActions {
           const refused = this.secretRefusal(await scanDiff(this.gitLines(cwd, env), ['--cached']), 'committed');
           if (refused) return refused;
           await this.verify(cwd, expect);
-          await this.git(commitArgs, cwd, 60_000, env);
+          await this.git(commitArgs, cwd, 60_000, { ...env, ...signer });
           // The real index catches up with the commit, as `add -A` + `commit` leaves it.
           try {
             await this.git(['reset', '-q'], cwd);
@@ -423,7 +442,7 @@ export class ShipActions {
       }
       await this.git(['add', '-A'], cwd);
       await this.verify(cwd, expect);
-      await this.git(commitArgs, cwd, 60_000);
+      await this.git(commitArgs, cwd, 60_000, signer);
       return { ok: true };
     } catch (err) {
       return this.failed('commit', cwd, err);
@@ -448,7 +467,7 @@ export class ShipActions {
         const refused = this.secretRefusal(await scanCommits(this.gitLines(cwd), [expect.head, '--not', `--remotes=${remote}`]), 'pushed');
         if (refused) return refused;
       }
-      await this.git(['push', remote, `${expect.head}:${merge}`], cwd, 120_000, { GIT_TERMINAL_PROMPT: '0' });
+      await this.git(['push', remote, `${expect.head}:${merge}`], cwd, 120_000, { GIT_TERMINAL_PROMPT: '0', ...signerAskEnv(getExecEnv()) });
       return { ok: true };
     } catch (err) {
       return this.failed('push', cwd, err, remote && remote !== '.' ? remote : undefined);
