@@ -35,6 +35,8 @@ export interface DaemonPaneState {
   title?: string;
   /** A turn is open. A quiet one (thinking, a slow tool) reads `idle` in agentStatus. */
   turnOpen?: boolean;
+  /** Agent turn excluding boot episodes and shell submits (newer daemons). */
+  agentMidTurn?: boolean;
   /** The pane's current agent has delivered a hook. */
   hookReports?: boolean;
 }
@@ -165,6 +167,15 @@ function applyStatus(id: string, state: DaemonPaneState, deps: ResubscribeResync
   if (truth === 'idle') {
     if (state.turnOpen === undefined) return false;
     if (state.turnOpen) truth = 'running';
+  }
+  // Restore the renderer latch even if main already retained 'running':
+  // equality of statuses says nothing about the renderer's freshness clock.
+  if (typeof state.agentMidTurn === 'boolean') {
+    broadcastMetadataUpdate(deps.win, {
+      ptyId: id,
+      daemonTurnOpen: state.agentMidTurn,
+      ...(state.agentMidTurn && truth === 'running' ? { agentStatus: 'running' as const } : {}),
+    });
   }
   if (truth === shown) return false;
   const router = deps.hookRouter;

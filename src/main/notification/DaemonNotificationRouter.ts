@@ -1258,7 +1258,15 @@ export class DaemonNotificationRouter {
       }
     };
 
-    const onIdle = (payload: { sessionId: string; preTurn?: boolean }) => {
+    const onIdle = (payload: { sessionId: string; preTurn?: boolean; agentMidTurn?: boolean }) => {
+      // Byte silence cannot end a daemon-owned agent turn. Also repair a
+      // missed start edge instead of relying on the activity freshness TTL.
+      if (payload.agentMidTurn === true) {
+        broadcastMetadataUpdate(this.getWindow(), {
+          ptyId: payload.sessionId, agentStatus: 'running', daemonTurnOpen: true,
+        });
+        return;
+      }
       const now = Date.now();
       // The daemon's own word that no turn ran since the agent's SessionStart:
       // turn-end evidence for the bot workers' idle stops, whatever the dot does.
@@ -1558,6 +1566,17 @@ export class DaemonNotificationRouter {
       }
     };
 
+    // The daemon tracks submitted/hook-backed agent turns independently of
+    // output rate. Codex can work quietly without a UserPromptSubmit hook.
+    const onAgentTurn = (payload: { sessionId: string; running: boolean }) => {
+      broadcastMetadataUpdate(this.getWindow(), {
+        ptyId: payload.sessionId,
+        daemonTurnOpen: payload.running,
+        ...(payload.running ? { agentStatus: 'running' as const } : {}),
+      });
+    };
+
+    this.daemonClient.on('session:agentTurn', onAgentTurn);
     this.daemonClient.on('session:agent', onAgent);
     this.daemonClient.on('session:active', onActive);
     this.daemonClient.on('session:idle', onIdle);
@@ -1597,6 +1616,7 @@ export class DaemonNotificationRouter {
     });
 
     this.cleanups.push(
+      () => this.daemonClient.off('session:agentTurn', onAgentTurn),
       () => this.daemonClient.off('session:agent', onAgent),
       () => this.daemonClient.off('session:active', onActive),
       () => this.daemonClient.off('session:idle', onIdle),

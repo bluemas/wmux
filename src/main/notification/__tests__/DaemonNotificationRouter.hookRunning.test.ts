@@ -64,7 +64,8 @@ const broadcastMetadataUpdateMock = metadataHandlerMocks.broadcastMetadataUpdate
 const PTY = 'daemon-worker-pane';
 
 interface Captured {
-  idle?: (payload: { sessionId: string; preTurn?: boolean }) => void;
+  turn?: (payload: { sessionId: string; running: boolean }) => void;
+  idle?: (payload: { sessionId: string; preTurn?: boolean; agentMidTurn?: boolean }) => void;
   agent?: (payload: { sessionId: string; event: unknown }) => void;
   active?: (payload: { sessionId: string; agentName?: string }) => void;
   processExit?: (payload: { sessionId: string; slug: string | null }) => void;
@@ -102,6 +103,7 @@ function makeRouter(
   const captured: Captured = {};
   const fakeDaemon = {
     on: vi.fn((event: string, cb: (payload: never) => void) => {
+      if (event === 'session:agentTurn') captured.turn = cb as Captured['turn'];
       if (event === 'session:idle') captured.idle = cb as Captured['idle'];
       if (event === 'session:agent') captured.agent = cb as Captured['agent'];
       if (event === 'session:active') captured.active = cb as Captured['active'];
@@ -153,6 +155,23 @@ describe('DaemonNotificationRouter — turn start lights the pane', () => {
     broadcastMetadataUpdateMock.mockClear();
     metadataHandlerMocks.lastBroadcastAgentStatus.delete(PTY);
     metadataHandlerMocks.runningClaim.delete(PTY);
+  });
+
+  it('relays daemon turns and keeps a quiet hookless Codex running', () => {
+    const { router, captured } = makeRouter();
+    captured.turn?.({ sessionId: PTY, running: true });
+    expect(broadcastMetadataUpdateMock).toHaveBeenLastCalledWith(null, {
+      ptyId: PTY, agentStatus: 'running', daemonTurnOpen: true,
+    });
+    captured.idle?.({ sessionId: PTY, agentMidTurn: true });
+    expect(broadcastMetadataUpdateMock).toHaveBeenLastCalledWith(null, {
+      ptyId: PTY, agentStatus: 'running', daemonTurnOpen: true,
+    });
+    captured.turn?.({ sessionId: PTY, running: false });
+    expect(broadcastMetadataUpdateMock).toHaveBeenLastCalledWith(null, {
+      ptyId: PTY, daemonTurnOpen: false,
+    });
+    router.stop();
   });
 
   it('broadcasts running on agent.user_prompt_submit, with no byte threshold', () => {
