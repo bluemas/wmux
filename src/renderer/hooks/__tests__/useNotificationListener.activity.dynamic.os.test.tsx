@@ -122,6 +122,24 @@ afterEach(() => {
 });
 
 describe('useNotificationListener — Fleet activity line (METADATA_UPDATE.activity)', () => {
+  it('the daemon\'s "no turn" withdraws only a latch the daemon opened, never a hook\'s', () => {
+    const ptyId = 'pty-hook-turn';
+    seedActivePaneSurface(ptyId);
+    act(() => { metaCb!({ ptyId, agentName: 'Claude Code', agentStatus: 'running', hookKind: 'agent.user_prompt_submit' }); });
+    const opened = useStore.getState().surfaceTurnOpenAt[ptyId];
+    expect(opened).toBeGreaterThan(0);
+    // An attach or resync snapshot of a pane the daemon does not track as mid-turn.
+    act(() => { metaCb!({ ptyId, daemonTurnOpen: false }); });
+    expect(useStore.getState().surfaceTurnOpenAt[ptyId]).toBe(opened);
+    // A daemon-opened latch on another pane does go with it.
+    const other = 'pty-daemon-turn';
+    seedActivePaneSurface(other);
+    act(() => { metaCb!({ ptyId: other, agentName: 'Codex CLI', agentStatus: 'running', daemonTurnOpen: true }); });
+    expect(useStore.getState().surfaceTurnOpenAt[other]).toBeGreaterThan(0);
+    act(() => { metaCb!({ ptyId: other, daemonTurnOpen: false }); });
+    expect(useStore.getState().surfaceTurnOpenAt[other]).toBeUndefined();
+  });
+
   it('keeps a quiet Codex working in the roster and the workspace dot until its daemon turn ends', () => {
     const ptyId = 'pty-codex-turn';
     const wsId = seedActivePaneSurface(ptyId);

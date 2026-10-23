@@ -50,6 +50,18 @@ describe('DaemonPTYBridge — interrupted-turn row', () => {
     expect(interrupted).toEqual([{ sessionId: 'sess-1', agent: 'Claude Code' }]);
   });
 
+  it('ends the open agent turn: no Stop hook follows an interrupt', () => {
+    const edges: Array<number | null> = [];
+    bridge.on('agentTurn', (p: { runningSince: number | null }) => edges.push(p.runningSince));
+    bridge.noteInput('fix the build\r');
+    bridge.noteAgentStatus('running', true); // UserPromptSubmit
+    expect(bridge.isAgentMidTurn()).toBe(true);
+    vi.advanceTimersByTime(RESIZE_REDRAW_GUARD_MS);
+    feed(ROW);
+    expect(bridge.isAgentMidTurn()).toBe(false);
+    expect(edges).toEqual([edges[0], null]);
+  });
+
   it('ignores the row inside a resize redraw', () => {
     bridge.noteResize();
     feed(ROW);

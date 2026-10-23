@@ -7649,6 +7649,11 @@ function wireEvents(
     };
     pipeServer.broadcast({ type: 'agent.event', sessionId: payload.sessionId, data });
     webTerminalServer?.emitAgentLiveness(deriveAgentLiveness(payload.sessionId, data, Date.now()));
+    // The turn the dialog paused goes on: its open turn was withheld while the
+    // pane waited on a human (`session:agentTurn`), and nothing else restores it.
+    if (managed?.bridge.isAgentMidTurn()) {
+      pipeServer.broadcast({ type: 'agent.turn', sessionId: payload.sessionId, data: { running: true } });
+    }
   });
 
   // OSC 133 prompt/command markers — broadcast to main so
@@ -7714,7 +7719,12 @@ function wireEvents(
   const AGENT_TURN_SAVE_DELAY_MS = 1_000;
   let agentTurnSaveTimer: NodeJS.Timeout | null = null;
   sessionManager.on('session:agentTurn', (payload: { sessionId: string; runningSince: number | null }) => {
-    pipeServer.broadcast({ type: 'agent.turn', sessionId: payload.sessionId, data: { running: payload.runningSince !== null } });
+    // A pane blocked on a human is not running, whatever its episode says (the
+    // same guard attach, the status RPC and `activity.idle` apply); the dialog's
+    // answer restores it (`session:answered`).
+    const turnBridge = sessionManager.getSession(payload.sessionId)?.bridge;
+    const turnRunning = payload.runningSince !== null && turnBridge?.getAgentStatus() !== 'awaiting_input';
+    pipeServer.broadcast({ type: 'agent.turn', sessionId: payload.sessionId, data: { running: turnRunning } });
     if (agentTurnSaveTimer || shuttingDown) return;
     agentTurnSaveTimer = setTimeout(() => {
       agentTurnSaveTimer = null;

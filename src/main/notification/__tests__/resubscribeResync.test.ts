@@ -105,6 +105,19 @@ describe('resyncAfterResubscribe (#2263)', () => {
     expect(statuses().some((s) => s.agentStatus === 'running')).toBe(false);
   });
 
+  it('sends the daemon latch only with a running status, and a pane with no daemon turn only closes it', async () => {
+    mocks.last.set('d1', 'complete');
+    mocks.last.set('d2', 'idle');
+    const { result } = run({
+      d1: { agentStatus: 'complete', agentName: 'Codex', turnOpen: true, agentMidTurn: true },
+      d2: { agentStatus: 'idle', agentName: 'Codex', turnOpen: false, agentMidTurn: false },
+    }, router);
+    await result;
+    expect(statuses().some((s) => s.ptyId === 'd1' && 'daemonTurnOpen' in s)).toBe(false);
+    expect(statuses()).toContainEqual({ ptyId: 'd2', daemonTurnOpen: false });
+    expect(statuses().some((s) => s.ptyId === 'd2' && 'agentStatus' in s)).toBe(false);
+  });
+
   it('takes no latch for a turn open without hooks', async () => {
     mocks.last.set('d1', 'idle');
     const { result } = run({ d1: { agentStatus: 'running', agentName: 'Codex', turnOpen: true, hookReports: false } }, router);

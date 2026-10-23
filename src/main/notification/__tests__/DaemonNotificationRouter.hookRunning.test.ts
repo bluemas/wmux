@@ -168,9 +168,53 @@ describe('DaemonNotificationRouter — turn start lights the pane', () => {
       ptyId: PTY, agentStatus: 'running', daemonTurnOpen: true,
     });
     captured.turn?.({ sessionId: PTY, running: false });
-    expect(broadcastMetadataUpdateMock).toHaveBeenLastCalledWith(null, {
+    expect(broadcastMetadataUpdateMock).toHaveBeenCalledWith(null, {
       ptyId: PTY, daemonTurnOpen: false,
     });
+    // Quiet to the end: the turn's end settles it (no other idle edge comes).
+    expect(broadcastMetadataUpdateMock).toHaveBeenLastCalledWith(null, { ptyId: PTY, agentStatus: 'idle', settled: true });
+    router.stop();
+    clearSuppression(PTY);
+  });
+
+  it('a daemon turn that ends with no output after its idle edge settles the pane to idle', () => {
+    const { router, captured } = makeRouter();
+    captured.turn?.({ sessionId: PTY, running: true });
+    captured.idle?.({ sessionId: PTY, agentMidTurn: true });
+    captured.turn?.({ sessionId: PTY, running: false });
+    expect(broadcastMetadataUpdateMock).toHaveBeenLastCalledWith(null, { ptyId: PTY, agentStatus: 'idle', settled: true });
+    router.stop();
+    clearSuppression(PTY);
+  });
+
+  it('a daemon turn whose pane is still printing at its end leaves the settle to the next idle edge', () => {
+    const { router, captured } = makeRouter();
+    captured.turn?.({ sessionId: PTY, running: true });
+    captured.idle?.({ sessionId: PTY, agentMidTurn: true });
+    captured.active?.({ sessionId: PTY });
+    captured.turn?.({ sessionId: PTY, running: false });
+    expect(broadcastMetadataUpdateMock).toHaveBeenLastCalledWith(null, { ptyId: PTY, daemonTurnOpen: false });
+    router.stop();
+  });
+
+  it('a daemon turn end never settles over the result or dialog the pane shows', () => {
+    const { router, captured } = makeRouter();
+    captured.turn?.({ sessionId: PTY, running: true });
+    captured.idle?.({ sessionId: PTY, agentMidTurn: true });
+    metadataHandlerMocks.lastBroadcastAgentStatus.set(PTY, 'complete');
+    captured.turn?.({ sessionId: PTY, running: false });
+    expect(broadcastMetadataUpdateMock).toHaveBeenLastCalledWith(null, { ptyId: PTY, daemonTurnOpen: false });
+    router.stop();
+  });
+
+  it('agent.turn and a mid-turn idle edge never replace a pane waiting on a human', () => {
+    const { router, captured } = makeRouter();
+    metadataHandlerMocks.lastBroadcastAgentStatus.set(PTY, 'awaiting_input');
+    broadcastMetadataUpdateMock.mockClear();
+    captured.turn?.({ sessionId: PTY, running: true });
+    captured.idle?.({ sessionId: PTY, agentMidTurn: true });
+    expect(broadcastMetadataUpdateMock.mock.calls.some(([, p]) => (p as { agentStatus?: string }).agentStatus === 'running')).toBe(false);
+    expect(metadataHandlerMocks.lastBroadcastAgentStatus.get(PTY)).toBe('awaiting_input');
     router.stop();
   });
 

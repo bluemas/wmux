@@ -831,8 +831,10 @@ export function useNotificationListener() {
             // setSurfaceAgentStatus above: every other status the agent (or the
             // process-death edge, or main's turn-expiry timer) can report ends
             // the turn.
-            if (daemonTurnOpen === true || hookKind === 'agent.user_prompt_submit' || hookKind === 'agent.tool_started' || hookKind === 'agent.teammate_wake') {
+            if (hookKind === 'agent.user_prompt_submit' || hookKind === 'agent.tool_started' || hookKind === 'agent.teammate_wake') {
               state.markSurfaceTurnOpen(ptyId);
+            } else if (daemonTurnOpen === true) {
+              state.openDaemonTurn(ptyId);
             }
           }
           // A SETTLE (main's interrupt / back-at-prompt / process-exit / latch
@@ -846,8 +848,9 @@ export function useNotificationListener() {
             state.settleSurfaceTurn(ptyId);
           }
         }
+        // The daemon's "no turn": withdraws only a latch the daemon opened.
         if (daemonTurnOpen === false) {
-          state.clearSurfaceTurnOpen(ptyId);
+          state.closeDaemonTurn(ptyId);
         }
         // The surface's own branch (Moa's view pointer): the workspace record
         // above only follows the active pane, and only at the time it arrives.

@@ -170,12 +170,14 @@ function applyStatus(id: string, state: DaemonPaneState, deps: ResubscribeResync
   }
   // Restore the renderer latch even if main already retained 'running':
   // equality of statuses says nothing about the renderer's freshness clock.
-  if (typeof state.agentMidTurn === 'boolean') {
-    broadcastMetadataUpdate(deps.win, {
-      ptyId: id,
-      daemonTurnOpen: state.agentMidTurn,
-      ...(state.agentMidTurn && truth === 'running' ? { agentStatus: 'running' as const } : {}),
-    });
+  // The renderer opens it only with a running status, so it goes out with one
+  // (the daemon's `agentMidTurn` already leaves out a pane waiting on a human);
+  // a pane with no daemon turn closes the latch the daemon opened, and only
+  // that one (a hook's stays).
+  if (state.agentMidTurn === true && truth === 'running') {
+    broadcastMetadataUpdate(deps.win, { ptyId: id, daemonTurnOpen: true, agentStatus: 'running' });
+  } else if (state.agentMidTurn === false) {
+    broadcastMetadataUpdate(deps.win, { ptyId: id, daemonTurnOpen: false });
   }
   if (truth === shown) return false;
   const router = deps.hookRouter;
