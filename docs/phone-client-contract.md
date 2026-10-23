@@ -494,8 +494,10 @@ Check `/api/config` and hide the keyboard rather than letting a user type into a
 mistake the browser client made and shipped.
 
 It is **409 `{"error":"terminal-prompt-active","effect":"none"}`** while the pane
-shows the agent's own permission dialog (a pending `terminal_prompt` record),
-except for a lone Esc or a lone Ctrl-C — see
+shows the agent's own permission dialog as an answerable pending
+`terminal_prompt` record (one that carries a `promptFingerprint`, or any
+ExitPlanMode record), except for a
+lone Esc or a lone Ctrl-C — see
 [`terminal_prompt`](#terminal_prompt--the-agents-own-permission-dialog).
 
 Phone scrolling has two ownership modes. A terminal's normal buffer is local
@@ -1428,12 +1430,20 @@ Every refusal writes nothing and carries `effect: "none"`:
 | 404 | `{error:"not-found"}` | Unknown id, or (device) the brain's pane |
 | 501 | `{error:"answer-in-terminal"}` | No `terminal-prompt-decline` in `X-Wmux-Client-Caps` |
 
-**Typing cannot answer it.** While the pane has a pending `terminal_prompt`
-record (answerable or not, answered-and-waiting included), `POST /api/input` to
-that pane is refused with 409 `{"error":"terminal-prompt-active","effect":"none"}`
-and nothing is written — a digit, Enter, a paste, a notification "Reply", any
-key sequence. The dialog is answered only through `POST /api/approvals/<id>`
-above, or at the computer. The one exception is the cancel direction: a body
+**Typing cannot answer it.** While the pane has a pending answerable
+`terminal_prompt` record (it carries a `promptFingerprint`; answered-and-waiting
+included), `POST /api/input` to that pane is refused with 409
+`{"error":"terminal-prompt-active","effect":"none"}` and nothing is written — a
+digit, Enter, a paste, a notification "Reply", any key sequence. That dialog is
+answered only through `POST /api/approvals/<id>` above, or at the computer. An
+informational record (no `promptFingerprint`: the dialog could not be bound to
+its tool call) does not refuse input: no route can answer it, so typed keys are
+the only way to answer it away from the computer. It still raises the pane's
+attention and its card, and when the dialog names its tool its `summary` is
+the command the screen shows, not the one the hook named.
+An ExitPlanMode record (`toolName: "ExitPlanMode"`) refuses input with or
+without a `promptFingerprint`: its first row, under the cursor, switches the
+session's permission mode. The one exception is the cancel direction: a body
 that is exactly one Esc (`\x1b`) or exactly one Ctrl-C (`\x03`) is written as
 usual. Esc followed by anything else (an arrow key, Enter) is refused. The check
 runs when the request body completes, immediately before the write, so a dialog
@@ -7006,6 +7016,8 @@ sheet. No stored token for that login → 424 `gh-auth-missing`;
 | 409 | `not-a-git-repo` | the session is not in a repository |
 | 500 | `git-operation-failed` | git could not answer; retry later |
 | 501 | `not-implemented` | this daemon does not serve the action yet (its key is absent) |
+| 409 | `secrets-found` (+ the first finding: `secretPath`, `secretWhat` (`file` \| `value`), `secretKind`, `secretLine?`; and `secretCount`; never the value) | the commits carry a password or key; take it out on the desktop and push again |
+| 500 | `secret-scan-failed` | the password and key check could not read the commits, so nothing was pushed; retry, or push from the desktop |
 | 409 | `squash-disabled`, `protected-target`, `remote-branch-exists`, `remote-unsupported`, `not-pushed`, `pr-exists` (+ `number`), `no-commits-ahead`, `detached-head`, `git-operation-in-progress`, `merge-in-flight`, `identity-changed`, `request-id-reused` | show; usually re-preview |
 | 424 | `gh-auth-missing`, `remote-forbidden` (+ `login`) | fix on the desktop |
 | 428 | `confirm-required` | new preview |
