@@ -1374,9 +1374,12 @@ export class DaemonClient extends EventEmitter {
           });
           break;
         case 'agent.turn': {
-          const data = event.data as { running?: unknown } | null;
+          const data = event.data as { running?: unknown; afterAnswer?: unknown } | null;
           if (typeof data?.running === 'boolean') {
-            this.emit('session:agentTurn', { sessionId: event.sessionId, running: data.running });
+            this.emit('session:agentTurn', {
+              sessionId: event.sessionId, running: data.running,
+              ...(data.afterAnswer === true ? { afterAnswer: true } : {}),
+            });
           }
           break;
         }

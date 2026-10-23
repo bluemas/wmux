@@ -3,7 +3,8 @@ import type { AgentStatus } from '../../shared/types';
 import type { HookSignalRouter } from '../hooks/HookSignalRouter';
 import { agentDisplayToSlug } from '../../shared/agentIdentity';
 import { broadcastMetadataUpdate, getLastBroadcastAgentStatus } from '../ipc/handlers/metadata.handler';
-import { broadcastSettledIdle, settleHookTurnToIdle } from './turnSettle';
+import { noteByteActivity } from './idleSuppression';
+import { broadcastSettledIdle, broadcastTurnRunning, settleHookTurnToIdle } from './turnSettle';
 
 /**
  * #2263 — bring pane state back in line after main subscribes to daemon events
@@ -160,6 +161,10 @@ async function resync(
 function applyStatus(id: string, state: DaemonPaneState, deps: ResubscribeResyncDeps): boolean {
   const now = deps.now?.() ?? Date.now();
   const shown = getLastBroadcastAgentStatus(id) ?? 'idle';
+  // The byte state a daemon turn's end settles by: the gap may have dropped
+  // its edges. The daemon's status reads the byte rate unless a result is
+  // settled, and then it is unknown.
+  noteByteActivity(id, state.agentStatus === 'idle' ? true : state.agentStatus === 'running' ? false : undefined);
   // The daemon's status reads the byte rate once no result is settled, so a
   // turn thinking quietly reads `idle` there; an open turn is still running.
   // An older daemon does not say which, and then an idle status is left alone.
@@ -175,7 +180,7 @@ function applyStatus(id: string, state: DaemonPaneState, deps: ResubscribeResync
   // a pane with no daemon turn closes the latch the daemon opened, and only
   // that one (a hook's stays).
   if (state.agentMidTurn === true && truth === 'running') {
-    broadcastMetadataUpdate(deps.win, { ptyId: id, daemonTurnOpen: true, agentStatus: 'running' });
+    broadcastTurnRunning(id, deps.win, { daemonTurnOpen: true });
   } else if (state.agentMidTurn === false) {
     broadcastMetadataUpdate(deps.win, { ptyId: id, daemonTurnOpen: false });
   }
@@ -184,6 +189,9 @@ function applyStatus(id: string, state: DaemonPaneState, deps: ResubscribeResync
   const agentName = state.agentName ?? '';
 
   if (truth === 'running') {
+    // Running never replaces a pane waiting on a human (broadcastTurnRunning):
+    // that wait is left to its own answer or result.
+    if (shown === 'awaiting_input') return false;
     // A turn started in the gap. Its own later events settle it as usual. A
     // turn the pane's hooks opened also gets the latch its missed running edge
     // would have set, so byte silence mid-turn does not clear it; a turn open
@@ -191,7 +199,7 @@ function applyStatus(id: string, state: DaemonPaneState, deps: ResubscribeResync
     if (state.turnOpen && state.hookReports && router && !router.governsRunningState(id, now)) {
       router.noteHookTurnStart(id, now, agentDisplayToSlug(agentName) ?? null);
     }
-    broadcastMetadataUpdate(deps.win, { ptyId: id, agentStatus: 'running', agentName });
+    broadcastTurnRunning(id, deps.win, { agentName });
     return true;
   }
   if (truth === 'idle') {

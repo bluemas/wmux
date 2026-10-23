@@ -7651,8 +7651,9 @@ function wireEvents(
     webTerminalServer?.emitAgentLiveness(deriveAgentLiveness(payload.sessionId, data, Date.now()));
     // The turn the dialog paused goes on: its open turn was withheld while the
     // pane waited on a human (`session:agentTurn`), and nothing else restores it.
+    // `afterAnswer`: main applies it even while it still shows the dialog.
     if (managed?.bridge.isAgentMidTurn()) {
-      pipeServer.broadcast({ type: 'agent.turn', sessionId: payload.sessionId, data: { running: true } });
+      pipeServer.broadcast({ type: 'agent.turn', sessionId: payload.sessionId, data: { running: true, afterAnswer: true } });
     }
   });
 
@@ -7720,11 +7721,13 @@ function wireEvents(
   let agentTurnSaveTimer: NodeJS.Timeout | null = null;
   sessionManager.on('session:agentTurn', (payload: { sessionId: string; runningSince: number | null }) => {
     // A pane blocked on a human is not running, whatever its episode says (the
-    // same guard attach, the status RPC and `activity.idle` apply); the dialog's
-    // answer restores it (`session:answered`).
+    // same guard attach, the status RPC and `activity.idle` apply): a start
+    // edge is left out then, never sent as an end, and the dialog's answer
+    // restores it (`session:answered`).
     const turnBridge = sessionManager.getSession(payload.sessionId)?.bridge;
-    const turnRunning = payload.runningSince !== null && turnBridge?.getAgentStatus() !== 'awaiting_input';
-    pipeServer.broadcast({ type: 'agent.turn', sessionId: payload.sessionId, data: { running: turnRunning } });
+    if (payload.runningSince === null || turnBridge?.getAgentStatus() !== 'awaiting_input') {
+      pipeServer.broadcast({ type: 'agent.turn', sessionId: payload.sessionId, data: { running: payload.runningSince !== null } });
+    }
     if (agentTurnSaveTimer || shuttingDown) return;
     agentTurnSaveTimer = setTimeout(() => {
       agentTurnSaveTimer = null;

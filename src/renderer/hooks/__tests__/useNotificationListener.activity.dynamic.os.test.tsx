@@ -140,6 +140,25 @@ describe('useNotificationListener — Fleet activity line (METADATA_UPDATE.activ
     expect(useStore.getState().surfaceTurnOpenAt[other]).toBeUndefined();
   });
 
+  it('an episode-over settle ends the turn whoever opened the latch', () => {
+    const ptyId = 'pty-hook-settle';
+    seedActivePaneSurface(ptyId);
+    act(() => { metaCb!({ ptyId, agentName: 'Claude Code', agentStatus: 'running', hookKind: 'agent.user_prompt_submit' }); });
+    act(() => { metaCb!({ ptyId, daemonTurnOpen: true, agentStatus: 'running' }); });
+    expect(useStore.getState().surfaceTurnOpenAt[ptyId]).toBeGreaterThan(0);
+    // Main's interrupt / process-death / turn-end settle.
+    act(() => { metaCb!({ ptyId, agentStatus: 'idle', settled: true }); });
+    expect(useStore.getState().surfaceTurnOpenAt[ptyId]).toBeUndefined();
+    // The same for a latch the daemon opened, and its mark goes with it.
+    const other = 'pty-daemon-settle';
+    seedActivePaneSurface(other);
+    act(() => { metaCb!({ ptyId: other, agentName: 'Codex CLI', agentStatus: 'running', daemonTurnOpen: true }); });
+    expect(useStore.getState().surfaceTurnOpenByDaemon[other]).toBe(true);
+    act(() => { metaCb!({ ptyId: other, agentStatus: 'idle', settled: true }); });
+    expect(useStore.getState().surfaceTurnOpenAt[other]).toBeUndefined();
+    expect(useStore.getState().surfaceTurnOpenByDaemon[other]).toBeUndefined();
+  });
+
   it('keeps a quiet Codex working in the roster and the workspace dot until its daemon turn ends', () => {
     const ptyId = 'pty-codex-turn';
     const wsId = seedActivePaneSurface(ptyId);

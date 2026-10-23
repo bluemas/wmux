@@ -10,6 +10,7 @@ import {
   clearEscapeKey,
   clearPty as clearSuppression,
   ESC_INTERRUPT_CONFIRM_MS,
+  noteByteActivity,
   recentlyEscaped,
   recentlySettled,
   SETTLE_REDRAW_GUARD_MS,
@@ -20,7 +21,7 @@ import {
   clearLastBroadcastAgentStatus,
 } from '../ipc/handlers/metadata.handler';
 import { noteBootSettled } from './turnEvidence';
-import { settleHookTurnToIdle, broadcastSettledIdle, holdsUnreadResult, holdsUnsettledRunningClaim } from './turnSettle';
+import { settleHookTurnToIdle, broadcastSettledIdle, broadcastTurnRunning, holdsUnreadResult, holdsUnsettledRunningClaim, settleEndedDaemonTurn } from './turnSettle';
 import { eventBus } from '../events/EventBus';
 import { starPromptSessions } from './starPromptSessions';
 import {
@@ -240,14 +241,6 @@ export class DaemonNotificationRouter {
    * row even when a transcript line was already on the wire.
    */
   private readonly hookActivityPanes = new Set<string>();
-  /**
-   * Panes whose byte-idle edge arrived while the daemon held their agent turn
-   * open (`activity.idle` with `agentMidTurn`), and no output since. That edge
-   * is the one way out of a byte `running`, and it was spent keeping the turn
-   * running; when the turn then ends with no further output, nothing else
-   * would settle the pane, so the turn's end does (see `onAgentTurn`).
-   */
-  private readonly quietMidTurn = new Set<string>();
   /** Rate limit for the vetoed-turn-end trace — see VETO_TRACE_THROTTLE_MS. */
   private vetoTraceThrottle = createLeadingEdgeThrottle(VETO_TRACE_THROTTLE_MS);
 
@@ -1236,7 +1229,7 @@ export class DaemonNotificationRouter {
     };
 
     const onActive = (payload: { sessionId: string; agentName?: string }) => {
-      this.quietMidTurn.delete(payload.sessionId);
+      noteByteActivity(payload.sessionId, false);
       try {
         // Daemon-mode twin of the PTYBridge.onActive gate: a pane whose bridge
         // reports turn starts has a better answer than this burst does, and an
@@ -1268,19 +1261,14 @@ export class DaemonNotificationRouter {
     };
 
     const onIdle = (payload: { sessionId: string; preTurn?: boolean; agentMidTurn?: boolean }) => {
+      noteByteActivity(payload.sessionId, true);
       // Byte silence cannot end a daemon-owned agent turn. Also repair a
       // missed start edge instead of relying on the activity freshness TTL.
       // The turn's own end settles the pane if no output follows (onAgentTurn).
       if (payload.agentMidTurn === true) {
-        this.quietMidTurn.add(payload.sessionId);
-        // A pane waiting on a human stays so (the daemon leaves those out too).
-        if (getLastBroadcastAgentStatus(payload.sessionId) === 'awaiting_input') return;
-        broadcastMetadataUpdate(this.getWindow(), {
-          ptyId: payload.sessionId, agentStatus: 'running', daemonTurnOpen: true,
-        });
+        broadcastTurnRunning(payload.sessionId, this.getWindow(), { daemonTurnOpen: true });
         return;
       }
-      this.quietMidTurn.delete(payload.sessionId);
       const now = Date.now();
       // The daemon's own word that no turn ran since the agent's SessionStart:
       // turn-end evidence for the bot workers' idle stops, whatever the dot does.
@@ -1492,7 +1480,6 @@ export class DaemonNotificationRouter {
     // sidebar dot when the user closed a terminal intentionally (Codex P2).
     const onSessionEnd = (payload: { sessionId: string }) => {
       this.hookActivityPanes.delete(payload.sessionId);
-      this.quietMidTurn.delete(payload.sessionId);
       try {
         broadcastMetadataUpdate(this.getWindow(), {
           ptyId: payload.sessionId,
@@ -1583,24 +1570,21 @@ export class DaemonNotificationRouter {
 
     // The daemon tracks submitted/hook-backed agent turns independently of
     // output rate. Codex can work quietly without a UserPromptSubmit hook.
-    // Running never replaces a pane waiting on a human (an approval or a
-    // question): the daemon withholds those, and this guards what is showing.
-    // An end clears only the latch the daemon opened (the renderer keeps a
-    // hook's), and settles a pane whose idle edge the turn spent: with no
-    // output after the end, no other idle comes.
-    const onAgentTurn = (payload: { sessionId: string; running: boolean }) => {
+    // Running goes through the one gate that never replaces a pane waiting
+    // on a human, except the edge the daemon sends with a dialog's answer
+    // (`afterAnswer`): the answer ended that wait, whether or not main has
+    // shown the answered status yet. An end clears only the latch the daemon
+    // opened (the renderer keeps a hook's) and settles a byte-idle pane, which
+    // gets no idle edge of its own; a hook-governed pane is the hook's to end.
+    const onAgentTurn = (payload: { sessionId: string; running: boolean; afterAnswer?: boolean }) => {
       const id = payload.sessionId;
       if (payload.running) {
-        if (getLastBroadcastAgentStatus(id) === 'awaiting_input') return;
-        broadcastMetadataUpdate(this.getWindow(), { ptyId: id, daemonTurnOpen: true, agentStatus: 'running' });
+        if (payload.afterAnswer) broadcastMetadataUpdate(this.getWindow(), { ptyId: id, daemonTurnOpen: true, agentStatus: 'running' });
+        else broadcastTurnRunning(id, this.getWindow(), { daemonTurnOpen: true });
         return;
       }
       broadcastMetadataUpdate(this.getWindow(), { ptyId: id, daemonTurnOpen: false });
-      // Only a pane still showing this turn's running: a result, a waiting
-      // prompt or a dialog that arrived with the end stands.
-      if (this.quietMidTurn.delete(id) && getLastBroadcastAgentStatus(id) === 'running') {
-        broadcastSettledIdle(id, this.getWindow(), this.now());
-      }
+      if (!this.getHookRouter?.()?.governsRunningState(id, this.now())) settleEndedDaemonTurn(id, this.getWindow(), this.now());
     };
 
     this.daemonClient.on('session:agentTurn', onAgentTurn);

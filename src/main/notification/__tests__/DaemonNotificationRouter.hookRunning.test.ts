@@ -64,7 +64,7 @@ const broadcastMetadataUpdateMock = metadataHandlerMocks.broadcastMetadataUpdate
 const PTY = 'daemon-worker-pane';
 
 interface Captured {
-  turn?: (payload: { sessionId: string; running: boolean }) => void;
+  turn?: (payload: { sessionId: string; running: boolean; afterAnswer?: boolean }) => void;
   idle?: (payload: { sessionId: string; preTurn?: boolean; agentMidTurn?: boolean }) => void;
   agent?: (payload: { sessionId: string; event: unknown }) => void;
   active?: (payload: { sessionId: string; agentName?: string }) => void;
@@ -185,6 +185,24 @@ describe('DaemonNotificationRouter — turn start lights the pane', () => {
     expect(broadcastMetadataUpdateMock).toHaveBeenLastCalledWith(null, { ptyId: PTY, agentStatus: 'idle', settled: true });
     router.stop();
     clearSuppression(PTY);
+  });
+
+  it('a daemon turn that started on a byte-idle pane and printed nothing settles at its end', () => {
+    const { router, captured } = makeRouter();
+    captured.idle?.({ sessionId: PTY }); // the pane went quiet before the turn
+    captured.turn?.({ sessionId: PTY, running: true });
+    captured.turn?.({ sessionId: PTY, running: false });
+    expect(broadcastMetadataUpdateMock).toHaveBeenLastCalledWith(null, { ptyId: PTY, agentStatus: 'idle', settled: true });
+    router.stop();
+    clearSuppression(PTY);
+  });
+
+  it('the turn edge that comes with a dialog\'s answer restores running even while main still shows the dialog', () => {
+    const { router, captured } = makeRouter();
+    metadataHandlerMocks.lastBroadcastAgentStatus.set(PTY, 'awaiting_input');
+    captured.turn?.({ sessionId: PTY, running: true, afterAnswer: true });
+    expect(broadcastMetadataUpdateMock).toHaveBeenLastCalledWith(null, { ptyId: PTY, daemonTurnOpen: true, agentStatus: 'running' });
+    router.stop();
   });
 
   it('a daemon turn whose pane is still printing at its end leaves the settle to the next idle edge', () => {
