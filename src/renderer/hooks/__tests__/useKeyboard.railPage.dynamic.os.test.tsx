@@ -8,6 +8,13 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import React from 'react';
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
+// The plugins whose rail page the rail lists (the plugin list is not read here).
+const railPages = vi.hoisted(() => ({ names: new Set(['office']) as ReadonlySet<string> }));
+vi.mock('../../plugins/usePlugins', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../plugins/usePlugins')>()),
+  listedRailPageNames: () => railPages.names,
+}));
+
 import { useKeyboard, WORKSPACES_ONLY_ACTIONS } from '../useKeyboard';
 import { useStore } from '../../stores';
 
@@ -61,6 +68,19 @@ describe('shortcuts on a rail page', () => {
     press(key);
     expect(useStore.getState().appRoute).toBe('plugin:office');
     act(() => useStore.getState().resetShortcut('plugin:office'));
+  });
+
+  it('the key of a plugin the rail no longer lists opens nothing', () => {
+    railPages.names = new Set();
+    try {
+      act(() => useStore.getState().setShortcutOverride('plugin:office', 'Ctrl+Alt+P'));
+      act(() => useStore.getState().setAppRoute('fleet'));
+      press({ ctrlKey: true, altKey: true, key: 'p', code: 'KeyP' });
+      expect(useStore.getState().appRoute).toBe('fleet');
+    } finally {
+      act(() => useStore.getState().resetShortcut('plugin:office'));
+      railPages.names = new Set(['office']);
+    }
   });
 
   it('pane and PTY shortcuts do nothing while Fleet covers the panes', () => {
