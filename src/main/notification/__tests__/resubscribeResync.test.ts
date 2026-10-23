@@ -91,6 +91,20 @@ describe('resyncAfterResubscribe (#2263)', () => {
     expect(router.governsRunningState('d1')).toBe(true);
   });
 
+  it('restores the renderer latch for an ongoing Codex even when main already shows running', async () => {
+    mocks.last.set('d1', 'running');
+    const { result } = run({ d1: { agentStatus: 'running', agentName: 'Codex', turnOpen: true, agentMidTurn: true } }, router);
+    await result;
+    expect(statuses()).toContainEqual({ ptyId: 'd1', agentStatus: 'running', daemonTurnOpen: true });
+  });
+
+  it('keeps an approval authoritative when restoring a daemon turn snapshot', async () => {
+    mocks.last.set('d1', 'awaiting_input');
+    const { result } = run({ d1: { agentStatus: 'awaiting_input', agentName: 'Codex', turnOpen: true, agentMidTurn: true } }, router);
+    await result;
+    expect(statuses().some((s) => s.agentStatus === 'running')).toBe(false);
+  });
+
   it('takes no latch for a turn open without hooks', async () => {
     mocks.last.set('d1', 'idle');
     const { result } = run({ d1: { agentStatus: 'running', agentName: 'Codex', turnOpen: true, hookReports: false } }, router);

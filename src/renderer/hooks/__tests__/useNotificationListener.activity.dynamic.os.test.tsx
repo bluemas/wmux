@@ -21,6 +21,8 @@ import { createRoot, type Root } from 'react-dom/client';
 import { useNotificationListener } from '../useNotificationListener';
 import { useStore } from '../../stores';
 import { createWorkspace, type MetadataUpdatePayload, type Surface } from '../../../shared/types';
+import { selectOfficeEmployees } from '../../stores/selectors/officeEmployees';
+import { selectWorkspaceAgentStatus } from '../../stores/selectors/fleet';
 import { selectWorkspaceAgentRoster } from '../../stores/selectors/workspaceAgentRoster';
 
 // React 19 logs a warning unless the test env flags act() support.
@@ -121,6 +123,26 @@ afterEach(() => {
 });
 
 describe('useNotificationListener — Fleet activity line (METADATA_UPDATE.activity)', () => {
+  it('keeps a quiet Codex working in Office and the workspace dot until its daemon turn ends', () => {
+    const ptyId = 'pty-codex-turn';
+    const wsId = seedActivePaneSurface(ptyId);
+    act(() => { metaCb!({ ptyId, agentName: 'Codex CLI', agentSlug: 'codex', agentStatus: 'running', daemonTurnOpen: true }); });
+    act(() => {
+      useStore.setState((s) => { s.agentClockMs = Date.now() + 60 * 60_000; });
+    });
+    expect(selectWorkspaceAgentStatus(useStore.getState(), wsId)).toBe('running');
+    expect(selectOfficeEmployees(useStore.getState(), Date.now()).find((e) => e.id === ptyId)?.state).toBe('working');
+    expect(useStore.getState().workspaces[0].metadata).not.toHaveProperty('daemonTurnOpen');
+
+    // A stopped turn withdraws the latch; its result remains authoritative.
+    act(() => { metaCb!({ ptyId, daemonTurnOpen: false }); });
+    act(() => { metaCb!({ ptyId, agentStatus: 'complete' }); });
+    expect(useStore.getState().surfaceTurnOpenAt[ptyId]).toBeUndefined();
+    expect(selectWorkspaceAgentStatus(useStore.getState(), wsId)).not.toBe('running');
+    expect(selectOfficeEmployees(useStore.getState(), Date.now()).find((e) => e.id === ptyId)?.state).not.toBe('working');
+    act(() => { useStore.setState((s) => { s.agentClockMs = Date.now(); }); });
+  });
+
   it('registers a METADATA_UPDATE handler at mount', () => {
     expect(metaCb).toBeTypeOf('function');
   });

@@ -322,7 +322,7 @@ export interface PaneSlice {
   // (markSurfaceTeammatesWorking). Fleet and the roster read it through
   // isTeammateRunning; it is never the activity stamp. Transient.
   surfaceTeammatesAt: Record<string, number>;
-  // The TURN LATCH: ptyId → epoch-ms of the hook-reported turn start
+  // The TURN LATCH: ptyId → epoch-ms of a daemon-owned or hook-reported turn start
   // (`UserPromptSubmit`, arriving as a METADATA_UPDATE tagged
   // hookKind:'agent.user_prompt_submit').
   //

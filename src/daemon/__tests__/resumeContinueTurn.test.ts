@@ -188,7 +188,7 @@ describe('turnRunningSince wiring', () => {
     const src = read('index.ts');
     const at = src.indexOf("sessionManager.on('session:agentTurn'");
     expect(at).toBeGreaterThan(-1);
-    const body = src.slice(at, at + 400);
+    const body = src.slice(at, src.indexOf('\n  });', at));
     expect(body).toMatch(/stateWriter\.saveAsap\(buildState\(sessionManager\)\)/);
     expect(body).not.toMatch(/saveDebounced/);
     expect(src).toMatch(/const AGENT_TURN_SAVE_DELAY_MS = 1_000;/);
