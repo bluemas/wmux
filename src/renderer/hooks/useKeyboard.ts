@@ -854,8 +854,9 @@ export function useKeyboard() {
         if (mentionClaim === 'noSource') {
           // Once per press: a held chord auto-repeats, and one toast is enough.
           if (!e.repeat) store.getState().pushToast({ message: t('mention.noSource'), level: 'info' });
-        } else if (!(action === 'closeSurface' && e.repeat)) {
+        } else if (!((action === 'closeSurface' || isPluginPageShortcut(action)) && e.repeat)) {
           // A held close-tab chord auto-repeats; only the first press asks.
+          // A held plugin page key would flip the page back and forth.
           run();
         }
         return;

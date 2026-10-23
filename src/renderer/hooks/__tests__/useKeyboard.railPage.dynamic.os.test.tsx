@@ -70,6 +70,17 @@ describe('shortcuts on a rail page', () => {
     act(() => useStore.getState().resetShortcut('plugin:office'));
   });
 
+  it('a held plugin page key opens the page once and does not flip it back', () => {
+    act(() => useStore.getState().setShortcutOverride('plugin:office', 'Ctrl+Alt+P'));
+    const key = { ctrlKey: true, altKey: true, key: 'p', code: 'KeyP' };
+    press(key);
+    press({ ...key, repeat: true });
+    expect(useStore.getState().appRoute).toBe('plugin:office');
+    press({ ...key, repeat: true });
+    expect(useStore.getState().appRoute).toBe('plugin:office');
+    act(() => useStore.getState().resetShortcut('plugin:office'));
+  });
+
   it('the key of a plugin the rail no longer lists opens nothing', () => {
     railPages.names = new Set();
     try {
