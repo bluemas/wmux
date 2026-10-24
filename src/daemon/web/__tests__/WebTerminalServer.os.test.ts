@@ -12,6 +12,7 @@ import { AnswerReceiptStore } from '../../approvals/AnswerReceiptStore';
 import { EventEmitter } from 'node:events';
 import { request as httpReq } from 'node:http';
 import { WebTerminalServer, SessionAuthorizationExpiredError, type WebDeviceResolver } from '../WebTerminalServer';
+import { AgentSignedOutError } from '../agentSignedOut';
 import { StreamResponseLimits } from '../StreamResponseLimits';
 import * as heartbeat from '../sseHeartbeat';
 import type { TranscriptProjector } from '../../transcript/TranscriptProjector';
@@ -193,7 +194,7 @@ function makeDeps() {
   // re-authorized before create is called, so the window this fake opens is
   // exactly the one the daemon's pre-spawn check has to cover.
   const lifecycleBox = {
-    createThrows: '', destroyThrows: '', createGoesMissing: false,
+    createThrows: '', destroyThrows: '', createGoesMissing: false, createError: null as Error | null,
     createGate: null as Promise<void> | null, gatePassed: false,
     authorizedAfterGate: null as boolean | null, spawned: false,
   };
@@ -206,6 +207,7 @@ function makeDeps() {
         lifecycleBox.authorizedAfterGate = lifecycleBox.gatePassed;
         throw new SessionAuthorizationExpiredError();
       }
+      if (lifecycleBox.createError) throw lifecycleBox.createError;
       lifecycleBox.spawned = true;
       if (lifecycleBox.createThrows) throw new Error(lifecycleBox.createThrows);
       created += 1;
@@ -488,7 +490,7 @@ describe('WebTerminalServer', () => {
   let emitApproval: (type: ApprovalEvent['type'], request: ApprovalRequest) => void;
   let approvalListeners: Set<(e: ApprovalEvent) => void>;
   let approvalBox: ReturnType<typeof makeApprovals>['approvalBox'];
-  let deviceRoster: Map<string, { secret: string; name?: string; revoked: boolean }>;
+  let deviceRoster: Map<string, { secret: string; name?: string; revoked: boolean; allowInput: boolean }>;
   let answerReceiptStore: AnswerReceiptStore;
   let reconcileCalls: number;
   let deviceMintCalls: Array<{ name?: string }>;
@@ -501,7 +503,7 @@ describe('WebTerminalServer', () => {
   let resizeCalls: Array<{ id: string; cols: number; rows: number }>;
   let resizeBox: ReturnType<typeof makeDeps>['resizeBox'];
   let lifecycleCalls: Array<{ op: 'create' | 'destroy'; arg: unknown }>;
-  let lifecycleBox: { createThrows: string; destroyThrows: string; createGoesMissing: boolean;
+  let lifecycleBox: { createThrows: string; destroyThrows: string; createGoesMissing: boolean; createError: Error | null;
     createGate: Promise<void> | null; gatePassed: boolean; authorizedAfterGate: boolean | null; spawned: boolean };
   let gitCalls: Array<{ args: readonly string[]; cwd: string }>;
   let gitScript: Record<string, { ok: boolean; stdout: string; stderr: string; ran?: boolean }>;
@@ -633,9 +635,9 @@ describe('WebTerminalServer', () => {
   // Port 0 → ephemeral bind; status() reports the actual port.
   const startRO = () => server.start({ port: 0, host: '127.0.0.1', allowInput: false, allowUpload: false });
   const startRW = () => server.start({ port: 0, host: '127.0.0.1', allowInput: true, allowUpload: false });
-  /** Uploads on, input OFF — the combination that proves the two grants are separate. */
+  /** Uploads on. An upload also takes the caller's input grant, so input is on too. */
   const startUpload = () =>
-    server.start({ port: 0, host: '127.0.0.1', allowInput: false, allowUpload: true });
+    server.start({ port: 0, host: '127.0.0.1', allowInput: true, allowUpload: true });
   /** #782 — transcript turn view armed (`--allow-transcript`); its own grant. */
   const startWithTranscript = () =>
     server.start({ port: 0, host: '127.0.0.1', allowInput: false, allowUpload: false, allowTranscript: true });
@@ -4271,6 +4273,117 @@ describe('WebTerminalServer', () => {
     expect(lifecycleCalls.at(-1)).toMatchObject({op:'create',arg:{agentLaunch:{agent:'claude',model:'opus',effort:'high'}}});
   });
 
+  describe('agentLaunch.mode: a phone launch mode on a new agent pane', () => {
+    const startModes = (over: { allowDangerousLaunch?: boolean; allowTranscript?: boolean } = {}) => server.start({
+      port: 0, host: '127.0.0.1', allowInput: true, allowUpload: false, allowTranscript: true, allowDangerousLaunch: true, ...over,
+    });
+    const post = (headers: Record<string, string>, body: unknown) =>
+      fetch(`${base()}/api/sessions`, { method: 'POST', headers, body: JSON.stringify(body) });
+    const flipOpts = (over: { allowDangerousLaunch?: boolean }) =>
+      Object.assign((server as unknown as { opts: Record<string, unknown> }).opts, over);
+
+    it('a dangerous mode without its confirm, or with another one, is 428 and spawns nothing', async () => {
+      const headers = bearer((await startModes()).token as string);
+      const before = lifecycleCalls.length;
+      for (const extra of [{}, { confirm: 'claude:yolo' }, { confirm: 'codex:bypass' }, { confirm: 'claude:default' }, { confirm: 'claude' }]) {
+        const res = await post(headers, { agentLaunch: { agent: 'claude', mode: 'bypass', ...extra } });
+        expect(res.status, JSON.stringify(extra)).toBe(428);
+        expect(await res.json()).toEqual({ error: 'dangerous-mode-unconfirmed', effect: 'none' });
+      }
+      expect(lifecycleCalls).toHaveLength(before);
+      expect(lifecycleBox.spawned).toBe(false);
+    });
+
+    it('with the ceiling off it is refused before the confirm is looked at', async () => {
+      let headers = bearer((await startModes({ allowDangerousLaunch: false })).token as string);
+      const before = lifecycleCalls.length;
+      for (const extra of [{}, { confirm: 'claude:bypass' }]) {
+        const res = await post(headers, { agentLaunch: { agent: 'claude', mode: 'bypass', ...extra } });
+        expect(res.status).toBe(403);
+        expect(await res.json()).toMatchObject({ error: expect.stringMatching(/^dangerous-launch-disabled: /), effect: 'none' });
+      }
+      await server.stop();
+      // The grants chat/launch needs: without the transcript grant a mode is refused too.
+      headers = bearer((await startModes({ allowTranscript: false })).token as string);
+      const res = await post(headers, { agentLaunch: { agent: 'claude', mode: 'bypass', confirm: 'claude:bypass' } });
+      expect(res.status).toBe(403);
+      expect((await res.json()).error).toMatch(/^transcript-disabled/);
+      expect(lifecycleCalls).toHaveLength(before);
+    });
+
+    it('a mode that is unknown or not valid for the agent is 400', async () => {
+      const headers = bearer((await startModes()).token as string);
+      const before = lifecycleCalls.length;
+      for (const agentLaunch of [
+        { agent: 'claude', mode: 'yolo', confirm: 'claude:yolo' },
+        { agent: 'codex', mode: 'bypass', confirm: 'codex:bypass' },
+        { agent: 'claude', mode: 'plan' },
+        { agent: 'claude', mode: null },
+        { agent: 'opencode', mode: 'bypass', confirm: 'opencode:bypass' },
+        { agent: 'claude', mode: 'bypass', confirm: 42 },
+      ]) {
+        const res = await post(headers, { agentLaunch });
+        expect(res.status, JSON.stringify(agentLaunch)).toBe(400);
+        expect(await res.json()).toMatchObject({ error: 'invalid-agent-launch', effect: 'none' });
+      }
+      expect(lifecycleCalls).toHaveLength(before);
+    });
+
+    it('no mode, or default, creates the pane exactly as before', async () => {
+      const headers = bearer((await startModes()).token as string);
+      let res = await post(headers, { agentLaunch: { agent: 'claude', model: 'opus' } });
+      expect(res.status).toBe(201);
+      expect(lifecycleCalls.at(-1)).toEqual({ op: 'create', arg: { agentLaunch: { agent: 'claude', model: 'opus' } } });
+      expect(await res.json()).not.toHaveProperty('launchMode');
+      // A confirm without a mode is ignored, as on chat/launch.
+      res = await post(headers, { agentLaunch: { agent: 'claude', mode: 'default', confirm: 'claude:bypass' } });
+      expect(res.status).toBe(201);
+      expect(lifecycleCalls.at(-1)).toEqual({ op: 'create', arg: { agentLaunch: { agent: 'claude' } } });
+      expect(await res.json()).toMatchObject({ launchMode: 'default' });
+    });
+
+    it('a confirmed mode reaches the spawn as dangerousLaunch, never inside agentLaunch', async () => {
+      const headers = bearer((await startModes()).token as string);
+      const res = await post(headers, { agentLaunch: { agent: 'claude', model: 'opus', mode: 'bypass', confirm: 'claude:bypass' } });
+      expect(res.status).toBe(201);
+      expect(await res.json()).toMatchObject({ launchMode: 'bypass' });
+      expect(lifecycleCalls.at(-1)).toEqual({ op: 'create', arg: {
+        agentLaunch: { agent: 'claude', model: 'opus' },
+        dangerousLaunch: { mode: 'bypass', owner: 'operator' },
+      } });
+    });
+
+    it('the ceiling is asked again at the spawn: off by then is 403 and no pane', async () => {
+      const headers = bearer((await startModes()).token as string);
+      let open!: () => void;
+      lifecycleBox.createGate = new Promise<void>((resolve) => { open = resolve; });
+      const pending = post(headers, { agentLaunch: { agent: 'claude', mode: 'bypass', confirm: 'claude:bypass' } });
+      await vi.waitFor(() => expect(lifecycleCalls.at(-1)?.op).toBe('create'), { timeout: 5_000 });
+      flipOpts({ allowDangerousLaunch: false });
+      open();
+      const res = await pending;
+      expect(res.status).toBe(403);
+      expect(await res.json()).toMatchObject({ error: expect.stringMatching(/^dangerous-launch-disabled: /), effect: 'none' });
+      expect(lifecycleBox.spawned).toBe(false);
+    });
+
+    it('/api/config advertises agentLaunchModes with the same ceiling as chat/launch', async () => {
+      const modes = async (over: { allowDangerousLaunch?: boolean; allowTranscript?: boolean }) => {
+        const info = await startModes(over);
+        const body = await (await fetch(`${base()}/api/config`, { headers: bearer(info.token as string) })).json();
+        await server.stop();
+        return body.agentLaunchModes;
+      };
+      expect(await modes({})).toEqual({ claude: ['default', 'bypass'], codex: ['default', 'yolo'] });
+      expect(await modes({ allowDangerousLaunch: false })).toEqual({ claude: ['default'], codex: ['default'] });
+      expect(await modes({ allowTranscript: false })).toEqual({ claude: ['default'], codex: ['default'] });
+      const ro = await startRO();
+      const body = await (await fetch(`${base()}/api/config`, { headers: bearer(ro.token as string) })).json();
+      expect(body.agentLaunch).toBe(false);
+      expect(body).not.toHaveProperty('agentLaunchModes');
+    });
+  });
+
   describe('per-pane account and handoff lineage (contract v-next item 4)', () => {
     /** A desktop that answers `accounts.envForAccount` from `accounts`; `announce` is what it registered with. */
     const accountDesktop = (announce: string[] | undefined, accounts: Record<string, unknown>, calls: unknown[] = []) => {
@@ -4293,6 +4406,18 @@ describe('WebTerminalServer', () => {
     const second = {ok:true,vendor:'codex',env:{CODEX_HOME:'/acct/second'}};
     const startBoth = () => server.start({port:0,host:'127.0.0.1',allowInput:true,allowTranscript:true,allowUpload:false});
     const post = (headers: Record<string,string>, body: unknown) => fetch(`${base()}/api/sessions`,{method:'POST',headers,body:JSON.stringify(body)});
+
+    it('a launch mode is refused before the account is looked up', async () => {
+      const calls = accountDesktop(['accounts.envForAccount'],{c2:second});
+      const info = await server.start({port:0,host:'127.0.0.1',allowInput:true,allowTranscript:true,allowUpload:false,allowDangerousLaunch:true});
+      const headers = bearer(info.token as string);
+      const before = lifecycleCalls.length;
+      const refused = await post(headers,{workspaceId:'ws-1',accountId:'c2',agentLaunch:{agent:'codex',mode:'yolo'}});
+      expect(refused.status).toBe(428);
+      expect(await refused.json()).toEqual({error:'dangerous-mode-unconfirmed',effect:'none'});
+      expect(calls).toEqual([]);
+      expect(lifecycleCalls).toHaveLength(before);
+    });
 
     it('an old desktop (command unknown) refuses the create and never spawns on the workspace env', async () => {
       accountDesktop(undefined,{c2:second});
@@ -6529,6 +6654,15 @@ describe('WebTerminalServer', () => {
     });
   });
 
+  it('409s agent-signed-out with the agent and no pane when its account is signed out', async () => {
+    const info = await startRW();
+    lifecycleBox.createError = new AgentSignedOutError('codex');
+    const res = await postSession(info.token as string, {});
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ error: 'agent-signed-out', agent: 'codex', effect: 'none' });
+    expect(lifecycleBox.spawned).toBe(false);
+  });
+
   it('500s rather than faking a row when the created session is not live', async () => {
     const info = await startRW();
     lifecycleBox.createGoesMissing = true;
@@ -6709,6 +6843,71 @@ describe('WebTerminalServer', () => {
     expect(fs.readdirSync(uploadsDir)).toEqual([]);
   });
 
+  it('refuses an upload from a device paired read-only before writing or counting anything', async () => {
+    await startUpload();
+    const viewer = await pairDevice('Wall display', false);
+    // More refusals than there are upload slots: a refusal that took a slot
+    // and never gave it back would leave the operator's upload below a 429.
+    for (let i = 0; i < 5; i++) {
+      const res = await upload(viewer.token, jpegBytes());
+      expect(res.status).toBe(403);
+      expect((await res.json() as { error: string }).error).toBe(
+        'read-only: this device was paired without permission to type',
+      );
+      const file = await fetch(`${base()}/api/upload-file`, {
+        method: 'POST', headers: { ...bearer(viewer.token), 'X-Wmux-File-Extension': 'txt' }, body: 'x',
+      });
+      expect(file.status).toBe(403);
+      expect((await file.json() as { error: string }).error).toMatch(/^read-only: /);
+    }
+    expect(fs.readdirSync(uploadsDir)).toEqual([]);
+    const typer = await pairDevice('iPhone', true);
+    expect((await upload(typer.token, jpegBytes())).status).toBe(201);
+    expect(fs.readdirSync(uploadsDir)).toHaveLength(1);
+  });
+
+  it('refuses an upload whose input grant is withdrawn while the body is arriving', async () => {
+    const info = await startUpload();
+    const typer = await pairDevice('iPhone', true);
+    const bytes = jpegBytes();
+    const inFlight = () => (server as unknown as { inFlightUploads: number }).inFlightUploads;
+    const held = httpReq({
+      host: '127.0.0.1', port: info.port as number, path: '/api/upload', method: 'POST',
+      headers: { Authorization: `Bearer ${typer.token}`, 'Content-Length': String(bytes.length) },
+    });
+    const reply = new Promise<{ status: number; body: string }>((resolve, reject) => {
+      held.on('response', (r) => {
+        let body = '';
+        r.on('data', (c: Buffer) => { body += c.toString('utf8'); });
+        r.on('end', () => resolve({ status: r.statusCode ?? 0, body }));
+      });
+      held.on('error', reject);
+    });
+    held.write(bytes.subarray(0, 4));
+    // Past the entry checks: the handler holds an upload slot.
+    await vi.waitFor(() => expect(inFlight()).toBe(1), { timeout: 5_000 });
+    deviceRoster.get(typer.deviceId)!.allowInput = false;
+    held.end(bytes.subarray(4));
+    const { status, body } = await reply;
+    expect(status).toBe(403);
+    expect(JSON.parse(body)).toMatchObject({
+      error: 'read-only: this device was paired without permission to type',
+      detail: expect.stringContaining('Input permission changed'),
+    });
+    expect(fs.readdirSync(uploadsDir)).toEqual([]);
+    expect(inFlight()).toBe(0);
+  });
+
+  it('reports allowUpload on /api/config per caller, false for a device paired read-only', async () => {
+    await startUpload();
+    const viewer = await pairDevice('Wall display', false);
+    const typer = await pairDevice('iPhone', true);
+    const read = async (token: string) =>
+      (await fetch(`${base()}/api/config`, { headers: bearer(token) })).json();
+    expect(await read(viewer.token)).toMatchObject({ allowInput: false, allowUpload: false, generalFileUpload: false });
+    expect(await read(typer.token)).toMatchObject({ allowInput: true, allowUpload: true, generalFileUpload: true });
+  });
+
   it('413s a body over the 10 MB cap and writes nothing', async () => {
     const info = await startUpload();
     const oversized = Buffer.concat([jpegBytes(), Buffer.alloc(10 * 1024 * 1024)]);
@@ -6780,7 +6979,7 @@ describe('WebTerminalServer', () => {
       uploadsDir,
       now: () => clock,
     });
-    const info = await swept.start({ port: 0, host: '127.0.0.1', allowInput: false, allowUpload: true });
+    const info = await swept.start({ port: 0, host: '127.0.0.1', allowInput: true, allowUpload: true });
     try {
       const token = info.token as string;
       const url = `http://127.0.0.1:${info.port}/api/upload`;
@@ -6807,7 +7006,7 @@ describe('WebTerminalServer', () => {
   it('reports allowUpload on /api/config so the phone can hide the button', async () => {
     const info = await startUpload();
     const res = await fetch(`${base()}/api/config`, { headers: bearer(info.token as string) });
-    expect(await res.json()).toMatchObject({ allowInput: false, allowUpload: true, generalFileUpload: true });
+    expect(await res.json()).toMatchObject({ allowInput: true, allowUpload: true, generalFileUpload: true });
     // status() carries it too — that is what `wmux web --status` prints.
     expect(server.status().allowUpload).toBe(true);
   });
@@ -6818,7 +7017,7 @@ describe('WebTerminalServer', () => {
       sessionManager, log: () => { /* noop */ }, assetsDir: os.tmpdir(), uploadsDir,
       now: () => clock, uploadLimits: {maxFiles: 1},
     });
-    const info = await bounded.start({port:0,host:'127.0.0.1',allowInput:false,allowUpload:true});
+    const info = await bounded.start({port:0,host:'127.0.0.1',allowInput:true,allowUpload:true});
     const post = (endpoint: string, body: Buffer) => fetch(`http://127.0.0.1:${info.port}${endpoint}`, {
       method:'POST',headers:{...bearer(info.token as string),'X-Wmux-File-Extension':'txt'},body: new Uint8Array(body),
     });
@@ -6849,7 +7048,7 @@ describe('WebTerminalServer', () => {
       log: () => { /* silent */ },
       assetsDir: os.tmpdir(),
     });
-    const info = await bare.start({ port: 0, host: '127.0.0.1', allowInput: false, allowUpload: true });
+    const info = await bare.start({ port: 0, host: '127.0.0.1', allowInput: true, allowUpload: true });
     try {
       const res = await fetch(`http://127.0.0.1:${info.port}/api/upload`, {
         method: 'POST',
@@ -6880,7 +7079,7 @@ describe('WebTerminalServer', () => {
       uploadsDir,
       uploadLimits: { maxFiles: 2 },
     });
-    const info = await quota.start({ port: 0, host: '127.0.0.1', allowInput: false, allowUpload: true });
+    const info = await quota.start({ port: 0, host: '127.0.0.1', allowInput: true, allowUpload: true });
     try {
       const url = `http://127.0.0.1:${info.port}/api/upload`;
       const post = () =>
@@ -6915,7 +7114,7 @@ describe('WebTerminalServer', () => {
     // ours to count against a limit either.
     fs.writeFileSync(path.join(uploadsDir, 'photo-vacation.jpg'), 'operator file');
     fs.writeFileSync(path.join(uploadsDir, 'notes.txt'), 'operator file');
-    const info = await quota.start({ port: 0, host: '127.0.0.1', allowInput: false, allowUpload: true });
+    const info = await quota.start({ port: 0, host: '127.0.0.1', allowInput: true, allowUpload: true });
     try {
       const res = await fetch(`http://127.0.0.1:${info.port}/api/upload`, {
         method: 'POST',
@@ -6939,7 +7138,7 @@ describe('WebTerminalServer', () => {
       uploadsDir,
       uploadLimits: { maxConcurrent: 1 },
     });
-    const info = await busy.start({ port: 0, host: '127.0.0.1', allowInput: false, allowUpload: true });
+    const info = await busy.start({ port: 0, host: '127.0.0.1', allowInput: true, allowUpload: true });
     const token = info.token as string;
     const port = info.port as number;
     try {
@@ -6988,7 +7187,7 @@ describe('WebTerminalServer', () => {
       uploadsDir,
       now: () => clock,
     });
-    const info = await swept.start({ port: 0, host: '127.0.0.1', allowInput: false, allowUpload: true });
+    const info = await swept.start({ port: 0, host: '127.0.0.1', allowInput: true, allowUpload: true });
     try {
       // Ours, and expired: the exact shape handleUpload writes.
       const mine = path.join(uploadsDir, generatedName(clock, '0123abcd'));

@@ -421,6 +421,14 @@ export default function SurfaceTabs({
   usageLimitCompact = false,
 }: SurfaceTabsProps) {
   const t = useT();
+  // "Continue in another agent": a held tab and the tab its work went on in
+  // each name the other on a tooltip line of its own.
+  const continuedNote = (s: Surface): string => ([['surface.continuedIn', s.continuedIn], ['surface.continuedFrom', s.continuedFrom]] as const)
+    .map(([key, id]) => {
+      const peer = id ? surfaces.find((p) => p.id === id) : undefined;
+      return peer ? `\n${t(key, { name: peer.title || t('surface.terminal') })}` : '';
+    })
+    .join('');
   // Same 200ms threshold pattern WorkspaceItem uses so a fast click never
   // gets eaten by a click-after-dragend race.
   const dragStartTimeRef = useRef<number>(0);
@@ -1122,9 +1130,9 @@ export default function SurfaceTabs({
           title={editingId === s.id ? undefined : (
             // Protection covers the pane's own Chrome; an in-app browser tab
             // beside it is not behind the pane's site policy.
-            browserPolicy.summary && s.surfaceType === 'browser'
+            (browserPolicy.summary && s.surfaceType === 'browser'
               ? `${surfaceTabTooltip(s, t)}\n${t('pane.browserPolicyInAppNotCovered')}`
-              : surfaceTabTooltip(s, t)
+              : surfaceTabTooltip(s, t)) + continuedNote(s)
           )}
         >
           <SurfaceTabStatusDot ptyId={s.ptyId} active={s.id === activeSurfaceId} />
@@ -1212,7 +1220,7 @@ export default function SurfaceTabs({
       {(() => {
         const surface = surfaces.find((s) => s.id === activeSurfaceId);
         if (!chatViewEnabled || readOnly || !surface || (surface.surfaceType && surface.surfaceType !== 'terminal')) return null;
-        return <div className="wmux-chat-toggle" role="group" aria-label={t('chat.viewMode')}>
+        return <div className="wmux-chat-toggle" role="group" aria-label={t('chat.viewMode')} title={t('chat.viewMode')}>
           {(['terminal', 'chat'] as const).map((view) => <button key={view} type="button"
             className={FOCUS_RING} data-surface-view={view}
             aria-pressed={(surface.viewMode ?? 'terminal') === view}

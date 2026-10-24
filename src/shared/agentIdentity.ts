@@ -153,11 +153,17 @@ export interface AgentSetupSpec {
    * code (0 / 1). `exit-code`: 0 is signed in, 1 with `signedOutText` in the
    * output is signed out. `none`: the vendor documents no such subcommand
    * (the agent signs in on its own first run and keeps the result in its own
-   * store), so wmux does not check it; the card says so.
+   * store), so wmux does not check it; the card says so. `accountEnv` names the
+   * variable that points the agent (and its status command) at one account's
+   * folder; an agent with both is one whose lost sign-in wmux reports per
+   * account (shared/agentAuthLost). `unseenCredentials` are ways the agent
+   * runs that its status command does not report (an API key in the
+   * environment, another model provider in its config): while one is present a
+   * "signed out" answer is read as "cannot tell".
    */
   readonly loginStatus:
-    | { readonly args: readonly string[]; readonly read: 'json-logged-in' }
-    | { readonly args: readonly string[]; readonly read: 'exit-code'; readonly signedOutText: string }
+    | { readonly args: readonly string[]; readonly read: 'json-logged-in'; readonly accountEnv?: 'CLAUDE_CONFIG_DIR' | 'CODEX_HOME'; readonly unseenCredentials?: UnseenCredentials }
+    | { readonly args: readonly string[]; readonly read: 'exit-code'; readonly signedOutText: string; readonly accountEnv?: 'CLAUDE_CONFIG_DIR' | 'CODEX_HOME'; readonly unseenCredentials?: UnseenCredentials }
     | { readonly read: 'none' };
   /** Below this version the card says "update recommended" (never forced). */
   readonly updateFloor: string;
@@ -248,6 +254,9 @@ export interface AgentIdentityRow {
   /** A double ESC at rest, with an empty composer, opens the agent's own
    *  Rewind picker (src/daemon/transcript/openClaudeRewind.ts). */
   readonly rewindPicker?: true;
+  /** Its TUI conversation can continue in chat v2: the TUI is stopped and the
+   *  chat driver resumes the same session id (src/daemon/chat/v2/fromTerminal.ts). */
+  readonly continueInChat?: true;
   /** Listed in Settings -> Token usage (activeProviders). */
   readonly tokenUsage?: true;
   /** Has a model discovery source (modelCatalog). */
@@ -257,6 +266,11 @@ export interface AgentIdentityRow {
    *  (agentTitleRules RUNNING_TITLE; DaemonPTYBridge noteCodexTitleSpinner).
    *  Claude's spinner has its own path in the bridge, so it is not listed. */
   readonly titleRunning?: true;
+  /** #2673 — a pane whose hooks do not report reads its turns off the agent's
+   *  window title: the running title (`◐`/`◑`) holds for the whole turn and
+   *  the idle one (`✳`) follows its end (DaemonPTYBridge noteClaudeTitle and
+   *  its idle edge). */
+  readonly titleTurns?: true;
   /** First-run "Agent ready" card; see {@link AgentSetupSpec}. */
   readonly setup?: AgentSetupSpec;
   /** Drawn in the Office page with its own character looks; an agent without
@@ -299,8 +313,10 @@ export const AGENT_IDENTITIES = [
     accounts: 'account-store',
     continueOnAccount: true,
     rewindPicker: true,
+    continueInChat: true,
     tokenUsage: true,
     modelCatalog: true,
+    titleTurns: true,
     setup: {
       binary: 'claude',
       // Native installer: https://code.claude.com/docs/en/setup (~/.local/bin).
@@ -308,7 +324,7 @@ export const AGENT_IDENTITIES = [
       npm: { package: ['@anthropic-ai', 'claude-code'], winEntries: [['bin', 'claude.exe'], ['cli.js']] },
       // `claude auth status --help`: "--json  Output as JSON (default)".
       // Measured on 2.1.305: exit 0 + "loggedIn": true / exit 1 + false.
-      loginStatus: { args: ['auth', 'status', '--json'], read: 'json-logged-in' },
+      loginStatus: { args: ['auth', 'status', '--json'], read: 'json-logged-in', accountEnv: 'CLAUDE_CONFIG_DIR' },
       // The interrupt / Stop hook findings the hook bridge is built on
       // (src/shared/hooks/interruptKeystroke.ts, HookSignalRouter.ts).
       updateFloor: '2.1.236',
@@ -360,7 +376,13 @@ export const AGENT_IDENTITIES = [
       npm: { package: ['@openai', 'codex'], winEntries: [['bin', 'codex.js']], besideShim: true },
       // `codex login --help`: "status  Show login status". Measured on
       // codex-cli 0.163.0: exit 0 signed in, exit 1 + "Not logged in".
-      loginStatus: { args: ['login', 'status'], read: 'exit-code', signedOutText: 'not logged in' },
+      // `codex login status` says "Not logged in" (exit 1) with only an API key
+      // in the environment or another model_provider configured (checked on
+      // codex-cli 0.142.5, 2026-10-24), and Codex runs with either.
+      loginStatus: {
+        args: ['login', 'status'], read: 'exit-code', signedOutText: 'not logged in', accountEnv: 'CODEX_HOME',
+        unseenCredentials: { env: ['OPENAI_API_KEY', 'CODEX_API_KEY'], configKey: { dir: '.codex', file: 'config.toml', key: 'model_provider', ownValue: 'openai', profile: { key: 'profile', table: 'profiles' } } },
+      },
       // One background server per account, which pane identity relies on
       // (src/mcp/codexThreadIdentity.ts).
       updateFloor: '0.157.0',
@@ -624,6 +646,22 @@ export const AGENT_IDENTITIES = [
 
 /** SLUG-form agent identifier. Derived, so it can never drift from the table. */
 export type AgentSlug = (typeof AGENT_IDENTITIES)[number]['slug'];
+
+/**
+ * See `loginStatus.unseenCredentials`. `configKey.dir` is the account folder's
+ * default under the home folder; `ownValue` is the value that still means the
+ * agent's own sign-in (Codex's default provider), so it is not another
+ * credential. `profile` names the top-level key that selects a profile and the
+ * table the profiles live in: the selected profile's value wins over the
+ * top-level one, and a profile nobody selected does not count.
+ */
+export interface UnseenCredentials {
+  readonly env: readonly string[];
+  readonly configKey?: {
+    readonly dir: string; readonly file: string; readonly key: string; readonly ownValue: string;
+    readonly profile?: { readonly key: string; readonly table: string };
+  };
+}
 
 /** Human-facing agent name. */
 export type AgentDisplayName = (typeof AGENT_IDENTITIES)[number]['display'];

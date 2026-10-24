@@ -8,8 +8,12 @@ import { S } from './strings';
 import { TranscriptRowView, type TranscriptActions } from './Transcript';
 import { useChatV2 } from './useChatV2';
 import { getChatV2Bridge } from './bridge';
+import { ChatKindBadge } from '../Chat/ChatKindBadge';
+import { ContinueInChat, usePaneMove } from './ContinueInChat';
 
 const NEAR_BOTTOM_PX = 48;
+
+const kindRow = <div className="wmux-chatv2-kind"><ChatKindBadge kind="chatOnly" /></div>;
 
 /**
  * Keys of rows appended after the transcript first loaded, so only those fade
@@ -74,6 +78,7 @@ export default function ChatV2View({ paneId, active, onTerminal, cwd }: {
   const [newModel, setNewModel] = useState('');
   const [newMode, setNewMode] = useState<ChatV2RunMode>('default');
   const [handingOff, setHandingOff] = useState(false);
+  const moveError = usePaneMove(paneId).error;
   // Bumped to remount the composer when a draft moved under it.
   const [draftRev, setDraftRev] = useState(0);
   const scroller = useRef<HTMLDivElement>(null);
@@ -120,11 +125,12 @@ export default function ChatV2View({ paneId, active, onTerminal, cwd }: {
   const closeFind = useCallback(() => { setFindOpen(false); setFindId(null); }, []);
 
   if (state.phase === 'loading') {
-    return <div className="wmux-chatv2" data-chatv2="loading"><div className="wmux-chatv2-state" role="status">{t('chat.loading')}</div></div>;
+    return <div className="wmux-chatv2" data-chatv2="loading">{kindRow}<div className="wmux-chatv2-state" role="status">{t('chat.loading')}</div></div>;
   }
   if (state.phase === 'unavailable' || !controller) {
     return (
       <div className="wmux-chatv2" data-chatv2="unavailable">
+        {kindRow}
         <div className="wmux-chatv2-state" role="alert">
           <p>{state.error?.message ?? S.unavailable}</p>
           <div className="wmux-chatv2-card-actions">
@@ -136,11 +142,16 @@ export default function ChatV2View({ paneId, active, onTerminal, cwd }: {
     );
   }
 
-  const error = state.error ? <div className="wmux-chatv2-notice" data-tone="error" role="alert">{state.error.message}</div> : null;
+  // A failed move into chat matters until the pane has a chat again.
+  const showMoveError = !!moveError && (!view || view.binding.status === 'handed-off');
+  const error = state.error || showMoveError
+    ? <div className="wmux-chatv2-notice" data-tone="error" role="alert">{state.error?.message ?? moveError}</div>
+    : null;
 
   if (state.phase === 'empty' || !view) {
     return (
       <div className="wmux-chatv2" data-chatv2="empty">
+        {kindRow}
         <div className="wmux-chatv2-viewport">
           <div className="wmux-chatv2-column wmux-chatv2-empty">
             <strong>{S.newChat}</strong>
@@ -186,6 +197,7 @@ export default function ChatV2View({ paneId, active, onTerminal, cwd }: {
 
   return (
     <div className="wmux-chatv2" data-chatv2="ready" data-status={binding.status} onKeyDown={onKeyDown}>
+      {kindRow}
       {findOpen && <FindBar blocks={view.session.blocks} onNavigate={setFindId} onClose={closeFind} />}
       <div className="wmux-chatv2-viewport" ref={scroller} onScroll={onScroll}>
         <div className="wmux-chatv2-column" role="log" aria-label={t('chat.conversation')}>
@@ -211,6 +223,8 @@ export default function ChatV2View({ paneId, active, onTerminal, cwd }: {
           <div className="wmux-chatv2-notice wmux-chatv2-handed-off">
             <span>{S.handedOff}</span>
             <button type="button" className="wmux-chatv2-link" onClick={onTerminal}>{t('chat.openTerminal')}</button>
+            {/* Shown only while no agent runs in the pane (viewState); the daemon checks again. */}
+            <ContinueInChat paneId={paneId} tombstone className="wmux-chatv2-link" />
             <button type="button" className="wmux-chatv2-btn" title={S.startNewChatHint} onClick={() => void controller.close()}>{S.startNewChat}</button>
           </div>
         ) : (

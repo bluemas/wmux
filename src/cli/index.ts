@@ -6,6 +6,8 @@ process.on('SIGINT', () => {
 
 // Must stay the first import: turns off working-directory executable lookup (Windows) before any module runs.
 import '../shared/exeSearchGuard';
+// Next, before any module can print or hold process.stdout/stderr: on Windows wmux.exe's console output is otherwise garbled or lost.
+import './consoleStdioPrelude';
 import { hasFlag } from './utils';
 import { handleWorkspace } from './commands/workspace';
 import { handleSurface } from './commands/surface';
@@ -120,9 +122,10 @@ WEB ACCESS (browser / PWA)
                                     paired phone (thinking, tool inputs, and
                                     contents of files the agent read). Off by
                                     default
-        [--allow-dangerous-launch]  Let a phone start Claude/Codex from chat
-                                    with approvals off (bypass/yolo), after
-                                    per-launch confirmation. Off by default
+        [--allow-dangerous-launch]  Let a phone start Claude/Codex (chat or a
+                                    new agent pane) with approvals off
+                                    (bypass/yolo), after per-launch
+                                    confirmation. Off by default
         [--allow-git-write]         Let a phone with an explicit input grant
                                     push, open PRs and squash-merge, after a
                                     preview and confirmation. Off by default
