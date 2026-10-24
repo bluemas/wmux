@@ -338,6 +338,21 @@ describe('SampleTaskBlock (renderToStaticMarkup)', () => {
     );
     expect(html).toContain('first-run-wizard-sample-success');
   });
+
+  it('a failed sample task shows its own message, not the MCP step\'s', () => {
+    const html = renderToStaticMarkup(
+      createElement(SampleTaskBlock, {
+        uiState: 'ready',
+        sampleState: 'error',
+        completedAt: undefined,
+        onTry: noop,
+        onFallbackContinue: noop,
+      }),
+    );
+    expect(html).toContain('first-run-wizard-sample-error');
+    expect(html).toContain('The sample task could not start in the terminal.');
+    expect(html).not.toContain('Registration failed.');
+  });
 });
 
 // ─── electronAPI.firstRun integration shape ───────────────────────────────────
@@ -498,6 +513,18 @@ describe('decidePrimaryAction', () => {
     expect(decidePrimaryAction({ ...base, uiState: 'reopen', mcpRegistered: false })).toBe('register');
     // With nothing to set up, reopen has no primary (the sample task is disabled).
     expect(decidePrimaryAction({ ...base, uiState: 'reopen' })).toBeNull();
+  });
+
+  it('the first task: Send after setup and before the sample task, nothing while it runs, then Open', () => {
+    expect(decidePrimaryAction({ ...base, firstTask: 'send' })).toBe('send');
+    // Setup that unblocks first keeps the emphasis.
+    expect(decidePrimaryAction({ ...base, hooksState: 'offer', firstTask: 'send' })).toBe('hooks');
+    expect(decidePrimaryAction({ ...base, mcpRegistered: false, firstTask: 'send' })).toBe('register');
+    expect(decidePrimaryAction({ ...base, agentAction: true, firstTask: 'send' })).toBe('agent');
+    // The consent screen and the wait are in flight: Try does not take over.
+    expect(decidePrimaryAction({ ...base, firstTask: 'busy' })).toBeNull();
+    expect(decidePrimaryAction({ ...base, firstTask: 'open' })).toBe('open');
+    expect(decidePrimaryAction({ ...base, firstTask: 'none' })).toBe('try');
   });
 
   it('has no primary when Claude is missing', () => {

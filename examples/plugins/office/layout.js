@@ -100,9 +100,9 @@
 
   /**
    * Every workspace's employees in one office (`agent-state` with
-   * `allWorkspaces`), in the host's (sidebar) order. Each also carries its
-   * workspace's name; where two would read the same, that name is added
-   * first, then the agent's, then a number.
+   * `allWorkspaces`), in the host's (sidebar) order. Each is named by its
+   * workspace; where two would read the same (one workspace, several agents),
+   * the pane's label is added first, then the agent's, then a number.
    */
   function employeesFromAll(all) {
     const out = [];
@@ -112,7 +112,8 @@
       seen.add(ws.workspaceId);
       out.push(...collectEmployees(ws, typeof ws.name === 'string' && ws.name ? ws.name : ws.workspaceId));
     }
-    distinguish(out, [(e) => `${e.label} · ${e.workspace}`, (e) => `${e.label} · ${e.agent}`, (e, k) => `${e.label} · ${k}`]);
+    for (const e of out) e.label = e.workspace;
+    distinguish(out, [(e) => `${e.label} · ${e.pane}`, (e) => `${e.label} · ${e.agent}`, (e, k) => `${e.label} · ${k}`]);
     return out;
   }
 
@@ -126,9 +127,12 @@
           id: surface.surfaceId,
           paneId: pane.paneId,
           label: String(pane.label || surface.agentName),
+          pane: String(pane.label || surface.agentName),
           agent: String(surface.agentName),
           ...(workspace === undefined ? {} : { workspace }),
           state: pane.state,
+          // The pane's activity line (terminal.read): what it is doing now.
+          ...(typeof pane.activity === 'string' && pane.activity ? { activity: pane.activity } : {}),
           stashed: pane.stashed === true,
           look: hashLook(surface.surfaceId),
         });

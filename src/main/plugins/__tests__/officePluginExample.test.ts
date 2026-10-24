@@ -55,7 +55,7 @@ describe('office example bundle', () => {
 
     expect(loader.listFailures()).toEqual([]);
     const manifest = loader.get('office')?.manifest;
-    expect(manifest?.capabilities).toEqual(['ui.rail-page', 'agent.state.read', 'agent.state.read.all', 'pane.read']);
+    expect(manifest?.capabilities).toEqual(['ui.rail-page', 'agent.state.read', 'agent.state.read.all', 'pane.read', 'terminal.read']);
     expect(manifest?.contributes.railPage).toEqual({ title: 'Office', entry: 'index.html', agentStateEvents: true });
 
     const html = fs.readFileSync(path.join(BUNDLE, 'index.html'), 'utf8');
@@ -176,13 +176,16 @@ describe('office, every workspace in one room', () => {
     ]);
   });
 
-  it('tells colliding labels apart by workspace first, then agent, then number', () => {
+  it('names employees by workspace, telling colliding ones apart by pane, then agent, then number', () => {
     const same = (id: string, ws: string, label: string) => ({ workspaceId: id, name: ws, truncated: false, panes: [agent(`p-${id}`, `s-${id}`, 'working', label)] });
     const labels = office.employeesFromAll({ workspaces: [same('a', 'alpha', 'build'), same('b', 'beta', 'build'), same('c', 'gamma', 'tests')] }).map((e) => e.label);
-    expect(labels).toEqual(['build · alpha', 'build · beta', 'tests']);
-    const twin = { workspaceId: 'd', name: 'alpha', truncated: false, panes: [agent('p-d', 's-d', 'working', 'build')] };
-    const twins = office.employeesFromAll({ workspaces: [same('a', 'alpha', 'build'), twin] }).map((e) => e.label);
-    expect(twins).toEqual(['build · alpha · Codex · 1', 'build · alpha · Codex · 2']);
+    expect(labels).toEqual(['alpha', 'beta', 'gamma']);
+    const twin = { workspaceId: 'd', name: 'alpha', truncated: false, panes: [agent('p-d', 's-d', 'working', 'tests')] };
+    expect(office.employeesFromAll({ workspaces: [same('a', 'alpha', 'build'), twin] }).map((e) => e.label))
+      .toEqual(['alpha · build', 'alpha · tests']);
+    const sameLabel = { ...twin, panes: [agent('p-d', 's-d', 'working', 'build')] };
+    expect(office.employeesFromAll({ workspaces: [same('a', 'alpha', 'build'), sameLabel] }).map((e) => e.label))
+      .toEqual(['alpha · build · Codex · 1', 'alpha · build · Codex · 2']);
   });
 
   it('skips malformed and repeated workspaces instead of seating them twice', () => {

@@ -14,10 +14,12 @@ What the snapshot drives:
 - The whole room is in view without scrolling: it is scaled to the page and
   shrinks as rows of desks are added. Names and bubbles shrink with it down to
   80% of their size, no further.
-- One employee per pane surface that runs an agent. Its name tag is the pane's
-  `label`; where two would read the same, the workspace's name is added, then
-  the agent's (hover or focus an employee to see both).
-- `working`: at its own desk, typing.
+- One employee per pane surface that runs an agent. Its name tag is its
+  workspace's name; where two would read the same, the pane's `label` is
+  added, then the agent's (hover or focus an employee to see both). With only
+  the shown workspace in the room, the name tag is the pane's `label`.
+- `working`: at its own desk, typing, with what it is doing (its activity
+  line) in a speech bubble over its head.
 - `needsYou`: walks to the queue in front of the boss desk and raises a hand,
   under a red "! Needs you" bubble.
 - `finished`: joins the same queue, behind everyone who needs you, under a
@@ -45,7 +47,7 @@ catalog. Manually installed copies can be disabled in Settings > Plugins;
 their folders are not deleted there.
 
 This requires a host implementing `ui.rail-page`, `agent.state.read` and
-`agent.state.read.all`. Older hosts reject the manifest's unknown
+`agent.state.read.all`, with activity on `agent.state.all`. Older hosts reject the manifest's unknown
 capabilities.
 
 If the host sends only the workspace it shows (a plain `snapshot` instead of
@@ -62,14 +64,14 @@ Permissions:
   another workspace.
 - `pane.read`: the existing pane listing and focus permission. This additionally
   permits pane metadata, including working directories; it is not status-only.
+- `terminal.read`: each pane's activity line (`includeActivity`), shown in a
+  speech bubble over a working employee's head. The grant is unrestricted: it
+  also allows reading every terminal's output, which this page does not do. A
+  narrower activity-only grant would be enough.
 
 ## Not yet, and what would enable it
 
-The page asks for no terminal-content permission, so employees have no
-activity bubbles. `agent.state({includeActivity:true})` could supply them, but
-it needs unrestricted `terminal.read`, which also allows reading every
-terminal's output; a narrower activity-only grant would let the Office show
-what each agent is doing without that. Other gaps, discussed in
+Gaps discussed in
 [openwong2kim/wmux#2485](https://github.com/openwong2kim/wmux/discussions/2485):
 
 - "Needs you" carries no reason (a question, an error, a usage limit) and no

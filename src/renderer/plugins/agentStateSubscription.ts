@@ -12,6 +12,8 @@ export function subscribeAgentState(options: {
   /** The bound workspace: fixed for a workspace stream, read live for 'all'. */
   workspaceId: string | undefined | (() => string | undefined);
   scope?: 'workspace' | 'all';
+  /** The read asks for activity (terminal.read): keep it when parsing. */
+  activity?: boolean;
   read: () => Promise<unknown>;
   post: (event: AgentStateEvent) => void;
   isCurrent: () => boolean;
@@ -52,7 +54,8 @@ export function subscribeAgentState(options: {
         }
         throw new Error('Agent state unavailable');
       }
-      const snapshot = all ? parsePluginAllAgentSnapshot(raw.result) : parsePluginAgentSnapshot(raw.result, workspaceId, false);
+      const activity = options.activity === true;
+      const snapshot = all ? parsePluginAllAgentSnapshot(raw.result, activity) : parsePluginAgentSnapshot(raw.result, workspaceId, activity);
       // In 'all' the bound workspace can change under one stream: a switch
       // alone is news to the page, so it is part of what counts as a change.
       const serialized = JSON.stringify(all ? [boundWorkspace(), snapshot] : snapshot);

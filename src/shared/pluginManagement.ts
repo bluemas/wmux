@@ -48,11 +48,11 @@ export const UI_PLUGIN_CATALOG = [{
   signature: true,
   glyph: 'office',
   preview: 'office',
-  capabilities: ['ui.rail-page', 'agent.state.read', 'agent.state.read.all', 'pane.read'],
+  capabilities: ['ui.rail-page', 'agent.state.read', 'agent.state.read.all', 'pane.read', 'terminal.read'],
   readme: 'https://github.com/openwong2kim/wmux/blob/main/examples/plugins/office/README.md',
   publisher: 'bluemas',
   license: 'MIT',
-  version: '1.1.0',
+  version: '1.2.0',
   files: ['manifest.json', 'index.html', 'office.js', 'layout.js', 'sprites.js', 'characters.png', 'furniture.png', 'README.md', 'LICENSE'],
 }] as const;
 

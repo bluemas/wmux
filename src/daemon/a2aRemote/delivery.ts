@@ -8,12 +8,13 @@ import {
   type A2aLinkRecordV1,
   type A2aOutboxRecordV1,
   type A2aRemoteDeliverResponse,
+  type A2aRemoteEnvelope,
   type A2aRemoteErrorCode,
   type A2aRemoteHostRecordV1,
   type HostId,
   type PeerCredential,
 } from '../../shared/a2aRemote';
-import { A2A_REMOTE_RPC, isLegacyHeldReason, readHeldReason, type A2aRemoteHeldReason } from '../../shared/a2aRemoteDelivery';
+import { A2A_REMOTE_RPC, isLegacyHeldReason, isWaitingCause, readHeldReason, type A2aRemoteHeldReason, type A2aRemoteWaitingCause } from '../../shared/a2aRemoteDelivery';
 import type { A2aRemoteHostStatus, A2aRemoteHostsStatusResult } from '../../shared/rpc';
 import { prepareA2aImage, type A2aImageInfo, type A2aImageRefusal } from '../../shared/a2aImages';
 import { TERMINAL_STATES } from '../../shared/types';
@@ -23,7 +24,7 @@ import { remoteTaskId } from './ids';
 import { A2aImageStore, sha256 } from './imageStore';
 import { registerImageRoutes } from './imageRoutes';
 import { imageRoots, imageSourceMessage, readImageSource } from './imageSource';
-import { acceptInbound, type ImagePull, type InboundDeps } from './inbound';
+import { PeerTaskBudget, acceptInbound, type ImagePull, type InboundDeps } from './inbound';
 import type { NotifyLinkChange } from './linkRpc';
 import type { LinkStore } from './linkStore';
 import type { A2aOffers } from './offers';
@@ -70,6 +71,12 @@ export interface A2aRemoteDeliveryDeps {
   localWorkspaceName?: (workspaceId: string) => string | undefined;
   /** Share offers: received as link envelopes, refused by older builds, ended when a peer stops supporting them. */
   offers?: A2aOffers;
+  /** Remote spawn requests, results and targets (link envelopes; see `spawnReceiver.ts`). */
+  spawn?: InboundDeps['spawn'];
+  /** Links a remote start made here (spawnStarter.ts): redacted, no images, follow-ups held for their card. */
+  spawnLinks?: NonNullable<InboundDeps['spawnLinks']>;
+  /** This PC's requests to start agents on other PCs (spawnRequester.ts): told when the other PC refuses one for good. */
+  spawnAsks?: { onRefused(hostId: HostId, envelope: A2aRemoteEnvelope, code: A2aRemoteErrorCode): void };
   /** Optional features this PC advertises: on its streams to the servers it joined, and in its own streams' `hello`. */
   features?: readonly string[];
   /**
@@ -96,10 +103,15 @@ export interface A2aRemoteDeliveryDeps {
 const SYNC_MS = 5_000;
 const MAINTENANCE_MS = 60_000;
 const HELD_REASONS: ReadonlySet<string> = new Set<A2aRemoteHeldReason>([
-  'occupant-changed', 'pane-missing', 'link-not-active', 'delivery-unconfirmed', 'no-agent',
+  'occupant-changed', 'pane-missing', 'link-not-active', 'delivery-unconfirmed', 'no-agent', 'awaiting-approval',
 ]);
 /** What the sender's ledger shows while our pane has no agent to take its task. */
 export const NO_AGENT_SUMMARY = 'The linked pane on the receiving PC has no agent running; the task is held until someone there acts.';
+/** What the sender's ledger shows while our pane's agent is there but cannot take its task yet (not a hold). */
+export const WAITING_SUMMARY: Readonly<Record<A2aRemoteWaitingCause, string>> = {
+  'agent-prompt': 'The agent on the receiving PC is waiting on a prompt there; the task is delivered once the prompt is answered.',
+  'user-typing': 'Someone is typing in the linked pane on the receiving PC; the task is delivered once they stop.',
+};
 const STATES: ReadonlySet<string> = new Set(['working', 'input-required', 'completed', 'failed', 'canceled']);
 const TERMINAL_LINK: ReadonlySet<string> = new Set(['revoked', 'broken']);
 
@@ -130,6 +142,8 @@ export class A2aRemoteDelivery {
   private readonly features: readonly string[] | undefined;
   /** Failed image fetches from the servers this PC joined (`InboundImages.pullAttempts`). */
   private readonly pullAttempts = new Map<string, number>();
+  /** New tasks each PC sent this one in the last hour (the inbound limit). */
+  private readonly taskBudget = new PeerTaskBudget();
   private readonly deps: A2aRemoteDeliveryDeps;
   private readonly sessions = new Map<HostId, { session: JoinerSession; fingerprint: string; port: number }>();
   /** Server-side status, last announced. */
@@ -328,6 +342,12 @@ export class A2aRemoteDelivery {
   /** Periodic upkeep: drop old acked records, reject holds past their TTL, re-queue what is owed. */
   async maintain(): Promise<void> {
     await this.syncAll().catch((err: unknown) => this.deps.log('warn', `[a2a-remote] outbound sync failed: ${errMsg(err)}`));
+    // A no-agent hold whose reply to the sender could not go when it was held
+    // (main marks it once): told here, once it can be.
+    for (const task of this.deps.taskService.listRemoteHeld()) {
+      const marker = task.metadata.remote as { direction?: string; held?: string } | undefined;
+      if (marker?.direction === 'inbound' && marker.held === 'no-agent') await this.tellSender(task.id, NO_AGENT_SUMMARY);
+    }
     // Before the prune: an ack whose mark never landed (crash, failed append) is
     // recovered while its record is still here. This runs at start and every
     // minute, so every acked record is seen at least once before it is pruned.
@@ -419,7 +439,12 @@ export class A2aRemoteDelivery {
         ...(p['note'] === 'pasted-not-submitted' ? { note: 'pasted-not-submitted' as const } : {}),
         ...(typeof p['ptyId'] === 'string' && isSafeId(p['ptyId']) ? { ptyId: p['ptyId'] } : {}),
       });
-      if (res.ok && held === 'no-agent' && messageId === undefined) await this.noAgent(taskId);
+      // A reply that could not go now is tried again by `maintain`.
+      if (res.ok && held === 'no-agent' && messageId === undefined) await this.tellSender(taskId, NO_AGENT_SUMMARY);
+      // Not a hold: main keeps delivering and says `waiting` on every later miss,
+      // so a reply that could not go is tried again then. A cause this build does not know is ignored.
+      const waiting = p['waiting'];
+      if (res.ok && held === undefined && isWaitingCause(waiting) && messageId === undefined) await this.tellSender(taskId, WAITING_SUMMARY[waiting]);
       // Handed over: the sender gets a `delivered` receipt.
       if (res.ok && p['delivered'] === true && messageId === undefined) await this.syncTask(taskId);
       return res.ok ? { ok: true } : res;
@@ -525,17 +550,21 @@ export class A2aRemoteDelivery {
   // --- internals ------------------------------------------------------------
 
   /**
-   * Our pane kept having no agent for the peer's task: the sender hears why,
-   * once, as a reply from this side (its task stays open; `submitted` has no
-   * edge to `input-required`, and nothing here has started the work).
+   * Our pane could not take the peer's task (no agent, or an agent behind a
+   * prompt or a person typing): the sender hears why, once per summary, as a
+   * reply from this side (its task stays open; `submitted` has no edge to
+   * `input-required`, and nothing here has started the work). Once means the
+   * reply is in the task's history: a send that failed stored nothing, so the
+   * next call tries again. False only when the reply could not be sent.
    */
-  private async noAgent(taskId: string): Promise<void> {
+  private async tellSender(taskId: string, summary: string): Promise<boolean> {
     const task = this.deps.taskService.getTask(taskId);
-    if (!task || task.status.state !== 'submitted') return;
-    const said = task.history.some((m) => m.parts.some((p) => p.kind === 'text' && p.text === NO_AGENT_SUMMARY));
-    if (said) return;
-    const res = await sendRemoteReply(this.outboundDeps(), { taskId, workspaceId: task.metadata.to.workspaceId, text: NO_AGENT_SUMMARY });
-    if (!res.ok) this.deps.log('warn', `[a2a-remote] ${taskId}: could not tell the sender its pane has no agent: ${res.error}`);
+    if (!task || task.status.state !== 'submitted') return true;
+    const said = task.history.some((m) => m.parts.some((p) => p.kind === 'text' && p.text === summary));
+    if (said) return true;
+    const res = await sendRemoteReply(this.outboundDeps(), { taskId, workspaceId: task.metadata.to.workspaceId, text: summary });
+    if (!res.ok) this.deps.log('warn', `[a2a-remote] ${taskId}: could not tell the sender why its task waits: ${res.error}`);
+    return res.ok;
   }
 
   private newSession(hostId: HostId): JoinerSession {
@@ -571,6 +600,7 @@ export class A2aRemoteDelivery {
   private async onRefused(rec: A2aOutboxRecordV1, code: A2aRemoteErrorCode, detail?: string): Promise<void> {
     this.deps.log('warn', `[a2a-remote] ${rec.hostId} refused ${rec.envelope.kind} on link ${rec.envelope.linkId}: ${code}`);
     this.deps.offers?.onRefused(rec.hostId, rec.envelope, code);
+    this.deps.spawnAsks?.onRefused(rec.hostId, rec.envelope, code);
     const taskId = taskOfEnvelope(rec.envelope, remoteTaskId);
     if (!taskId || !this.deps.taskService.getTask(taskId)) return;
     const reason = code === 'attachment-failed' ? `not sent to the other PC: ${detail ?? 'its images could not be uploaded'}` : `refused by the other PC: ${code}`;
@@ -658,7 +688,11 @@ export class A2aRemoteDelivery {
       aliasFor: (l) => this.aliasFor(l),
       ...(this.deps.localWorkspaceName ? { localWorkspaceName: this.deps.localWorkspaceName } : {}),
       ...(this.deps.offers ? { offers: this.deps.offers } : {}),
+      ...(this.deps.spawn ? { spawn: this.deps.spawn } : {}),
+      ...(this.deps.spawnLinks ? { spawnLinks: this.deps.spawnLinks } : {}),
       ...(this.images ? { images: { store: this.images, pullAttempts: this.pullAttempts } } : {}),
+      taskBudget: this.taskBudget,
+      log: this.deps.log,
     };
   }
 
@@ -670,6 +704,7 @@ export class A2aRemoteDelivery {
       outbox: this.outbox,
       aliasFor: (l) => this.aliasFor(l),
       peerFeatures: (hostId) => this.peerFeatures(hostId),
+      ...(this.deps.spawnLinks ? { spawnLink: (id: string) => this.deps.spawnLinks!.isSpawnLink(id) } : {}),
       ...(store
         ? {
           images: {
@@ -741,7 +776,12 @@ export class A2aRemoteDelivery {
   }
 
   private heldDeps(): HeldDeps {
-    return { taskService: this.deps.taskService, linkStore: this.deps.links, outbox: this.outbox };
+    return {
+      taskService: this.deps.taskService,
+      linkStore: this.deps.links,
+      outbox: this.outbox,
+      ...(this.deps.spawnLinks ? { spawnLink: (id: string) => this.deps.spawnLinks!.isSpawnLink(id) } : {}),
+    };
   }
 }
 

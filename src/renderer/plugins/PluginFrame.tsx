@@ -59,6 +59,7 @@ export default function PluginFrame({
   forwardEvents = false,
   agentStateEvents = false,
   agentStateScope = 'workspace',
+  agentStateActivity = false,
   railPage = false,
   className,
 }: {
@@ -68,6 +69,8 @@ export default function PluginFrame({
   agentStateEvents?: boolean;
   /** 'all': the page is approved for agent.state.read.all (main re-checks). */
   agentStateScope?: 'workspace' | 'all';
+  /** The page also reads each pane's activity line (terminal.read; main re-checks). */
+  agentStateActivity?: boolean;
   railPage?: boolean;
   className?: string;
 }) {
@@ -296,12 +299,13 @@ export default function PluginFrame({
     if (!agentStateEvents || agentStateScope === 'all' || !railPage || bridgeEpoch === 0 || !port) return;
     return subscribeAgentState({
       workspaceId: activeWorkspaceId,
-      read: () => window.electronAPI.plugins.rpc(pluginName, 'agent.state', {}, activeWorkspaceId),
+      activity: agentStateActivity,
+      read: () => window.electronAPI.plugins.rpc(pluginName, 'agent.state', agentStateActivity ? { includeActivity: true } : {}, activeWorkspaceId),
       post: (event) => { try { port.postMessage(event); } catch { /* closed during teardown */ } },
       isCurrent: () => scopeEpochRef.current === scopeEpoch && portRef.current === port && useStore.getState().activeWorkspaceId === activeWorkspaceId
         && useStore.getState().appRoute === `plugin:${pluginName}`,
     });
-  }, [pluginName, agentStateEvents, agentStateScope, railPage, activeWorkspaceId, bridgeEpoch, scopeEpoch]);
+  }, [pluginName, agentStateEvents, agentStateScope, agentStateActivity, railPage, activeWorkspaceId, bridgeEpoch, scopeEpoch]);
 
   // Every local workspace in one stream. It does not restart on a workspace
   // switch (that would wipe the page between two identical answers); the
@@ -311,12 +315,14 @@ export default function PluginFrame({
     if (!agentStateEvents || agentStateScope !== 'all' || !railPage || bridgeEpoch === 0 || !port) return;
     return subscribeAgentState({
       scope: 'all',
+      activity: agentStateActivity,
       workspaceId: () => useStore.getState().activeWorkspaceId ?? undefined,
-      read: () => window.electronAPI.plugins.rpc(pluginName, 'agent.state.all', {}, useStore.getState().activeWorkspaceId),
+      read: () => window.electronAPI.plugins.rpc(pluginName, 'agent.state.all', agentStateActivity ? { includeActivity: true } : {},
+        useStore.getState().activeWorkspaceId),
       post: (event) => { try { port.postMessage(event); } catch { /* closed during teardown */ } },
       isCurrent: () => portRef.current === port && useStore.getState().appRoute === `plugin:${pluginName}`,
     });
-  }, [pluginName, agentStateEvents, agentStateScope, railPage, bridgeEpoch]);
+  }, [pluginName, agentStateEvents, agentStateScope, agentStateActivity, railPage, bridgeEpoch]);
 
   if (blocked) return <div role="status" className="p-4 text-[13px] text-[var(--text-sub)]">{t('plugins.page.frameUnavailable')}</div>;
   return (

@@ -223,10 +223,15 @@ export function launchUserDataDirArg({ explicit = null, previous, home, suffix, 
  * call cannot open a login-keychain dialog on the owner's desktop (and block
  * the main thread on a locked screen); e2e/lib.mjs passes the same.
  */
-export function launchAppArgs({ userDataDirArg = null, platform = process.platform }) {
+export function launchAppArgs({ userDataDirArg = null, fakeAudio = null, platform = process.platform }) {
   const args = [];
   if (platform === 'darwin') args.push('--use-mock-keychain');
   if (userDataDirArg) args.push(`--user-data-dir=${userDataDirArg}`);
+  // Chromium's fake capture device plays a WAV file as the microphone, once:
+  // dictation can be proven on a machine with no microphone, and the real
+  // one (and its OS prompt) is never touched. The audio service's sandbox
+  // would refuse to read the file, so that one sandbox (only) is off.
+  if (fakeAudio) args.push('--use-fake-device-for-media-stream', `--use-file-for-fake-audio-capture=${fakeAudio}%noloop`, '--disable-features=AudioServiceSandbox');
   return args;
 }
 
@@ -407,6 +412,54 @@ export function envHasSuffix(envText, suffix) {
   if (!suffix) return false;
   const escaped = suffix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   return new RegExp(`(^|[\\s\\0])WMUX_DATA_SUFFIX=${escaped}($|[\\s\\0])`).test(String(envText ?? ''));
+}
+
+/**
+ * The answering daemon's pid from `wmux daemon status --json` stdout, or null.
+ * Decided on the JSON, not the exit code: a daemon that does not answer also
+ * prints JSON (`{ ok: false, running: false, error }`) and exits 1.
+ */
+export function parseDaemonStatusPid(stdout) {
+  let out;
+  try {
+    out = JSON.parse(String(stdout ?? '').trim());
+  } catch {
+    return null;
+  }
+  if (out?.ok !== true || out.running !== true) return null;
+  return Number.isInteger(out.pid) && out.pid > 0 ? out.pid : null;
+}
+
+/**
+ * Does live `pid`, read from this run's suffixed daemon.pid, belong to the
+ * recorded isolated instance? A stale pid file can name a reused pid, so the
+ * pid alone proves nothing. Returns { ok, how, reason }.
+ *   - 'pipe': the daemon on this suffix's own control pipe (its name and auth
+ *     token both live under ~/.wmux<suffix>) answers `daemon.ping` with this
+ *     very pid. Every platform; the only proof on Windows, where another
+ *     process's environment is not readable.
+ *   - 'env' (not Windows): the process's own environment sets
+ *     WMUX_DATA_SUFFIX to exactly `suffix` (envHasSuffix).
+ * probes: pidAlive(pid), pingPid() -> number|null, envText(pid) -> string.
+ */
+export function daemonIdentityHolds({ pid, suffix }, probes, platform = process.platform) {
+  if (!Number.isInteger(pid) || pid <= 0 || !suffix) return { ok: false, how: null, reason: 'no daemon pid or suffix' };
+  if (!probes.pidAlive(pid)) return { ok: false, how: null, reason: `daemon pid ${pid} is not running` };
+  let answered = null;
+  try { answered = probes.pingPid(); } catch { answered = null; }
+  if (answered === pid) return { ok: true, how: 'pipe', reason: null };
+  if (platform !== 'win32') {
+    let envText = '';
+    try { envText = probes.envText(pid); } catch { envText = ''; }
+    if (envHasSuffix(envText, suffix)) return { ok: true, how: 'env', reason: null };
+  }
+  return {
+    ok: false,
+    how: null,
+    reason: answered == null
+      ? `no daemon answered on the ${suffix} pipe, and daemon pid ${pid} is not otherwise proven ours`
+      : `the daemon on the ${suffix} pipe is pid ${answered}, not daemon.pid's ${pid}`,
+  };
 }
 
 /**

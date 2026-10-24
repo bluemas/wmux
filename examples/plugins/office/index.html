@@ -51,6 +51,9 @@ body { margin: 0; }
 .bubble[hidden] { display: none; }
 .bubble.alert { border-color: #8f1d22; background: #e5484d; color: #fff; }
 .bubble.done { border-color: #1f6940; background: #34d399; color: #0b2a1c; }
+.bubble.say { max-width: 180px; overflow: hidden; text-overflow: ellipsis; border-color: #3a3640; background: #fdfcf8; color: #201e28;
+  font-weight: 400; }
+.employee:hover .bubble.say, .employee:focus-visible .bubble.say { max-width: 360px; }
 .mark { font-weight: 700; margin-right: 4px; }
 .employee:hover .bubble, .employee:focus-visible .bubble { z-index: 120000 !important; }
 

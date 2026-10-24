@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { usePlugins, refreshPlugins } from './usePlugins';
+import { railPagePlugins } from './railPagePlugins';
 import PluginFrame from './PluginFrame';
 import { useStore } from '../stores';
 import { useT } from '../hooks/useT';
@@ -9,7 +10,7 @@ import { FOCUS_RING } from '../components/focusRing';
 export function PluginRailNavigation({ compact }: { compact: boolean }) {
   const { plugins } = usePlugins();
   const route = useStore((s) => s.appRoute);
-  const pages = plugins.filter((p) => p.contributes.railPage && p.trustStatus !== 'denied');
+  const pages = railPagePlugins(plugins);
   if (pages.length === 0) return null;
   // Under the built-in pages, set apart by one short hairline; each carries
   // its catalog glyph (a package for a bundle the catalog did not install).
@@ -44,7 +45,8 @@ export default function PluginRailPage({ name }: { name: string }) {
       <span className="text-[11px] text-[var(--text-muted)]">{t('plugins.page.extension')}</span>
     </header>
     {plugin.trustStatus === 'trusted' ? <PluginFrame key={`${name}:${plugin.version}:${page.entry}`} pluginName={name} entry={page.entry} railPage agentStateEvents={page.agentStateEvents && plugin.capabilities.includes('agent.state.read')}
-      agentStateScope={plugin.capabilities.includes('agent.state.read.all') ? 'all' : 'workspace'} className="min-h-0 flex-1" /> : (
+      agentStateScope={plugin.capabilities.includes('agent.state.read.all') ? 'all' : 'workspace'}
+      agentStateActivity={plugin.capabilities.includes('terminal.read')} className="min-h-0 flex-1" /> : (
       <div className="px-5 py-3 text-[12px] text-[var(--text-sub)]">
         <button type="button" className={`underline ${FOCUS_RING}`} disabled={busy} onClick={() => {
           setBusy(true); setFailed(false);

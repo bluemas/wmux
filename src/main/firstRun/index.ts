@@ -7,13 +7,18 @@
  */
 
 import { ipcMain } from 'electron';
-import type { IpcMainInvokeEvent } from 'electron';
+import type { BrowserWindow, IpcMainInvokeEvent } from 'electron';
 
 import { IPC } from '../../shared/constants';
 import { wrapHandler } from '../ipc/wrapHandler';
 import type { FirstRunOrchestrator } from './FirstRunOrchestrator';
-import type { SampleTaskStartPayload } from '../../shared/firstRun';
+import type { FirstBotResult, FirstRunFolderCheck, SampleTaskStartPayload } from '../../shared/firstRun';
 import { AGENT_IDS, type AgentId } from '../../shared/agentSetup';
+import type { FactorySettings } from '../../shared/factorySettings';
+import { isMainWindowSender } from '../ipc/mainWindowSender';
+import { getBotStore } from '../factory/botStore';
+import { getFactorySettingsStore } from '../factory/factorySettings';
+import { checkFirstRunFolder, firstRunBot } from './firstBot';
 
 function requireAgentId(value: unknown): AgentId {
   if (typeof value !== 'string' || !(AGENT_IDS as readonly string[]).includes(value)) {
@@ -22,7 +27,29 @@ function requireAgentId(value: unknown): AgentId {
   return value as AgentId;
 }
 
-export function registerFirstRunHandlers(orchestrator: FirstRunOrchestrator): () => void {
+/** firstRun:first-bot's body: the sender check, then the first-run bot. */
+export function firstBotHandler(
+  getWindow: () => BrowserWindow | null,
+  deps: { store?: typeof getBotStore; settings?: () => FactorySettings | null } = {},
+): (e: { sender?: unknown; senderFrame?: unknown }, req: unknown) => Promise<FirstBotResult> {
+  return async (e, req) => {
+    if (!isMainWindowSender(e, getWindow())) return { ok: false, code: 'invalid_argument', message: 'only the main window may make the first bot' };
+    const settings = deps.settings ? deps.settings() : getFactorySettingsStore()?.get() ?? null;
+    return firstRunBot((deps.store ?? getBotStore)(), settings, req);
+  };
+}
+
+/** firstRun:check-folder's body: the sender check, then the folder check. */
+export function checkFolderHandler(
+  getWindow: () => BrowserWindow | null,
+): (e: { sender?: unknown; senderFrame?: unknown }, folder: unknown) => Promise<FirstRunFolderCheck> {
+  return async (e, folder) => {
+    if (!isMainWindowSender(e, getWindow())) return { ok: false, code: 'invalid_argument', message: 'only the main window may check the first run\'s folder' };
+    return checkFirstRunFolder(folder);
+  };
+}
+
+export function registerFirstRunHandlers(orchestrator: FirstRunOrchestrator, getWindow: () => BrowserWindow | null): () => void {
   ipcMain.removeHandler(IPC.FIRST_RUN_CHECK);
   ipcMain.handle(
     IPC.FIRST_RUN_CHECK,
@@ -93,26 +120,44 @@ export function registerFirstRunHandlers(orchestrator: FirstRunOrchestrator): ()
         if (!payload || typeof payload.ptyId !== 'string' || payload.ptyId.length === 0) {
           throw new Error('FIRST_RUN_START_SAMPLE_TASK: missing or invalid ptyId');
         }
-        // Fire-and-forget — the runner outcome is reported via the
-        // FIRST_RUN_SAMPLE_TASK_READY / TIMEOUT event channels rather than
-        // the invoke return value, so the renderer can keep the wizard
-        // responsive while the 5s OSC133 handshake plays out.
+        // The invoke awaits the runner, but success and the fallback are
+        // reported on the FIRST_RUN_SAMPLE_TASK_READY / TIMEOUT event
+        // channels, which the wizard subscribed to before it called this.
         //
         // I6 fix: if startSampleTask itself throws (e.g. PTYBridge gone,
         // daemon disconnect mid-flight), the wizard would otherwise hang in
         // 'awaiting-prompt' forever because it relies on the READY/TIMEOUT
         // event channels for resolution. Surface failures as a TIMEOUT
         // event so the wizard's fallback "Press Enter" UI engages.
-        orchestrator.startSampleTask(payload.ptyId).catch((err: unknown) => {
+        //
+        // A command that never reached the pane is the one outcome the invoke
+        // answers itself: it rejects, so the wizard shows an error instead of
+        // success or "press Enter" over an empty prompt.
+        const outcome = await orchestrator.startSampleTask(payload.ptyId).catch((err: unknown) => {
           console.error('[firstRun] startSampleTask failed:', err);
           orchestrator.emitSampleTaskTimeout();
+          return 'timeout' as const;
         });
+        if (outcome === 'undelivered') {
+          throw new Error('FIRST_RUN_START_SAMPLE_TASK: the sample command did not reach the pane');
+        }
       },
     ),
   );
 
+  ipcMain.removeHandler(IPC.FIRST_RUN_CHECK_FOLDER);
+  ipcMain.handle(
+    IPC.FIRST_RUN_CHECK_FOLDER,
+    wrapHandler(IPC.FIRST_RUN_CHECK_FOLDER, checkFolderHandler(getWindow)),
+  );
+
+  ipcMain.removeHandler(IPC.FIRST_RUN_FIRST_BOT);
+  ipcMain.handle(IPC.FIRST_RUN_FIRST_BOT, wrapHandler(IPC.FIRST_RUN_FIRST_BOT, firstBotHandler(getWindow)));
+
   return () => {
     ipcMain.removeHandler(IPC.FIRST_RUN_CHECK);
+    ipcMain.removeHandler(IPC.FIRST_RUN_CHECK_FOLDER);
+    ipcMain.removeHandler(IPC.FIRST_RUN_FIRST_BOT);
     ipcMain.removeHandler(IPC.FIRST_RUN_COMPLETE);
     ipcMain.removeHandler(IPC.FIRST_RUN_DISMISS);
     ipcMain.removeHandler(IPC.FIRST_RUN_REOPEN);
