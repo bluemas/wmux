@@ -140,6 +140,10 @@ export interface Surface {
    *  Not refreshed from OSC titles while locked — an agent retitles its tab
    *  many times a second, and each refresh would be a store write. */
   autoTitle?: string;
+  /** "Continue in another agent": the tab this one's work went on in, and on
+   *  that tab, the held one it came from. Each tab's tooltip names the other. */
+  continuedIn?: string;
+  continuedFrom?: string;
   /**
    * #2398 — this surface replaces a session the daemon confirmed dead, and has
    * not created its replacement yet. Carried with the surface (and so saved
@@ -924,6 +928,8 @@ export interface SessionData {
   /** Chat presentation for local Claude Code sessions. Default false while
    *  experimental; persisted so an opt-in survives restarts. */
   chatViewEnabled?: boolean;
+  /** The one-time "Show this as a chat?" question; see uiSlice.chatViewFirstAsk. */
+  chatViewFirstAsk?: ChatViewFirstAsk;
   // Titlebar wall-clock (2026-09-05). Default off; persisted so the people who
   // turn it on keep it across restarts.
   titlebarClockVisible?: boolean;
@@ -1895,3 +1901,13 @@ export function validateNavigationUrl(
 
 /** One Claude Code Agent Teams teammate of a pane, as the daemon reads it from the session's `subagents/` folder. */
 export interface TeammateInfo { name: string; color?: string; working: boolean; activity?: string; at: number }
+
+/** The agents the one-time "Show this as a chat?" question is asked for. */
+export type ChatViewAskAgent = 'claude' | 'codex';
+
+/**
+ * The one-time "Show this as a chat?" question: each supported agent's answer
+ * once given, or `'never'` when it is not asked at all (an existing user, or
+ * one who changed the setting in Settings).
+ */
+export type ChatViewFirstAsk = 'never' | Partial<Record<ChatViewAskAgent, 'show' | 'terminal'>>;

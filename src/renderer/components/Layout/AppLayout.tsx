@@ -6,6 +6,8 @@ import type { AgentSlug } from '../../../shared/events';
 import type { ResumeBinding } from '../../../shared/agentResume';
 import { useStore } from '../../stores';
 import { useT } from '../../hooks/useT';
+import { t as translate } from '../../i18n';
+import { deliverMirrorDrop, showRemoteSendNotice } from '../Remote/mirrorFileSend';
 import Sidebar from '../Sidebar/Sidebar';
 import MiniSidebar from '../Sidebar/MiniSidebar';
 import { SidebarSlot } from './SidebarSlot';
@@ -68,6 +70,7 @@ import { useResizeGuard } from '../../hooks/useResizeGuard';
 import { useApprovalInboxBridge } from '../../hooks/useApprovalInboxBridge';
 import { useBrowserHelpBridge } from '../../hooks/useBrowserHelpBridge';
 import { useUsageLimitBridge } from '../../hooks/useUsageLimitBridge';
+import { useAgentAuthBridge } from '../../hooks/useAgentAuthBridge';
 import { useWorkspaceSettleBridge } from '../../hooks/useWorkspaceSettleBridge';
 import { useStarPromptSessionBridge } from '../../utils/starPrompt';
 import { useRemoteInboxBridge } from '../../hooks/useRemoteInboxBridge';
@@ -447,6 +450,7 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
     channelsTabVisible: state.channelsTabVisible,
     paneActionsVisible: state.paneActionsVisible,
     chatViewEnabled: state.chatViewEnabled,
+    chatViewFirstAsk: state.chatViewFirstAsk,
     titlebarClockVisible: state.titlebarClockVisible,
     titlebarVitalsAlwaysVisible: state.titlebarVitalsAlwaysVisible,
     paneNewTerminalButton: state.paneNewTerminalButton,
@@ -952,6 +956,8 @@ export default function AppLayout() {
   // the store (and jump to its pane) whichever surface the operator is on.
   useBrowserHelpBridge();
   useUsageLimitBridge();
+  // N4 — agents whose sign-in was lost: the toast with [Sign in again].
+  useAgentAuthBridge();
   // Workspace settle / snooze — main owns the state; this mirrors it and
   // raises the Undo toasts.
   useWorkspaceSettleBridge();
@@ -1121,7 +1127,7 @@ export default function AppLayout() {
 
   useEffect(() => {
     // File drop via preload onFileDrop (reliable cross-platform)
-    const removeDrop = window.electronAPI.onFileDrop((paths) => {
+    const removeDrop = window.electronAPI.onFileDrop((paths, registerDrop) => {
       setIsDragging(false);
       dragCounterRef.current = 0;
 
@@ -1148,7 +1154,15 @@ export default function AppLayout() {
 
       const activeSurface = leaf.surfaces.find((s) => s.id === leaf.activeSurfaceId);
       // browser/editor/diff는 PTY가 없어 경로 붙여넣기 대상이 아님(J2 — diff 추가).
-      if (!activeSurface || activeSurface.surfaceType === 'browser' || activeSurface.surfaceType === 'editor' || activeSurface.surfaceType === 'preview' || activeSurface.surfaceType === 'diff' || activeSurface.surfaceType === 'remote-terminal') return;
+      if (!activeSurface || activeSurface.surfaceType === 'browser' || activeSurface.surfaceType === 'editor' || activeSurface.surfaceType === 'preview' || activeSurface.surfaceType === 'diff') return;
+      // Another PC's pane: a dropped path names a file on this machine, so the
+      // mirror showing it uploads the files to that PC and types their paths there.
+      if (activeSurface.surfaceType === 'remote-terminal') {
+        if (!deliverMirrorDrop(activeSurface.id, registerDrop)) {
+          showRemoteSendNotice('not-connected', translate('remote.hostFallback'));
+        }
+        return;
+      }
 
       // Chat view shows the drop as a composer chip; typing the path into the
       // hidden terminal would attach it where the user cannot see it. With no

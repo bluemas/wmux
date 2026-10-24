@@ -30,6 +30,7 @@ import { BOT_MEMORY_IPC } from '../shared/botMemory';
 import { BOT_COMMAND_IPC } from '../shared/botCommand';
 import { BOT_GROUP_IPC } from '../shared/botGroup';
 import type { PaneLabelRejection } from '../shared/paneLabelRules';
+import type { RemoteSendResult, RemoteSendSource, RemoteWriteResult } from '../shared/remoteUpload';
 import { CHROME_PANE_IPC, type ChromePaneBindings } from '../shared/chromePaneBinding';
 import {
   BROWSER_AGENT_CONTROL_IPC,
@@ -85,6 +86,7 @@ import type { ComputerUseSettingsPayload } from '../shared/computer/config';
 import type { QuickLaunchSettingsPayload } from '../shared/quickLaunch';
 import type { ResumeBinding } from '../shared/agentResume';
 import type { PaneUsageLimit, PaneUsageLimitPatch } from '../shared/usageLimit';
+import type { AuthLostEntry } from '../shared/agentAuthLost';
 import type { DictationAssetsResult, DictationMicAccess, DictationModelState } from '../shared/dictation';
 import type { PreviewChangedEvent, PreviewLinkEvent, PreviewOpenResult } from '../shared/filePreview';
 import type {
@@ -1983,6 +1985,19 @@ const electronAPI = {
     /** Manual refresh. UI is responsible for the 5-minute cooldown. */
     refresh: () => ipcRenderer.send(IPC.USAGE_REFRESH),
   },
+  // N4 — agents whose sign-in was lost (shared/agentAuthLost), one entry per
+  // agent and account; `loginState` asks the agent's own status for an entry
+  // main already holds (main drops the entry when it says signed in).
+  agentAuth: {
+    list: () => ipcRenderer.invoke(IPC.AGENT_AUTH_LOST_LIST) as Promise<AuthLostEntry[]>,
+    onChanged: (callback: (entries: AuthLostEntry[]) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, entries: AuthLostEntry[]) => callback(entries);
+      ipcRenderer.on(IPC.AGENT_AUTH_LOST_CHANGED, listener);
+      return () => { ipcRenderer.removeListener(IPC.AGENT_AUTH_LOST_CHANGED, listener); };
+    },
+    loginState: (key: string) =>
+      ipcRenderer.invoke(IPC.AGENT_AUTH_LOGIN_STATE, key) as Promise<{ known: false } | { known: true; signedIn: boolean | null }>,
+  },
   // Pane usage-limit pause (shared/usageLimit). The daemon owns the state;
   // `list` hydrates on boot, `onChanged` streams per-pane changes (null =
   // cleared), `update` edits one pane (auto-resume, dismiss, resume now).
@@ -2163,7 +2178,9 @@ const electronAPI = {
 };
 
 // File drag-and-drop: capture in preload where File.path is accessible
-const fileDropCallbacks: ((paths: string[]) => void)[] = [];
+/** Asks main for a token naming this drop's paths (memoized; null when main refuses). */
+type RegisterDrop = () => Promise<string | null>;
+const fileDropCallbacks: ((paths: string[], registerDrop: RegisterDrop) => void)[] = [];
 
 document.addEventListener('DOMContentLoaded', () => {
   document.addEventListener('dragover', (e) => {
@@ -2182,12 +2199,19 @@ document.addEventListener('DOMContentLoaded', () => {
       if (filePath) paths.push(filePath);
     }
     if (paths.length > 0) {
-      fileDropCallbacks.forEach((cb) => cb(paths));
+      // Only paths from a real OS drop can be registered: this closure is the
+      // one way to name them to main (a send to another PC's pane uses it).
+      let token: Promise<string | null> | null = null;
+      const registerDrop: RegisterDrop = () => {
+        token ??= (ipcRenderer.invoke(IPC.REMOTE_DROP_REGISTER, paths) as Promise<string | null>).catch(() => null);
+        return token;
+      };
+      fileDropCallbacks.forEach((cb) => cb(paths, registerDrop));
     }
   });
 });
 
-(electronAPI as Record<string, unknown>).onFileDrop = (callback: (paths: string[]) => void) => {
+(electronAPI as Record<string, unknown>).onFileDrop = (callback: (paths: string[], registerDrop: RegisterDrop) => void) => {
   fileDropCallbacks.push(callback);
   return () => {
     const idx = fileDropCallbacks.indexOf(callback);
@@ -2466,6 +2490,10 @@ document.addEventListener('DOMContentLoaded', () => {
   paneWrite: (attachId: string, data: string) => {
     ipcRenderer.send(IPC.REMOTE_PANE_WRITE, attachId, data);
   },
+  paneSendFiles: (attachId: string, source: RemoteSendSource, opts: { wsl: boolean }) =>
+    ipcRenderer.invoke(IPC.REMOTE_PANE_SEND_FILES, attachId, source, opts) as Promise<RemoteSendResult>,
+  paneWriteChecked: (attachId: string, data: string) =>
+    ipcRenderer.invoke(IPC.REMOTE_PANE_WRITE_CHECKED, attachId, data) as Promise<RemoteWriteResult>,
   paneResize: (attachId: string, cols: number, rows: number) =>
     ipcRenderer.invoke(IPC.REMOTE_PANE_RESIZE_REQUEST, attachId, cols, rows) as Promise<
       { ok: true; cols: number; rows: number } | { ok: false; reason: string }

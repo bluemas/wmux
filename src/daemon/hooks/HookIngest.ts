@@ -180,6 +180,12 @@ export interface HookAgentEventData extends HookArbitration {
    * minting a second event type for each of them.
    */
   signal: AgentSignal;
+  /**
+   * On a SessionStart: no turn was open when it came (the lead turn had ended
+   * and nothing reported work since), so the session is at its prompt. Tells a
+   * `/compact` typed at the prompt from a compaction inside a running turn.
+   */
+  atPrompt?: true;
 }
 
 /**
@@ -1448,6 +1454,7 @@ export class HookIngest {
         hookKind: signal.kind,
         decision: 'activity',
         signal,
+        ...(signal.kind === 'agent.session_start' && this.leadTurnEnded.has(sessionId) ? { atPrompt: true as const } : {}),
       });
     }
 
@@ -1921,10 +1928,11 @@ export class HookIngest {
    * detector veto belongs to the dead launch's generation: left alone it keeps
    * suppressing every completion of a relaunched same-slug agent whose hooks
    * are broken. `onlyAgent` scopes the expiry so a death of process A never
-   * strips process B's authority.
+   * strips process B's authority; `signaledBefore` keeps an entry a later
+   * launch's signal touched (HookSignalRouter.expireAuthorityFor).
    */
-  expireAuthorityFor(sessionId: string, onlyAgent?: string): void {
-    this.router.expireAuthorityFor(sessionId, onlyAgent);
+  expireAuthorityFor(sessionId: string, onlyAgent?: string, signaledBefore?: number): void {
+    this.router.expireAuthorityFor(sessionId, onlyAgent, signaledBefore);
   }
 
   /**
