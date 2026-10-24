@@ -7,7 +7,7 @@ import { createStartupRecovery } from './startupRecovery';
 import { loadChatSkills } from './transcript/chatSkills';
 import { TerminalChatService } from './transcript/TerminalChatService';
 import { OpenCodeIdleSettler } from './transcript/openCodeIdleSettle';
-import type { ChatBridge, ChatLaunchRequest } from './chat/chatBridge';
+import { dangerousLaunchNotice, type ChatBridge, type ChatLaunchRequest } from './chat/chatBridge';
 import { ChatSendReceiptStore } from './chat/ChatSendReceiptStore';
 import { ChatCancelReceiptStore } from './chat/ChatCancelReceiptStore';
 import { ChatQueueStore } from './chat/ChatQueue';
@@ -20,7 +20,7 @@ import { paneCodexSettings } from './web/paneCodexSettings';
 import { createPaneJob } from './paneJob';
 import { CodexPaneRelays, paneCodexHome } from './web/codexPaneRelays';
 import { createCodexAccountStatusReader } from './web/codexAccountStatus';
-import { buildAgentLaunch, installedAgentLaunchOptions, pinnedAgentLaunch } from './web/agentLaunch';
+import { buildAgentLaunch, installedAgentLaunchOptions, webPaneSpawn } from './web/agentLaunch';
 import { agentExecEnv } from '../shared/execEnv';
 import { workspaceAccountEnv } from './phone/workspaceAccountEnv';
 import { applyPaneAccount, assertPaneAccountUsable } from './phone/paneAccount';
@@ -88,7 +88,10 @@ import { queuedScreenText, queuedTextSnapshot } from './queuedSessionText';
 import type { TerminalPty } from '../shared/terminalPty';
 import { serializeSession } from './sessionSerialize';
 import { AwaitingScreenVerifier, AWAITING_NARROW_DIALOG_COLS, questionInFlight, renderPaneScreen, renderPaneTail } from './AwaitingScreenVerifier';
-import { screenShowsAgentDialog, screenShowsActiveDialog, screenShowsPermissionDialog } from './transcript/chatScreenGate';
+import { screenBlocksChatSend, screenShowsAgentDialog, screenShowsActiveDialog, screenShowsPermissionDialog, screenShowsRunningTurn, titleShowsRunningTurn } from './transcript/chatScreenGate';
+import { claudeComposerEmpty, claudeComposerVisible } from './transcript/deliverChatPrompt';
+import { CHATV2_LAUNCH_ALLOWED_RPC } from '../shared/chatv2/ipc';
+import { isPaneMoving } from './chat/v2/paneClaims';
 import { ApprovalPushRouter } from './push/approvalPushRouter';
 import { readPendingToolUse } from './transcript/pendingToolUse';
 import { isClaudeFamilyAgent } from './approvals/terminalPrompt';
@@ -196,6 +199,10 @@ import { DIALOG_RECHECK_MS, HookIngest, identifiedAgentPid, type HookArbitration
 import { DetectionAgreementLog } from './diagnostics/detectionAgreementLog';
 import { deriveAgentLiveness } from './hooks/agentLiveness';
 import { classifyClaudeStopFailure, classifyCodexTurnCompleted, type TurnFailure } from '../shared/phoneTurnFailure';
+import { authConfigDir, isAuthLostAgent, type AgentAuthLost, type AuthLostAgent, type AuthLostOrigin } from '../shared/agentAuthLost';
+import { AgentLoginGate } from './agentLoginGate';
+import { refuseSignedOutAgent } from './web/agentSignedOut';
+import { AgentSetupDetector } from '../main/firstRun/AgentSetupDetector';
 import { serveTurnFailure } from './turnFailure/serveTurnFailure';
 import { buildTurnFailedPushPayload, turnFailedPushCollapseId } from './push/turnFailedPushPayload';
 import { agentSlugToDisplay, isAgentSignal, type AgentSignal } from '../shared/hooks/signal-types';
@@ -406,6 +413,8 @@ const codexProcessStart = new Map<string, number>();
 let bindFromAgentCommandLine: ((sessionId: string, slug: string, pid: number) => void) | null = null;
 // The agent process (`pid@start`) whose command line each pane last read; cleared on its death edge.
 const agentCommandLineRead = new Map<string, string>();
+// N4 — the agent pid each pane's sign-in was last checked for (once per agent process).
+const loginCheckedProcess = new Map<string, number>();
 // #1163 — registerRpcHandlers' canonical agent-state reader (readDaemonAgentState),
 // read by BOTH WebTerminalServer construction sites for /api/workspaces (and
 // /api/sessions' `agentAlive`). Module-
@@ -440,6 +449,12 @@ let noteCodexServerLost: ((id:string)=>void) | undefined;
 let noteCodexTurnFailed: ((id:string, threadId:string, turn:unknown)=>void) | undefined;
 /** The `turn_failed` push (contract §7), set at boot once the push sender exists. */
 let pushTurnFailed: ((sessionId:string, failure:TurnFailure)=>void) | undefined;
+/** N4 — an agent's sign-in was lost (shared/agentAuthLost); set at boot once the pipe server exists. */
+let noteAuthLost: ((sessionId: string, agent: AuthLostAgent, env: Record<string, string> | undefined, origin: AuthLostOrigin, providerCode?: string) => void) | undefined;
+/** N4 — an agent and account was seen to work (a confirmed turn end, or its status said signed in). */
+let noteAuthWorks: ((agent: AuthLostAgent, env: Record<string, string> | undefined) => void) | undefined;
+/** N4 — one status probe per agent and account a minute, before a scheduled run and as an agent starts. */
+const agentLoginGate = new AgentLoginGate((agent, env) => new AgentSetupDetector().loginState(agent, env));
 /** Re-run a pane's awaiting verification (#1901), set by wireEvents. */
 let reverifyAwaiting: ((sessionId: string) => void) | undefined;
 /**
@@ -2805,7 +2820,7 @@ function registerRpcHandlers(
       release: () => { if (--held.holders === 0) startingWorkspaceNames.delete(workspaceId); },
     };
   };
-  const createWebPane: WebSessionLifecycle['create'] = async ({ workspaceId, cwd, agentLaunch, authorized, account, handoffFrom, workspaceName }) => {
+  const createWebPane: WebSessionLifecycle['create'] = async ({ workspaceId, cwd, agentLaunch, authorized, account, handoffFrom, workspaceName, dangerousLaunch }) => {
       const id = `web-${randomUUID()}`;
       // The human-readable workspace NAME is copied from a live sibling pane;
       // the daemon has no workspace registry of its own to look one up in.
@@ -2837,10 +2852,24 @@ function registerRpcHandlers(
       const agentCommand = agentLaunch ? buildAgentLaunch(agentLaunch, await installedAgentLaunchOptions(env)) : undefined;
       // The pane runs `$SHELL -lc '<agent>'`, whose profile rewrites PATH and skips
       // ~/.zshrc; the spawn is pinned to the binary and PATH the probe verified
-      // (the persisted exec command stays the plain one). The pane env gets the
-      // agent PATH too, for a later recovery that replays the plain command.
-      const launchCommand = agentCommand ? await pinnedAgentLaunch(agentCommand) : undefined;
+      // (the persisted exec command stays the plain one, without a launch mode:
+      // webPaneSpawn). The pane env gets the agent PATH too, for a later recovery
+      // that replays the plain command.
       if (agentCommand) env = { ...env, PATH: (await agentExecEnv(env)).PATH ?? env.PATH };
+      // N4 — a surely signed-out account gets 409 agent-signed-out instead of a
+      // pane stuck on the agent's sign-in screen, before anything is reserved.
+      // The phone waits on this create, so the status gets SESSION_LOGIN_WAIT_MS
+      // at most; past that the pane is created as before.
+      if (agentLaunch) {
+        await refuseSignedOutAgent((agent, probeEnv, opts) => agentLoginGate.check(agent, probeEnv, opts), agentLaunch.agent, env,
+          (agent) => noteAuthLost?.('', agent, env, 'start'), {
+            // The spawn-time refusals below keep their place ahead of this 409.
+            beforeRefusing: async () => {
+              if (authorized && !await authorized()) throw new SessionAuthorizationExpiredError();
+              if (account) assertPaneAccountUsable(desktopPhoneBridge, account);
+            },
+          });
+      }
       let relay: Awaited<ReturnType<CodexPaneRelays['prepare']>> | undefined;
       if (agentLaunch?.agent === 'codex' && process.platform !== 'win32') {
         try { relay = await codexPaneRelays.prepare(id,env.CODEX_HOME); }
@@ -2852,6 +2881,9 @@ function registerRpcHandlers(
       }
       try {
         if (relay && !/^unix:\/\/\/[A-Za-z0-9_./-]+$/.test(relay.url)) throw new Error('Unsupported Codex relay path');
+        const relayUrl = relay?.url;
+        const spawn = agentCommand ? await webPaneSpawn(agentCommand, dangerousLaunch?.mode,
+          relayUrl ? (command) => withCodexRemote(command, relayUrl, codexCdOperand(cwd ?? os.homedir())) : undefined) : undefined;
         // LAST check before a PTY exists. The HTTP layer re-authenticated after
         // reading the body, but everything above this line is asynchronous —
         // the workspace account environment, the installed-CLI lookup and the
@@ -2877,10 +2909,8 @@ function registerRpcHandlers(
           ...(cwd ? { cwd } : {}),
           env,
         }, {
-          ...(relay && agentCommand
-            // Relay flags first (they anchor on a leading `codex`), then pin the binary.
-            ? {execLaunchCommand:await pinnedAgentLaunch(withCodexRemote(agentCommand,relay.url,codexCdOperand(cwd ?? os.homedir())))}
-            : launchCommand !== agentCommand ? {execLaunchCommand:launchCommand} : {}),
+          // Relay flags first (they anchor on a leading `codex`), then pin the binary.
+          ...(spawn?.launch ? {execLaunchCommand:spawn.launch} : {}),
           // Lineage is on the meta from the moment the session exists, so the
           // first hook of the new pane already carries it.
           ...(handoffFrom ? {handoffFrom} : {}),
@@ -2889,6 +2919,13 @@ function registerRpcHandlers(
           // A remote client's pane outlives the ordinary detached TTL (bounded).
           remoteDurable: true,
         });
+        // The agent now runs in that mode: the desktop is told, as for chat/launch
+        // (a security toast), even if the pane closes again below.
+        if (dangerousLaunch) {
+          const notice = dangerousLaunchNotice(dangerousLaunch.owner, dangerousLaunch.mode, true, id);
+          pipeServer.broadcast({ type: 'notification.event', sessionId: id,
+            data: { source: 'security', title: notice.title, body: notice.body, ts: Date.now() } });
+        }
         if (relay) {
           const managed = sessionManager.getSession(id);
           if (!managed || !relay.commit(managed)) {
@@ -4509,12 +4546,79 @@ function registerRpcHandlers(
         return startTime && commandLine ? { startTime, commandLine } : null;
       },
       killTree: (pid) => killProcessTree(pid),
+      // Terminal → chat (chat/v2/fromTerminal.ts): the pane's Claude TUI.
+      terminal: {
+        holdKeyboard: (id) => nativeChatBridge?.holdKeyboard(id) ?? null,
+        binding: (id) => sessionManager.getSession(id)?.meta.resumeBinding,
+        unsupported: (id) => {
+          const meta = sessionManager.getSession(id)?.meta;
+          if (!meta) return 'That pane is gone.';
+          if (meta.exec) return 'This pane runs a command, not a shell.';
+          return meta.wslTarget ? 'A WSL pane cannot move into chat yet.' : null;
+        },
+        liveAgent: (id) => paneLiveAgent(sessionManager, agentProcessTracker, id),
+        notAtRest: async (id) => {
+          const pane = sessionManager.getSession(id);
+          if (!pane) return 'That pane is gone.';
+          const status = pane.bridge.getAgentStatus();
+          if (pane.bridge.isTurnOpen() || status === 'running') return 'Claude is still working. Try once its turn ends.';
+          if (status === 'awaiting_input') return 'Claude is waiting for an answer in the terminal.';
+          // No registry is "may be pending"; any kind of record holds the pane.
+          if (!approvalRegistry || approvalRegistry.list().pending.some((r) => r.sessionId === id)) return 'Something in this pane waits for an approval.';
+          // No watcher, or no watch of this pane's transcript, is "may be working".
+          if (!transcriptActivity || transcriptActivity.helpersWorking(id)) return 'Claude\u2019s teammates or subagents may still be working.';
+          const outcome = await queuedScreenText(sessionManager, id, true);
+          const rows = outcome?.ok
+            ? Object.assign(outcome.rows.map((r) => r.text), { undimmed: outcome.rows.map((r) => r.undimmed ?? r.text) })
+            : null;
+          if (screenBlocksChatSend(rows)) return 'A dialog is open in the terminal, or its screen could not be read.';
+          if (screenShowsRunningTurn(rows, 'claude') || titleShowsRunningTurn(pane.bridge.getTitle(), 'claude', Date.now())) {
+            return 'Claude is still working. Try once its turn ends.';
+          }
+          if (!claudeComposerEmpty(rows)) {
+            return claudeComposerVisible(rows) ? 'Claude\u2019s input holds a draft. Send or clear it first.' : 'Claude\u2019s input is not on screen.';
+          }
+          return null;
+        },
+        // notAtRest again, right before the first signal, but for the screen
+        // read (async; notAtRest read it just before).
+        stillIdle: (id) => {
+          const bridge = sessionManager.getSession(id)?.bridge;
+          return !!bridge && !!approvalRegistry && !!transcriptActivity
+            && paneTurnClosed({ agentStatus: bridge.getAgentStatus(), turnOpen: bridge.isTurnOpen() })
+            && !approvalRegistry.list().pending.some((r) => r.sessionId === id)
+            && !transcriptActivity.helpersWorking(id)
+            && !titleShowsRunningTurn(bridge.getTitle(), 'claude', Date.now());
+        },
+        tree: (id) => agentProcessTracker.agentProcessTree(id, 'claude'),
+        stop: (id, stillIdle) => stopAgentTree({
+          tree: () => agentProcessTracker.agentProcessTree(id, 'claude'),
+          stillRunning: (entries) => agentProcessTracker.stillRunning(entries),
+          kill: (pid, signal) => process.kill(pid, signal),
+          stillIdle,
+        }),
+        processesWithArg: (marker) => agentProcessTracker.processesWithArg(marker),
+        otherOwners: (id, sessionId) => sessionManager.listManagedSessions()
+          .filter((s) => s.meta.id !== id && s.meta.resumeBinding?.sessionId === sessionId
+            && agentProcessTracker.identityFor(s.meta.id)?.alive === true)
+          .map((s) => s.meta.id),
+      },
     });
     chatV2Host = host;
     pipeServer.onClientClose((clientId) => host.clientGone(clientId));
     void host.start().catch((err) => log('error', `[chatv2] start failed: ${String(err)}`));
   }
   registerChatV2Rpc((method, handler) => pipeServer.onRpc(method, handler), chatV2Host, firstPartyOnly);
+  // main asks before it types a line that starts an agent (the Resume pill,
+  // auto-resume): refused while chat v2 owns the pane, a move holds it, or the
+  // line names a conversation an active chat holds (in any pane).
+  pipeServer.onRpc(CHATV2_LAUNCH_ALLOWED_RPC, async (params, ctx) => {
+    if (!firstPartyOnly(ctx.clientId, CHATV2_LAUNCH_ALLOWED_RPC)) return { allowed: false };
+    const paneId = typeof params['paneId'] === 'string' ? params['paneId'] : '';
+    const line = typeof params['line'] === 'string' ? params['line'] : '';
+    if (!paneId || isPaneMoving(paneId) || chatV2Host?.ownsPane(paneId) === true) return { allowed: false };
+    return { allowed: !chatV2Host?.activeSessionIds().some((id) => line.includes(id)) };
+  });
   pipeServer.onRpc('daemon.chat.providers', async (_params, ctx) =>
     firstPartyOnly(ctx.clientId, 'chat.providers') ? chatSessions?.listProviders() ?? [] : []);
   for (const action of ['start', 'reconnect', 'cancel', 'respond', 'close'] as const) {
@@ -4646,6 +4750,16 @@ function registerRpcHandlers(
       .map((s) => s.meta.id),
     agentState: (id) => readDaemonAgentState(id),
     chatAgentState: (id) => readChatAgentState(id),
+    agentLaunchAt: (id) => {
+      const commandAt = sessionManager.getSession(id)?.promptLog.recent(256).filter((e) => e.type === 'command_start').pop()?.ts;
+      // `pid@start` from the launch edge, only while that pid is still the pane's agent.
+      const read = agentCommandLineRead.get(id) ?? '';
+      const at = read.indexOf('@');
+      const startedAt = at > 0 && Number(read.slice(0, at)) === agentProcessTracker.pidFor(id) ? Number(read.slice(at + 1)) : NaN;
+      const known = [commandAt, startedAt > 0 ? startedAt : undefined].filter((v): v is number => v !== undefined);
+      return known.length > 0 ? Math.max(...known) : undefined;
+    },
+    transcriptBinding: resolveTranscriptBinding,
     projector,
     terminalChat: () => terminalChat,
     managed: () => chatSessions,
@@ -4711,6 +4825,7 @@ function registerRpcHandlers(
     // pipe, not session:notification, which would also reach phones as attention.
     notify: (paneId, title, body) => pipeServer.broadcast({ type: 'notification.event', sessionId: paneId,
       data: { source: 'security', title, body, ts: Date.now() } }),
+    chatOwnsPane: (id) => chatV2Host?.ownsPane(id) === true || isPaneMoving(id),
   });
   chatBridge = bridge;
   nativeChatBridge = bridge;
@@ -4830,9 +4945,17 @@ function registerRpcHandlers(
           ? serveTurnFailure(historySession.bridge, classifyClaudeStopFailure(data.signal.payload ?? {}, now), {
             ts: Number.isFinite(data.signal.ts) ? data.signal.ts : now,
             ...(data.signal.agentSessionId ? { agentSessionId: data.signal.agentSessionId } : {}),
-            push: (f) => pushTurnFailed?.(sessionId, f),
+            push: (f) => {
+              pushTurnFailed?.(sessionId, f);
+              if (f.reason === 'auth') noteAuthLost?.(sessionId, 'claude', historySession.meta.env, 'turn', f.providerCode);
+            },
           })
           : undefined;
+        if (data.signal.kind === 'agent.stop' && data.status === 'complete' && historySession
+          && isAuthLostAgent(data.signal.agent)
+          && !['internal', 'veto', 'pending'].includes(data.decision ?? '')) {
+          noteAuthWorks?.(data.signal.agent, historySession.meta.env);
+        }
         const failure = served?.failure;
         const liveFailure = served?.current ? served.failure : undefined;
         // Scheduled runs keep their own history; they are not phone runs.
@@ -4844,6 +4967,8 @@ function registerRpcHandlers(
             status: data.status,
             ...(data.decision ? { decision: data.decision } : {}),
             ...(data.signal.agentSessionId ? { agentSessionId: data.signal.agentSessionId } : {}),
+            ...(data.signal.kind === 'agent.stop_failure' && classifyClaudeStopFailure(data.signal.payload ?? {}, now).reason === 'auth'
+              ? { authFailure: true } : {}),
           }).catch((err) => log('warn', `[automation] agent event handling failed for ${sessionId}:`, err));
         }
         // Hook Stop/awaiting-input is authoritative inside the same daemon that
@@ -5728,6 +5853,12 @@ function registerRpcHandlers(
     log: (level, message) => log(level, message),
     emit: (event) => pipeServer.broadcast({ type: AUTOMATION_EVENT, sessionId: '', data: event }),
     buildBaseCommand: async (choice, env) => buildAgentLaunch(choice, await installedAgentLaunchOptions(env)),
+    signedOut: async (agent, env) => {
+      const signedIn = await agentLoginGate.check(agent, env);
+      if (signedIn === true) noteAuthWorks?.(agent, env);
+      return signedIn === false;
+    },
+    authLost: (agent, env) => noteAuthLost?.('', agent, env, 'schedule'),
     createSession: async ({ id, cwd, env, command }) => {
       await createSessionRpc({ id, cwd, env, exec: { command } });
     },
@@ -7955,6 +8086,18 @@ async function sessionPaneFree(sessionManager: DaemonSessionManager, agentProces
   });
 }
 
+/** The pane's agent as the canonical tiers name it; none once the shell is
+ *  back at its prompt with no live agent process (#1392). */
+function paneLiveAgent(sessionManager: DaemonSessionManager, agentProcessTracker: AgentProcessTracker, id: string): string | undefined {
+  const pane = sessionManager.getSession(id);
+  if (!pane) return undefined;
+  const rawName = pane.bridge.getLastAgent();
+  const canonical = canonicalIdentityFor(agentProcessTracker, id, rawName ? agentDisplayToSlug(rawName) : undefined);
+  if (!canonical) return undefined;
+  const live = provesLiveAgent(agentProcessTracker.identityFor(id), canonical.slug);
+  return pane.promptLog.commandRunningIfKnown() === false && !live ? undefined : canonical.slug;
+}
+
 function sessionsToSave(sessionManager: DaemonSessionManager): DaemonSession[] {
   const managed = sessionManager.listSessions();
   diskOnlySessions = retireAdopted(managed, diskOnlySessions);
@@ -8570,6 +8713,23 @@ async function main(): Promise<void> {
     pushSender.notify(buildTurnFailedPushPayload(sessionId, failure), { collapseId: turnFailedPushCollapseId(sessionId) });
   };
   const pipeServer = new DaemonPipeServer(config.daemon.pipeName);
+  // N4 — main folds these into one notice per agent and account, and drops it
+  // when any pane or run of that account is seen to work. Nothing about the
+  // account beyond its folder is sent. A loss makes the login gate forget the
+  // account and a working turn records it as signed in; either way an answer
+  // still in flight from before is not used.
+  noteAuthLost = (sessionId, agent, env, origin, providerCode) => {
+    const configDir = authConfigDir(agent, env);
+    agentLoginGate.forget(agent, configDir);
+    const lost: AgentAuthLost = { agent, configDir, origin, ...(providerCode ? { providerCode } : {}), at: Date.now() };
+    log('info', `[auth] ${sessionId || (origin === 'schedule' ? 'scheduled run' : 'new pane')}: ${agent} is signed out (${origin}${providerCode ? `, ${providerCode}` : ''})`);
+    pipeServer.broadcast({ type: 'agent.auth_lost', sessionId, data: { lost } });
+  };
+  noteAuthWorks = (agent, env) => {
+    const configDir = authConfigDir(agent, env);
+    agentLoginGate.markWorks(agent, configDir);
+    pipeServer.broadcast({ type: 'agent.auth_lost', sessionId: '', data: { works: { agent, configDir } } });
+  };
   // A re-list nudge for main's HQ approval lane (deck/hqApprovalLane.ts).
   // Subscribed here, not above: that listener runs before `pipeServer` exists.
   // No record field rides along — every subscribed client gets broadcasts.
@@ -9176,17 +9336,7 @@ async function main(): Promise<void> {
     try {
       return await continueOnAccount({
         pane: (sid) => sessionManager.getSession(sid)?.meta,
-        // The pane's agent as the canonical tiers name it; none once the shell
-        // is back at its prompt with no live agent process (#1392).
-        liveAgent: (sid) => {
-          const pane = sessionManager.getSession(sid);
-          if (!pane) return undefined;
-          const rawName = pane.bridge.getLastAgent();
-          const canonical = canonicalIdentityFor(agentProcessTracker, sid, rawName ? agentDisplayToSlug(rawName) : undefined);
-          if (!canonical) return undefined;
-          const live = provesLiveAgent(agentProcessTracker.identityFor(sid), canonical.slug);
-          return pane.promptLog.commandRunningIfKnown() === false && !live ? undefined : canonical.slug;
-        },
+        liveAgent: (sid) => paneLiveAgent(sessionManager, agentProcessTracker, sid),
         turnClosed: (sid) => {
           const bridge = sessionManager.getSession(sid)?.bridge;
           if (!bridge) return false;
@@ -9208,6 +9358,7 @@ async function main(): Promise<void> {
           stillIdle,
         }),
         paneFree: (sid) => sessionPaneFree(sessionManager, agentProcessTracker, sid),
+        chatOwnsPane: (sid) => chatV2Host?.ownsPane(sid) === true,
         promptRevision: (sid) => {
           const pane = sessionManager.getSession(sid);
           if (!pane || pane.promptLog.size === 0 || pane.promptLog.isCommandRunning()) return null;
@@ -9257,13 +9408,24 @@ async function main(): Promise<void> {
     if (!managed || !guard) return undefined;
     return { epoch: guard.epoch, isCurrent: () => sessionManager.getSession(sessionId) === managed && guard.isCurrent() };
   });
+  // #2673 — a watched agent's death is checked for a relaunch only after the
+  // pane's shell started a command since that agent was picked.
+  agentProcessTracker.setLaunchCounter((sessionId) => sessionManager.getSession(sessionId)?.bridge.getCommandStarts());
   agentProcessTracker.setStateChangeListener((sessionId, state) => {
     if (!state.alive) hookIngest?.expireAuthorityFor(sessionId, state.slug);
+    // #2673 — a launch edge that replaced a live process (the tracker found a
+    // relaunch where its watched agent died) carries no death edge, so the
+    // dead launch is retired here. Its hook authority expires, except an
+    // entry the relaunch's own hooks touched since its command start.
+    if (state.alive && state.replacedLive) {
+      const launchAt = sessionManager.getSession(sessionId)?.promptLog.recent(256).filter((e) => e.type === 'command_start').pop()?.ts;
+      hookIngest?.expireAuthorityFor(sessionId, undefined, launchAt);
+    }
     if (!state.alive) automationEngine?.onAgentProcessExit(sessionId);
     // The agent that hit the limit is gone; a relaunch is a new agent.
-    if (!state.alive) usageLimits?.drop(sessionId);
+    if (!state.alive || state.replacedLive) usageLimits?.drop(sessionId);
     // A question its agent can no longer be waiting on stops holding the pane.
-    if (!state.alive) reverifyAwaiting?.(sessionId);
+    if (!state.alive || state.replacedLive) reverifyAwaiting?.(sessionId);
     // An agent whose command line names its conversation (`--resume <id>`,
     // `resume <id>`, a pinned `--session-id <id>`) binds the pane to exactly that.
     if (state.alive && state.slug && resumeGrammarFor(state.slug)) {
@@ -9271,6 +9433,25 @@ async function main(): Promise<void> {
       if (pid !== undefined) bindFromAgentCommandLine?.(sessionId, state.slug, pid);
     }
     if (!state.alive) agentCommandLineRead.delete(sessionId);
+    // N4 — an agent that starts in a pane whose account is signed out gets
+    // the notice now, not after its first turn fails. It still runs: the pane
+    // is the user's own. Once per agent process (the tracker re-emits alive);
+    // a scheduled run was already checked before its launch, and a WSL pane's
+    // agent signs in inside Linux, which a host probe cannot see.
+    if (!state.alive) loginCheckedProcess.delete(sessionId);
+    if (state.alive && isAuthLostAgent(state.slug)) {
+      const managed = sessionManager.getSession(sessionId);
+      const pid = agentProcessTracker.pidFor(sessionId);
+      if (managed && pid !== undefined && loginCheckedProcess.get(sessionId) !== pid && !managed.meta.wslTarget && !isWslShell(managed.meta.cmd)
+        && automationEngine?.ownsPane(sessionId) !== true && !isBrainPty({ id: sessionId, env: managed.meta.env })) {
+        loginCheckedProcess.set(sessionId, pid);
+        const agent = state.slug;
+        void agentLoginGate.check(agent, managed.meta.env).then((signedIn) => {
+          if (signedIn === true) noteAuthWorks?.(agent, managed.meta.env);
+          else if (signedIn === false && sessionManager.getSession(sessionId) === managed) noteAuthLost?.(sessionId, agent, managed.meta.env, 'start');
+        });
+      }
+    }
     // A Codex launch edge opens a fresh cwd-bind window; a death edge closes it.
     codexCwdBinder?.reset(sessionId);
     codexProcessStart.delete(sessionId);
@@ -9739,7 +9920,18 @@ async function main(): Promise<void> {
     if (!classified) return;
     // The thread id is the conversation id `/turns` resolves for a Codex pane,
     // so a pane that moved to another thread does not show this failure.
-    const served = serveTurnFailure(session.bridge, classified, { ts: now, agentSessionId: threadId, push: (f) => pushTurnFailed?.(id, f) });
+    const served = serveTurnFailure(session.bridge, classified, { ts: now, agentSessionId: threadId, push: (f) => {
+      pushTurnFailed?.(id, f);
+      if (f.reason !== 'auth') return;
+      noteAuthLost?.(id, 'codex', session.meta.env, 'turn', f.providerCode);
+      // A scheduled run's Codex turn failed on sign-in: the relay is the proof
+      // the turn ended, so the run ends now, as login_needed (Claude's comes
+      // through its StopFailure hook).
+      if (automationEngine?.ownsPane(id)) {
+        automationEngine.onAgentEvent(id, { kind: 'agent.stop_failure', status: 'error', authFailure: true })
+          .catch((err) => log('warn', `[automation] agent event handling failed for ${id}:`, err));
+      }
+    } });
     if (!served) return;
     const { failure } = served;
     session.bridge.noteTranscriptTurnEnd(now);

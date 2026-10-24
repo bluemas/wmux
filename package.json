@@ -1,7 +1,7 @@
 {
   "name": "wmux",
   "productName": "wmux",
-  "version": "4.9.0",
+  "version": "4.10.0",
   "description": "Workspace multiplexer for AI agents — run fleets of Claude Code, Codex & Gemini in parallel on Windows & macOS, with MCP browser automation built in",
   "private": true,
   "main": ".vite/build/index.js",
@@ -19,7 +19,7 @@
     "typecheck:quiet": "node scripts/typecheck.mjs --quiet",
     "build:daemon": "tsc -p tsconfig.daemon.json && esbuild dist/daemon/daemon/index.js --bundle --platform=node --outfile=dist/daemon-bundle/index.js --external:node-pty --external:koffi && npm run build:daemon-web",
     "build:daemon-web": "node scripts/build-daemon-web.mjs",
-    "build:cli": "tsc -p tsconfig.cli.json && esbuild dist/cli/cli/index.js --bundle --platform=node --outfile=dist/cli-bundle/index.js && node scripts/copy-bridge.mjs",
+    "build:cli": "tsc -p tsconfig.cli.json && esbuild dist/cli/cli/index.js --bundle --platform=node --outfile=dist/cli-bundle/index.js --external:koffi && node scripts/copy-bridge.mjs",
     "build:mcp": "tsc -p tsconfig.mcp.json && node scripts/build-mcp.js",
     "build:computer-use-macos": "bash native/computer-use-macos/build.sh",
     "test:computer-use-macos": "swift test --package-path native/computer-use-macos",
@@ -102,7 +102,7 @@
     "@xterm/addon-serialize": "0.15.0-beta.301",
     "@xterm/headless": "6.1.0-beta.303",
     "autoprefixer": "^10.4.27",
-    "electron": "42.11.3",
+    "electron": "42.11.16",
     "esbuild": "0.25.12",
     "eslint": "^8.57.1",
     "eslint-plugin-import": "^2.32.0",
@@ -144,7 +144,7 @@
     "smol-toml": "^1.9.0",
     "ws": "^8.21.0",
     "yaml": "2.9.0",
-    "zod": "^4.3.6",
+    "zod": "^4.6.7",
     "zustand": "^5.0.12"
   },
   "overrides": {

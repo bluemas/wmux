@@ -2701,7 +2701,10 @@ the bytes land on disk and you put the **path** in the composer.
 ```
 POST /api/upload      body: raw JPEG or PNG bytes (no multipart)
   → 201 {path, expiresAt}
+  → 400 {error: 'invalid-file-extension'}   (POST /api/upload-file only)
+  → 401 {error: 'authorization-expired'}
   → 403 {error: 'uploads-disabled: server started without --allow-upload'}
+  → 403 {error: 'read-only: …', detail}
   → 413 {error: 'payload too large'}
   → 415 {error: 'unsupported-format: only JPEG and PNG are accepted'}
   → 429 {error: 'too-many-uploads: try again in a moment'}
@@ -2710,18 +2713,39 @@ POST /api/upload      body: raw JPEG or PNG bytes (no multipart)
   → 507 {error: 'uploads-full: quota exceeded, try again later'}
 ```
 
-Any authenticated principal may call it — operator token or device credential,
-same as every other route.
+**An upload takes two grants.** The server needs `--allow-upload`, and the
+caller needs input permission — the same grant `POST /api/input` asks for
+(`--allow-input` on the server, and for a device credential its own pairing
+grant). Typing into a pane the operator is watching is a smaller thing than
+writing a file into their home directory, so input never implies upload; and
+an upload follows input, so a device paired read-only cannot upload either.
 
-**The grant is its own flag.** `--allow-upload`, not `--allow-input`: typing
-into a pane the operator is watching is a smaller thing than writing a file into
-their home directory, so one never implies the other. Gate the button on
-`allowUpload` from `/api/config`, and match the 403 by **prefix** — the text
-after the colon is prose and may be reworded, the `uploads-disabled:` tag is
-not. A daemon predating this route has no `allowUpload` key at all; read a
-missing key as `false` and hide the button. On the desktop the grant is the
-**Photo & file upload** toggle in the Remote popover; it persists the same way
-as Conversation access.
+Two 403s, told apart by their tag. Match each by **prefix** — the text after
+the colon is prose and may be reworded, the tags are not:
+
+- `uploads-disabled:` — the server runs without `--allow-upload`. Checked
+  before the caller's grant, so a server with uploads off answers this
+  whatever the caller may do.
+- `read-only:` — uploads are on, but this caller may not type: the server runs
+  without `--allow-input`, or this device was paired without permission to
+  type. Same body as the input routes' refusal, `detail` included. Nothing is
+  written and nothing counts toward the bounds below.
+
+The order, after authentication: on `POST /api/upload-file` only, a bad
+`X-Wmux-File-Extension` header is `400 invalid-file-extension` before
+anything else; then `uploads-disabled:`; then `read-only:`; then the body is
+read. The grant is read again once the whole body is in, so a grant withdrawn
+while the body was arriving is also `read-only:` (its `detail` says the input
+permission changed), and a device revoked meanwhile is
+`401 authorization-expired`. Neither writes the file.
+
+Gate the button on `allowUpload` from `/api/config`. It is **this caller's**
+effective grant, like `allowInput`: `true` only when the server allows uploads
+and this caller may type, so a read-only device reads `false`.
+`generalFileUpload` follows it. A daemon predating this route has no
+`allowUpload` key at all; read a missing key as `false` and hide the button.
+On the desktop the server grant is the **Photo & file upload** toggle in the
+Remote popover; it persists the same way as Conversation access.
 
 **The bytes decide the format, not your header.** JPEG (`FF D8 FF`) and PNG
 (the 8-byte signature) only; anything else is 415, including an empty body.
@@ -3365,13 +3389,75 @@ On a Windows host `~` means the user profile and only paths under it are
 listed; WSL paths are not browsed.
 
 `POST /api/sessions` optionally accepts
-`agentLaunch:{agent:"claude"|"codex",model?:id,effort?:level}`. The server validates
+`agentLaunch:{agent:"claude"|"codex",model?:id,effort?:level,mode?:mode,confirm?:string}`. The server validates
 against its current catalog and constructs only the known launcher and flags.
 The actual spawn uses the daemon's existing `exec.command` path; `cmd` continues
 to select the wrapper shell, not a command string. No arbitrary launch command,
-prompt, permission override, or environment is accepted through this field.
+prompt, permission flag, or environment is accepted through this field; the
+only permission choice is `mode` below.
 Omitting agentLaunch retains normal shell creation. A 201 confirms creation of
 the pane, not authentication or acceptance of the model by the provider.
+
+**Launch mode.** `mode` and `confirm` follow `POST …/chat/launch`'s rules
+(see "Dangerous modes" there):
+
+- `mode` is `"default"`, `"bypass"` (Claude only, `--dangerously-skip-permissions`)
+  or `"yolo"` (Codex only, `--dangerously-bypass-approvals-and-sandbox`). Omitted
+  means `default`, and the request is exactly the one an older app sends. Any
+  other value, or a mode for the other agent, is
+  `400 {error:"invalid-agent-launch", detail, effect:"none"}`.
+- A mode other than `default` needs the grants chat/launch needs (input and
+  `--allow-transcript`: without the transcript grant it is the transcript
+  refusal, `403`), then the host's ceiling `wmux web --allow-dangerous-launch`
+  (`403 {error:"dangerous-launch-disabled: …", effect:"none"}`, checked before
+  the confirm), then `confirm` equal to `"<agent>:<mode>"` exactly, inside
+  `agentLaunch` (e.g. `"codex:yolo"`); missing or different is
+  `428 {error:"dangerous-mode-unconfirmed", effect:"none"}`. `confirm` is
+  ignored for `default`.
+- These checks run before any lookup, and the ceiling is asked again right
+  before the spawn; off by then is the same `403`. No pane is created on any
+  refusal.
+- `/api/config` carries `agentLaunchModes: {claude:[…], codex:[…]}` whenever
+  `agentLaunch` is true: `default` only, plus `bypass` / `yolo` when both the
+  ceiling and the transcript grant are on (the same ceiling `chatLaunchModes`
+  states). Send `mode` only to a daemon whose `agentLaunchModes` lists it: an
+  older daemon ignores the field and starts the pane in `default`.
+- The 201 row adds `launchMode` (the mode applied) when the body named a `mode`.
+- The mode applies to this spawn only. The pane's stored launch command stays
+  the plain one, so the desktop shows it as a plain `claude` / `codex` pane and
+  a daemon recovery replays it in `default` (a recovered pane never regains a
+  dangerous mode on its own). To continue in that mode, launch again with
+  `chat/launch {resume:true, mode, confirm}`.
+- A pane started in a dangerous mode raises a notification on the host once its
+  process exists; the start and every refusal are written to the daemon log.
+
+**Signed-out agent.** A create whose `agentLaunch.agent` is `claude` or `codex`
+(any `mode`) is refused when that agent's own status command
+(`claude auth status --json` / `codex login status`) says the pane's account is
+signed out. The account is the workspace binding or the body's `accountId`.
+
+- `409 {error:"agent-signed-out", agent:"claude"|"codex", effect:"none"}`. No
+  pane is created and nothing is reserved. The body carries no account id,
+  folder or provider text; `agent` echoes the request.
+- It is checked last, inside the create, just before the spawn: after every
+  refusal above, the account checks and `cwd-not-found`. The refusals the
+  create otherwise makes only at the spawn (`401 authorization-expired`, the
+  ceiling's `403`, `409 account-directory-missing`) still answer first.
+- Only a definite "signed out" refuses. A status that cannot tell, fails, or
+  has not answered within **3 s** creates the pane as before. The daemon keeps
+  waiting for that answer in the background and caches it for the next create.
+  A plain shell create (no `agentLaunch`) is never refused this way.
+- A Codex account that runs on an API key in the pane's environment
+  (`OPENAI_API_KEY`, `CODEX_API_KEY`) or on another `model_provider` in its
+  `config.toml` is never refused: `codex login status` does not report either.
+- The host shows its signed-out notice (one per agent and account, with Sign
+  in again). Offer "sign in on the computer" rather than a retry loop. A retry
+  after signing in goes through at once: a signed-out answer is never cached.
+- There is no `/api/config` flag. An older daemon never sends this error, and a
+  client that does not know the tag can treat it like any refused create.
+- `POST /api/sessions` keeps no request receipt: a retried request creates
+  another pane. Reset the mode to `default` after every attempt and whenever
+  the agent changes; never persist it.
 
 Codex is advertised only when its installed CLI exposes `--model` and `--config`.
 Its visible model IDs and per-model effort levels come from that account's
@@ -5105,9 +5191,9 @@ remain separate integration checks.
 ### General file attachments
 
 `generalFileUpload` in config advertises `POST /api/upload-file` when uploads
-are enabled and storage is wired. It uses the same authentication and explicit
-`--allow-upload` grant, 10 MiB body cap, concurrency/aggregate quota and expiry
-as photo upload. The raw body is stored unchanged with private 0600 permissions.
+are enabled for this caller (`allowUpload`) and storage is wired. It uses the
+same authentication, the same two grants and 403s (§8), 10 MiB body cap,
+concurrency/aggregate quota and expiry as photo upload. The raw body is stored unchanged with private 0600 permissions.
 It never executes or inserts the file into a pane.
 
 The optional `X-Wmux-File-Extension` header accepts 1–12 ASCII alphanumeric
@@ -5876,7 +5962,8 @@ The ceiling is re-read after the body and again before typing. `claude+yolo` or
 or ends `launch-unconfirmed`, raises a notification on the host; those outcomes
 and the two refusals above are written to the daemon's audit log (no prompt
 text). Reset the mode to `default` after every attempt and whenever the agent
-changes; never persist it.
+changes; never persist it. A new agent pane takes the same `mode` and
+`confirm` under the same rules: `POST /api/sessions {agentLaunch:{mode}}`.
 
 | Outcome | HTTP | Body | `effect` |
 | --- | --- | --- | --- |

@@ -33,7 +33,7 @@ import { CHAT_CANCEL_OBSERVE_MS, type StoredCancelProgress } from '../../shared/
 import { isActiveQueueState, type ChatQueueReason, type ChatQueueRecord, type ChatQueueState, type ChatQueueStore } from './ChatQueue';
 import {
   CHAT_LAUNCH_MAX_UNITS, CHAT_MESSAGE_RETENTION_MS, CHAT_SEND_MAX_UNITS, OPENCODE_MAX_SEND_BYTES, OPENCODE_REQUEST_MAX_BYTES,
-  checkChatId, fileHistoryEpoch, openCodeSendBytes, tuiHistoryEpoch,
+  checkChatId, dangerousLaunchNotice, fileHistoryEpoch, openCodeSendBytes, tuiHistoryEpoch,
   type ChatBlocked, type ChatBridge, type ChatCancelOutcome, type ChatCancelRequest, type ChatCancelTag, type ChatEffect, type ChatLaunchOutcome, type ChatLaunchPreview, type ChatLaunchReason,
   type ChatLaunchRequest, type ChatLaunchTag, type ChatOwner, type ChatResolution, type ChatSendOutcome, type ChatSendRequest,
   type ChatSendTag, type ChatTurn, type DangerousLaunchTrace,
@@ -131,6 +131,15 @@ export interface NativeChatBridgeDeps<P extends ChatPane> {
   installedAgents(env: NodeJS.ProcessEnv): Promise<AgentLaunchOptions[]>;
   /** Whether a pane's binding still names a conversation to continue (default: its transcript and folder exist). */
   boundSessionLives?(binding: ResumeBinding, env: NodeJS.ProcessEnv, fresh: boolean): Promise<boolean>;
+  /**
+   * The earliest the pane's running agent can have started (its process start
+   * or the shell's last command start, whichever is later); undefined when
+   * neither is known. A binding captured before it belongs to an earlier agent.
+   */
+  agentLaunchAt?(id: string): number | undefined;
+  /** The binding the projector reads the pane's transcript through (a live Codex relay's
+   *  selection first); default the pane's stored binding. */
+  transcriptBinding?(id: string): ResumeBinding | undefined;
   /** Panes whose resume binding names this agent session (the daemon's own records). */
   panesBoundTo?(agent: TerminalLaunchAgent, sessionId: string): string[];
   /** Whether the agent takes a first message on its resume line (default RESUME_TAKES_PROMPT). */
@@ -165,6 +174,8 @@ export interface NativeChatBridgeDeps<P extends ChatPane> {
   platform?: NodeJS.Platform;
   /** Paste→Enter delay override (tests). */
   delay?: (ms: number) => Promise<void>;
+  /** Chat v2 owns the pane, or a move into chat holds it: nothing launches or resumes an agent there. */
+  chatOwnsPane?: (id: string) => boolean;
 }
 
 type QueueMethods = 'queueEnabled' | 'queue' | 'dequeue' | 'steer' | 'dropQueue' | 'delivered';
@@ -192,6 +203,12 @@ export interface NativeChatBridge extends Omit<ChatBridge, QueueMethods>, Requir
   desktopRewind(id: string, opts?: { kitty?: boolean }): Promise<ClaudeRewindResult>;
   /** A file-binding send is between its first check and its last write (Stop must wait). */
   sendInFlight(id: string): boolean;
+  /**
+   * Take the pane's keyboard for a move into chat: sends, Stop, Rewind and
+   * launches are refused until the release is called. Null while one of them
+   * holds it.
+   */
+  holdKeyboard(id: string): (() => void) | null;
   /**
    * The write-time approval fence for a chat write (send or Stop): any pending
    * record of any kind, or no registry at all. Kind-blind by design.
@@ -570,6 +587,14 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
     return { ready: reason === 'ok', reason, agents: await installed(pane), maxPromptUnits: CHAT_LAUNCH_MAX_UNITS };
   };
 
+  /** The pane's binding is this conversation's, captured since its live agent started. */
+  const runningAgentBound = (id: string, status: TranscriptStatus): boolean => {
+    const binding = deps.transcriptBinding ? deps.transcriptBinding(id) : deps.pane(id)?.meta.resumeBinding;
+    const since = deps.agentLaunchAt?.(id);
+    return status.agentAlive === true && !!binding && binding.sessionId === status.agentSessionId
+      && since !== undefined && binding.ts >= since;
+  };
+
   const resolve = async (id: string): Promise<ChatResolution> => {
     const found = await route(id);
     if (found.kind === 'native') {
@@ -590,7 +615,15 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
       const epoch = managed?.conversationEpoch(id);
       if (status && epoch) return { source: 'managed', status, epoch };
     }
-    const status = fileStatus(id);
+    let status = fileStatus(id);
+    // An empty transcript (Claude's before its first prompt, a fresh Codex
+    // thread's) is a conversation only for the agent running now: one that
+    // exited without writing a record left nothing to show, and the pane can
+    // launch; a relaunch shows nothing until its own session start binds it.
+    if (status.available && status.sizeBytes === 0 && !runningAgentBound(id, status)) {
+      status = { available: false, reason: 'unreadable', agentStatus: status.agentStatus, agentAlive: false,
+        ...(status.transcriptBasename ? { transcriptBasename: status.transcriptBasename } : {}) };
+    }
     if (status.available) {
       // The web layer derives the same value when this is absent; keep them one formula.
       const agent = status.terminal?.agent;
@@ -1744,6 +1777,8 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
       head = withLaunchSessionId(head, launchId);
     }
     if (launching.has(id)) return fail('launch-pending');
+    // A chat-v2 record (or a move into chat) owns the pane: a launch would be a second writer.
+    if (deps.chatOwnsPane?.(id)) return fail(resume ? 'resume-in-use' : 'launch-not-ready', resume ? undefined : 'shell-busy');
     launching.add(id);
     let relay: LaunchRelay | undefined;
     let typing = false;
@@ -1907,10 +1942,8 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
       const { at, owner, paneId, agent, mode, clientLaunchId, outcome } = trace;
       deps.log('info', `[chat] dangerous-launch ${JSON.stringify({ at, owner, paneId, agent, mode, clientLaunchId, outcome })}`);
       if (mode === 'default' || outcome !== 'submitted' && outcome !== 'launch-unconfirmed') return;
-      const who = owner === 'operator' ? 'The operator token' : 'A phone';
-      const what = agent === 'codex' ? 'Codex with approvals and sandbox off' : 'Claude with permission prompts off';
-      deps.notify(paneId, 'Agent started from the phone',
-        `${who} ${outcome === 'submitted' ? 'started' : 'may have started'} ${what} in pane ${paneId}.`);
+      const notice = dangerousLaunchNotice(owner, mode, outcome === 'submitted', paneId);
+      deps.notify(paneId, notice.title, notice.body);
     },
     status: async (id) => {
       const found = await route(id);
@@ -1942,6 +1975,12 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
     desktopInterrupt,
     desktopRewind,
     sendInFlight: (id) => sending.has(id),
+    holdKeyboard: (id) => {
+      if (sending.has(id) || launching.has(id)) return null;
+      sending.add(id);
+      let held = true;
+      return () => { if (held) { held = false; sending.delete(id); } };
+    },
     hasOpenApproval,
     desktopSkills: (id, agent) => skillsWith(id, agent, 'cwd'),
     cancelOutcomeEnabled: () => !!deps.cancelReceipts,
