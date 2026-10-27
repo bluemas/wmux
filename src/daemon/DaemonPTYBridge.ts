@@ -1544,6 +1544,8 @@ export class DaemonPTYBridge extends EventEmitter {
     }
     if (signalTs < turnEvidenceAt) return;
     this.preTurn = true;
+    // `/clear` is a command, not a turn: no Stop ends the episode its Enter opened.
+    if (source === 'clear' && this.turnOpen && !this.awaitingHuman) this.closeTurn();
     if (atIdlePrompt && this.sessionId) this.emit('idle', { sessionId: this.sessionId, preTurn: true });
   }
 
