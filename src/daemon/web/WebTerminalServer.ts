@@ -4,6 +4,7 @@ import { buildAgentLaunch, type AgentLaunchChoice, type AgentLaunchOptions } fro
 import { AgentSignedOutError } from './agentSignedOut';
 import type { TerminalLaunchAgent, TerminalLaunchMode } from '../../shared/transcript/terminalChat';
 import { DesktopPhoneError, type DesktopPhoneBridge } from '../phone/DesktopPhoneBridge';
+import { AGENT_ENV_COMMAND, AGENT_ENV_ROUTE, parseAgentEnvSummary } from '../../shared/agentEnvSummary';
 import type { RunHistoryStore } from '../history/RunHistoryStore';
 import { agentAliveVerdict } from '../canonicalAgent';
 import { applyPaneAccount, handoffRowOf, paneAccountFailure, resolvePaneAccount, verifyHandoff, type ResolvedPaneAccount } from '../phone/paneAccount';
@@ -200,9 +201,13 @@ import { BOTS_ROUTE, botsResponse, botsSupported } from './bots';
 import { GuestRateLimiter, guestRouteResponse, readGuestBody, type GuestBotResolver } from './guestBotRoutes';
 import { isGuestRoute, looksLikeGuestCredential, type GuestBotGates } from '../../shared/guestBots';
 import { BOT_APPROVALS_ROUTE, botApprovalDecisionRefusal, botApprovalsResponse, botApprovalsSupported, type BotApprovalsCaller } from './botApprovals';
+import { BROWSER_CHROME_PREVIEW_CAPABILITY, PHONE_BROWSER_ERROR_STATUS, isPhoneBrowserErrorCode } from '../../shared/phoneBrowserPreview';
+import { BROWSER_HELP_DECISION_ROUTE, BROWSER_HELP_LIST_ROUTE, browserHelpDecisionRefusal, browserHelpDecisionResponse, browserHelpListResponse, browserHelpSupported, type BrowserHelpTableView } from './browserHelp';
+import { browserHelpFrameJson, isBrowserHelpId, type PhoneBrowserHelpFrame } from '../../shared/phoneBrowserHelp';
 import { WORKER_RESUME_ROUTE, workerResumeRefusal, workerResumeResponse, workerResumeSupported } from './workerResume';
 import type { ChatV2Binding } from '../../shared/chatv2/ipc';
 import { buildWebCsp, WEB_APP_FONT_FILE } from './webCsp';
+import { folderTrustRefusal } from '../folderTrustState';
 // Type only — the channel service implementation stays out of this module.
 // The web server is a STATELESS consumer of its phone projection (§9): it
 // lists, pages, acks, joins and republishes mention notifications. The
@@ -859,6 +864,12 @@ interface WebTerminalServerDeps {
    * check; `moaSession` re-validates it against the live session.
    */
   moaPane?: () => MoaPaneFact | null;
+  /**
+   * Main's open browser help requests (`daemon.browserHelp.set`), held by the
+   * daemon. `GET /api/browser-help` is served from it; absent or unpublished,
+   * that route answers 503.
+   */
+  browserHelp?: () => BrowserHelpTableView | null;
   /** The prompts main sent to the HQ brain (`moa-prompts.json`), read per Moa `/turns` request. Absent: none. */
   moaPrompts?: () => NotedPrompt[];
   /** Records one phone send to the Moa pane (the device audit log). */
@@ -2759,6 +2770,10 @@ export class WebTerminalServer {
     // gate and before the route table so no route can forget it, and so a
     // failed credential never counts as someone using the daemon.
     this.lastApiActivityAt = this.now();
+    // Desktop-internal: a paired PC compares agent environments with it
+    // (shared/agentEnvSummary.ts). Names, versions and hashes only, read by
+    // the desktop; not part of the phone contract.
+    if (req.method === 'GET' && p === AGENT_ENV_ROUTE) return this.handleAgentEnv(res);
     if (req.method === 'GET' && p === '/api/config') {
       // The handshake rides HERE rather than on a route of its own: this is
       // already the first call a client makes after pairing, so a dedicated
@@ -2848,6 +2863,10 @@ export class WebTerminalServer {
         browserCreation: this.mayInput(principal) && this.opts?.allowTranscript === true && desktopAvailable,
         browserKeyboard: this.mayInput(principal) && this.opts?.allowTranscript === true && desktopAvailable,
         browserPreview: this.opts?.allowTranscript === true && desktopAvailable,
+        // `GET …/browser?chrome=1` also lists and drives dedicated-profile
+        // Chrome tabs: the transcript consent and a desktop that announced it.
+        // OMITTED otherwise (an older desktop announces nothing).
+        ...(this.opts?.allowTranscript === true && this.availableDesktop()?.supports(BROWSER_CHROME_PREVIEW_CAPABILITY) === true ? { browserPreviewChrome: true } : {}),
         workspaceCreation: this.mayInput(principal) && desktopAvailable,
         quickCommands: this.opts?.allowTranscript === true && desktopAvailable,
         desktopAccounts: this.opts?.allowTranscript === true && desktopAvailable,
@@ -2956,6 +2975,11 @@ export class WebTerminalServer {
         // `/api/bot-approvals/*` answer here: a desktop that announced both
         // commands. OMITTED otherwise. A decision still needs the grant.
         ...(botApprovalsSupported(this.availableDesktop()) ? { botApprovals: true } : {}),
+        // `/api/browser-help` answers here and `browser.help` frames arrive on
+        // `/api/events`: the transcript consent (the list carries the agent's
+        // prompt) and a desktop that announced `browser.help`. OMITTED
+        // otherwise. A decision still needs the grant.
+        ...(browserHelpSupported(this.availableDesktop(), this.opts?.allowTranscript === true) ? { browserHelp: true } : {}),
         // `POST /api/bot-tasks/:taskId/resume` answers here: a desktop that
         // announced the command. OMITTED otherwise. A resume still needs the grant.
         ...(workerResumeSupported(this.availableDesktop()) ? { workerResume: true } : {}),
@@ -3228,6 +3252,38 @@ export class WebTerminalServer {
       const refused = botApprovalDecisionRefusal(caller, readOnly);
       if (refused) this.json(res,refused.status,refused.body,{'Cache-Control':'no-store'});
       else this.readJsonBody(req,res,answer);
+      return;
+    }
+    // Browser help requests: listed from the daemon's table, answered by the
+    // operator or a device with an explicit input grant (browserHelp.ts).
+    if (req.method === 'GET' && p === BROWSER_HELP_LIST_ROUTE) {
+      const r = browserHelpListResponse({
+        allowTranscript: this.opts?.allowTranscript === true, desktop: this.availableDesktop(), table: this.deps.browserHelp?.() ?? null,
+        isBrainPane: (ptyId) => this.isBrainApproval(ptyId),
+        // A pane /api/sessions lists: a live session (listLiveSessions'
+        // states); brain panes never get here (phoneRow answers them first).
+        requesterSession: (ptyId) => {
+          const managed = this.deps.sessionManager.getSession(ptyId);
+          return managed && (managed.meta.state === 'attached' || managed.meta.state === 'detached') ? ptyId : undefined;
+        },
+      });
+      return this.json(res, r.status, r.body, { 'Cache-Control': 'no-store' });
+    }
+    const browserHelpRoute = req.method === 'POST' ? BROWSER_HELP_DECISION_ROUTE.exec(p) : null;
+    if (browserHelpRoute) {
+      const caller = this.botApprovalsCaller(principal);
+      const gates = { readOnly: this.opts?.allowInput !== true, allowTranscript: this.opts?.allowTranscript === true };
+      const reauthorize = async () => {
+        const fresh = await this.authenticate(req,url,false).catch(() => ({ok:false as const}));
+        return fresh.ok && sameCaller(principal, fresh.principal) ? this.botApprovalsCaller(fresh.principal) : null;
+      };
+      // Refused before the body is read; checked again once it is in.
+      const refused = browserHelpDecisionRefusal(caller, gates);
+      if (refused) this.json(res,refused.status,refused.body,{'Cache-Control':'no-store'});
+      else this.readJsonBody(req,res,(body: unknown) => void browserHelpDecisionResponse(browserHelpRoute[1], body, {
+        caller, desktop: this.availableDesktop(), table: this.deps.browserHelp?.() ?? null, ...gates, reauthorize,
+        isBrainPane: (ptyId) => this.isBrainApproval(ptyId),
+      }).then(r => this.json(res,r.status,r.body,{'Cache-Control':'no-store'})));
       return;
     }
     // A stopped bot worker's Resume: the operator, or a device with an
@@ -3873,6 +3929,21 @@ export class WebTerminalServer {
     });
   }
 
+  /** GET /api/agent-env: this PC's agent environment summary, from the desktop, in the reader's bounds. */
+  private async handleAgentEnv(res: http.ServerResponse): Promise<void> {
+    const desktop = this.availableDesktop();
+    if (!desktop || !desktop.supports(AGENT_ENV_COMMAND)) return this.json(res, 503, { error: 'desktop-unavailable' });
+    let reply: unknown;
+    try {
+      reply = await desktop.request(AGENT_ENV_COMMAND, {});
+    } catch (err) {
+      return this.json(res, 503, { error: err instanceof DesktopPhoneError ? err.tag : 'desktop-unavailable' });
+    }
+    // Main's answer goes out only in the shape and bounds a reader enforces.
+    const summary = parseAgentEnvSummary(reply);
+    return summary ? this.json(res, 200, summary) : this.json(res, 503, { error: 'desktop-unavailable' });
+  }
+
   /**
    * The desktop sidebar snapshot for the two polled list routes, or null.
    * Stale-while-revalidate (see DESKTOP_SIDEBAR_TTL_MS): answers from the
@@ -4251,14 +4322,25 @@ export class WebTerminalServer {
     if (!workspaceId) return this.json(res,409,{error:'workspace-required'});
     const desktop = this.availableDesktop();
     if (!desktop) return this.json(res,503,{error:'desktop-unavailable'});
-    const send = (command: 'browser.list' | 'browser.capture' | 'browser.viewport' | 'browser.navigate' | 'browser.type' | 'browser.key' | 'browser.tap' | 'browser.open' | 'browser.scroll', payload: Record<string,unknown>) => {
-      void desktop.request(command,{...payload,workspaceId}).then(result => this.json(res,200,result,{'Cache-Control':'no-store'}))
-        .catch(() => this.json(res,503,{error:'browser-preview-unavailable'}));
+    const send = (command: 'browser.list' | 'browser.capture' | 'browser.viewport' | 'browser.navigate' | 'browser.type' | 'browser.key' | 'browser.tap' | 'browser.open' | 'browser.scroll' | 'browser.focus', payload: Record<string,unknown>) => {
+      void desktop.request(command,{...payload,workspaceId}).then(result => {
+        // Main's words for a failure ride inside a successful reply
+        // (shared/phoneBrowserPreview.ts); an unknown code is just a failure.
+        if (result && typeof result === 'object' && 'error' in result) {
+          const code = (result as {error?:unknown}).error;
+          return isPhoneBrowserErrorCode(code) ? this.json(res,PHONE_BROWSER_ERROR_STATUS[code],{error:code},{'Cache-Control':'no-store'})
+            : this.json(res,503,{error:'browser-preview-unavailable'});
+        }
+        return this.json(res,200,result,{'Cache-Control':'no-store'});
+      }).catch(() => this.json(res,503,{error:'browser-preview-unavailable'}));
     };
     if (req.method === 'GET') {
       const surfaceId = url.searchParams.get('surfaceId');
       if (surfaceId !== null && (!surfaceId || surfaceId.length > 128)) return this.json(res,400,{error:'invalid-browser-surface'});
-      return surfaceId ? send('browser.capture',{surfaceId}) : send('browser.list',{});
+      // `?chrome=1`: this phone also takes dedicated-profile Chrome tabs. Asked
+      // of a desktop that announced it only; any other ask lists as before.
+      const chrome = url.searchParams.get('chrome') === '1' && desktop.supports(BROWSER_CHROME_PREVIEW_CAPABILITY);
+      return surfaceId ? send('browser.capture',{surfaceId}) : send('browser.list',chrome ? {chrome:true} : {});
     }
     this.readJsonBody(req,res,async body => {
       const fresh = await this.authenticate(req,url,false).catch(() => ({ok:false as const}));
@@ -4267,8 +4349,13 @@ export class WebTerminalServer {
       if (session && (this.attachableSession(fresh.principal,id!) !== session || session.meta.env?.[ENV_KEYS.WORKSPACE_ID] !== workspaceId)) return this.json(res,404,{error:'session not found'});
       if (!body || typeof body !== 'object' || Array.isArray(body)) return this.json(res,400,{error:'invalid-browser-request'});
       const value = body as Record<string,unknown>;
-      if (value.action === 'open' && typeof value.url === 'string' && value.url.length <= 4096) return send('browser.open',{url:value.url});
+      if (value.action === 'open' && typeof value.url === 'string' && value.url.length <= 4096) {
+        if (value.backend !== undefined && value.backend !== 'builtin' && value.backend !== 'chrome') return this.json(res,400,{error:'invalid-browser-request'});
+        return send('browser.open',{url:value.url,...(value.backend !== undefined ? {backend:value.backend} : {})});
+      }
       if (typeof value.surfaceId !== 'string' || !value.surfaceId || value.surfaceId.length > 128) return this.json(res,400,{error:'invalid-browser-surface'});
+      // Bring the tab forward on the desktop: only ever on this explicit ask.
+      if (value.action === 'focus') return send('browser.focus',{surfaceId:value.surfaceId});
       if (value.action === 'viewport' && (value.mode === 'mobile' || value.mode === 'desktop')) return send('browser.viewport',{surfaceId:value.surfaceId,mode:value.mode});
       if (value.action === 'navigate' && typeof value.url === 'string' && value.url.length <= 4096) return send('browser.navigate',{surfaceId:value.surfaceId,url:value.url});
       if ((value.action === 'type' || value.action === 'key' || value.action === 'tap' || value.action === 'scroll') && typeof value.expectedURL === 'string' && value.expectedURL.length <= 4096) {
@@ -4277,7 +4364,19 @@ export class WebTerminalServer {
           if (value.action === 'tap') return send('browser.tap',{...scope,x:value.x,y:value.y,geometry:value.geometry});
           if (typeof value.deltaX === 'number' && Math.abs(value.deltaX) <= 1 && typeof value.deltaY === 'number' && Math.abs(value.deltaY) <= 1) return send('browser.scroll',{...scope,x:value.x,y:value.y,geometry:value.geometry,deltaX:value.deltaX,deltaY:value.deltaY});
         }
-        if (value.action === 'type' && typeof value.text === 'string' && value.text.length > 0 && value.text.length <= 4096) return send('browser.type',{...scope,text:value.text});
+        if (value.action === 'type' && typeof value.text === 'string' && value.text.length > 0 && value.text.length <= 4096) {
+          if (value.helpRequestId === undefined) return send('browser.type',{...scope,text:value.text});
+          // Help-card typing: only into the tab the open request is about, at
+          // the origin its row showed. The origin is the daemon's, never the body's.
+          if (!isBrowserHelpId(value.helpRequestId)) return this.json(res,400,{error:'invalid-browser-request'});
+          // Another workspace's request, or another tab's, reads as unknown, closed or not.
+          const found = this.deps.browserHelp?.()?.lookup(value.helpRequestId) ?? null;
+          const about = found && ('closed' in found ? found : found.row);
+          if (!found || !about || about.workspaceId !== workspaceId || about.surfaceId !== value.surfaceId) return this.json(res,404,{error:'browser-help-not-found'});
+          if ('closed' in found) return this.json(res,409,{error:'browser-help-closed'});
+          if (found.row.origin === undefined) return this.json(res,409,{error:'browser-help-origin-changed'});
+          return send('browser.type',{...scope,text:value.text,helpOrigin:found.row.origin});
+        }
         if (value.action === 'key' && ['Tab','Shift+Tab','Enter','Backspace','Escape','PageUp','PageDown'].includes(value.key as string)) return send('browser.key',{...scope,key:value.key});
       }
       return this.json(res,400,{error:'invalid-browser-request'});
@@ -6023,6 +6122,29 @@ export class WebTerminalServer {
         writeSse(client.res, 'moa', body);
       } catch {
         /* client stream broken — its own 'close' handler cleans up */
+      }
+    }
+  }
+
+  /**
+   * The global `browser.help` event: one frame per browser help request that
+   * opened or closed in main's table (see phone/BrowserHelpTable.ts). Live
+   * only, like `moa`: never recorded in the attention log, so it can never
+   * push a pending approval out of the backlog, and a reconnecting phone
+   * reads `GET /api/browser-help` instead of a replay. Sent only under the
+   * transcript consent, which the list needs too. The frame is serialized
+   * from an allowlist, so no prompt can ride along.
+   */
+  emitBrowserHelp(frames: readonly PhoneBrowserHelpFrame[]): void {
+    if (this.opts?.allowTranscript !== true || this.eventClients.size === 0) return;
+    for (const frame of frames) {
+      const body = browserHelpFrameJson(frame);
+      for (const client of this.eventClients) {
+        try {
+          writeSse(client.res, 'browser.help', body);
+        } catch {
+          /* client stream broken — its own 'close' handler cleans up */
+        }
       }
     }
   }
@@ -7787,6 +7909,9 @@ export class WebTerminalServer {
       return this.json(res, 404, { error: 'session not found' });
     }
     const incarnation = managed.meta.incarnationId;
+    // A launch line the browser client types (its auto-resume, a Resume pill):
+    // `launch=human` for one a person clicked for, any other value automated.
+    const launch = url.searchParams.get('launch');
     const requestID = req.headers['x-wmux-input-request-id'];
     const afterInput = req.headers['x-wmux-input-after'];
     if (afterInput !== undefined && (typeof afterInput !== 'string' || afterInput.length > 160 || requestID === undefined)) {
@@ -7822,6 +7947,18 @@ export class WebTerminalServer {
         if (!this.mayInput(fresh.principal)) return this.refuseInput(res,fresh.principal,'Input permission changed');
         if (this.inputSession(fresh.principal,sessionId) !== managed || managed.meta.incarnationId !== incarnation) {
           return this.json(res,409,{error:'pane-incarnation-changed'});
+        }
+        // As main's launch lines: a folder-trust prompt stops every one, a
+        // screen that cannot rule one out all but a person's.
+        if (launch !== null) {
+          const human = launch === 'human';
+          const refused = await folderTrustRefusal(this.deps.sessionManager, sessionId, human ? 'web launch line' : 'web automated launch line', {
+            refuseUnknown: !human, log: (message) => this.deps.log('warn', message),
+          });
+          if (refused) return this.json(res,409,{error:'folder-trust',verdict:refused,effect:'none'});
+          if (this.inputSession(fresh.principal,sessionId) !== managed || managed.meta.incarnationId !== incarnation) {
+            return this.json(res,409,{error:'pane-incarnation-changed'});
+          }
         }
         // Decided with the check above, before the write, so the audit line
         // cannot be lost to a withdrawal between the write and the log.
@@ -11184,7 +11321,9 @@ function resumeInfoOf(binding: ResumeBinding, paneCwd: string | undefined): Remo
   return {
     agent: binding.agent,
     sessionId: binding.sessionId,
-    cwdMatches:
+    // A folder the daemon reports gone never matches, even when the pane's
+    // recorded cwd still names it: the desktop would type `--resume` there.
+    cwdMatches: binding.cwdMissing !== true &&
       !!paneCwd && !!binding.cwd && normalizeResumeCwd(binding.cwd) === normalizeResumeCwd(paneCwd),
     ...(binding.permissionMode ? { permissionMode: binding.permissionMode } : {}),
   };

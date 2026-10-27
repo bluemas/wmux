@@ -18,6 +18,7 @@ import { clearRemoteSelection } from './workspaceSlice';
 import { publishPaneStashed, publishPaneFocused } from '../../events/publisher';
 import { saveSessionNow } from '../../utils/sessionSaveBridge';
 import { markRetentionMigrationDone } from '../retentionMigration';
+import type { CloseTabTarget } from '../closeTabConfirm';
 import { DEFAULT_BROWSER_BACKEND, isBrowserBackend, type BrowserBackend } from '../../../shared/browserBackend';
 import { CHROME_PRESET_VALUES } from '../../../shared/chromePresets';
 import { sanitizeShortcutOverrides, type ShortcutActionId, type ShortcutOverrides } from '../../../shared/keymap';
@@ -476,8 +477,8 @@ export interface UISlice {
   setCloseTabOnShellExit: (enabled: boolean) => void;
 
   // #1839: the tab waiting on the close-tab confirm (tab × or the shortcut).
-  closeTabConfirm: { workspaceId: string; paneId: string; surfaceId: string } | null;
-  requestCloseTab: (target: { workspaceId: string; paneId: string; surfaceId: string }) => void;
+  closeTabConfirm: CloseTabTarget | null;
+  requestCloseTab: (target: CloseTabTarget) => void;
   dismissCloseTab: () => void;
 
   // Idle-clearing of xterm's hidden IME textarea (issue #167, AutoGLM-style
@@ -1076,9 +1077,15 @@ export interface UISlice {
   ) => void;
 
   // ─── Scrollback bookmarks ─────────────────────────────────────────
+  /** ptyId → ids of the xterm markers that hold its scrollback bookmarks
+   *  (Ctrl+M); see components/Terminal/scrollbackBookmarks.ts. The markers
+   *  themselves stay in their Terminal, never here: immer freezes what the
+   *  store holds, and a frozen marker stops tracking its line. */
   terminalBookmarks: Record<string, number[]>;
-  addBookmark: (ptyId: string, line: number) => void;
-  removeBookmark: (ptyId: string, line: number) => void;
+  addBookmark: (ptyId: string, markerId: number) => void;
+  removeBookmark: (ptyId: string, markerId: number) => void;
+  /** Replace a pane's bookmark ids in one set (a repaint's carry). */
+  setBookmarks: (ptyId: string, markerIds: number[]) => void;
   clearBookmarks: (ptyId: string) => void;
 
   // ─── Floating pane ────────────────────────────────────────────────
@@ -2543,20 +2550,23 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
   // ─── Scrollback bookmarks ─────────────────────────────────────────
   terminalBookmarks: {},
 
-  addBookmark: (ptyId, line) => set((state) => {
+  addBookmark: (ptyId, markerId) => set((state) => {
     if (!state.terminalBookmarks[ptyId]) {
       state.terminalBookmarks[ptyId] = [];
     }
-    const lines = state.terminalBookmarks[ptyId];
-    if (!lines.includes(line)) {
-      lines.push(line);
-      lines.sort((a, b) => a - b);
-    }
+    state.terminalBookmarks[ptyId].push(markerId);
   }),
 
-  removeBookmark: (ptyId, line) => set((state) => {
-    if (!state.terminalBookmarks[ptyId]) return;
-    state.terminalBookmarks[ptyId] = state.terminalBookmarks[ptyId].filter((l) => l !== line);
+  removeBookmark: (ptyId, markerId) => set((state) => {
+    if (!state.terminalBookmarks[ptyId]?.includes(markerId)) return;
+    const ids = state.terminalBookmarks[ptyId].filter((id) => id !== markerId);
+    if (ids.length > 0) state.terminalBookmarks[ptyId] = ids;
+    else delete state.terminalBookmarks[ptyId];
+  }),
+
+  setBookmarks: (ptyId, markerIds) => set((state) => {
+    if (markerIds.length > 0) state.terminalBookmarks[ptyId] = markerIds;
+    else delete state.terminalBookmarks[ptyId];
   }),
 
   clearBookmarks: (ptyId) => set((state) => {
