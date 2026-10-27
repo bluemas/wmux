@@ -32,7 +32,7 @@ describe('DaemonPTYBridge — an episode no transcript turn backs', () => {
 
   it('ends the episode a /status submit opened', () => {
     bridge.noteInput('/status\r');
-    vi.advanceTimersByTime(300);
+    vi.advanceTimersByTime(3_000);
     expect(bridge.isAgentMidTurn()).toBe(true);
     bridge.noteNoTranscriptTurn();
     expect(bridge.isAgentMidTurn()).toBe(false);
@@ -45,5 +45,11 @@ describe('DaemonPTYBridge — an episode no transcript turn backs', () => {
     bridge.noteAgentStatus('awaiting_input', true);
     bridge.noteNoTranscriptTurn();
     expect(bridge.getAgentStatus()).toBe('awaiting_input');
+  });
+  it('leaves a just-submitted turn alone while its prompt may not have reached the rollout yet', () => {
+    bridge.noteInput('fix it\r');
+    vi.advanceTimersByTime(300);
+    bridge.noteNoTranscriptTurn();
+    expect(bridge.isAgentMidTurn()).toBe(true);
   });
 });

@@ -105,6 +105,9 @@ export function scanStartupDa1(text: string): 'answer' | 'more' | 'closed' {
  *                 agent started (epoch ms of the episode's start) or stopped
  *                 being mid-turn; see isAgentMidTurn. Edges only.
  */
+/** How long an open episode must stay without a transcript turn before noteNoTranscriptTurn closes it. */
+const NO_TRANSCRIPT_TURN_GRACE_MS = 2_000;
+
 export class DaemonPTYBridge extends EventEmitter {
   private outputInterpreter: OutputInterpreter | null = null;
   private modeTracker: OutputModes | null = null;
@@ -1251,6 +1254,9 @@ export class DaemonPTYBridge extends EventEmitter {
    * none of its stops will end it.
    */
   noteNoTranscriptTurn(): void {
+    // A real prompt reaches the rollout within milliseconds of its Enter; only
+    // an episode that has stayed empty past the grace is taken as no turn.
+    if (Date.now() - this.turnOpenedAt < NO_TRANSCRIPT_TURN_GRACE_MS) return;
     if (this.turnOpen && !this.awaitingHuman) this.closeTurn();
   }
   /** When noteTranscriptTurnEnd last closed an episode (0 = never). */
@@ -2238,6 +2244,15 @@ export class DaemonPTYBridge extends EventEmitter {
   /** Whether the bridge is currently dropping PTY output. */
   get isMuted(): boolean {
     return this.muted;
+  }
+
+  /**
+   * The output held while muted (see heldWhileMuted), oldest first, and
+   * whether later output was dropped once the cap was reached; null when not
+   * muted. Read-only: the unmute still releases it.
+   */
+  heldOutput(): { data: string; full: boolean } | null {
+    return this.heldWhileMuted ? { data: this.heldWhileMuted.join(''), full: this.heldFull } : null;
   }
 
   cleanup(): void {
