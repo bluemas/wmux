@@ -1220,6 +1220,14 @@ export class DaemonPTYBridge extends EventEmitter {
       this.transcriptTurnEndAt = Date.now();
     }
   }
+  /**
+   * The pane's own transcript ends with a finished turn, yet an episode is
+   * open: whatever opened it (a Codex /status submit) ran no turn there, so
+   * none of its stops will end it.
+   */
+  noteNoTranscriptTurn(): void {
+    if (this.turnOpen && !this.awaitingHuman) this.closeTurn();
+  }
   /** When noteTranscriptTurnEnd last closed an episode (0 = never). */
   private transcriptTurnEndAt = 0;
 
@@ -1519,6 +1527,8 @@ export class DaemonPTYBridge extends EventEmitter {
     }
     if (signalTs < turnEvidenceAt) return;
     this.preTurn = true;
+    // `/clear` is a command, not a turn: no Stop ends the episode its Enter opened.
+    if (source === 'clear' && this.turnOpen && !this.awaitingHuman) this.closeTurn();
     if (atIdlePrompt && this.sessionId) this.emit('idle', { sessionId: this.sessionId, preTurn: true });
   }
 
