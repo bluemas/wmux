@@ -15,7 +15,7 @@ describe('DaemonPTYBridge — an episode no transcript turn backs', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     bridge = new DaemonPTYBridge();
-    const pty = { onData: () => ({ dispose() {} }), onExit: () => ({ dispose() {} }) } as unknown as IPty;
+    const pty = { onData: () => ({ dispose() { /* no-op */ } }), onExit: () => ({ dispose() { /* no-op */ } }) } as unknown as IPty;
     bridge.setupDataForwarding(pty, new RingBuffer(65536), 'sess-1', new PromptEventLog());
     turns = [];
     bridge.on('agentTurn', (e: { runningSince: number | null }) => turns.push(e.runningSince));
