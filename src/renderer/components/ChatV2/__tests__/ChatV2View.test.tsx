@@ -1,4 +1,6 @@
 // @vitest-environment jsdom
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -12,6 +14,8 @@ import { createMockHost, type MockHost } from './mockHost';
 const store = vi.hoisted(() => ({ state: { surfaceAgent: {} as Record<string, { name: string }>, agentAliveByPtyId: {}, commandRunningByPtyId: {} } }));
 vi.mock('../../../stores', () => ({ useStore: Object.assign((select: (s: unknown) => unknown) => select(store.state), { getState: () => ({ setSurfaceViewMode: vi.fn() }) }) }));
 vi.mock('../../../hooks/useT', () => { const t = (key: string) => key; return { useT: () => t }; });
+const focusPaneByPtyId = vi.hoisted(() => vi.fn(() => true));
+vi.mock('../../../hooks/useNotificationListener', () => ({ focusPaneByPtyId }));
 
 let root: Root;
 let host: HTMLDivElement;
@@ -147,6 +151,42 @@ describe('ChatV2View', () => {
     expect(ptyCalls).toEqual([]);
   });
 
+  it('starts a Codex chat from the agent chip, on its own default model and always asking', async () => {
+    await act(async () => root.render(<ChatV2View paneId="daemon-codex" active onTerminal={() => undefined} />));
+    await flush();
+    const set = (el: HTMLSelectElement | HTMLTextAreaElement, value: string) => {
+      const proto = el instanceof HTMLSelectElement ? HTMLSelectElement.prototype : HTMLTextAreaElement.prototype;
+      Object.getOwnPropertyDescriptor(proto, 'value')?.set?.call(el, value);
+      el.dispatchEvent(new Event(el instanceof HTMLSelectElement ? 'change' : 'input', { bubbles: true }));
+    };
+    const agent = () => host.querySelector('[data-chatv2-agent]') as HTMLElement;
+    const mode = () => host.querySelector('[data-mode] select') as HTMLSelectElement;
+    expect(agent().querySelector('select')?.value).toBe('claude');
+    // Bypass picked for Claude does not carry over to Codex.
+    await act(async () => { set(mode(), 'bypass'); });
+    await act(async () => { set(agent().querySelector('select') as HTMLSelectElement, 'codex'); });
+    expect(mode().value).toBe('default');
+    expect(mode().disabled).toBe(true);
+    // The always-asks chip wears the fixed-chip style: muted, no hover highlight.
+    const chip = mode().closest('.wmux-chatv2-chip') as HTMLElement;
+    const hoverable = fs.readFileSync(path.resolve('src/renderer/styles/ui.css'), 'utf8').match(/^(\.wmux-chatv2-chip:hover[^{]*)\{/m)?.[1].replace(':hover', '').trim();
+    expect(hoverable).toBeTruthy();
+    expect(chip.getAttribute('aria-disabled')).toBe('true');
+    expect(chip.matches(hoverable as string)).toBe(false);
+    expect(host.querySelector('.wmux-chatv2-chips')?.textContent).toContain('Codex default');
+    const box = host.querySelector('textarea') as HTMLTextAreaElement;
+    expect(box.placeholder).toBe('What should Codex do?');
+    expect(host.querySelector('.wmux-chatv2-empty')?.textContent).toContain('Starts Codex in this pane');
+    await act(async () => { set(box, 'fix the build'); });
+    await act(async () => { (host.querySelector('.wmux-chatv2-send') as HTMLButtonElement).click(); });
+    await flush();
+    expect(mock.calls.find((call) => call.method === 'create')?.params).toEqual({ paneId: 'daemon-codex', agent: 'codex', mode: 'default' });
+    // The started chat names its agent, fixed.
+    expect(agent().tagName).toBe('SPAN');
+    expect(agent().textContent).toContain('Codex');
+    expect((host.querySelector('textarea') as HTMLTextAreaElement).placeholder).toBe('Message Codex…');
+  });
+
   it('renders a streaming turn, an approval card and the finished footer from pushes', async () => {
     await mock.call('subscribe', { paneId: 'daemon-live' });
     await mock.call('create', { paneId: 'daemon-live', agent: 'claude', mode: 'default', model: 'claude-opus-5-5' });
@@ -279,5 +319,29 @@ describe('ChatV2View', () => {
     await act(async () => { [...host.querySelectorAll('button')].find((b) => b.textContent === 'New chat')!.click(); });
     await flush();
     expect(host.querySelector('[data-chatv2="empty"]')).not.toBeNull();
+  });
+
+  it('says a chat a terminal in another pane took continued there, and shows that pane (#2730)', async () => {
+    await mock.call('create', { paneId: 'daemon-elsewhere', agent: 'claude', mode: 'default' });
+    const record = mock.record('daemon-elsewhere')!;
+    record.binding = { ...record.binding, status: 'handed-off', continuedIn: { paneId: 'pty-other' }, capabilities: { ...record.binding.capabilities, send: false, toTerminal: false } };
+    await act(async () => root.render(<ChatV2View paneId="daemon-elsewhere" active onTerminal={() => undefined} />));
+    await flush();
+    expect(host.querySelector('textarea')).toBeNull();
+    expect(host.textContent).toContain('chat.continuedInPane');
+    expect(host.textContent).not.toContain('chat.openTerminal');
+    await act(async () => { [...host.querySelectorAll('button')].find((b) => b.textContent === 'chat.showPane')!.click(); });
+    expect(focusPaneByPtyId).toHaveBeenCalledWith(expect.any(Function), 'pty-other');
+  });
+
+  it('names no pane when the terminal that took the chat was matched by its folder (#2730)', async () => {
+    await mock.call('create', { paneId: 'daemon-folder', agent: 'claude', mode: 'default' });
+    const record = mock.record('daemon-folder')!;
+    record.binding = { ...record.binding, status: 'handed-off', continuedIn: {}, capabilities: { ...record.binding.capabilities, send: false, toTerminal: false } };
+    await act(async () => root.render(<ChatV2View paneId="daemon-folder" active onTerminal={() => undefined} />));
+    await flush();
+    expect(host.textContent).toContain('chat.continuedInTerminal');
+    expect(host.textContent).not.toContain('chat.showPane');
+    expect(host.textContent).not.toContain('chat.openTerminal');
   });
 });

@@ -2,13 +2,14 @@
 // at start the store itself with main's ports, fed every fact (an owner's
 // message may approve) and resuming approved merges due after a restart.
 // Registered from modules.ts only, so it starts after the fact log, the bot
-// runtime, the rooms and the merge lane it reads.
+// runtime, the rooms, the merge lane and the act outbox it reads.
 
 import path from 'node:path';
 import type { Fact } from '../../shared/facts';
 import { APPROVALS_FILENAME, APPROVAL_LIMITS, ApprovalService, getApprovalService, registerApprovalRpc, setApprovalService } from './approvals';
 import { registerFactoryRpcModule, type FactoryHostDeps } from './factoryHost';
 import { conversationSignedIn, conversationTainted } from './conversationMarks';
+import { noteBotApprovalStoreUnavailable, noteBotApprovalsChanged } from '../phone/BotApprovalPushFeed';
 
 registerFactoryRpcModule('approvals', (router, deps: FactoryHostDeps) => {
   // Why the store did not start: bots asking for approval are told, so the
@@ -31,7 +32,9 @@ registerFactoryRpcModule('approvals', (router, deps: FactoryHostDeps) => {
       ]);
       const { getSkillApprovalHost } = await import('../pipe/handlers/skill.rpc');
       const { getOwnerProfileApprovalHost } = await import('../pipe/handlers/memory.rpc');
+      const { getRoutineApprovalHost } = await import('../pipe/handlers/routine.rpc');
       const { noticeBot } = await import('./botNotices');
+      const { getApprovalActHost } = await import('./actHost');
       let service: ApprovalService;
       try {
         service = new ApprovalService({
@@ -64,17 +67,24 @@ registerFactoryRpcModule('approvals', (router, deps: FactoryHostDeps) => {
           emit: (payload) => {
             const win = deps.getMainWindow();
             if (win && !win.isDestroyed()) win.webContents.send(BOT_EVENT, payload);
+            // The phone's copy: waiting requests are pushed, settled ones retracted.
+            noteBotApprovalsChanged();
           },
           skills: getSkillApprovalHost,
           ownerProfile: getOwnerProfileApprovalHost,
+          routines: getRoutineApprovalHost,
+          acts: getApprovalActHost,
         });
       } catch (err) {
         startFailure = String(err);
         console.error(`[factory] approvals did not start: ${startFailure}`);
+        noteBotApprovalStoreUnavailable();
         return;
       }
       startFailure = null;
       setApprovalService(service);
+      // Requests kept from the last run are waiting again.
+      noteBotApprovalsChanged();
       const log = getFactLog();
       off = log ? log.subscribe((f) => service.onFact(f)) : null;
       service.resume();

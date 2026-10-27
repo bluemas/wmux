@@ -1,6 +1,7 @@
 // Must stay the first import: turns off working-directory executable lookup (Windows) before any module runs.
 import '../shared/exeSearchGuard';
 import { isInternalForkPayload } from '../shared/hooks/internalFork';
+import { releaseDaemonFiles, replaceFileOrWrite, unlinkIfContent } from '../shared/daemon/daemonFiles';
 import { terminalCoreRuntime, terminalCoreSelection } from '../shared/terminalCoreSettings';
 import { collectDaemonMemoryDiagnostics } from './memoryDiagnostics';
 import { createStartupRecovery } from './startupRecovery';
@@ -25,7 +26,9 @@ import { agentExecEnv } from '../shared/execEnv';
 import { workspaceAccountEnv } from './phone/workspaceAccountEnv';
 import { applyPaneAccount, assertPaneAccountUsable } from './phone/paneAccount';
 import type { PaneAccountVendor, StoredHandoffFrom } from '../shared/phonePaneAccount';
-import { DesktopPhoneBridge } from './phone/DesktopPhoneBridge';
+import { DesktopPhoneBridge, keepAwakeRpc } from './phone/DesktopPhoneBridge';
+import { BrowserHelpTable } from './phone/BrowserHelpTable';
+import { BROWSER_HELP_SET_METHOD, PHONE_BROWSER_HELP_DECIDE_COMMAND, type BrowserHelpTableRow } from '../shared/phoneBrowserHelp';
 import { RunHistoryStore } from './history/RunHistoryStore';
 import { AutomationEngine } from './automation/AutomationEngine';
 import { assertExternalSessionId, registerAutomationRpc } from './automation/rpc';
@@ -35,6 +38,7 @@ import { pendingRemovalRefusalAt } from '../main/worktask/pendingWorktreeRemoval
 import { recordedRunPtyIds } from './automation/store';
 import { AUTOMATION_EVENT } from '../shared/automation';
 import { InputReceiptStore } from './web/InputReceiptStore';
+import { parseTrustedProxyConfig } from './web/trustedProxy';
 import { PhoneWorktreeService } from './web/phoneWorktree';
 import { ProjectConfigStore } from '../main/project/ProjectConfigStore';
 import { phonePrepSummary, prepareNewWorktree } from '../main/worktask/workspacePrep';
@@ -82,9 +86,10 @@ import { loadWebPrefs, saveWebPrefs } from './web/webPrefsStore';
 import { scheduleTokenFileReHarden } from '../shared/security';
 import { applyTaskQueryView } from '../shared/a2aTaskQueryView';
 import { normalizeLivePaneIds } from '../shared/a2aOrphanedTask';
-import type { WebTlsConfig } from '../shared/web';
+import { WEB_DEFAULT_PORT, webHostIsLoopback, type WebTlsConfig } from '../shared/web';
 import { generateSnapshotUnqueued, enqueueSnapshotJob, generateTextSnapshot, generateTextSnapshotUnqueued, runSmallSnapshotJob, capTextRowsToFrameBudget, MAX_SCROLLBACK } from './HeadlessSnapshot';
 import { queuedScreenText, queuedTextSnapshot } from './queuedSessionText';
+import { registerFolderTrustRpc } from './folderTrustState';
 import type { TerminalPty } from '../shared/terminalPty';
 import { serializeSession } from './sessionSerialize';
 import { AwaitingScreenVerifier, AWAITING_NARROW_DIALOG_COLS, questionInFlight, renderPaneScreen, renderPaneTail } from './AwaitingScreenVerifier';
@@ -93,17 +98,31 @@ import { claudeComposerEmpty, claudeComposerVisible } from './transcript/deliver
 import { CHATV2_LAUNCH_ALLOWED_RPC } from '../shared/chatv2/ipc';
 import { isPaneMoving } from './chat/v2/paneClaims';
 import { ApprovalPushRouter } from './push/approvalPushRouter';
+import { BotApprovalPushRouter } from './push/botApprovalPush';
+import { BotPromptPushRouter } from './push/botPromptPush';
+import { BROWSER_HELP_PUSH_CAPABILITY, BrowserHelpPushRouter, browserHelpPushAudience, type BrowserHelpResolution } from './push/browserHelpPush';
+import type { PushTableRouterDeps } from './push/pushTableRouter';
+import { parseBotApprovalPushRows, type BotApprovalPushRow } from '../shared/botApprovalPush';
+import { parseBotPromptPushRows, type BotPromptPushRow } from '../shared/botPromptPush';
 import { readPendingToolUse } from './transcript/pendingToolUse';
+import { STALL_AGENT, StallWatch, lastHumanPrompt, readTranscriptTail, stopAndPrefill } from './transcript/stallWatch';
 import { isClaudeFamilyAgent } from './approvals/terminalPrompt';
 import { StateWriter, scrubPersistedCredentials, detachedTtlHoursFor } from './StateWriter';
 import { stripCredentialValues } from '../shared/envFilter';
 import { LanLinkInbox } from './lanlink/inbox';
 import { LanLinkController } from './lanlink/controller';
 import { LanLinkServer } from './lanlink/server';
+import { QUERY_TIMEOUT_MS } from './lanlink/netCategory';
 import { PeerStore } from './lanlink/peers';
 import { coerceLanLinkPatch } from '../shared/lanlink';
 import { A2aRemoteController } from './a2aRemote/controller';
-import { A2aServer } from './a2aRemote/server';
+import { A2aServer, rankedExternalIpv4s } from './a2aRemote/server';
+import { registerNetRpc } from './net/rpc';
+import { FirewallRecordStore } from './net/firewallRecord';
+import type { ProbeTarget } from './net/inboundProbe';
+import { isLoopbackHost } from './net/inboundSeen';
+import { FIREWALL_GROUP, currentRuleUser } from '../shared/netFirewallScripts';
+import { isIpv4, type FirewallListener } from '../shared/netFirewall';
 import { forgetHostCascade, registerA2aRemoteRpc } from './a2aRemote/rpc';
 import { PeerStore as A2aPeerStore } from './a2aRemote/peerStore';
 import { RemoteHostStore } from './a2aRemote/remoteHostStore';
@@ -124,7 +143,7 @@ import { A2aSpawnRequester, registerSpawnAskRpc } from './a2aRemote/spawnRequest
 import { SpawnOutgoingStore } from './a2aRemote/spawnOutgoingStore';
 import { linkAlias } from './a2aRemote/outbound';
 import { A2A_SPAWN_EVENT, type A2aSpawnEvent } from '../shared/a2aSpawn';
-import { A2A_FEATURE_IMAGES, A2A_FEATURE_LINK_OFFER, A2A_FEATURE_SPAWN, A2A_FEATURE_STREAM_PING, isRemoteTaskId } from '../shared/a2aRemote';
+import { A2A_FEATURE_IMAGES, A2A_FEATURE_LINK_OFFER, A2A_FEATURE_SPAWN, A2A_FEATURE_STREAM_PING, isRemoteTaskId, isTailnetIpv4 } from '../shared/a2aRemote';
 import type { A2aRemoteLinkEvent } from '../shared/rpc';
 import { ChannelService, ChannelStateWriter, ChannelWakeWorker, wakeAgentSlug, wrapChannelMessageEnvelope, wrapChannelCatalogEnvelope, stampChannelCaller, type CallerFieldSpec, type ChannelServiceEventLog } from './channels';
 import { AppendOnlyLog } from './eventlog/AppendOnlyLog';
@@ -144,7 +163,8 @@ import { viewerVisibilityUpdates } from '../shared/viewerVisibilityBatch';
 import { isTaskState, type AgentStatus, type Message, type Task } from '../shared/types';
 import { ProcessMonitor } from './ProcessMonitor';
 import { AgentProcessTracker } from './AgentProcessTracker';
-import { liveRecoveryHint, namedAgentAlive, recordedTurnStillOpen, recordWasMidTurn, screenShowsLiveAgent, sightedRecoveredAgent } from './recoveryHint';
+import { CustomAgentNames } from './customAgentNames';
+import { liveRecoveryHint, markCwdMissing, namedAgentAlive, recordedTurnStillOpen, recordWasMidTurn, screenShowsLiveAgent, sightedRecoveredAgent } from './recoveryHint';
 import { checkWslAgentRunning, reportedAgentForPane, stopWslAgent, WslPidWatcher } from './wslAgentProcess';
 import { GateFlagFile } from './gateFlagFile';
 import { WSL_GATE_FLAG_FILE } from '../shared/wslIntegration';
@@ -190,7 +210,7 @@ import { isWslDistroSpawnArgs } from '../shared/wslDistro';
 import { gitDirMapperFor, gitWatchCwdFor } from './gitWatchCwd';
 import { randomUUID } from 'node:crypto';
 import { monitorEventLoopDelay, performance as nodePerformance } from 'node:perf_hooks';
-import { DAEMON_EXIT_ALREADY_RUNNING, ENV_KEYS, isBrainPty } from '../shared/constants';
+import { DAEMON_EXIT_ALREADY_RUNNING, ENV_KEYS, dataSuffix, isBrainPty } from '../shared/constants';
 import { toResumeCommand, resumeGrammarFor, resumeOfferForRecovered, mergeResumeBinding, isProvisionalCapture, transcriptRelocated, normalizeResumeCwd, isUsableResumeBinding, isPlausibleResumeSessionId } from '../shared/agentResume';
 import type { ResumeBinding } from '../shared/agentResume';
 import { agentDisplayToSlug, agentRow, AGENT_SLUG_SET, isAgentSlug } from '../shared/agentIdentity';
@@ -254,11 +274,13 @@ import type { ApprovalDecision, DecisionFormKind, NativeDecisionOutcome, NativeD
 import type { AgentSlug } from '../shared/events';
 import { LANLINK_SENTINEL_SESSION_ID } from '../shared/lanlink';
 import { classifyTasklistOutput, classifyKillOutcome, lockOwnerIsReclaimable, type ProcessLiveness } from '../shared/processLiveness';
+import { handleLiveness } from '../shared/processHandleLiveness';
 import { deliverScheduledPrompt, deliveryInputFence, type ScheduledPromptDeliveryDeps } from './sessionPromptDelivery';
 import { deliverCallerNudge } from './callerNudgeDelivery';
 import { paneTurnClosed, stopAgentTree } from './agentStop';
 import { continueOnAccount } from './continueOnAccount';
 import { paneFree } from './paneFree';
+import { createOrphanSweep } from './winProcessSweep';
 import { classifyShell } from './shell-integration';
 import { UsageLimitRegistry } from './usageLimit/UsageLimitRegistry';
 import type { SessionPromptScheduleResult } from '../shared/sessionPromptSchedule';
@@ -379,6 +401,7 @@ let transcriptProjector: TranscriptProjector | null = null;
 // Fleet's now-doing line for panes with no per-tool hook (setup-hooks installs,
 // Codex): tails the agent's own transcript. Guarded like the projector.
 let transcriptActivity: TranscriptActivityWatcher | null = null;
+let stallWatch: StallWatch | null = null;
 let shellPrompts: ShellPromptWatcher | null = null;
 let apiErrorTurnEnds: ApiErrorTurnEnds | null = null;
 let teammateWakes: TeammateWakes | null = null;
@@ -394,6 +417,8 @@ let chatQueue: ChatQueueStore | null | undefined;
 let chatSessions: ChatSessionService | null = null;
 // Chat v2: daemon-owned agent drivers bound to an anchor pane (src/shared/chatv2/ipc.ts).
 let chatV2Host: ChatV2Host | null = null;
+/** Pane → whether the capture that started its pending transcript search was pane-exact (#2730). */
+const discoveryPaneExact = new Map<string, boolean>();
 let terminalChat: TerminalChatService | null = null;
 /** OpenCode permissions/questions as native records (built with terminalChat). */
 let openCodeDecisions: ReturnType<typeof createOpenCodeDecisions> | null = null;
@@ -449,6 +474,19 @@ let noteCodexServerLost: ((id:string)=>void) | undefined;
 let noteCodexTurnFailed: ((id:string, threadId:string, turn:unknown)=>void) | undefined;
 /** The `turn_failed` push (contract §7), set at boot once the push sender exists. */
 let pushTurnFailed: ((sessionId:string, failure:TurnFailure)=>void) | undefined;
+/** Main's table of waiting bot approvals (`daemon.botApprovals.set`), set at boot once the push sender exists. */
+let pushBotApprovals: ((rows: BotApprovalPushRow[]) => void) | undefined;
+/** Main's table of open bot prompts (`daemon.botPrompts.set`), set at boot once the push sender exists. */
+let pushBotPrompts: ((rows: BotPromptPushRow[]) => void) | undefined;
+/** The pipe clients that last published the bot approval and prompt tables (main). */
+let botApprovalsPublisher: string | null = null;
+let botPromptsPublisher: string | null = null;
+/** Main's open browser help requests (`daemon.browserHelp.set`), built once the pipe server exists. */
+let browserHelpTable: BrowserHelpTable | null = null;
+/** The browser help table, as phone pushes; set at boot once the push sender exists. */
+let pushBrowserHelp: ((rows: readonly BrowserHelpTableRow[], closed: ReadonlyMap<string, BrowserHelpResolution>) => void) | undefined;
+/** The pipe client that last published the browser help table (main). */
+let browserHelpPublisher: string | null = null;
 /** N4 — an agent's sign-in was lost (shared/agentAuthLost); set at boot once the pipe server exists. */
 let noteAuthLost: ((sessionId: string, agent: AuthLostAgent, env: Record<string, string> | undefined, origin: AuthLostOrigin, providerCode?: string) => void) | undefined;
 /** N4 — an agent and account was seen to work (a confirmed turn end, or its status said signed in). */
@@ -728,11 +766,11 @@ function createApprovalRegistry(sessionManager: DaemonSessionManager): ApprovalR
     answerNative: async (native, reply, sessionId) => {
       const adapters: Partial<Record<NativeDecisionRef['adapter'], (n: NativeDecisionRef, r: NativeDecisionReply) => Promise<NativeDecisionOutcome>>> = {
         codex: (n, r) => codexPaneRelays.answer(n, r.decision),
-        // Chat v2 driver requests are answered by the driver that holds them.
-        claude: (n, r) => chatV2Host?.answerNative(n, r, sessionId) ?? Promise.resolve('unavailable' as const),
         // OpenCode answers go back through the pane's own TUI plugin.
         ...(openCodeDecisions ? { opencode: (n: NativeDecisionRef, r: NativeDecisionReply) => openCodeDecisions!.answer(n, r, sessionId) } : {}),
       };
+      // A chat-v2 driver's request goes to the host whatever its agent (a Codex one is not the relay's).
+      if (native.via === 'chat-v2') return chatV2Host?.answerNative(native, reply, sessionId) ?? 'unavailable';
       return adapters[native.adapter]?.(native, reply) ?? 'unavailable';
     },
     readScreenTail: async (sessionId) => {
@@ -969,11 +1007,14 @@ async function restoreWebServer(sessionManager: DaemonSessionManager): Promise<v
         // reachable by browser_file_upload without a second policy.
         uploadsDir: path.join(wmuxDir, 'uploads', 'phone'),
         roomAttachmentsDir: path.join(wmuxDir, 'factory', 'room-attachments'),
+        roomFilesDir: path.join(wmuxDir, 'factory', 'room-files'),
         // Each file served because an agent sent it with SendUserFile.
         auditSentFile: (entry) => getDeviceStore().recordSentFile(entry),
         // The Moa (HQ brain) pane main last vouched for, read per request so a
         // withdrawal closes the next check. See web/moaPane.ts.
         moaPane: currentMoaPane,
+        // Main's open browser help requests (phone/BrowserHelpTable.ts).
+        browserHelp: () => browserHelpTable,
         moaPrompts: readMoaPrompts,
         moaWake: getMoaWake,
         auditMoaSend: (entry) => getDeviceStore().recordMoaSend(entry),
@@ -1402,7 +1443,10 @@ function resumeLaunchCommand(
   if (!session.exec) return undefined;
   const phoneResume = codexRelayResumeCommand({...session,env:session.env ?? {}});
   if (phoneResume !== undefined) return phoneResume;
-  if (!isWslShell(session.cmd) && !fs.existsSync(session.cwd)) return undefined; // cwd gone → fresh, not wrong-target resume
+  if (!isWslShell(session.cmd) && !fs.existsSync(session.cwd)) { // cwd gone → fresh, not wrong-target resume
+    log('info', `[resume] ${session.id}: folder ${session.cwd} no longer exists; starting fresh, not resuming${session.resumeBinding ? ` ${session.resumeBinding.agent} conversation ${session.resumeBinding.sessionId}` : ''}`);
+    return undefined;
+  }
   // Prefer the persisted binding; fall back to a spool-captured one (the live
   // capture RPC failed, so the exact id only survived in the spool) so an exec
   // agent pane replays as `--resume <id>` instead of an ambiguous `--continue`.
@@ -1629,6 +1673,10 @@ function ingestResumeSpool(
  */
 async function processLiveness(pid: number): Promise<ProcessLiveness> {
   if (process.platform === 'win32') {
+    // The process handle first, as the launcher asks it (#2774): a terminated
+    // process can stay listed by tasklist while its last handles close.
+    const fromHandle = handleLiveness(pid);
+    if (fromHandle !== 'unknown') return fromHandle;
     // process.kill(pid, 0) is unreliable on Windows — it succeeds for stale PIDs
     // — so probe with tasklist. A thrown probe leaves stdout null → unknown.
     let stdout: string | null = null;
@@ -1867,8 +1915,14 @@ async function acquireLock(): Promise<boolean> {
     }
   }
 
-  // Write PID file (separate from lock for backward compat)
-  fs.writeFileSync(PID_FILE, String(process.pid), { encoding: 'utf-8', mode: 0o600 });
+  // Write PID file (separate from lock for backward compat). Renamed into place:
+  // the launcher already wrote one (claimSpawnedDaemonFiles) that other
+  // starters may be reading, and a truncating write would show them it empty.
+  // Fatal, as the plain write it replaced was, once the in-place fallback
+  // fails too: we hold the lock, but daemon.pid may name another starter's child.
+  if (!replaceFileOrWrite(PID_FILE, String(process.pid), (msg) => log('warn', msg))) {
+    throw new Error(`Failed to write ${PID_FILE}`);
+  }
   // Issue #546 — boot-progress marker. The window between this line and
   // `daemon-pipe` being written is the whole problem: we are alive and own the
   // lock, but we cannot answer a ping (no pipe yet), and cold recovery of a
@@ -1883,51 +1937,37 @@ async function acquireLock(): Promise<boolean> {
   //        │                                                    ├── daemon-pipe
   //        └───────────── launcher must NOT kill in here ───────┘
   //
+  // The launcher normally wrote daemon.pid and this marker with our PID right
+  // after spawn (claimSpawnedDaemonFiles), so the time before this line is
+  // covered too. Holding the lock, we overwrite both: when two starters raced,
+  // the files may name the other starter's child, which lost the lock.
+  //
   // Written once, never re-touched: the launcher trusts it on existence + PID
   // liveness, not freshness. A freshness gate would re-create the very bug —
   // recovery is a long await chain, so a busy event loop can delay a periodic
   // touch and a healthy daemon would read as stale. Elapsed time is bounded on
   // the launcher side by DAEMON_READY_HARD_CEILING_MS instead. A marker
   // orphaned by a hard crash is self-invalidating: its PID is dead.
-  try {
-    fs.writeFileSync(BOOT_MARKER_FILE, String(process.pid), { encoding: 'utf-8', mode: 0o600 });
-  } catch (err) {
-    // Non-fatal: without the marker the launcher just falls back to the old
-    // escalated-reping-then-kill behavior. Never block boot on it.
-    log('warn', 'Failed to write boot marker:', err);
-  }
+  // Renamed into place, like the pid file: a launcher waiting on the marker
+  // reads an empty one as "boot finished". Non-fatal (a failure is logged):
+  // without the marker the launcher just falls back to the old
+  // escalated-reping-then-kill behavior. Never block boot on it.
+  replaceFileOrWrite(BOOT_MARKER_FILE, String(process.pid), (msg) => log('warn', msg));
   return true;
 }
 
 /** Issue #546 — drop the boot-progress marker once we can answer pings, and on
- *  every teardown path. Idempotent; never throws. */
+ *  every teardown path. Only our own marker. Idempotent; never throws. */
 function clearBootMarker(): void {
-  try {
-    if (fs.existsSync(BOOT_MARKER_FILE)) fs.unlinkSync(BOOT_MARKER_FILE);
-  } catch {
-    // ignore
-  }
+  unlinkIfContent(BOOT_MARKER_FILE, String(process.pid));
 }
 
+/** The pipe name this daemon wrote to `daemon-pipe`, once it has. */
+let writtenPipeName: string | null = null;
+
+/** Remove the files this daemon wrote, and only those (releaseDaemonFiles). */
 function releaseLock(): void {
-  try {
-    if (fs.existsSync(PID_FILE)) fs.unlinkSync(PID_FILE);
-  } catch {
-    // ignore
-  }
-  try {
-    if (fs.existsSync(LOCK_FILE)) fs.unlinkSync(LOCK_FILE);
-  } catch {
-    // ignore
-  }
-  // Clean up pipe name file
-  try {
-    const pipeNameFile = path.join(wmuxDir, 'daemon-pipe');
-    if (fs.existsSync(pipeNameFile)) fs.unlinkSync(pipeNameFile);
-  } catch {
-    // ignore
-  }
-  clearBootMarker();
+  releaseDaemonFiles(wmuxDir, process.pid, writtenPipeName);
 }
 
 // === Session recovery ===
@@ -3114,6 +3154,7 @@ function registerRpcHandlers(
         type: 'agent.turn', sessionId: p.id,
         data: { running: managed.bridge.isAgentMidTurn() && managed.bridge.getAgentStatus() !== 'awaiting_input' },
       });
+      if (stallWatch) pipeServer.broadcast({ type: 'agent.stall', sessionId: p.id, data: { stalledSince: stallWatch.stalledSince(p.id) } });
     }
 
     return { ok: true };
@@ -3425,7 +3466,11 @@ function registerRpcHandlers(
       const withAlive = managedForPrompt?.recoveredAgentUnconfirmed === true && agentProcessAlive !== true
         ? { ...withAlive0, recoveredAgentUnconfirmed: true as const }
         : withAlive0;
-      return surfacedBinding ? { ...withAlive, resumeBinding: surfacedBinding } : withAlive;
+      // A person-driven pane whose conversation folder is gone says so, instead
+      // of the picker in a folder that cannot list that conversation.
+      return surfacedBinding
+        ? { ...withAlive, resumeBinding: markCwdMissing(surfacedBinding, s, bindingTranscriptLives, fs.existsSync) }
+        : withAlive;
     });
 
     // Fix B: when includeSuspended is requested, append cap-skipped suspended
@@ -3700,10 +3745,12 @@ function registerRpcHandlers(
       // See the restore path for why this directory and not another.
       uploadsDir: path.join(wmuxDir, 'uploads', 'phone'),
         roomAttachmentsDir: path.join(wmuxDir, 'factory', 'room-attachments'),
+        roomFilesDir: path.join(wmuxDir, 'factory', 'room-files'),
       // See the restore path.
       auditSentFile: (entry) => getDeviceStore().recordSentFile(entry),
       // See the restore path.
       moaPane: currentMoaPane,
+      browserHelp: () => browserHelpTable,
       moaPrompts: readMoaPrompts,
       moaWake: getMoaWake,
       auditMoaSend: (entry) => getDeviceStore().recordMoaSend(entry),
@@ -3737,6 +3784,17 @@ function registerRpcHandlers(
   // Bumped by every operator stop. An in-place grant change
   // (`onlyIfRunning`) that a stop overtook must not bring the server back.
   let webStopGeneration = 0;
+  // The last start's bind failure (code, port, address), reported by status
+  // while the server is down so the popover can name the port's holder.
+  let webListenError: { code: string; port: number; host: string } | null = null;
+  const webStatus = (): WebTerminalInfo => {
+    const info = webServer.status();
+    return {
+      ...info,
+      ...(!info.running && webListenError ? { listenError: webListenError } : {}),
+      preferredPort: loadWebPrefs(wmuxDir).port ?? WEB_DEFAULT_PORT,
+    };
+  };
   pipeServer.onRpc('daemon.web.start', syncGateAfter(async (params) => {
     await afterRestore();
     const p = params as {
@@ -3755,6 +3813,8 @@ function registerRpcHandlers(
       newToken?: boolean;
       tailscale?: boolean;
       tls?: unknown;
+      trustedProxy?: unknown;
+      rememberPort?: boolean;
     };
     const port =
       typeof p.port === 'number' && p.port > 0 && p.port < 65536 ? Math.floor(p.port) : 7681;
@@ -3767,13 +3827,20 @@ function registerRpcHandlers(
       ? p.allowedHosts.filter((h): h is string => typeof h === 'string')
       : [];
     const requestedTls = parseWebTlsConfig(p.tls);
+    // Never persisted and never inherited: a start that does not send it runs without it.
+    const trustedProxy = parseTrustedProxyConfig(p.trustedProxy);
+    if (trustedProxy && webHostIsLoopback(host)) {
+      throw new Error(
+        `--trust-proxy-* needs a non-loopback bind: a proxy at ${[...trustedProxy.from].join(', ')} cannot reach ${host}. Add --expose or --host <address>`,
+      );
+    }
     const tailscale = p.tailscale === true;
     // The desktop's in-place grant change restarts a RUNNING server. A stop
     // that landed after it read status wins: nothing is started, and the
     // record the stop cleared is not written back.
     const onlyIfRunning = p.onlyIfRunning === true;
     const stopGeneration = webStopGeneration;
-    if (onlyIfRunning && !webServer.currentStartState) return webServer.status();
+    if (onlyIfRunning && !webServer.currentStartState) return webStatus();
     const loadedPrevious = loadWebStateWithDiagnostics(wmuxDir);
     // Each grant is its own opt-in and fail-closed: a caller that says nothing
     // gets a read-only server that cannot write files, read transcripts, or
@@ -3793,7 +3860,7 @@ function registerRpcHandlers(
     );
     // An explicit choice is an operator preference: it outlives this server,
     // including an operator stop (see webPrefsStore).
-    if (typeof p.inlineImages === 'boolean' && !saveWebPrefs(wmuxDir, { inlineImages })) {
+    if (typeof p.inlineImages === 'boolean' && !saveWebPrefs(wmuxDir, { ...loadWebPrefs(wmuxDir), inlineImages })) {
       log('warn', '[web] could not persist the inline images preference; it applies until the next restart');
     }
     const { tls, token, rotateCredentials } = decideWebStartPolicy({
@@ -3805,24 +3872,39 @@ function registerRpcHandlers(
       tailscale,
       newToken: p.newToken === true,
     });
-    const info = await webServer.start({
-      port,
-      host,
-      allowInput,
-      allowUpload,
-      allowTranscript,
-      allowDangerousLaunch,
-      allowGitWrite,
-      ...(gitWriteLogin ? { gitWriteLogin } : {}),
-      inlineImages,
-      allowedHosts,
-      tailscale,
-      ...(tls ? { tls } : {}),
-      token,
-    });
+    let info: WebTerminalInfo;
+    try {
+      info = await webServer.start({
+        port,
+        host,
+        allowInput,
+        allowUpload,
+        allowTranscript,
+        allowDangerousLaunch,
+        allowGitWrite,
+        ...(gitWriteLogin ? { gitWriteLogin } : {}),
+        inlineImages,
+        allowedHosts,
+        tailscale,
+        ...(tls ? { tls } : {}),
+        ...(trustedProxy ? { trustedProxy } : {}),
+        token,
+      });
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      webListenError = typeof code === 'string' && (err as NodeJS.ErrnoException).syscall === 'listen' ? { code, port, host } : null;
+      throw err;
+    }
+    webListenError = null;
+    // "Use port N" in the popover: the port it picked is where the next start goes too.
+    if (p.rememberPort === true && loadWebPrefs(wmuxDir).port !== info.port && typeof info.port === 'number') {
+      if (!saveWebPrefs(wmuxDir, { ...loadWebPrefs(wmuxDir), port: info.port })) {
+        log('warn', '[web] could not persist the web port; the next start uses the default again');
+      }
+    }
     if (onlyIfRunning && stopGeneration !== webStopGeneration) {
       await webServer.stop();
-      return webServer.status();
+      return webStatus();
     }
     if (rotateCredentials) {
       // A device authenticates with its own durable `deviceId.secret`, so
@@ -3863,6 +3945,7 @@ function registerRpcHandlers(
     // both the persisted listener and its paired devices.
     await afterRestore();
     webStopGeneration += 1;
+    webListenError = null;
     // #783 — the answering surface is going away, so every gate still holding a
     // bridge open is now unanswerable. Defer them here instead of making each
     // one wait out its own deadline in front of a blocked agent.
@@ -3884,8 +3967,52 @@ function registerRpcHandlers(
     // for a server that is about to come back, and the GUI popover would latch
     // that stale answer.
     await afterRestore();
-    return webServer.status();
+    return webStatus();
   });
+  // Firewall and port diagnosis for the three listeners another PC reaches
+  // (src/daemon/net/rpc.ts). Read-only: the elevated Fix runs in main.
+  const netTarget = (listener: FirewallListener): ProbeTarget => {
+    if (listener === 'a2a') {
+      const f = a2aServerRef?.firewallFacts();
+      return {
+        listener,
+        applicable: f?.listening === true,
+        port: f?.port ?? null,
+        ips: f?.ips ?? [],
+        inboundSeenAt: a2aServerRef?.status().inboundSeenAt ?? null,
+        tailnet: (f?.tailnetIps.length ?? 0) > 0,
+      };
+    }
+    if (listener === 'web') {
+      const info = webServer.status();
+      const host = info.host ?? '127.0.0.1';
+      const exposed = info.running && !isLoopbackHost(host);
+      const ranked = rankedExternalIpv4s();
+      const ips = !exposed ? [] : host === '0.0.0.0' || host === '::' ? ranked.map((r) => r.address) : isIpv4(host) ? [host] : [];
+      return { listener, applicable: exposed, port: info.port ?? null, ips, inboundSeenAt: info.inboundSeenAt ?? null, tailnet: ips.some(isTailnetIpv4) };
+    }
+    const f = lanLinkServer.firewallFacts();
+    return { listener, applicable: f.listening, port: f.port, ips: f.ip ? [f.ip] : [], inboundSeenAt: null, tailnet: f.ip ? isTailnetIpv4(f.ip) : false };
+  };
+  registerNetRpc((method, handler) => pipeServer.onRpc(method, handler), {
+    target: netTarget,
+    failure: (listener) => {
+      if (listener === 'a2a') {
+        const st = a2aServerRef?.status();
+        return st?.enabled && st.lastErrorCode ? { code: st.lastErrorCode, port: st.lastErrorPort ?? st.port, address: null } : null;
+      }
+      if (listener === 'web') {
+        return webListenError && !webServer.status().running ? { code: webListenError.code, port: webListenError.port, address: webListenError.host } : null;
+      }
+      const rt = lanLinkServer.runtimeStatus();
+      if (rt.stopReason !== 'listen-failed') return null;
+      const attempt = lanLinkServer.lastBindAttempt();
+      return attempt.port === null ? null : { code: rt.listenErrorCode ?? null, port: attempt.port, address: attempt.ip };
+    },
+    records: new FirewallRecordStore(wmuxDir),
+    scope: { dataSuffix: dataSuffix(), user: currentRuleUser(), group: FIREWALL_GROUP },
+  });
+
   // Operator-initiated pairing-code refresh — the escape hatch when a code has
   // been used or has expired and another device still needs to pair.
   pipeServer.onRpc('daemon.web.pairRefresh', async () => {
@@ -4055,11 +4182,18 @@ function registerRpcHandlers(
   // daemon directly and main never sees the signal, so this must not stay
   // reachable only over the wire. Returns false when there is nothing to
   // apply (dead session / empty binding) — the callers report it differently.
-  const applyResumeBinding = (id: string, resumeBinding: ResumeBinding | undefined): boolean => {
+  //
+  // `paneExact`: the capture came from the pane itself (its WMUX_PTY_ID, its
+  // agent's command line or relay), not a hook routed to it by its folder.
+  const applyResumeBinding = (id: string, resumeBinding: ResumeBinding | undefined, paneExact: boolean): boolean => {
     const managed = sessionManager.getSession(id);
     // A binding without its folder can never be resumed (`--resume` is
     // cwd-scoped) and must not be stored: refuse it like an empty one.
     if (!managed || !isUsableResumeBinding(resumeBinding)) return false;
+    // A capture without a path may start a transcript search, whose find
+    // re-enters below: it keeps this capture's exactness (#2730).
+    if (resumeBinding.transcriptPath) discoveryPaneExact.delete(id);
+    else discoveryPaneExact.set(id, paneExact);
     // #1823: the RPC and main's hooks.signal fallback reach here without
     // HookIngest's checks; an id the agent cannot resume is never stored.
     if (!isPlausibleResumeSessionId(resumeBinding.agent, resumeBinding.sessionId)) {
@@ -4156,6 +4290,13 @@ function registerRpcHandlers(
       // transitions once (absent → present), so no per-turn write amplification.
       || prev.transcriptPath !== next.transcriptPath;
     managed.meta.resumeBinding = next;
+    // #2730: the pane's agent now holds this conversation (a resume typed by
+    // hand, the TUI's own /resume). The terminal wins: a chat in another pane
+    // on the same conversation gives way. No liveness gate: every writer here
+    // is driven by a running agent (its hook, its command line on the alive
+    // edge), and the tracker's probe is still pending at a fresh launch's
+    // SessionStart, whose newer ts then makes the command-line capture stale.
+    chatV2Host?.terminalHolds(id, next.agent, next.sessionId, paneExact);
     // X6 ③ (Rung 1): a captured binding PROVES claude ran in this pane, so the
     // hook is a SECOND, independent writer of the pill gate (lastDetectedAgent) —
     // the live AgentDetector banner is once-per-session and is never re-armed from
@@ -4175,7 +4316,8 @@ function registerRpcHandlers(
 
   pipeServer.onRpc('daemon.setResumeBinding', async (params) => {
     const p = params as unknown as DaemonSetResumeBindingParams;
-    return { ok: applyResumeBinding(p.id, p.resumeBinding) };
+    // Main relays only a pane-exact hook route (hooks.rpc.ts, #1523).
+    return { ok: applyResumeBinding(p.id, p.resumeBinding, true) };
   });
 
   // M1 — daemon.hooks.signal. The hook bridge's daemon-first target: the
@@ -4359,6 +4501,28 @@ function registerRpcHandlers(
     });
     transcriptActivity.start();
   }
+  if (!stallWatch) {
+    stallWatch = new StallWatch({
+      listSessionIds: () => sessionManager.listLiveSessions().map((s) => s.id),
+      getBinding: (id) => (currentMoaPane()?.sessionId === id ? undefined : resolveTranscriptBinding(id)),
+      midTurn: (id) => {
+        const bridge = sessionManager.getSession(id)?.bridge;
+        return bridge?.isAgentMidTurn() ? bridge.getTurn(bridge.getAgentStatus()).id : null;
+      },
+      awaitingHuman: (id) => sessionManager.getSession(id)?.bridge.getAgentStatus() === 'awaiting_input'
+        || approvalRegistry?.list().pending.some((r) => r.sessionId === id) === true,
+      readScreen: async (id) => {
+        const outcome = await queuedScreenText(sessionManager, id);
+        return outcome?.ok ? outcome.rows.map((r) => r.text) : null;
+      },
+      titleRunning: (id) => titleShowsRunningTurn(sessionManager.getSession(id)?.bridge.getTitle(), STALL_AGENT, Date.now()),
+      emit: (sessionId, stalledSince) => {
+        const event: DaemonEvent = { type: 'agent.stall', sessionId, data: { stalledSince } };
+        pipeServer.broadcast(event);
+      },
+    });
+    stallWatch.start();
+  }
 
   // Chat View — F9 early availability. Guarded like the projector: a second
   // registerRpcHandlers call must not mint a second searcher, or the first
@@ -4372,13 +4536,15 @@ function registerRpcHandlers(
       onFound: ({ sessionId, agentSessionId, transcriptPath, cwd, agent }) => {
         // Re-enter through the normal writer so the discovered path is vetted,
         // sticky-merged, and saveImmediate'd exactly like a hook-supplied one.
+        const paneExact = discoveryPaneExact.get(sessionId) ?? false;
+        discoveryPaneExact.delete(sessionId);
         applyResumeBinding(sessionId, {
           agent: agent ?? DISCOVERABLE_AGENT,
           sessionId: agentSessionId,
           cwd,
           transcriptPath,
           ts: Date.now(),
-        });
+        }, paneExact);
         // `status()` re-reads the binding on every call, so availability flips
         // on its own; this is only for a Chat surface that is ALREADY open and
         // would otherwise wait for the next hook nudge to notice the path.
@@ -4418,7 +4584,7 @@ function registerRpcHandlers(
       bind: (id, match) => {
         log('info', `[codex] bound ${id} to rollout ${match.threadId} by cwd`);
         // Same writer as a hook-supplied path: vetted, merged, saveImmediate'd.
-        applyResumeBinding(id, { agent: 'codex', sessionId: match.threadId, cwd: match.cwd, transcriptPath: match.transcriptPath, ts: Date.now() });
+        applyResumeBinding(id, { agent: 'codex', sessionId: match.threadId, cwd: match.cwd, transcriptPath: match.transcriptPath, ts: Date.now() }, true);
         transcriptProjector?.rebind(id);
       },
       log: (level, message) => log(level, message),
@@ -4456,7 +4622,7 @@ function registerRpcHandlers(
       if (!binding) return;
       log('info', `[resume] bound ${id} to ${slug} conversation ${binding.sessionId} from its command line`);
       // Same writer as a hook-supplied binding: vetted, merged, saveImmediate'd.
-      if (applyResumeBinding(id, binding)) transcriptProjector?.rebind(id);
+      if (applyResumeBinding(id, binding, true)) transcriptProjector?.rebind(id);
     }).catch(() => undefined).finally(() => commandLineReading.delete(flight));
   };
 
@@ -4480,8 +4646,15 @@ function registerRpcHandlers(
   desktopPhoneBridge ??= new DesktopPhoneBridge((id,event) => pipeServer.sendTo(id,event));
   pipeServer.onRpc('daemon.phone.register', async (params,ctx) => {
     if (!firstPartyOnly(ctx.clientId,'daemon.phone.register')) return {ok:false};
-    return {ok:desktopPhoneBridge!.register(ctx.clientId,(params as {commands?:unknown} | undefined)?.commands)};
+    const ok = desktopPhoneBridge!.register(ctx.clientId,(params as {commands?:unknown} | undefined)?.commands);
+    // Keep the computer awake: a (re)connected desktop learns at once whether
+    // a paired phone is attached, and answers with its own keep-awake state.
+    if (ok) desktopPhoneBridge?.notifyPhonePresence(webTerminalServer?.phoneAttached() ?? false);
+    return {ok};
   });
+  // Main's "Keep the computer awake" mode and whether its blocker is held,
+  // for `/api/config` `keepAwake`. Only the registered desktop may report it.
+  pipeServer.onRpc('daemon.phone.keepAwake', keepAwakeRpc(desktopPhoneBridge,(clientId) => firstPartyOnly(clientId,'daemon.phone.keepAwake')));
   pipeServer.onRpc('daemon.phone.complete', async (params,ctx) => {
     if (!firstPartyOnly(ctx.clientId,'daemon.phone.complete')) return {ok:false};
     return {ok:desktopPhoneBridge!.complete(ctx.clientId,params)};
@@ -4546,6 +4719,23 @@ function registerRpcHandlers(
         return startTime && commandLine ? { startTime, commandLine } : null;
       },
       killTree: (pid) => killProcessTree(pid),
+      // A Codex chat resuming its thread: a terminal Codex on the shared
+      // app-server holding it. The chat's own pane counts too: it runs no
+      // terminal Codex while the chat is there (paneFree), so a relay of its
+      // own on that thread is one that has not let go of it yet.
+      codexThreadOwners: (threadId) => codexPaneRelays.threadHolders(threadId),
+      // #2730: what terminal agents hold once the records load. A Codex relay's
+      // selection is the pane's own; a stored Claude binding may have come
+      // from a hook routed by folder, so it does not name the pane.
+      terminalBindings: () => sessionManager.listManagedSessions().flatMap((pane) => {
+        const id = pane.meta.id;
+        const held: Array<{ paneId: string; agent: string; sessionId: string; paneExact: boolean }> = [];
+        const relay = codexPaneRelays.liveSelection(id, sessionManager.getSession(id));
+        if (relay.live && relay.selection) held.push({ paneId: id, agent: 'codex', sessionId: relay.selection.threadId, paneExact: true });
+        const binding = pane.meta.resumeBinding;
+        if (binding && agentProcessTracker.identityFor(id)?.alive === true) held.push({ paneId: id, agent: binding.agent, sessionId: binding.sessionId, paneExact: false });
+        return held;
+      }),
       // Terminal → chat (chat/v2/fromTerminal.ts): the pane's Claude TUI.
       terminal: {
         holdKeyboard: (id) => nativeChatBridge?.holdKeyboard(id) ?? null,
@@ -4593,9 +4783,13 @@ function registerRpcHandlers(
         tree: (id) => agentProcessTracker.agentProcessTree(id, 'claude'),
         stop: (id, stillIdle) => stopAgentTree({
           tree: () => agentProcessTracker.agentProcessTree(id, 'claude'),
-          stillRunning: (entries) => agentProcessTracker.stillRunning(entries),
+          stillRunning: (entries) => agentProcessTracker.liveness(entries),
           kill: (pid, signal) => process.kill(pid, signal),
           stillIdle,
+          // Windows never reparents: a child started after the tree was read outlives the kill.
+          ...(process.platform === 'win32'
+            ? { sweep: createOrphanSweep({ read: () => agentProcessTracker.processTable(), kill: (pid) => process.kill(pid, 'SIGKILL') }) }
+            : {}),
         }),
         processesWithArg: (marker) => agentProcessTracker.processesWithArg(marker),
         otherOwners: (id, sessionId) => sessionManager.listManagedSessions()
@@ -5034,7 +5228,7 @@ function registerRpcHandlers(
           );
         }
       },
-      applyResumeBinding: (id, binding) => { applyResumeBinding(id, binding); },
+      applyResumeBinding: (id, binding, paneExact) => { applyResumeBinding(id, binding, paneExact); },
       liveAgentFor: (id) => {
         const tracked = agentProcessTracker.identityFor(id);
         return tracked?.alive ? tracked.slug : undefined;
@@ -5077,6 +5271,7 @@ function registerRpcHandlers(
         projector.nudge(sessionId, kind, agentSessionId);
         // A hook-fed session's own activity line wins over the transcript.
         transcriptActivity?.noteHookSignal(sessionId, kind);
+        stallWatch?.noteHookSignal(sessionId, kind);
         apiErrorTurnEnds?.noteHookSignal(sessionId, kind, ts, promptId);
         teammateWakes?.noteHookSignal(sessionId, kind, ts);
         // #782 — phone turn-view nudge. Non-recording: bypasses attentionLog so
@@ -5326,6 +5521,49 @@ function registerRpcHandlers(
   // main. Main pushes the whole table here on every change; until it does, the
   // store answers "not established" and an automated press is refused as
   // `scope-unavailable`. See approvals/workspaceFacts.ts.
+  // ── Main → daemon bot approvals waiting on the owner (phone push) ─────────
+  // The whole table, on every change; see shared/botApprovalPush.ts.
+  pipeServer.onRpc('daemon.botApprovals.set', async (params, ctx) => {
+    // First-party only: a client that could write this table would choose
+    // which approval banners reach the owner's phone.
+    if (!firstPartyOnly(ctx.clientId, 'daemon.botApprovals.set')) {
+      return { ok: false, error: 'daemon.botApprovals.set is first-party only' };
+    }
+    const rows = parseBotApprovalPushRows((params as { requests?: unknown } | undefined)?.requests);
+    if (!rows) return { ok: false, error: 'daemon.botApprovals.set requires a requests array' };
+    pushBotApprovals?.(rows);
+    botApprovalsPublisher = ctx.clientId;
+    return { ok: true, accepted: rows.length };
+  });
+  // The same for a bot's open prompts; see shared/botPromptPush.ts.
+  pipeServer.onRpc('daemon.botPrompts.set', async (params, ctx) => {
+    if (!firstPartyOnly(ctx.clientId, 'daemon.botPrompts.set')) {
+      return { ok: false, error: 'daemon.botPrompts.set is first-party only' };
+    }
+    const rows = parseBotPromptPushRows((params as { prompts?: unknown } | undefined)?.prompts);
+    if (!rows) return { ok: false, error: 'daemon.botPrompts.set requires a prompts array' };
+    pushBotPrompts?.(rows);
+    botPromptsPublisher = ctx.clientId;
+    return { ok: true, accepted: rows.length };
+  });
+  // Main's open browser help requests (shared/phoneBrowserHelp.ts): the whole
+  // table, from the registered desktop only. The phone lists it and gets a
+  // live `browser.help` frame for each one that opens or closes.
+  browserHelpTable ??= new BrowserHelpTable({
+    firstParty: (clientId) => firstPartyOnly(clientId, BROWSER_HELP_SET_METHOD),
+    isOwner: (clientId) => desktopPhoneBridge?.isOwner(clientId) === true,
+    emit: (frames) => webTerminalServer?.emitBrowserHelp(frames),
+    onRows: (rows, closed) => pushBrowserHelp?.(rows, closed),
+    log: (level, message) => log(level, message),
+  });
+  const helpTable = browserHelpTable;
+  pipeServer.onRpc(BROWSER_HELP_SET_METHOD, async (params, ctx) => {
+    const result = helpTable.set(ctx.clientId, params);
+    if (result.ok) browserHelpPublisher = ctx.clientId;
+    return result;
+  });
+  pipeServer.onClientClose((clientId) => helpTable.onClientClose(clientId));
+
   pipeServer.onRpc('daemon.workspaceFacts.set', async (params, ctx) => {
     // FIRST-PARTY ONLY, and this one is load-bearing rather than hygienic: a
     // client that could write this table would be choosing which panes an
@@ -5494,7 +5732,7 @@ function registerRpcHandlers(
     }
     const agentVerified = liveProcess;
     return {
-      agentName: reportedAgentName({ rawName, screenSlug, canonical }),
+      agentName: reportedAgentName({ rawName, screenSlug, canonical, customName: agentProcessTracker.customAgentNameFor(id) }),
       agentVerified,
       ...state,
     };
@@ -5512,7 +5750,11 @@ function registerRpcHandlers(
     const managed = sessionManager.getSession(id);
     if (!managed) return undefined;
     const durable = managed.meta.resumeBinding;
-    const binding = durable && bindingTranscriptLives(durable) ? durable : undefined;
+    // A gone folder is marked as for pty.list, so the host never calls a stale
+    // pane cwd that still names it a match (resumeInfoOf).
+    const binding = durable && bindingTranscriptLives(durable)
+      ? markCwdMissing(durable, managed.meta, bindingTranscriptLives, fs.existsSync)
+      : undefined;
     const commandRunning = managed.promptLog.commandRunningIfKnown();
     // Same three-state derivation as pty.list: an exec unit IS its agent
     // process, a tracked pane answers from the tracker, and anything else stays
@@ -5608,6 +5850,8 @@ function registerRpcHandlers(
     const bracketedPaste = sessionManager.getSession(id)?.bridge.outputModes?.isSet(2004) ?? null;
     return { agentName: readDaemonAgentState(id).agentName, bracketedPaste };
   });
+  // Main's folder-trust check for a pane its renderer has no screen for.
+  registerFolderTrustRpc(pipeServer, sessionManager);
   const readChatAgentState = (id: string) => {
     const keyed = sessionManager.getSession(id)?.bridge;
     // A chat send fences on keys only: a pointer drifting over a mouse-tracking
@@ -5938,6 +6182,59 @@ function registerRpcHandlers(
     return { result: await bridge.desktopInterrupt(id, agentSessionId) };
   });
 
+  // A turn that seems stuck (StallWatch): Keep waiting doubles its threshold;
+  // Stop and prefill interrupts it and puts the last prompt back, unsent.
+  pipeServer.onRpc('daemon.chat.stallKeepWaiting', async (params, ctx) => {
+    if (!firstPartyOnly(ctx.clientId, 'stallKeepWaiting')) return { ok: false };
+    const id = typeof params['id'] === 'string' ? params['id'] : '';
+    return { ok: stallWatch?.keepWaiting(id) === true };
+  });
+  pipeServer.onRpc('daemon.chat.stallPrefill', async (params, ctx) => {
+    if (!firstPartyOnly(ctx.clientId, 'stallPrefill')) return { result: 'unavailable' };
+    const id = typeof params['id'] === 'string' ? params['id'] : '';
+    // The card may be older than the stall: only the turn the stall was recorded for is stopped.
+    const stalledTurn = stallWatch?.stalledTurn(id);
+    if (stalledTurn === undefined) return { result: 'not_running' };
+    // Moa's brain pane is not watched, so it is never stopped from here either.
+    const binding = id && currentMoaPane()?.sessionId !== id ? resolveTranscriptBinding(id) : undefined;
+    if (binding?.agent !== STALL_AGENT || !binding.transcriptPath) return { result: 'unavailable' };
+    const transcriptPath = binding.transcriptPath;
+    const result = await stopAndPrefill({
+      // A dialog or approval that appeared after the chip: an ESC would answer it.
+      blocked: () => sessionManager.getSession(id)?.bridge.getAgentStatus() === 'awaiting_input'
+        || !approvalRegistry || approvalRegistry.list().pending.some((r) => r.sessionId === id),
+      interrupt: () => bridge.desktopInterrupt(id, binding.sessionId, stalledTurn),
+      turnId: () => {
+        const paneBridge = sessionManager.getSession(id)?.bridge;
+        return paneBridge?.getTurn(paneBridge.getAgentStatus()).id;
+      },
+      // The turn's own prompt, as written (not the projected, length-capped text).
+      lastPrompt: () => {
+        const tail = readTranscriptTail(transcriptPath);
+        return tail ? lastHumanPrompt(tail.entries) : null;
+      },
+      holdKeyboard: () => bridge.holdKeyboard(id),
+      readScreen: async () => {
+        const outcome = await queuedScreenText(sessionManager, id, true);
+        return outcome?.ok
+          ? Object.assign(outcome.rows.map((r) => r.text), { undimmed: outcome.rows.map((r) => r.undimmed ?? r.text) })
+          : null;
+      },
+      write: (data) => {
+        const managed = sessionManager.getSession(id);
+        if (!managed || resolveTranscriptBinding(id)?.sessionId !== binding.sessionId) return false;
+        managed.ptyProcess.write(data);
+        managed.bridge.noteInput(data);
+        return true;
+      },
+    });
+    // The turn was stopped: its stall is over now, not at the next tick.
+    if (result === 'filled' || result === 'kept' || result === 'stopped') stallWatch?.dropSession(id);
+    // The send queue was held off the keyboard for the paste: let it try now.
+    void bridge.kickQueue(id);
+    return { result };
+  });
+
   // Pane menu "Rewind" for a terminal Claude: its own double ESC, only at rest
   // with an empty composer (see openClaudeRewind), under the bridge's send lock.
   pipeServer.onRpc('daemon.transcript.rewind', async (params, ctx) => {
@@ -6047,11 +6344,24 @@ function registerRpcHandlers(
   // these). `lanlink.status` reads persisted state + live NICs; `lanlink.configure`
   // validates the renderer-supplied patch (coerceLanLinkPatch — throws on garbage),
   // persists, and fires the 'changed' seam. Network-0: no listener is started here.
+  // Both answer the persisted state merged with the listener's live state;
+  // configure waits for the reconcile it triggered (which reads the network
+  // category), so the caller sees whether LanLink is listening and why not.
   pipeServer.onRpc('lanlink.status', async () => {
-    return lanLinkController.getStatus();
+    return { ...lanLinkController.getStatus(), ...lanLinkServer.runtimeStatus() };
   });
   pipeServer.onRpc('lanlink.configure', async (params) => {
-    return lanLinkController.configure(coerceLanLinkPatch(params));
+    const status = lanLinkController.configure(coerceLanLinkPatch(params));
+    // Bounded below the RPC timeout: a pass already reading the category can
+    // run ahead of the one this queued. Past the deadline the answer says
+    // `checking: true`, and the status-changed nudge follows.
+    let deadline: NodeJS.Timeout | undefined;
+    await Promise.race([
+      lanLinkServer.settled(),
+      new Promise<void>((resolve) => { deadline = setTimeout(resolve, QUERY_TIMEOUT_MS); }),
+    ]);
+    clearTimeout(deadline);
+    return { ...status, ...lanLinkServer.runtimeStatus() };
   });
 
   // LanLink PR-4 — pairing + peer control plane. Machine-local control-pipe RPCs
@@ -7233,6 +7543,7 @@ function wireEvents(
     chatSubscribers.delete(payload.id);
     transcriptProjector?.dropPty(payload.id);
     transcriptActivity?.dropSession(payload.id);
+    stallWatch?.dropSession(payload.id);
     apiErrorTurnEnds?.dropSession(payload.id);
     teammateWakes?.dropSession(payload.id);
     terminalChat?.dropPty(payload.id);
@@ -7589,11 +7900,13 @@ function wireEvents(
       // path that fills running-state agentName (local mode stays on
       // PTYBridge's getLastAgent). Undefined canonical with a mappable screen
       // slug is the residue veto: null, not the dead agent's sticky label.
-      data: activeCanonical
-        ? agentSlugToDisplay(activeCanonical.slug)
-        : activeScreenSlug
-          ? null
-          : payload.agentName ?? null,
+      // A live custom agent names the pane when no registry agent does.
+      data: reportedAgentName({
+        rawName: payload.agentName,
+        screenSlug: activeScreenSlug,
+        canonical: activeCanonical,
+        customName: agentProcessTracker.customAgentNameFor(payload.sessionId),
+      }),
     };
     pipeServer.broadcast(event);
   });
@@ -7917,6 +8230,7 @@ function wireEvents(
     chatSubscribers.delete(payload.id);
     transcriptProjector?.dropPty(payload.id);
     transcriptActivity?.dropSession(payload.id);
+    stallWatch?.dropSession(payload.id);
     apiErrorTurnEnds?.dropSession(payload.id);
     teammateWakes?.dropSession(payload.id);
     terminalChat?.dropPty(payload.id);
@@ -8052,7 +8366,7 @@ let paneSupervisorRef: PaneSupervisor | null = null;
 // (startupRecovery.ts); `daemon.listSessions` says it when asked.
 const startupRecovery = createStartupRecovery({ log: (line) => log('info', line) });
 // Module-level so the standalone shutdown() can dispose the LanLink listener
-// (close the net.Server, drop live connections, remove the firewall rules).
+// (close the net.Server, drop live connections).
 let lanLinkServerRef: LanLinkServer | null = null;
 // Same for the cross-host A2A listener.
 let a2aServerRef: A2aServer | null = null;
@@ -8224,6 +8538,7 @@ async function shutdown(
   chatPushTimers.clear(); chatSubscribers.clear();
   transcriptProjector?.dispose();
   transcriptActivity?.dispose();
+  stallWatch?.dispose();
   terminalChat?.dispose();
   // Same for the discovery searches — unref'd watch handles and poll timers.
   transcriptDiscovery?.dispose();
@@ -8272,8 +8587,8 @@ async function shutdown(
   // re-arms them on the next boot.
   try { paneSupervisorRef?.dispose(); } catch { /* best effort */ }
 
-  // LanLink PR-4: close the listener, drop live AEAD connections, remove firewall
-  // rules. Best-effort — must never block the shutdown path.
+  // LanLink PR-4: close the listener and drop live AEAD connections.
+  // Best-effort — must never block the shutdown path.
   try { lanLinkServerRef?.dispose(); } catch { /* best effort */ }
   try { void a2aDeliveryRef?.stop(); } catch { /* best effort */ }
   try { a2aServerRef?.dispose(); } catch { /* best effort */ }
@@ -8587,11 +8902,23 @@ async function main(): Promise<void> {
   // nobody there to report anything. Same collapseId, so the phone replaces
   // the pane's banner rather than stacking a second one.
   const deferredPush = new DeferredPushQueue({
-    send: (payload, opts) => pushSender.notify(payload, opts),
+    // A held browser help push goes only to the devices that may still answer
+    // it, and never costs an approval its place in the relay queue.
+    send: (payload, opts) => {
+      if (opts.requires !== BROWSER_HELP_PUSH_CAPABILITY || !opts.deviceIds) return pushSender.notify(payload, opts);
+      const deviceIds = browserHelpPushRouter.narrowRelease(String(payload.browserHelpId), opts.deviceIds);
+      if (deviceIds.length > 0) pushSender.notify(payload, { ...opts, deviceIds, yields: true });
+    },
     // Whether a held push went out or was evicted unsent decides whether its
     // record may later retract it. Only called on a release or an eviction,
     // both of which happen after the router below exists.
-    onOutcome: (id, outcome, collapseId) => approvalPushRouter.onParkedOutcome(id, outcome, collapseId),
+    onOutcome: (id, outcome, collapseId) => {
+      if (botApprovalPushRouter.owns(id)) botApprovalPushRouter.onParkedOutcome(id, outcome);
+      else if (botPromptPushRouter.owns(id)) botPromptPushRouter.onParkedOutcome(id, outcome);
+      else if (browserHelpPushRouter.owns(id)) browserHelpPushRouter.onParkedOutcome(id, outcome);
+      else approvalPushRouter.onParkedOutcome(id, outcome, collapseId);
+    },
+    yields: (key) => browserHelpPushRouter.owns(key),
     isPresent: desktopIsPresent,
     staleAfterMs: () => presenceConfig().staleAfterMs,
     log: (level, msg) => log(level, msg),
@@ -8711,6 +9038,50 @@ async function main(): Promise<void> {
   // normally empty — and a banner delivered before a restart is not retracted,
   // because which pushes were delivered is not persisted.
   approvalPushRouter.adopt(approvalRegistry.list().pending);
+  // A bot's approval requests live in main, which pushes the table of those
+  // waiting on the owner (shared/botApprovalPush.ts). Same presence rules and
+  // park queue as a pane approval; only devices that registered the
+  // capability receive them.
+  //
+  // A bot's open prompts (question / login_request / secret_request cards)
+  // ride the same plumbing under their own capability (shared/botPromptPush.ts).
+  const botPushTableDeps: PushTableRouterDeps = {
+    suppress: (payload) => shouldSuppressPush({
+      state: desktopPresence.snapshot(),
+      now: Date.now(),
+      config: presenceConfig(),
+      ...(payload.risk !== undefined ? { risk: payload.risk } : {}),
+    }),
+    send: (payload, opts) => pushSender.notify(payload, opts),
+    park: (key, payload, collapseId, requires) => deferredPush.park(key, payload, collapseId, requires),
+    forget: (key) => deferredPush.forget(key),
+    log: (level, msg) => log(level, msg),
+  };
+  const botApprovalPushRouter = new BotApprovalPushRouter(botPushTableDeps);
+  const botPromptPushRouter = new BotPromptPushRouter(botPushTableDeps);
+  pushBotApprovals = (rows) => botApprovalPushRouter.set(rows);
+  pushBotPrompts = (rows) => botPromptPushRouter.set(rows);
+  // A browser help request (phone/BrowserHelpTable.ts), pushed only to the
+  // devices that may answer it (push/browserHelpPush.ts). Same presence rules
+  // and park queue; the retraction goes to the devices the push went to.
+  const browserHelpPushRouter = new BrowserHelpPushRouter({
+    audience: () => {
+      const store = getDeviceStore();
+      return browserHelpPushAudience({
+        server: webTerminalServer?.currentStartState,
+        desktopDecides: desktopPhoneBridge?.supports(PHONE_BROWSER_HELP_DECIDE_COMMAND) === true,
+        targets: store.pushTargets(),
+        hasExplicitInputGrant: (deviceId) => store.hasExplicitInputGrant(deviceId),
+      });
+    },
+    isBrainPane: (ptyId) => isBrainPty({ id: ptyId, env: sessionManager.getSession(ptyId)?.meta.env }),
+    suppress: botPushTableDeps.suppress,
+    send: (payload, opts) => pushSender.notify(payload, opts),
+    park: (key, payload, collapseId, requires, deviceIds) => deferredPush.park(key, payload, collapseId, requires, deviceIds),
+    forget: (key) => deferredPush.forget(key),
+    log: (level, msg) => log(level, msg),
+  });
+  pushBrowserHelp = (rows, closed) => browserHelpPushRouter.set(rows, closed);
   // Contract §7 `turn_failed`: one push per failed turn (serveTurnFailure only
   // calls this for a failure it had not held). Presence is consulted like an
   // approval's, but a suppressed one is DROPPED, not parked: someone at the
@@ -8772,6 +9143,20 @@ async function main(): Promise<void> {
   // this, killing the app mid-focus would leave a fresh report standing for the
   // rest of the freshness window and swallow the pushes it was meant to hand off.
   pipeServer.onClientClose((clientId) => {
+    // Before presence drops below: a bot table's publisher took the only way
+    // to answer its rows with it, so its held pushes go first.
+    if (botApprovalsPublisher !== null && botApprovalsPublisher === clientId) {
+      botApprovalPushRouter.forgetParked();
+      botApprovalsPublisher = null;
+    }
+    if (botPromptsPublisher !== null && botPromptsPublisher === clientId) {
+      botPromptPushRouter.forgetParked();
+      botPromptsPublisher = null;
+    }
+    if (browserHelpPublisher !== null && browserHelpPublisher === clientId) {
+      browserHelpPushRouter.publisherGone();
+      browserHelpPublisher = null;
+    }
     desktopPresence.forget(clientId);
     deferredPush.onPresenceChanged();
     // The press-scope table belongs to the main process that published it. Once
@@ -9272,6 +9657,10 @@ async function main(): Promise<void> {
     watcher: new WslPidWatcher(),
     isRunning: (agent) => checkWslAgentRunning(agent),
   });
+  // The operator's custom agents (Settings → Roles & fan-out): a pane running
+  // one is labelled with its name. Read from main's file, never written here.
+  const customAgentNames = new CustomAgentNames(getWmuxDir());
+  agentProcessTracker.setCustomAgentNames(() => customAgentNames.names());
   // Whether a session is a WSL pane whose agent is live right now, for main's
   // browser-identity check of a WSL pane (Windows cannot walk Linux processes,
   // so main asks the daemon, which follows that agent from inside the distro).
@@ -9323,7 +9712,7 @@ async function main(): Promise<void> {
     try {
       return await stopAgentTree({
         tree: () => agentProcessTracker.agentProcessTree(id, 'claude'),
-        stillRunning: (entries) => agentProcessTracker.stillRunning(entries),
+        stillRunning: (entries) => agentProcessTracker.liveness(entries),
         kill: (pid, signal) => process.kill(pid, signal),
         ...(stillIdle ? { stillIdle } : {}),
       });
@@ -9360,7 +9749,7 @@ async function main(): Promise<void> {
         },
         stopClaude: (sid, stillIdle) => stopAgentTree({
           tree: () => agentProcessTracker.agentProcessTree(sid, 'claude'),
-          stillRunning: (entries) => agentProcessTracker.stillRunning(entries),
+          stillRunning: (entries) => agentProcessTracker.liveness(entries),
           kill: (pid, signal) => process.kill(pid, signal),
           stillIdle,
         }),
@@ -9547,6 +9936,13 @@ async function main(): Promise<void> {
         type: 'lanlink.remote.received',
         sessionId: LANLINK_SENTINEL_SESSION_ID,
         data: { seq },
+      }),
+    // A nudge only: the UI re-reads `lanlink.status`.
+    onStatusChange: () =>
+      pipeServer.broadcast({
+        type: 'lanlink.status.changed',
+        sessionId: LANLINK_SENTINEL_SESSION_ID,
+        data: {},
       }),
   });
   lanLinkServerRef = lanLinkServer;
@@ -9903,6 +10299,10 @@ async function main(): Promise<void> {
     if (shuttingDown || sessionManager.getSession(id) !== owner || !['attached','detached'].includes(owner.meta.state)) return;
     const before = JSON.stringify(owner.meta.codexRelayResume);
     const observed = codexPaneRelays.liveSelection(id,owner);
+    // #2730: the pane's terminal Codex selected this thread; a chat in another
+    // pane on it gives way (chat v2 host terminalHolds, never throws).
+    const selectedThread = observed.live ? observed.selection?.threadId : undefined;
+    if (selectedThread) chatV2Host?.terminalHolds(id, 'codex', selectedThread, true);
     const codeHome = codexPaneRelays.accountHome(id,owner);
     if (codeHome) persistCodexThreadOwner(owner.meta, observed, codeHome);
     captureCodexRelayResume(owner.meta, observed);
@@ -10079,10 +10479,10 @@ async function main(): Promise<void> {
   // Write active pipe name so clients know which pipe to connect to
   const activePipeName = pipeServer.getActivePipeName();
   const pipeNameFile = path.join(wmuxDir, 'daemon-pipe');
-  try {
-    fs.writeFileSync(pipeNameFile, activePipeName, { encoding: 'utf-8', mode: 0o600 });
-  } catch (err) {
-    log('warn', 'Failed to write pipe name file:', err);
+  // Renamed into place: a client that reads it empty falls back to the
+  // default pipe name, which is not ours when we bound a fallback pipe.
+  if (replaceFileOrWrite(pipeNameFile, activePipeName, (msg) => log('warn', msg))) {
+    writtenPipeName = activePipeName;
   }
   markDaemonBoot('pipe-file-written');
   // Issue #546 — we can answer pings from here on, so the "still booting" grace
@@ -10403,9 +10803,10 @@ main().catch((err) => {
     // redundant second daemon the launcher spawned over a daemon it failed to
     // detect (split-brain Defect 3 / Step ③). Exit with a DISTINCT code so the
     // launcher reconnects to the existing daemon instead of treating this as a
-    // generic startup failure. releaseLock() clears the daemon.pid that
-    // acquireLock() wrote for us; the launcher reconnects via the canonical
-    // pipe name, not the pid file.
+    // generic startup failure. releaseLock() clears the daemon.pid and lock
+    // that acquireLock() wrote for us, and keeps the live daemon's daemon-pipe
+    // (we never wrote one); the launcher reconnects via the canonical pipe
+    // name and restores daemon.pid from the ping.
     log('warn', 'another live daemon owns the control pipe — exiting cleanly (EDAEMON_ALREADY_RUNNING)');
     noteExitReason('another live daemon owns the control pipe');
     releaseLock();

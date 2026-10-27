@@ -5,8 +5,9 @@
 // sum of the page's own rows) and the Toggle Company View shortcut.
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useStore } from '../../../stores';
+import { loadLocale } from '../../../i18n';
 import { ALL_THREADS, timelineKey } from '../../../stores/slices/roomSlice';
 import { setRoomsApiForTests, type RoomsApi } from '../../../hooks/useRoomSync';
 import { setFactoryBotPort, type FactoryBotPort, type FactoryBotRow } from '../../Room/factoryPorts';
@@ -31,6 +32,9 @@ import { botHueIndex } from '../../Room/BotAvatar';
 vi.mock('../../Terminal/Terminal', () => ({ default: () => null }));
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+// Tables other than English load on demand; the tests below read Korean synchronously.
+beforeAll(() => loadLocale('ko'));
 
 const LEAD = 'bot-0000000a';
 const VERIFIER = 'bot-0000000b';
@@ -393,6 +397,55 @@ describe('Bots page', () => {
     expect(q('[data-bots-chat]')?.getAttribute('data-bots-chat')).toBe('bot:bot-0000000e');
   });
 
+  it('first screen: None pressed is sent with Start (noRepo), so main remembers it', async () => {
+    bots = [];
+    seedRooms();
+    act(() => useStore.setState({ activeWorkspaceId: 'w1' } as never));
+    const suggestRepo = vi.fn(async () => ({ ok: true as const, repoKey: 'github.com/acme/app', root: '/r/app', displayRoot: '/r/app', inherited: false }));
+    const created = botRow('bot-0000000e', 'lead', 'w1', 9, 'Ada').bot;
+    const create = vi.fn(async () => ({ ok: true as const, bot: created }));
+    setFactoryBotPort({ ...port, create, createTeam: vi.fn(), suggestRepo } as unknown as FactoryBotPort);
+    await render(<BotsPage engine={{}} />);
+    await act(async () => { await Promise.resolve(); });
+    const input = q<HTMLInputElement>('[data-bots-first-name]')!;
+    act(() => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, 'Ada');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    act(() => { q<HTMLButtonElement>('[data-testid="factory-add-bot-repo-none"]')!.click(); });
+    await act(async () => { q<HTMLButtonElement>('[data-bots-first-start]')!.click(); });
+    await act(async () => { await Promise.resolve(); });
+    expect(create).toHaveBeenCalledWith({ workspaceId: 'w1', name: 'Ada', noRepo: true });
+  });
+
+  it('first screen: Start and Add a team wait for main\'s repository answer, then send it', async () => {
+    bots = [];
+    seedRooms();
+    act(() => useStore.setState({ activeWorkspaceId: 'w1' } as never));
+    let answer: (s: { ok: true; repoKey: string; root: string; displayRoot: string; inherited: boolean }) => void = () => undefined;
+    const suggestRepo = vi.fn(() => new Promise((r) => { answer = r; }));
+    const created = botRow('bot-0000000e', 'lead', 'w1', 9, 'Ada').bot;
+    const create = vi.fn(async () => ({ ok: true as const, bot: created }));
+    setFactoryBotPort({ ...port, create, createTeam: vi.fn(), suggestRepo } as unknown as FactoryBotPort);
+    await render(<BotsPage engine={{}} />);
+    const start = q<HTMLButtonElement>('[data-bots-first-start]')!;
+    const team = q<HTMLButtonElement>('[data-bots-first-team]')!;
+    const input = q<HTMLInputElement>('[data-bots-first-name]')!;
+    act(() => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, 'Ada');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    expect(q('[data-testid="factory-add-bot-repo-row"]')?.getAttribute('data-repo-kind')).toBe('checking');
+    expect(start.disabled).toBe(true);
+    expect(team.disabled).toBe(true);
+    await act(async () => { answer({ ok: true, repoKey: 'github.com/acme/app', root: '/r/app', displayRoot: '/r/app', inherited: false }); });
+    expect(start.disabled).toBe(false);
+    expect(team.disabled).toBe(false);
+    await act(async () => { start.click(); });
+    await act(async () => { await Promise.resolve(); });
+    expect(create).toHaveBeenCalledWith({ workspaceId: 'w1', name: 'Ada', repoFolder: '/r/app' });
+  });
+
   it('first screen: a team answer with nothing made says so and opens nothing; the lead opens wherever it is in the answer', async () => {
     bots = [];
     seedRooms();
@@ -571,6 +624,30 @@ describe('Bots page', () => {
     expect(create).not.toHaveBeenCalled();
   });
 
+  it('"+" › Add bot opens on the current workspace, not the workspace of the conversation the page opened on', async () => {
+    bots = [botRow(LEAD, 'lead', 'w1', 2, 'Lead'), botRow('bot-0000000f', 'lead', 'w2', 3, 'Web lead')];
+    seedRooms();
+    act(() => useStore.setState({ workspaces: [ws('hq', 'Headquarters'), ws('w1', 'api'), ws('w2', 'web')], activeWorkspaceId: 'w2' } as never));
+    setFactoryBotPort({ ...port, create: vi.fn(), createTeam: vi.fn() } as unknown as FactoryBotPort);
+    await render(<BotsPage />);
+    act(() => q<HTMLElement>(`[data-bots-row="bot:${LEAD}"]`)!.click());
+    expect(q('[data-bots-chat]')?.getAttribute('data-bots-chat')).toBe(`bot:${LEAD}`);
+    openAddBot();
+    const select = () => document.querySelector<HTMLSelectElement>('[data-testid="bots-add-bot"] [data-testid="factory-add-bot-workspace"]');
+    expect(select()?.value).toBe('w2');
+  });
+
+  it('"+" › Add bot opens on the selected conversation\'s workspace when the current one is not a workspace a bot may join', async () => {
+    bots = [botRow(LEAD, 'lead', 'w1', 2, 'Lead'), botRow('bot-0000000f', 'lead', 'w2', 3, 'Web lead')];
+    seedRooms();
+    act(() => useStore.setState({ workspaces: [ws('hq', 'Headquarters'), ws('w1', 'api'), ws('w2', 'web'), ws('t1', 'wtask: fix login')], activeWorkspaceId: 't1' } as never));
+    setFactoryBotPort({ ...port, create: vi.fn() } as unknown as FactoryBotPort);
+    await render(<BotsPage />);
+    act(() => q<HTMLElement>(`[data-bots-row="bot:${LEAD}"]`)!.click());
+    openAddBot();
+    expect(document.querySelector<HTMLSelectElement>('[data-testid="bots-add-bot"] [data-testid="factory-add-bot-workspace"]')?.value).toBe('w1');
+  });
+
   it('first screen: a build that cannot tell the engine\'s state never blocks Start', async () => {
     bots = [];
     seedRooms();
@@ -675,6 +752,26 @@ describe('Bots page', () => {
     await act(async () => { q('[data-testid="bots-stop-bot-confirm"]')!.click(); });
     expect(stop.stopBot).toHaveBeenCalledWith(LEAD);
     expect(useStore.getState().toasts.at(-1)?.message).toBe('Stopped Lead and 2 of its workers.');
+  });
+
+  it('New conversation in a bot\'s profile asks in place, then starts it; mid-turn it says to stop the turn first', async () => {
+    seedRooms();
+    let running = false;
+    const stop = { newConversation: vi.fn(async () => (running ? { ok: false, code: 'running', message: 'stop the turn first' } : { ok: true })) };
+    act(() => useStore.setState({ toasts: [] } as never));
+    await render(<BotsPage stop={stop} />);
+    act(() => q(`[data-bots-row="bot:${LEAD}"]`)?.click());
+    act(() => q('[data-bots-pill]')?.click());
+    act(() => q('[data-testid="bots-new-conversation"]')?.click());
+    expect(stop.newConversation).not.toHaveBeenCalled();
+    expect(q('[data-testid="bots-new-conversation-confirm-row"]')?.textContent).toContain('Start a new conversation with Lead?');
+    await act(async () => { q('[data-testid="bots-new-conversation-confirm"]')?.click(); });
+    expect(stop.newConversation).toHaveBeenCalledWith(LEAD);
+    expect(useStore.getState().toasts.at(-1)?.message).toBe('Lead starts a new conversation on its next turn.');
+    running = true;
+    act(() => q('[data-testid="bots-new-conversation"]')?.click());
+    await act(async () => { q('[data-testid="bots-new-conversation-confirm"]')?.click(); });
+    expect(useStore.getState().toasts.at(-1)).toMatchObject({ message: 'Lead is in a turn. Stop the turn first.', level: 'error' });
   });
 
   it('Pause in a bot\'s profile parks it at once (no confirm), and the profile then shows Paused with Resume', async () => {

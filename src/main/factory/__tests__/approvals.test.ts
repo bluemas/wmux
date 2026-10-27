@@ -15,7 +15,7 @@ import type { Fact, FactDraft } from '../../../shared/facts';
 import type { MergeEffect } from '../../../shared/moaDecision';
 import type { PrLaneFacts } from '../../../shared/prReview';
 import type { RpcContext } from '../../../shared/rpc';
-import { ApprovalService, GUEST_REASON_HIDDEN, registerApprovalRpc, ruleCovers, typedApprovalSourceAllowed, typedApprovalTargets, withoutOwnerQuotes, type ApprovalMergeHost, type ApprovalPorts, type ApprovalWake, type StoredApproval } from '../approvals';
+import { ApprovalService, GUEST_REASON_HIDDEN, registerApprovalRpc, ruleCovers, typedApprovalSourceAllowed, typedApprovalTargets, withoutOwnerQuotes, type ApprovalActHost, type ApprovalMergeHost, type ApprovalPorts, type ApprovalWake, type StoredApproval } from '../approvals';
 import type { BotNoticeInput } from '../botNotices';
 import { RoomWriter } from '../roomWriter';
 import { registeredFactoryModules } from '../factoryHost';
@@ -39,6 +39,20 @@ const facts = (n: number, head = HEAD): PrLaneFacts => ({
   author: 'owner', mergedAt: null, mergeCommitOid: null, labels: [], labelsTruncated: false, files: ['a.ts'], filesTruncated: false,
   checksHeadOid: head, checks: [], checksTruncated: false,
 });
+
+/** The act outbox as far as a release request reads it: the main branch's
+ *  head, green, nothing else (approvalsRelease.os.test.ts runs releases). */
+const releaseOnly: ApprovalActHost = {
+  login: async () => 'owner',
+  repo: async () => ({ fullName: 'o/r', nodeId: 'R_1', id: 1 }),
+  issue: async () => ({ error: 'not used' }),
+  pull: async () => ({ error: 'not used' }),
+  release: async (_k, input) => ({ mode: 'release', workflows: [], alsoRuns: [], targetSha: HEAD, defaultBranch: 'main', behindBy: 0, checks: 'passed', version: null, prerelease: input.prerelease ?? false, pushWorkflows: [], checksExpected: false }),
+  enqueue: () => null,
+  run: async () => null,
+  effect: () => null,
+  remove: () => undefined,
+};
 
 let dir = '';
 beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-approvals-')); });
@@ -79,6 +93,7 @@ function rig(over: Partial<ApprovalPorts> = {}) {
     ghLogin: async () => state.login,
     rooms: () => writer,
     merge: () => host,
+    acts: () => releaseOnly,
     appendFact: (d) => {
       facts_.push(d);
       return null;
@@ -170,7 +185,7 @@ describe('approval requests (bot side)', () => {
     // An owner card in another thread is not answered across threads.
     const other = r.ownerSays('and the issue', 'task:t-2');
     r.state.wakes.set(DEV.id, { wakeId: 'w-2', attempt: 1, threadId: 'general' as never, tainted: false, ownerCardId: other.id });
-    const next = await r.ask(DEV, { action: 'comment', prNumber: 1, reason: 'note' });
+    const next = await r.ask(DEV, { action: 'merge', prNumber: 2, reason: 'note' });
     const card = r.writer.get(WS, next.cardId as string);
     expect(card?.threadId).toBe('general');
     expect(card?.replyTo).toBeUndefined();
@@ -197,8 +212,8 @@ describe('approval requests (bot side)', () => {
     expect(r.writer.get(WS, req.cardId as string)?.body).not.toContain('머지');
     // Nothing of its own left: main names the act.
     r.state.wakes.set(DEV.id, { wakeId: 'w-2', attempt: 1, threadId: 'general' as never, tainted: false });
-    const bare = await r.ask(DEV, { action: 'issue_close', issueNumber: 3, reason: '"머지할거 머지해"' });
-    expect(bare).toMatchObject({ reason: 'Close issue #3.' });
+    const bare = await r.ask(DEV, { action: 'release', tagName: 'v1', reason: '"머지할거 머지해"' });
+    expect(bare).toMatchObject({ reason: 'Publish a release of github.com/o/r (v1).' });
   });
 
   it('a request lands in the thread of the owner\'s latest words to the bot, else the owner wake\'s own thread', async () => {
@@ -268,12 +283,12 @@ describe('approval requests (bot side)', () => {
 
   it('a turn still running keeps its request count while many other turns ask', async () => {
     const r = rig();
-    const a = await r.ask(DEV, { action: 'issue_create', reason: 'first' });
+    const a = await r.ask(DEV, { action: 'release', tagName: 'v1', reason: 'first' });
     for (let i = 0; i < 210; i += 1) {
       r.state.wakes.set(OTHER.id, { wakeId: `w-o${i}`, attempt: 1, threadId: null, tainted: false });
-      await r.svc.request(binding(OTHER), { action: 'issue_create', reason: 'x' });
+      await r.svc.request(binding(OTHER), { action: 'release', tagName: `v-o${i}`, reason: 'x' });
     }
-    const b = await r.svc.request(binding(DEV), { action: 'issue_create', reason: 'second' });
+    const b = await r.svc.request(binding(DEV), { action: 'release', tagName: 'v2', reason: 'second' });
     expect(b).toMatchObject({ ok: true });
     expect((b as { duplicate?: true }).duplicate).toBeUndefined();
     expect((b as { request: { requestId: string } }).request.requestId).not.toBe(a.requestId);
@@ -281,15 +296,15 @@ describe('approval requests (bot side)', () => {
 
   it('a retried turn (the next attempt) asks again under the same default keys', async () => {
     const r = rig();
-    const a = await r.ask(DEV, { action: 'issue_create', reason: 'file it' });
+    const a = await r.ask(DEV, { action: 'merge', prNumber: 1, reason: 'file it' });
     r.state.wakes.set(DEV.id, { wakeId: 'w-1', attempt: 2, threadId: null, tainted: false });
-    expect(await r.svc.request(binding(DEV), { action: 'issue_create', reason: 'file it' })).toMatchObject({ ok: true, duplicate: true, request: { requestId: a.requestId } });
+    expect(await r.svc.request(binding(DEV), { action: 'merge', prNumber: 2, reason: 'file it' })).toMatchObject({ ok: true, duplicate: true, request: { requestId: a.requestId } });
   });
 
   it('approval_list returns only the caller\'s requests', async () => {
     const r = rig();
     await r.ask(DEV, { action: 'merge', prNumber: 1, reason: 'x' });
-    await r.ask(OTHER, { action: 'issue_create', reason: 'y' });
+    await r.ask(OTHER, { action: 'release', tagName: 'v1', reason: 'y' });
     const mine = r.svc.listFor(binding(DEV), {});
     expect(mine).toMatchObject({ ok: true, requests: [{ botId: DEV.id }] });
     expect((mine as { requests: unknown[] }).requests).toHaveLength(1);
@@ -385,12 +400,15 @@ describe('owner decisions', () => {
     expect(cards.at(-1)).toMatchObject({ kind: 'refusal', title: expect.stringContaining('needs a new approval') });
   });
 
-  it('acts other than merge are recorded, never executed', async () => {
+  it('a release is an act the outbox carries out: asked only while it runs, never a merge', async () => {
     vi.useFakeTimers();
+    const off = rig({ acts: () => null });
+    expect(await off.svc.request(binding(DEV), { action: 'release', tagName: 'v1', reason: 'ship it' })).toMatchObject({ ok: false, code: 'not_started' });
     const r = rig();
-    const req = await r.ask(DEV, { action: 'issue_create', reason: 'file the crash' });
-    expect(r.writer.get(WS, req.cardId as string)?.body).toContain('does not carry this act out yet');
-    expect(r.svc.decide({ requestId: req.requestId, decision: 'approve' }, 'desktop')).toMatchObject({ ok: true, request: { state: 'approved' } });
+    const req = await r.ask(DEV, { action: 'release', tagName: 'v1', reason: 'ship it' });
+    expect(req).toMatchObject({ act: { kind: 'release', tagName: 'v1', targetSha: HEAD }, payloadHash: expect.stringMatching(/^[0-9a-f]{64}$/) });
+    expect(r.writer.get(WS, req.cardId as string)?.body).not.toContain('does not carry this act out yet');
+    expect(r.svc.decide({ requestId: req.requestId, decision: 'approve', payloadHash: req.payloadHash }, 'desktop')).toMatchObject({ ok: true, request: { state: 'approved' } });
     await vi.advanceTimersByTimeAsync(APPROVAL_UNDO_MS * 2);
     expect(r.enqueued).toEqual([]);
   });
@@ -661,7 +679,7 @@ describe('always allow (remembered rules)', () => {
     }
     expect(r.svc.rulesList()).toEqual([]);
     expect(r.svc.get(a.requestId)?.state).toBe('pending');
-    const issue = await r.ask(DEV, { action: 'issue_create', reason: 'y' });
+    const issue = await r.ask(DEV, { action: 'release', tagName: 'v1', reason: 'y' });
     expect(r.svc.decide({ requestId: issue.requestId, decision: 'always' }, 'desktop')).toMatchObject({ ok: false, code: 'not_ruleable' });
   });
 
@@ -743,7 +761,7 @@ describe('always allow (remembered rules)', () => {
     r.state.heads.set(5, HEAD);
     // The rule covers the bot that asks: another bot's request is told so.
     expect(await r.ask(OTHER, { action: 'merge', prNumber: 5, reason: 'x' })).toMatchObject({ state: 'pending', ruleSkipped: 'rule-other-asker' });
-    const rel = await r.ask(DEV, { action: 'release', reason: 'ship' });
+    const rel = await r.ask(DEV, { action: 'release', tagName: 'v1', reason: 'ship' });
     expect(r.svc.decide({ requestId: rel.requestId, decision: 'always' }, 'desktop')).toMatchObject({ ok: false, code: 'not_ruleable' });
     expect(ruleCovers({ ruleId: 'r', action: 'merge', repoKey: KEY, scope: { workspaceId: WS }, createdAt: 1 }, { action: 'release', repoKey: KEY, botId: DEV.id, workspaceId: WS })).toBe(false);
   });
@@ -966,5 +984,220 @@ describe('merges from before the start (review)', () => {
     expect(r.svc.get(req.requestId)?.state).toBe('expired');
     expect(r.svc.get(other.requestId)?.state).toBe('pending');
     expect(notices).toEqual([]);
+  });
+});
+
+describe('native tool requests (a Hermes bot asks mid-turn)', () => {
+  const ask = { title: 'delete in root path: rm -rf /tmp/x', command: 'rm -rf /tmp/x' };
+
+  it('Approve on the card answers the turn true; the request never reaches approvals.json or the bot\'s list', async () => {
+    const r = rig();
+    const answer = r.svc.askNativeTool(binding(DEV), ask, { timeoutMs: 60_000 });
+    const req = r.svc.listForOperator(WS).find((x) => x.action === 'native_tool');
+    expect(req).toMatchObject({ state: 'pending', nativeTool: { command: 'rm -rf /tmp/x' } });
+    expect(r.writer.get(WS, req?.cardId as string)?.body).toContain('rm -rf /tmp/x');
+    // A typed "ok" approves nothing: the card is the only place.
+    r.ownerSays('ok');
+    expect(r.svc.get(req?.requestId as string)?.state).toBe('pending');
+    expect(r.svc.decide({ requestId: req?.requestId, decision: 'approve' }, 'desktop')).toMatchObject({ ok: true });
+    await expect(answer).resolves.toBe(true);
+    const onDisk = JSON.parse(fs.readFileSync(r.ports.file, 'utf8')) as { requests: Array<{ action: string }> };
+    expect(onDisk.requests.some((x) => x.action === 'native_tool')).toBe(false);
+    const own = r.svc.listFor(binding(DEV), {});
+    expect(own.ok && own.requests.some((x) => x.action === 'native_tool')).toBe(false);
+    // Answered: nothing of it stays in memory either.
+    expect(r.svc.get(req?.requestId as string)).toBeFalsy();
+  });
+
+  it('Deny, a second request while one waits, the deadline and an abort all answer false', async () => {
+    const r = rig();
+    const first = r.svc.askNativeTool(binding(DEV), ask, { timeoutMs: 60_000 });
+    await expect(r.svc.askNativeTool(binding(DEV), ask, { timeoutMs: 60_000 })).resolves.toBe(false);
+    const id = r.svc.listForOperator(WS).find((x) => x.action === 'native_tool' && x.state === 'pending')?.requestId;
+    expect(r.svc.decide({ requestId: id, decision: 'deny' }, 'desktop')).toMatchObject({ ok: true });
+    await expect(first).resolves.toBe(false);
+
+    const lapsed = r.svc.askNativeTool(binding(DEV), ask, { timeoutMs: 20 });
+    await expect(lapsed).resolves.toBe(false);
+    const expired = r.svc.listForOperator(WS).filter((x) => x.action === 'native_tool').map((x) => x.state);
+    expect(expired).toContain('expired');
+
+    const ac = new AbortController();
+    const aborted = r.svc.askNativeTool(binding(DEV), ask, { timeoutMs: 60_000, signal: ac.signal });
+    ac.abort();
+    await expect(aborted).resolves.toBe(false);
+    expect(r.svc.listForOperator(WS).some((x) => x.action === 'native_tool' && x.state === 'pending')).toBe(false);
+  });
+});
+
+describe('a release refusal told before its draft was decided', () => {
+  it('is amended once the draft is decided, with one more outcome card, never two', async () => {
+    const r = rig();
+    const req = await r.ask(DEV, { action: 'release', tagName: 'v1', reason: 'ship' });
+    const effect = (reason: string): Parameters<ApprovalService['onActEffect']>[0] => ({
+      id: `act:${req.requestId}`, requestId: req.requestId, action: 'release', repoKey: KEY, payloadHash: 'h', status: 'refused', attempt: 1, reason, draftId: 50, createdAt: 1, updatedAt: 1,
+    });
+    const outcomes = () => r.writer.read(WS, {}).cards.filter((c) => c.clientPostId?.startsWith(`approval-outcome:${req.requestId}`));
+    // A quit came between the refusal and the draft's decision: the refusal is told as it stood.
+    r.svc.onActEffect(effect('checks-failing'));
+    expect(r.svc.get(req.requestId)).toMatchObject({ state: 'refused', refusal: 'checks-failing' });
+    expect(outcomes()).toHaveLength(1);
+    r.state.now += 5;
+    r.svc.onActEffect(effect('checks-failing, draft-kept-tag-made'));
+    expect(r.svc.get(req.requestId)).toMatchObject({ state: 'refused', refusal: 'checks-failing, draft-kept-tag-made', updatedAt: r.state.now });
+    expect(outcomes()).toHaveLength(2);
+    expect(outcomes()[1]).toMatchObject({
+      clientPostId: `approval-outcome:${req.requestId}:draft`, title: expect.stringMatching(/^Draft release still on GitHub: /),
+      body: 'The tag was already made: its draft release is kept on GitHub for you to publish or delete',
+    });
+    // Told again (a second emit), or with no draft code: nothing more.
+    r.svc.onActEffect(effect('checks-failing, draft-kept-tag-made'));
+    r.svc.onActEffect(effect('identity-changed'));
+    expect(outcomes()).toHaveLength(2);
+    expect(r.svc.get(req.requestId)?.refusal).toBe('checks-failing, draft-kept-tag-made');
+  });
+
+  it('an amendment that cannot be written posts no card, and the next one does', async () => {
+    const r = rig();
+    const req = await r.ask(DEV, { action: 'release', tagName: 'v1', reason: 'ship' });
+    const effect = (reason: string): Parameters<ApprovalService['onActEffect']>[0] => ({
+      id: `act:${req.requestId}`, requestId: req.requestId, action: 'release', repoKey: KEY, payloadHash: 'h', status: 'refused', attempt: 1, reason, draftId: 50, createdAt: 1, updatedAt: 1,
+    });
+    const outcomes = () => r.writer.read(WS, {}).cards.filter((c) => c.clientPostId?.startsWith(`approval-outcome:${req.requestId}`));
+    r.svc.onActEffect(effect('checks-failing'));
+    const folder = path.dirname(r.ports.file);
+    const realWrite = fsDefault.writeFileSync;
+    const spy = vi.spyOn(fsDefault, 'writeFileSync').mockImplementation(((file: fs.PathOrFileDescriptor, ...rest: unknown[]) => {
+      if (typeof file === 'string' && path.dirname(file) === folder) throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
+      return (realWrite as (...a: unknown[]) => void)(file, ...rest);
+    }) as typeof fsDefault.writeFileSync);
+    try {
+      r.svc.onActEffect(effect('checks-failing, draft-kept-tag-made'));
+    } finally {
+      spy.mockRestore();
+    }
+    expect(outcomes()).toHaveLength(1);
+    expect(r.svc.get(req.requestId)?.refusal).toBe('checks-failing');
+    r.svc.onActEffect(effect('checks-failing, draft-kept-tag-made'));
+    expect(outcomes()).toHaveLength(2);
+  });
+
+  it('a refusal stored cut at 300 characters is amended all the same, its draft code kept', async () => {
+    const r = rig();
+    const req = await r.ask(DEV, { action: 'release', tagName: 'v1', reason: 'ship' });
+    // The refusal as told first: its primary code is never dropped.
+    const long = ['checks-failing', ...Array.from({ length: 30 }, (_, i) => `gh-${400 + i}-reason`)].join(', ');
+    const effect = (reason: string): Parameters<ApprovalService['onActEffect']>[0] => ({
+      id: `act:${req.requestId}`, requestId: req.requestId, action: 'release', repoKey: KEY, payloadHash: 'h', status: 'refused', attempt: 1, reason, draftId: 50, createdAt: 1, updatedAt: 1,
+    });
+    r.svc.onActEffect(effect(long));
+    r.svc.onActEffect(effect(`${long}, draft-kept-tag-made`));
+    const refusal = r.svc.get(req.requestId)?.refusal ?? '';
+    expect(refusal.length).toBeLessThanOrEqual(300);
+    expect(refusal.startsWith('checks-failing, ')).toBe(true);
+    expect(refusal.endsWith(', draft-kept-tag-made')).toBe(true);
+  });
+
+  it('a draft that could not be checked is told as one that may still be there', async () => {
+    const r = rig();
+    const req = await r.ask(DEV, { action: 'release', tagName: 'v1', reason: 'ship' });
+    const effect = (reason: string): Parameters<ApprovalService['onActEffect']>[0] => ({
+      id: `act:${req.requestId}`, requestId: req.requestId, action: 'release', repoKey: KEY, payloadHash: 'h', status: 'refused', attempt: 1, reason, draftId: 50, createdAt: 1, updatedAt: 1,
+    });
+    r.svc.onActEffect(effect('checks-failing'));
+    r.svc.onActEffect(effect('checks-failing, draft-kept-unchecked'));
+    const card = r.writer.read(WS, {}).cards.find((c) => c.clientPostId === `approval-outcome:${req.requestId}:draft`);
+    expect(card?.title).toMatch(/^Draft release may still be on GitHub: /);
+  });
+});
+
+describe('a release refusal\'s word to the bot while its draft is decided', () => {
+  const effectOf = (requestId: string, reason: string, draftOpen = false): Parameters<ApprovalService['onActEffect']>[0] => ({
+    id: `act:${requestId}`, requestId, action: 'release', repoKey: KEY, payloadHash: 'h', status: 'refused', attempt: 1, reason, draftId: 50,
+    ...(draftOpen ? { draftOpen: true as const } : {}), createdAt: 1, updatedAt: 1,
+  });
+  /** A notice port that drops a repeat key per bot, as the fact log does. */
+  const deliveringRig = (over: Partial<ApprovalPorts> = {}) => {
+    const delivered: BotNoticeInput[] = [];
+    const seen = new Set<string>();
+    const r = rig({
+      notice: (n) => {
+        if (seen.has(`${n.botId} ${n.key}`)) return;
+        seen.add(`${n.botId} ${n.key}`);
+        delivered.push(n);
+      },
+      ...over,
+    });
+    return { ...r, delivered };
+  };
+
+  it('the correction is told under a key of its own, so a store that drops repeat keys delivers it', async () => {
+    const r = deliveringRig();
+    const req = await r.ask(DEV, { action: 'release', tagName: 'v1', reason: 'ship' });
+    r.svc.onActEffect(effectOf(req.requestId, 'checks-failing'));
+    r.svc.onActEffect(effectOf(req.requestId, 'checks-failing, draft-kept-tag-made'));
+    const mine = r.delivered.filter((n) => n.botId === DEV.id);
+    expect(mine.map((n) => n.key)).toEqual([`approval:${req.requestId}:refused`, `approval:${req.requestId}:refused:draft`]);
+    expect(mine[1]).toMatchObject({
+      title: expect.stringMatching(/^Not done: .*The tag was already made/),
+      body: 'Its draft release stays on GitHub until the owner publishes or deletes it: do not ask for this release again meanwhile.',
+    });
+  });
+
+  it('a bot told while the draft is undecided is told to wait, then told once it is settled; never asked to ask again meanwhile', async () => {
+    const r = deliveringRig();
+    const req = await r.ask(DEV, { action: 'release', tagName: 'v1', reason: 'ship' });
+    const outcomes = () => r.writer.read(WS, {}).cards.filter((c) => c.clientPostId?.startsWith(`approval-outcome:${req.requestId}`));
+    r.svc.onActEffect(effectOf(req.requestId, 'checks-failing', true));
+    const mine = () => r.delivered.filter((n) => n.botId === DEV.id);
+    expect(mine()).toHaveLength(1);
+    expect(mine()[0].body).toBe('Its draft release is not settled yet: do not ask for this release again until you are told it is.');
+    // Still undecided (a later sweep GitHub did not answer either): nothing more.
+    r.svc.onActEffect(effectOf(req.requestId, 'checks-failing', true));
+    expect(mine()).toHaveLength(1);
+    // Decided, deleted: no code to add, but the bot is told it is settled.
+    r.svc.onActEffect(effectOf(req.requestId, 'checks-failing'));
+    expect(mine().map((n) => n.key)).toEqual([`approval:${req.requestId}:refused`, `approval:${req.requestId}:refused:draft`]);
+    expect(mine()[1].body).toBe('Its draft release is settled. Nothing more is tried for this request; ask again with a new request if it is still wanted.');
+    expect(r.svc.get(req.requestId)).toMatchObject({ state: 'refused', refusal: 'checks-failing' });
+    expect(r.svc.get(req.requestId)).not.toHaveProperty('draftWait');
+    // No second card: nothing new for the owner.
+    expect(outcomes()).toHaveLength(1);
+    expect(r.svc.listForOperator(WS).find((x) => x.requestId === req.requestId)).not.toHaveProperty('draftWait');
+  });
+
+  it('a draft that may still be on GitHub is told so to the bot', async () => {
+    const r = deliveringRig();
+    const req = await r.ask(DEV, { action: 'release', tagName: 'v1', reason: 'ship' });
+    r.svc.onActEffect(effectOf(req.requestId, 'checks-failing', true));
+    r.svc.onActEffect(effectOf(req.requestId, 'checks-failing, draft-kept-unchecked'));
+    const last = r.delivered.filter((n) => n.botId === DEV.id).at(-1);
+    expect(last?.key).toBe(`approval:${req.requestId}:refused:draft`);
+    expect(last?.body).toBe('Its draft release may still be on GitHub until the owner publishes or deletes it: do not ask for this release again meanwhile.');
+  });
+
+  it('a refusal told with its draft already decided says what to do from its code', async () => {
+    const r = deliveringRig();
+    const kept = await r.ask(DEV, { action: 'release', tagName: 'v1', reason: 'ship' });
+    r.svc.onActEffect(effectOf(kept.requestId, 'checks-failing, draft-kept-tag-made'));
+    const gone = await r.ask(DEV, { action: 'release', tagName: 'v2', reason: 'ship' });
+    r.svc.onActEffect(effectOf(gone.requestId, 'draft-gone'));
+    const of = (id: string) => r.delivered.find((n) => n.botId === DEV.id && n.key === `approval:${id}:refused`)?.body;
+    expect(of(kept.requestId)).toBe('Its draft release stays on GitHub until the owner publishes or deletes it: do not ask for this release again meanwhile.');
+    expect(of(gone.requestId)).toBe('Nothing more is tried for this request; ask again with a new request if it is still wanted.');
+  });
+
+  it('a refused release whose draft is undecided is kept past its retention until the draft is decided', async () => {
+    const rows = new Map<string, Parameters<ApprovalService['onActEffect']>[0]>();
+    const r = rig({ acts: () => ({ ...releaseOnly, effect: (id) => rows.get(id) ?? null }) });
+    const req = await r.ask(DEV, { action: 'release', tagName: 'v1', reason: 'ship' });
+    const undecided = effectOf(req.requestId, 'checks-failing', true);
+    rows.set(undecided.id, undecided);
+    r.svc.onActEffect(undecided);
+    r.state.now += 31 * 24 * 3600_000;
+    expect(r.svc.listForOperator(WS).some((x) => x.requestId === req.requestId)).toBe(true);
+    rows.set(undecided.id, effectOf(req.requestId, 'checks-failing'));
+    r.state.now += 1;
+    expect(r.svc.listForOperator(WS).some((x) => x.requestId === req.requestId)).toBe(false);
   });
 });

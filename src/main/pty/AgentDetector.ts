@@ -13,7 +13,7 @@ import { CodexUsageLimitLineScanner } from '../../shared/usageLimit';
 import type { AgentStatus } from '../../shared/types';
 import type { AgentSlug } from '../../shared/agentIdentity';
 import type { ApprovalScreenSnapshot } from '../../shared/approvalScreen';
-import { agyScreenApproval, claudeScreenApproval, codexScreenApproval, openCodeScreenApproval, type ScreenApproval } from './approvalScreen';
+import { agyScreenApproval, claudeScreenApproval, codexScreenApproval, openCodeScreenApproval, piScreenApproval, qwenScreenApproval, type ScreenApproval } from './approvalScreen';
 export type { AgentSlug };
 export { agentDisplayToSlug } from '../../shared/agentIdentity';
 
@@ -125,9 +125,46 @@ interface AgentPattern {
   chrome?: (line: string) => boolean;
   /** This visible banner can be a prose prefix until its visual row ends. */
   completeChromeRow?: boolean;
+  /**
+   * The TUI draws each repaint as one synchronized-output frame (`ESC[?2026h`
+   * … `ESC[?2026l`), and a frame that fills the screen leaves its bottom row
+   * without a line break. While this agent owns the pane, the frame's end also
+   * ends a row; otherwise that row would wait for the next repaint, glued to
+   * the next frame's first row.
+   */
+  frameEndsRow?: true;
+  /**
+   * Agents whose gate this one's chrome may take a pane from mid-session: a
+   * fork that draws the other agent's chrome, so the other gate can open
+   * first on this agent's own screen.
+   */
+  takesOverFrom?: readonly AgentSlug[];
   /** Strict live-grid recovery, used only after a fresh external identity. */
   approvalScreen?: (rows: readonly string[]) => ScreenApproval | null;
-  patterns: { regex: RegExp; status: AgentEvent['status']; message: string }[];
+  /**
+   * A question the grid can read: its question row, and the row that
+   * finishes it. The question row arms it and a later finishing row makes it
+   * ready, however far apart the two are drawn. Ready after identity arrived,
+   * it asks the host for that identity's one recheck
+   * (takeApprovalRecheckRequest) unless a line pattern reported awaiting_input
+   * in the same read, since the grid could then add nothing; no recheck is
+   * spent before it is ready, because a read then would see half a question.
+   *
+   * `shared`: the screen reader also reads dialogs that line patterns or the
+   * stream report (Claude, Codex). Their recheck is not held for this
+   * question, and spending it does not spend the one this question asks for.
+   */
+  approvalReady?: { question: RegExp; end: RegExp; shared?: true };
+  patterns: {
+    regex: RegExp;
+    status: AgentEvent['status'];
+    message: string;
+    /**
+     * Counts only as the last row drawn in its frame (`frameEndsRow` agents):
+     * held until the frame ends, dropped if another non-blank row follows.
+     */
+    frameTail?: true;
+  }[];
 }
 
 /**
@@ -220,6 +257,12 @@ const AGENT_PATTERNS: AgentPattern[] = [
     agent: 'Claude Code',
     slug: 'claude',
     approvalScreen: claudeScreenApproval,
+    // The folder-trust screen (2.1.310 live capture, __tests__/fixtures/
+    // claude-code-2.1.310-trust-120x40.json) comes before any banner or
+    // footer, so the gate is closed and no line pattern reads it; its choices
+    // are unnumbered (`❯ No, exit`). Read from the grid once process identity
+    // has seeded the profile: the question, then the key footer, its last row.
+    approvalReady: { question: /Is\s*this\s*a\s*project\s*you\s*created\s*or\s*one\s*you\s*trust\?/, end: /Enter\s*to\s*confirm\s*·\s*Esc\s*to\s*cancel/, shared: true },
     // \s* — Claude Code TUI는 배너 "Claude Code"를 셀 단위 커서 이동으로 그려,
     // ANSI strip 후 "Claude"와 "Code" 사이 공백이 사라진 "ClaudeCode"가 된다.
     // 공백을 선택적으로 둬야 daemon mode에서도 gate가 매칭된다(핵심 race 원인).
@@ -357,6 +400,11 @@ const AGENT_PATTERNS: AgentPattern[] = [
     agent: 'Codex CLI',
     slug: 'codex',
     approvalScreen: codexScreenApproval,
+    // codex-cli 0.162.1 (live capture, __tests__/fixtures/
+    // codex-0.162.1-trust-120x40.json) draws the trust screen in the alternate
+    // screen with CUP only, no CR/LF, so no line pattern below sees it. Read
+    // from the grid once process identity has seeded the profile.
+    approvalReady: { question: /Trust\s*this\s*folder\?\s*Codex\s*can/, end: /enter\s*continue\s*·\s*esc\s*back/, shared: true },
     // The trust-prompt phrase is part of the gate because on a first boot in
     // an untrusted directory Codex shows it BEFORE the "OpenAI Codex" banner
     // — with the banner-only gate the trust pattern below could never fire.
@@ -398,8 +446,66 @@ const AGENT_PATTERNS: AgentPattern[] = [
       // higher risk..."), so only the start is anchored.
       { regex: /^\s*Do you trust the contents of this directory\?/,     status: 'awaiting_input', message: 'Directory trust prompt' },
       // codex-cli 0.157's wording ("Folder access" / "Trust this folder?" /
-      // "› 1. Trust and continue"): the question has its own row.
-      { regex: /^\s*Trust\s*this\s*folder\?\s*$/,                      status: 'awaiting_input', message: 'Directory trust prompt' },
+      // "› 1. Trust and continue"): the question has its own row. 0.162.1
+      // goes on with the explanation on the same row ("Trust this folder?
+      // Codex can read, …", a narrow pane may wrap after `Codex`). Only that
+      // sentence: Kimi Code CLI asks the bare question too, and this must
+      // claim no more of it than before.
+      { regex: /^\s*Trust\s*this\s*folder\?(?:\s*Codex(?:\s*can|\s*$)|\s*$)/, status: 'awaiting_input', message: 'Directory trust prompt' },
+    ],
+  },
+
+  // ── Qwen Code ─────────────────────────────────────────────────────────────
+  // Live capture 2026-10-26, @qwen-code/qwen-code 0.26.1 on macOS (120x40 and
+  // 60x30, `--approval-mode default`, a loopback model; the frames are in
+  // __tests__/fixtures/qwen-code-0.26.1-*.json). Qwen Code is a Gemini CLI fork
+  // and draws Gemini's composer row (`>   Type your message or
+  // @path/to/file`), which opens the Gemini gate. Qwen's own chrome usually
+  // comes first (the window title is the first thing it prints, and the
+  // banner row tops each frame until the transcript pushes it off). When the
+  // composer row wins, the next title Qwen sets takes the pane back.
+  // Each frame is a full repaint, one row per CRLF line (also at 60x30):
+  //   - footer `<mode> (shift + tab to cycle)` on a row of its own only while
+  //     idle. Mid-turn the same row reads `Enter to steer · Ctrl+Q to queue ·
+  //     ⏸ Ask permissions (…)` (cut with `…` in a narrow pane), and a prompt
+  //     typed but not yet sent adds ` ⏳ 1 queued` after it;
+  //   - spinner row `⠸ <phrase>... (1s · ↓ 8 tokens · esc to cancel)` while a
+  //     turn runs, its counters changing on every frame; a narrow pane wraps
+  //     the counters onto a row of their own;
+  //   - every permission dialog (shell `Allow execution of: 'touch'?`, file
+  //     write `Apply this change?`) ends its frame with the spinner row
+  //     `⠏ Waiting for user confirmation...`, with no counters. Just after an
+  //     answer the running spinner can keep that phrase, with its counters
+  //     beside it or, when narrow, on the next row; so the row counts only as
+  //     the frame's last. The question rows stay out: the transcript is
+  //     repainted on every frame, and a reply line quoting a question would
+  //     read as a live dialog.
+  // English UI only; on Windows the footer says `(tab to cycle)` (not
+  // captured, so not matched).
+  {
+    agent: 'Qwen Code',
+    slug: 'qwen',
+    // The dialog read off the grid once a process or hook identity arrives
+    // after it was drawn, when no line pattern was reading for Qwen yet.
+    approvalScreen: qwenScreenApproval,
+    // Its question (shell, or file write and edit), then the confirmation
+    // spinner row drawn below the choices, without the counters a running
+    // spinner adds beside it (or, when narrow, on the next row) just after
+    // an answer.
+    approvalReady: { question: /Allow\s*execution\s*of:|Apply\s*this\s*change\?/, end: /Waiting\s*for\s*user\s*confirmation\.\.\.(?!\s*\()/ },
+    gate: /Qwen\s*Code\s*\(v\d|Qwen - /,
+    chrome: isQwenChrome,
+    completeChromeRow: true,
+    // In the 60x30 capture the dialog's spinner row and the idle footer are
+    // both such bottom rows.
+    frameEndsRow: true,
+    takesOverFrom: ['gemini'],
+    patterns: [
+      { regex: /(?<=^[⠀-⣿]\s*)Waiting\s*for\s*user\s*confirmation\.\.\.$/,         status: 'awaiting_input', message: 'Approval requested', frameTail: true },
+      // Only the fixed tail, so the ticking counters do not re-emit each frame.
+      { regex: /(?<=\(\d+[smh]\b[^()]*)·\s*esc\s*to\s*cancel\)$/,                           status: 'running',        message: 'Working' },
+      // The five approval modes' labels, each captured live.
+      { regex: /^(?:⏸ Ask permissions|Auto mode|auto-accept edits|plan mode|YOLO mode) \(shift \+ tab to cycle\)$/, status: 'waiting', message: 'Ready for input' },
     ],
   },
 
@@ -479,6 +585,30 @@ const AGENT_PATTERNS: AgentPattern[] = [
     ],
   },
 
+  // ── Pi ────────────────────────────────────────────────────────────────────
+  // Live capture 2026-10-26, @earendil-works/pi-coding-agent 1.4.0 on macOS
+  // (120x40, loopback fake model; __tests__/fixtures/pi-1.4.0-capture.json).
+  // Pi owns the alternate screen and places every row with CUP: it writes no
+  // CR/LF until it exits, so no line pattern ever sees its composer or its
+  // `── ⠦ Working ──` border, and running/idle come from output activity.
+  // Identity is its native title, `π - <cwd basename>`, written once at
+  // startup. Tools (bash included) run without asking. The one question it
+  // asks is the project-trust selector, drawn as CRLF rows before the title:
+  // it is read only structurally (approvalScreen, the current grid) once
+  // process identity has seeded the profile. Its question row alone is no
+  // evidence: a seeded `pi -p` or a shell after Pi exits can print it.
+  {
+    agent: 'Pi',
+    slug: 'pi',
+    approvalScreen: piScreenApproval,
+    // The question, then the key footer that is the selector's last row (a
+    // narrow pane wraps `cancel`).
+    approvalReady: { question: /Trust\s*project\s*folder\?/, end: /escape\/ctrl\+c\s*cancel/ },
+    gate: /π - /,
+    chrome: isPiChrome,
+    patterns: [],
+  },
+
   // ── GitHub Copilot CLI ────────────────────────────────────────────────────
   {
     agent: 'GitHub Copilot CLI',
@@ -514,6 +644,21 @@ const AGENT_PATTERNS: AgentPattern[] = [
  *  (src/shared/agentIdentity.ts) must name exactly these; a test holds them
  *  together. */
 export const DETECTOR_PROFILE_SLUGS: readonly AgentSlug[] = AGENT_PATTERNS.map((ap) => ap.slug);
+/** The profile table by slug. */
+const PROFILE_BY_SLUG = new Map(AGENT_PATTERNS.map((ap) => [ap.slug, ap]));
+/**
+ * How far before the newly drawn text an approvalReady match may begin: a
+ * footer a narrow pane wraps carries that row's padding.
+ */
+const READY_MATCH_REACH = 512;
+/** The profiles with an approvalReady question, its patterns compiled global once. */
+const READY_PROFILES = AGENT_PATTERNS.flatMap((ap) => (ap.approvalReady
+  ? [{ slug: ap.slug, question: globalRegExp(ap.approvalReady.question), end: globalRegExp(ap.approvalReady.end) }]
+  : []));
+
+function globalRegExp(re: RegExp): RegExp {
+  return re.global ? re : new RegExp(re.source, `${re.flags}g`);
+}
 
 // Derive the Claude waiting patterns from the table above so the gate replay
 // and the ordinary pattern pass can never disagree about which fragment a line
@@ -524,6 +669,14 @@ CLAUDE_WAITING_PATTERNS = (AGENT_PATTERNS.find((ap) => ap.slug === 'claude')?.pa
   .map((p) => p.regex);
 
 const MAX_BUFFER = 16 * 1024;
+/** Longest OSC the line buffer's cut keeps whole (a title fits many times over). */
+const MAX_OSC_KEPT = 4096;
+
+/** Where feedOutput ends a line; the second also ends one at a frame's end (`frameEndsRow`). */
+const ROW_END_G = /\r?\n|\r(?!\n)/g;
+// eslint-disable-next-line no-control-regex
+const ROW_OR_FRAME_END_G = /\r?\n|\r(?!\n)|\x1b\[\?2026l/g;
+const FRAME_END_ROW_AGENTS: ReadonlySet<string> = new Set(AGENT_PATTERNS.filter((ap) => ap.frameEndsRow).map((ap) => ap.agent));
 
 // ANSI escape strip regex. Covers:
 //   CSI    \x1b[ <params> <final>   where params may include digits/semicolons
@@ -783,7 +936,26 @@ function isCodexChrome(line: string): boolean {
   const v = visibleChrome(stripped);
   return /^>_\s*OpenAI\s*Codex\b/.test(v)
     || /^Do\s*you\s*trust\s*the\s*contents\s*of\s*this\s*directory\?/.test(v)
-    || /^Trust\s*this\s*folder\?$/.test(v);
+    // 0.162.1 explains on the same row; the bare question is also Kimi's.
+    || /^Trust\s*this\s*folder\?(?:\s*Codex(?:\s*can|$)|$)/.test(v);
+}
+
+/**
+ * Qwen Code's own chrome (0.26.1 live capture): its window title, `Qwen -
+ * <folder>`, set at launch and again with a status glyph (`◐︎ Qwen - proj`) as
+ * each turn starts and ends; or its banner row, `│ >_ Qwen Code (v0.26.1) │`,
+ * which, like the Codex banner, must be the row's whole visible text once the
+ * logo and frame are stripped. The banner leaves the screen once the
+ * transcript outgrows it; the title does not. Qwen pads the title with spaces
+ * to 80 columns, which a shell or editor title that merely starts `Qwen - `
+ * (`vim 'Qwen - notes.md'`) does not.
+ */
+function isQwenChrome(line: string): boolean {
+  // eslint-disable-next-line no-control-regex
+  if (/\x1b\][02];(?:\S{1,3} )?Qwen - [^\x07\x1b\r\n]{1,160}? {2,}(?:\x07|\x1b\\)/.test(line)) return true;
+  const stripped = stripAnsi(line);
+  if (SOURCE_LINE_RE.test(stripped)) return false;
+  return /^>_\s*Qwen\s*Code\s*\(v\d+\.\d+\.\d+[\w.+-]*\)$/.test(visibleChrome(stripped));
 }
 
 /**
@@ -863,6 +1035,18 @@ function isAntigravityChrome(line: string): boolean {
 function isOpenCodeChrome(line: string): boolean {
   // eslint-disable-next-line no-control-regex
   return /\x1b\][02];(?:OpenCode|OC \| [^\x07\x1b\r\n]{1,160})(?:\x07|\x1b\\)/.test(line);
+}
+
+/**
+ * Pi's native title, `π - <cwd basename>` or `π - <session> - <cwd basename>`
+ * (pi 1.4.0 interactive-mode setTitle, OSC 0 / BEL in the live capture). The
+ * basename is empty at `/` or a drive root, and a session name has no length
+ * bound. Both OSC title selectors and terminators are accepted; an unfinished
+ * OSC or the same words as visible text are not evidence.
+ */
+function isPiChrome(line: string): boolean {
+  // eslint-disable-next-line no-control-regex
+  return /\x1b\][02];π - [^\x07\x1b\r\n]*(?:\x07|\x1b\\)/.test(line);
 }
 
 /**
@@ -946,6 +1130,15 @@ export class AgentDetector {
   // must precede it (idleSuppression.recentlyEscaped). A dedup here would let a
   // redrawn old row use up the report the real interrupt needs.
   private interruptedCallbacks: InterruptedCallback[] = [];
+  // The owner's approvalReady question became ready: see takeApprovalRecheckRequest.
+  private approvalRecheckRequested = false;
+  // approvalReady questions whose question row was drawn, and those whose
+  // finishing row followed it, since the screen was last invalidated.
+  private approvalArmed = new Set<AgentSlug>();
+  private approvalReadySlugs = new Set<AgentSlug>();
+  // An identity change kept the approval evidence, and no question has been
+  // drawn since: the next seed drops it unless its profile has approvalReady.
+  private approvalEvidenceRetired = false;
   private codexLimitScanner = new CodexUsageLimitLineScanner();
   private lineBuffer = '';
   /** Incomplete OSC 133 boundary, bounded to a short shell payload. */
@@ -973,6 +1166,8 @@ export class AgentDetector {
   private approvalHintTail = '';
   private approvalHintAt: number | null = null;
   private approvalRecheckEpoch: number | null = null;
+  // The owner's approvalReady question's own recheck (see `shared`).
+  private approvalReadyRecheckEpoch: number | null = null;
   // Kiro uses a compound gate so another agent merely mentioning "Kiro CLI"
   // cannot steal this PTY's identity. Evidence is scoped to this detector/PTy.
   private kiroChromeSeen = false;
@@ -995,6 +1190,8 @@ export class AgentDetector {
   private dialogQuestion: DialogQuestion | null = null;
   // The whole-line pass already reported an approval in this feed() call.
   private approvalEmittedInFeed = false;
+  // A `frameTail` match waiting for its frame to end with nothing drawn after it.
+  private frameTail: AgentEvent & { value: string } | null = null;
 
   /**
    * Register a callback for agent status events.
@@ -1093,7 +1290,7 @@ export class AgentDetector {
    */
   seedTrustedIdentity(slug: AgentSlug, expectedEpoch: number): boolean {
     if (expectedEpoch !== this.identityEpoch) return false;
-    const profile = AGENT_PATTERNS.find((candidate) => candidate.slug === slug);
+    const profile = PROFILE_BY_SLUG.get(slug);
     if (!profile) return false;
     if (this.trustedAgent === slug && !this.shellPromptSinceOwner) return true;
 
@@ -1101,11 +1298,17 @@ export class AgentDetector {
     if (!sameOwner) {
       if (this.lastAgent !== null && this.lastAgent !== profile.agent) {
         this.advanceIdentityBoundary();
-        this.invalidateApprovalScreen();
+        this.retireApprovalScreen();
       }
       this.resetLaunchEvidence();
       this.lastScreenAgent = null;
     }
+    // Evidence an identity change kept: a grid-only question this owner drew
+    // before its seed is still read once ready; any other profile drops it.
+    // A `shared` profile keeps it only for that question, once drawn.
+    const ready = profile.approvalReady;
+    if (this.approvalEvidenceRetired && !(ready && (!ready.shared || this.approvalArmed.has(slug)))) this.invalidateApprovalScreen();
+    this.approvalEvidenceRetired = false;
     this.trustedAgent = slug;
     this.lastAgent = profile.agent;
     this.activeAgents.add(profile.agent);
@@ -1115,7 +1318,7 @@ export class AgentDetector {
 
   /** Confirmed death/disposal: revoke all launch identity, without an event. */
   clearTrustedIdentity(): void {
-    this.invalidateApprovalScreen();
+    this.retireApprovalScreen();
     this.advanceIdentityBoundary();
     this.trustedAgent = null;
     this.lastAgent = null;
@@ -1131,6 +1334,29 @@ export class AgentDetector {
     this.approvalHintTail = '';
     this.approvalHintAt = null;
     this.approvalRecheckEpoch = null;
+    this.approvalReadyRecheckEpoch = null;
+    this.approvalRecheckRequested = false;
+    this.approvalArmed = new Set();
+    this.approvalReadySlugs = new Set();
+    this.approvalEvidenceRetired = false;
+  }
+
+  /**
+   * An identity change (its callers advance the identity epoch, which resets
+   * the recheck): no read in flight may land, but the evidence, and output
+   * drawn before the next seed, stays for that seed to judge.
+   */
+  private retireApprovalScreen(): void {
+    this.approvalScreenGeneration++;
+    this.approvalRecheckRequested = false;
+    this.approvalEvidenceRetired = true;
+    // A question the ending owner drew belongs to that lifetime: its next
+    // launch must not inherit it half-drawn or ready.
+    const ending = this.trustedAgent ?? AGENT_PATTERNS.find((ap) => ap.agent === this.lastAgent)?.slug;
+    if (ending) {
+      this.approvalArmed.delete(ending);
+      this.approvalReadySlugs.delete(ending);
+    }
   }
 
   /**
@@ -1142,13 +1368,18 @@ export class AgentDetector {
    */
   async revalidateApprovalScreen(read: () => Promise<ApprovalScreenSnapshot | null>): Promise<boolean> {
     const owner = this.trustedAgent;
-    const profile = AGENT_PATTERNS.find((candidate) => candidate.slug === owner);
+    const profile = owner === null ? undefined : PROFILE_BY_SLUG.get(owner);
     const epoch = this.identityEpoch;
     const generation = this.approvalScreenGeneration;
     const fresh = (): boolean => this.approvalHintAt !== null
       && Date.now() >= this.approvalHintAt && Date.now() - this.approvalHintAt <= 30_000;
-    if (!owner || !profile?.approvalScreen || !fresh() || this.approvalRecheckEpoch === epoch) return false;
-    this.approvalRecheckEpoch = epoch;
+    if (!owner || !profile?.approvalScreen || !fresh()) return false;
+    const readyRead = this.approvalReadySlugs.has(owner);
+    // Not spent on half a question: the row that finishes it asks again.
+    if (profile.approvalReady && !profile.approvalReady.shared && !readyRead) return false;
+    if ((readyRead ? this.approvalReadyRecheckEpoch : this.approvalRecheckEpoch) === epoch) return false;
+    if (readyRead) this.approvalReadyRecheckEpoch = epoch;
+    else this.approvalRecheckEpoch = epoch;
     const owns = (): boolean => this.trustedAgent === owner && this.identityEpoch === epoch
       && this.approvalScreenGeneration === generation && !this.shellPromptSinceOwner && fresh();
     for (let attempt = 0; attempt < 2; attempt++) {
@@ -1161,7 +1392,8 @@ export class AgentDetector {
       const approval = profile.approvalScreen(snapshot.rows);
       if (!approval) return false;
       const key = `${profile.agent}:awaiting_input`;
-      if (this.lastEmittedFor.get(key) === approval.text) return false;
+      // Whitespace-insensitive, like emitDialog's stored value.
+      if (this.lastEmittedFor.get(key)?.replace(/\s+/g, '') === approval.text.replace(/\s+/g, '')) return false;
       this.lastEmittedFor.set(key, approval.text);
       for (const cb of this.callbacks) cb({ agent: profile.agent, status: 'awaiting_input', message: approval.message });
       return true;
@@ -1236,6 +1468,18 @@ export class AgentDetector {
     this.feedOutput(rest.slice(0, holdAt));
   }
 
+  /**
+   * Whether the output fed since the last call finished a grid-only question
+   * on a pane whose owner's one recheck is still unused (approvalReady).
+   * The host calls this once the same output is on the screen it reads, and
+   * answers true with revalidateApprovalScreen. Reading clears the request.
+   */
+  takeApprovalRecheckRequest(): boolean {
+    const requested = this.approvalRecheckRequested;
+    this.approvalRecheckRequested = false;
+    return requested;
+  }
+
   private noteShellReturn(): void {
     this.invalidateApprovalScreen();
     this.advanceIdentityBoundary();
@@ -1259,6 +1503,7 @@ export class AgentDetector {
     this.dialogRow = '';
     this.dialogQuestion = null;
     this.approvalEmittedInFeed = false;
+    this.frameTail = null;
     this.codexLimitScanner = new CodexUsageLimitLineScanner();
   }
 
@@ -1267,27 +1512,73 @@ export class AgentDetector {
     const previousLength = stripAnsi(this.approvalHintTail).length;
     const probe = this.approvalHintTail + data;
     const cleanProbe = stripAnsi(probe);
-    const hint = /Do\s*you\s*(?:want|trust)|Would\s*you\s*like|Allow\s*tool\s*use|Permission\s*required/g;
+    // Keep in step with the approvalReady questions (READY_PROFILES).
+    const hint = /Do\s*you\s*(?:want|trust)|Would\s*you\s*like|Allow\s*tool\s*use|Permission\s*required|Trust\s*project\s*folder|Allow\s*execution\s*of:|Apply\s*this\s*change\?|Trust\s*this\s*folder|Is\s*this\s*a\s*project\s*you\s*created/g;
     for (const match of cleanProbe.matchAll(hint)) {
       // Only newly drawn text refreshes freshness. Retaining an old question
       // in the tail across a title update must not make it recent again.
-      if (match.index + match[0].length > previousLength) this.approvalHintAt = Date.now();
+      if (match.index + match[0].length > previousLength) {
+        this.approvalHintAt = Date.now();
+        // A question drawn after an identity change belongs to whoever owns
+        // the pane next: the next seed keeps it, as before the change.
+        this.approvalEvidenceRetired = false;
+      }
+    }
+    // Readiness reads only the newly drawn text, with room for a match that
+    // began just before it; positions below are relative to `recentAt`.
+    let readyForOwner = false;
+    const recentAt = Math.max(0, previousLength - READY_MATCH_REACH);
+    const recent = cleanProbe.slice(recentAt);
+    const drawnAfter = previousLength - recentAt;
+    for (const { slug, question, end } of READY_PROFILES) {
+      // An end counts only after a question: from 0 once one is armed.
+      let from = this.approvalArmed.has(slug) ? 0 : -1;
+      for (const match of recent.matchAll(question)) {
+        if (match.index + match[0].length <= drawnAfter) continue;
+        from = match.index + match[0].length;
+        this.approvalArmed.add(slug);
+        this.approvalReadySlugs.delete(slug);
+      }
+      if (from < 0) continue;
+      for (const match of recent.matchAll(end)) {
+        if (match.index < from || match.index + match[0].length <= drawnAfter) continue;
+        this.approvalReadySlugs.add(slug);
+        if (slug === this.trustedAgent && this.approvalReadyRecheckEpoch !== this.identityEpoch) readyForOwner = true;
+      }
     }
     this.approvalHintTail = probe.slice(-4096);
     this.lineBuffer += data;
     if (this.lineBuffer.length > MAX_BUFFER) {
-      this.lineBuffer = this.lineBuffer.slice(-MAX_BUFFER);
+      // A CUP-only screen never shortens the buffer, so one read can bury a
+      // title written once (Pi, `--continue` at 300x90: 26 KB of frame right
+      // after it). The gates see the dropped part first, and the cut does not
+      // split an OSC: one begun shortly before it and unterminated there is
+      // kept whole (a longer one is no title and may be cut).
+      let cut = this.lineBuffer.length - MAX_BUFFER;
+      const osc = this.lineBuffer.lastIndexOf('\u001b]', cut - 1);
+      const split = osc < 0 ? '' : this.lineBuffer.slice(osc + 2, cut);
+      if (osc >= 0 && osc >= cut - MAX_OSC_KEPT && !split.includes('\u0007') && !split.includes('\u001b\\')) cut = osc;
+      if (cut > 0) this.checkGates(this.lineBuffer.slice(0, cut));
+      this.lineBuffer = this.lineBuffer.slice(cut);
     }
     // Split on both LF and lone CR. TUI footers (Claude, Codex) redraw the
     // same line using CR without a following LF; without this split the
     // entire redraw collapses into one buffered string and patterns fail to
-    // match line-anchored regexes.
-    const lines = this.lineBuffer.split(/\r?\n|\r(?!\n)/);
-    this.lineBuffer = lines.pop() || '';
-
-    for (const line of lines) {
-      this.processLine(line);
+    // match line-anchored regexes. The owner is looked up per line: a gate
+    // opened by one line decides how the next one ends.
+    const buffer = this.lineBuffer;
+    let start = 0;
+    for (;;) {
+      const rowEnd = this.lastAgent !== null && !this.shellPromptSinceOwner && FRAME_END_ROW_AGENTS.has(this.lastAgent)
+        ? ROW_OR_FRAME_END_G : ROW_END_G;
+      rowEnd.lastIndex = start;
+      const m = rowEnd.exec(buffer);
+      if (!m) break;
+      this.processLine(buffer.slice(start, m.index));
+      start = m.index + m[0].length;
+      if (m[0].startsWith('\u001b')) this.flushFrameTail();
     }
+    this.lineBuffer = buffer.slice(start);
 
     // 미완성 라인(아직 개행이 안 온 redraw)의 gate도 미리 검사한다. claude처럼
     // 시작 배너를 개행 없이 커서 이동으로 그리는 TUI는 "Claude Code vX"가
@@ -1301,6 +1592,8 @@ export class AgentDetector {
     // its name inside the OSC window-title escape, which the strip removes.
     if (this.lineBuffer) this.checkGates(this.lineBuffer);
 
+    // Asked only when no line pattern reported the dialog in this read.
+    if (readyForOwner && !this.approvalEmittedInFeed) this.approvalRecheckRequested = true;
     this.scanDialog(data);
   }
 
@@ -1543,8 +1836,10 @@ export class AgentDetector {
       // pane's permission prompts. Codex is included — its banner row can be
       // reproduced by a Claude reply that wraps with `>_ OpenAI Codex` at the
       // start of a row (seen live when a Claude pane printed that line).
+      // A fork may take its parent's pane (`takesOverFrom`).
       const blockedTakeover = this.lastAgent !== null && this.lastAgent !== ap.agent
-        && !this.shellPromptSinceOwner;
+        && !this.shellPromptSinceOwner
+        && !ap.takesOverFrom?.some((slug) => AGENT_PATTERNS.find((other) => other.slug === slug)?.agent === this.lastAgent);
       const gateMatched = ap.slug === 'kiro'
         ? this.kiroChromeSeen && this.kiroPromptSeen
         : ap.slug === 'claude'
@@ -1603,6 +1898,18 @@ export class AgentDetector {
     }
   }
 
+  /** The frame ended: report a held frame-tail match if its agent still owns the pane. */
+  private flushFrameTail(): void {
+    const tail = this.frameTail;
+    this.frameTail = null;
+    if (!tail || tail.agent !== this.lastAgent || this.shellPromptSinceOwner) return;
+    const key = `${tail.agent}:${tail.status}`;
+    if (this.lastEmittedFor.get(key) === tail.value) return;
+    this.lastEmittedFor.set(key, tail.value);
+    if (tail.status === 'awaiting_input') this.approvalEmittedInFeed = true;
+    for (const cb of this.callbacks) cb({ agent: tail.agent, status: tail.status, message: tail.message });
+  }
+
   private processLine(line: string): void {
     // RAW-line gate check BEFORE the empty-clean bail. Live incident
     // 2026-07-17 (Fable-era Claude Code): the TUI renders no visible
@@ -1617,6 +1924,8 @@ export class AgentDetector {
 
     const clean = line.replace(ANSI_STRIP, '').trim();
     if (!clean) return;
+    // A held frame-tail row was not the frame's last: another row followed it.
+    this.frameTail = null;
 
     // Only on a pane Codex owns: another agent quoting the message (a review
     // of this very detector) must not hold its pane. The row regex is also
@@ -1686,6 +1995,10 @@ export class AgentDetector {
       for (const p of ap.patterns) {
         if (dialogScanned && p.status === 'awaiting_input' && p.message !== 'Tool approval requested') continue;
         const match = clean.match(p.regex);
+        if (match && p.frameTail) {
+          this.frameTail = { agent: ap.agent, status: p.status, message: match[1] || p.message, value: match[0] };
+          return;
+        }
         if (match) {
           const key = `${ap.agent}:${p.status}`;
           const value = match[0];

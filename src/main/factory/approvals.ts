@@ -44,9 +44,17 @@
 // waits for the owner, its card naming why the rule did not apply. No rule
 // covers a release or a push to a default branch.
 //
-// Acts other than merge are recorded and decided, but nothing carries them
-// out yet (the card says so); a bot's workers are refused them
-// (shared/botWorkerGuard.ts).
+// A comment, a new issue, closing an issue or a PR, or a release
+// (ACT_ACTIONS) is carried out the same way once approved: the request pins
+// what it acts on and the text it publishes (`act`), the card shows that text
+// whole (fenced, actPayload.ts), an approval from a button (the card's, the
+// chip's or the phone's) echoes the card's payloadHash (a text act and a
+// release are approved from their card only, never by typed words or the
+// chip), and after the Undo window the act outbox runs it (actHost.ts,
+// actExecutor.ts, releaseAct.ts) under the same gates as a merge; the outcome
+// comes back here (onActEffect). A request an older build stored (no `act`),
+// and every other act, is recorded and decided only (the card says so). A
+// bot's workers are refused all of them (shared/botWorkerGuard.ts).
 //
 // Persistence: `<wmuxDir>/factory/approvals.json` ({version:1, requests,
 // rules}), written on every change; a change that did not reach the file is
@@ -68,19 +76,28 @@ import { atomicReadJSONSync, atomicWriteJSONSync } from '../../daemon/util/atomi
 import { botTemplate, type BotBinding, type BotEventPayload, type BotProfile } from '../../shared/bot';
 import type { MemoryChange } from '../../shared/botMemory';
 import {
+  ACT_ACTIONS,
   APPROVAL_ACTIONS,
   APPROVAL_ID_RE,
   APPROVAL_NEVER_BY_RULE,
   APPROVAL_UNDO_MS,
   BOT_APPROVAL_RPC,
+  BOT_REQUESTABLE_ACTIONS,
   CARD_ONLY_ACTIONS,
   RULE_OTHER_ASKER,
+  TEXT_ACT_ACTIONS,
+  TYPED_APPROVABLE_ACTIONS,
   firstRuleSkip,
   isOwnerApprovalText,
+  type ActAction,
+  type ApprovalAct,
+  type ApprovalActRepo,
   type ApprovalAction,
+  type ApprovalReleaseAct,
   type ApprovalApprover,
   type ApprovalDecideRequest,
   type ApprovalRequest,
+  type ApprovalRoutine,
   type ApprovalRule,
   type ApprovalRuleNeed,
   type ApprovalState,
@@ -91,6 +108,7 @@ import type { MergeEffect } from '../../shared/moaDecision';
 import type { PrLaneFacts } from '../../shared/prReview';
 import type { RpcContext } from '../../shared/rpc';
 import { GENERAL_THREAD, ROOM_LIMITS, dmThreadBot, dmThreadId, issueThreadId, parseThreadId, prThreadId, type RoomCard, type ThreadId } from '../../shared/room';
+import { secretValueKind } from '../../shared/secretGuard';
 import type { FactoryRouter } from './factoryHost';
 import { factFromMergeEffect } from './factIngest';
 import { fenceFor } from '../../shared/markdownFence';
@@ -104,12 +122,21 @@ import type { BotNoticeInput } from './botNotices';
 import type { BotDirectoryApi } from './triggerEngine';
 import { GUEST_TURN_STARTS_NO_WORKERS, guestOfRecord } from './wakeTaint';
 import { guestSide } from './guestWorkspaces';
+import { CONTEXT_FENCE_INFO, PAYLOAD_FENCE_INFO, UNSHOWABLE, actContentKey, actTextProblem, bodyWithMarker, fencedLines, normalizeActText, payloadHashOf } from './actPayload';
+import { nextSlot, scheduleLabel } from './routines';
+import type { OwnerCardProof } from './ownerAsked';
+import { actEffectId, actRowClaimed, draftUndecided, type ActEffect, type ActEffectStatus } from './actEffectStore';
+import type { IssueFacts, PullFacts } from './actExecutor';
+import { releaseTagProblem, type AlsoRunsOn, type ReleaseAsk, type ReleaseAskInput, type ReleaseAskRefusal } from './releaseAct';
 
 export const APPROVALS_FILENAME = 'approvals.json';
 
 export const APPROVAL_LIMITS = {
   /** A pending request older than this expires. */
   PENDING_TTL_MS: 24 * 3600_000,
+  /** An approved act no try of which was started this long after its
+   *  decision is refused (`approval-stale`). */
+  APPROVED_TTL_MS: 24 * 3600_000,
   /** Settled requests older than this are dropped from the file. */
   RETAIN_MS: 30 * 24 * 3600_000,
   REQUESTS_MAX: 500,
@@ -142,16 +169,26 @@ export interface StoredApproval extends ApprovalRequest {
    *  decision are told in a guest-sourced notice. Absent (a request stored
    *  before it was recorded): as its taint says. */
   guest?: boolean;
+  /** An act: its bot text and target without the marker (one request per
+   *  content while it waits; a reused clientRequestId must carry the same). */
+  contentKey?: string;
+  /** A refused release whose bot was told to wait while its draft was
+   *  undecided: told again once it is decided. */
+  draftWait?: true;
 }
 
-/** A request as the main window and the bot see it (no checkout path). */
-export type ApprovalView = Omit<StoredApproval, 'repoPath' | 'clientRequestId'>;
+/** A request as the main window and the bot see it (no checkout path). An
+ *  act carries where its outbox row stands (`actStatus`), so its card can
+ *  say it is running or being checked. */
+export type ApprovalView = Omit<StoredApproval, 'repoPath' | 'clientRequestId' | 'contentKey'> & { actStatus?: ActEffectStatus };
 
 export function approvalView(r: StoredApproval): ApprovalView {
   const view: Partial<StoredApproval> = { ...r };
   delete view.repoPath;
   delete view.clientRequestId;
   delete view.guest;
+  delete view.contentKey;
+  delete view.draftWait;
   // What the owner reads: sentences, never the raw codes.
   delete view.refusalText;
   delete view.ruleSkippedText;
@@ -179,6 +216,9 @@ export function botApprovalView(r: StoredApproval, readerGuest: boolean): Approv
   const hidden: ApprovalView = { ...view, reason: GUEST_REASON_HIDDEN };
   delete hidden.skill;
   delete hidden.ownerProfile;
+  delete hidden.routine;
+  delete hidden.botMemory;
+  delete hidden.act;
   return hidden;
 }
 
@@ -228,6 +268,26 @@ export interface ApprovalMergeHost {
   effect?(effectId: string): MergeEffect | null;
 }
 
+/** What the approvals reach of the act outbox (actHost.ts): GitHub reads for
+ *  a request's pins (gh, from a folder main owns), and the outbox. */
+export interface ApprovalActHost {
+  login(repoKey: string): Promise<string | null>;
+  /** The repository's pins, and the default branch it names now (not pinned). */
+  repo(repoKey: string): Promise<(ApprovalActRepo & { defaultBranch?: string }) | { error: string; status?: number }>;
+  issue(repoKey: string, n: number): Promise<IssueFacts | { error: string; status?: number }>;
+  pull(repoKey: string, n: number): Promise<PullFacts | { error: string; status?: number }>;
+  /** What a release request pins and its card states (releaseAct.ts), or
+   *  why the repository cannot take it as asked. */
+  release(repoKey: string, input: ReleaseAskInput): Promise<ReleaseAsk | ReleaseAskRefusal>;
+  /** The outbox row of an approved request (one per request), or null when
+   *  it could not be stored. */
+  enqueue(r: StoredApproval): ActEffect | null;
+  run(effectId: string): Promise<ActEffect | null>;
+  effect(effectId: string): ActEffect | null;
+  /** Drop the row of a request that ended (expired, dropped). */
+  remove(effectId: string): void;
+}
+
 export interface ApprovalPorts {
   /** `<wmuxDir>/factory/approvals.json`. */
   file: string;
@@ -252,10 +312,16 @@ export interface ApprovalPorts {
    *  act. `approve` returns why the proposal on the card cannot be approved
    *  (it changed since), or null once it is the approved version. */
   skills?: () => ApprovalSkillHost | null;
-  /** The memory store, for `owner_profile` requests: `approve` applies the
-   *  change on the card, checked again, and returns why it cannot, or null
-   *  once it is written. */
+  /** The memory store, for `owner_profile` and `bot_memory` requests:
+   *  `approve` applies the change on the card, checked again, and returns
+   *  why it cannot, or null once it is written. */
   ownerProfile?: () => ApprovalOwnerProfileHost | null;
+  /** The routine store, for `routine` requests: `approve` saves the routine
+   *  on the card, checked again as of now, and returns why it cannot, or
+   *  null once it is saved. */
+  routines?: () => ApprovalRoutineHost | null;
+  /** The act outbox, for ACT_ACTIONS requests. Absent: none is asked for. */
+  acts?: () => ApprovalActHost | null;
   now?: () => number;
   log?: (line: string) => void;
 }
@@ -267,10 +333,22 @@ export interface ApprovalSkillHost {
   deny(r: StoredApproval): void;
 }
 
-/** What an `owner_profile` request's Approve does to the owner's profile. */
+/** What an `owner_profile` request's Approve does to the owner's profile,
+ *  and a `bot_memory` request's to the bot's notes. */
 export interface ApprovalOwnerProfileHost {
   approve(r: StoredApproval): string | null;
 }
+
+/** What a `routine` request's Approve does: saves its routine. */
+export interface ApprovalRoutineHost {
+  approve(r: StoredApproval): string | null;
+}
+
+/** What the owner asked a bot for in a conversation that took in outside
+ *  text (proposeOwnerAsked). */
+export type OwnerAsk =
+  | { action: 'routine'; routine: ApprovalRoutine }
+  | { action: 'bot_memory' | 'owner_profile'; change: MemoryChange };
 
 /** What `proposeSkill` takes (the store has written the proposal). */
 export interface SkillApprovalInput {
@@ -284,7 +362,7 @@ export interface SkillApprovalInput {
   reason: string;
 }
 
-type Refusal = FactoryRefusal<'not_bot' | 'not_running' | 'not_now' | 'invalid' | 'no_repo' | 'read_failed' | 'not_open' | 'too_many' | 'not_found' | 'not_pending' | 'too_late' | 'not_ruleable' | 'write_failed' | 'not_started' | 'stale'>;
+type Refusal = FactoryRefusal<'not_bot' | 'not_running' | 'not_now' | 'invalid' | 'no_repo' | 'read_failed' | 'not_open' | 'too_many' | 'not_found' | 'not_pending' | 'too_late' | 'not_ruleable' | 'write_failed' | 'not_started' | 'stale' | 'client_update_required' | 'changed' | 'not_here'>;
 
 function refuse(code: Refusal['code'], message: string): Refusal {
   return { ok: false, code, message };
@@ -435,6 +513,9 @@ export function typedApprovalTargets(
   return above.sort((a, b) => a.seq - b.seq).map((a) => a.id);
 }
 
+/** The longest command a `native_tool` card shows. */
+const NATIVE_TOOL_COMMAND_MAX = 1_500;
+
 const ACTION_TITLE: Readonly<Record<ApprovalAction, string>> = {
   merge: 'Merge',
   push_default: 'Push to the default branch of',
@@ -442,8 +523,21 @@ const ACTION_TITLE: Readonly<Record<ApprovalAction, string>> = {
   issue_close: 'Close',
   comment: 'Comment on',
   release: 'Publish a release of',
+  pr_close: 'Close',
   skill: 'Load the skill',
   owner_profile: 'Change',
+  native_tool: 'Run',
+  routine: 'Set up the routine',
+  bot_memory: 'Change',
+};
+
+/** What a done act's outcome card says it did. */
+const ACT_DONE_TITLE: Readonly<Record<ActAction, string>> = {
+  comment: 'Commented on',
+  issue_create: 'Opened',
+  issue_close: 'Closed',
+  pr_close: 'Closed without merging',
+  release: 'Published',
 };
 
 /** A PR as its host names it: a GitLab merge request is `MR !n`. */
@@ -451,9 +545,12 @@ function prName(repoKey: string, n: number): string {
   return isGitlabRepoKey(repoKey) ? `MR !${n}` : `PR #${n}`;
 }
 
-function subject(r: Pick<ApprovalRequest, 'action' | 'repoKey' | 'prNumber' | 'issueNumber' | 'skill'>): string {
+function subject(r: Pick<ApprovalRequest, 'action' | 'repoKey' | 'prNumber' | 'issueNumber' | 'skill' | 'act' | 'routine'>): string {
   if (r.skill) return `${r.skill.name} ${r.skill.version}`;
+  if (r.act?.kind === 'release') return `${r.repoKey} (${r.act.tagName})`;
   if (r.action === 'owner_profile') return 'your profile';
+  if (r.action === 'bot_memory') return 'your notes';
+  if (r.routine) return `"${r.routine.title}"`;
   if (r.prNumber !== undefined) return prName(r.repoKey, r.prNumber);
   if (r.issueNumber !== undefined) return `issue #${r.issueNumber}`;
   return r.repoKey;
@@ -484,15 +581,23 @@ const OWNER_PROFILE_TITLE: Readonly<Record<MemoryChange['action'], string>> = {
   remove: 'Remove this from your profile?',
 };
 
+const BOT_MEMORY_TITLE: Readonly<Record<MemoryChange['action'], string>> = {
+  add: 'Add this to the bot\'s notes?',
+  replace: 'Change this in the bot\'s notes?',
+  remove: 'Remove this from the bot\'s notes?',
+};
+
+function textBlock(text: string): string[] {
+  const fence = fenceFor(text);
+  return [`${fence}text`, text, fence];
+}
+
 /** An owner-profile card's lines after the bot's: what Approve does, then
  *  the exact entry (replace: as it reads, then as it would), each in a
- *  fence no backtick run in it can close. Pure. */
-export function ownerProfileCardLines(change: MemoryChange): string[] {
-  const block = (text: string): string[] => {
-    const fence = fenceFor(text);
-    return [`${fence}text`, text, fence];
-  };
-  const shared = 'Every bot of yours reads your profile when its session starts.';
+ *  fence no backtick run in it can close. `shared` says who reads it (the
+ *  bot's own notes: that bot). Pure. */
+export function ownerProfileCardLines(change: MemoryChange, shared = 'Every bot of yours reads your profile when its session starts.'): string[] {
+  const block = textBlock;
   if (change.action === 'add') {
     return ['', `Approve to add this entry; Deny drops it. ${shared}`, '', ...block(change.text ?? '')];
   }
@@ -500,6 +605,183 @@ export function ownerProfileCardLines(change: MemoryChange): string[] {
     return ['', `Approve to remove this entry; Deny keeps it. ${shared}`, '', ...block(change.old ?? '')];
   }
   return ['', `Approve to replace this entry; Deny keeps it as it is. ${shared}`, '', 'Now:', ...block(change.old ?? ''), '', 'Becomes:', ...block(change.text ?? '')];
+}
+
+/** The lines an owner-asked card starts with (proposeOwnerAsked): why it is
+ *  asked, and the owner's own message it was asked on. Pure. */
+export function ownerAskedLines(excerpt: string): string[] {
+  return [
+    '',
+    'This conversation has read outside text (a pull request, an issue, CI, or work that read them), so nothing it asks for that stays is saved without you. Check that this is what you asked for. Your message:',
+    ...textBlock(excerpt),
+  ];
+}
+
+function hhmm(at: number): string {
+  const d = new Date(at);
+  const pad = (n: number): string => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/** A routine card's lines after the owner-asked ones: what Approve does,
+ *  then every field that changes what runs and when (the schedule in words
+ *  with the time zone and its next run, quiet hours, the thread), then the
+ *  title and the whole prompt, each fenced. Pure. */
+export function routineCardLines(r: ApprovalRoutine, o: { botId: string; botName: string; now: number; timeZone: string }): string[] {
+  const s = r.schedule;
+  const next = s.kind === 'interval' ? `first run ${scheduleLabel(s).replace(/^every /, '')} after you approve` : `next run ${hhmm(nextSlot(s, o.now))}`;
+  const thread = !r.threadId || r.threadId === GENERAL_THREAD ? 'General' : r.threadId === dmThreadId(o.botId) ? `your 1:1 with ${o.botName}` : r.threadId;
+  return [
+    '',
+    `Approve to save this routine; Deny drops it. Each run wakes ${o.botName} afresh, with the prompt below as its instructions.`,
+    '',
+    `Schedule: ${scheduleLabel(s)} (${o.timeZone} time); ${next}`,
+    `Quiet hours: ${r.quietHours ? `${r.quietHours.start}–${r.quietHours.end} (runs inside it are skipped)` : 'none'}`,
+    `Runs in: ${thread}`,
+    '',
+    'Title:',
+    ...textBlock(r.title),
+    '',
+    'Prompt:',
+    ...textBlock(r.prompt),
+  ];
+}
+
+/** Why a text an owner-asked card would show is not shown as it is saved,
+ *  or null: what the card shows is what is saved, nothing hidden or cut. */
+export function ownerAskedTextProblem(text: string): string | null {
+  if (UNSHOWABLE.test(text)) return 'it holds control, bidi or zero-width characters, which the card would not show as they are saved';
+  if (redactStoredSecrets(text) !== text) return 'it holds a stored secret, which the card would hide';
+  const key = text.split('\n').map(secretValueKind).find((k) => k !== null);
+  if (key) return `it holds a key (${key}); a secret goes through secret_request`;
+  return null;
+}
+
+/** The longest text an act publishes (the card's room is the real cap). */
+export const ACT_TEXT_MAX = 6000;
+export const ACT_TITLE_MAX = 256;
+
+/** An act card's lines after the bot's: what Approve does, then the target's
+ *  GitHub title as context (fence `text`), then each payload field in its
+ *  own `wmux-payload` fence, in order (actPayload.ts). Pure. */
+export function actCardLines(act: Exclude<ApprovalAct, ApprovalReleaseAct>, fields: readonly string[], o: { login: string; repoKey: string; signedIn: boolean }): string[] {
+  const secs = Math.round(APPROVAL_UNDO_MS / 1000);
+  const when = `${secs} s after you approve (Undo until then)`;
+  const target = act.kind === 'issue_create' ? '' : act.kind === 'pr_close' || (act.kind === 'comment' && act.target === 'pr') ? prName(o.repoKey, act.number) : `issue #${act.number}`;
+  const what = act.kind === 'comment'
+    ? `Approve to post this comment on ${target} as @${o.login}, ${when}. It is public and stays under your name. Its last line is wmux's marker; GitHub does not show it.`
+    : act.kind === 'issue_create'
+      ? `Approve to open this issue on ${o.repoKey} as @${o.login}, ${when}: the first block is its title, the second its body. The body's last line is wmux's marker; GitHub does not show it.`
+      : act.kind === 'issue_close'
+        ? `Approve to close ${target} as ${act.stateReason === 'not_planned' ? 'not planned' : 'completed'} as @${o.login}, ${when}.`
+        : `Approve to close ${target} without merging as @${o.login}, ${when}. It can be reopened; its branch stays.`;
+  const lines = ['', what];
+  if (o.signedIn) lines.push('This bot\'s conversation holds data from a task you signed in to: check that the text shares none of it.');
+  if (act.kind !== 'issue_create') lines.push('', `${target} on GitHub:`, ...fencedLines(act.title, CONTEXT_FENCE_INFO));
+  for (const f of fields) lines.push('', ...fencedLines(f, PAYLOAD_FENCE_INFO));
+  return lines;
+}
+
+/** A release's payload fields, in card order: the tag, the commit, then
+ *  what the owner approves of the release itself (its title, notes and
+ *  `release` or `prerelease`), or the workflows a pushed tag starts. Pure. */
+export function releaseFields(act: ApprovalReleaseAct): string[] {
+  return act.mode === 'workflow'
+    ? [act.tagName, act.targetSha, act.workflows.join('\n')]
+    : [act.tagName, act.targetSha, act.title, act.notes, act.prerelease ? 'prerelease' : 'release'];
+}
+
+/** A release card's title: the tag, the repository, the commit, and that it
+ *  cannot be undone. Pure. */
+export function releaseCardTitle(act: ApprovalReleaseAct, fullName: string): string {
+  const at = act.targetSha.slice(0, 7);
+  return act.mode === 'workflow'
+    ? `Push tag ${act.tagName} to ${fullName} at ${at} — starts its release workflow, cannot be undone`
+    : `Publish release ${act.tagName} of ${fullName} at ${at} — publishes a release, cannot be undone`;
+}
+
+/** What the card says of the checks the bot's request read. An approval
+ *  while they have not passed is refused, not held: the bot asks again once
+ *  they pass (a held approval would keep an irreversible act waiting). */
+const CHECK_WORDS: Readonly<Record<ReleaseAsk['checks'], string>> = {
+  passed: 'passed',
+  failed: 'one did not pass; approving now is refused, and the bot asks again once they pass',
+  running: 'still running; approving now is refused, and the bot asks again once they pass',
+  none: 'none',
+  'not-started': 'its push CI has not run yet; approving now is refused, and the bot asks again once it passes',
+};
+
+/** A release refusal's code that says what became of its draft. */
+function isDraftCode(code: string): boolean {
+  return code.startsWith('draft-');
+}
+
+const ASK_AGAIN = 'Nothing more is tried for this request; ask again with a new request if it is still wanted.';
+
+/** What a bot told of a release refusal is to do: wait while its draft is
+ *  undecided (asking again would find it), leave the release alone while
+ *  its draft stays, or may stay, on GitHub, else ask again if wanted. Pure. */
+function releaseRefusalAdvice(refusal: string, draftOpen: boolean): string {
+  if (draftOpen) return 'Its draft release is not settled yet: do not ask for this release again until you are told it is.';
+  const codes = laneRefusalCodes(refusal);
+  if (codes.includes('draft-kept-unchecked')) {
+    return 'Its draft release may still be on GitHub until the owner publishes or deletes it: do not ask for this release again meanwhile.';
+  }
+  if (codes.some((c) => isDraftCode(c) && c !== 'draft-gone')) {
+    return 'Its draft release stays on GitHub until the owner publishes or deletes it: do not ask for this release again meanwhile.';
+  }
+  return ASK_AGAIN;
+}
+
+/** What starts another workflow, as the card says it. */
+const ALSO_RUNS_WORDS: Readonly<Record<AlsoRunsOn, string>> = {
+  'tag-push': 'on this tag push',
+  'tag-create': 'when the tag is created',
+  'release-published': 'when the release is published',
+};
+
+/** `a`, `a and b`, `a, b and c`. Pure. */
+function joinWords(words: readonly string[]): string {
+  return words.length <= 1 ? words.join('') : `${words.slice(0, -1).join(', ')} and ${words[words.length - 1]}`;
+}
+
+/** A release card's lines after the bot's: what Approve does and whether it
+ *  is marked Latest, the workflows the tag push also starts, what main read when the bot asked (the default branch,
+ *  the checks, package.json's version), then each payload field in its own
+ *  `wmux-payload` fence, in order. Pure. */
+export function releaseCardLines(act: ApprovalReleaseAct, fields: readonly string[], o: { login: string; facts: Pick<ReleaseAsk, 'behindBy' | 'checks' | 'version' | 'alsoRuns'>; signedIn: boolean }): string[] {
+  const secs = Math.round(APPROVAL_UNDO_MS / 1000);
+  const when = `${secs} s after you approve (Undo until then)`;
+  const at = act.targetSha.slice(0, 7);
+  const lines = [''];
+  if (act.mode === 'release') {
+    lines.push(
+      `Approve publishes this release on GitHub as @${o.login}, ${when}. A published release and its tag cannot be taken back by wmux. On a repository whose workflows run on a tag push (wmux's own builds installers and publishes to WinGet and Chocolatey), this starts them.`,
+      act.prerelease ? 'Prerelease, never Latest.' : 'Marked Latest.',
+    );
+  } else {
+    const runs = act.workflows.length === 1 ? `the workflow ${act.workflows[0]} runs on it` : `the workflows ${act.workflows.join(', ')} run on it`;
+    lines.push(
+      `Approve pushes the tag ${act.tagName} at ${at} as @${o.login}, ${when}; ${runs} and builds and publishes the release (wmux's own builds installers and publishes to WinGet and Chocolatey). A pushed tag cannot be taken back by wmux.`,
+      'The workflow decides whether it is marked Latest.',
+    );
+  }
+  // Other workflows the act starts (they build nothing that is published,
+  // but they run).
+  for (const w of o.facts.alsoRuns) lines.push(`${w.path} also runs ${joinWords(w.on.map((e) => ALSO_RUNS_WORDS[e]))}.`);
+  const behind = o.facts.behindBy === 0 ? `${at} is its head` : `${at} is ${o.facts.behindBy} ${o.facts.behindBy === 1 ? 'commit' : 'commits'} behind its head`;
+  // A push runs the checks on the pushed head only: one behind it may never run them.
+  const checks = o.facts.checks === 'not-started' && o.facts.behindBy > 0
+    ? 'its push CI has not run yet (a commit behind the head may never run it); approving now is refused, and the bot asks again once it passes'
+    : CHECK_WORDS[o.facts.checks];
+  lines.push('', `Default branch ${act.defaultBranch}: ${behind}.`, `Checks on ${at}: ${checks}.`);
+  if (o.facts.version) lines.push(`package.json version: ${o.facts.version}.`);
+  if (o.signedIn) lines.push('This bot\'s conversation holds data from a task you signed in to: check that the title and notes share none of it.');
+  lines.push('', act.mode === 'release'
+    ? 'The blocks are the tag, the commit, the release\'s title, its notes, and release or prerelease.'
+    : `The blocks are the tag, the commit, and the ${act.workflows.length === 1 ? 'workflow' : 'workflows'} it starts.`);
+  for (const f of fields) lines.push('', ...fencedLines(f, PAYLOAD_FENCE_INFO));
+  return lines;
 }
 
 /** The first line of an approval card's body. */
@@ -517,6 +799,8 @@ export class ApprovalService {
   private readonly typedSeen = new Set<string>();
   /** Merge approvals the file held, now pending again (reopened on resume). */
   private readonly reloaded = new Set<string>();
+  /** `native_tool` requests: the turn waiting for the owner's answer. */
+  private readonly nativeWaiters = new Map<string, (approved: boolean) => void>();
   private readonly now: () => number;
   private readonly log: (line: string) => void;
 
@@ -553,7 +837,9 @@ export class ApprovalService {
   private save(): boolean {
     try {
       fs.mkdirSync(path.dirname(this.ports.file), { recursive: true });
-      atomicWriteJSONSync(this.ports.file, { version: 1, requests: [...this.requests.values()], rules: [...this.rules.values()] });
+      // A `native_tool` request lives only while its turn waits; an older
+      // build reading the file would refuse the unknown action.
+      atomicWriteJSONSync(this.ports.file, { version: 1, requests: [...this.requests.values()].filter((r) => r.action !== 'native_tool'), rules: [...this.rules.values()] });
       return true;
     } catch (err) {
       this.log(`[factory] approvals not written: ${String(err)}`);
@@ -597,7 +883,16 @@ export class ApprovalService {
       return refuse('invalid', `action must be one of ${APPROVAL_ACTIONS.join(', ')}`);
     }
     const act = action as ApprovalAction;
-    if (CARD_ONLY_ACTIONS.has(act)) return refuse('invalid', act === 'skill' ? 'a skill is proposed with skill_propose' : 'a change to the owner\'s profile is proposed with memory_update');
+    if (CARD_ONLY_ACTIONS.has(act)) {
+      return refuse('invalid', act === 'skill' ? 'a skill is proposed with skill_propose'
+        : act === 'native_tool' ? 'a command approval comes from the bot\'s own engine, not approval_request'
+          : act === 'routine' ? 'a routine is proposed with routine_set'
+            : act === 'bot_memory' ? 'a change to your notes is proposed with memory_update target memory'
+              : 'a change to the owner\'s profile is proposed with memory_update');
+    }
+    if (!(BOT_REQUESTABLE_ACTIONS as readonly string[]).includes(act)) {
+      return refuse('invalid', `${act} is not asked for with approval_request; it has no executor yet`);
+    }
     const num = (v: unknown): number | undefined | null => (v === undefined ? undefined : Number.isSafeInteger(v) && (v as number) > 0 ? (v as number) : null);
     const prNumber = num(raw.prNumber);
     const issueNumber = num(raw.issueNumber);
@@ -605,6 +900,10 @@ export class ApprovalService {
     if (act === 'merge' && prNumber === undefined) return refuse('invalid', 'a merge names its prNumber');
     if (act === 'issue_close' && issueNumber === undefined) return refuse('invalid', 'closing an issue names its issueNumber');
     if (act === 'comment' && prNumber === undefined && issueNumber === undefined) return refuse('invalid', 'a comment names a prNumber or an issueNumber');
+    if (act === 'pr_close' && (prNumber === undefined || issueNumber !== undefined)) return refuse('invalid', 'closing a pull request names its prNumber');
+    if (act === 'issue_close' && prNumber !== undefined) return refuse('invalid', 'closing an issue names its issueNumber; a pull request is closed with pr_close');
+    if (act === 'issue_create' && (prNumber !== undefined || issueNumber !== undefined)) return refuse('invalid', 'a new issue names no number');
+    if (act === 'release' && (prNumber !== undefined || issueNumber !== undefined)) return refuse('invalid', 'a release names its tagName, no number');
     if (prNumber !== undefined && issueNumber !== undefined) return refuse('invalid', 'name a prNumber or an issueNumber, not both');
     const given = oneLine(raw.reason, APPROVAL_LIMITS.REASON_MAX);
     if (!given) return refuse('invalid', 'reason is required (one line)');
@@ -637,6 +936,7 @@ export class ApprovalService {
         : 'this bot has no repository to act on, and no bot of this workspace has one: tell the owner in one line and ask them to set a repository on a bot\'s profile');
     }
     const { repoKey, repoPath } = repo;
+    if (ACT_ACTIONS.has(act)) return this.requestAct(bot, raw, act as ActAction, wake, profile, repoKey, repoPath, prNumber, issueNumber, given);
 
     // One request per (bot, key): a retried turn gets the first one back.
     const clientRequestId = typeof raw.clientRequestId === 'string' ? raw.clientRequestId : this.nextOrdinal(bot.botId, wake);
@@ -712,6 +1012,194 @@ export class ApprovalService {
     return { ok: true, request: approvalView(this.get(record.requestId) ?? record) };
   }
 
+  /**
+   * An act main carries out (ACT_ACTIONS): the text the bot wrote, checked
+   * so the card shows the bytes the post sends, and what main reads now on
+   * GitHub (the login it goes out as, the repository's name and node id, the
+   * target's node id, state and head). The card is posted first, with the
+   * text fenced (actPayload.ts), and the request stored once, with it. No
+   * rule approves it.
+   */
+  private async requestAct(
+    bot: BotBinding, raw: Record<string, unknown>, act: ActAction, wake: ApprovalWake, profile: BotProfile,
+    repoKey: string, repoPath: string, prNumber: number | undefined, issueNumber: number | undefined, given: string,
+  ): Promise<{ ok: true; request: ApprovalView; duplicate?: true } | Refusal> {
+    // What a guest's turn asks for is never published under the owner's name.
+    if (guestSourcedWake(wake)) return refuse('not_now', `approval_request: ${GUEST_TURN_STARTS_NO_WORKERS}`);
+    if (isGitlabRepoKey(repoKey)) return refuse('invalid', `wmux carries out ${act} on GitHub only; this repository is on GitLab`);
+    const host = this.ports.acts?.() ?? null;
+    if (!host) return refuse('not_started', 'wmux cannot carry out this act right now; ask again later');
+    const text = (v: unknown, what: string, max: number, required: boolean): string | Refusal => {
+      if (v === undefined && !required) return '';
+      if (typeof v !== 'string') return refuse('invalid', `${what} is required`);
+      const t = normalizeActText(v);
+      if (required && !t) return refuse('invalid', `${what} is required`);
+      if (t.length > max) return refuse('invalid', `${what} is longer than ${max} characters`);
+      const problem = t ? actTextProblem(t, redactStoredSecrets) : null;
+      return problem ? refuse('invalid', `${what} cannot be shown and posted as it is: ${problem}`) : t;
+    };
+    const isRefusal = (v: unknown): v is Refusal => typeof v === 'object' && v !== null && (v as Refusal).ok === false;
+    const body = act === 'comment' || act === 'issue_create' ? text(raw.body, 'body', ACT_TEXT_MAX, act === 'comment') : '';
+    if (isRefusal(body)) return body;
+    const title = act === 'issue_create' || act === 'release' ? text(raw.title, 'title', ACT_TITLE_MAX, act === 'issue_create') : '';
+    if (isRefusal(title)) return title;
+    if (title.includes('\n')) return refuse('invalid', 'title is one line');
+    const stateReason = raw.stateReason === undefined || raw.stateReason === 'completed' ? 'completed' : raw.stateReason === 'not_planned' ? 'not_planned' : null;
+    if (stateReason === null) return refuse('invalid', 'stateReason is completed or not_planned');
+    // A release: its tag, the commit (default: the default branch's head
+    // when main reads it), its notes, and whether it is a prerelease.
+    let tagName = '';
+    let targetSha: string | undefined;
+    let notes = '';
+    let prerelease: boolean | undefined;
+    if (act === 'release') {
+      if (typeof raw.tagName !== 'string') return refuse('invalid', 'a release names its tagName');
+      tagName = raw.tagName;
+      const bad = releaseTagProblem(tagName) ?? actTextProblem(tagName, redactStoredSecrets);
+      if (bad) return refuse('invalid', `tagName cannot be used: ${bad}`);
+      if (raw.targetSha !== undefined && (typeof raw.targetSha !== 'string' || !/^[0-9a-f]{40}$/i.test(raw.targetSha))) return refuse('invalid', 'targetSha is a full 40-character commit SHA');
+      targetSha = typeof raw.targetSha === 'string' ? raw.targetSha.toLowerCase() : undefined;
+      const n = text(raw.notes, 'notes', ACT_TEXT_MAX, false);
+      if (isRefusal(n)) return n;
+      notes = n;
+      if (raw.prerelease !== undefined && typeof raw.prerelease !== 'boolean') return refuse('invalid', 'prerelease is true or false');
+      prerelease = raw.prerelease as boolean | undefined;
+    }
+    const contentKey = actContentKey([act, repoKey, prNumber ?? null, issueNumber ?? null, title, body, act === 'issue_close' ? stateReason : null,
+      ...(act === 'release' ? [tagName, targetSha ?? null, notes, prerelease ?? null] : [])]);
+    const readerGuest = wake.guest === true;
+
+    // One request per (bot, key), and one per content while it waits.
+    const clientRequestId = typeof raw.clientRequestId === 'string' ? raw.clientRequestId : this.nextOrdinal(bot.botId, wake);
+    const duplicate = (): { ok: true; request: ApprovalView; duplicate: true } | Refusal | null => {
+      const prior = [...this.requests.values()].find((r) => r.botId === bot.botId && r.clientRequestId === clientRequestId);
+      if (prior) {
+        return prior.action === act && prior.contentKey === contentKey
+          ? { ok: true, request: botApprovalView(prior, readerGuest), duplicate: true }
+          : refuse('invalid', 'clientRequestId was used for another request; send a new one');
+      }
+      const same = [...this.requests.values()].find((r) => r.repoKey === repoKey && r.contentKey === contentKey && (r.state === 'pending' || r.state === 'approved'));
+      return same ? { ok: true, request: botApprovalView(same, readerGuest), duplicate: true } : null;
+    };
+    const first = duplicate();
+    if (first) return first;
+    const open = [...this.requests.values()].filter((r) => r.botId === bot.botId && r.state === 'pending');
+    if (open.length >= APPROVAL_LIMITS.PENDING_PER_BOT) return refuse('too_many', `${open.length} requests already wait for the owner`);
+
+    // GitHub, read now: the login, the repository, the target.
+    const login = await host.login(repoKey).catch(() => null);
+    if (!login) return refuse('read_failed', 'the gh login could not be read');
+    const repoPin = await host.repo(repoKey).catch((err: unknown) => ({ error: String(err) }));
+    if ('error' in repoPin) return refuse('read_failed', `the repository could not be read: ${repoPin.error}`.slice(0, 300));
+    const n = (prNumber ?? issueNumber) as number;
+    const unread = (what: string, r: { error: string; status?: number }): Refusal => (r.status === 404 || r.status === 410
+      ? refuse('not_open', `${what} was not found on GitHub`)
+      : refuse('read_failed', `${what} could not be read: ${r.error}`.slice(0, 300)));
+    let actPin: ApprovalAct;
+    let headSha: string | undefined;
+    let ask: ReleaseAsk | null = null;
+    if (act === 'release') {
+      const read = await host.release(repoKey, {
+        tagName, ...(targetSha ? { targetSha } : {}), ...(prerelease !== undefined ? { prerelease } : {}),
+        ...(repoPin.defaultBranch ? { defaultBranch: repoPin.defaultBranch } : {}),
+      })
+        .catch((err: unknown): ReleaseAskRefusal => ({ refuse: 'read_failed', message: `the repository could not be read: ${String(err)}`.slice(0, 300) }));
+      if ('refuse' in read) return refuse(read.refuse, read.message);
+      ask = read;
+      headSha = read.targetSha;
+      // In workflow mode the workflow writes the release: no title or notes.
+      actPin = {
+        kind: 'release', mode: read.mode, tagName, targetSha: read.targetSha, defaultBranch: read.defaultBranch,
+        title: read.mode === 'release' ? title || tagName : '', notes: read.mode === 'release' ? notes : '',
+        prerelease: read.prerelease, workflows: read.workflows, checksExpected: read.checksExpected, pushWorkflows: read.pushWorkflows, draft: false,
+      };
+    } else if (act === 'issue_create') {
+      actPin = { kind: 'issue_create', title, body };
+    } else if (act === 'pr_close') {
+      const pr = await host.pull(repoKey, n).catch((err: unknown) => ({ error: String(err) }));
+      if ('error' in pr) return unread(prName(repoKey, n), pr);
+      if (pr.merged || pr.state !== 'open') return refuse('not_open', `${prName(repoKey, n)} is not open`);
+      headSha = pr.headSha;
+      actPin = { kind: 'pr_close', number: n, targetNodeId: pr.nodeId, headSha, title: pr.title };
+    } else {
+      const issue = await host.issue(repoKey, n).catch((err: unknown) => ({ error: String(err) }));
+      const what = prNumber !== undefined ? prName(repoKey, n) : `issue #${n}`;
+      if ('error' in issue) return unread(what, issue);
+      if (issue.isPr !== (prNumber !== undefined)) {
+        return refuse('invalid', issue.isPr ? `#${n} is a pull request: name it with prNumber` : `#${n} is an issue: name it with issueNumber`);
+      }
+      if (act === 'issue_close') {
+        if (issue.state !== 'open') return refuse('not_open', `${what} is not open`);
+        actPin = { kind: 'issue_close', number: n, targetNodeId: issue.nodeId, title: issue.title, stateReason };
+      } else {
+        if (issue.locked) return refuse('invalid', `${what} is locked`);
+        if (prNumber !== undefined) {
+          const pr = await host.pull(repoKey, n).catch((err: unknown) => ({ error: String(err) }));
+          if ('error' in pr) return unread(what, pr);
+          headSha = pr.headSha;
+        }
+        actPin = { kind: 'comment', target: prNumber !== undefined ? 'pr' : 'issue', number: n, targetNodeId: issue.nodeId, ...(headSha ? { headSha } : {}), title: issue.title, body };
+      }
+    }
+    // Re-read the wake after the awaits: a request outlives no turn.
+    const still = this.ports.runningWake(bot.botId);
+    if (!still || still.wakeId !== wake.wakeId) return refuse('not_running', 'the wake that asked has ended');
+    if (guestSourcedWake(still)) return refuse('not_now', `approval_request: ${GUEST_TURN_STARTS_NO_WORKERS}`);
+    if (this.botGone(bot)) return refuse('not_bot', 'this bot was deleted');
+    const again = duplicate();
+    if (again) return again;
+
+    const requestId = newRequestId();
+    const fields = actPin.kind === 'comment' ? [bodyWithMarker(actPin.body, requestId)]
+      : actPin.kind === 'issue_create' ? [actPin.title, bodyWithMarker(actPin.body, requestId)]
+        : actPin.kind === 'release' ? releaseFields(actPin)
+          : [];
+    const reason = withoutOwnerQuotes(given, this.ownerTexts(bot.workspaceId)) || `${ACTION_TITLE[act]} ${subject({ action: act, repoKey, prNumber, issueNumber, act: actPin })}.`;
+    const signedIn = signedInWake(wake) || signedInWake(still);
+    const lines = actPin.kind === 'release' && ask
+      ? releaseCardLines(actPin, fields, { login, facts: ask, signedIn: actPin.mode === 'release' && signedIn })
+      : actPin.kind !== 'release' ? actCardLines(actPin, fields, { login, repoKey, signedIn: TEXT_ACT_ACTIONS.has(act) && signedIn }) : [];
+    // Measured as the room stores it: the owner reads all of what they approve.
+    if (redactStoredSecrets([askLine(profile, reason), ...lines].join('\n')).length > ROOM_LIMITS.CARD_BODY_MAX) {
+      return refuse('invalid', 'the text does not fit on the owner\'s card; write a shorter one');
+    }
+    const at = this.now();
+    const record: StoredApproval = {
+      requestId,
+      action: act,
+      repoKey,
+      repoPath,
+      ...(prNumber !== undefined ? { prNumber } : {}),
+      ...(issueNumber !== undefined ? { issueNumber } : {}),
+      ...(headSha ? { headSha } : {}),
+      ghLogin: login.toLowerCase(),
+      act: actPin,
+      actRepo: { fullName: repoPin.fullName, nodeId: repoPin.nodeId, id: repoPin.id },
+      payloadHash: payloadHashOf(fields),
+      contentKey,
+      botId: bot.botId,
+      workspaceId: bot.workspaceId,
+      threadId: this.conversationThread(bot.botId, wake, signedInWake(wake) || signedInWake(still)),
+      reason,
+      tainted: wake.tainted || still.tainted,
+      guest: false,
+      state: 'pending',
+      clientRequestId,
+      createdAt: at,
+      updatedAt: at,
+    };
+    // Approved on its card only: the card is posted first and the request
+    // stored once, with it.
+    const card = this.postCard(record, profile, still, lines);
+    if (!card) return refuse('write_failed', 'the approval card could not be posted; ask again');
+    if (!this.put({ ...record, cardId: card.id })) {
+      this.closeCard({ ...record, cardId: card.id });
+      return refuse('write_failed', 'the request could not be stored; ask again');
+    }
+    this.changed(record.workspaceId);
+    return { ok: true, request: approvalView(this.get(record.requestId) ?? record) };
+  }
+
   /** A bot's skill proposal (the skills module, from `skill_propose`): one
    *  `skill` request whose card shows the diff. No repository is needed and
    *  no rule ever approves it. */
@@ -764,6 +1252,72 @@ export class ApprovalService {
     }
     this.changed(record.workspaceId);
     return { ok: true, request: approvalView(this.get(record.requestId) ?? record) };
+  }
+
+  /** A Hermes bot's own tool asks for permission mid-turn (its ACP
+   *  permission request, main/deck/AcpBrainAdapter.ts): one `native_tool`
+   *  request whose desktop card shows the command. Resolves the owner's
+   *  answer: true on Approve; false on Deny, after `timeoutMs`, when
+   *  `signal` aborts, or when no card could be posted. One waits per bot;
+   *  the request lives only while it waits (never in approvals.json). */
+  askNativeTool(bot: BotBinding, input: { title: string; command: string }, opts: { timeoutMs: number; signal?: AbortSignal }): Promise<boolean> {
+    const wake = this.ports.runningWake(bot.botId);
+    if (!wake || opts.signal?.aborted) return Promise.resolve(false);
+    let profile: BotProfile | null = null;
+    try {
+      profile = this.ports.bots()?.get(bot.botId) ?? null;
+    } catch {
+      profile = null;
+    }
+    if (!profile || !profile.enabled || profile.workspaceId !== bot.workspaceId) return Promise.resolve(false);
+    if ([...this.requests.values()].some((r) => r.botId === bot.botId && r.action === 'native_tool' && r.state === 'pending')) return Promise.resolve(false);
+    const command = redactStoredSecrets(String(input.command ?? '')).slice(0, NATIVE_TOOL_COMMAND_MAX);
+    const title = oneLine(redactStoredSecrets(String(input.title ?? '')), APPROVAL_LIMITS.REASON_MAX);
+    const at = this.now();
+    const record: StoredApproval = {
+      requestId: newRequestId(),
+      action: 'native_tool',
+      repoKey: '',
+      repoPath: '',
+      nativeTool: { title, command },
+      botId: bot.botId,
+      workspaceId: bot.workspaceId,
+      threadId: this.conversationThread(bot.botId, wake),
+      reason: 'Hermes wants to run a command it flags as needing your approval.',
+      tainted: wake.tainted || guestSourcedWake(wake),
+      guest: guestSourcedWake(wake),
+      state: 'pending',
+      clientRequestId: `native:${wake.wakeId}:${at}`,
+      createdAt: at,
+      updatedAt: at,
+    };
+    const fence = fenceFor(command);
+    const card = this.postCard(record, profile, wake, ['', 'Approve to let it run this once; Deny refuses it. No answer in a few minutes refuses it too.', '', `${fence}text`, command, fence]);
+    if (!card) return Promise.resolve(false);
+    const stored: StoredApproval = { ...record, cardId: card.id };
+    this.requests.set(stored.requestId, stored);
+    this.changed(stored.workspaceId);
+    return new Promise<boolean>((resolve) => {
+      const done = (approved: boolean): void => {
+        clearTimeout(timer);
+        opts.signal?.removeEventListener('abort', onAbort);
+        this.nativeWaiters.delete(stored.requestId);
+        resolve(approved);
+      };
+      const lapse = (): void => {
+        this.withdraw(stored.requestId);
+        done(false);
+      };
+      const onAbort = (): void => lapse();
+      const timer = setTimeout(lapse, opts.timeoutMs);
+      opts.signal?.addEventListener('abort', onAbort, { once: true });
+      this.nativeWaiters.set(stored.requestId, done);
+    });
+  }
+
+  /** The turn waiting on a `native_tool` request gets the owner's answer. */
+  private answerNativeTool(r: StoredApproval, approved: boolean): void {
+    if (r.action === 'native_tool') this.nativeWaiters.get(r.requestId)?.(approved);
   }
 
   /** A bot's change to the owner's profile (the memory module, from
@@ -823,6 +1377,93 @@ export class ApprovalService {
     return { ok: true, request: approvalView(this.get(record.requestId) ?? record) };
   }
 
+  /** What the owner asked the bot for in a conversation that took in
+   *  outside text (routine_set, memory_update): one card-only request, asked
+   *  in the wake that runs on the owner's card (`proof`), whose card shows
+   *  that message and the whole change. One per action and owner message:
+   *  the same change again while it waits is that request, another one, or
+   *  any once the owner answered, is refused. The caller has
+   *  refused a guest's wake, a tainted wake and a signed-in conversation. */
+  proposeOwnerAsked(bot: BotBinding, ask: OwnerAsk, proof: OwnerCardProof): { ok: true; request: ApprovalView; duplicate?: true } | Refusal {
+    const tool = ask.action === 'routine' ? 'routine_set' : 'memory_update';
+    const wake = this.ports.runningWake(bot.botId);
+    if (!wake || wake.wakeId !== proof.wakeId) return refuse('not_running', `${tool}: the turn the owner's message started has ended`);
+    if (guestSourcedWake(wake)) return refuse('not_now', `${tool}: ${GUEST_TURN_STARTS_NO_WORKERS}`);
+    let profile: BotProfile | null = null;
+    try {
+      profile = this.ports.bots()?.get(bot.botId) ?? null;
+    } catch {
+      profile = null;
+    }
+    if (!profile || !profile.enabled || profile.workspaceId !== bot.workspaceId) return refuse('not_bot', 'this bot is not running in the factory');
+    // A replace or remove shows the entry it changes too.
+    const texts = ask.action === 'routine' ? [ask.routine.title, ask.routine.prompt] : [ask.change.text ?? '', ask.change.old ?? ''];
+    for (const t of texts) {
+      const problem = ownerAskedTextProblem(t);
+      if (problem) return refuse('invalid', `${tool}: this cannot go on the owner's card as it is: ${problem}`);
+    }
+    // The owner's words on the card are held to the same: shown as stored.
+    if (ownerAskedTextProblem(proof.excerpt)) return refuse('invalid', `${tool}: the owner's message cannot be quoted on a card as it is; tell the owner what you would save`);
+    const payload = ask.action === 'routine' ? ask.routine : ask.change;
+    const contentKey = createHash('sha256').update(JSON.stringify([ask.action, payload])).digest('hex').slice(0, 32);
+    // One per action and owner message, whichever wake runs on it, so
+    // outside text cannot fill the owner's inbox.
+    const clientRequestId = `${ask.action}:${proof.cardId}`;
+    const prior = [...this.requests.values()].find((r) => r.botId === bot.botId && r.clientRequestId === clientRequestId);
+    if (prior) {
+      if (prior.state !== 'pending') return refuse('not_pending', `${tool}: the owner already answered this request (${prior.state}); do not ask again unless they say so`);
+      return prior.contentKey === contentKey
+        ? { ok: true, request: approvalView(prior), duplicate: true }
+        : refuse('too_many', `${tool}: one such request per owner message, and one waits already; tell the owner what else you would save`);
+    }
+    const open = [...this.requests.values()].filter((r) => r.botId === bot.botId && r.state === 'pending').length;
+    if (open >= APPROVAL_LIMITS.PENDING_PER_BOT) return refuse('too_many', `${open} requests already wait for the owner`);
+    const reason = ask.action === 'routine' ? 'Set up this routine you asked for.'
+      : ask.action === 'bot_memory' ? 'Keep this in my notes, as you asked.'
+        : 'Remember this about you, for every bot.';
+    const lines = [
+      ...ownerAskedLines(proof.excerpt),
+      ...(ask.action === 'routine'
+        ? routineCardLines(ask.routine, { botId: bot.botId, botName: profile.name || 'the bot', now: this.now(), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone })
+        : ownerProfileCardLines(ask.change, ask.action === 'bot_memory' ? 'This bot reads its notes when its session starts.' : undefined)),
+    ];
+    // Measured as posted, and never cut: the owner reads all of what they
+    // approve.
+    if ([askLine(profile, reason), ...lines].join('\n').length > ROOM_LIMITS.CARD_BODY_MAX) {
+      return refuse('invalid', `${tool}: this does not fit on the owner's card; make it shorter`);
+    }
+    const at = this.now();
+    const record: StoredApproval = {
+      requestId: newRequestId(),
+      action: ask.action,
+      repoKey: '',
+      repoPath: '',
+      ...(ask.action === 'routine' ? { routine: { ...ask.routine } } : ask.action === 'bot_memory' ? { botMemory: { ...ask.change } } : { ownerProfile: { ...ask.change } }),
+      ownerCardId: proof.cardId,
+      botId: bot.botId,
+      workspaceId: bot.workspaceId,
+      threadId: this.conversationThread(bot.botId, wake),
+      reason,
+      tainted: true,
+      guest: false,
+      state: 'pending',
+      clientRequestId,
+      contentKey,
+      createdAt: at,
+      updatedAt: at,
+    };
+    // Approved on its card only: the card is posted first and the request
+    // stored once, with it.
+    const card = this.postCard(record, profile, wake, lines);
+    if (!card) return refuse('write_failed', `${tool}: the approval card could not be posted; ask again`);
+    if (!this.put({ ...record, cardId: card.id })) {
+      this.closeCard({ ...record, cardId: card.id });
+      return refuse('write_failed', `${tool}: the request could not be stored; ask again`);
+    }
+    this.changed(record.workspaceId);
+    return { ok: true, request: approvalView(this.get(record.requestId) ?? record) };
+  }
+
   /** The bot was deleted: each of its requests still waiting expires and
    *  its card closes (a skill's proposal is shelved), and so does a merge
    *  approved but still inside its Undo window. Returns how many. */
@@ -830,7 +1471,7 @@ export class ApprovalService {
     let n = 0;
     for (const r of [...this.requests.values()]) {
       if (r.botId !== botId) continue;
-      const armed = r.state === 'approved' && r.action === 'merge' && !r.effectId;
+      const armed = r.state === 'approved' && (r.act ? !this.actClaimed(r) : r.action === 'merge' && !r.effectId);
       if (r.state !== 'pending' && !armed) continue;
       if (this.expireForGoneBot(r)) n += 1;
     }
@@ -847,6 +1488,15 @@ export class ApprovalService {
     if (next.action === 'skill') this.skillDenied(next);
     this.changed(next.workspaceId);
     return true;
+  }
+
+  /** The bot that asked is there and switched on. */
+  private botEnabled(r: Pick<StoredApproval, 'botId'>): boolean {
+    try {
+      return this.ports.bots()?.get(r.botId)?.enabled === true;
+    } catch {
+      return false;
+    }
   }
 
   /** The bot that asked was deleted (a directory that is running says so). */
@@ -867,6 +1517,7 @@ export class ApprovalService {
     const next: StoredApproval = { ...r, state: 'expired', updatedAt: this.now() };
     if (!this.put(next)) return false;
     this.closeCard(next);
+    this.answerNativeTool(next, false);
     this.changed(next.workspaceId);
     return true;
   }
@@ -947,7 +1598,7 @@ export class ApprovalService {
       readerGuest = false;
     }
     const rows = [...this.requests.values()]
-      .filter((r) => r.botId === bot.botId && (!want || want.includes(r.state)))
+      .filter((r) => r.botId === bot.botId && r.action !== 'native_tool' && (!want || want.includes(r.state)))
       .sort((a, b) => b.createdAt - a.createdAt)
       .slice(0, limit)
       .map((r) => botApprovalView(r, readerGuest));
@@ -963,7 +1614,27 @@ export class ApprovalService {
       .filter((r) => !workspaceId || r.workspaceId === workspaceId)
       .sort((a, b) => b.createdAt - a.createdAt)
       .slice(0, APPROVAL_LIMITS.REQUESTS_MAX)
-      .map(approvalView);
+      .map((r) => {
+        const view = approvalView(r);
+        const effect = r.act ? this.actEffect(r) : null;
+        return effect ? { ...view, actStatus: effect.status } : view;
+      });
+  }
+
+  /** An act request's outbox row, or null. */
+  private actEffect(r: Pick<StoredApproval, 'requestId'>): ActEffect | null {
+    try {
+      return this.ports.acts?.()?.effect(actEffectId(r.requestId)) ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Whether an act request's row was claimed (it may have reached GitHub):
+   *  from then on it is not undone, and not taken back on a restart. */
+  private actClaimed(r: Pick<StoredApproval, 'requestId'>): boolean {
+    const e = this.actEffect(r);
+    return !!e && actRowClaimed(e);
   }
 
   rulesList(): ApprovalRule[] {
@@ -991,10 +1662,26 @@ export class ApprovalService {
       if (cur.state === 'pending') this.expireForGoneBot(cur);
       return refuse('not_bot', 'the bot that asked was deleted');
     }
-    const via = by === 'phone' && deviceId ? `phone, device ${deviceId}` : by;
+    const via = `${by === 'phone' && deviceId ? `phone, device ${deviceId}` : by}${p.source === 'chip' || p.source === 'card' ? `, ${p.source}` : ''}`;
     switch (p.decision) {
-      case 'approve':
+      case 'approve': {
+        // The chip approves a merge and a close without text only; a text act
+        // is approved from its card, echoing the text the card shows.
+        if (p.source === 'chip' && !TYPED_APPROVABLE_ACTIONS.has(cur.action)) {
+          return refuse('not_here', cur.action === 'release'
+            ? 'a release is approved with Approve on its card, where what it publishes is shown'
+            : 'this act publishes text: approve it with Approve on its card, where the text is shown');
+        }
+        // Every request that carries a payloadHash needs it echoed: an app
+        // that sends none does not know what it approves, a close included.
+        if (cur.payloadHash !== undefined && typeof p.payloadHash !== 'string') {
+          return refuse('client_update_required', 'this app version cannot show this act: update the app, or approve it on the desktop');
+        }
+        if (cur.act && p.payloadHash !== undefined && p.payloadHash !== cur.payloadHash) {
+          return refuse('changed', 'the card changed since you read it: read it again before you approve');
+        }
         return this.approve(cur, 'owner', via);
+      }
       case 'always': {
         // Only merges are carried out by a rule (and never a release or a
         // push to a default branch).
@@ -1018,14 +1705,21 @@ export class ApprovalService {
         this.closeCard(next);
         if (next.action === 'skill') this.skillDenied(next);
         this.changed(next.workspaceId);
-        this.tellDecided(next, `The owner denied: ${ACTION_TITLE[next.action]} ${subject(next)}.`, 'Do not ask for it again unless the owner says so.');
+        // A native tool hears the answer in its own turn.
+        if (next.action === 'native_tool') this.answerNativeTool(next, false);
+        else this.tellDecided(next, `The owner denied: ${ACTION_TITLE[next.action]} ${subject(next)}.`, 'Do not ask for it again unless the owner says so.');
         return { ok: true, request: approvalView(next) };
       }
       case 'undo': {
         if (cur.state !== 'approved') return refuse('not_pending', `the request is ${cur.state}`);
         // An approved skill is loaded already; the profile's Archive unloads it.
         if (cur.action === 'skill') return refuse('too_late', 'the skill is loaded; archive it from the bot\'s profile');
-        if (cur.effectId || (cur.executeAfter !== undefined && this.now() >= cur.executeAfter)) return refuse('too_late', 'the merge has started');
+        if (cur.action === 'native_tool') return refuse('too_late', 'the tool was told already');
+        // Approving saved it already: there is no window to take it back in.
+        if (cur.action === 'owner_profile' || cur.action === 'bot_memory' || cur.action === 'routine') return refuse('too_late', 'it is saved already; change it from the bot\'s profile or the Schedules page');
+        if (cur.act) {
+          if (this.actClaimed(cur) || (cur.executeAfter !== undefined && this.now() >= cur.executeAfter)) return refuse('too_late', 'wmux has already started it');
+        } else if (cur.effectId || (cur.executeAfter !== undefined && this.now() >= cur.executeAfter)) return refuse('too_late', 'the merge has started');
         const next: StoredApproval = { ...cur, state: 'pending', updatedAt: this.now() };
         delete next.decidedBy;
         delete next.decidedAt;
@@ -1051,8 +1745,13 @@ export class ApprovalService {
     }
     const skillHost = cur.action === 'skill' ? this.ports.skills?.() ?? null : null;
     if (cur.action === 'skill' && !skillHost) return refuse('not_started', 'skills are not running yet');
-    const profileHost = cur.action === 'owner_profile' ? this.ports.ownerProfile?.() ?? null : null;
-    if (cur.action === 'owner_profile' && !profileHost) return refuse('not_started', 'memory is not running yet');
+    const memory = cur.action === 'owner_profile' || cur.action === 'bot_memory';
+    const profileHost = memory ? this.ports.ownerProfile?.() ?? null : null;
+    if (memory && !profileHost) return refuse('not_started', 'memory is not running yet');
+    const routineHost = cur.action === 'routine' ? this.ports.routines?.() ?? null : null;
+    if (cur.action === 'routine' && !routineHost) return refuse('not_started', 'routines are not running yet');
+    // What it saves runs in the bot's later turns.
+    if ((cur.action === 'routine' || cur.action === 'bot_memory') && !this.botEnabled(cur)) return refuse('not_now', 'the bot is switched off: switch it on, then approve');
     const at = this.now();
     const next: StoredApproval = {
       ...cur,
@@ -1061,7 +1760,7 @@ export class ApprovalService {
       decidedAt: at,
       updatedAt: at,
       ...(ruleId ? { ruleId } : {}),
-      ...(cur.action === 'merge' ? { executeAfter: at + APPROVAL_UNDO_MS } : {}),
+      ...(cur.action === 'merge' || cur.act ? { executeAfter: at + APPROVAL_UNDO_MS } : {}),
     };
     const stored = this.commit(() => {
       this.requests.set(next.requestId, next);
@@ -1090,13 +1789,15 @@ export class ApprovalService {
         return refuse('stale', why);
       }
     }
-    if (profileHost) {
-      // The owner's answer is the act, checked again as the profile stands
-      // now (the scanner, the limit, the entry it was for). When it cannot be
-      // applied the decision is taken back and the card is moot.
+    const applier = profileHost ?? routineHost;
+    if (applier) {
+      // The owner's answer is the act, checked again as things stand now
+      // (the scanner, the limit, the entry it was for; a routine's schedule
+      // and the bot's cap). When it cannot be applied the decision is taken
+      // back and the card is moot.
       let why: string | null;
       try {
-        why = profileHost.approve(next);
+        why = applier.approve(next);
       } catch (err) {
         why = `the change could not be applied: ${String(err)}`;
       }
@@ -1111,13 +1812,24 @@ export class ApprovalService {
     this.log(`[factory] approval ${cur.requestId} approved by ${approver} (${by})`);
     // Decided: the card stops waiting on the owner (its Undo reads the request).
     this.closeCard(next);
-    if (next.action === 'merge') this.arm(next);
+    if (next.action === 'merge' || next.act) this.arm(next);
     this.changed(next.workspaceId);
     // A merge is told once it ran (merged, or refused); any other act now.
     if (next.action === 'skill') {
       this.tellDecided(next, `The owner approved your skill ${subject(next)}.`, 'It is listed in your wakes from now on; read it with skill_read.');
     } else if (next.action === 'owner_profile') {
       this.tellDecided(next, 'The owner approved the change to their profile.', 'Every bot\'s next session starts with it.');
+    } else if (next.action === 'bot_memory') {
+      this.tellDecided(next, 'The owner approved the change to your notes.', 'Your next session starts with it.');
+    } else if (next.action === 'routine') {
+      this.tellDecided(next, `The owner approved the routine ${subject(next)}.`, 'It runs on its schedule from now on; routine_list shows it.');
+    } else if (next.action === 'native_tool') {
+      this.answerNativeTool(next, true);
+      // Nothing is left to do or undo: the card keeps the answer.
+      this.requests.delete(next.requestId);
+      this.changed(next.workspaceId);
+    } else if (next.act) {
+      this.tellDecided(next, `The owner approved: ${ACTION_TITLE[next.action]} ${subject(next)}.`, `wmux carries it out after a ${Math.round(APPROVAL_UNDO_MS / 1000)} s Undo window, and tells you how it went.`);
     } else if (next.action !== 'merge') {
       this.tellDecided(next, `The owner approved: ${ACTION_TITLE[next.action]} ${subject(next)}.`, 'wmux records it but does not carry this act out yet.');
     }
@@ -1147,7 +1859,8 @@ export class ApprovalService {
     this.expire();
     // A skill or a profile change is approved on its card only, where the
     // change is shown.
-    const pending = [...this.requests.values()].filter((r) => r.state === 'pending' && !CARD_ONLY_ACTIONS.has(r.action));
+    // A text act is approved on its card only, where its text is shown.
+    const pending = [...this.requests.values()].filter((r) => r.state === 'pending' && !CARD_ONLY_ACTIONS.has(r.action) && TYPED_APPROVABLE_ACTIONS.has(r.action));
     // The thread's latest cards: what sits between the requests and the words.
     const threadCards = writer.read(stored.workspaceId, { threadId: stored.threadId }).cards;
     let message: RoomCard = stored;
@@ -1293,6 +2006,7 @@ export class ApprovalService {
       }
       this.reloaded.clear();
     }
+    this.resumeActs();
     this.expire();
     // A bot deleted while a request of its was still open (its clean-up did
     // not land): those end now.
@@ -1331,6 +2045,10 @@ export class ApprovalService {
   /** Run an approved merge whose Undo window passed. */
   async execute(requestId: string): Promise<MergeEffect | null> {
     const r = this.requests.get(requestId);
+    if (r?.act) {
+      await this.executeAct(r);
+      return null;
+    }
     if (!r || r.state !== 'approved' || r.action !== 'merge' || !r.decidedBy) return null;
     if (r.executeAfter !== undefined && this.now() < r.executeAfter) {
       this.arm(r);
@@ -1355,6 +2073,167 @@ export class ApprovalService {
       return effect;
     }
     return host.run(effect.id);
+  }
+
+  /** Start: an approved act whose outbox row was never claimed waits for the
+   *  owner again (only a decision of this run is carried out); one whose row
+   *  was claimed stays approved while the outbox settles it, and one whose
+   *  row ended takes that outcome. */
+  private resumeActs(): void {
+    for (const r of [...this.requests.values()]) {
+      if (!r.act || r.state !== 'approved' || this.timers.has(r.requestId)) continue;
+      const e = this.actEffect(r);
+      if (e && (e.status === 'done' || e.status === 'refused')) {
+        this.onActEffect(e);
+        continue;
+      }
+      if (e && actRowClaimed(e)) continue;
+      this.handActBack(r);
+    }
+  }
+
+  /** An approved act no try of which was claimed waits for the owner again,
+   *  its unclaimed outbox row dropped. */
+  private handActBack(r: StoredApproval): void {
+    const back: StoredApproval = { ...r, state: 'pending', updatedAt: this.now() };
+    delete back.decidedBy;
+    delete back.decidedAt;
+    delete back.executeAfter;
+    delete back.effectId;
+    if (!this.put(back)) return;
+    this.removeActEffect(back);
+    this.clearTimer(back.requestId);
+    this.reopenCard(back);
+    this.changed(back.workspaceId);
+  }
+
+  /** Run an approved act whose Undo window passed (its outbox row). */
+  private async executeAct(r: StoredApproval): Promise<void> {
+    if (r.state !== 'approved' || r.decidedBy !== 'owner') return;
+    if (r.executeAfter !== undefined && this.now() < r.executeAfter) {
+      this.arm(r);
+      return;
+    }
+    const host = this.ports.acts?.() ?? null;
+    const effect = host?.enqueue(r) ?? null;
+    if (!host || !effect) {
+      this.log(`[factory] approval ${r.requestId}: ${host ? 'its act could not be put in the outbox' : 'the act outbox is not running'}; it waits for the owner again`);
+      this.handActBack(r);
+      return;
+    }
+    const cur = this.requests.get(r.requestId);
+    if (cur && cur.effectId !== effect.id) this.put({ ...cur, effectId: effect.id, updatedAt: this.now() });
+    this.changed(r.workspaceId);
+    await host.run(effect.id);
+  }
+
+  /** The act outbox's gate for a row, asked on every try and again right
+   *  before the write: null when the request allows it now. Not approved
+   *  (undone, denied, waiting again) or inside the Undo window means "not
+   *  now" (the row waits; actExecutor.ts ACT_NOT_NOW). A row no try of
+   *  which was started (actRowClaimed) whose approval is APPROVED_TTL_MS
+   *  old is refused `approval-stale`; a row that may have reached GitHub is
+   *  left to its read. */
+  authorizeAct(e: Pick<ActEffect, 'requestId' | 'action' | 'payloadHash' | 'repoKey' | 'status' | 'attempt' | 'draftId'>): string | null {
+    const r = this.requests.get(e.requestId);
+    if (!r) return 'approval-missing';
+    if (!r.act || r.action !== e.action) return 'approval-mismatch';
+    if (this.botGone(r)) return 'bot-removed';
+    if (r.state !== 'approved') return 'approval-not-approved';
+    if (r.decidedBy !== 'owner' || r.payloadHash !== e.payloadHash || normalizeRepoKey(e.repoKey) !== r.repoKey) return 'approval-mismatch';
+    // Counted from the decision on purpose, a long sleep before the first
+    // try included: a day on, things may have changed, so the bot asks
+    // again. No decision time (none is made without one) counts as stale; a
+    // clock that went back waits (the Undo window below), and only one
+    // that went back more than a day is stale too.
+    const at = this.now();
+    const ttl = APPROVAL_LIMITS.APPROVED_TTL_MS;
+    const stale = !actRowClaimed(e) && (r.decidedAt === undefined || at - r.decidedAt >= ttl || r.decidedAt - at > ttl);
+    // A directory that cannot be read now says nothing about the bot: not
+    // now, unless the approval is stale (a "not now" never outlives it).
+    let profile: BotProfile | null;
+    try {
+      profile = this.ports.bots()?.get(r.botId) ?? null;
+    } catch {
+      return stale ? 'approval-stale' : 'bots-unreadable';
+    }
+    if (!profile) return stale ? 'approval-stale' : 'bots-unreadable';
+    if (botRepo(profile)?.repoKey !== r.repoKey) return 'repo-changed';
+    // A secret stored since the request would now be hidden on the card the
+    // owner reads, and published by the post.
+    const texts = r.act.kind === 'comment' ? [r.act.body] : r.act.kind === 'issue_create' ? [r.act.title, r.act.body]
+      : r.act.kind === 'release' ? [r.act.title, r.act.notes] : [];
+    if (texts.some((t) => redactStoredSecrets(t) !== t)) return 'secret-in-body';
+    // After the refusals that name a cause.
+    if (stale) return 'approval-stale';
+    // A clock behind the decision is inside the window too: not now.
+    if ((r.executeAfter !== undefined && at < r.executeAfter) || (r.decidedAt !== undefined && at < r.decidedAt)) return 'approval-undo-window';
+    return null;
+  }
+
+  /** An act outbox row moved: a row that ended settles its request (the
+   *  outcome card, the bot told); any other move redraws the card. */
+  onActEffect(e: ActEffect): void {
+    const r = this.requests.get(e.requestId);
+    if (!r?.act) return;
+    if (e.status !== 'done' && e.status !== 'refused') {
+      this.changed(r.workspaceId);
+      return;
+    }
+    if (r.state === 'refused' && e.status === 'refused' && r.act.kind === 'release') {
+      // A refusal told before its draft was decided (a quit, or GitHub not
+      // answering, came between): its draft's code added, told in one more
+      // outcome card and to the bot. Within 300 characters the refusal as
+      // told stays first (cut at its end), the draft's code last. A bot told
+      // to wait is told once it is decided, whatever became of the draft.
+      if (e.draftOpen) return;
+      const had = laneRefusalCodes(r.refusal ?? '');
+      const added = laneRefusalCodes(e.reason ?? '').filter((c) => isDraftCode(c) && !had.includes(c));
+      if (added.length === 0 && !r.draftWait) return;
+      const tail = added.join(', ');
+      const base = r.refusal ?? 'refused';
+      const room = 300 - tail.length - 2;
+      const amended: StoredApproval = {
+        ...r,
+        ...(tail ? { refusal: `${base.length <= room ? base : base.slice(0, Math.max(0, room))}, ${tail}` } : {}),
+        updatedAt: this.now(),
+      };
+      delete amended.draftWait;
+      if (!this.put(amended)) return;
+      if (tail) this.outcomeCard(amended, 'draft');
+      this.changed(amended.workspaceId);
+      this.tellDecided(
+        amended,
+        `Not done: ${ACTION_TITLE[amended.action]} ${subject(amended)} (${laneRefusalLine(tail || (amended.refusal ?? ''), amended.repoKey) || 'refused'}).`,
+        tail ? releaseRefusalAdvice(amended.refusal ?? '', false) : `Its draft release is settled. ${ASK_AGAIN}`,
+        'draft',
+      );
+      return;
+    }
+    if (r.state === 'executed' || r.state === 'refused') return;
+    const done = e.status === 'done';
+    const next: StoredApproval = {
+      ...r,
+      state: done ? 'executed' : 'refused',
+      effectId: e.id,
+      // A refusal may carry what it still made (a release published on a
+      // tag that points elsewhere).
+      ...(e.result ? { result: e.result } : {}),
+      ...(!done ? { refusal: (e.reason ?? 'refused').slice(0, 300) } : {}),
+      ...(!done && r.act.kind === 'release' && e.draftOpen ? { draftWait: true as const } : {}),
+      updatedAt: this.now(),
+    };
+    this.put(next);
+    this.clearTimer(next.requestId);
+    this.outcomeCard(next);
+    this.closeCard(next);
+    this.changed(next.workspaceId);
+    if (done) {
+      this.tellDecided(next, `Done: ${ACTION_TITLE[next.action]} ${subject(next)}${next.result?.url ? ` (${next.result.url})` : ''}.`, 'It is done: do not ask the owner for it again.');
+    } else {
+      this.tellDecided(next, `Not done: ${ACTION_TITLE[next.action]} ${subject(next)} (${laneRefusalLine(next.refusal ?? '', next.repoKey) || 'refused'}).`,
+        next.act?.kind === 'release' ? releaseRefusalAdvice(next.refusal ?? '', next.draftWait === true) : ASK_AGAIN);
+    }
   }
 
   /** The executor's run-time gate for an effect behind a request. */
@@ -1440,8 +2319,9 @@ export class ApprovalService {
   }
 
   /** A request was decided: its bot, and the bots that spoke in its thread
-   *  since its card, are told once. */
-  private tellDecided(r: StoredApproval, title: string, body?: string): void {
+   *  since its card, are told once (once per `again`: a later word on the
+   *  same decision, under a key of its own). */
+  private tellDecided(r: StoredApproval, title: string, body?: string, again?: 'draft'): void {
     const cardSeq = r.cardId ? this.ports.rooms()?.get(r.workspaceId, r.cardId)?.seq ?? null : null;
     const bots = new Set([r.botId, ...this.speakersAfter(r.workspaceId, r.threadId, cardSeq)]);
     // As guest-sourced as the request (an older one without the field: as
@@ -1449,7 +2329,7 @@ export class ApprovalService {
     const guest = guestOfRecord(r.guest, r.tainted) !== false;
     for (const botId of [...bots].slice(0, APPROVAL_LIMITS.NOTIFY_MAX)) {
       this.notice({
-        botId, workspaceId: r.workspaceId, key: `approval:${r.requestId}:${r.state}`, topic: 'approval.decided',
+        botId, workspaceId: r.workspaceId, key: `approval:${r.requestId}:${r.state}${again ? `:${again}` : ''}`, topic: 'approval.decided',
         title, ...(body ? { body } : {}), threadId: r.threadId, repoKey: r.repoKey,
         ...(guest ? { guest: true, tainted: true } : {}),
         ...(r.prNumber !== undefined ? { pr: r.prNumber } : {}),
@@ -1510,19 +2390,45 @@ export class ApprovalService {
   private expire(): void {
     const at = this.now();
     const stale = [...this.requests.values()].filter((r) => r.state === 'pending' && at - r.createdAt >= APPROVAL_LIMITS.PENDING_TTL_MS);
-    const old = [...this.requests.values()].filter((r) => r.state !== 'pending' && r.state !== 'approved' && at - r.updatedAt >= APPROVAL_LIMITS.RETAIN_MS);
+    // A refused release whose draft is undecided stays: its refusal is
+    // amended, and its bot told, once the draft is decided.
+    const ends = (r: StoredApproval): boolean => r.state !== 'pending' && r.state !== 'approved' && !this.draftUndecidedOf(r);
+    const old = [...this.requests.values()].filter((r) => ends(r) && at - r.updatedAt >= APPROVAL_LIMITS.RETAIN_MS);
     if (stale.length === 0 && old.length === 0 && this.requests.size <= APPROVAL_LIMITS.REQUESTS_MAX) return;
     const ok = this.commit(() => {
       for (const r of stale) this.requests.set(r.requestId, { ...r, state: 'expired', updatedAt: at });
       for (const r of old) this.requests.delete(r.requestId);
-      const settled = [...this.requests.values()].filter((r) => r.state !== 'pending' && r.state !== 'approved').sort((a, b) => a.updatedAt - b.updatedAt);
+      const settled = [...this.requests.values()].filter(ends).sort((a, b) => a.updatedAt - b.updatedAt);
       while (this.requests.size > APPROVAL_LIMITS.REQUESTS_MAX && settled.length > 0) this.requests.delete((settled.shift() as StoredApproval).requestId);
     });
     if (ok) {
+      // An act's outbox row goes with its request (one that may have run stays
+      // until a read settles it).
+      for (const r of [...stale, ...old]) if (r.act) this.removeActEffect(r);
       for (const r of stale) {
         this.closeCard(r);
         if (r.action === 'skill') this.skillDenied(r);
+        this.answerNativeTool(r, false);
       }
+    }
+  }
+
+  /** Whether a refused release's outbox row has its draft undecided. */
+  private draftUndecidedOf(r: StoredApproval): boolean {
+    if (r.state !== 'refused' || r.act?.kind !== 'release') return false;
+    try {
+      const row = this.ports.acts?.()?.effect(actEffectId(r.requestId));
+      return !!row && draftUndecided(row);
+    } catch {
+      return false;
+    }
+  }
+
+  private removeActEffect(r: Pick<StoredApproval, 'requestId'>): void {
+    try {
+      this.ports.acts?.()?.remove(actEffectId(r.requestId));
+    } catch (err) {
+      this.log(`[factory] act row of ${r.requestId} not removed: ${String(err)}`);
     }
   }
 
@@ -1544,13 +2450,17 @@ export class ApprovalService {
     const what = r.skill
       ? `${r.skill.update ? 'Update the skill' : 'Add the skill'} ${subject(r)}?`
       : r.ownerProfile ? OWNER_PROFILE_TITLE[r.ownerProfile.action]
+      : r.botMemory ? BOT_MEMORY_TITLE[r.botMemory.action]
+      : r.routine ? 'Save this routine?'
+      : r.nativeTool ? 'Let Hermes run this command?'
+      : r.act?.kind === 'release' ? releaseCardTitle(r.act, r.actRepo?.fullName ?? r.repoKey)
       : `${ACTION_TITLE[r.action]} ${subject(r)}${r.headSha ? ` at ${r.headSha.slice(0, 7)}` : ''}?`;
     const subjectThread = r.prNumber !== undefined ? prThreadId(r.repoKey, r.prNumber) : r.issueNumber !== undefined ? issueThreadId(r.repoKey, r.issueNumber) : null;
     const lines = [
       askLine(profile, r.reason),
       // "Started from outside text" is the card's own line, from the
       // request's `tainted` (ApprovalAnswers, the phone): not in the body.
-      ...(r.action === 'merge' || CARD_ONLY_ACTIONS.has(r.action) ? [] : ['wmux records your answer; it does not carry this act out yet.']),
+      ...(r.action === 'merge' || r.act || CARD_ONLY_ACTIONS.has(r.action) ? [] : ['wmux records your answer; it does not carry this act out yet.']),
     ];
     if (changeLines) lines.push(...changeLines);
     const res = writer.post({
@@ -1595,22 +2505,44 @@ export class ApprovalService {
     }
   }
 
-  private outcomeCard(r: StoredApproval): void {
+  /** `amend`: the card that tells a refusal amended after it was told (its
+   *  own clientPostId, so it is posted once). */
+  private outcomeCard(r: StoredApproval, amend?: 'draft'): void {
     const writer = this.ports.rooms();
     if (!writer) return;
     const by = r.decidedBy === 'rule' ? 'a rule you set' : 'you';
     const done = r.state === 'executed';
     const moved = r.refusal === 'head-moved';
+    const full = r.actRepo?.fullName ?? r.repoKey;
+    // A release draft's fate (`draft-*` codes) is told in the body, not the title.
+    const codes = laneRefusalCodes(r.refusal ?? '');
+    const isDraft = (c: string): boolean => r.act?.kind === 'release' && isDraftCode(c);
+    const why = laneRefusalLine(codes.filter((c) => !isDraft(c)).join(', '), r.repoKey);
+    const title = amend
+      ? `${codes.includes('draft-kept-unchecked') ? 'Draft release may still be on GitHub' : 'Draft release still on GitHub'}: ${ACTION_TITLE[r.action]} ${subject(r)}`
+      : r.act?.kind === 'release' && done
+      ? r.act.mode === 'workflow'
+        ? `Tag pushed — the release workflow is building it (${r.act.tagName} on ${full}, approved by you)`
+        : `${ACT_DONE_TITLE.release} release ${r.act.tagName} of ${full} (approved by you)`
+      : r.act
+      ? done ? `${ACT_DONE_TITLE[r.act.kind]} ${r.act.kind === 'issue_create' ? `issue #${r.result?.number ?? '?'} on ${r.repoKey}` : subject(r)} (approved by you)`
+        : `Not done: ${ACTION_TITLE[r.action]} ${subject(r)} (${why || 'refused'})`
+      : done
+        ? `Merged ${subject(r)} (approved by ${by})`
+        : moved ? `Not merged: ${subject(r)} has a new head since the request; it needs a new approval` : `Not merged: ${subject(r)} (${laneRefusalLine(r.refusal ?? '') || 'refused'})`;
+    // What became of a refused release's draft (its refusal's `draft-*`
+    // code), in the body too: a long title is cut.
+    const draft = done ? '' : laneRefusalLine(codes.filter(isDraft).join(', '), r.repoKey);
+    const body = [draft, r.act ? r.result?.url ?? '' : ''].filter(Boolean).join('\n\n');
     writer.post({
       workspaceId: r.workspaceId,
       threadId: r.threadId,
       kind: done ? 'status' : 'refusal',
       actor: { kind: 'system' },
-      title: done
-        ? `Merged ${subject(r)} (approved by ${by})`
-        : moved ? `Not merged: ${subject(r)} has a new head since the request; it needs a new approval` : `Not merged: ${subject(r)} (${laneRefusalLine(r.refusal ?? '') || 'refused'})`,
-      refs: { approvalId: r.requestId, ...(r.prNumber !== undefined ? { pr: r.prNumber } : {}) },
-      clientPostId: `approval-outcome:${r.requestId}`,
+      title,
+      ...(body ? { body } : {}),
+      refs: { approvalId: r.requestId, ...(r.prNumber !== undefined ? { pr: r.prNumber } : {}), ...(r.issueNumber !== undefined ? { issue: r.issueNumber } : {}) },
+      clientPostId: `approval-outcome:${r.requestId}${amend ? `:${amend}` : ''}`,
     });
   }
 }

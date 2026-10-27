@@ -428,6 +428,7 @@ export const METHOD_CAPABILITY: Record<RpcMethod, RequiredCapability> = {
   'daemon.readPromptEvents': { capability: 'wmux.internal' },
   'daemon.phone.register': { capability: 'wmux.internal' },
   'daemon.phone.complete': { capability: 'wmux.internal' },
+  'daemon.phone.keepAwake': { capability: 'wmux.internal' },
   'daemon.ping':             { capability: 'wmux.internal' },
   'daemon.shutdown':         { capability: 'wmux.internal' },
   'daemon.compact':          { capability: 'wmux.internal' },
@@ -443,6 +444,11 @@ export const METHOD_CAPABILITY: Record<RpcMethod, RequiredCapability> = {
   // Main → daemon only. A plugin that could write this table would choose
   // which panes an automated approval may be pressed into.
   'daemon.workspaceFacts.set': { capability: 'wmux.internal' },
+  // Main → daemon only. A client that could write this would put approval
+  // banners of its choosing on the owner's phone.
+  'daemon.botApprovals.set': { capability: 'wmux.internal' },
+  // Main → daemon only, for the same reason.
+  'daemon.botPrompts.set': { capability: 'wmux.internal' },
   // Main → daemon only. A client that could write this would choose which
   // brain pane a paired phone may read and type into.
   'daemon.moa.set':          { capability: 'wmux.internal' },

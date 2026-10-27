@@ -310,11 +310,16 @@ export type DecisionChannel = 'hook-verdict' | 'native-rpc' | 'fenced-keys' | 'n
 
 /** The agent-side identity of a `native-rpc` decision. */
 export interface NativeDecisionRef {
-  /** `claude`: a chat-v2 driver's request (src/daemon/chat/v2), answered through its stdio.
+  /** The agent: `claude` (chat v2), `codex` (the terminal relay, or chat v2
+   *  with `via`), `opencode`.
    *  TODO(#1904): each member is a native decision channel written in code; a
    *  registry slug subset, persisted on records, so it is not derived. */
   adapter: Extract<AgentSlug, 'opencode' | 'codex' | 'claude'>;
-  /** OpenCode requestID / Codex JSON-RPC server request id / Claude `control_request.request_id`. */
+  /** `chat-v2`: a chat-v2 driver's request (src/daemon/chat/v2), answered
+   *  through its stdio, whatever the adapter. Absent: the adapter's own channel. */
+  via?: 'chat-v2';
+  /** OpenCode requestID / Codex JSON-RPC server request id / chat v2: the
+   *  driver's tag, a dot, then its request id. */
   requestId: string;
   /** OpenCode sessionID. */
   nativeSessionId?: string;
@@ -325,7 +330,8 @@ export interface NativeDecisionRef {
   /** Codex ServerRequest method. */
   method?: string;
   /**
-   * OpenCode: the plugin's hash of the whole request. Part of the record's
+   * OpenCode: the plugin's hash of the whole request. Chat v2: the permission
+   * card's revision. Part of the record's
    * fingerprint (the same id asking something else is a new card) and echoed
    * with the answer, so a stale card is refused right before it is sent.
    */
@@ -350,6 +356,12 @@ export interface DecisionForm {
     text: string;
     multiSelect: boolean;
     allowOther: boolean;
+    /**
+     * Claude AskUserQuestion only: the options carry a `preview`, and Claude
+     * draws them beside it (labels only, no free-text row, so `allowOther` is
+     * false). Single-select questions only.
+     */
+    preview?: true;
     /**
      * `description`: Claude AskUserQuestion only — the option's description,
      * drawn under its label.
@@ -408,6 +420,8 @@ export interface NativeDecisionReply {
    * what its agent takes (OpenCode: option indexes, then its own labels).
    */
   answers?: Array<{ keys: string[]; other?: string }>;
+  /** A chat-v2 permission decision's revision, passed back as it was raised (chat/v2/types.ts). */
+  revision?: string;
 }
 
 /**

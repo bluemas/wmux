@@ -35,6 +35,22 @@ export interface WebTlsConfig {
 }
 
 /**
+ * `wmux web --trust-proxy-header/--trust-proxy-user/--trust-proxy-from` as the
+ * CLI sends them to `daemon.web.start`. The daemon parses it again
+ * (daemon/web/trustedProxy.ts) and never persists it.
+ */
+export interface WebTrustedProxyWire {
+  header: string;
+  user: string;
+  from: string[];
+}
+
+/** The trusted proxy sign-in a running server reports, normalized, with refusals since start by reason. */
+export interface WebTrustedProxyInfo extends WebTrustedProxyWire {
+  refusals?: Record<string, number>;
+}
+
+/**
  * Status/start/stop result. Mirrors the daemon's WebInfo plus an optional
  * `error` the main-process handler synthesizes when the daemon control pipe is
  * unreachable (so the renderer can render a quiet failure instead of throwing).
@@ -144,6 +160,32 @@ export interface WebTerminalInfo {
    * `running: true`.
    */
   pairStartError?: string;
+  /**
+   * Authenticated requests from other machines since this server started
+   * (a bare connect, such as a LAN scanner's, does not count), counted only
+   * while it listens beyond loopback ("Expose to network"): the epoch ms of
+   * the last one and how many. Loopback and this PC's own addresses never
+   * count. Absent from an older daemon.
+   */
+  inboundSeenAt?: number | null;
+  inboundCount?: number;
+  /**
+   * Present only while the server runs with trusted proxy sign-in: a request
+   * from one of `from` carrying `user` in `header` is the operator.
+   */
+  trustedProxy?: WebTrustedProxyInfo;
+  /**
+   * The last start's bind failure, while the server is not running: the
+   * error code (EADDRINUSE, EACCES…), the port and the address it tried.
+   * Cleared by a successful start and by an operator stop. Lets the popover
+   * name what holds the port instead of quoting Node's message.
+   */
+  listenError?: { code: string; port: number; host: string };
+  /**
+   * The port the popover starts on: the one saved when "Use port N" was
+   * pressed, else WEB_DEFAULT_PORT. Absent from an older daemon.
+   */
+  preferredPort?: number;
   /**
    * Set by the main-process handler when the control operation failed: no
    * daemon, a timeout, or an application-level RPC error such as a durable stop
@@ -288,6 +330,12 @@ export type WebDeviceListError = 'unavailable' | 'malformed';
 
 /** Renderer → main start request. `expose` maps to the 0.0.0.0 bind. */
 export interface WebStartArgs {
+  /**
+   * Start on this port and remember it for the next start (the stopped
+   * popover's "Use port N"). Absent: the remembered port, else
+   * WEB_DEFAULT_PORT. An integer in 1024-65535; anything else is ignored.
+   */
+  port?: number;
   /** Enable keyboard input (default false — read-only preserves the default). */
   allowInput?: boolean;
   /** Bind all interfaces instead of loopback (default false). */

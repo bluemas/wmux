@@ -51,10 +51,11 @@ const BOT_LIST_CALLERS: Record<string, Why> = {
   'src/main/factory/approvals.ts#ApprovalService.onMerged': { kind: 'guest-skip', why: 'repo-keyed watchers skip guest workspaces' },
   'src/main/factory/approvals.ts#ApprovalService.onOwnerCard': { kind: 'closed', why: 'the room\'s own bots, of a request no guest wake can make' },
   'src/main/factory/approvals.ts#ApprovalService.request': { kind: 'one-workspace', why: 'whether the asking bot\'s own workspace has a bot with a repository, for its refusal\'s wording' },
-  'src/main/factory/botCreate.ts#botRepoFromFolder': { kind: 'one-workspace', why: 'the repository of the workspace a bot is added to' },
+  'src/main/factory/botCreate.ts#recordWorkspaceRepo': { kind: 'one-workspace', why: 'the bots of the one workspace whose repository was just set; BotStore.update holds the rules' },
   'src/main/factory/botCreate.ts#missing': { kind: 'one-workspace', why: 'the team roles the workspace a team is added to already has' },
   'src/main/factory/botCreate.ts#refusal':{ kind: 'one-workspace', why: 'names in the workspace a team is added to; BotStore.create holds the rules' },
-  'src/main/factory/botCreate.ts#workspaceRepo': { kind: 'one-workspace', why: 'the repository of one workspace' },
+  'src/main/factory/botCreate.ts#otherBotsRepo': { kind: 'one-workspace', why: 'the repository of the other bots in one bot\'s workspace' },
+  'src/main/factory/botCreate.ts#workspaceBotsRepo': { kind: 'one-workspace', why: 'the repository of one workspace' },
   'src/main/factory/botStore.ts#enabledBotsIncludingGuest': { kind: 'including-guest', why: 'the helper itself' },
   'src/main/factory/botWorkflowModule.ts#registerWorkflowRpc': { kind: 'not-bots', why: 'the workflow store, by the bot and its workspace' },
   'src/main/factory/factoryWiring.ts#factoryPhoneMessage': { kind: 'including-guest', why: 'the owner\'s phone message; postHumanMessage holds the boundary' },
@@ -78,6 +79,7 @@ const BOT_LIST_CALLERS: Record<string, Why> = {
   'src/main/ipc/handlers/guestBots.handler.ts#defaultGuestWorkspacePorts': { kind: 'owner', why: 'the owner flagging one workspace checks its bots' },
   'src/main/ipc/handlers/room.handler.ts#registerRoomIpcHandlers': { kind: 'owner', why: 'the owner\'s room view' },
   'src/main/phone/PhoneFactory.ts#defaultPhoneFactoryPorts': { kind: 'owner', why: 'the owner\'s phone' },
+  'src/main/phone/BotPromptPushFeed.ts#openBotPromptRows': { kind: 'closed', why: 'the owner\'s phone push' },
   'src/main/pipe/handlers/bot.rpc.ts#botRuntimeModule': { kind: 'one-workspace', why: 'each bot\'s own queued wakes at start' },
   'src/main/pipe/handlers/bot.rpc.ts#registerBotRpcHandlers': { kind: 'guest-skip', why: 'bot.list: a bot lists only its side of the boundary' },
   'src/main/pipe/handlers/botSecret.rpc.ts#handleSecretList': { kind: 'not-bots', why: 'the secret store' },
@@ -120,6 +122,7 @@ const ROOM_READ_CALLERS: Record<string, Why> = {
   'src/main/factory/humanMessage.ts#linkedGroup': { kind: 'one-workspace', why: 'the owner message\'s own thread, in its own room' },
   'src/main/factory/humanMessage.ts#waitingOnOwner': { kind: 'one-workspace', why: 'the owner message\'s own thread: who asked the owner there' },
   'src/main/factory/morningReport.ts#buildMorningData': { kind: 'guest-skip', why: 'skips guest workspaces\' rooms' },
+  'src/main/factory/ownerAsked.ts#ownerCardProof': { kind: 'one-workspace', why: 'the owner card the wake names, in the wake\'s own room and thread' },
   'src/main/factory/roomWriter.ts#wakeReplyTo': { kind: 'one-workspace', why: 'a card of the poster\'s own room' },
   'src/main/ipc/handlers/guestBots.handler.ts#registerGuestBotHandlers': { kind: 'owner', why: 'the owner adding a guest reads the conversation\'s last seq' },
   'src/main/ipc/handlers/room.handler.ts#cardFile': { kind: 'owner', why: 'the owner\'s room view' },
@@ -130,8 +133,10 @@ const ROOM_READ_CALLERS: Record<string, Why> = {
   'src/main/phone/PhoneFactory.ts#handlePhoneRoomCommand': { kind: 'owner', why: 'the owner\'s phone; a guest\'s read goes through handleGuestCards, flag checked' },
   'src/main/phone/PhoneFactory.ts#newestMessage': { kind: 'owner', why: 'the owner\'s phone' },
   'src/main/phone/PhoneFactory.ts#openQuestionsIn': { kind: 'owner', why: 'the owner\'s phone' },
+  'src/main/phone/BotPromptPushFeed.ts#openBotPromptRows': { kind: 'closed', why: 'the owner\'s phone push; listEnabled leaves guest workspaces out' },
   'src/main/phone/PhoneFactory.ts#phoneFactoryState': { kind: 'owner', why: 'the owner\'s phone' },
   'src/main/phone/PhoneFactory.ts#phoneRoomAttachment': { kind: 'owner', why: 'the owner\'s phone' },
+  'src/main/phone/PhoneFactory.ts#phoneRoomFile': { kind: 'owner', why: 'the owner\'s phone: a bot card\'s file, guest-sourced ones too, as the desktop opens them (room.handler.ts roomFileRead)' },
   'src/main/phone/PhoneFactory.ts#threads': { kind: 'owner', why: 'the owner\'s phone' },
   'src/main/pipe/handlers/botSecret.rpc.ts#openRequestCard': { kind: 'one-workspace', why: 'the request\'s own card' },
   'src/main/pipe/handlers/factoryRead.rpc.ts#handlePlanPropose': { kind: 'one-workspace', why: 'the proposing bot\'s own room' },
@@ -150,7 +155,7 @@ const ROOM_READ_CALLERS: Record<string, Why> = {
 const ROOT = path.resolve(__dirname, '../../../..');
 const BOT_ALWAYS = new Set(['listEnabled', 'listEnabledIncludingGuest']);
 const BOT_LIST = new Set(['list', 'listRemoved']);
-const ROOM_READS = new Set(['read', 'find', 'get', 'threads', 'summary']);
+const ROOM_READS = new Set(['read', 'find', 'get', 'threads', 'summary', 'openCards']);
 
 function sources(dir: string, out: string[] = []): string[] {
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {

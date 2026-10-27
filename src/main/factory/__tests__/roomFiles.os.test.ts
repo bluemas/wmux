@@ -48,6 +48,9 @@ describe('room file rules', () => {
     expect(roomFileMediaType('x.svg')).toBe('image/svg+xml');
     expect(roomFileMediaType('main.ts')).toBe('text/plain');
     expect(roomFileMediaType('change.patch')).toBe('text/x-diff');
+    expect(roomFileMediaType('cardnews.mp4')).toBe('video/mp4');
+    expect(roomFileMediaType('clip.MOV')).toBe('video/quicktime');
+    expect(roomFileMediaType('clip.webm')).toBe('video/webm');
     expect(roomFileMediaType('blob.bin')).toBe('application/octet-stream');
     expect(roomFileMediaType('Makefile')).toBe('application/octet-stream');
     expect(roomFileName('/a/b/report.md')).toBe('report.md');
@@ -152,7 +155,13 @@ describe('RoomFileStore.copyIn', () => {
     // A linked folder that leads out of the root.
     fs.symlinkSync(outside(), path.join(repo(), 'linked-dir'));
     expect(store.copyIn(WS, path.join(repo(), 'linked-dir', 'secret.txt'), [repo()])).toMatchObject({ ok: false, reason: 'outside' });
+    // A linked folder that stays inside the root is refused too.
+    write(path.join(repo(), 'deep', 'card.png'));
+    fs.symlinkSync(path.join(repo(), 'deep'), path.join(repo(), 'in-dir'));
+    expect(store.copyIn(WS, path.join(repo(), 'in-dir', 'card.png'), [repo()])).toMatchObject({ ok: false, reason: 'linked_folder' });
     expect(stored()).toEqual([]);
+    // The same file by its own path is taken.
+    expect(store.copyIn(WS, path.join(repo(), 'deep', 'card.png'), [repo()]).ok).toBe(true);
   });
 
   it('refuses a file with more than one name, whether the other name is outside the root or inside it', () => {

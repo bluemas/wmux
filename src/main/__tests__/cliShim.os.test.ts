@@ -14,6 +14,7 @@ import {
 import { buildSync } from 'esbuild';
 import * as pty from 'node-pty';
 import { codexHandoffLines } from '../../cli/commands/codex';
+import { REMOVE_TEMP_DIR_HOOK_TIMEOUT_MS, removeTempDir } from '../../test-utils/removeTempDir';
 
 describe('buildShimCmd', () => {
   it('discovers app-* dynamically, scopes ELECTRON_RUN_AS_NODE, and forwards args + exit code', () => {
@@ -68,6 +69,11 @@ describe('buildShimCmd', () => {
     expect(lines[lines.length - 2]).toBe('endlocal & exit /b %WMUX_CODEX_EXIT%');
   });
 });
+
+// The live blocks below run stand-in executables (copies or hard links of
+// node.exe) from their temp root, and remove it through removeTempDir: on the
+// GitHub Windows runner provjobd.exe, outside the test's own process tree,
+// keeps a just-run image open for 1-14 s, and the helper waits that out.
 
 // Runs the generated script under a root whose path holds a space, `&` and
 // parentheses, with Node standing in for wmux.exe and Codex. The handoff's
@@ -144,7 +150,7 @@ describe.skipIf(process.platform !== 'win32')('wmux.cmd codex launch (live cmd.e
     ].join('\r\n'));
   });
 
-  afterAll(() => { if (root) nodeFs.rmSync(root, { recursive: true, force: true }); });
+  afterAll(async () => { if (root) await removeTempDir(root); }, REMOVE_TEMP_DIR_HOOK_TIMEOUT_MS);
 
   const codexEvent = (argv: string[], cwd: string) => ({
     codex: ['--remote', 'ws://127.0.0.1:1', ...argv],
@@ -272,7 +278,7 @@ describe.skipIf(process.platform !== 'win32')('wmux.cmd codex handoff errors (li
     ].join('\n'));
   }, 60_000);
 
-  afterAll(() => { if (root) nodeFs.rmSync(root, { recursive: true, force: true }); });
+  afterAll(async () => { if (root) await removeTempDir(root); }, REMOVE_TEMP_DIR_HOOK_TIMEOUT_MS);
 
   it('shows the real handoff\'s error and exits 1, leaving no file behind', async () => {
     const r = await run('codex resume');
