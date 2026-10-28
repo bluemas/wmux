@@ -16,6 +16,7 @@ import type { ChatBridgeApi } from '../shared/transcript/turnEvents';
 import { CHATV2_IPC, type ChatV2BridgeApi, type ChatV2EventsPush, type ChatV2ResyncPush } from '../shared/chatv2/ipc';
 import { contextBridge, ipcRenderer, webFrame, webUtils } from 'electron';
 import { START_POLARITY_STORAGE_KEY, resolveStartPolarity, startPaintCss } from '../shared/windowStartPaint';
+import { startLocaleFromArgv } from '../shared/startLocale';
 import { IPC } from '../shared/constants';
 import type { A2aSpawnAskResult, A2aSpawnOutgoingList, A2aSpawnPolicySetResult, A2aSpawnPolicyV1, A2aSpawnRequestSummary, A2aSpawnUiAsk } from '../shared/a2aSpawn';
 import type { SleepPreventionMode, SleepWindow } from '../shared/sleepPrevention';
@@ -81,7 +82,7 @@ import type { AgentId, AgentSetupStatus } from '../shared/agentSetup';
 import type { AgentSetupPlan, SetAgentPathResult } from '../shared/agentInstall';
 import { isFileDrag } from '../shared/dragDrop';
 import { parseWindowsBuildNumber } from '../shared/platform';
-import type { NotificationCategory } from '../shared/types';
+import type { NotificationCategory, StallPrefillResult } from '../shared/types';
 import type { ComputerUseSettingsPayload } from '../shared/computer/config';
 import type { QuickLaunchSettingsPayload } from '../shared/quickLaunch';
 import type { ResumeBinding } from '../shared/agentResume';
@@ -109,6 +110,8 @@ import type {
   LanLinkSendArgs,
   LanLinkPeersListResult,
 } from '../shared/lanlink';
+import type { FirewallActionResult, FirewallListener, InboundStatusView, NetworkSettingsUri } from '../shared/netFirewall';
+import type { ListenProblemReport } from '../shared/netListen';
 import type {
   A2aRemoteExposureGetResult,
   A2aRemoteExposureSetResult,
@@ -281,6 +284,11 @@ const onBotEventPush = (): void => {
 
 const electronAPI = {
   chat,
+  // A Claude turn that seems stuck (the daemon's StallWatch).
+  agentStall: {
+    keepWaiting: (ptyId: string): Promise<{ ok: boolean }> => ipcRenderer.invoke(CHAT_IPC.stallKeepWaiting, { ptyId }),
+    stopAndPrefill: (ptyId: string): Promise<{ result: StallPrefillResult }> => ipcRenderer.invoke(CHAT_IPC.stallPrefill, { ptyId }),
+  },
   chatv2,
   // OS-aware shortcut mapping support — renderer cannot read process.platform
   // directly under sandbox + contextIsolation, so expose it here.
@@ -289,6 +297,9 @@ const electronAPI = {
   // The saved theme's polarity main started the window in, or null: index.tsx
   // shows that polarity's default theme until the session's loads (#2512).
   startPolarity,
+  // The UI locale saved in session.json, or null: index.tsx loads its table
+  // before the first render (shared/startLocale.ts).
+  startLocale: startLocaleFromArgv(process.argv),
   // The Windows build number (eg. 19045), or null off Windows / when it cannot
   // be read. xterm needs this SYNCHRONOUSLY at Terminal construction to pick
   // its ConPTY behaviour, so it is a static value here rather than an IPC call.
@@ -324,9 +335,11 @@ const electronAPI = {
       ipcRenderer.send(IPC.PTY_WRITE, id, data);
     },
     /** Type a launch line (a resume) into the pane, Enter too when `submit`.
-     *  Rejects when main refuses the line (a bot worker's line it cannot guard). */
-    writeLaunch: (id: string, text: string, submit: boolean) =>
-      ipcRenderer.invoke(IPC.PTY_WRITE_LAUNCH, id, text, submit) as Promise<void>,
+     *  Rejects when main refuses the line (a bot worker's line it cannot guard).
+     *  `origin: 'human'`: a person clicked for it; without it the line counts
+     *  as typed by wmux on its own. */
+    writeLaunch: (id: string, text: string, submit: boolean, origin?: 'human') =>
+      ipcRenderer.invoke(IPC.PTY_WRITE_LAUNCH, id, text, submit, origin) as Promise<void>,
     schedules: {
       list: (ptyId: string) =>
         ipcRenderer.invoke(IPC.SESSION_PROMPT_SCHEDULES_LIST, { ptyId }) as Promise<{
@@ -644,8 +657,9 @@ const electronAPI = {
     // live listener, not just a live (but reloading/unmounted) window.
     listenerReady: () => ipcRenderer.send(IPC.NOTIFICATION_LISTENER_READY),
     // J3 §3: initialCommand 재시도 소진(프롬프트 미발사) 통지 — fan-out 토스트 소비.
-    onInitialCmdExhausted: (callback: (ptyId: string) => void) => {
-      const listener = (_event: Electron.IpcRendererEvent, ptyId: string) => callback(ptyId);
+    onInitialCmdExhausted: (callback: (ptyId: string, reason?: string) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, ptyId: string, reason?: unknown) =>
+        callback(ptyId, typeof reason === 'string' ? reason : undefined);
       ipcRenderer.on(IPC.PTY_INITIAL_CMD_EXHAUSTED, listener);
       return () => { ipcRenderer.removeListener(IPC.PTY_INITIAL_CMD_EXHAUSTED, listener); };
     },
@@ -676,8 +690,8 @@ const electronAPI = {
     // progress) flow through this one shape. Renderer routes by ptyId
     // (preferred) or workspaceId (for surface-less updates like
     // meta.setStatus on the active workspace).
-    onUpdate: (callback: (payload: { ptyId?: string; workspaceId?: string; gitBranch?: string; cwd?: string; listeningPorts?: number[]; agentStatus?: string; agentName?: string; status?: string; progress?: number; gitIsWorktree?: boolean; pr?: { number: number; state: 'open' | 'draft' | 'merged' | 'closed'; checks: 'pending' | 'passing' | 'failing' | null; url: string } | null; gitSync?: { dirty: number; ahead: number; behind: number; hasUpstream: boolean } | null; lastNotificationText?: { ts: number; title: string | null; body: string; source: 'osc9' | 'osc777' | 'osc99' }; activity?: string; teammatesWorking?: true; subagents?: number; teammates?: Array<{ name: string; color?: string; working: boolean; activity?: string; at: number }>; shellPrompt?: { shape: 'yes-no' | 'enter' | 'secret'; question?: string } | null; pendingQuestion?: string; lastMessage?: string; lastActivity?: ''; paneId?: string; paneLabel?: string; paneRole?: string; agentSlug?: string | null; hookKind?: string; settled?: boolean; daemonTurnOpen?: boolean }) => void) => {
-      const listener = (_event: Electron.IpcRendererEvent, payload: { ptyId?: string; workspaceId?: string; gitBranch?: string; cwd?: string; listeningPorts?: number[]; agentStatus?: string; agentName?: string; status?: string; progress?: number; gitIsWorktree?: boolean; pr?: { number: number; state: 'open' | 'draft' | 'merged' | 'closed'; checks: 'pending' | 'passing' | 'failing' | null; url: string } | null; gitSync?: { dirty: number; ahead: number; behind: number; hasUpstream: boolean } | null; lastNotificationText?: { ts: number; title: string | null; body: string; source: 'osc9' | 'osc777' | 'osc99' }; activity?: string; teammatesWorking?: true; subagents?: number; teammates?: Array<{ name: string; color?: string; working: boolean; activity?: string; at: number }>; shellPrompt?: { shape: 'yes-no' | 'enter' | 'secret'; question?: string } | null; pendingQuestion?: string; lastMessage?: string; lastActivity?: ''; paneId?: string; paneLabel?: string; paneRole?: string; agentSlug?: string | null; hookKind?: string; settled?: boolean; daemonTurnOpen?: boolean }) =>
+    onUpdate: (callback: (payload: { ptyId?: string; workspaceId?: string; gitBranch?: string; cwd?: string; listeningPorts?: number[]; agentStatus?: string; agentName?: string; status?: string; progress?: number; gitIsWorktree?: boolean; pr?: { number: number; state: 'open' | 'draft' | 'merged' | 'closed'; checks: 'pending' | 'passing' | 'failing' | null; url: string } | null; gitSync?: { dirty: number; ahead: number; behind: number; hasUpstream: boolean } | null; lastNotificationText?: { ts: number; title: string | null; body: string; source: 'osc9' | 'osc777' | 'osc99' }; activity?: string; teammatesWorking?: true; subagents?: number; teammates?: Array<{ name: string; color?: string; working: boolean; activity?: string; at: number }>; shellPrompt?: { shape: 'yes-no' | 'enter' | 'secret'; question?: string } | null; pendingQuestion?: string; lastMessage?: string; lastActivity?: ''; paneId?: string; paneLabel?: string; paneRole?: string; agentSlug?: string | null; hookKind?: string; settled?: boolean; daemonTurnOpen?: boolean; stalledSince?: number | null; stallCompactions?: number }) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, payload: { ptyId?: string; workspaceId?: string; gitBranch?: string; cwd?: string; listeningPorts?: number[]; agentStatus?: string; agentName?: string; status?: string; progress?: number; gitIsWorktree?: boolean; pr?: { number: number; state: 'open' | 'draft' | 'merged' | 'closed'; checks: 'pending' | 'passing' | 'failing' | null; url: string } | null; gitSync?: { dirty: number; ahead: number; behind: number; hasUpstream: boolean } | null; lastNotificationText?: { ts: number; title: string | null; body: string; source: 'osc9' | 'osc777' | 'osc99' }; activity?: string; teammatesWorking?: true; subagents?: number; teammates?: Array<{ name: string; color?: string; working: boolean; activity?: string; at: number }>; shellPrompt?: { shape: 'yes-no' | 'enter' | 'secret'; question?: string } | null; pendingQuestion?: string; lastMessage?: string; lastActivity?: ''; paneId?: string; paneLabel?: string; paneRole?: string; agentSlug?: string | null; hookKind?: string; settled?: boolean; daemonTurnOpen?: boolean; stalledSince?: number | null; stallCompactions?: number }) =>
         callback(payload);
       ipcRenderer.on(IPC.METADATA_UPDATE, listener);
       return () => { ipcRenderer.removeListener(IPC.METADATA_UPDATE, listener); };
@@ -776,6 +790,9 @@ const electronAPI = {
     getTrustAgyFolders: () => ipcRenderer.invoke(IPC.FANOUT_TRUST_AGY_FOLDERS_GET) as Promise<boolean>,
     setTrustAgyFolders: (value: boolean) =>
       ipcRenderer.invoke(IPC.FANOUT_TRUST_AGY_FOLDERS_SET, value) as Promise<boolean>,
+    getWorkerFenceOff: (workspaceId: string) => ipcRenderer.invoke(IPC.WORKER_FENCE_OFF_GET, workspaceId) as Promise<boolean>,
+    setWorkerFenceOff: (workspaceId: string, off: boolean) =>
+      ipcRenderer.invoke(IPC.WORKER_FENCE_OFF_SET, workspaceId, off) as Promise<boolean>,
     getWorkerPermissionMode: () =>
       ipcRenderer.invoke(IPC.FANOUT_WORKER_MODE_GET) as Promise<
         import('../shared/workerLaunch').FanoutWorkerPermissionMode
@@ -794,6 +811,17 @@ const electronAPI = {
       ipcRenderer.invoke(IPC.FANOUT_PRESETS_SET, presets) as Promise<
         | { ok: true; presets: import('../shared/fanoutPreset').FanoutPreset[] }
         | ({ ok: false } & import('../shared/fanoutPreset').FanoutIssue)
+      >,
+    getCustomAgents: () =>
+      ipcRenderer.invoke(IPC.FANOUT_CUSTOM_AGENTS_GET) as Promise<{
+        agents: import('../shared/customAgents').CustomAgent[];
+        dropped: import('../shared/customAgents').CustomAgentDropped[];
+        unreadable?: true;
+      }>,
+    setCustomAgents: (agents: unknown[]) =>
+      ipcRenderer.invoke(IPC.FANOUT_CUSTOM_AGENTS_SET, agents) as Promise<
+        | { ok: true; agents: import('../shared/customAgents').CustomAgent[] }
+        | ({ ok: false } & import('../shared/customAgents').CustomAgentIssue)
       >,
   },
   // Command Deck Phase 2 — the Commander brain. `send` runs one orchestrator
@@ -945,6 +973,11 @@ const electronAPI = {
       ipcRenderer.invoke(IPC.AUTOMATION_RUN_NOW, id, kind, ...(endSessionOf === undefined ? [] : [endSessionOf])) as Promise<import('../shared/automation').AutomationRunNowResult>,
     cancelRun: (runId: string) =>
       ipcRenderer.invoke(IPC.AUTOMATION_CANCEL_RUN, runId) as Promise<import('../shared/automation').AutomationOkResult>,
+    /** Null when the daemon is not reachable or too old to have them. */
+    settings: () =>
+      ipcRenderer.invoke(IPC.AUTOMATION_SETTINGS) as Promise<import('../shared/automation').AutomationSettings | null>,
+    setSettings: (settings: import('../shared/automation').AutomationSettings) =>
+      ipcRenderer.invoke(IPC.AUTOMATION_SET_SETTINGS, settings) as Promise<import('../shared/automation').AutomationSettingsResult>,
     // The UI locale id only; main owns the toast words.
     setUiLocale: (locale: string) => ipcRenderer.send(IPC.AUTOMATION_TOAST_LABELS, locale),
     onPush: (callback: (push: import('../main/automation/AutomationBridge').AutomationPush) => void) => {
@@ -1124,6 +1157,8 @@ const electronAPI = {
         profiles: string[];
         bindings: Record<string, string>;
         paneBindings?: ChromePaneBindings;
+        /** The last-used profile an unbound workspace may be offered. */
+        lastUsed?: string;
       }> => ipcRenderer.invoke('browser:chrome-profiles:list'),
       create: (name: string): Promise<{ ok: boolean; error?: string }> =>
         ipcRenderer.invoke('browser:chrome-profiles:create', name),
@@ -1138,6 +1173,14 @@ const electronAPI = {
         ipcRenderer.invoke(CHROME_PANE_IPC.bind, { paneId, workspaceId, profileName }),
       revealPane: (paneId: string, workspaceId: string): Promise<{ ok: boolean; error?: string }> =>
         ipcRenderer.invoke(CHROME_PANE_IPC.reveal, { paneId, workspaceId }),
+      /** An unbound workspace's browser call used the shared default profile (once per workspace per run of the app). */
+      onFallback: (callback: (info: { workspaceId: string; suggested?: string }) => void): (() => void) => {
+        const listener = (_e: Electron.IpcRendererEvent, info: { workspaceId: string; suggested?: string }) => callback(info);
+        ipcRenderer.on(IPC.CHROME_PROFILE_FALLBACK, listener);
+        return () => {
+          ipcRenderer.removeListener(IPC.CHROME_PROFILE_FALLBACK, listener);
+        };
+      },
     },
     // Protected browser panes (src/shared/browserPolicy.ts). Operator-only:
     // main accepts these from the main window's top frame alone.
@@ -1410,6 +1453,9 @@ const electronAPI = {
     stopAll: () => ipcRenderer.invoke(IPC.FACTORY_STOP_ALL) as Promise<import('../main/factory/factoryStop').FactoryStopResult>,
     stopBot: (botId: string) =>
       ipcRenderer.invoke(IPC.FACTORY_STOP_BOT, { botId }) as Promise<import('../main/factory/factoryStop').FactoryStopResult>,
+    // The owner's New conversation for a bot: its next wake starts clean.
+    newConversation: (botId: string) =>
+      ipcRenderer.invoke(IPC.FACTORY_BOT_NEW_CONVERSATION, { botId }) as Promise<{ ok: boolean; code?: string; message?: string }>,
     // The owner's stop of one bot task's worker (its task cancelled).
     stopTask: (taskId: string) =>
       ipcRenderer.invoke(IPC.FACTORY_STOP_TASK, { taskId }) as Promise<import('../main/factory/factoryStop').FactoryStopResult>,
@@ -1426,6 +1472,17 @@ const electronAPI = {
     // active workspace); rejects when no tab could be opened. Poll
     // factoryEngineReadiness to see it land.
     factoryEngineLogin: (req?: { botId: string }) => ipcRenderer.invoke(IPC.FACTORY_ENGINE_LOGIN, req) as Promise<void>,
+    // Can the Hermes bot engine run here? Checked without a model turn.
+    // `fresh`: never the answer main cached for the polling (an owner's Check again).
+    factoryHermesReadiness: (opts?: { fresh?: boolean }) =>
+      ipcRenderer.invoke(IPC.FACTORY_HERMES_READINESS, opts) as Promise<import('../shared/hermesEngine').HermesReadiness>,
+    // Start Hermes's own model setup for wmux's Hermes home in a terminal tab
+    // of the active workspace; rejects when no tab could be opened. Poll
+    // factoryHermesReadiness to see it land.
+    factoryHermesSetup: () => ipcRenderer.invoke(IPC.FACTORY_HERMES_SETUP) as Promise<void>,
+    // The owner picks a bot's engine: Claude (SDK) or Hermes.
+    setBotEngine: (botId: string, engine: 'claude-sdk' | 'hermes') =>
+      ipcRenderer.invoke(IPC.FACTORY_BOT_SET_ENGINE, { botId, engine }) as Promise<{ ok: boolean; code?: string; message?: string }>,
     // The engines a bot's workers may run on, and which are installed here.
     workerAgents: () =>
       ipcRenderer.invoke(IPC.FACTORY_WORKER_AGENTS) as Promise<import('../shared/botWorkerAgent').BotWorkerAgentOption[]>,
@@ -1984,6 +2041,11 @@ const electronAPI = {
     setEnabled: (enabled: boolean) => ipcRenderer.send(IPC.USAGE_TOGGLE, enabled),
     /** Manual refresh. UI is responsible for the 5-minute cooldown. */
     refresh: () => ipcRenderer.send(IPC.USAGE_REFRESH),
+    /** The usage reserve setting (main persists and enforces it). */
+    reserve: {
+      get: () => ipcRenderer.invoke(IPC.USAGE_RESERVE_GET) as Promise<{ enabled: boolean }>,
+      set: (enabled: boolean) => ipcRenderer.invoke(IPC.USAGE_RESERVE_SET, enabled) as Promise<{ ok: boolean }>,
+    },
   },
   // N4 — agents whose sign-in was lost (shared/agentAuthLost), one entry per
   // agent and account; `loginState` asks the agent's own status for an entry
@@ -2335,6 +2397,14 @@ document.addEventListener('DOMContentLoaded', () => {
   status: () => ipcRenderer.invoke(IPC.LANLINK_STATUS) as Promise<LanLinkStatus>,
   configure: (patch: LanLinkConfigurePatch) =>
     ipcRenderer.invoke(IPC.LANLINK_CONFIGURE, patch) as Promise<LanLinkStatus>,
+  // The listener state may have changed (a nudge: re-read status). Returns an unsubscribe fn.
+  onStatusChanged: (callback: () => void) => {
+    const listener = () => callback();
+    ipcRenderer.on(IPC.LANLINK_STATUS_CHANGED, listener);
+    return () => {
+      ipcRenderer.removeListener(IPC.LANLINK_STATUS_CHANGED, listener);
+    };
+  },
   // LanLink PR-5 pairing/peer control plane (Settings → LanLink pairing section).
   // Outbound-only (pair/send) + read-only queries; structurally unable to reach a
   // local PTY. Extends THIS literal in place (never a second .lanlink assignment).
@@ -2348,6 +2418,20 @@ document.addEventListener('DOMContentLoaded', () => {
   peersList: () => ipcRenderer.invoke(IPC.LANLINK_PEERS_LIST) as Promise<LanLinkPeersListResult>,
   peersRemove: (peerUuid: string) =>
     ipcRenderer.invoke(IPC.LANLINK_PEERS_REMOVE, peerUuid) as Promise<{ ok: true }>,
+};
+
+// Firewall and port problems of the listeners other PCs reach. The Fix and
+// Remove each show one OS consent prompt; main refuses them from anything but
+// the main window.
+(electronAPI as Record<string, unknown>).netFirewall = {
+  status: (listener: FirewallListener, fresh?: boolean) =>
+    ipcRenderer.invoke(IPC.NET_FIREWALL_STATUS, listener, fresh === true) as Promise<InboundStatusView>,
+  listenProblem: (listener: FirewallListener) =>
+    ipcRenderer.invoke(IPC.NET_LISTEN_PROBLEM, listener) as Promise<ListenProblemReport | null>,
+  fix: (listener: FirewallListener) => ipcRenderer.invoke(IPC.NET_FIREWALL_FIX, listener) as Promise<FirewallActionResult>,
+  remove: (listener: FirewallListener) => ipcRenderer.invoke(IPC.NET_FIREWALL_REMOVE, listener) as Promise<FirewallActionResult>,
+  open: (which: 'firewall' | 'network', page?: NetworkSettingsUri) =>
+    (page === undefined ? ipcRenderer.invoke(IPC.NET_FIREWALL_OPEN, which) : ipcRenderer.invoke(IPC.NET_FIREWALL_OPEN, which, page)) as Promise<{ ok: boolean }>,
 };
 
 // Cross-host A2A control plane (Settings → LAN). Request/response via invoke,
@@ -2623,6 +2707,8 @@ contextBridge.exposeInMainWorld('clipboardAPI', {
    *  pane needs /mnt/...). Omit it and the host path is returned verbatim. */
   readImage: (ptyId?: string) => ipcRenderer.invoke(IPC.CLIPBOARD_READ_IMAGE, ptyId) as Promise<string | null>,
   hasImage: () => ipcRenderer.invoke(IPC.CLIPBOARD_HAS_IMAGE) as Promise<boolean>,
+  /** `ssh` when the pane's foreground is a remote session, else null. */
+  paneRemoteShell: (ptyId: string) => ipcRenderer.invoke(IPC.CLIPBOARD_PANE_REMOTE_SHELL, ptyId) as Promise<string | null>,
   /** Write text main takes back off after `ttlMs` or on quit, if still there. */
   writeEphemeral: (text: string, ttlMs: number) =>
     ipcRenderer.invoke(IPC.CLIPBOARD_WRITE_EPHEMERAL, text, ttlMs) as Promise<void>,

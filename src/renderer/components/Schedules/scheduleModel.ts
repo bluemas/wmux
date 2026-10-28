@@ -24,6 +24,8 @@ export interface ScheduleForm {
   /** Not editable in v1, but carried through an edit: the daemon replaces the
    *  whole policy on update, so dropping it would reset it to the default. */
   maxRunMinutes: string;
+  /** Retry once after a temporary provider error (the global setting allowing). */
+  retryTransientErrors: boolean;
   mode: AutomationPermissionMode;
   toolsText: string;
   /**
@@ -68,6 +70,7 @@ export function emptyForm(): ScheduleForm {
     name: '', prompt: '', cwd: '', agent: 'claude', accountId: '',
     weekdays: WEEKDAYS.slice(), time: '09:00', model: '', effort: '',
     graceMinutes: String(AUTOMATION_DEFAULTS.graceMinutes), awaitTimeoutMinutes: '', maxRunMinutes: '',
+    retryTransientErrors: true,
     mode: defaultModeFor('claude'), toolsText: '',
     browserWorkspaceId: '', browserPaneId: '',
   };
@@ -87,6 +90,7 @@ export function formFromAutomation(a: Automation): ScheduleForm {
     graceMinutes: String(a.trigger.graceMinutes),
     awaitTimeoutMinutes: a.policy.awaitTimeoutMinutes !== undefined ? String(a.policy.awaitTimeoutMinutes) : '',
     maxRunMinutes: a.policy.maxRunMinutes !== undefined ? String(a.policy.maxRunMinutes) : '',
+    retryTransientErrors: a.policy.retryTransientErrors !== false,
     mode: a.permission.mode,
     toolsText: (a.permission.allowedTools ?? []).join(', '),
     browserWorkspaceId: a.action.browserIdentity?.workspaceId ?? '',
@@ -164,10 +168,11 @@ export function draftFromForm(form: ScheduleForm): AutomationDraft {
       ...(effort ? { effort } : {}),
       prompt: form.prompt,
     },
-    ...(form.awaitTimeoutMinutes || form.maxRunMinutes ? {
+    ...(form.awaitTimeoutMinutes || form.maxRunMinutes || !form.retryTransientErrors ? {
       policy: {
         ...(form.awaitTimeoutMinutes ? { awaitTimeoutMinutes: Number(form.awaitTimeoutMinutes) } : {}),
         ...(form.maxRunMinutes ? { maxRunMinutes: Number(form.maxRunMinutes) } : {}),
+        ...(!form.retryTransientErrors ? { retryTransientErrors: false as const } : {}),
       },
     } : {}),
   };
@@ -255,7 +260,21 @@ export interface ScheduleTemplate {
   /** i18n keys: `schedules.tpl.<id>.title` / `.desc` / `.prompt`. */
   weekdays: number[];
   time: string;
+  /** A permission the template needs, filled in for the user to review (never granted by the template). */
+  permission?: { agent: AutomationAgent; mode: AutomationPermissionMode; allowedTools?: readonly string[] };
+  /** The composer opens with More options shown and the browser identity picker focused. */
+  pickBrowserIdentity?: boolean;
 }
+
+/**
+ * The wmux browser tools a publishing run needs: open a page, read it, act on
+ * it, and attach a file. Nothing that reads or writes cookies, storage or
+ * network traffic, and no page script.
+ */
+export const BROWSER_PUBLISH_TOOLS: readonly string[] = [
+  'open', 'navigate', 'tabs', 'snapshot', 'screenshot', 'click', 'type', 'fill',
+  'press_key', 'select', 'scroll', 'wait', 'file_upload', 'dialog',
+].map((name) => `mcp__wmux__browser_${name}`);
 
 export const SCHEDULE_TEMPLATES: readonly ScheduleTemplate[] = [
   { id: 'briefing', weekdays: DAILY, time: '09:00' },
@@ -264,9 +283,17 @@ export const SCHEDULE_TEMPLATES: readonly ScheduleTemplate[] = [
   { id: 'flakyHunt', weekdays: [5], time: '10:00' },
   { id: 'changelog', weekdays: [5], time: '17:00' },
   { id: 'triage', weekdays: WEEKDAYS, time: '09:30' },
+  {
+    id: 'browserPublish', weekdays: WEEKDAYS, time: '10:00',
+    // Scoped: the wmux browser tools stay on for the run, and only these run
+    // without asking. Auto and Bypass start without them.
+    permission: { agent: 'claude', mode: 'scoped', allowedTools: BROWSER_PUBLISH_TOOLS },
+    pickBrowserIdentity: true,
+  },
 ];
 
 export function formFromTemplate(template: ScheduleTemplate, name: string, prompt: string, cwd: string): ScheduleForm {
+  const permission = template.permission;
   return {
     ...emptyForm(),
     name,
@@ -274,7 +301,23 @@ export function formFromTemplate(template: ScheduleTemplate, name: string, promp
     cwd,
     weekdays: template.weekdays.slice(),
     time: template.time,
+    ...(permission ? {
+      agent: permission.agent,
+      mode: permission.mode,
+      toolsText: (permission.allowedTools ?? []).join(', '),
+    } : {}),
   };
+}
+
+/**
+ * Whether to say that the wmux browser tools are off for this run: a run in
+ * Auto or Bypass starts without wmux's tools, and an agent that keeps the
+ * server for an unattended browser identity gets them back by picking one
+ * (main admits that run's browser calls).
+ */
+export function browserToolsOff(form: Pick<ScheduleForm, 'agent' | 'mode' | 'browserPaneId'>): boolean {
+  return AUTOMATION_AGENT_CAPS[form.agent].unattendedBrowserIdentity
+    && (form.mode === 'auto' || form.mode === 'bypass') && !form.browserPaneId;
 }
 
 /** Whether the form's browser identity differs from the schedule's. */

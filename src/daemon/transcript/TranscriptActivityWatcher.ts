@@ -202,6 +202,9 @@ export interface TranscriptActivityDeps {
   /** Lines of this session's Claude transcript were skipped unread (more was
    *  appended in one tick than READ_CAP_BYTES): what they said is unknown. */
   onClaudeGap?: (sessionId: string) => void;
+  /** This session's Claude transcript is no longer read (its agent exited, the
+   *  file went away or another one replaces it). */
+  onClaudeWatchEnd?: (sessionId: string) => void;
   /** Runs at the end of every tick. */
   afterTick?: () => void;
   now?: () => number;
@@ -356,6 +359,18 @@ export class TranscriptActivityWatcher {
     }
   }
 
+  /** Read the pane's Claude lines now, not at the next tick (its Stop hook
+   *  arrived: what the turn wrote last is handed over before the Stop is). */
+  readLinesNow(sessionId: string): void {
+    const watch = this.watches.get(sessionId);
+    if (!watch?.lines) return;
+    try {
+      this.read(sessionId, watch);
+    } catch {
+      this.dropWatch(sessionId);
+    }
+  }
+
   /** This pane's watch reads `path` and hands its lines to `onClaudeLine`. */
   readsLines(sessionId: string, path: string): boolean {
     const watch = this.watches.get(sessionId);
@@ -450,6 +465,7 @@ export class TranscriptActivityWatcher {
     this.watches.delete(id);
     if (watch.subagentsSent > 0) this.deps.emitSubagents?.(id, 0);
     if (watch.teammatesSent !== '') this.deps.emitTeammates?.(id, []);
+    if (watch.lines) this.deps.onClaudeWatchEnd?.(id);
   }
 
   /**

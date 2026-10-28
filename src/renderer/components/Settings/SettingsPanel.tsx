@@ -1,4 +1,3 @@
-import PluginsSection from './PluginsSection';
 import { TerminalEngineSetting } from './TerminalEngineSetting';
 import { QuickCommandsSection } from './QuickCommandsSection';
 import { SecretHookSetting } from './SecretHookSetting';
@@ -36,6 +35,7 @@ import type { ChromePreset } from '../../../shared/chromePresets';
 import { ROLE_PRESET_SPECS, applyRolePreset, hasRolePreset, rolePresetApplied, rolePresetSkipsPermissions } from '../../../shared/rolePresets';
 import { NOTIFICATION_CATEGORIES } from '../../../shared/types';
 import { ORCH_ROLES, applyRoleBinding, launcherSupportsModelFlag, type RoleBinding } from '../../../shared/orchestratorRole';
+import { customAgentLaunchLine, customAgentStem, findCustomAgent, type CustomAgent } from '../../../shared/customAgents';
 import {
   DEFAULT_FANOUT_WORKER_PERMISSION_MODE,
   FANOUT_WORKER_PERMISSION_MODES,
@@ -44,7 +44,6 @@ import {
 } from '../../../shared/workerLaunch';
 import {
   ADVERTISED_SHORTCUTS,
-  UNBOUND_SHORTCUTS,
   builtinCombosFor,
   comboFromEvent,
   concreteCombo,
@@ -52,6 +51,7 @@ import {
   displayCombo,
   isPluginPageShortcut,
   pluginPageShortcut,
+  settingsUnboundRows,
   type ShortcutActionId,
 } from '../../../shared/keymap';
 import { usePlugins } from '../../plugins/usePlugins';
@@ -78,7 +78,9 @@ import {
 import { freshContextGrammarFor, launchGrammarFor } from '../../../shared/agentLaunchOptions';
 import { ModelCombobox } from './ModelCombobox';
 import { MULTIVIEW_ARRANGEMENTS } from '../../utils/multiviewGrid';
-import type { NicInfo, LanLinkNic, LanLinkStatus } from '../../../shared/lanlink';
+import type { NicInfo, LanLinkNic, LanLinkStatus, LanLinkStopReason } from '../../../shared/lanlink';
+import { lanLinkStopReasonKey } from '../Remote/lanLinkStopReason';
+import { FirewallNoticeView, ListenProblemView, useFirewall, useListenProblem } from '../Remote/FirewallNotice';
 import type { FirstRunCheckResult } from '../../../shared/firstRun';
 import { FIRST_RUN_REOPEN_EVENT } from '../../../shared/firstRun';
 import { ClaudeIntegrationSection } from './ClaudeIntegrationSection';
@@ -87,17 +89,18 @@ import { McpStatusSection } from './McpStatusSection';
 import { AccountsSection } from './AccountsSection';
 import { AgyAccountsSection } from './AgyAccountsSection';
 import { FanoutPresetsSection } from './FanoutPresetsSection';
+import { CustomAgentsSection } from './CustomAgentsSection';
 import { A2aRemoteSection } from './A2aRemoteSection';
 import { RemoteSpawnSection } from './RemoteSpawnSection';
 import { terminalFontFamilyCss } from '../../utils/terminalFont';
 import { hasBareFunctionKeyBinding } from '../../utils/functionKeyBinding';
-import { Icon, IconPuzzle, IconX, IconCheck, IconChevron, IconExternalLink, IconBrowser, IconComputer, IconUsers, IconRobot, IconRemoteDevices, IconPlus, IconWarning } from '../icons';
+import { Icon, IconX, IconCheck, IconChevron, IconExternalLink, IconBrowser, IconComputer, IconUsers, IconRobot, IconRemoteDevices, IconPlus, IconWarning } from '../icons';
 import { TabComputerUse } from './ComputerUseSection';
 import { QuickLaunchSection } from './QuickLaunchSection';
 import PairedDevicesModal from '../StatusBar/PairedDevicesModal';
 import { FOCUS_RING } from '../focusRing';
-import { SETTINGS_CATALOG, SETTINGS_NAV_GROUPS, catalogEntryOnPlatform, resolveSettingsTab, type SettingsTabId } from '../../settings/catalog';
-import { windowGlassSupported, type WindowGlassLevel } from '../../utils/windowGlass';
+import { SETTINGS_CATALOG, SETTINGS_NAV_GROUPS, catalogEntryFor, catalogEntryOnPlatform, catalogKeysOn, resolveSettingsTab, type SettingsTabId } from '../../settings/catalog';
+import { themeBlocksWindowGlass, windowGlassSupported, type WindowGlassLevel } from '../../utils/windowGlass';
 import { matchSettings, tabHitCount } from '../../settings/searchSettings';
 import { CursorShapePicker } from './CursorShapePicker';
 import { SettingsSearchResults } from './SettingsSearchResults';
@@ -522,11 +525,11 @@ function KbdRow({
           </kbd>
         )}
         {onToggleDisabled !== undefined && (
-          <Checkbox
+          <Switch
             checked={!disabled}
             onCheckedChange={() => onToggleDisabled()}
             title={toggleTitle}
-            // Unique per row — a list of checkboxes all reading the same hint
+            // Unique per row — a list of switches all reading the same hint
             // would be indistinguishable to a screen reader.
             aria-label={`${description} (${keys})`}
           />
@@ -587,7 +590,7 @@ const BUNDLED_FONTS = new Set([
 
 // ─── Reset section ───────────────────────────────────────────────────────────
 
-function ResetSection() {
+function ResetRow() {
   const t = useT();
   // A1: workspaces는 이 콜백 안에서만 명령형으로 쓰인다(렌더에 미사용) — 구독을
   // 없애고 getState()로 읽어 불필요한 리렌더를 제거한다.
@@ -622,25 +625,23 @@ function ResetSection() {
   }, [removeWorkspace, addWorkspace, setVisible, ipcInvoke]);
 
   return (
-    <SettingsSection id="reset" title={t('settings.reset')}>
-      <SettingRow label={t('settings.resetWorkspaces')} description={t('settings.resetWorkspacesDesc')}>
-        {confirming ? (
-          <div className="flex items-center gap-2 shrink-0">
-            <Button variant="ghost" onClick={() => setConfirming(false)}>
-              {t('settings.close')}
-            </Button>
-            {/* The final confirm of a destructive flow: solid red. */}
-            <UiButton variant="danger" size="md" onClick={handleReset}>
-              {t('settings.resetButton')}
-            </UiButton>
-          </div>
-        ) : (
-          <Button variant="destructive" onClick={() => setConfirming(true)}>
-            {t('settings.resetButton')}
+    <SettingRow id="reset" label={t('settings.resetWorkspaces')} description={t('settings.resetWorkspacesDesc')}>
+      {confirming ? (
+        <div className="flex items-center gap-2 shrink-0">
+          <Button variant="ghost" onClick={() => setConfirming(false)}>
+            {t('settings.close')}
           </Button>
-        )}
-      </SettingRow>
-    </SettingsSection>
+          {/* The final confirm of a destructive flow: solid red. */}
+          <UiButton variant="danger" size="md" onClick={handleReset}>
+            {t('settings.resetButton')}
+          </UiButton>
+        </div>
+      ) : (
+        <Button variant="destructive" onClick={() => setConfirming(true)}>
+          {t('settings.resetButton')}
+        </Button>
+      )}
+    </SettingRow>
   );
 }
 
@@ -686,11 +687,11 @@ const ROLE_BINDING_FIELD_CLASS = 'settings-input font-mono';
 /** The one honest thing to say about a row's current state, or none when the
  *  row does exactly what it appears to. Keeps a mis-set binding from looking
  *  bound while enforcing nothing. */
-export function roleBindingHint(b: RoleBinding):
+export function roleBindingHint(b: RoleBinding, customAgents?: readonly CustomAgent[]):
   | { key: string; params?: Record<string, string> }
   | undefined {
   if (b.model && !b.agent) return { key: 'settings.roleBindingHintNoAgent' };
-  if (b.model && b.agent && !launcherSupportsModelFlag(b.agent)) {
+  if (b.model && b.agent && !launcherSupportsModelFlag(b.agent) && !findCustomAgent(b.agent, customAgents)?.modelFlag) {
     return { key: 'settings.roleBindingHintNoGrammar', params: { agent: b.agent } };
   }
   // #1680 — the checkbox is only offered for an agent with a verified command,
@@ -767,6 +768,8 @@ export interface RoleBindingsViewProps {
   onRefreshModels?: (agent: string) => void;
   /** Ask before a preset that turns on skip permissions (default window.confirm). */
   confirm?: (message: string) => boolean;
+  /** The operator's custom agents, offered after the registry agents. */
+  customAgents?: readonly CustomAgent[];
 }
 
 /** Models to offer for an agent: the discovered list, or claude's static one. */
@@ -796,7 +799,7 @@ export function effortChoicesFor(b: RoleBinding, models: readonly CatalogModel[]
 
 /** Presentational half — the container below owns the store. Split so the view
  *  is renderable (and assertable) without a live store, matching NotificationsView. */
-export function RoleBindingsView({ bindings, onChange, t, catalog, onRefreshModels, confirm }: RoleBindingsViewProps) {
+export function RoleBindingsView({ bindings, onChange, t, catalog, onRefreshModels, confirm, customAgents }: RoleBindingsViewProps) {
   const update = (role: string, patch: Partial<RoleBinding>) => {
     onChange(role, { ...(bindings[role] ?? {}), ...patch });
   };
@@ -805,7 +808,8 @@ export function RoleBindingsView({ bindings, onChange, t, catalog, onRefreshMode
     <SettingsSection id="roles" title={t('settings.roleBindings')} description={t('settings.roleBindingsDesc')} overflowVisible>
       {ORCH_ROLES.map((role) => {
         const b = bindings[role] ?? {};
-        const hint = roleBindingHint(b);
+        const hint = roleBindingHint(b, customAgents);
+        const custom = b.agent ? findCustomAgent(b.agent, customAgents) : undefined;
         const models = modelsFor(b.agent, catalog);
         const efforts = effortChoicesFor(b, models);
         const grammar = launchGrammarFor(b.agent);
@@ -813,7 +817,13 @@ export function RoleBindingsView({ bindings, onChange, t, catalog, onRefreshMode
         const effortValue =
           b.agent === 'agy' ? (b.model ? agyEffortOf(b.model) ?? '' : '') : b.effort ?? '';
         // What a bare launch of the bound agent becomes (machine evidence, mono).
-        const preview = b.agent ? applyRoleBinding(b.agent, b, { spawnedProcess: true }).command : '';
+        // A custom agent launches as the operator typed it.
+        const preview = b.agent
+          ? applyRoleBinding(custom ? customAgentLaunchLine(custom) : b.agent, b, {
+            spawnedProcess: true,
+            ...(custom ? { customAgents } : {}),
+          }).command
+          : '';
         return (
           <div key={role} className="settings-row" data-role-binding-row={role}>
             <div className="flex items-center gap-2">
@@ -827,6 +837,9 @@ export function RoleBindingsView({ bindings, onChange, t, catalog, onRefreshMode
                 <option value="">{t('settings.roleBindingAgentPlaceholder')}</option>
                 {ROLE_BINDING_AGENTS.map((a) => (
                   <option key={a} value={a}>{a}</option>
+                ))}
+                {customAgents?.map((a) => (
+                  <option key={customAgentStem(a)} value={customAgentStem(a)}>{a.name}</option>
                 ))}
               </Select>
               {/* Discovered models (ModelCatalog); free text stays allowed. */}
@@ -895,7 +908,7 @@ export function RoleBindingsView({ bindings, onChange, t, catalog, onRefreshMode
                     {t('settings.roleBindingFreshContext')}
                   </label>
                 )}
-                {onRefreshModels && b.agent !== 'claude' && (
+                {onRefreshModels && b.agent !== 'claude' && !custom && (
                   <UiButton
                     variant="ghost"
                     size="sm"
@@ -978,6 +991,7 @@ function RoleBindingEditor() {
   const t = useT();
   const bindings = useStore((s) => s.orchestratorRoleBindings);
   const setBinding = useStore((s) => s.setOrchestratorRoleBinding);
+  const customAgents = useStore((s) => s.customAgents);
   const [catalog, setCatalog] = useState<Record<string, ModelCatalogResult>>({});
   const load = useCallback((agent: string, refresh = false) => {
     window.electronAPI.agentModels
@@ -1001,6 +1015,7 @@ function RoleBindingEditor() {
       t={t}
       catalog={catalog}
       onRefreshModels={(a) => load(a, true)}
+      customAgents={customAgents}
     />
   );
 }
@@ -1091,6 +1106,14 @@ export interface LanLinkViewProps {
   selectedValue: string;
   onChangeNic: (value: string) => void;
   busy: boolean;
+  /** Why LanLink is on but not listening; null while it listens, is off, or has no NIC. */
+  stopReason: LanLinkStopReason | null;
+  /** Windows: LanLink is gated on the network category. macOS/Linux have none. */
+  hasNetworkCategory: boolean;
+  /** A failed bind explained (who holds the port, Use port N), in place of the listen-failed line. */
+  listenNotice?: ReactNode;
+  /** The firewall check of the open listener. */
+  firewallNotice?: ReactNode;
   t: (key: string) => string;
 }
 
@@ -1105,6 +1128,10 @@ export function LanLinkView({
   selectedValue,
   onChangeNic,
   busy,
+  stopReason,
+  hasNetworkCategory,
+  listenNotice,
+  firewallNotice,
   t,
 }: LanLinkViewProps) {
   return (
@@ -1120,8 +1147,15 @@ export function LanLinkView({
           label={t('settings.lanlinkNic')}
         />
       </SettingRow>
+      {enabled && stopReason && (stopReason !== 'listen-failed' || !listenNotice) && (
+        <SettingNote tone="warning" role="status" data-testid="lanlink-stop-reason">
+          {t(lanLinkStopReasonKey(stopReason))}
+        </SettingNote>
+      )}
+      {enabled && stopReason === 'listen-failed' && listenNotice}
+      {enabled && !stopReason && firewallNotice}
       <SettingNote data-testid="lanlink-warning">
-        {t('settings.lanlinkWarning')}
+        {t(hasNetworkCategory ? 'settings.lanlinkWarning' : 'settings.lanlinkWarningNoCategory')}
       </SettingNote>
       {busy && (
         <SettingNote>{t('settings.lanlinkApplying')}</SettingNote>
@@ -1142,7 +1176,13 @@ function LanLinkSection() {
 
   // Lazily access the API so the component is safe where preload hasn't exposed it.
   const lanlinkApi = (
-    window.electronAPI as unknown as { lanlink?: { status: () => Promise<LanLinkStatus>; configure: (p: { enabled?: boolean; nic?: LanLinkNic | null }) => Promise<LanLinkStatus> } }
+    window.electronAPI as unknown as {
+      lanlink?: {
+        status: () => Promise<LanLinkStatus>;
+        configure: (p: { enabled?: boolean; nic?: LanLinkNic | null; port?: number }) => Promise<LanLinkStatus>;
+        onStatusChanged?: (cb: () => void) => () => void;
+      };
+    }
   ).lanlink;
 
   const refresh = useCallback(async () => {
@@ -1175,11 +1215,13 @@ function LanLinkSection() {
       window.electronAPI as unknown as { daemon?: { onConnected?: (cb: () => void) => () => void } }
     ).daemon;
     const off = daemonApi?.onConnected?.(() => void refresh());
-    return () => { off?.(); };
-  }, [refresh]);
+    // The daemon finished deciding (listening, or why not): re-read.
+    const offStatus = lanlinkApi?.onStatusChanged?.(() => void refresh());
+    return () => { off?.(); offStatus?.(); };
+  }, [refresh, lanlinkApi]);
 
   const apply = useCallback(
-    async (patch: { enabled?: boolean; nic?: LanLinkNic | null }) => {
+    async (patch: { enabled?: boolean; nic?: LanLinkNic | null; port?: number }) => {
       if (!lanlinkApi?.configure) return;
       setBusy(true);
       try {
@@ -1191,6 +1233,15 @@ function LanLinkSection() {
     },
     [ipcInvoke, lanlinkApi],
   );
+
+  // The listener's firewall, checked when it opens or moves (never on a poll),
+  // and a failed bind explained once per distinct failure.
+  const firewall = useFirewall('lanlink', {
+    enabled: status?.listening === true,
+    checkKey: `${status?.effectivePort ?? ''}:${status?.nic?.mac ?? ''}`,
+  });
+  const failed = status?.enabled && status.stopReason === 'listen-failed' && status.listenErrorCode ? status.listenErrorCode : null;
+  const problem = useListenProblem('lanlink', failed ? `${failed}:${status?.effectivePort ?? ''}` : null);
 
   // Local mode / daemon unreachable: the tab is always listed, so render an
   // explanatory placeholder rather than a blank pane. The on-mount probe +
@@ -1226,6 +1277,21 @@ function LanLinkSection() {
         void apply({ nic: picked?.nic ?? null });
       }}
       busy={busy}
+      stopReason={status.stopReason}
+      hasNetworkCategory={window.electronAPI?.platform === 'win32'}
+      listenNotice={failed ? (
+        <ListenProblemView
+          report={problem}
+          fallback={t(lanLinkStopReasonKey('listen-failed'))}
+          onUsePort={(port) => void apply({ port })}
+          busy={busy}
+          repair={false}
+          primary={false}
+          listener="lanlink"
+          t={t}
+        />
+      ) : undefined}
+      firewallNotice={<FirewallNoticeView c={firewall} listener="lanlink" primary={false} t={t} />}
       t={t}
     />
   );
@@ -1522,7 +1588,7 @@ function UpdateStatus() {
 // is the source of truth — read on mount, flipped optimistically with echo
 // reconciliation (mirrors OrchestratorSection's auto-wake). Rendered on win32
 // (Run key) + darwin(로그인 항목); the backing IPC is a no-op elsewhere.
-function StartupSection() {
+function StartupRow() {
   const t = useT();
   const [enabled, setEnabled] = useState(true);
   useEffect(() => {
@@ -1541,37 +1607,33 @@ function StartupSection() {
       .catch(() => setEnabled(!next));
   };
   return (
-    <SettingsSection title={t('settings.startup')}>
-      <SettingRow id="startup" label={t('settings.startOnLogin')} description={t('settings.startOnLoginDesc')}>
-        <Toggle checked={enabled} onChange={onChange} label={t('settings.startOnLogin')} />
-      </SettingRow>
-    </SettingsSection>
+    <SettingRow id="startup" label={t('settings.startOnLogin')} description={t('settings.startOnLoginDesc')}>
+      <Toggle checked={enabled} onChange={onChange} label={t('settings.startOnLogin')} />
+    </SettingRow>
   );
 }
 
 // Keep the computer awake (main/power/sleepPrevention.ts): off, while any
 // local agent is working (Fleet's Running), or always. The store holds the
 // choice; utils/sleepPreventionBridge.ts tells main.
-function SleepPreventionSection() {
+function SleepPreventionRow() {
   const t = useT();
   const mode = useStore((s) => s.sleepPreventionMode);
   const setMode = useStore((s) => s.setSleepPreventionMode);
   return (
-    <SettingsSection title={t('settings.power')}>
-      <SettingRow id="sleepprevention" label={t('settings.sleepPrevention')} description={t('settings.sleepPreventionDesc')}>
-        <SegmentedControl
-          value={mode}
-          onValueChange={setMode}
-          ariaLabel={t('settings.sleepPrevention')}
-          options={[
-            { value: 'off', label: t('settings.sleepPreventionOff') },
-            { value: 'working', label: t('settings.sleepPreventionWorking') },
-            { value: 'always', label: t('settings.sleepPreventionAlways') },
-          ]}
-          data-testid="sleep-prevention-mode"
-        />
-      </SettingRow>
-    </SettingsSection>
+    <SettingRow id="sleepprevention" label={t('settings.sleepPrevention')} description={t('settings.sleepPreventionDesc')}>
+      <SegmentedControl
+        value={mode}
+        onValueChange={setMode}
+        ariaLabel={t('settings.sleepPrevention')}
+        options={[
+          { value: 'off', label: t('settings.sleepPreventionOff') },
+          { value: 'working', label: t('settings.sleepPreventionWorking') },
+          { value: 'always', label: t('settings.sleepPreventionAlways') },
+        ]}
+        data-testid="sleep-prevention-mode"
+      />
+    </SettingRow>
   );
 }
 
@@ -1594,9 +1656,9 @@ function TabGeneral() {
 
   return (
     <div className="settings-page">
-      {/* Language — native names in one Select; no flags (DESIGN.md: no
-          emoji in chrome, and a flag is not a language). */}
-      <SettingsSection>
+      <SettingsSection title={t('settings.sectionLanguageUpdates')}>
+        {/* Language — native names in one Select; no flags (DESIGN.md: no
+            emoji in chrome, and a flag is not a language). */}
         <SettingRow id="language" label={t('settings.language')}>
           <SettingSelect
             label={t('settings.language')}
@@ -1605,10 +1667,6 @@ function TabGeneral() {
             options={LOCALE_OPTIONS.map(({ value, label }) => ({ value, label }))}
           />
         </SettingRow>
-      </SettingsSection>
-
-      {/* Updates */}
-      <SettingsSection title={t('settings.updates')}>
         <SettingRow id="autoupdate" label={t('settings.autoUpdate')} description={t('settings.autoUpdateDesc')}>
           <Toggle
             checked={autoUpdateEnabled}
@@ -1619,23 +1677,23 @@ function TabGeneral() {
         <UpdateStatus />
       </SettingsSection>
 
+      <SettingsSection title={t('settings.sectionStartupPower')}>
+        {/* Startup — win32(레지스트리 Run 키) + darwin(로그인 항목). 그 외 숨김. */}
+        {(window.electronAPI.platform === 'win32' || window.electronAPI.platform === 'darwin') && (
+          <StartupRow />
+        )}
+        <SleepPreventionRow />
+      </SettingsSection>
+
       {/* Git: commit / push / PR from the Git page, task adopt and Moa delivery. */}
-      <SettingsSection title={t('git.title')}>
+      <SettingsSection title={t('settings.sectionGitSafety')}>
         <SettingRow id="secretguard" label={t('settings.secretGuard')} description={t('settings.secretGuardDesc')}>
           <Toggle checked={secretGuardEnabled} onChange={setSecretGuardEnabled} label={t('settings.secretGuard')} />
         </SettingRow>
         <SecretHookSetting />
       </SettingsSection>
 
-      {/* Startup — win32(레지스트리 Run 키) + darwin(로그인 항목). 그 외 숨김. */}
-      {(window.electronAPI.platform === 'win32' || window.electronAPI.platform === 'darwin') && (
-        <StartupSection />
-      )}
-
-      <SleepPreventionSection />
-
-      {/* Tutorial */}
-      <SettingsSection title={t('settings.tutorial')}>
+      <SettingsSection title={t('settings.sectionSetupReset')}>
         <SettingRow id="tutorial" label={t('settings.restartTutorial')} description={t('settings.restartTutorialDesc')}>
           <Button
             variant="secondary"
@@ -1647,13 +1705,10 @@ function TabGeneral() {
             {t('settings.restartTutorial')}
           </Button>
         </SettingRow>
+        {/* First-run setup — the wizard and cheat sheet re-entry points. */}
+        <TabFirstRunSetup />
+        <ResetRow />
       </SettingsSection>
-
-      {/* First-run setup — the wizard and cheat sheet re-entry points. */}
-      <TabFirstRunSetup />
-
-      {/* Reset */}
-      <ResetSection />
     </div>
   );
 }
@@ -1688,6 +1743,10 @@ export function ImagePasteModeView({
 
 function TabTerminal() {
   const t = useT();
+  const terminalFontSize    = useStore((s) => s.terminalFontSize);
+  const setTerminalFontSize = useStore((s) => s.setTerminalFontSize);
+  const terminalCursorStyle = useStore((s) => s.terminalCursorStyle);
+  const setTerminalCursorStyle = useStore((s) => s.setTerminalCursorStyle);
   const defaultShell = useStore((s) => s.defaultShell);
   const setDefaultShell = useStore((s) => s.setDefaultShell);
   const scrollbackLines = useStore((s) => s.scrollbackLines);
@@ -1767,6 +1826,32 @@ function TabTerminal() {
 
   return (
     <div className="settings-page">
+      <SettingsSection title={t('settings.sectionFontCursor')} overflowVisible>
+        <SettingRow id="fontsize" label={t('settings.fontSize')} description={`${terminalFontSize}px — ${t('settings.fontSizeRange')}`}>
+          <div className="flex items-center gap-2">
+            <input
+              type="range"
+              min={8}
+              max={24}
+              value={terminalFontSize}
+              onChange={(e) => setTerminalFontSize(Number(e.target.value))}
+              aria-label={t('settings.fontSize')}
+              className={`settings-range ${FOCUS_RING}`}
+            />
+            <span className="settings-range-value">{terminalFontSize}</span>
+          </div>
+        </SettingRow>
+        <SettingRow id="fontfamily" label={t('settings.fontFamily')} description={t('settings.fontFamilyDesc')}>
+          <FontFamilyField />
+        </SettingRow>
+        <div data-setting-id="cursorshape" className="settings-block scroll-mt-4">
+          <div className="flex flex-col gap-0.5">
+            <span className="ui-field-label">{t('settings.cursorShape')}</span>
+            <span className="ui-field-description">{t('settings.cursorShapeDesc')}</span>
+          </div>
+          <CursorShapePicker value={terminalCursorStyle} onChange={setTerminalCursorStyle} t={t} />
+        </div>
+      </SettingsSection>
       <SettingsSection title={t('settings.sectionShell')}>
         <SettingRow id="shell" label={t('settings.defaultShell')}>
           <SettingSelect
@@ -1796,7 +1881,7 @@ function TabTerminal() {
             label={t('settings.startupDirectory')}
             value={startupDirectory}
             onCommit={setStartupDirectory}
-            placeholder={t('settings.startupDirectoryPlaceholder')}
+            placeholder={t(window.electronAPI?.platform === 'win32' ? 'settings.startupDirectoryPlaceholder' : 'settings.startupDirectoryPlaceholder.posix')}
           />
         </SettingRow>
         <SettingRow id="splitcwd" label={t('settings.splitInheritsCwd')} description={t('settings.splitInheritsCwdDesc')}>
@@ -2024,6 +2109,9 @@ function FanoutWorkersSection() {
   const [requireApproval, setRequireApprovalState] = useState(false);
   // Main-side as well: main refuses the agy trust write while this is off.
   const [trustAgyFolders, setTrustAgyFoldersState] = useState(false);
+  // Main-side, per workspace: the worker fence of this workspace's bots.
+  const activeWorkspaceId = useStore((s) => s.activeWorkspaceId);
+  const [fenceOff, setFenceOffState] = useState(false);
   const [mode, setMode] = useState<FanoutWorkerPermissionMode>(DEFAULT_FANOUT_WORKER_PERMISSION_MODE);
   // Shown as its own line under the row, not in the (one-line) description,
   // so a failure's text is never cut off behind Learn more.
@@ -2051,6 +2139,29 @@ function FanoutWorkersSection() {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    setFenceOffState(false);
+    if (activeWorkspaceId) {
+      window.electronAPI?.fanout?.getWorkerFenceOff?.(activeWorkspaceId)
+        .then((v) => {
+          if (!cancelled && typeof v === 'boolean') setFenceOffState(v);
+        })
+        .catch(() => undefined);
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [activeWorkspaceId]);
+
+  const onFenceChange = (on: boolean) => {
+    if (!activeWorkspaceId) return;
+    window.electronAPI.fanout
+      .setWorkerFenceOff(activeWorkspaceId, !on)
+      .then((stored) => setFenceOffState(stored))
+      .catch(() => undefined);
+  };
 
   const onModeChange = (next: string) => {
     if (!isFanoutWorkerPermissionMode(next)) return;
@@ -2112,6 +2223,24 @@ function FanoutWorkersSection() {
           label={t('settings.fanoutTrustAgyFolders')}
         />
       </SettingRow>
+      {activeWorkspaceId && (
+        <SettingRow
+          id="workerfence"
+          label={t('settings.workerFence')}
+          description={t('settings.workerFenceDesc')}
+        >
+          <Toggle
+            checked={!fenceOff}
+            onChange={onFenceChange}
+            label={t('settings.workerFence')}
+          />
+        </SettingRow>
+      )}
+      {activeWorkspaceId && fenceOff && (
+        <SettingNote tone="warning">
+          {t('settings.workerFenceOffWarning')}
+        </SettingNote>
+      )}
       <SettingRow
         id="fanoutworkers"
         label={t('settings.fanoutWorkerPermissionMode')}
@@ -2173,6 +2302,9 @@ function TabRoles() {
 
       {/* Fan-out presets */}
       <FanoutPresetsSection />
+
+      {/* Custom agents (last: they exist to be picked by the roles and rows above) */}
+      <CustomAgentsSection />
     </div>
   );
 }
@@ -2187,7 +2319,7 @@ function AgentToolbarSection() {
 
   return (
     <SettingsSection title={t('settings.agentToolbar')}>
-      <SettingRow id="toolbar" label={t('settings.agentToolbarShow')} description={t('settings.agentToolbarShowDesc')}>
+      <SettingRow id="toolbar" label={t('settings.agentToolbarShow')} description={t(catalogKeysOn('toolbar', window.electronAPI?.platform).descKey ?? 'settings.agentToolbarShowDesc')}>
         <Toggle
           checked={agentToolbarEnabled}
           onChange={setAgentToolbarEnabled}
@@ -3401,23 +3533,31 @@ function FontFamilyField() {
 
 /**
  * The window glass row. Without a material (Windows before 11 22H2) it reads
- * Off with every level disabled and says why.
+ * Off with every level disabled and says why. When the theme keeps the
+ * window opaque on Windows (`themeBlocked`), the levels stay enabled on the
+ * user's saved level, which applies again on a theme that can keep glass,
+ * and the description says why nothing shows.
  */
 export function WindowGlassSetting({
   supported,
+  themeBlocked = false,
   value,
   onChange,
 }: {
   supported: boolean;
+  themeBlocked?: boolean;
   value: WindowGlassLevel;
   onChange: (level: WindowGlassLevel) => void;
 }) {
   const t = useT();
+  const description = !supported
+    ? t('settings.windowGlassUnsupported')
+    : themeBlocked ? t('settings.windowGlassThemeOpaque') : t('settings.windowGlassDesc');
   return (
     <SettingRow
       id="windowglass"
       label={t('settings.windowGlass')}
-      description={supported ? t('settings.windowGlassDesc') : t('settings.windowGlassUnsupported')}
+      description={description}
     >
       <SegmentedControl
         value={supported ? value : 'off'}
@@ -3467,11 +3607,8 @@ export function ChromePresetActionsView({
 
 function TabAppearance() {
   const t = useT();
-  const terminalFontSize    = useStore((s) => s.terminalFontSize);
-  const setTerminalFontSize = useStore((s) => s.setTerminalFontSize);
-  const terminalCursorStyle = useStore((s) => s.terminalCursorStyle);
-  const setTerminalCursorStyle = useStore((s) => s.setTerminalCursorStyle);
-
+  // The OS's own name for its file manager, as the sidebar button says it.
+  const explorerButtonLabelKey = catalogKeysOn('sidebarexplorerbutton', window.electronAPI?.platform).labelKey;
   const sidebarPosition = useStore((s) => s.sidebarPosition);
   const sidebarSortMode = useStore((s) => s.sidebarSortMode);
   const setSidebarSortMode = useStore((s) => s.setSidebarSortMode);
@@ -3491,6 +3628,8 @@ function TabAppearance() {
   const windowGlass = useStore((s) => s.windowGlass);
   const setWindowGlass = useStore((s) => s.setWindowGlass);
   const glassSupported = windowGlassSupported();
+  const windowGlassEffective = useStore((s) => s.windowGlassEffective);
+  const glassThemeBlocked = themeBlocksWindowGlass(window.electronAPI?.platform, windowGlass, windowGlassEffective);
   const setAttentionBlinkFinished = useStore((s) => s.setAttentionBlinkFinished);
   const workspaceSettleIdleDays = useStore((s) => s.workspaceSettle.idleDays);
   const fleetLayout = useStore((s) => s.fleetLayout);
@@ -3613,7 +3752,7 @@ function TabAppearance() {
             reason, so nobody picks a level that changes nothing. Linux has
             no material and no row. */}
         {(window.electronAPI?.platform === 'darwin' || window.electronAPI?.platform === 'win32') && (
-          <WindowGlassSetting supported={glassSupported} value={windowGlass} onChange={setWindowGlass} />
+          <WindowGlassSetting supported={glassSupported} themeBlocked={glassThemeBlocked} value={windowGlass} onChange={setWindowGlass} />
         )}
         <SettingRow id="chrome" label={t('settings.chromePreset')} description={t('settings.chromePresetDesc')}>
           <ChromePresetActionsView onApply={applyChromePresetWithFeedback} />
@@ -3667,11 +3806,11 @@ function TabAppearance() {
             ]}
           />
         </SettingRow>
-        <SettingRow id="sidebarexplorerbutton" label={t('settings.sidebarShowExplorerButton')} description={t('settings.sidebarShowExplorerButtonDesc')}>
+        <SettingRow id="sidebarexplorerbutton" label={t(explorerButtonLabelKey)} description={t('settings.sidebarShowExplorerButtonDesc')}>
           <Toggle
             checked={sidebarShowExplorerButton}
             onChange={setSidebarShowExplorerButton}
-            label={t('settings.sidebarShowExplorerButton')}
+            label={t(explorerButtonLabelKey)}
           />
         </SettingRow>
         <SettingRow id="sidebarcopyinfobutton" label={t('settings.sidebarShowCopyInfoButton')} description={t('settings.sidebarShowCopyInfoButtonDesc')}>
@@ -3827,33 +3966,6 @@ function TabAppearance() {
         </SettingRow>
       </SettingsSection>
 
-      <SettingsSection title={t('settings.terminal')} overflowVisible>
-        <SettingRow id="fontsize" label={t('settings.fontSize')} description={`${terminalFontSize}px — ${t('settings.fontSizeRange')}`}>
-          <div className="flex items-center gap-2">
-            <input
-              type="range"
-              min={8}
-              max={24}
-              value={terminalFontSize}
-              onChange={(e) => setTerminalFontSize(Number(e.target.value))}
-              aria-label={t('settings.fontSize')}
-              className={`settings-range ${FOCUS_RING}`}
-            />
-            <span className="settings-range-value">{terminalFontSize}</span>
-          </div>
-        </SettingRow>
-        <SettingRow id="fontfamily" label={t('settings.fontFamily')} description={t('settings.fontFamilyDesc')}>
-          <FontFamilyField />
-        </SettingRow>
-        <div data-setting-id="cursorshape" className="settings-block scroll-mt-4">
-          <div className="flex flex-col gap-0.5">
-            <span className="ui-field-label">{t('settings.cursorShape')}</span>
-            <span className="ui-field-description">{t('settings.cursorShapeDesc')}</span>
-          </div>
-          <CursorShapePicker value={terminalCursorStyle} onChange={setTerminalCursorStyle} t={t} />
-        </div>
-      </SettingsSection>
-
       <AgentToolbarSection />
     </div>
   );
@@ -3883,7 +3995,8 @@ export interface NotificationsViewWorkspaceRow {
 export interface NotificationsViewProps {
   // Existing notification toggles
   notificationSoundEnabled: boolean;
-  onToggleNotificationSound: () => void;
+  /** The one Notification sound switch; see {@link applyNotificationSound}. */
+  onChangeNotificationSound: (on: boolean) => void;
   toastEnabled: boolean;
   onChangeToastEnabled: (v: boolean) => void;
   notificationRingEnabled: boolean;
@@ -3899,8 +4012,9 @@ export interface NotificationsViewProps {
   onChangePaneFlashEnabled: (v: boolean) => void;
   taskbarFlashEnabled: boolean;
   onChangeTaskbarFlashEnabled: (v: boolean) => void;
+  /** Names the taskbar row in the OS's words (the Dock on macOS). */
+  platform?: string;
   notificationSoundChoice: 'default' | 'none';
-  onChangeNotificationSoundChoice: (choice: 'default' | 'none') => void;
 
   // #516 — per-category mute
   mutedNotificationCategories: NotificationCategory[];
@@ -3919,22 +4033,44 @@ export interface NotificationsViewProps {
 }
 
 /**
+ * Notification sound is two stored values: `notificationSoundEnabled` (saved
+ * with the session) and `notificationSoundChoice` ('none' silences the cue
+ * whatever the flag says). Settings shows them as one switch: on only when
+ * both let the cue play.
+ */
+export function notificationSoundOn(enabled: boolean, choice: 'default' | 'none'): boolean {
+  return enabled && choice !== 'none';
+}
+
+/** Turning the switch on also picks the default cue, so a 'none' left behind
+ *  by the old sound picker cannot keep an "on" switch silent. */
+export function applyNotificationSound(
+  on: boolean,
+  setEnabled: (enabled: boolean) => void,
+  setChoice: (choice: 'default' | 'none') => void,
+): void {
+  setEnabled(on);
+  if (on) setChoice('default');
+}
+
+/**
  * Pure presentational notifications settings block.
  *
  * Renders the global notification toggles (sound, toast, ring + 3 new T12
- * toggles + 1 sound-choice radio group) followed by the per-workspace mute
- * list. Exported so tests can drive it through `renderToStaticMarkup`.
+ * toggles) followed by the per-workspace mute list. Exported so tests can
+ * drive it through `renderToStaticMarkup`.
  */
 export function NotificationsView(props: NotificationsViewProps) {
   const {
-    notificationSoundEnabled, onToggleNotificationSound,
+    notificationSoundEnabled, onChangeNotificationSound,
     toastEnabled, onChangeToastEnabled,
     notificationRingEnabled, onChangeNotificationRingEnabled,
     paneRingEnabled, onChangePaneRingEnabled,
     paneGlowOpacity, onChangePaneGlowOpacity,
     paneFlashEnabled, onChangePaneFlashEnabled,
     taskbarFlashEnabled, onChangeTaskbarFlashEnabled,
-    notificationSoundChoice, onChangeNotificationSoundChoice,
+    platform,
+    notificationSoundChoice,
     mutedNotificationCategories, onChangeCategoryMuted,
     workspaces, onChangeWorkspaceMuted, onChangeWorkspacePrWake, onChangeWorkspacePrWakeChecksPassed,
     t,
@@ -3946,8 +4082,8 @@ export function NotificationsView(props: NotificationsViewProps) {
       <SettingsSection title={t('settings.notificationBehavior')}>
         <SettingRow id="sound" label={t('settings.sound')} description={t('settings.soundDesc')}>
           <Toggle
-            checked={notificationSoundEnabled}
-            onChange={() => onToggleNotificationSound()}
+            checked={notificationSoundOn(notificationSoundEnabled, notificationSoundChoice)}
+            onChange={onChangeNotificationSound}
             label={t('settings.sound')}
           />
         </SettingRow>
@@ -3996,66 +4132,29 @@ export function NotificationsView(props: NotificationsViewProps) {
           </div>
         </SettingRow>
 
-        {/* T12 — Pane flash */}
+        {/* T12 — Pane flash. The flash plays only inside the pane ring
+            (useNotificationPolicy), so it is disabled while the ring is off. */}
         <SettingRow label={t('settings.paneFlash')} description={t('settings.paneFlashDesc')}>
           <Toggle
             checked={paneFlashEnabled}
             onChange={onChangePaneFlashEnabled}
             label={t('settings.paneFlash')}
+            disabled={!paneRingEnabled}
           />
         </SettingRow>
 
-        {/* T12 — Taskbar flash */}
-        <SettingRow label={t('settings.taskbarFlash')} description={t('settings.taskbarFlashDesc')}>
+        {/* T12 — Taskbar flash. The same switch bounces the Dock on macOS
+            (ToastManager's dockBounceEnabled) and flashes the taskbar elsewhere. */}
+        <SettingRow
+          label={t(platform === 'darwin' ? 'settings.taskbarFlash.darwin' : 'settings.taskbarFlash')}
+          description={t(platform === 'darwin' ? 'settings.taskbarFlashDesc.darwin' : platform === 'linux' ? 'settings.taskbarFlashDesc.linux' : 'settings.taskbarFlashDesc')}
+        >
           <Toggle
             checked={taskbarFlashEnabled}
             onChange={onChangeTaskbarFlashEnabled}
-            label={t('settings.taskbarFlash')}
+            label={t(platform === 'darwin' ? 'settings.taskbarFlash.darwin' : 'settings.taskbarFlash')}
           />
         </SettingRow>
-
-        {/* T12 — Notification sound choice (radio group, not a toggle) */}
-        <div className="settings-row" data-testid="notification-sound-choice-row">
-          <div className="flex items-center justify-between gap-4">
-            <div className="min-w-0 flex flex-col gap-0.5">
-              <span className="ui-field-label" id="notification-sound-choice-label">
-                {t('settings.notificationSoundChoice')}
-              </span>
-              <span className="ui-field-description" id="notification-sound-choice-desc">
-                {t('settings.notificationSoundChoiceDesc')}
-              </span>
-            </div>
-            <div
-              role="radiogroup"
-              aria-labelledby="notification-sound-choice-label"
-              aria-describedby="notification-sound-choice-desc"
-              className="flex items-center gap-4 shrink-0"
-            >
-              <label className="settings-radio">
-                <input
-                  type="radio"
-                  name="notification-sound-choice"
-                  value="default"
-                  checked={notificationSoundChoice === 'default'}
-                  aria-describedby="notification-sound-choice-desc"
-                  onChange={() => onChangeNotificationSoundChoice('default')}
-                />
-                {t('settings.notificationSoundChoiceDefault')}
-              </label>
-              <label className="settings-radio">
-                <input
-                  type="radio"
-                  name="notification-sound-choice"
-                  value="none"
-                  checked={notificationSoundChoice === 'none'}
-                  aria-describedby="notification-sound-choice-desc"
-                  onChange={() => onChangeNotificationSoundChoice('none')}
-                />
-                {t('settings.notificationSoundChoiceNone')}
-              </label>
-            </div>
-          </div>
-        </div>
       </SettingsSection>
 
       {/* #516 — Per-category mute. Muted categories still reach the
@@ -4094,43 +4193,22 @@ export function NotificationsView(props: NotificationsViewProps) {
           </SettingNote>
         ) : (
           <div className="flex flex-col" style={{ maxHeight: 240, overflowY: 'auto' }}>
-            {workspaces.map((ws, idx) => {
-              const labelId = `workspace-mute-label-${ws.id}`;
-              const descId = `workspace-mute-desc-${ws.id}`;
-              return (
-                <label
-                  key={ws.id}
-                  htmlFor={`workspace-mute-${ws.id}`}
-                  className="settings-row cursor-pointer hover:bg-[color:var(--surface-fill-hover)] transition-colors"
-                  style={{
-                    flexDirection: 'row',
-                    alignItems: 'center',
-                    justifyContent: 'space-between',
-                    borderTop: idx === 0 ? 'none' : '1px solid var(--surface-hairline)',
-                  }}
-                  data-testid={`per-workspace-mute-row-${ws.id}`}
-                >
-                  <div className="min-w-0 mr-3 flex flex-col gap-0.5">
-                    <span className="ui-field-label truncate" id={labelId}>
-                      {t('settings.muteWorkspace', { name: ws.name })}
-                    </span>
-                    <span className="ui-field-description truncate" id={descId}>
-                      {ws.name}
-                    </span>
-                  </div>
-                  <input
-                    id={`workspace-mute-${ws.id}`}
-                    type="checkbox"
-                    checked={ws.muted}
-                    aria-labelledby={labelId}
-                    aria-describedby={descId}
-                    onChange={(e) => onChangeWorkspaceMuted(ws.id, e.target.checked)}
-                    data-testid={`per-workspace-mute-checkbox-${ws.id}`}
-                    className="settings-native-check shrink-0 cursor-pointer"
-                  />
-                </label>
-              );
-            })}
+            {workspaces.map((ws, idx) => (
+              <SettingRow
+                key={ws.id}
+                label={t('settings.muteWorkspace', { name: ws.name })}
+                description={ws.name}
+                style={{ borderTop: idx === 0 ? 'none' : '1px solid var(--surface-hairline)' }}
+                data-testid={`per-workspace-mute-row-${ws.id}`}
+              >
+                <Switch
+                  id={`workspace-mute-${ws.id}`}
+                  checked={ws.muted}
+                  onCheckedChange={(muted) => onChangeWorkspaceMuted(ws.id, muted)}
+                  data-testid={`per-workspace-mute-switch-${ws.id}`}
+                />
+              </SettingRow>
+            ))}
           </div>
         )}
       </SettingsSection>
@@ -4204,7 +4282,7 @@ export function NotificationsView(props: NotificationsViewProps) {
 function TabNotifications() {
   const t = useT();
   const notificationSoundEnabled  = useStore((s) => s.notificationSoundEnabled);
-  const toggleNotificationSound   = useStore((s) => s.toggleNotificationSound);
+  const setNotificationSoundEnabled = useStore((s) => s.setNotificationSoundEnabled);
   const toastEnabled              = useStore((s) => s.toastEnabled);
   const setToastEnabled           = useStore((s) => s.setToastEnabled);
   const notificationRingEnabled   = useStore((s) => s.notificationRingEnabled);
@@ -4246,7 +4324,7 @@ function TabNotifications() {
     <NotificationsView
       t={t}
       notificationSoundEnabled={notificationSoundEnabled}
-      onToggleNotificationSound={toggleNotificationSound}
+      onChangeNotificationSound={(on) => applyNotificationSound(on, setNotificationSoundEnabled, setNotificationSoundChoice)}
       toastEnabled={toastEnabled}
       onChangeToastEnabled={setToastEnabled}
       notificationRingEnabled={notificationRingEnabled}
@@ -4259,8 +4337,8 @@ function TabNotifications() {
       onChangePaneFlashEnabled={setPaneFlashEnabled}
       taskbarFlashEnabled={taskbarFlashEnabled}
       onChangeTaskbarFlashEnabled={setTaskbarFlashEnabled}
+      platform={window.electronAPI?.platform}
       notificationSoundChoice={notificationSoundChoice}
-      onChangeNotificationSoundChoice={setNotificationSoundChoice}
       mutedNotificationCategories={mutedNotificationCategories}
       onChangeCategoryMuted={setNotificationCategoryMuted}
       workspaces={workspaceRows}
@@ -4479,7 +4557,7 @@ export function TabShortcuts() {
   const pluginPages = railPagePlugins(plugins).map((p) => pluginPageShortcut(p.name));
   const orphanedPages = (Object.keys(shortcutOverrides) as ShortcutActionId[])
     .filter((action) => isPluginPageShortcut(action) && !pluginPages.includes(action));
-  const visibleUnbound = [...UNBOUND_SHORTCUTS.map((e) => e.action), ...pluginPages, ...orphanedPages].filter((action) => {
+  const visibleUnbound = [...settingsUnboundRows(shortcutOverrides), ...pluginPages, ...orphanedPages].filter((action) => {
     const override = shortcutOverrides[action];
     return matchesShortcut(describe(action), typeof override === 'string' ? displayCombo(override, platform) : '');
   });
@@ -4606,42 +4684,42 @@ export function TabShortcuts() {
         {bindingEntries.length === 0 ? (
           <SettingNote>{t('settings.kb.noBindings')}</SettingNote>
         ) : (
+          // Laid out like the shortcut rows above: what it does on the left
+          // (the one menu that changes it), the key on the right.
           bindingEntries.map(([key, actionId]) => (
             <div key={key} className="settings-row settings-kbd-row">
-              <div className="flex items-center gap-3 min-w-0 flex-1">
+              <Select
+                aria-label={`${t('settings.prefixAction')} (${key})`}
+                className="settings-select settings-prefix-action min-w-0"
+                value={actionId}
+                onChange={(e) => {
+                  removePrefixBinding(key);
+                  setPrefixBinding(key, e.target.value);
+                }}
+              >
+                {PREFIX_ACTION_IDS.map((aid) => (
+                  <option key={aid} value={aid}>{prefixActionLabel(aid, t)}</option>
+                ))}
+              </Select>
+              <span className="flex items-center gap-3 shrink-0">
                 <button
                   type="button"
-                  className={`settings-kbd ${FOCUS_RING}`}
-                  // Fixed width so the action selects line up down the list.
-                  style={{ width: 88, justifyContent: 'center' }}
+                  className={`settings-kbd settings-kbd-hint ${FOCUS_RING}`}
                   onClick={() => setCapturingBindingKey(key)}
+                  title={t('settings.sc.changeKey')}
+                  aria-label={`${prefixActionLabel(actionId, t)} (${key}) — ${t('settings.sc.changeKey')}`}
                 >
                   {key}
                 </button>
-                <span className="text-[color:var(--text-muted)] shrink-0 inline-flex"><IconChevron /></span>
-                <Select
-                  aria-label={`${t('settings.prefixAction')} (${key})`}
-                  className="flex-1 min-w-0"
-                  value={actionId}
-                  onChange={(e) => {
-                    removePrefixBinding(key);
-                    setPrefixBinding(key, e.target.value);
-                  }}
+                <UiButton
+                  variant="icon"
+                  onClick={() => removePrefixBinding(key)}
+                  title={t('settings.kb.delete')}
+                  aria-label={t('settings.kb.delete')}
                 >
-                  {PREFIX_ACTION_IDS.map((aid) => (
-                    <option key={aid} value={aid}>{prefixActionLabel(aid, t)}</option>
-                  ))}
-                </Select>
-              </div>
-              <UiButton
-                variant="icon"
-                className="shrink-0"
-                onClick={() => removePrefixBinding(key)}
-                title={t('settings.kb.delete')}
-                aria-label={t('settings.kb.delete')}
-              >
-                <IconX size={12} />
-              </UiButton>
+                  <IconX size={12} />
+                </UiButton>
+              </span>
             </div>
           ))
         )}
@@ -4857,7 +4935,8 @@ interface FirstRunStatusViewProps {
 /**
  * Pure presentational block exported for renderToStaticMarkup tests.
  *
- * Renders the four status rows + the two action buttons. State + event wiring
+ * Renders the four status rows + the two action buttons, as rows of General's
+ * "Setup and reset" section (no section of its own). State + event wiring
  * lives in {@link TabFirstRunSetup}; this component just receives the data.
  */
 export function FirstRunStatusView({ status, onOpenWizard, onShowCheatSheet }: FirstRunStatusViewProps) {
@@ -4882,8 +4961,8 @@ export function FirstRunStatusView({ status, onOpenWizard, onShowCheatSheet }: F
   });
 
   return (
-    <SettingsSection id="firstrun" title={t('settings.firstRunSetup')} data-testid="first-run-setup-section">
-      <div className="settings-row" data-testid="first-run-setup-last-completed">
+    <>
+      <div className="settings-row scroll-mt-4" data-setting-id="firstrun" data-testid="first-run-setup-last-completed">
         <div className="flex items-center justify-between gap-4">
           <div className="min-w-0 flex flex-col gap-0.5">
             <span className="ui-field-label">{lastCompleted}</span>
@@ -4927,7 +5006,7 @@ export function FirstRunStatusView({ status, onOpenWizard, onShowCheatSheet }: F
           {status.status.claudeJsonPath}
         </SettingNote>
       )}
-    </SettingsSection>
+    </>
   );
 }
 
@@ -4999,7 +5078,7 @@ function TabAbout() {
             <span className="text-[11px] font-mono tabular-nums text-[color:var(--text-sub)]">v{__APP_VERSION__}</span>
           </div>
           <p data-setting-id="version" className="ui-field-description m-0 mt-0.5 truncate scroll-mt-4">
-            {t('settings.aboutTagline')}
+            {t(catalogKeysOn('version', window.electronAPI?.platform).labelKey)}
           </p>
         </div>
       </Card>
@@ -5222,7 +5301,9 @@ export default function SettingsPanel({ initialTab }: { initialTab?: string }) {
     () => matchSettings(
       searchQuery,
       t,
-      SETTINGS_CATALOG.filter((entry) => catalogEntryOnPlatform(entry, window.electronAPI?.platform)),
+      SETTINGS_CATALOG
+        .filter((entry) => catalogEntryOnPlatform(entry, window.electronAPI?.platform))
+        .map((entry) => catalogEntryFor(entry, window.electronAPI?.platform)),
     ),
     [searchQuery, t],
   );
@@ -5267,7 +5348,6 @@ export default function SettingsPanel({ initialTab }: { initialTab?: string }) {
     tokens:               { label: t('settings.tabTokens'),        icon: <IconAgents /> },
     browser:              { label: t('settings.tabBrowser'),       icon: <IconBrowser /> },
     'computer-use':       { label: t('settings.tabComputerUse'),   icon: <IconComputer /> },
-    plugins:              { label: t('plugins.settings.title'), icon: <IconPuzzle /> },
     remote:               { label: t('settings.tabRemote'),        icon: <IconRemoteDevices /> },
     lanlink:              { label: t('settings.tabLan'),           icon: <IconLanLink /> },
     about:                { label: t('settings.tabAbout'),         icon: <IconAbout /> },
@@ -5455,7 +5535,6 @@ export default function SettingsPanel({ initialTab }: { initialTab?: string }) {
           {activeTab === 'tokens'             && <TokenUsageTab onOpenTab={setActiveTab} />}
                     {activeTab === 'browser'            && <TabBrowser />}
                     {activeTab === 'computer-use'       && <TabComputerUse />}
-                    {activeTab === 'plugins'            && <PluginsSection />}
                     {activeTab === 'remote'             && <TabRemote />}
                     {activeTab === 'lanlink'            && <><LanConnectionsLink /><LanLinkSection /><A2aRemoteSection /><RemoteSpawnSection /></>}
                     {activeTab === 'about'              && <TabAbout />}

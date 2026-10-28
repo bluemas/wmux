@@ -11,10 +11,12 @@ import {
   parsePsOutput,
   resolveAgentSlug,
   selectAgentProcess,
+  selectCustomAgentProcess,
   tokenizeCmdline,
   type PidWatcher,
   type ProcessTreeEntry,
 } from '../AgentProcessTracker';
+import { stopAgentTree } from '../agentStop';
 
 const entry = (pid: number, ppid: number, name: string, cmdline?: string): ProcessTreeEntry => ({
   pid,
@@ -44,16 +46,17 @@ describe('fresh idle-shell evidence', () => {
 });
 
 describe('parsePipeDelimited', () => {
-  it('parses pid|ppid|name|cmdline lines, rejoining pipes inside the cmdline', () => {
+  it('parses pid|ppid|created|name|cmdline lines, rejoining pipes inside the cmdline', () => {
     const out = parsePipeDelimited(
-      'Windows PowerShell banner\r\n4|0|System\r\n123|4|pwsh.exe\r\n\r\nnot-a-line\r\n'
-        + '77|123|claude.exe|claude --foo|bar\r\n'
-        + '78|123|codex.exe\r\n',
+      'Windows PowerShell banner\r\n4|0||System\r\n123|4|1792407685810|pwsh.exe\r\n\r\nnot-a-line\r\n'
+        + '77|123|1792407690000|claude.exe|claude --foo|bar\r\n'
+        + '78|123||codex.exe\r\n'
+        + '79|123|claude.exe\r\n',
     );
     expect(out).toEqual([
       entry(4, 0, 'System'),
-      entry(123, 4, 'pwsh.exe'),
-      entry(77, 123, 'claude.exe', 'claude --foo|bar'),
+      { ...entry(123, 4, 'pwsh.exe'), created: 1792407685810 },
+      { ...entry(77, 123, 'claude.exe', 'claude --foo|bar'), created: 1792407690000 },
       entry(78, 123, 'codex.exe'),
     ]);
   });
@@ -221,6 +224,50 @@ describe('selectAgentProcess', () => {
     const table = [entry(200, SHELL, 'kiro-cli')];
     expect(selectAgentProcess(table, SHELL)).toEqual({ pid: 200, slug: 'kiro' });
   });
+
+  it('names a version binary run by its path in the agent\'s install directory under the home', () => {
+    const HOME = '/Users/dev';
+    const slug = (name: string, cmdline = name, home = HOME) => selectAgentProcess([entry(200, SHELL, name, cmdline)], SHELL, home)?.slug;
+    const claude = `${HOME}/.local/share/claude/versions/2.1.311`;
+    expect(slug(claude)).toBe('claude');
+    expect(slug(`${HOME}/.grok/downloads/grok-1.0.52-macos-aarch64`)).toBe('grok');
+    // Another home, a versions directory elsewhere, a node script, a name that is no version.
+    expect(slug(claude, claude, '/Users/other')).toBeUndefined();
+    expect(slug('/work/claude/versions/1.2.3')).toBeUndefined();
+    expect(slug('node', 'node /work/claude/x.js')).toBeUndefined();
+    expect(slug(`${HOME}/.local/share/claude/versions/latest`)).toBeUndefined();
+    expect(slug('.local/share/claude/versions/2.1.311')).toBeUndefined();
+    // Look-alike directories and homes, and grok's name outside its directory.
+    expect(slug(`${HOME}/.local/share/claude-versions/2.1.311`)).toBeUndefined();
+    expect(slug(`${HOME}/.local/share/claude/versions-old/2.1.311`)).toBeUndefined();
+    expect(slug(`${HOME}x/.local/share/claude/versions/2.1.311`)).toBeUndefined();
+    expect(slug(`${HOME}/.local/share/claude/versions/2.1.311`.toUpperCase())).toBeUndefined();
+    expect(slug('/tmp/.grok/downloads/grok-1.0.52-macos-aarch64')).toBeUndefined();
+    // Only a bare version name: not a temporary, backup or wrapper file beside it.
+    expect(slug(`${HOME}/.local/share/claude/versions/2.1.312.tmp`)).toBeUndefined();
+    expect(slug(`${HOME}/.local/share/claude/versions/2.1.311.old`)).toBeUndefined();
+    expect(slug(`${HOME}/.local/share/claude/versions/2.1.311-wrapper`)).toBeUndefined();
+    // The path is compared normalized.
+    expect(slug(`${HOME}//.local/share/claude/./versions/2.1.311`)).toBe('claude');
+    expect(slug(`${HOME}/.local/share/claude/versions/../versions/2.1.311`)).toBe('claude');
+  });
+
+  it('a claude that re-execs into a new version binary keeps its name', () => {
+    const HOME = '/Users/dev';
+    const next = `${HOME}/.local/share/claude/versions/2.1.312`;
+    // The same pid, now argv0 is the new version's path, with the old arguments.
+    expect(selectAgentProcess([entry(200, SHELL, next, `${next} --resume abc`)], SHELL, HOME)).toEqual({ pid: 200, slug: 'claude' });
+    // An exec-rooted pane: the PTY root itself is the version binary.
+    expect(selectAgentProcess([entry(SHELL, 1, next, `${next} -c`), entry(300, SHELL, 'node', 'node /tmp/mcp.js')], SHELL, HOME))
+      .toEqual({ pid: SHELL, slug: 'claude' });
+  });
+
+  it('on Windows a version binary is not named: its path is only in the self-reported command line', () => {
+    const HOME = 'C:\\Users\\Dev';
+    const claims = '"C:\\Users\\Dev\\.local\\share\\claude\\versions\\2.1.311.exe" --resume abc';
+    expect(selectAgentProcess([entry(200, SHELL, '2.1.311.exe', claims)], SHELL, HOME)).toEqual({ pid: 200 });
+    expect(selectAgentProcess([entry(200, SHELL, 'foo.exe', claims)], SHELL, HOME)).toEqual({ pid: 200 });
+  });
 });
 
 // ── tracker lifecycle ────────────────────────────────────────────────────────
@@ -306,6 +353,22 @@ describe('AgentProcessTracker', () => {
     expect(await tracker.stillRunning([entry(999, 200, 'node')])).toEqual([]);
     expect(tracker.statusFor('s1')).toBe(true);
     expect(watcher.watches.has('agent:s1')).toBe(true);
+  });
+
+  it('processesWithArg: the marker in argv, and on Windows an agent image whose argv cannot be read', async () => {
+    const MARK = '0f8fad5b-d9cb-469f-a165-70867728950e';
+    const table = [
+      entry(300, 1, 'claude.exe', `claude --resume ${MARK}`),
+      entry(301, 1, 'node.exe'),
+      entry(302, 1, 'Bun.exe', ''),
+      entry(303, 1, 'svchost.exe'),
+      entry(304, 1, 'node.exe', 'node other.js'),
+    ];
+    const win = new AgentProcessTracker(makeWatcher(), async () => table, undefined, undefined, undefined, 'win32');
+    expect((await win.processesWithArg(MARK)).map((e) => e.pid)).toEqual([300, 301, 302]);
+    // Elsewhere ps always prints argv: only the marker counts.
+    const mac = new AgentProcessTracker(makeWatcher(), async () => table, undefined, undefined, undefined, 'darwin');
+    expect((await mac.processesWithArg(MARK)).map((e) => e.pid)).toEqual([300]);
   });
 
   it('a reused pid is no longer the agent: the confirming read records its death edge', async () => {
@@ -459,6 +522,104 @@ describe('AgentProcessTracker', () => {
     // The scoped launcher script names no agent; the native binary does.
     expect(watcher.watches.get('agent:s1')?.pid).toBe(201);
     expect(listener).toHaveBeenCalledWith('s1', { slug: 'codex', alive: true, observedAt: expect.any(Number) });
+  });
+
+  it('labels a pane with its custom agent beside the tracked agent, never as it', async () => {
+    // "Tern" is a made-up CLI the operator defined (Settings → Custom agents).
+    const watcher = makeWatcher();
+    const listener = vi.fn();
+    const table = [entry(200, SHELL, 'sh', 'sh /usr/local/bin/tern --fast')];
+    const tracker = new AgentProcessTracker(watcher, async () => table);
+    tracker.setStateChangeListener(listener);
+    tracker.setCustomAgentNames(() => new Map([['tern', 'Tern']]));
+    tracker.armIfAgent('s1', SHELL);
+    await flush();
+    expect(tracker.customAgentNameFor('s1')).toBe('Tern');
+    // No tracked agent and no edge: the label is all it gets.
+    expect(tracker.identityFor('s1')).toBeUndefined();
+    expect(listener).not.toHaveBeenCalled();
+    watcher.watches.get('custom-agent:s1')?.onDead();
+    expect(tracker.customAgentNameFor('s1')).toBeUndefined();
+  });
+
+  it('tracks the registry agent a custom wrapper starts, and keeps the wrapper label after it exits', async () => {
+    const watcher = makeWatcher();
+    // Both at the first probe: the wrapper and its agent.
+    let table = [entry(200, SHELL, 'tern'), entry(201, 200, 'claude')];
+    const tracker = new AgentProcessTracker(watcher, async () => table);
+    tracker.setCustomAgentNames(() => new Map([['tern', 'Tern']]));
+    tracker.armIfAgent('s1', SHELL);
+    await flush();
+    expect(tracker.identityFor('s1')).toEqual({ slug: 'claude', alive: true });
+    expect(tracker.customAgentNameFor('s1')).toBe('Tern');
+    table = [entry(200, SHELL, 'tern')];
+    watcher.watches.get('agent:s1')?.onDead();
+    await flush();
+    expect(tracker.identityFor('s1')).toEqual({ slug: 'claude', alive: false });
+    expect(tracker.customAgentNameFor('s1')).toBe('Tern');
+  });
+
+  it('drops the label when the wrapper execs a registry agent, or execs away when its agent exits', async () => {
+    const watcher = makeWatcher();
+    let table = [entry(200, SHELL, 'sh', 'sh /usr/local/bin/tern')];
+    const tracker = new AgentProcessTracker(watcher, async () => table);
+    tracker.setCustomAgentNames(() => new Map([['tern', 'Tern']]));
+    tracker.armIfAgent('s1', SHELL);
+    await flush();
+    // `exec codex`: the same pid now runs codex. The banner's arm names it.
+    table = [entry(200, SHELL, 'codex')];
+    tracker.arm('s1', SHELL);
+    await flush();
+    expect(tracker.identityFor('s1')).toEqual({ slug: 'codex', alive: true });
+    expect(tracker.customAgentNameFor('s1')).toBeUndefined();
+
+    // `claude; exec $SHELL`: when claude exits, the wrapper's pid is a shell.
+    table = [entry(300, SHELL, 'tern'), entry(301, 300, 'claude')];
+    tracker.disarm('s1');
+    tracker.arm('s1', SHELL);
+    await flush();
+    expect(tracker.customAgentNameFor('s1')).toBe('Tern');
+    table = [entry(300, SHELL, 'zsh')];
+    watcher.watches.get('agent:s1')?.onDead();
+    await flush();
+    await flush();
+    expect(tracker.customAgentNameFor('s1')).toBeUndefined();
+  });
+
+  it('selectCustomAgentProcess matches an image or what a shell, cmd, PowerShell or runtime runs', () => {
+    const names = new Map([['tern', 'Tern'], ['gull', 'Gull'], ['tern-daemon', 'Tern']]);
+    const pick = (image: string, cmdline?: string) => selectCustomAgentProcess([entry(200, SHELL, image, cmdline)], SHELL, names);
+    expect(pick('/opt/gull/bin/gull')).toEqual({ pid: 200, name: 'gull' });
+    expect(pick('ternary')).toBeUndefined();
+    // A bare script name is the user's own file.
+    expect(pick('bash', 'bash tern')).toBeUndefined();
+    expect(pick('bash', 'bash /usr/local/bin/tern -c x')).toEqual({ pid: 200, name: 'tern' });
+    // `-c`: the program its command starts with (a PATH name counts), never another word.
+    expect(pick('sh', "sh -c '/opt/tern/bin/tern --fast'")).toEqual({ pid: 200, name: 'tern' });
+    expect(pick('sh', "sh -c 'tern --fast'")).toEqual({ pid: 200, name: 'tern' });
+    expect(pick('bash', 'bash -c "tail -f /var/log/tern"')).toBeUndefined();
+    expect(pick('sh', "sh -lc 'make -C /home/u/src/tern'")).toBeUndefined();
+    // cmd /c, with an outer quote pair and a spaced path; /k is not a launch.
+    expect(pick('cmd.exe', 'cmd.exe /d /s /c "C:\\Tools\\tern.cmd --fast"')).toEqual({ pid: 200, name: 'tern' });
+    expect(pick('cmd.exe', 'cmd.exe /d /s /c ""C:\\Program Files\\Tern\\tern.cmd" --fast"')).toEqual({ pid: 200, name: 'tern' });
+    expect(pick('cmd.exe', 'cmd.exe /k C:\\Tools\\tern.cmd')).toBeUndefined();
+    expect(pick('cmd.exe', 'cmd.exe /c ""C:\\Program Files\\Tern\\tern" --fast"')).toEqual({ pid: 200, name: 'tern' });
+    expect(pick('cmd.exe', 'cmd.exe /c "C:\\Program Files\\Tern\\tern"')).toEqual({ pid: 200, name: 'tern' });
+    expect(pick('cmd.exe', 'cmd.exe /c "tail -f /var/log/tern"')).toBeUndefined();
+    expect(pick('pwsh.exe', 'pwsh.exe -NoProfile -File C:\\Tools\\tern.ps1')).toEqual({ pid: 200, name: 'tern' });
+    for (const cmdline of [
+      'node C:\\Users\\x\\AppData\\Roaming\\npm\\node_modules\\tern\\bin\\cli.js',
+      'python3.12 /opt/tern/tern.py',
+      'node --max-old-space-size=4096 /usr/local/bin/tern',
+      'npx -y tern',
+    ]) expect(pick(cmdline.split(' ')[0], cmdline), cmdline).toEqual({ pid: 200, name: 'tern' });
+    expect(pick('npx', 'npx -y @acme/tern')).toBeUndefined();
+    // A package boundary under a shell host.
+    expect(selectCustomAgentProcess([entry(200, SHELL, 'sh', 'sh /usr/local/lib/node_modules/tern-cli/bin/run.sh')], SHELL, new Map([['tern-cli', 'Tern']])))
+      .toEqual({ pid: 200, name: 'tern-cli' });
+    // Two agents at one depth: none. Two process names of one agent: that agent.
+    expect(selectCustomAgentProcess([entry(200, SHELL, 'tern'), entry(201, SHELL, 'gull')], SHELL, names)).toBeUndefined();
+    expect(selectCustomAgentProcess([entry(200, SHELL, 'tern'), entry(201, SHELL, 'tern-daemon')], SHELL, names)).toEqual({ pid: 200, name: 'tern' });
   });
 
   it('armIfAgent leaves no trace for a non-agent command and backs off only itself', async () => {
@@ -726,6 +887,145 @@ describe('owned native agent root', () => {
   });
 });
 
+// Windows never reparents: a process whose parent died before the agent
+// started keeps that parent's pid, which the agent may have reused.
+describe('the agent tree on Windows is dated', () => {
+  const dated = (pid: number, ppid: number, name: string, created?: number): ProcessTreeEntry =>
+    ({ ...entry(pid, ppid, name), ...(created !== undefined ? { created } : {}) });
+  const SHELL = dated(100, 1, 'pwsh.exe', 1_000);
+  const AGENT = dated(200, 100, 'claude.exe', 2_000);
+  const pids = (es: readonly ProcessTreeEntry[] | undefined) => (es ?? []).map((e) => e.pid);
+
+  async function armed(table: () => ProcessTreeEntry[], platform: NodeJS.Platform = 'win32') {
+    const tracker = new AgentProcessTracker(makeWatcher(), async () => table(), async () => '/Users/dev/.local/share/claude/versions/2.1.307',
+      '/Users/dev', {}, platform);
+    tracker.arm('s1', SHELL.pid);
+    await flush();
+    return tracker;
+  }
+
+  it('leaves out a process older than the agent, and everything under it', async () => {
+    const table = [SHELL, AGENT,
+      dated(201, 200, 'node.exe', 2_500), dated(202, 201, 'node.exe', 2_600),
+      // Started before the agent, under a dead parent that had pid 200.
+      dated(300, 200, 'Code.exe', 1_500), dated(301, 300, 'Code.exe', 3_000)];
+    const tree = await (await armed(() => table)).agentProcessTree('s1', 'claude');
+    expect(tree?.root.pid).toBe(200);
+    expect(pids(tree?.descendants)).toEqual([201, 202]);
+    expect(pids(tree?.uncertain)).toEqual([]);
+  });
+
+  it('a child started in the same millisecond as its parent is uncertain, with everything under it', async () => {
+    const table = [SHELL, AGENT, dated(201, 200, 'node.exe', 2_000), dated(202, 201, 'node.exe', 2_500)];
+    const tree = await (await armed(() => table)).agentProcessTree('s1', 'claude');
+    expect(pids(tree?.descendants)).toEqual([]);
+    expect(pids(tree?.uncertain)).toEqual([201, 202]);
+  });
+
+  it('a process whose age cannot be read is uncertain, with everything under it', async () => {
+    const table = [SHELL, AGENT, dated(400, 200, 'node.exe'), dated(401, 400, 'node.exe', 3_000),
+      // Under an undated parent but older than the agent: not below it.
+      dated(402, 400, 'Code.exe', 1_500)];
+    const tree = await (await armed(() => table)).agentProcessTree('s1', 'claude');
+    expect(pids(tree?.descendants)).toEqual([]);
+    expect(pids(tree?.uncertain)).toEqual([400, 401]);
+  });
+
+  it('a stop kills the agent\'s own children and never the older process', async () => {
+    const alive = new Set([100, 200, 201, 300]);
+    const table = [SHELL, AGENT, dated(201, 200, 'node.exe', 2_500), dated(300, 200, 'Code.exe', 1_500)];
+    const tracker = await armed(() => table.filter((e) => alive.has(e.pid)));
+    const kill = vi.fn((pid: number) => { alive.delete(pid); });
+    const r = await stopAgentTree({
+      tree: () => tracker.agentProcessTree('s1', 'claude'),
+      stillRunning: (es) => tracker.liveness(es),
+      kill,
+      sleep: async () => undefined,
+    });
+    expect(kill.mock.calls).toEqual([[200, 'SIGTERM'], [201, 'SIGKILL']]);
+    expect(r).toEqual({ ok: true, stopped: true, pid: 200, killed: 2 });
+    expect(alive.has(300)).toBe(true);
+  });
+
+  it('a stop never signals an undated process, and is not confirmed while it runs', async () => {
+    const alive = new Set([100, 200, 400]);
+    const table = [SHELL, AGENT, dated(400, 200, 'node.exe')];
+    const tracker = await armed(() => table.filter((e) => alive.has(e.pid)));
+    const kill = vi.fn((pid: number) => { alive.delete(pid); });
+    const r = await stopAgentTree({
+      tree: () => tracker.agentProcessTree('s1', 'claude'),
+      stillRunning: (es) => tracker.liveness(es),
+      kill,
+      sleep: async () => undefined,
+    });
+    expect(kill.mock.calls).toEqual([[200, 'SIGTERM']]);
+    expect(r).toEqual({ ok: false, code: 'still_running', pid: 200 });
+  });
+
+  it('a process is the same one only with the same creation time', async () => {
+    const mcp = dated(201, 200, 'node.exe', 2_500);
+    let table = [SHELL, AGENT, mcp];
+    const tracker = await armed(() => table);
+    expect(await tracker.liveness([mcp])).toEqual({ same: [mcp], unsure: [] });
+    // The pid taken by the same program with the same arguments, started later.
+    table = [SHELL, AGENT, dated(201, 200, 'node.exe', 4_000)];
+    expect(await tracker.liveness([mcp])).toEqual({ same: [], unsure: [] });
+    expect(await tracker.stillRunning([mcp])).toEqual([]);
+    // A creation time missing on either side proves nothing either way.
+    table = [SHELL, AGENT, dated(201, 200, 'node.exe')];
+    expect(await tracker.liveness([mcp])).toEqual({ same: [], unsure: [mcp] });
+    expect(await tracker.stillRunning([mcp])).toEqual([mcp]);
+  });
+
+  it('a stop never kills a process that took a tree pid during the grace', async () => {
+    let table = [SHELL, AGENT, dated(201, 200, 'node.exe', 2_500)];
+    const tracker = await armed(() => table);
+    const kill = vi.fn((pid: number) => {
+      // The agent exits with its MCP server, and an identical server started
+      // by something else gets pid 201 before the grace ends.
+      if (pid === 200) table = [SHELL, dated(201, 999, 'node.exe', 6_000)];
+      else table = table.filter((e) => e.pid !== pid);
+    });
+    const r = await stopAgentTree({
+      tree: () => tracker.agentProcessTree('s1', 'claude'),
+      stillRunning: (es) => tracker.liveness(es),
+      kill,
+      sleep: async () => undefined,
+    });
+    expect(kill.mock.calls).toEqual([[200, 'SIGTERM']]);
+    expect(r).toEqual({ ok: true, stopped: true, pid: 200, killed: 2 });
+  });
+
+  it('a stop never kills a tree process a later read cannot date, and is not confirmed while it runs', async () => {
+    let table = [SHELL, AGENT, dated(201, 200, 'node.exe', 2_500)];
+    const tracker = await armed(() => table);
+    const kill = vi.fn((pid: number) => {
+      if (pid === 200) table = [SHELL, dated(201, 200, 'node.exe')];
+      else table = table.filter((e) => e.pid !== pid);
+    });
+    const r = await stopAgentTree({
+      tree: () => tracker.agentProcessTree('s1', 'claude'),
+      stillRunning: (es) => tracker.liveness(es),
+      kill,
+      sleep: async () => undefined,
+    });
+    expect(kill.mock.calls).toEqual([[200, 'SIGTERM']]);
+    expect(r).toEqual({ ok: false, code: 'still_running', pid: 200 });
+  });
+
+  it('POSIX reparents, so its tree is the plain ppid walk', async () => {
+    const table = [SHELL, dated(200, 100, 'claude', 2_000), dated(201, 200, 'node', 1_500), dated(202, 200, 'node')];
+    const tracker = await armed(() => table, 'linux');
+    const tree = await tracker.agentProcessTree('s1', 'claude');
+    expect(tree?.root.pid).toBe(200);
+    expect(pids(tree?.descendants)).toEqual([201, 202]);
+    expect(pids(tree?.uncertain)).toEqual([]);
+    // Nor is a creation time part of a process's identity there.
+    const later = [dated(201, 200, 'node', 9_000), dated(202, 200, 'node', 9_000)];
+    expect(await tracker.liveness(later)).toEqual({ same: later, unsure: [] });
+  });
+});
+
 const imageTracker = (table: ProcessTreeEntry[], readImage: (pid: number) => Promise<string | undefined>, platform: NodeJS.Platform) =>
   new AgentProcessTracker(makeWatcher(), async () => table, readImage, '/Users/dev', {}, platform);
 
@@ -800,6 +1100,8 @@ describe.skipIf(process.platform === 'win32')('the real executable backs the age
     fs.symlinkSync(real, path.join(root, 'home-link'));
     const image = path.join(real, '.local/share/claude/versions/2.1.307');
     expect(isAgentImage(entry(200, 100, 'claude'), 'claude', image, path.join(root, 'home-link'))).toBe(true);
+    // Run by its resolved path, it is named the same way.
+    expect(selectAgentProcess([entry(200, 100, image, image)], 100, path.join(root, 'home-link'))).toEqual({ pid: 200, slug: 'claude' });
   });
 
   it('a runtime-hosted agent runs a script inside that agent\'s installed package', () => {
@@ -848,6 +1150,27 @@ describe.skipIf(process.platform === 'win32')('the real executable backs the age
     expect(await live.verifyLive('s1', 'claude')).toBe(true);
     expect(await live.isAgentRunning('s1', 'claude', async () => true)).toBe(true);
     expect(real).toHaveBeenCalledTimes(1);
+  });
+
+  it('a version binary run by its full path is named, and verified by its home-anchored image', async () => {
+    const bin = `${HOME}/.local/share/claude/versions/2.1.311`;
+    const table = [entry(100, 1, 'zsh'), entry(200, 100, bin, `${bin} --model opus`)];
+    const live = imageTracker(table, async () => bin, 'darwin');
+    live.arm('s1', 100);
+    await flush();
+    expect(live.identityFor('s1')).toEqual({ slug: 'claude', alive: true });
+    expect(await live.verifyLive('s1', 'claude')).toBe(true);
+    expect(await live.isAgentRunning('s1', 'claude', async () => true)).toBe(true);
+    // The argv names claude, but the running binary is something else.
+    const renamed = imageTracker(table, async () => '/bin/sleep', 'darwin');
+    renamed.arm('s1', 100);
+    await flush();
+    expect(await renamed.verifyLive('s1', 'claude')).toBe(false);
+    // Under another home the path names no agent at all.
+    const other = new AgentProcessTracker(makeWatcher(), async () => table, async () => bin, '/Users/other', {}, 'darwin');
+    other.arm('s1', 100);
+    await flush();
+    expect(await other.verifyLive('s1', 'claude')).toBe(false);
   });
 
   it('a failed image read is not cached: the next check reads again', async () => {

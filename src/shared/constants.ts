@@ -157,10 +157,14 @@ export const IPC = {
   FANOUT_REQUIRE_APPROVAL_SET: 'fanout:requireApproval:set',
   FANOUT_TRUST_AGY_FOLDERS_GET: 'fanout:trustAgyFolders:get',
   FANOUT_TRUST_AGY_FOLDERS_SET: 'fanout:trustAgyFolders:set',
+  WORKER_FENCE_OFF_GET: 'workerFence:off:get',
+  WORKER_FENCE_OFF_SET: 'workerFence:off:set',
   FANOUT_AUDIT_RECENT: 'fanout:audit:recent',
   FANOUT_LINEAGE: 'fanout:lineage',
   FANOUT_PRESETS_GET: 'fanout:presets:get',
   FANOUT_PRESETS_SET: 'fanout:presets:set',
+  FANOUT_CUSTOM_AGENTS_GET: 'fanout:customAgents:get',
+  FANOUT_CUSTOM_AGENTS_SET: 'fanout:customAgents:set',
   // J3 태스크 수명주기 — renderer → main(파이프 미노출, channelLocal과 동일 trust).
   //  TASK_CLOSE: remove 성공→close 커밋 순서 오케스트레이션(TaskCloseService).
   //  TASK_CREATE_PR: gh 4중 게이트 1클릭 PR(TaskPrService).
@@ -293,6 +297,8 @@ export const IPC = {
   CLIPBOARD_READ: 'clipboard:read',
   CLIPBOARD_READ_IMAGE: 'clipboard:read-image',
   CLIPBOARD_HAS_IMAGE: 'clipboard:has-image',
+  /** The remote-session client (`ssh`) in a pane's foreground, or null. */
+  CLIPBOARD_PANE_REMOTE_SHELL: 'clipboard:pane-remote-shell',
   /** Write text that main takes back off the clipboard at its expiry or on quit. */
   CLIPBOARD_WRITE_EPHEMERAL: 'clipboard:write-ephemeral',
   /** Clear the ephemeral text unless it equals the still-valid value passed. */
@@ -369,6 +375,8 @@ export const IPC = {
   BROWSER_HELP_OPEN: 'browser:help-open',
   BROWSER_HELP_RESOLVE: 'browser:help-resolve',
   BROWSER_HELP_CLOSED: 'browser:help-closed',
+  /** main → renderer: an unbound workspace's browser call used the shared default Chrome profile. */
+  CHROME_PROFILE_FALLBACK: 'browser:chrome-profile-fallback',
   // #898 — main → renderer push, once at startup, when a Claude Code plugin
   // install is found whose bridge still forces a permission prompt. wmux
   // refreshes its OWN copy of the bridge but never the plugin's, so this tells
@@ -484,6 +492,7 @@ export const IPC = {
   // factoryStop.ts): turns, gates, workers; main window only.
   FACTORY_STOP_ALL: 'factory:stop:all',
   FACTORY_STOP_BOT: 'factory:stop:bot',
+  FACTORY_BOT_NEW_CONVERSATION: 'factory:bot:newConversation',
   // Stop one bot task's worker (factoryStop.ts stopFactoryTask): its row
   // cancelled, its gate and worker stopped; main window only.
   FACTORY_STOP_TASK: 'factory:stop:task',
@@ -497,6 +506,14 @@ export const IPC = {
   // model turn, and the Claude sign-in (shared/factoryEngine.ts); main window only.
   FACTORY_ENGINE_READINESS: 'factory:engine:readiness',
   FACTORY_ENGINE_LOGIN: 'factory:engine:login',
+  // Whether the Hermes bot engine can run here, checked without a model turn,
+  // and its one-time model setup in a terminal tab (shared/hermesEngine.ts);
+  // main window only.
+  FACTORY_HERMES_READINESS: 'factory:hermes:readiness',
+  FACTORY_HERMES_SETUP: 'factory:hermes:setup',
+  // The owner picks a bot's engine (Claude (SDK) or Hermes); main window only.
+  // The pipe's bot.create / bot.update keep the bot's ACP engine as it is.
+  FACTORY_BOT_SET_ENGINE: 'factory:bot:setEngine',
   // The engines a bot's workers may run on that are installed here
   // (shared/botWorkerAgent.ts); main window only.
   FACTORY_WORKER_AGENTS: 'factory:worker:agents',
@@ -591,6 +608,10 @@ export const IPC = {
   // "지금 새로고침" button). Triggers an immediate poll regardless of
   // interval timing. Caller enforces a UI-side cooldown (5 min).
   USAGE_REFRESH: 'usage:refresh',
+  // Usage reserve (main/usage/usageReserve.ts): renderer ↔ main read and
+  // write of the setting, which main persists and enforces.
+  USAGE_RESERVE_GET: 'usage:reserve:get',
+  USAGE_RESERVE_SET: 'usage:reserve:set',
   // Pane usage-limit pause (shared/usageLimit). Main → renderer push of one
   // pane's limit (`{ ptyId, limit: PaneUsageLimit | null }`, null = cleared),
   // renderer → main list on boot, and renderer → main edits (auto-resume,
@@ -720,6 +741,8 @@ export const IPC = {
   // LanLink PR-3 control plane (renderer → main → daemon control pipe).
   LANLINK_STATUS: 'lanlink:status',
   LANLINK_CONFIGURE: 'lanlink:configure',
+  // main → renderer nudge: the daemon's LanLink listener state may have changed.
+  LANLINK_STATUS_CHANGED: 'lanlink:status:changed',
   // LanLink PR-5 pairing/peer control plane (renderer → main → daemon control pipe).
   // These bridge the PR-4 daemon control-pipe RPCs (machine-local, never on the LAN
   // net.Server) to the Settings pairing UI. Outbound-only (pair/send); no PTY paste.
@@ -732,6 +755,12 @@ export const IPC = {
   LANLINK_PEERS_REMOVE: 'lanlink:peers:remove',
   // Cross-host A2A control plane (Settings → LAN → renderer → main → daemon
   // control pipe `a2a.remote.*`).
+  // Remote pairing's firewall and port problems (net.* in the daemon; the Fix runs in main).
+  NET_FIREWALL_STATUS: 'netFirewall:status',
+  NET_FIREWALL_FIX: 'netFirewall:fix',
+  NET_FIREWALL_REMOVE: 'netFirewall:remove',
+  NET_FIREWALL_OPEN: 'netFirewall:open',
+  NET_LISTEN_PROBLEM: 'netFirewall:listenProblem',
   A2A_REMOTE_STATUS: 'a2aRemote:status',
   A2A_REMOTE_CONFIGURE: 'a2aRemote:configure',
   A2A_REMOTE_PAIR_BEGIN: 'a2aRemote:pair:begin',
@@ -792,6 +821,8 @@ export const IPC = {
   AUTOMATION_GRANT: 'automation:grant',
   AUTOMATION_RUN_NOW: 'automation:runNow',
   AUTOMATION_CANCEL_RUN: 'automation:cancelRun',
+  AUTOMATION_SETTINGS: 'automation:settings',
+  AUTOMATION_SET_SETTINGS: 'automation:setSettings',
   AUTOMATION_PUSH: 'automation:push',
   AUTOMATION_OPEN_RUN: 'automation:openRun',
   AUTOMATION_TOAST_LABELS: 'automation:toastLabels',

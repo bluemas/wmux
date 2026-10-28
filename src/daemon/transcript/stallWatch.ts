@@ -1,0 +1,590 @@
+// StallWatch — says when a Claude turn in a terminal pane seems stuck.
+//
+// A running Claude repaints its spinner about every 100 ms for the whole turn,
+// so terminal bytes never go quiet and cannot tell a stall from work. What can:
+// the agent's own transcript, which it appends to as a turn makes progress, and
+// the token counter on its spinner row. Rules, each from a way this goes wrong:
+//
+//   - Claude only. Codex has not been measured, and any other agent has no
+//     transcript reader. No binding, no transcript, no mid-turn: no alert.
+//   - Silence is measured on the transcript itself (size and mtime, stat-polled
+//     here: TranscriptActivityWatcher stops for hook-fed sessions).
+//   - A tool in flight is never a stall: a `tool_use` with no `tool_result`
+//     since the last prompt (a subagent's `Agent` call stays open until the
+//     subagent returns), or a tool_started hook after the last append. Build
+//     and test runs are the common long quiet. A tail that cannot show the
+//     whole turn counts as unknown.
+//   - Extended thinking writes nothing for minutes (246 s measured at 33k
+//     tokens), and the spinner row shows no token count, or only an earlier
+//     one, while it thinks. So the short threshold applies only while a visible
+//     token count, outside a thinking phase, stays frozen for the whole window;
+//     anything else falls back to the long transcript-only threshold.
+//   - The agent must still say it is running: its spinner row or its running
+//     title. A turn the daemon still holds open with neither is not reported.
+//   - Waiting on the human (a dialog, an approval) is not silence.
+//   - Keep waiting doubles the threshold for that turn only; a new prompt or a
+//     new turn resets it. Never stops anything on its own.
+//
+// A busy turn can also go nowhere: auto-compaction, re-reading the same files,
+// compaction again, each round writing to the transcript and so never silent,
+// while it spends the account's usage limit. So a second rule, spinning: within
+// one turn, SPIN_COMPACTIONS compaction summaries with no edit-type tool call
+// since the first of them (Edit, Write, MultiEdit, NotebookEdit, or a shell
+// call that runs `git commit`). The turn is followed from its start through
+// the projector's own incremental reader, since a spinning turn runs to
+// megabytes; one whose start is not in the first read counts as unknown, and
+// the reading outlives a one-tick gap. It raises the same alert with the
+// count, only while the agent says it is running; waiting on the human clears
+// it until the next compaction. Keep waiting doubles the count for that turn.
+import fs from 'node:fs';
+import type { ResumeBinding } from '../../shared/agentResume';
+import type { AgentSlug } from '../../shared/agentIdentity';
+import type { ChatInterruptResult, TurnEvent } from '../../shared/transcript/turnEvents';
+import type { StallPrefillResult } from '../../shared/types';
+import { formatBracketedPastePayload } from '../../shared/ptyMessageDelivery';
+import { screenShowsRunningTurn } from './chatScreenGate';
+import { claudeComposerEmpty, claudeComposerVisible, type ChatScreenRows } from './deliverChatPrompt';
+import { contentBlocks, isObject, PENDING_TOOL_USE_TAIL_BYTES } from './pendingToolUse';
+import { COMPACTED_LABEL, parseTranscriptLine } from './parseEntry';
+import { readTranscriptDelta, readTranscriptPage } from './readTail';
+
+/** The one agent whose turns are watched: the rules below read Claude's own
+ *  spinner row, composer and transcript. Codex waits until it is measured. */
+export const STALL_AGENT = 'claude' satisfies AgentSlug;
+
+/** Silence with a frozen, visible token count. */
+export const STALL_COUNTER_MS = 180_000;
+/** Silence when the token count cannot be read for the whole window. */
+export const STALL_FALLBACK_MS = 600_000;
+export const STALL_TICK_MS = 10_000;
+/** Compactions in one turn, with no edit since the first, that read as spinning. */
+export const SPIN_COMPACTIONS = 3;
+/** Delta reads per tick, each bounded by the reader: a fast writer is caught up over a few ticks. */
+const SPIN_READS_PER_TICK = 8;
+
+export interface StallWatchDeps {
+  listSessionIds: () => string[];
+  getBinding: (id: string) => ResumeBinding | undefined;
+  /** The running turn's id while the daemon has the agent mid-turn, else null. */
+  midTurn: (id: string) => string | null;
+  /** A dialog or an approval waits on the human. */
+  awaitingHuman: (id: string) => boolean;
+  readScreen: (id: string) => Promise<readonly string[] | null>;
+  /** The agent's window title shows its running spinner, freshly set. */
+  titleRunning?: (id: string) => boolean;
+  /** `compactions` is set when the turn is spinning (compacting without editing), not silent. */
+  emit: (id: string, stalledSince: number | null, compactions?: number) => void;
+  stat?: (path: string) => { size: number; mtimeMs: number } | null;
+  /** True/false; null when the tail cannot tell. */
+  toolInFlight?: (path: string) => boolean | null;
+  now?: () => number;
+}
+
+interface Watch {
+  turn: string;
+  path: string;
+  size: number;
+  mtimeMs: number;
+  /** Last append, counter move, tool start or human wait: the silence clock's start. */
+  progressAt: number;
+  /** Last token count seen on the spinner row. */
+  counter?: string;
+  /** Start of the current run of samples that all showed a count. */
+  readableFrom?: number;
+  toolStartedAt: number;
+  stalledSince?: number;
+  spin: Spin;
+  /** The spinning alert: since the first compaction it counts, and that count. */
+  spinningSince?: number;
+  spinningCount?: number;
+}
+
+/** The turn's compactions, folded from its transcript as the file grows. */
+interface Spin {
+  turn: string;
+  path: string;
+  /** Next byte to read, a line boundary; null once the file cannot be followed. */
+  offset: number | null;
+  /** The turn's start was read: false means unknown, never an alert. */
+  known: boolean;
+  /** Compactions since the turn's prompt or its last edit. */
+  compactions: number;
+  firstAt?: number;
+  /** The count the human was asked at: it alerts again only past it. */
+  heldAt?: number;
+}
+
+const EDIT_TOOLS: ReadonlySet<string> = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
+const SHELL_TOOLS: ReadonlySet<string> = new Set(['Bash', 'PowerShell']);
+/** `git commit`, also with global options before it (`git -C dir commit`). */
+const GIT_COMMIT = /\bgit(?:\s+-\S+(?:\s+[^\s-]\S*)?)*\s+commit\b/;
+
+function isEditCall(ev: TurnEvent): boolean {
+  if (ev.kind !== 'tool_use') return false;
+  if (EDIT_TOOLS.has(ev.name)) return true;
+  // The input's head (4 KB inline), else the one-line summary.
+  return SHELL_TOOLS.has(ev.name) && GIT_COMMIT.test(ev.input?.inline ?? ev.argSummary);
+}
+
+/** A turn ends at Claude's end_turn or an interrupt; a turn it starts by itself has no prompt. */
+function endsTurn(ev: TurnEvent): boolean {
+  return (ev.kind === 'assistant_text' && ev.turnComplete === true) || (ev.kind === 'meta' && ev.subtype === 'turn_aborted');
+}
+
+function resetSpin(spin: Spin): void {
+  spin.compactions = 0;
+  spin.firstAt = undefined;
+  spin.heldAt = undefined;
+}
+
+/** Fold events into the count; true when a new prompt was among them. */
+function foldSpin(spin: Spin, events: readonly TurnEvent[], now: number): boolean {
+  let prompted = false;
+  for (const ev of events) {
+    if (ev.kind === 'user_text') {
+      prompted = true;
+      spin.known = true;
+      resetSpin(spin);
+    } else if (endsTurn(ev)) {
+      spin.known = true;
+      resetSpin(spin);
+    } else if (ev.kind === 'meta' && ev.subtype === 'caveat' && ev.label === COMPACTED_LABEL) {
+      if (spin.compactions++ === 0) spin.firstAt = ev.ts ?? now;
+    } else if (isEditCall(ev)) {
+      resetSpin(spin);
+    }
+  }
+  return prompted;
+}
+
+/** Tool results are most of a busy turn's bytes and count for nothing here: left unparsed. */
+const parseSpinLine: typeof parseTranscriptLine = (line, offset) =>
+  line.includes('"tool_result"') ? [] : parseTranscriptLine(line, offset);
+
+/** The turn so far, from the tail: unknown when the tail starts mid-file with no turn start in it. */
+function seedSpin(turn: string, path: string, now: number): Spin {
+  const page = readTranscriptPage(path, { parseLine: parseSpinLine });
+  if (!page) return { turn, path, offset: null, known: false, compactions: 0 };
+  const spin: Spin = { turn, path, offset: page.cursor.tailOffset, known: !page.truncatedHead, compactions: 0 };
+  foldSpin(spin, page.events, now);
+  return spin;
+}
+
+/** Claude's thinking phrases on the spinner row ("still thinking", "deep in
+ *  thought", "thought for 1s"). Measured: after a tool, the row kept
+ *  `↓ 262 tokens · deep in thought` unchanged for 170 s of healthy thinking. */
+const THINKING_PHASE = /\bthinking\b|\bthought\b/i;
+
+/**
+ * The token count on Claude's spinner row (`↓ 1.2k tokens`), or undefined when
+ * there is no row, no count, or the row says it is thinking: thinking tokens
+ * are not counted, so a count shown then is an earlier one standing still.
+ */
+export function spinnerTokenCount(rows: readonly string[] | null): string | undefined {
+  if (!rows) return undefined;
+  // The last match: the live row is drawn under any earlier output that looks like one.
+  const row = [...rows].reverse().find((line) => screenShowsRunningTurn([line], STALL_AGENT));
+  if (!row || THINKING_PHASE.test(row)) return undefined;
+  return /([\d.,]+k?) tokens\b/.exec(row)?.[1];
+}
+
+type Entry = Record<string, unknown>;
+
+/** Claude's own wrappers for a turn it started from a command, a hook or a notice. */
+const NOT_A_TYPED_PROMPT = /<(?:command-name|command-message|command-args|local-command-stdout|task-notification|bash-input|bash-stdout)>/;
+const INTERRUPT_MARK = /^\[Request interrupted by user/;
+
+/** A user row with text (not a tool result, not meta, not a subagent's): its text, else null. */
+function userText(entry: Entry): string | null {
+  if (entry['type'] !== 'user' || entry['isMeta'] === true || entry['isSidechain'] === true) return null;
+  const message = entry['message'];
+  if (isObject(message) && typeof message['content'] === 'string') return message['content'];
+  const blocks = contentBlocks(entry);
+  if (!blocks.length || blocks.some((b) => b['type'] === 'tool_result')) return null;
+  return blocks.map((b) => (typeof b['text'] === 'string' ? b['text'] : '')).join('\n');
+}
+
+/**
+ * A prompt the human typed. A notice Claude writes as a user row mid-turn (a
+ * background task finishing, a local command's output) is not one: it starts
+ * no new turn, so the calls still open stay open.
+ */
+function isHumanTurnStart(entry: Entry): boolean {
+  const text = userText(entry);
+  return text !== null && !NOT_A_TYPED_PROMPT.test(text);
+}
+
+/**
+ * Whether a tool call since the last prompt has no result yet. A prompt starts
+ * a new count, so an orphaned call of an earlier turn never holds a later one.
+ * Sidechain entries are another agent's. Null when the window was cut and
+ * holds no prompt: an open call may lie before it.
+ */
+export function transcriptToolInFlight(entries: readonly unknown[], opts: { windowCut?: boolean } = {}): boolean | null {
+  const open = new Set<string>();
+  let sawPrompt = false;
+  for (const entry of entries) {
+    if (!isObject(entry) || entry['isSidechain'] === true) continue;
+    if (isHumanTurnStart(entry)) { open.clear(); sawPrompt = true; continue; }
+    for (const block of contentBlocks(entry)) {
+      if (entry['type'] === 'assistant' && block['type'] === 'tool_use' && typeof block['id'] === 'string') open.add(block['id']);
+      if (entry['type'] === 'user' && block['type'] === 'tool_result' && typeof block['tool_use_id'] === 'string') open.delete(block['tool_use_id']);
+    }
+  }
+  if (open.size > 0) return true;
+  return opts.windowCut && !sawPrompt ? null : false;
+}
+
+/**
+ * The prompt the current turn started from, exactly as written, or null when
+ * it cannot be put back as typed: a slash command, a notice, an image, or no
+ * prompt in the window. Never an earlier turn's prompt: the walk stops at the
+ * latest user row with text, notices included.
+ */
+export function lastHumanPrompt(entries: readonly unknown[]): string | null {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    // Claude's summary after a compaction is a user row nobody typed.
+    if (!isObject(entry) || entry['isCompactSummary'] === true) continue;
+    const text = userText(entry);
+    if (text === null) continue;
+    if (contentBlocks(entry).some((b) => b['type'] !== 'text')) return null;
+    // Claude's own row after an interrupt is not the prompt; the one before it may be.
+    if (INTERRUPT_MARK.test(text.trim())) continue;
+    return text.trim() && !NOT_A_TYPED_PROMPT.test(text) ? text : null;
+  }
+  return null;
+}
+
+/** The transcript's tail, parsed; `windowCut` when it starts mid-file. Null when unreadable. */
+export function readTranscriptTail(path: string): { entries: unknown[]; windowCut: boolean } | null {
+  let fd: number | null = null;
+  try {
+    fd = fs.openSync(path, 'r');
+    const size = fs.fstatSync(fd).size;
+    const start = Math.max(0, size - PENDING_TOOL_USE_TAIL_BYTES);
+    const buf = Buffer.alloc(size - start);
+    fs.readSync(fd, buf, 0, buf.length, start);
+    const lines = buf.toString('utf8').split('\n');
+    if (start > 0) lines.shift();
+    const entries: unknown[] = [];
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try { entries.push(JSON.parse(line)); } catch { /* a half-written last line */ }
+    }
+    return { entries, windowCut: start > 0 };
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) { try { fs.closeSync(fd); } catch { /* already gone */ } }
+  }
+}
+
+function readToolInFlight(path: string): boolean | null {
+  const tail = readTranscriptTail(path);
+  return tail ? transcriptToolInFlight(tail.entries, { windowCut: tail.windowCut }) : null;
+}
+
+function statFile(path: string): { size: number; mtimeMs: number } | null {
+  try {
+    const st = fs.statSync(path);
+    return st.isFile() ? { size: st.size, mtimeMs: st.mtimeMs } : null;
+  } catch {
+    return null;
+  }
+}
+
+export class StallWatch {
+  private readonly watches = new Map<string, Watch>();
+  /** Keep waiting's factor per pane, kept with its turn so a one-tick gap does not reset it. */
+  private readonly factors = new Map<string, { turn: string; factor: number }>();
+  /** Keep waiting on a spinning turn: the compaction count that alerts next, kept the same way. */
+  private readonly spinAt = new Map<string, { turn: string; at: number }>();
+  /** Each pane's reading of its turn, kept across a forgotten watch so a one-tick gap does not lose the turn's start. */
+  private readonly spins = new Map<string, Spin>();
+  private timer: NodeJS.Timeout | null = null;
+  private ticking = false;
+
+  constructor(private readonly deps: StallWatchDeps) {}
+
+  private now(): number { return this.deps.now?.() ?? Date.now(); }
+
+  start(): void {
+    if (this.timer) return;
+    this.timer = setInterval(() => { this.tick().catch(() => undefined); }, STALL_TICK_MS);
+    this.timer.unref?.();
+  }
+
+  dispose(): void {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+    this.watches.clear();
+    this.factors.clear();
+    this.spinAt.clear();
+    this.spins.clear();
+  }
+
+  /** The pane's stall (its last progress) when it reads as stuck now, for a client that attaches later. */
+  stalledSince(id: string): number | null {
+    const w = this.watches.get(id);
+    return w?.stalledSince ?? w?.spinningSince ?? null;
+  }
+
+  /** The compaction count when the pane's alert is the spinning one, else undefined. */
+  stallCompactions(id: string): number | undefined {
+    return this.watches.get(id)?.spinningCount;
+  }
+
+  /** A resolved hook signal for the pane. */
+  noteHookSignal(id: string, kind: string): void {
+    if (kind === 'agent.user_prompt_submit') { this.factors.delete(id); this.spinAt.delete(id); }
+    const w = this.watches.get(id);
+    if (!w) return;
+    if (kind === 'agent.tool_started' || kind === 'agent.awaiting_permission' || kind === 'agent.user_prompt_submit') {
+      const now = this.now();
+      if (kind !== 'agent.user_prompt_submit') w.toolStartedAt = now;
+      w.progressAt = now;
+      this.clear(id, w);
+    }
+  }
+
+  /** The turn a recorded stall belongs to, or undefined when none is recorded. */
+  stalledTurn(id: string): string | undefined {
+    const w = this.watches.get(id);
+    return w?.stalledSince !== undefined || w?.spinningCount !== undefined ? w.turn : undefined;
+  }
+
+  /** Keep waiting: double the threshold for this turn. False when not stalled. */
+  keepWaiting(id: string): boolean {
+    const w = this.watches.get(id);
+    if (w?.spinningCount !== undefined) {
+      this.spinAt.set(id, { turn: w.turn, at: w.spinningCount * 2 });
+      this.clearSpin(id, w);
+      return true;
+    }
+    if (!w || w.stalledSince === undefined) return false;
+    const saved = this.factors.get(id);
+    this.factors.set(id, { turn: w.turn, factor: (saved?.turn === w.turn ? saved.factor : 1) * 2 });
+    this.clear(id, w);
+    return true;
+  }
+
+  /** The pane closed. */
+  dropSession(id: string): void {
+    this.forget(id);
+    this.factors.delete(id);
+    this.spinAt.delete(id);
+    this.spins.delete(id);
+  }
+
+  async tick(): Promise<void> {
+    if (this.ticking) return;
+    this.ticking = true;
+    try {
+      const ids = new Set(this.deps.listSessionIds());
+      for (const id of [...this.watches.keys()]) if (!ids.has(id)) this.dropSession(id);
+      for (const id of ids) {
+        // One pane's failure must not stop the others, nor reach the process.
+        try { await this.check(id); } catch { this.forget(id); }
+      }
+    } finally {
+      this.ticking = false;
+    }
+  }
+
+  private forget(id: string): void {
+    const w = this.watches.get(id);
+    if (w) { this.clear(id, w); this.clearSpin(id, w); }
+    this.watches.delete(id);
+  }
+
+  private clear(id: string, w: Watch): void {
+    if (w.stalledSince === undefined) return;
+    w.stalledSince = undefined;
+    this.deps.emit(id, null);
+  }
+
+  private clearSpin(id: string, w: Watch): void {
+    if (w.spinningCount === undefined) return;
+    w.spinningSince = undefined;
+    w.spinningCount = undefined;
+    this.deps.emit(id, null);
+  }
+
+  /** Read what the turn appended since the last read; a file that cannot be followed is unknown. */
+  private followSpin(id: string, w: Watch, now: number): void {
+    const spin = w.spin;
+    for (let i = 0; i < SPIN_READS_PER_TICK && spin.offset !== null && spin.offset < w.size; i++) {
+      const delta = readTranscriptDelta(w.path, spin.offset, undefined, parseSpinLine);
+      if (!delta || delta.reset) {
+        spin.offset = null;
+        spin.known = false;
+        return;
+      }
+      // A half-written last line, or an entry still being written: next tick.
+      if (delta.stalled || delta.cursor.tailOffset <= spin.offset) return;
+      spin.offset = delta.cursor.tailOffset;
+      // A new prompt ends this turn's Keep waiting, as the hook does.
+      if (foldSpin(spin, delta.events, now)) this.spinAt.delete(id);
+    }
+  }
+
+  /** The spinning rule; true while its alert stands, which then holds the stall rule off. */
+  private checkSpin(id: string, w: Watch, running: boolean): boolean {
+    const spin = w.spin;
+    const saved = this.spinAt.get(id);
+    const at = Math.max(saved?.turn === w.turn ? saved.at : SPIN_COMPACTIONS, (spin.heldAt ?? 0) + 1);
+    if (!spin.known || spin.compactions < at) {
+      this.clearSpin(id, w);
+      return false;
+    }
+    // Raised only while the agent says it is running; a turn that ended resets the count.
+    if (w.spinningCount === undefined && !running) return false;
+    if (w.spinningCount !== spin.compactions) {
+      // The reading can lag the silence rule: one alert stands, and this one replaces it.
+      w.stalledSince = undefined;
+      w.spinningSince = spin.firstAt ?? this.now();
+      w.spinningCount = spin.compactions;
+      this.deps.emit(id, w.spinningSince, w.spinningCount);
+    }
+    return true;
+  }
+
+  /** The same turn's reading after a gap; a new turn's from where the last one stopped; else from the tail. */
+  private spinFor(id: string, turn: string, path: string, now: number): Spin {
+    const saved = this.spins.get(id);
+    let spin: Spin;
+    if (saved?.path === path && saved.turn === turn) spin = saved;
+    else if (saved?.path === path && saved.offset !== null) spin = { turn, path, offset: saved.offset, known: true, compactions: 0 };
+    else spin = seedSpin(turn, path, now);
+    this.spins.set(id, spin);
+    return spin;
+  }
+
+  private factorFor(id: string, turn: string): number {
+    const saved = this.factors.get(id);
+    return saved?.turn === turn ? saved.factor : 1;
+  }
+
+  private async check(id: string): Promise<void> {
+    const binding = this.deps.getBinding(id);
+    const turn = this.deps.midTurn(id);
+    const path = binding?.agent === STALL_AGENT ? binding.transcriptPath : undefined;
+    const st = path && turn ? (this.deps.stat ?? statFile)(path) : null;
+    if (!path || !turn || !st) { this.forget(id); return; }
+    const now = this.now();
+    let w = this.watches.get(id);
+    if (!w || w.turn !== turn || w.path !== path) {
+      if (w) { this.clear(id, w); this.clearSpin(id, w); }
+      w = { turn, path, size: st.size, mtimeMs: st.mtimeMs, progressAt: now, toolStartedAt: 0, spin: this.spinFor(id, turn, path, now) };
+      this.watches.set(id, w);
+    } else if (st.size !== w.size || st.mtimeMs !== w.mtimeMs) {
+      w.size = st.size;
+      w.mtimeMs = st.mtimeMs;
+      w.progressAt = now;
+      this.clear(id, w);
+    }
+    this.followSpin(id, w, now);
+    if (this.deps.awaitingHuman(id)) {
+      w.progressAt = now;
+      this.clear(id, w);
+      if (w.spinningCount !== undefined) w.spin.heldAt = w.spinningCount;
+      this.clearSpin(id, w);
+      return;
+    }
+    let rows: readonly string[] | null = null;
+    try { rows = await this.deps.readScreen(id); } catch { /* unreadable: no count */ }
+    // The pane may have moved on while the screen was read.
+    if (this.watches.get(id) !== w) return;
+    const count = spinnerTokenCount(rows);
+    if (count === undefined) {
+      w.readableFrom = undefined;
+    } else {
+      if (w.counter !== undefined && count !== w.counter) {
+        w.progressAt = now;
+        this.clear(id, w);
+      }
+      w.counter = count;
+      w.readableFrom ??= now;
+    }
+    // A count visible across the whole silence (one tick of sampling slack).
+    const counted = w.readableFrom !== undefined && w.readableFrom <= w.progressAt + STALL_TICK_MS;
+    const threshold = (counted ? STALL_COUNTER_MS : STALL_FALLBACK_MS) * this.factorFor(id, turn);
+    const running = screenShowsRunningTurn(rows, STALL_AGENT) || this.deps.titleRunning?.(id) === true;
+    if (this.checkSpin(id, w, running)) return;
+    if (now - w.progressAt < threshold || w.toolStartedAt >= w.progressAt || !running) {
+      this.clear(id, w);
+      return;
+    }
+    if (w.stalledSince !== undefined) return;
+    // Read the tail only once the silence is long enough to matter.
+    if ((this.deps.toolInFlight ?? readToolInFlight)(path) !== false) return;
+    // Stuck since the last progress, which is what "for N min" counts from.
+    w.stalledSince = w.progressAt;
+    this.deps.emit(id, w.progressAt);
+  }
+}
+
+export interface StallPrefillDeps {
+  /** A dialog or an approval waits on the human: an ESC would answer it, so nothing is sent. */
+  blocked: () => boolean;
+  interrupt: () => Promise<ChatInterruptResult>;
+  /** The prompt to put back, read before the interrupt. */
+  lastPrompt: () => string | null;
+  /** The pane's turn identity: a turn started after the interrupt never gets the stopped turn's prompt. */
+  turnId?: () => string | undefined;
+  readScreen: () => Promise<ChatScreenRows | null>;
+  write: (data: string) => boolean;
+  /** Take the pane's keyboard from the chat send queue for the paste; null when it is taken. */
+  holdKeyboard?: () => (() => void) | null;
+  delay?: (ms: number) => Promise<void>;
+}
+
+/** Composer reads, 250 ms apart, that must all be empty before a paste. */
+const EMPTY_READS = 6;
+const PREFILL_READS = 24;
+
+/**
+ * Stop the turn, then put the last prompt back into Claude's input without
+ * sending it. Claude restores the prompt by itself when the interrupt comes
+ * before anything was written, so the paste happens only into a composer that
+ * stays empty for 1.5 s, and is read once more right before the write; one
+ * holding anything is left as it is. The chat send queue is held off the
+ * keyboard meanwhile, so its Enter cannot send the pasted prompt.
+ */
+export async function stopAndPrefill(deps: StallPrefillDeps): Promise<StallPrefillResult> {
+  if (deps.blocked()) return 'blocked';
+  const prompt = deps.lastPrompt()?.trim() || null;
+  const stoppedTurn = deps.turnId?.();
+  // interruptChatTurn checks again right before its ESC (open approval,
+  // awaiting_input, a dialog on the screen read).
+  const stopped = await deps.interrupt();
+  if (stopped !== 'sent') return stopped === 'session_changed' ? 'unavailable' : stopped;
+  if (!prompt) return 'stopped';
+  const release = deps.holdKeyboard ? deps.holdKeyboard() : () => undefined;
+  if (!release) return 'stopped';
+  const delay = deps.delay ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const read = async (): Promise<ChatScreenRows | null> => {
+    try { return await deps.readScreen(); } catch { return null; }
+  };
+  try {
+    let empty = 0;
+    for (let i = 0; i < PREFILL_READS; i++) {
+      await delay(250);
+      const rows = await read();
+      if (!rows || screenShowsRunningTurn(rows, STALL_AGENT)) { empty = 0; continue; }
+      if (claudeComposerEmpty(rows)) {
+        if (++empty < EMPTY_READS) continue;
+        if (!claudeComposerEmpty(await read())) return 'kept';
+        if (deps.turnId && deps.turnId() !== stoppedTurn) return 'kept';
+        return deps.write(formatBracketedPastePayload(prompt)) ? 'filled' : 'error';
+      }
+      empty = 0;
+      if (claudeComposerVisible(rows)) return 'kept';
+    }
+    // The ESC went out, but the turn never showed an input to fill.
+    return 'blocked';
+  } finally {
+    release();
+  }
+}

@@ -22,7 +22,7 @@ import { isUsableResumeBinding, withLaunchSessionId, type ResumeBinding } from '
 import { CHATV2_PROVIDER_SESSION_ID } from '../../shared/chatv2/ipc';
 import { classifyShell } from '../shell-integration';
 import { inResumeCwd, type ResumeShell } from './v2/handoff';
-import { guardBotWorkerLaunch } from './botWorkerLaunchGuard';
+import { guardBotWorkerLaunch, type WorkerFenceRefused } from './botWorkerLaunchGuard';
 import type { TerminalChatFailure, TerminalChatService } from '../transcript/TerminalChatService';
 import type { ChatSessionService } from './ChatSessionService';
 import { ChatSendReceiptStore, type StoredChatOutcome } from './ChatSendReceiptStore';
@@ -34,7 +34,7 @@ import { isActiveQueueState, type ChatQueueReason, type ChatQueueRecord, type Ch
 import {
   CHAT_LAUNCH_MAX_UNITS, CHAT_MESSAGE_RETENTION_MS, CHAT_SEND_MAX_UNITS, OPENCODE_MAX_SEND_BYTES, OPENCODE_REQUEST_MAX_BYTES,
   checkChatId, dangerousLaunchNotice, fileHistoryEpoch, openCodeSendBytes, tuiHistoryEpoch,
-  type ChatBlocked, type ChatBridge, type ChatCancelOutcome, type ChatCancelRequest, type ChatCancelTag, type ChatEffect, type ChatLaunchOutcome, type ChatLaunchPreview, type ChatLaunchReason,
+  type ChatBlocked, type ChatBridge, type ChatCancelOutcome, type ChatCancelRequest, type ChatCancelTag, type ChatEffect, type ChatLaunchOutcome, type ChatLaunchPreview, type ChatLaunchReason, type ChatLaunchRefusalReason,
   type ChatLaunchRequest, type ChatLaunchTag, type ChatOwner, type ChatResolution, type ChatSendOutcome, type ChatSendRequest,
   type ChatSendTag, type ChatTurn, type DangerousLaunchTrace,
   type ChatDeliveredMessage, type ChatDequeueResult, type ChatQueueEvent, type ChatQueueHoldReason, type ChatQueueItemView, type ChatSendReceiptView,
@@ -98,7 +98,12 @@ export interface NativeChatBridgeDeps<P extends ChatPane> {
   agentState(id: string): ChatAgentState;
   /** Chat-refined agent state (reads the transcript tail for Claude/Codex). */
   chatAgentState(id: string): ChatAgentState;
-  projector: { status(id: string): TranscriptStatus; snapshot(id: string, opts?: { before: number }): TranscriptPage | null };
+  projector: {
+    status(id: string): TranscriptStatus;
+    snapshot(id: string, opts?: { before: number }): TranscriptPage | null;
+    /** Bring a WSL pane's transcript proof up to date before a read (TranscriptProjector.ready). */
+    ready?(id: string): Promise<void>;
+  };
   terminalChat(): Pick<TerminalChatService, 'read' | 'send' | 'subscribe' | 'unsubscribe'> & Partial<Pick<TerminalChatService, 'inspect' | 'abort'>> | null;
   managed(): Pick<ChatSessionService, 'has' | 'status' | 'snapshot' | 'send' | 'conversationEpoch'> | null;
   /**
@@ -107,6 +112,11 @@ export interface NativeChatBridgeDeps<P extends ChatPane> {
    */
   approvals(): { pendingFor(id: string): { id: string; kind: string; answerable?: boolean } | undefined } | null;
   readScreen(id: string): Promise<ChatScreenRows | null>;
+  /** True when the session's own output shows an agent's folder-trust prompt
+   *  (held output included), asked before a Stop's or a Rewind's ESC. A chat
+   *  write is a person's, so a screen the daemon cannot read does not count.
+   *  (A send's own screen read already blocks the dialog.) Absent: not asked. */
+  atFolderTrust?(id: string, writer: string): Promise<boolean>;
   agentProcessAlive(id: string, slug: string): Promise<boolean>;
   /** Writes to the pane PTY and notes the input; false when the pane is gone. */
   write(id: string, data: string): boolean;
@@ -145,8 +155,8 @@ export interface NativeChatBridgeDeps<P extends ChatPane> {
   /** Whether the agent takes a first message on its resume line (default RESUME_TAKES_PROMPT). */
   resumeTakesPrompt?(agent: TerminalLaunchAgent): boolean;
   /** The launch line for a pane, guarded when it is a bot's fan-out worker
-   *  (default guardBotWorkerLaunch); null: type nothing. */
-  botWorkerLaunch?(id: string, line: string, head: string, folders?: readonly string[]): string | null;
+   *  (default guardBotWorkerLaunch); null or a worker-fence refusal: type nothing. */
+  botWorkerLaunch?(id: string, line: string, head: string, folders?: readonly string[]): string | null | WorkerFenceRefused;
   relays: {
     retire(id: string): Promise<void>;
     prepare(id: string, pane: P): Promise<LaunchRelay>;
@@ -198,7 +208,8 @@ export interface NativeChatBridge extends Omit<ChatBridge, QueueMethods>, Requir
    * `daemon.transcript.interrupt`: the desktop Stop, through the same lock,
    * once-per-turn latch and cooldown as the phone cancel. No receipt.
    */
-  desktopInterrupt(id: string, agentSessionId: string): Promise<ChatInterruptResult>;
+  /** `turnId`: stop only that turn; another one running is `not_running`. */
+  desktopInterrupt(id: string, agentSessionId: string, turnId?: string): Promise<ChatInterruptResult>;
   /** `daemon.transcript.rewind`: Claude's own Rewind picker, under the same send lock as Stop. */
   desktopRewind(id: string, opts?: { kitty?: boolean }): Promise<ClaudeRewindResult>;
   /** A file-binding send is between its first check and its last write (Stop must wait). */
@@ -466,6 +477,8 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
     const inspected = service?.inspect ? await service.inspect(id) : { read: await service?.read(id) ?? null };
     const read = 'read' in inspected ? inspected.read : null;
     if (read) return { kind: 'native', read };
+    // Every file-backed read below goes through this route first.
+    await deps.projector.ready?.(id);
     const live = deps.agentState(id);
     if (slugOf(live) === 'opencode') return { kind: 'opencode', ...('failure' in inspected ? { failure: inspected.failure } : {}) };
     if (!live.agentName && !deps.projector.status(id).available && deps.managed()?.has(id)) return { kind: 'managed' };
@@ -1385,6 +1398,8 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
     if (sending.has(id)) return 'busy';
     sending.add(id);
     try {
+      // The ESC would answer a folder-trust prompt (Claude Code exits on it).
+      if (await deps.atFolderTrust?.(id, 'chat stop')) return 'blocked';
       return await interruptChatTurn(agentSessionId, {
         getTranscriptSessionId: () => deps.projector.status(id).agentSessionId,
         hasOpenApproval: () => hasOpenApproval(id),
@@ -1705,7 +1720,7 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
     sent: 'sent', not_running: 'not_running', pending: 'not_running', prompt_active: 'blocked', session_changed: 'session_changed', unconfirmed: 'error',
   };
 
-  const desktopInterrupt = async (id: string, agentSessionId: string): Promise<ChatInterruptResult> => {
+  const desktopInterrupt = async (id: string, agentSessionId: string, turnId?: string): Promise<ChatInterruptResult> => {
     if (!id) return 'unavailable';
     const found = await route(id);
     if (found.kind === 'native') {
@@ -1720,7 +1735,7 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
     }
     // No registry = "may be pending".
     if (!deps.approvals()) return 'unavailable';
-    return DESKTOP_INTERRUPT[await interruptLocked(id, agentSessionId)];
+    return DESKTOP_INTERRUPT[await interruptLocked(id, agentSessionId, turnId !== undefined ? { turnId } : {})];
   };
 
   const desktopRewind = async (id: string, opts: { kitty?: boolean } = {}): Promise<ClaudeRewindResult> => {
@@ -1729,6 +1744,7 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
     if (sending.has(id)) return 'busy';
     sending.add(id);
     try {
+      if (await deps.atFolderTrust?.(id, 'chat rewind')) return 'blocked';
       return await openClaudeRewind({
         hasOpenApproval: () => hasOpenApproval(id),
         getAgentState: () => {
@@ -1750,7 +1766,7 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
   // Launch
 
   const launch = async (req: ChatLaunchRequest): Promise<ChatLaunchOutcome> => {
-    const fail = (error: ChatLaunchTag, reason?: ChatLaunchReason, effect: ChatEffect = 'none'): ChatLaunchOutcome =>
+    const fail = (error: ChatLaunchTag, reason?: ChatLaunchRefusalReason, effect: ChatEffect = 'none'): ChatLaunchOutcome =>
       ({ ok: false, error, effect, ...(reason ? { reason } : {}) });
     const { id, agent } = req;
     if (agent !== 'claude' && agent !== 'codex') return fail('invalid-chat-request');
@@ -1837,6 +1853,8 @@ export function createChatBridge<P extends ChatPane>(deps: NativeChatBridgeDeps<
       const folders = [bound?.cwd, pane.meta.cwd, pane.meta.spawnCwd].filter((f): f is string => typeof f === 'string' && f.length > 0);
       const guarded = (deps.botWorkerLaunch ?? ((i: string, l: string, h: string, f?: readonly string[]) => guardBotWorkerLaunch(i, l, h, undefined, f)))(id, command, head, folders);
       if (guarded === null) return fail('launch-unsupported');
+      // Said so the phone can tell where to restart it: only the desktop app.
+      if (typeof guarded !== 'string') return fail('launch-unsupported', 'worker-fence');
       command = guarded;
       if (agent === 'codex' && boundShell !== 'pwsh') {
         // Hook session_id can name an invocation rather than the conversation.

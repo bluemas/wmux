@@ -14,6 +14,7 @@ import { isPcRailAction, pcRailClaimsKey } from '../components/PcRail/pcRailMode
 import { xtermWindowsBuildNumber } from '../../shared/conptyWindows';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { useStore } from '../stores';
+import { claimsBookmarkKey, keepAcrossRepaint as keepBookmarksAcrossRepaint } from '../components/Terminal/scrollbackBookmarks';
 import { t } from '../i18n';
 import { XTERM_THEMES, extractXtermColors, type ThemeId, type BuiltinThemeId } from '../themes';
 import { resolveMinimumContrastRatio } from '../tailwindPalette';
@@ -66,6 +67,7 @@ import { awaitParseBarrier } from '../terminal/parseBarrier';
 import { STALE_REPLAY_INPUT_MODE_RESETS, STALE_REPLAY_ALIVE_SHELL_RESETS, STALE_REPLAY_DISPLAY_RESETS, staleReplayResetLevel } from '../../shared/terminal/staleReplayModeReset';
 import { installShellPromptModeReset, shellPromptModeResetFor } from '../../shared/terminal/shellPromptModeReset';
 import { holdNewXtermReplies } from '../../shared/terminal/replyParity';
+import { markUserInput, type UserInputTerminal } from '../../shared/terminal/userInputGate';
 import { ATTACH_SNAPSHOT_MIN_BYTES } from '../../shared/terminal/attachSnapshot';
 import { paneForegroundProbe } from '../terminal/paneForegroundProbe';
 import { attachAltScreenWheel, PAGE_SCROLL_AGENTS } from '../terminal/altScreenWheel';
@@ -83,6 +85,7 @@ import {
   getQueuedCharCount,
   promoteTerminalToPriorityDrain,
   rebindTerminalOutputWriter,
+  noteTerminalDirectWrite,
 } from '../terminal/terminalOutputScheduler';
 import { reconnectPtyWithRetry as reconnectPtyWithRetryImpl, type ReconnectSettleInfo } from './reconnectPtyWithRetry';
 import { resumesOnStart, type ResumeHint } from '../stores/selectors/surfaceShown';
@@ -1065,6 +1068,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       try {
         for (const chunk of st.buffer) {
           writePtyDataImmediately(term, chunk, replayMuteRef.current);
+          noteTerminalDirectWrite(term, chunk.data);
         }
       } catch { /* disposed mid-abort — teardown owns cleanup */ }
     }
@@ -1115,6 +1119,12 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         // the reset (rows, the same convention terminalPark uses, so the
         // restore stays proportional if the repaint reflows line counts).
         const fromBottom = Math.max(0, term.buffer.active.baseY - term.buffer.active.viewportY);
+        // reset() disposes every marker; put the scrollback bookmarks back
+        // once the snapshot has been parsed.
+        let restoreBookmarks: (() => void) | null = null;
+        try {
+          if (ptyIdRef.current) restoreBookmarks = keepBookmarksAcrossRepaint(term, ptyIdRef.current, useStore);
+        } catch { /* a bookmark carry never stops the repaint */ }
         discardTerminalOutput(term);
         term.reset();
         shellPromptModeResetFor(term)?.reset();
@@ -1126,6 +1136,12 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         // historical chunks are muted; genuinely live chunks remain trusted.
         for (const chunk of st.buffer) {
           writePtyDataImmediately(term, chunk, replayMuteRef.current);
+        }
+        if (restoreBookmarks) {
+          const restore = restoreBookmarks;
+          term.write('', () => {
+            try { restore(); } catch { /* disposed mid-restore — teardown owns cleanup */ }
+          });
         }
         markTerminalClean(term);
         if (fromBottom > 0) {
@@ -2098,7 +2114,9 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // UI noise. Errors are also silent: the explicit Ctrl+C path still
     // surfaces them on retry.
     const autoCopy = createAutoSelectionCopy({
-      write: (text) => window.clipboardAPI.writeText(text),
+      // Silent on the web too: a refused auto-copy is not kept for the next
+      // key, which could be the ⌘V meant to paste what the clipboard holds.
+      write: (text) => window.clipboardAPI.writeText(text, { keepIfRefused: false }),
     });
     const selectionDisposable = terminal.onSelectionChange(() => {
       autoCopy.onSelection(terminal.getSelection());
@@ -2413,6 +2431,9 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // No paired computer, or a custom keybinding on the chord: the PC rail
       // does not take it, so the pane gets Shift+Alt+Arrow / Home.
       if (isPcRailAction(shortcut) && !pcRailClaimsKey(useStore.getState(), e)) return true;
+      // On the alternate screen Ctrl+M is the full-screen app's Enter, not a
+      // scrollback bookmark (useKeyboard asks the same predicate).
+      if (shortcut === 'addBookmark' && !claimsBookmarkKey(terminal)) return true;
       // #1280 — the Rich Input chord bubbles from HERE, instead of merely
       // being preventDefault'd downstream: xterm's own encode path calls
       // stopPropagation (its `cancel()`), so otherwise the chord never reaches
@@ -2789,7 +2810,15 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
     // silent backstop in `pty.handler.ts`. The helper preserves xterm's
     // own bracketed-paste markers if it pre-wrapped the payload.
     let inputBuffer = '';
+    // onData carries the user's input AND xterm's own answers to queries in
+    // the output (DA1/DA2, cursor and status reports, kitty keyboard flags,
+    // colour reports), which a program sends whether or not anyone looks at
+    // the pane. Both go to the PTY; only the user's input counts as typing.
+    const userInput = markUserInput(terminal as unknown as UserInputTerminal);
     const onDataDisposable = terminal.onData((data) => {
+      // Consumed first, before any early return, so the signal of one chunk
+      // can never carry over to the next.
+      const fromUser = userInput.consume();
       // #1794: a reset is owed for leaked mouse / focus modes but has not
       // applied yet (process truth pending, or queued behind output): the
       // reports are the dead TUI's, not the shell's. Before anything else.
@@ -2797,18 +2826,17 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // X6 ②: the user is driving this shell themselves — retract any pending
       // resume offer so the pill can't fire into a session they've moved on in.
       //
-      // BUT onData also carries terminal REPORTS that are not user typing — most
-      // notably focus-tracking (CSI I / CSI O), which xterm emits every time the
-      // pane mounts or refocuses. A recovered agent pane fires CSI I on mount, so
-      // without this guard the resume pill is cleared the instant it hydrates and
-      // never renders (the bug that made the pill invisible after every reboot).
-      // Focus reports are the only non-input bytes observed here; real keys,
-      // pastes, and IME commits all still clear as intended.
-      if (data !== '\x1b[I' && data !== '\x1b[O') {
+      // BUT onData also carries terminal REPORTS that are not user typing:
+      // focus-tracking (CSI I / CSI O), which xterm emits every time the pane
+      // mounts or refocuses (a recovered agent pane fires CSI I on mount, which
+      // cleared the resume pill the instant it hydrated), and every reply to a
+      // query. Neither carries xterm's user-input signal. The focus check by
+      // shape stays for a terminal without that signal.
+      if (fromUser && data !== '\x1b[I' && data !== '\x1b[O') {
         noteUserKeystroke(data);
       } else if (interruptKeystrokes.observe(ptyId, data)) {
         // Not user input, but the interrupt detector still consumes every
-        // chunk: a focus report between two ESC taps is "something else" and
+        // chunk: a report between two ESC taps is "something else" and
         // must cancel the double-tap. (Pre-#1228 this observe ran
         // unconditionally — the split keeps that contract while the pill /
         // watchdog / scheduler side effects stay gated on real input.)
@@ -2819,6 +2847,8 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         data,
       ).catch((err) => console.error('[wmux:onData] chunk write failed:', err));
 
+      // A reply is not part of a command the user typed.
+      if (!fromUser) return;
       if (data === '\r' || data === '\n') {
         const cmd = inputBuffer.trim();
         if (cmd.length > 1) {
@@ -2948,6 +2978,13 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       const fromBottom = Math.max(0, terminal.buffer.active.baseY - terminal.buffer.active.viewportY);
       discardTerminalOutput(terminal); // stale retained backlog + dirty flag
       warmSwap.cancel(); // this repaint replaces any pending cold frame
+      // The RIS disposes every marker. Measure the scrollback bookmarks once
+      // the bytes ahead of it have parsed, and put them back after the replay.
+      let restoreBookmarks: (() => void) | null = null;
+      const measureBookmarks = () => {
+        try { restoreBookmarks = keepBookmarksAcrossRepaint(terminal, ptyId, useStore); } catch { /* disposed mid-repaint — teardown owns cleanup */ }
+      };
+      terminal.write('', measureBookmarks);
       terminal.write(REPAINT_BEGIN, () => { shellPromptModeResetFor(terminal)?.reset(); });
       // The scanner labels every held chunk at its source. Historical bytes
       // are muted for their exact parse lifetime; live output is not muted.
@@ -2959,6 +2996,13 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       }
       terminal.write(REPAINT_END);
       if (held.pending) writePtyDataImmediately(terminal, held.pending, replayMuteRef.current);
+      // The scheduler's query splitter was discarded above; give it the
+      // unfinished tail xterm now holds, so the live bytes that finish it are
+      // still recognised as a query.
+      if (held.pending) noteTerminalDirectWrite(terminal, held.pending.data);
+      terminal.write('', () => {
+        try { restoreBookmarks?.(); } catch { /* disposed mid-restore — teardown owns cleanup */ }
+      });
       if (fromBottom > 0) {
         // Trailing empty write = parse barrier (callbacks fire in write
         // order); scrollToLine only after the recovered screen is parsed and
@@ -3060,6 +3104,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
         retainWhenHidden: retain,
         onWritten: (chars) => glyphRepaint.onData(chars),
         write: payload.replay ? writeReplayOutput : undefined,
+        ptyId,
       });
     };
     // Write what the cold-frame swap owes at a flush marker (or after held
@@ -3626,6 +3671,7 @@ export function useTerminal(containerRef: React.RefObject<HTMLDivElement | null>
       // other listeners are already torn down. Dropping this disposable here
       // stops stray input during the defer window.
       onDataDisposable.dispose();
+      userInput.dispose();
       container.removeEventListener('mousedown', onHintMouseDown);
       document.removeEventListener('mousemove', onHintMouseMove);
       document.removeEventListener('mouseup', onHintMouseUp);

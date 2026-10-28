@@ -257,6 +257,7 @@ describe('FirstRunOrchestrator', () => {
   // ── 4. dismiss() — aborts active runner + writes marker ─────────────────────
   it('dismiss() aborts active sample-task runner and writes marker', async () => {
     vi.mocked(fs.writeFile).mockResolvedValue(undefined as never);
+    vi.mocked(fs.stat).mockRejectedValue(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
     runnerOutcomes.push('aborted');
 
     const orch = new FirstRunOrchestrator(
@@ -282,6 +283,48 @@ describe('FirstRunOrchestrator', () => {
     expect(vi.mocked(fs.writeFile)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(fs.writeFile).mock.calls[0][0]).toBe(MARKER_PATH);
     await startPromise; // settle
+  });
+
+  // ── 4b. Skip is not completion ───────────────────────────────────────────────
+  it('a skipped first run reads back as shown but not completed', async () => {
+    vi.mocked(fs.stat).mockRejectedValueOnce(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }));
+    vi.mocked(fs.writeFile).mockResolvedValueOnce(undefined as never);
+    const orch = new FirstRunOrchestrator(
+      makePtyManager() as never,
+      makePtyBridge() as never,
+      () => null,
+      makeMcpRegistrar() as never,
+      () => 'token',
+      () => makeWindow() as never,
+    );
+
+    await orch.dismiss();
+    const written = vi.mocked(fs.writeFile).mock.calls[0][1] as string;
+    expect(written.startsWith('skipped ')).toBe(true);
+
+    vi.mocked(fs.stat).mockResolvedValueOnce({ isFile: () => true } as never);
+    vi.mocked(fs.readFile).mockResolvedValueOnce(written);
+    const result = await orch.check();
+    expect(result.shown).toBe(true);
+    expect(result.completedAt).toBeUndefined();
+
+    vi.mocked(fs.readFile).mockResolvedValueOnce(written);
+    expect((await orch.reopen()).completedAt).toBeUndefined();
+  });
+
+  it('closing a reopened wizard leaves a completed first run completed', async () => {
+    vi.mocked(fs.stat).mockResolvedValue({ isFile: () => true } as never);
+    const orch = new FirstRunOrchestrator(
+      makePtyManager() as never,
+      makePtyBridge() as never,
+      () => null,
+      makeMcpRegistrar() as never,
+      () => 'token',
+      () => makeWindow() as never,
+    );
+
+    await orch.dismiss();
+    expect(vi.mocked(fs.writeFile)).not.toHaveBeenCalled();
   });
 
   // ── 5. reopen() — fresh status, shown:false even when marker exists ─────────
@@ -477,6 +520,8 @@ describe('FirstRunOrchestrator', () => {
     expect(dc.rpc.mock.calls[1]).toEqual(['daemon.writeIfUnchanged', {
       sessionId: 'session-A',
       data: 'cmd\r',
+      // The person running the wizard asked for it: only a folder-trust prompt seen stops it.
+      origin: 'human',
       expect: { keyInputRevision: 0, incarnationId: 'inc-1', requireEmptyShellPrompt: true, outputBytes: 9, markerCount: 2, lastPromptMarker: { type: 'prompt_end', byteOffset: 9 } },
     }]);
 

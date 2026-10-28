@@ -1,9 +1,12 @@
 // What the owner reads of a card or a thread: names, never internal ids,
 // role tags or machine codes.
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { CardKind, RoomCard } from '../../../../shared/room';
-import { setLocale, t as i18nT } from '../../../i18n';
+import { loadLocale, setLocale, t as i18nT } from '../../../i18n';
 import { actorLabel, cardApplyTaskId, cardResumeTaskId, kindLabel, formatCardTime, formatNoticeTime, noticeText, onceText, ownerCardText, requestTitles, routineCardBody, threadLabel, withoutInternalIds, withoutReasonCodes, withoutRoleTags } from '../roomFormat';
+
+// Tables other than English load on demand; the tests below read Korean, Polish and Chinese synchronously.
+beforeAll(() => Promise.all((['ko', 'pl', 'zh'] as const).map(loadLocale)));
 
 const t = (key: string) => key;
 const system = { kind: 'system' as const };
@@ -109,6 +112,11 @@ describe('factory system cards in the reader\'s language (RoomCard.notice)', () 
     const trust = noticeText(card({ body: "worker is waiting on Claude Code's workspace trust dialog; it needs a keypress in the pane", notice: { code: 'task.inputRequired', args: { title: 'add', why: 'trustDialog' } } }), i18nT);
     expect(trust?.title).toBe('작업 입력 필요: add');
     expect(trust?.body).toContain('신뢰하는지');
+    // Written before the dialog named its agent: Claude Code's. Since then, the agent named.
+    expect(trust?.body).toContain('Claude Code');
+    const gemini = noticeText(card({ notice: { code: 'task.inputRequired', args: { title: 'add', why: 'trustDialog', agent: 'Gemini CLI' } } }), i18nT);
+    expect(gemini?.body).toContain('Gemini CLI');
+    expect(gemini?.body).not.toContain('Claude Code');
     expect(noticeText(card({ notice: { code: 'task.inputRequired', args: { title: 'add', why: 'launchFailed' } } }), i18nT)?.body).toContain('셸 프롬프트');
     // The worker's own reason (no why), or a why this build does not know: as written.
     expect(noticeText(card({ body: 'need the API key', notice: { code: 'task.inputRequired', args: { title: 'add' } } }), i18nT)?.body).toBe('need the API key');

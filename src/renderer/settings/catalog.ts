@@ -14,7 +14,6 @@ export type SettingsTabId =
   | 'browser'
   | 'computer-use'
   | 'remote'
-  | 'plugins'
   | 'lanlink'
   | 'about';
 
@@ -29,6 +28,9 @@ export interface SettingsCatalogEntry {
   synonyms: string;
   /** Rendered only on these platforms; search leaves it out elsewhere. */
   platform?: NodeJS.Platform | readonly NodeJS.Platform[];
+  /** Wording for one platform (a Finder or ⌘ where Windows says File
+   *  Explorer or Ctrl). The row and its search hit both read these. */
+  platformKeys?: Partial<Record<NodeJS.Platform, { labelKey?: TranslationKey; descKey?: TranslationKey }>>;
 }
 
 /** Whether an entry is rendered on this platform (no `platform` means everywhere). */
@@ -36,6 +38,20 @@ export function catalogEntryOnPlatform(entry: SettingsCatalogEntry, platform: st
   if (!entry.platform) return true;
   const list: readonly string[] = typeof entry.platform === 'string' ? [entry.platform] : entry.platform;
   return platform !== undefined && list.includes(platform);
+}
+
+/** The entry as it reads on `platform`, its per-platform wording swapped in. */
+export function catalogEntryFor(entry: SettingsCatalogEntry, platform: string | undefined): SettingsCatalogEntry {
+  const keys = platform ? entry.platformKeys?.[platform as NodeJS.Platform] : undefined;
+  return keys ? { ...entry, ...keys } : entry;
+}
+
+/** The label and description keys catalog row `id` shows on `platform`. */
+export function catalogKeysOn(id: string, platform: string | undefined): { labelKey: TranslationKey; descKey?: TranslationKey } {
+  const entry = SETTINGS_CATALOG.find((e) => e.id === id);
+  if (!entry) throw new Error(`no settings catalog entry "${id}"`);
+  const { labelKey, descKey } = catalogEntryFor(entry, platform);
+  return { labelKey, descKey };
 }
 
 /**
@@ -60,7 +76,7 @@ export const SETTINGS_NAV_GROUPS: {
   {
     id: 'connections',
     labelKey: 'settings.navGroupConnections',
-    tabs: ['plugins', 'remote', 'lanlink'],
+    tabs: ['remote', 'lanlink'],
   },
   {
     id: 'about',
@@ -98,17 +114,19 @@ export function resolveSettingsTab(id: string | null | undefined): SettingsTabId
  * "언어" finds Language while the UI is still in English).
  */
 export const SETTINGS_CATALOG: SettingsCatalogEntry[] = [
-  { id: 'plugins', tab: 'plugins', labelKey: 'plugins.settings.title', descKey: 'plugins.settings.description', synonyms: 'connector extension install Gmail GitHub MCP 플러그인 커넥터 插件 wtyczki' },
   { id: 'language', tab: 'general', labelKey: 'settings.language', synonyms: 'locale 언어 language 日本語 中文 idioma' },
   { id: 'autoupdate', tab: 'general', labelKey: 'settings.autoUpdate', descKey: 'settings.autoUpdateDesc', synonyms: 'update upgrade version' },
   { id: 'checkupdate', tab: 'general', labelKey: 'settings.checkUpdate', synonyms: 'update now latest release' },
   { id: 'secretguard', tab: 'general', labelKey: 'settings.secretGuard', descKey: 'settings.secretGuardDesc', synonyms: 'git secret password key token env commit push pr 비밀번호 키' },
-  { id: 'startup', tab: 'general', labelKey: 'settings.startup', synonyms: 'autostart boot login launch 시작' },
+  { id: 'startup', tab: 'general', labelKey: 'settings.startup', synonyms: 'autostart boot login launch 시작', platform: ['win32', 'darwin'] },
   { id: 'sleepprevention', tab: 'general', labelKey: 'settings.sleepPrevention', descKey: 'settings.sleepPreventionDesc', synonyms: 'sleep awake suspend standby power caffeine 절전 잠자기 대기 uśpienie czuwanie 睡眠 休眠' },
   { id: 'tutorial', tab: 'general', labelKey: 'settings.restartTutorial', descKey: 'settings.restartTutorialDesc', synonyms: 'onboarding tour help 튜토리얼' },
   { id: 'firstrun', tab: 'general', labelKey: 'settings.firstRunSetup', descKey: 'settings.firstRunSetupDesc', synonyms: 'first run setup doctor diagnose' },
   { id: 'reset', tab: 'general', labelKey: 'settings.reset', synonyms: 'factory default wipe 초기화' },
 
+  { id: 'fontsize', tab: 'terminal', labelKey: 'settings.fontSize', synonyms: 'type size zoom text 글자' },
+  { id: 'fontfamily', tab: 'terminal', labelKey: 'settings.fontFamily', descKey: 'settings.fontFamilyDesc', synonyms: 'typeface mono cascadia jetbrains 폰트' },
+  { id: 'cursorshape', tab: 'terminal', labelKey: 'settings.cursorShape', descKey: 'settings.cursorShapeDesc', synonyms: 'cursor caret bar block underline beam 커서 캐럿 막대 블록 shape type style' },
   { id: 'terminal-engine', tab: 'terminal', labelKey: 'settings.terminalEngine', descKey: 'settings.terminalEngineDesc', synonyms: 'rust node engine pty buffer memory 러스트 엔진 메모리' },
   { id: 'shell', tab: 'terminal', labelKey: 'settings.defaultShell', synonyms: 'zsh bash powershell pwsh fish 셸' },
   { id: 'startdir', tab: 'terminal', labelKey: 'settings.startupDirectory', descKey: 'settings.startupDirectoryDesc', synonyms: 'cwd home folder path' },
@@ -124,14 +142,11 @@ export const SETTINGS_CATALOG: SettingsCatalogEntry[] = [
   { id: 'imagepaste', tab: 'terminal', labelKey: 'settings.imagePaste', descKey: 'settings.imagePasteDesc', synonyms: 'image paste screenshot clipboard png inline native wsl 이미지 붙여넣기 스크린샷 클립보드' },
 
   { id: 'theme', tab: 'appearance', labelKey: 'settings.theme', synonyms: 'color colour dark light palette 테마' },
-  { id: 'fontsize', tab: 'appearance', labelKey: 'settings.fontSize', synonyms: 'type size zoom text 글자' },
-  { id: 'fontfamily', tab: 'appearance', labelKey: 'settings.fontFamily', descKey: 'settings.fontFamilyDesc', synonyms: 'typeface mono cascadia jetbrains 폰트' },
-  { id: 'cursorshape', tab: 'appearance', labelKey: 'settings.cursorShape', descKey: 'settings.cursorShapeDesc', synonyms: 'cursor caret bar block underline beam 커서 캐럿 막대 블록 shape type style' },
   { id: 'windowglass', tab: 'appearance', labelKey: 'settings.windowGlass', descKey: 'settings.windowGlassDesc', synonyms: 'transparent translucent transparency vibrancy acrylic blur glass opacity 투명 반투명 투명도 유리 블러', platform: ['darwin', 'win32'] },
   { id: 'chrome', tab: 'appearance', labelKey: 'settings.chromePreset', descKey: 'settings.chromePresetDesc', synonyms: 'density compact comfortable' },
   { id: 'sidebarpos', tab: 'appearance', labelKey: 'settings.sidebarPosition', descKey: 'settings.sidebarPositionDesc', synonyms: 'sidebar left right dock' },
   { id: 'sidebarattention', tab: 'appearance', labelKey: 'settings.sidebarSort', descKey: 'settings.sidebarSortDesc', synonyms: 'needs you waiting attention sort order recent activity manual pin top 대기 정렬 순서 최근' },
-  { id: 'sidebarexplorerbutton', tab: 'appearance', labelKey: 'settings.sidebarShowExplorerButton', descKey: 'settings.sidebarShowExplorerButtonDesc', synonyms: 'sidebar folder file explorer finder open button hover 사이드바 폴더 탐색기 버튼' },
+  { id: 'sidebarexplorerbutton', tab: 'appearance', labelKey: 'settings.sidebarShowExplorerButton', descKey: 'settings.sidebarShowExplorerButtonDesc', synonyms: 'sidebar folder file explorer finder open button hover 사이드바 폴더 탐색기 버튼', platformKeys: { darwin: { labelKey: 'settings.sidebarShowExplorerButton.darwin' }, linux: { labelKey: 'settings.sidebarShowExplorerButton.linux' } } },
   { id: 'sidebarcopyinfobutton', tab: 'appearance', labelKey: 'settings.sidebarShowCopyInfoButton', descKey: 'settings.sidebarShowCopyInfoButtonDesc', synonyms: 'sidebar copy session info clipboard button hover 사이드바 세션 정보 복사 버튼' },
   { id: 'sidebarports', tab: 'appearance', labelKey: 'settings.sidebarShowPorts', descKey: 'settings.sidebarShowPortsDesc', synonyms: 'sidebar port ports localhost listening number 사이드바 포트 번호 표시' },
   { id: 'sidebarpanecoordinates', tab: 'appearance', labelKey: 'settings.sidebarShowPaneCoordinates', descKey: 'settings.sidebarShowPaneCoordinatesDesc', synonyms: 'roster coordinate w1-2 pane name label unnamed clutter agent' },
@@ -142,7 +157,7 @@ export const SETTINGS_CATALOG: SettingsCatalogEntry[] = [
   { id: 'multiview', tab: 'appearance', labelKey: 'settings.multiviewArrangement', descKey: 'settings.multiviewArrangementDesc', synonyms: 'grid split stack columns rows' },
   { id: 'uiscale', tab: 'appearance', labelKey: 'settings.uiScale', descKey: 'settings.uiScaleDesc', synonyms: 'zoom dpi accessibility scale 배율' },
   { id: 'titlebarvitals', tab: 'appearance', labelKey: 'settings.titlebarVitals', descKey: 'settings.titlebarVitalsDesc', synonyms: 'memory ram cpu usage gauge chip titlebar status vitals 메모리 사용량 타이틀바' },
-  { id: 'toolbar', tab: 'appearance', labelKey: 'settings.agentToolbarShow', descKey: 'settings.agentToolbarShowDesc', synonyms: 'toolbar compose files snippets schedule multi task' },
+  { id: 'toolbar', tab: 'appearance', labelKey: 'settings.agentToolbarShow', descKey: 'settings.agentToolbarShowDesc', synonyms: 'toolbar compose files snippets schedule multi task', platformKeys: { darwin: { descKey: 'settings.agentToolbarShowDesc.darwin' } } },
 
   { id: 'sound', tab: 'notifications', labelKey: 'settings.sound', descKey: 'settings.soundDesc', synonyms: 'sound audio beep alarm 소리' },
   { id: 'toast', tab: 'notifications', labelKey: 'settings.toast', descKey: 'settings.toastDesc', synonyms: 'toast popup banner' },
@@ -160,6 +175,8 @@ export const SETTINGS_CATALOG: SettingsCatalogEntry[] = [
   { id: 'setup', tab: 'claude-integration', labelKey: 'integrationSetup.title', descKey: 'integrationSetup.description', synonyms: 'hooks hook bridge statusline status line mcp install setup 훅 설치' },
   { id: 'usage', tab: 'claude-integration', labelKey: 'claudeIntegration.usage.title', descKey: 'claudeIntegration.usage.description', synonyms: 'usage quota limit 5h 7d meter anthropic 사용량' },
   { id: 'usagelimitresume', tab: 'claude-integration', labelKey: 'claudeIntegration.usageLimit.autoResume', descKey: 'claudeIntegration.usageLimit.autoResumeDesc', synonyms: 'usage limit rate resume continue reset pause codex 한도 이어가기 재개' },
+  { id: 'usagereserve', tab: 'claude-integration', labelKey: 'claudeIntegration.usageReserve', descKey: 'claudeIntegration.usageReserveDesc', synonyms: 'usage reserve quota limit 5h keep schedule fan-out bot worker unattended 사용량 예비 남기기 예약 팬아웃 봇' },
+  { id: 'scheduledretry', tab: 'claude-integration', labelKey: 'claudeIntegration.scheduledRetry', descKey: 'claudeIntegration.scheduledRetryDesc', synonyms: 'schedule scheduled run retry network server error overloaded continue 예약 재시도 오류' },
   { id: 'clauderesumeonstart', tab: 'claude-integration', labelKey: 'claudeIntegration.resumeOnStart', descKey: 'claudeIntegration.resumeOnStartDesc', synonyms: 'resume restart recover continue launch boot session 재시작 이어가기 복원' },
   { id: 'mcp', tab: 'claude-integration', labelKey: 'settings.mcpServers', synonyms: 'mcp plugin tools broker register codex' },
 
@@ -184,9 +201,11 @@ export const SETTINGS_CATALOG: SettingsCatalogEntry[] = [
   { id: 'roles', tab: 'roles', labelKey: 'settings.roleBindings', descKey: 'settings.roleBindingsDesc', synonyms: 'role reviewer tester planner model bind' },
   { id: 'a2a', tab: 'roles', labelKey: 'settings.a2aAutoApproveExecute', descKey: 'settings.a2aAutoApproveExecuteDesc', synonyms: 'a2a execute approve' },
   { id: 'fanoutapproval', tab: 'roles', labelKey: 'settings.fanoutRequireApproval', descKey: 'settings.fanoutRequireApprovalDesc', synonyms: 'fanout fan-out approval approve prompt unattended ask' },
+  { id: 'workerfence', tab: 'roles', labelKey: 'settings.workerFence', descKey: 'settings.workerFenceDesc', synonyms: 'worker fence sandbox bot unattended bypass auto credentials 울타리 샌드박스 봇 워커' },
   { id: 'fanoutagytrust', tab: 'roles', labelKey: 'settings.fanoutTrustAgyFolders', descKey: 'settings.fanoutTrustAgyFoldersDesc', synonyms: 'agy antigravity trust trusted folder workspace fanout fan-out' },
   { id: 'fanoutworkers', tab: 'roles', labelKey: 'settings.fanoutWorkerPermissionMode', descKey: 'settings.fanoutWorkerPermissionModeDesc', synonyms: 'fanout fan-out worker permission auto bypass sandbox' },
   { id: 'fanoutpresets', tab: 'roles', labelKey: 'settings.fanoutPresets', descKey: 'settings.fanoutPresetsDesc', synonyms: 'fanout fan-out preset image video agents codex grok output folder worktree' },
+  { id: 'customagents', tab: 'roles', labelKey: 'settings.customAgents', descKey: 'settings.customAgentsDesc', synonyms: 'custom agent cli command own add unknown fanout role' },
   { id: 'fanoutallowtools', tab: 'roles', labelKey: 'settings.fanoutAllowWorkerTools', descKey: 'settings.fanoutAllowWorkerToolsDesc', synonyms: 'fanout worker allow tools permissions settings.json' },
 
   { id: 'tokenprofile', tab: 'tokens', labelKey: 'settings.tokenProfile', descKey: 'settings.tokenProfileDesc', synonyms: 'token usage cost cheap minimal balanced effort model profile' },
@@ -209,6 +228,6 @@ export const SETTINGS_CATALOG: SettingsCatalogEntry[] = [
   { id: 'lannic', tab: 'lanlink', labelKey: 'settings.lanlinkNic', descKey: 'settings.lanlinkNicDesc', synonyms: 'nic interface ethernet wifi mac' },
   { id: 'lanpair', tab: 'lanlink', labelKey: 'settings.lanlinkConnections', descKey: 'settings.lanlinkConnectionsDesc', synonyms: 'pin pair join revoke peer connections remote invite 연결 페어링' },
 
-  { id: 'version', tab: 'about', labelKey: 'settings.aboutTagline', synonyms: 'version about changelog release 버전' },
+  { id: 'version', tab: 'about', labelKey: 'settings.aboutTagline', synonyms: 'version about changelog release 버전', platformKeys: { darwin: { labelKey: 'settings.aboutTagline.darwin' }, linux: { labelKey: 'settings.aboutTagline.linux' } } },
   { id: 'stargithub', tab: 'about', labelKey: 'starPrompt.settingsLabel', descKey: 'starPrompt.settingsDescription', synonyms: 'star github support repository 스타 깃허브' },
 ];

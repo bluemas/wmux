@@ -8,7 +8,7 @@ import {
   recordStarPromptAgentSession,
   type StarPromptState,
 } from '../../../shared/starPrompt';
-import { setLocale as i18nSetLocale, t, type Locale } from '../../i18n';
+import { isLocaleLoaded, requestLocale, setLocale as i18nSetLocale, t, type Locale } from '../../i18n';
 import { collectLeafIds, findPane, getLeafPanes, getWorkspaceLeafPanes } from '../../../shared/paneUtils';
 import { canStashPaneSurfaces } from '../../../shared/paneStash';
 import { isDaemonModeActive } from '../../daemon/daemonMode';
@@ -18,6 +18,7 @@ import { clearRemoteSelection } from './workspaceSlice';
 import { publishPaneStashed, publishPaneFocused } from '../../events/publisher';
 import { saveSessionNow } from '../../utils/sessionSaveBridge';
 import { markRetentionMigrationDone } from '../retentionMigration';
+import type { CloseTabTarget } from '../closeTabConfirm';
 import { DEFAULT_BROWSER_BACKEND, isBrowserBackend, type BrowserBackend } from '../../../shared/browserBackend';
 import { CHROME_PRESET_VALUES } from '../../../shared/chromePresets';
 import { sanitizeShortcutOverrides, type ShortcutActionId, type ShortcutOverrides } from '../../../shared/keymap';
@@ -111,6 +112,7 @@ import {
   type OrchestratorRoleBindings,
   type RoleBinding,
 } from '../../../shared/orchestratorRole';
+import type { CustomAgent } from '../../../shared/customAgents';
 import {
   generateId,
   createLeafPane,
@@ -378,6 +380,12 @@ export interface UISlice {
   /** Upsert one role's binding; an empty/undefined binding clears it. */
   setOrchestratorRoleBinding: (role: string, binding: RoleBinding | undefined) => void;
 
+  // The operator's custom agents, as main last returned them (main owns the
+  // list: Settings → Roles & fan-out). Read by the launch rewrites; never
+  // persisted in the session.
+  customAgents: CustomAgent[];
+  setCustomAgents: (agents: CustomAgent[]) => void;
+
   // Orchestrator full-power mode (BYOB approach A): load the user's Claude
   // Code ecosystem (skills, CLAUDE.md, hooks) into brain turns. Default OFF —
   // raw mode is the documented safe default (hook storms, personal hooks in
@@ -471,8 +479,8 @@ export interface UISlice {
   setCloseTabOnShellExit: (enabled: boolean) => void;
 
   // #1839: the tab waiting on the close-tab confirm (tab × or the shortcut).
-  closeTabConfirm: { workspaceId: string; paneId: string; surfaceId: string } | null;
-  requestCloseTab: (target: { workspaceId: string; paneId: string; surfaceId: string }) => void;
+  closeTabConfirm: CloseTabTarget | null;
+  requestCloseTab: (target: CloseTabTarget) => void;
   dismissCloseTab: () => void;
 
   // Idle-clearing of xterm's hidden IME textarea (issue #167, AutoGLM-style
@@ -748,8 +756,8 @@ export interface UISlice {
   // notificationSoundChoice: 'default' picks the bundled cue; 'none' suppresses
   //   sound regardless of notificationSoundEnabled. We keep both flags because
   //   the boolean is the "feature gate" while the choice is the "selected cue".
-  //   Per DESIGN review, the toggle UI exposes the choice; advanced users keep
-  //   the boolean as a master mute.
+  //   Settings shows both as one Notification sound switch (on = enabled and
+  //   not 'none'; turning it on also resets the choice to 'default').
   paneRingEnabled: boolean;
   setPaneRingEnabled: (enabled: boolean) => void;
 
@@ -1071,9 +1079,15 @@ export interface UISlice {
   ) => void;
 
   // ─── Scrollback bookmarks ─────────────────────────────────────────
+  /** ptyId → ids of the xterm markers that hold its scrollback bookmarks
+   *  (Ctrl+M); see components/Terminal/scrollbackBookmarks.ts. The markers
+   *  themselves stay in their Terminal, never here: immer freezes what the
+   *  store holds, and a frozen marker stops tracking its line. */
   terminalBookmarks: Record<string, number[]>;
-  addBookmark: (ptyId: string, line: number) => void;
-  removeBookmark: (ptyId: string, line: number) => void;
+  addBookmark: (ptyId: string, markerId: number) => void;
+  removeBookmark: (ptyId: string, markerId: number) => void;
+  /** Replace a pane's bookmark ids in one set (a repaint's carry). */
+  setBookmarks: (ptyId: string, markerIds: number[]) => void;
   clearBookmarks: (ptyId: string) => void;
 
   // ─── Floating pane ────────────────────────────────────────────────
@@ -1434,11 +1448,19 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
   locale: 'en',
 
   setLocale: (locale) => {
-    // Sync i18n module state immediately (outside immer — pure function call)
-    i18nSetLocale(locale);
-    set((state) => {
-      state.locale = locale;
-    });
+    // A language whose table is not loaded yet switches once it is: the UI
+    // stays in the current language meanwhile, never English or keys. A
+    // newer pick wins over one still loading; a table that fails to load
+    // leaves the language as it was.
+    const apply = () => {
+      // Sync i18n module state immediately (outside immer — pure function call)
+      i18nSetLocale(locale);
+      set((state) => {
+        state.locale = locale;
+      });
+    };
+    if (isLocaleLoaded(locale)) apply();
+    else void requestLocale(locale).then((current) => { if (current) apply(); });
   },
 
   // ─── VI copy mode ─────────────────────────────────────────────────────────
@@ -1540,6 +1562,12 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
     } else {
       delete state.orchestratorRoleBindings[key];
     }
+  }),
+
+  customAgents: [],
+
+  setCustomAgents: (agents) => set((state) => {
+    state.customAgents = agents;
   }),
 
   deckBrainFullPower: false,
@@ -2527,20 +2555,23 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
   // ─── Scrollback bookmarks ─────────────────────────────────────────
   terminalBookmarks: {},
 
-  addBookmark: (ptyId, line) => set((state) => {
+  addBookmark: (ptyId, markerId) => set((state) => {
     if (!state.terminalBookmarks[ptyId]) {
       state.terminalBookmarks[ptyId] = [];
     }
-    const lines = state.terminalBookmarks[ptyId];
-    if (!lines.includes(line)) {
-      lines.push(line);
-      lines.sort((a, b) => a - b);
-    }
+    state.terminalBookmarks[ptyId].push(markerId);
   }),
 
-  removeBookmark: (ptyId, line) => set((state) => {
-    if (!state.terminalBookmarks[ptyId]) return;
-    state.terminalBookmarks[ptyId] = state.terminalBookmarks[ptyId].filter((l) => l !== line);
+  removeBookmark: (ptyId, markerId) => set((state) => {
+    if (!state.terminalBookmarks[ptyId]?.includes(markerId)) return;
+    const ids = state.terminalBookmarks[ptyId].filter((id) => id !== markerId);
+    if (ids.length > 0) state.terminalBookmarks[ptyId] = ids;
+    else delete state.terminalBookmarks[ptyId];
+  }),
+
+  setBookmarks: (ptyId, markerIds) => set((state) => {
+    if (markerIds.length > 0) state.terminalBookmarks[ptyId] = markerIds;
+    else delete state.terminalBookmarks[ptyId];
   }),
 
   clearBookmarks: (ptyId) => set((state) => {

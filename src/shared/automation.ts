@@ -124,12 +124,22 @@ export interface Automation {
     awaitTimeoutMinutes?: number;
     /** Absolute per-run ceiling (default AUTOMATION_DEFAULTS.maxRunMinutes). */
     maxRunMinutes?: number;
+    /**
+     * `false`: a turn that fails on a temporary provider error ends the run at
+     * once. Absent = retry once (when the global setting allows it).
+     */
+    retryTransientErrors?: false;
   };
   /** ms epoch of the next occurrence; null when disabled. */
   nextRunAt: number | null;
   createdAt: number;
   updatedAt: number;
   createdBy: 'desktop-ui' | 'mcp-proposal';
+  /**
+   * Daemon-written only, never read from a draft. Consecutive scheduled runs
+   * that failed with one reason; see isBreakerPaused.
+   */
+  failureStreak?: AutomationFailureStreak;
 }
 
 export type AutomationRunState =
@@ -177,7 +187,13 @@ export type AutomationRunDetail =
   /** A browser action needed a person's consent, and nobody watches a scheduled run. */
   | 'browser_consent_unattended'
   /** Skipped as overlap only because a finished run's session is still open (it lingers, then closes). */
-  | 'previous_session_open';
+  | 'previous_session_open'
+  /** The turn failed on a temporary provider error, was continued once, and failed again. */
+  | 'retried_once'
+  /** The turn failed on a temporary provider error; at retry time the session could not take the continue. */
+  | 'retry_blocked'
+  /** The turn failed on a temporary provider error; wmux restarted before the retry. */
+  | 'retry_interrupted';
 
 export interface AutomationRun {
   id: string;
@@ -204,6 +220,41 @@ export interface AutomationRun {
   browserIdentity?: AutomationBrowserIdentity;
   /** Set on broadcast run events in place of `browserIdentity`, which the event stream never carries. */
   hasBrowserIdentity?: true;
+  /** A browser call of this run used the shared default Chrome profile because nothing was bound. */
+  browserProfileUnbound?: true;
+  /**
+   * Set while the run is held after a temporary provider error: when the one
+   * continue message is due, ms epoch. The run stays `running` meanwhile.
+   */
+  retryAt?: number;
+  /** The one continue message after a temporary provider error was attempted (at most one per run). */
+  retried?: true;
+}
+
+/**
+ * The ends of a launched run that count toward the failure breaker. Every other
+ * end is neutral: a person cancelled it or never answered it (await_timeout),
+ * it never launched (skipped), or the daemon cannot tell what happened (unknown).
+ */
+export const AUTOMATION_FAILURE_REASONS = [
+  'first_run_blocked',
+  'launch_failed',
+  'account_missing',
+  'timeout',
+  'agent_error',
+  'login_needed',
+  'process_exit',
+] as const satisfies readonly AutomationRunReason[];
+export type AutomationFailureReason = (typeof AUTOMATION_FAILURE_REASONS)[number];
+
+export function isFailureReason(reason: unknown): reason is AutomationFailureReason {
+  return (AUTOMATION_FAILURE_REASONS as readonly unknown[]).includes(reason);
+}
+
+export interface AutomationFailureStreak {
+  reason: AutomationFailureReason;
+  /** 1..AUTOMATION_DEFAULTS.failureBreakerRuns */
+  count: number;
 }
 
 /** Terminal states — a run never leaves these. */
@@ -227,7 +278,18 @@ export const AUTOMATION_DEFAULTS = {
   snapshotMaxBytes: 64 * 1024,
   maxAutomations: 50,
   maxPromptChars: 8000,
+  /** Consecutive same-reason scheduled failures that turn a schedule off. */
+  failureBreakerRuns: 3,
 } as const;
+
+/**
+ * The breaker turned this schedule off and nobody has turned it back on: any
+ * human toggle deletes the streak, so a full streak on a schedule that is off
+ * can only be the breaker's.
+ */
+export function isBreakerPaused(a: Pick<Automation, 'enabled' | 'failureStreak'>): boolean {
+  return !a.enabled && (a.failureStreak?.count ?? 0) >= AUTOMATION_DEFAULTS.failureBreakerRuns;
+}
 
 /** Daemon PTY ids for scheduled runs carry this prefix (UX filtering only — not a trust signal). */
 export const AUTOMATION_PTY_PREFIX = 'auto-';
@@ -240,8 +302,16 @@ export interface AutomationDraft {
   name: string;
   trigger: AutomationScheduleTrigger;
   action: AutomationLaunchAction;
-  policy?: Partial<Pick<Automation['policy'], 'awaitTimeoutMinutes' | 'maxRunMinutes'>>;
+  policy?: Partial<Pick<Automation['policy'], 'awaitTimeoutMinutes' | 'maxRunMinutes' | 'retryTransientErrors'>>;
 }
+
+/** Engine-wide settings, kept by the daemon (runs happen with no window open). */
+export interface AutomationSettings {
+  /** Hold a run whose turn failed on a temporary provider error and continue it once. Default on. */
+  retryTransientErrors: boolean;
+}
+
+export const AUTOMATION_DEFAULT_SETTINGS: AutomationSettings = { retryTransientErrors: true };
 
 // ── Daemon RPC contract ─────────────────────────────────────────────────────
 // Mutating methods and run snapshots are first-party only (desktop main).
@@ -269,6 +339,10 @@ export const AUTOMATION_RPC = {
   identityRuns: 'automation.identityRuns',
   /** First-party: record a refused browser call on a live run's detail. */
   noteRunBrowser: 'automation.noteRunBrowser',
+  /** First-party: a browser call of the live run behind `ptyId` used the shared default Chrome profile. */
+  noteRunBrowserProfile: 'automation.noteRunBrowserProfile',
+  /** First-party: change the engine-wide settings (`list` returns them). */
+  setSettings: 'automation.setSettings',
 } as const;
 
 export interface AutomationCapabilitiesResult { capabilities: string[] }
@@ -300,8 +374,9 @@ export interface AutomationNoteRunBrowserParams {
 /**
  * `needs-regrant`: an update changed what runs after a non-approval grant, so
  * the schedule is skipped until a human grants it again.
+ * `failure-paused`: the failure breaker turned the schedule off.
  */
-export type AutomationAttentionKind = 'proposed' | 'grant-raised' | 'needs-regrant';
+export type AutomationAttentionKind = 'proposed' | 'grant-raised' | 'needs-regrant' | 'failure-paused';
 
 /**
  * A queued `attention` event. The daemon keeps these until a first-party
@@ -314,13 +389,19 @@ export interface AutomationAttention {
   automationName: string;
   kind: AutomationAttentionKind;
   at: number;
+  /** Set only for `failure-paused`: the reason the streak shared. */
+  reason?: AutomationFailureReason;
 }
 
 export interface AutomationListResult {
   automations: Automation[];
   /** Unacknowledged attention items, oldest first. */
   pendingAttention?: AutomationAttention[];
+  /** Absent from an older daemon. */
+  settings?: AutomationSettings;
 }
+export interface AutomationSetSettingsParams { settings: Partial<AutomationSettings> }
+export type AutomationSettingsResult = { ok: true; settings: AutomationSettings } | { ok: false; error: string };
 export interface AutomationRunsParams { automationId?: string }
 export interface AutomationRunsResult { runs: AutomationRun[] }
 export interface AutomationSnapshotParams { runId: string }
@@ -383,6 +464,9 @@ export const AUTOMATION_EVENT = 'automation.event';
 
 export type AutomationEvent =
   | { type: 'automations-changed' }
-  | { type: 'run-changed'; run: AutomationRun; automationName: string }
+  /** `pausedSchedule`: this run's end tripped the failure breaker, and the `failure-paused` notice speaks for it. */
+  | { type: 'run-changed'; run: AutomationRun; automationName: string; pausedSchedule?: true }
   /** A draft arrived, a grant was raised, or a grant went stale — surface to the human. */
-  | { type: 'attention'; automationId: string; automationName: string; kind: AutomationAttentionKind };
+  | { type: 'attention'; automationId: string; automationName: string; kind: AutomationAttentionKind }
+  /** A due run was held by the usage reserve: it starts once `untilMs` passes. Main tells the owner once per hold. */
+  | { type: 'reserve-held'; automationId: string; automationName: string; account: string; untilMs: number };

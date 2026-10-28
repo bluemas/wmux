@@ -1,14 +1,17 @@
 // Fleet rows say what the agent is doing in words; raw output lives in the
 // detail area, never in a row.
-import { describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { createElement } from 'react';
-import FleetCard, { agentDisplayName, FleetCardMissionLine, FleetCardEvidenceBadge } from '../FleetCard';
+import FleetCard, { agentDisplayName, fleetAgentName, FleetCardMissionLine, FleetCardEvidenceBadge } from '../FleetCard';
 import { fleetRow, type FleetPane } from '../../../stores/selectors/fleet';
 import { fleetTitle } from '../fleetPresentation';
 import type { WorkTask } from '../../../../shared/workTask';
 import type { EvidenceItem, Task } from '../../../../shared/types';
-import { getLocale, setLocale } from '../../../i18n';
+import { getLocale, loadLocale, setLocale } from '../../../i18n';
+
+// Tables other than English load on demand; the tests below read Korean synchronously.
+beforeAll(() => loadLocale('ko'));
 
 const noop = () => undefined;
 
@@ -65,7 +68,8 @@ describe('FleetCard — task-first rows', () => {
 
   it('puts an input request ahead of a previous tool activity', () => {
     const html = render({ card: card({ agentStatus: 'awaiting_input', activity: '✎ fleet.ts' }) });
-    expect(html).toContain('Needs your input');
+    expect(html).toContain('<span>Needs you</span>');
+    expect(html).not.toContain('Needs your input');
     expect(html).not.toContain('data-fleet-activity');
     expect(html).toContain('Respond');
   });
@@ -133,6 +137,19 @@ describe('FleetCard — one name, a short label', () => {
     expect(agentDisplayName('my build')).toBe('my build');
   });
 
+  it('names the agent, never the shell: a Zsh tab with no detected agent names nothing', () => {
+    expect(fleetAgentName({ agentName: 'Claude Code', surfaceType: 'terminal', title: 'Zsh' })).toBe('Claude Code');
+    expect(fleetAgentName({ agentName: undefined, surfaceType: 'terminal', title: 'Zsh' })).toBe('');
+    expect(fleetAgentName({ agentName: undefined, surfaceType: 'terminal', title: '✳ Claude Code' })).toBe('Claude Code');
+    expect(fleetAgentName({ agentName: undefined, surfaceType: 'terminal', title: 'my build' })).toBe('my build');
+  });
+
+  it('no shell wmux opens (ShellDetector names) or multiplexer is shown as the agent', () => {
+    for (const title of ['Fish', 'Bash', 'Git Bash', 'PowerShell 7', 'Windows PowerShell', 'pwsh.exe', 'Command Prompt', 'cmd.exe', 'WSL', 'nu', 'Nushell', 'tmux', 'sh', 'dash']) {
+      expect(fleetAgentName({ agentName: undefined, surfaceType: 'terminal', title }), title).toBe('');
+    }
+  });
+
   it('keeps the accessible name short: name, status, place, the question clipped', () => {
     const question = 'q'.repeat(200);
     const html = renderToStaticMarkup(createElement(FleetCard, {
@@ -140,7 +157,7 @@ describe('FleetCard — one name, a short label', () => {
       row: { pane: card({ agentStatus: 'awaiting_input' }), section: 'needsYou', detail: question, detailSource: 'question', detailKey: 'fleet.needsYourInput' },
     }));
     const label = /aria-label="([^"]*)"/.exec(html)?.[1] ?? '';
-    expect(label.startsWith('alpha, Needs input, alpha, ')).toBe(true);
+    expect(label.startsWith('alpha, Needs you, alpha, ')).toBe(true);
     expect(label.length).toBeLessThan(140);
     expect(label).not.toContain('Respond');
   });

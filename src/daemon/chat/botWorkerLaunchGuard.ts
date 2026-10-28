@@ -18,10 +18,19 @@
 // WSL session gets the worker settings file alone, as before. Any other
 // session (recorded without its files, or a record that cannot be read) gets
 // nothing typed.
+//
+// The worker fence (main/agents/botWorkerFence.ts): the daemon cannot build
+// it (the self-tested claude, the folder and git checks), so a claude line
+// that would run unattended types nothing: one whose flags, or (with no
+// flag) whose settings, name bypassPermissions or auto, or any launch of a
+// session main started inside the fence. Such a worker starts again only
+// from wmux on the computer.
 
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { getWmuxDir } from '../config';
-import { namesClaude, readBotWorkerSessions, workerProjectSettingsRefusal } from '../../shared/botWorkerGuard';
+import { isFencedMode, linePermissionMode, namesClaude, readBotWorkerSessions, settingsDefaultMode, workerProjectSettingsRefusal } from '../../shared/botWorkerGuard';
 import { spliceWorkerLaunch } from '../../shared/botWorkerMcp';
 import { namesCodex } from '../../shared/codexWorkerGuard';
 import { toWslPath } from '../../shared/imagePaste';
@@ -30,10 +39,17 @@ import { toWslPath } from '../../shared/imagePaste';
  *  each `'` written `'\''`. */
 const QUOTED_FIRST_MESSAGE = /^ -- '(?:[^']|'\\'')*'$/;
 
+/** The launch was refused because the worker would run unattended (by its
+ *  flags or settings) or was started inside the worker fence: it starts again
+ *  only from wmux on the computer. Nothing is typed, as with null. */
+export const WORKER_FENCE_REFUSED = Object.freeze({ refused: 'worker-fence' as const });
+export type WorkerFenceRefused = typeof WORKER_FENCE_REFUSED;
+
 /**
  * The line to type into pane `sessionId`: `line` itself for a pane that is
  * not a bot's worker; for one that is, the line with the worker settings
- * right after the launcher, or null (type nothing). `head` is `line` up to
+ * right after the launcher, or null (type nothing), or WORKER_FENCE_REFUSED
+ * (type nothing, because of the worker fence). `head` is `line` up to
  * the first message: the launcher and its flags, which the guard reads; the
  * rest must be exactly the quoted first message, and is kept as it is.
  */
@@ -44,7 +60,7 @@ export function guardBotWorkerLaunch(
   dir: string = getWmuxDir(),
   /** The folders the line may start claude in (the pane's, a resume's). */
   folders: readonly string[] = [],
-): string | null {
+): string | null | WorkerFenceRefused {
   const read = readBotWorkerSessions(dir);
   if ('sessions' in read && !read.sessions.has(sessionId)) return line;
   // A codex worker starts only as main's fan-out launch (codexWorkerGuard).
@@ -54,6 +70,13 @@ export function guardBotWorkerLaunch(
   const tail = line.slice(head.length);
   if (tail && !QUOTED_FIRST_MESSAGE.test(tail)) return null;
   const rec = 'sessions' in read ? read.sessions.get(sessionId) : undefined;
+  if (runsUnattended(head, rec, dir)) {
+    // Only a readable record establishes that this pane is a fenced worker;
+    // without one the launch is still refused, but without that reason.
+    if (!rec) return null;
+    console.warn(`[botWorkerLaunchGuard] ${sessionId}: a bot worker that runs unattended starts again only from wmux on the computer (worker fence)`);
+    return WORKER_FENCE_REFUSED;
+  }
   if (rec?.launch && !rec.wsl) {
     if (!rec.cwd || [rec.cwd, ...folders].some((f) => workerProjectSettingsRefusal(f) !== null)) return null;
     if (!fs.existsSync(rec.launch.settingsFile) || !fs.existsSync(rec.launch.mcpConfigFile)) return null;
@@ -74,6 +97,25 @@ export function guardBotWorkerLaunch(
   const inWsl = (p: string): string => toWslPath(p) ?? p;
   const guarded = spliceWorkerLaunch(head, inWsl(rec.launch.settingsFile), inWsl(rec.launch.mcpConfigFile));
   return guarded === null ? null : guarded + tail;
+}
+
+/** Would this launch run unattended, or was the session started inside the
+ *  fence? The mode comes from the line's flags, else from the folder's and
+ *  every user settings folder the pane may use (the default one, the
+ *  daemon's CLAUDE_CONFIG_DIR, each account's under `<dir>/accounts`). */
+function runsUnattended(head: string, rec: { cwd?: string; launch?: { fence?: { strength: string } } } | undefined, dir: string): boolean {
+  if (rec?.launch?.fence && rec.launch.fence.strength !== 'off') return true;
+  const home = os.homedir();
+  const accounts = (() => {
+    try {
+      return fs.readdirSync(path.join(dir, 'accounts')).map((n) => path.join(dir, 'accounts', n));
+    } catch {
+      return [];
+    }
+  })();
+  const env = process.env.CLAUDE_CONFIG_DIR;
+  const configDirs = [path.join(home, '.claude'), ...(env && path.isAbsolute(env) ? [env] : []), ...accounts];
+  return isFencedMode(linePermissionMode(head) ?? settingsDefaultMode(rec?.cwd, configDirs));
 }
 
 /** Does a recorded MCP config name any server but wmux (or not parse)? */

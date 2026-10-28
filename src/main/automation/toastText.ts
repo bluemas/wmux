@@ -4,7 +4,7 @@
  * prompt and the run's output never ride in it. Kept pure so a test can pin
  * that nothing else leaks in.
  */
-export type AutomationToastKind = 'awaiting' | 'failed' | 'proposed' | 'grantRaised' | 'needsRegrant';
+export type AutomationToastKind = 'awaiting' | 'failed' | 'proposed' | 'grantRaised' | 'needsRegrant' | 'failurePaused';
 export type AutomationToastLabels = Record<AutomationToastKind, string>;
 
 /**
@@ -13,8 +13,8 @@ export type AutomationToastLabels = Record<AutomationToastKind, string>;
  * anything a status word would not.
  */
 const LABELS: Record<'en' | 'ko', AutomationToastLabels> = {
-  en: { awaiting: 'Needs your response', failed: 'Failed', proposed: 'Draft to review', grantRaised: 'Permission raised', needsRegrant: 'Needs permission again' },
-  ko: { awaiting: '응답 대기', failed: '실패', proposed: '검토할 초안', grantRaised: '권한 상승', needsRegrant: '권한 다시 필요' },
+  en: { awaiting: 'Needs your response', failed: 'Failed', proposed: 'Draft to review', grantRaised: 'Permission raised', needsRegrant: 'Needs permission again', failurePaused: 'Paused after repeated failures' },
+  ko: { awaiting: '응답 대기', failed: '실패', proposed: '검토할 초안', grantRaised: '권한 상승', needsRegrant: '권한 다시 필요', failurePaused: '연속 실패로 일시 중지됨' },
 };
 
 export const DEFAULT_AUTOMATION_TOAST_LABELS: AutomationToastLabels = LABELS.en;
@@ -68,4 +68,14 @@ export function automationToastText(
 ): string {
   const name = oneLine(automationName, NAME_MAX) || 'wmux';
   return `${name} · ${labels[kind]}`;
+}
+
+/** The usage-reserve notice: unattended work on an account waits for its 5h
+ *  reset. `who` is the account's name, or null for the default login. */
+export function usageReserveToastText(locale: AutomationUiLocale, who: string | null, untilClock: string): string {
+  const name = who === null ? null : oneLine(who, NAME_MAX);
+  if (locale === 'ko') {
+    return `사용량 예비분 보호: ${name ?? '기본 Claude 로그인'}의 무인 작업은 ${untilClock}까지 시작하지 않습니다`;
+  }
+  return `Usage reserve: unattended work on ${name ?? 'your default Claude login'} waits until ${untilClock}`;
 }

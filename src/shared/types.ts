@@ -620,7 +620,18 @@ export interface MetadataUpdatePayload {
   settled?: boolean;
   /** Daemon-owned agent turn; excludes boot paints and bare shell submissions. */
   daemonTurnOpen?: boolean;
+  /** The daemon reads the pane's Claude turn as stuck: no progress since this time. Null clears it. */
+  stalledSince?: number | null;
+  /** With `stalledSince`: the turn keeps compacting without editing, this many times. */
+  stallCompactions?: number;
 }
+
+/**
+ * Stop and prefill on a stuck turn: `filled` = the last prompt was pasted into
+ * the empty input, unsent; `kept` = the input already held text (Claude puts an
+ * interrupted prompt back by itself); `stopped` = stopped, nothing pasted.
+ */
+export type StallPrefillResult = 'filled' | 'kept' | 'stopped' | 'not_running' | 'blocked' | 'unavailable' | 'error';
 
 // === Status indicator colors ===
 export type WorkspaceStatus = 'active' | 'idle' | 'error' | 'running';
@@ -852,6 +863,14 @@ export interface ArchivedWorkspace {
 /** The Fleet page's layout: the attention list, or the same rows as a four-column board. */
 export type FleetLayout = 'list' | 'board';
 
+/** One app window's slice of the session. A workspace belongs to exactly one
+ *  window. Bounds live in window-state.json, not here. */
+export interface SessionWindow {
+  id: string;
+  workspaceIds: string[];
+  activeWorkspaceId?: string;
+}
+
 export interface SessionData {
   workspaces: Workspace[];
   activeWorkspaceId: string;
@@ -863,6 +882,14 @@ export interface SessionData {
    *  workspace numbers across restart). Optional for pre-P2 sessions. */
   nextWorkspaceOrdinal?: number;
   sidebarVisible: boolean;
+  /** Multiple windows (roadmap P2-1). Which window shows which workspaces;
+   *  windows[0] is the primary window. `workspaces` above stays the union of
+   *  every window's workspaces, so an older version that ignores this field
+   *  still restores every workspace (in its one window). Absent or unusable =
+   *  one window with every workspace. Read through resolveSessionWindows()
+   *  (sessionWindows.ts), never directly. Not written yet: the renderer still
+   *  saves a single-window session. */
+  windows?: SessionWindow[];
   /** Right-side channel dock visibility. Optional for backward-compat with
    *  pre-dock sessions (defaults to false on load). */
   channelDockVisible?: boolean;

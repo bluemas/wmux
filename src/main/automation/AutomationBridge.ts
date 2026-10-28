@@ -22,6 +22,7 @@ const ATTENTION_TOAST_KIND: Record<AutomationAttentionKind, AutomationToastKind>
   proposed: 'proposed',
   'grant-raised': 'grantRaised',
   'needs-regrant': 'needsRegrant',
+  'failure-paused': 'failurePaused',
 };
 
 function isAttentionKind(kind: unknown): kind is AutomationAttentionKind {
@@ -119,6 +120,7 @@ export function parseAutomationEvent(data: unknown): AutomationEvent | null {
       type: 'run-changed',
       run: run as unknown as AutomationRun,
       automationName: typeof ev.automationName === 'string' ? ev.automationName : '',
+      ...(ev.pausedSchedule === true && { pausedSchedule: true as const }),
     };
   }
   if (ev.type === 'attention') {
@@ -129,6 +131,17 @@ export function parseAutomationEvent(data: unknown): AutomationEvent | null {
       automationId: ev.automationId,
       automationName: typeof ev.automationName === 'string' ? ev.automationName : '',
       kind: ev.kind,
+    };
+  }
+  if (ev.type === 'reserve-held') {
+    if (typeof ev.automationId !== 'string' || typeof ev.account !== 'string' || !ev.account) return null;
+    if (typeof ev.untilMs !== 'number' || !Number.isFinite(ev.untilMs)) return null;
+    return {
+      type: 'reserve-held',
+      automationId: ev.automationId,
+      automationName: typeof ev.automationName === 'string' ? ev.automationName : '',
+      account: ev.account,
+      untilMs: ev.untilMs,
     };
   }
   return null;
@@ -156,6 +169,8 @@ export class AutomationBridge {
   constructor(
     private readonly getWindow: () => BrowserWindow | null,
     private readonly toast: AutomationToastFn,
+    /** A scheduled run was held by the usage reserve (main tells the owner once per hold). */
+    private readonly onReserveHeld?: (hold: { account: string; untilMs: number }) => void,
   ) {}
 
   /**
@@ -276,6 +291,11 @@ export class AutomationBridge {
   }
 
   private handle(ev: AutomationEvent): void {
+    if (ev.type === 'reserve-held') {
+      // Main's to tell; the renderer's run list is unchanged by a hold.
+      this.onReserveHeld?.({ account: ev.account, untilMs: ev.untilMs });
+      return;
+    }
     if (ev.type === 'run-changed') {
       this.noteRun(ev.run);
       this.touchedDuringPull?.add(ev.run.id);
@@ -283,7 +303,11 @@ export class AutomationBridge {
     this.send({ kind: 'event', event: ev });
     if (ev.type === 'run-changed') {
       noteRunForIdentity(ev.run);
-      this.toastRun(ev.run, ev.automationName);
+      // The failure-paused notice that follows says it for the run that tripped
+      // the breaker. Mark the run's failure as shown: terminate() re-emits the
+      // run without the flag, and that copy must not toast "Failed".
+      if (ev.pausedSchedule) remember(`${ev.run.id}:${ev.run.state}`);
+      else this.toastRun(ev.run, ev.automationName);
     } else if (ev.type === 'attention') {
       // The live event carries no queue id; read the queue so the toast and
       // its ack refer to the same item.

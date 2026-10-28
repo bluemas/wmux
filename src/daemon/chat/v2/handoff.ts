@@ -6,9 +6,12 @@ import {
   type ChatV2RunMode,
 } from '../../../shared/chatv2/ipc';
 import { permissionFlagFor } from '../../../shared/agentResume';
+import { inResumeCwd, pwshQuote, shellQuote, type ResumeShell } from '../../../shared/resumeShell';
 import { sameProcessStartTime } from '../../phantomExit';
 import { beginPaneMove, endPaneMove } from './paneClaims';
 import type { ChatV2Driver, ChatV2HostDeps, ChatV2StoredRecord } from './types';
+
+export { inResumeCwd, pwshQuote, type ResumeShell };
 
 /**
  * Chat → terminal handoff, the only direction v1 offers (ipc.ts, Ownership).
@@ -25,6 +28,9 @@ import type { ChatV2Driver, ChatV2HostDeps, ChatV2StoredRecord } from './types';
  * tombstone was written, the tombstone is rolled back. Every value that
  * reaches the shell is checked against its pattern first.
  */
+
+/** Why a handoff stops when a terminal in another pane took the conversation meanwhile. */
+const YIELDED = 'This conversation continued in a terminal in another pane.';
 
 /** What a pid probe can tell: only `gone` is proof the process exited. */
 export type ProcessProbe = 'gone' | 'exists' | 'unknown';
@@ -69,18 +75,6 @@ function signalProbe(pid: number): ProcessProbe {
   }
 }
 
-/** The shells a resume command is written for: POSIX sh-family, or PowerShell (5.1 and 7). */
-export type ResumeShell = 'posix' | 'pwsh';
-
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
-}
-
-/** PowerShell single quotes: also closed by the typographic single quotes, so those are doubled too. */
-export function pwshQuote(value: string): string {
-  return `'${value.replace(/['\u2018\u2019\u201a\u201b]/g, (q) => q + q)}'`;
-}
-
 /** Anything a command line must never carry: C0 controls and DEL. */
 // eslint-disable-next-line no-control-regex
 const CONTROL = /[\u0000-\u001f\u007f]/;
@@ -108,14 +102,6 @@ export function resumeCommand(
     ...(permission ? [permission] : []),
   ].join(' ');
   return `${inResumeCwd(cwd, agent, shell)}\r`;
-}
-
-/** `line`, run only once the shell has changed to `cwd`. */
-export function inResumeCwd(cwd: string, line: string, shell: ResumeShell): string {
-  // PowerShell 5.1 has no `&&`; `Set-Location -PassThru` yields nothing when it fails.
-  return shell === 'pwsh'
-    ? `if (Set-Location -LiteralPath ${pwshQuote(cwd)} -PassThru -ErrorAction SilentlyContinue) { ${line} }`
-    : `cd -- ${shellQuote(cwd)} && ${line}`;
 }
 
 function modePermission(mode: ChatV2RunMode): 'bypassPermissions' | 'default' {
@@ -182,6 +168,11 @@ async function handOff(deps: ChatV2HandoffDeps, input: ChatV2HandoffInput): Prom
   if (!(await deps.paneFree(paneId))) return refuse('The terminal is busy.');
   const revision = deps.promptRevision(paneId);
   if (revision === null) return refuse('The terminal prompt is not empty.');
+  // A terminal in another pane took the conversation during the awaits above
+  // (the host's terminalHolds turned this record into its tombstone): typing
+  // the resume here would make a second writer.
+  // (Read through a call: the check at the top narrowed `record.state` for the compiler.)
+  if (handedOffRefusal(record)) return refuse(YIELDED);
 
   // 2. The tombstone, before anything reaches the shell.
   const tombstone: ChatV2StoredRecord = { ...record, state: 'handed-off' };
@@ -207,6 +198,8 @@ async function rollBack(
   tombstone: ChatV2StoredRecord,
   message: string,
 ): Promise<ChatV2HandoffResult> {
+  // Another pane's terminal holds the conversation now: never active again.
+  if (record.state === 'handed-off') return { ...chatV2Error('handoff-refused', YIELDED), record: tombstone };
   const restored: ChatV2StoredRecord = { ...record, state: 'active' };
   delete restored.process;
   try {

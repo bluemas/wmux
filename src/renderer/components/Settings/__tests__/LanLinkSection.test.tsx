@@ -30,6 +30,8 @@ function makeProps(overrides: Partial<LanLinkViewProps> = {}): LanLinkViewProps 
     selectedValue: LANLINK_NIC_NONE,
     onChangeNic: () => undefined,
     busy: false,
+    stopReason: null,
+    hasNetworkCategory: true,
     t: tStub,
     ...overrides,
   };
@@ -82,6 +84,26 @@ describe('LanLinkView — markup', () => {
     expect(html).toContain('aria-checked="true"');
   });
 
+  it('says in one line why an enabled LanLink is not listening', () => {
+    const html = renderToStaticMarkup(createElement(LanLinkView, makeProps({ enabled: true, stopReason: 'network-public' })));
+    expect(html).toContain('lanlink-stop-reason');
+    expect(html).toContain('settings.lanlinkStopPublic');
+    expect(html).toContain('data-tone="warning"');
+  });
+
+  it('says on macOS and Linux that there is no network category to gate on', () => {
+    const html = renderToStaticMarkup(createElement(LanLinkView, makeProps({ hasNetworkCategory: false })));
+    expect(html).toContain('settings.lanlinkWarningNoCategory');
+    expect(html).not.toContain('settings.lanlinkWarning<');
+  });
+
+  it('shows no reason line while listening, or when LanLink is off', () => {
+    const listening = renderToStaticMarkup(createElement(LanLinkView, makeProps({ enabled: true, stopReason: null })));
+    expect(listening).not.toContain('lanlink-stop-reason');
+    const off = renderToStaticMarkup(createElement(LanLinkView, makeProps({ enabled: false, stopReason: 'network-public' })));
+    expect(off).not.toContain('lanlink-stop-reason');
+  });
+
   it('shows the applying hint only when busy', () => {
     const idle = renderToStaticMarkup(createElement(LanLinkView, makeProps({ busy: false })));
     expect(idle).not.toContain('settings.lanlinkApplying');
@@ -105,5 +127,27 @@ describe('LanLinkView — onChange wiring', () => {
     const ethOption = props.options.find((o) => o.nic?.name === 'Ethernet')!;
     props.onChangeNic(ethOption.value);
     expect(onChangeNic).toHaveBeenCalledWith(ethOption.value);
+  });
+});
+
+describe('LanLinkView — port and firewall notices', () => {
+  const slot = (id: string) => createElement('div', { 'data-slot': id });
+  const render = (p: Partial<LanLinkViewProps>) => renderToStaticMarkup(createElement(LanLinkView, makeProps({ enabled: true, ...p })));
+
+  it('an explained bind failure replaces the listen-failed line', () => {
+    const html = render({ stopReason: 'listen-failed', listenNotice: slot('listen'), firewallNotice: slot('firewall') });
+    expect(html).toContain('data-slot="listen"');
+    expect(html).not.toContain('settings.lanlinkStopListenFailed');
+    expect(html).not.toContain('data-slot="firewall"');
+  });
+
+  it('other stop reasons keep their line and never show the listen notice', () => {
+    const html = render({ stopReason: 'network-public', listenNotice: slot('listen') });
+    expect(html).toContain('settings.lanlinkStopPublic');
+    expect(html).not.toContain('data-slot="listen"');
+  });
+
+  it('a listener shows its firewall check', () => {
+    expect(render({ stopReason: null, firewallNotice: slot('firewall') })).toContain('data-slot="firewall"');
   });
 });

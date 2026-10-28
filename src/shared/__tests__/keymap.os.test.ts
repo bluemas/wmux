@@ -7,6 +7,7 @@ import {
   collidesWithKeymap,
   ADVERTISED_SHORTCUTS,
   UNBOUND_SHORTCUTS,
+  settingsUnboundRows,
   SHORTCUT_ACTION_IDS,
   comboFromEvent,
   concreteCombo,
@@ -259,8 +260,8 @@ describe('toggleOfficeView (Shift+Alt+O)', () => {
     const o = { key: 'O', code: 'KeyO', ctrlKey: false, shiftKey: true, altKey: true };
     expect(resolveShortcut(ev(o), win)).toBe('toggleOfficeView');
     expect(resolveShortcut(ev({ ...o, key: 'Ø' }), mac)).toBe('toggleOfficeView');
-    // Ctrl+Shift+O stays Company View; Alt+O alone is the pane's.
-    expect(resolveShortcut(ev({ key: 'O', code: 'KeyO', shiftKey: true }), win)).toBe('toggleCompanyView');
+    // Ctrl+Shift+O and Alt+O alone are the pane's.
+    expect(resolveShortcut(ev({ key: 'O', code: 'KeyO', shiftKey: true }), win)).toBeNull();
     expect(resolveShortcut(ev({ key: 'o', code: 'KeyO', ctrlKey: false, altKey: true }), win)).toBeNull();
   });
 });
@@ -615,5 +616,25 @@ describe('workspaceShortcutNumber', () => {
   it('has no digit for a row outside the list', () => {
     expect(workspaceShortcutNumber(-1, 12)).toBeUndefined();
     expect(workspaceShortcutNumber(12, 12)).toBeUndefined();
+  });
+});
+
+describe('the dead Company View toggle', () => {
+  it('takes no key by default, so Ctrl+Shift+O reaches the pane', () => {
+    for (const platform of ['win32', 'darwin', 'linux'] as const) {
+      const bindings = effectiveBindings(platform, {});
+      expect(bindings.some((b) => b.action === 'toggleCompanyView')).toBe(false);
+      expect(resolveShortcut(ev({ key: 'O', code: 'KeyO', ctrlKey: true, shiftKey: true }), bindings)).toBeNull();
+      expect(resolveShortcut(ev({ key: 'O', code: 'KeyO', metaKey: true, shiftKey: true }), bindings)).toBeNull();
+    }
+  });
+
+  it('still binds a key the user saved, and is listed only while it holds one', () => {
+    const overrides = sanitizeShortcutOverrides({ toggleCompanyView: 'Ctrl+Alt+O' });
+    expect(overrides).toEqual({ toggleCompanyView: 'Ctrl+Alt+O' });
+    expect(resolveShortcut(ev({ key: 'o', code: 'KeyO', ctrlKey: true, altKey: true }), effectiveBindings('win32', overrides))).toBe('toggleCompanyView');
+    expect(settingsUnboundRows({})).not.toContain('toggleCompanyView');
+    expect(settingsUnboundRows(overrides)).toContain('toggleCompanyView');
+    expect(settingsUnboundRows({})).toContain('stashPane');
   });
 });

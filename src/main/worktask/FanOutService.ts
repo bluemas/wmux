@@ -45,6 +45,7 @@ import * as crypto from 'node:crypto';
 import { TaskWorktreeManager, taskIdSuffix } from './TaskWorktreeManager';
 import { getWmuxHomeDir } from '../../shared/constants';
 import { type FanoutAgentChoice } from '../../shared/fanoutPreset';
+import type { CustomAgent } from '../../shared/customAgents';
 import { sanitizeFanoutOrigin, type FanoutOrigin } from '../../shared/fanoutOrigin';
 import type { TaskWorktreePlan } from './TaskWorktreeManager';
 import type { ProjectConfigState } from '../../shared/wmuxProjectConfig';
@@ -83,7 +84,7 @@ import { inheritTaskAutonomy } from './taskAutonomy';
 import { getFanOutGuards, type FanOutGuards } from './fanoutGuards';
 import { getWorkerSlots, type WorkerSlots } from '../factory/workerSlots';
 import { loadFanoutWorkerPermissionMode } from './fanoutWorkerPolicy';
-import { commandChoosesModel, promptFlagForLauncher } from '../../shared/orchestratorRole';
+import { commandChoosesModel, promptFlagForLauncher, type RoleBinding } from '../../shared/orchestratorRole';
 import {
   MODEL_ENV_MARKER,
   WORKER_GATEWAY_ENV,
@@ -95,7 +96,7 @@ import {
 import { launchLineForShell, promptFileArgument } from '../../shared/promptFileArgument';
 import { getPtyShell } from '../pty/ptyShellRegistry';
 import type { Connector } from '../../shared/botConnector';
-import { AGENT_SLUG_SET } from '../../shared/agentIdentity';
+import { AGENT_ROWS, AGENT_SLUG_SET, agentLauncherStem, agentSlugToDisplay, type AgentSlug } from '../../shared/agentIdentity';
 import { getSharedTaskGateRunner } from './TaskGateRunner';
 import {
   clearFirstRunPrompts,
@@ -106,6 +107,7 @@ import {
   SUPPORTED_STEMS,
   type FirstRunPort,
   type FirstRunWatchOptions,
+  watchFolderTrust,
 } from './agentFirstRun';
 
 /**
@@ -203,6 +205,10 @@ export interface FanOutRendererPort {
      *  renderer rewrites the launch command through the same applyRoleBinding
      *  path a human-opened pane uses. Absent = launch the command as given. */
     role?: string;
+    /** The binding the fan-out's approval showed for `role` (null = shown as
+     *  unbound). Present only for an approved fan-out: the renderer launches
+     *  it instead of reading the role's current binding. */
+    roleBinding?: RoleBinding | null;
     /** Depth-1 lineage: the workspace that fanned this task out. The renderer
      *  hands it to pty.create, whose main-side handler stamps it BEFORE the
      *  PTY (and the agent) exists; a failed stamp fails the spawn. */
@@ -221,6 +227,9 @@ export interface FanOutRendererPort {
      *  task runs on. Data, not a command — the renderer re-validates it and
      *  turns it into a RoleBinding on the same rewrite path a role uses. */
     agentChoice?: FanoutAgentChoice;
+    /** The operator's custom agents as main read them when the fan-out was
+     *  approved: the renderer launches these definitions, not a later read. */
+    customAgents?: CustomAgent[];
     /** A bot worker's single-use secret grant: an opaque id the renderer
      *  hands to pty.create unchanged (it carries no name and no value). */
     secretGrant?: string;
@@ -278,6 +287,13 @@ export interface FanOutProjectPort {
 }
 
 /** fan-out 호출 입력(렌더러 다이얼로그 → IPC). */
+/** A task's `roleBinding` field: the binding its approval showed for `role`
+ *  (null = shown as unbound), or no field when the request carries none. */
+function approvedRoleBindingFor(req: FanOutRequest, role: string | undefined): { roleBinding?: RoleBinding | null } {
+  if (!role || !req.roleBindings || !Object.hasOwn(req.roleBindings, role)) return {};
+  return { roleBinding: req.roleBindings[role] };
+}
+
 export interface FanOutRequest {
   /** 호출 단위 멱등키(렌더러가 제출 시 1회 발급 — §2 G1). */
   idempotencyKey: string;
@@ -310,12 +326,18 @@ export interface FanOutRequest {
    * bindings the operator configured; it cannot invent a command.
    */
   roles?: string[];
+  /** The bindings the approval showed for `roles` (approvedRoleBindings), set
+   *  by main from the approval verdict, never by the caller. */
+  roleBindings?: Record<string, RoleBinding | null>;
   /**
    * Per-task agent choice, index-aligned with `titles` — from an operator
    * preset or a caller's `agents[]`, already validated against the closed
    * table in shared/fanoutPreset.ts. Mutually exclusive with `roles`.
    */
   agents?: FanoutAgentChoice[];
+  /** The operator's custom agents as main read them for the approval: every
+   *  task launches these definitions (main's snapshot, never the caller's). */
+  customAgents?: CustomAgent[];
   /**
    * false = no git worktree (preset option). Each task gets its own folder
    * under `<wmux data>/outputs/<outputFolder>/<batch>/`, no branch, no fetch,
@@ -360,8 +382,9 @@ export interface FanOutRequest {
    *  worktree is ready: a reason refuses that task (its mission is closed,
    *  nothing is launched, and since no pane was ever started in it, its
    *  worktree is rolled back; see rollbackTaskWorktree). A bot's fan-out answers from the
-   *  factory switch, so turning the factory off stops a launch in progress. */
-  mayLaunch?: () => string | null;
+   *  factory switch, so turning the factory off stops a launch in progress.
+   *  `task.index` names the task (its index in `titles`). */
+  mayLaunch?: (task?: { index: number }) => string | null;
   /** Awaited right before mayLaunch for each task: a launch slot under the
    *  factory's agent budget (factory/agentSlots.ts). `ok:false` refuses the
    *  task as mayLaunch does; `release` is called once the task's ledger row is
@@ -672,7 +695,7 @@ export class FanOutService {
   /** F15 — delay before the single late model re-read. */
   private readonly firstRunRecheckMs: number;
   /** F15 — deferred re-checks still in flight (tests await them). */
-  private pendingRechecks: Promise<void>[] = [];
+  private readonly pendingRechecks = new Set<Promise<void>>();
   /** Depth-1 lineage + live-cap store (absent = the hosted one). */
   private readonly lineage?: Pick<FanOutGuards, 'markTask' | 'taskSettled'> & Partial<Pick<FanOutGuards, 'bindTask'>>;
   private readonly launches?: Pick<WorkerSlots, 'beginLaunch' | 'launched' | 'released'>;
@@ -930,7 +953,9 @@ export class FanOutService {
       missionIdemKey: `${req.idempotencyKey}-${k}`,
       reservationKey: req.idempotencyKey,
       ...(entries[k].role ? { role: entries[k].role } : {}),
+      ...approvedRoleBindingFor(req, entries[k].role),
       ...(entries[k].agent ? { agentChoice: entries[k].agent } : {}),
+      ...(req.customAgents ? { customAgents: req.customAgents } : {}),
       ...(req.branches?.[k] ? { branch: req.branches[k] } : {}),
       ...(req.preset ? { preset: req.preset } : {}),
       ...(req.checkout ? { checkout: { sha: req.checkout.sha } } : {}),
@@ -1242,7 +1267,9 @@ export class FanOutService {
         reservationKey: req.idempotencyKey,
         output: { batchDir },
         ...(entries[k].role ? { role: entries[k].role } : {}),
+        ...approvedRoleBindingFor(req, entries[k].role),
         ...(entries[k].agent ? { agentChoice: entries[k].agent } : {}),
+        ...(req.customAgents ? { customAgents: req.customAgents } : {}),
         // A bot's research task runs here: its preset, thread, handoff,
         // launch check, agent slot and secrets as on a worktree.
         ...(req.preset ? { preset: req.preset } : {}),
@@ -1390,6 +1417,8 @@ export class FanOutService {
     suggestCopy?: { cwd: string; count: number; root: string };
     /** Orchestrator role for this task's pane (absent = unroled). */
     role?: string;
+    /** FanOutRequest.roleBindings[role], when the request carries them. */
+    roleBinding?: RoleBinding | null;
     /** The task branch's name (absent = wtask/{slug}-{id}). */
     branch?: string;
     /** T3 — commit the task branch starts from (absent = HEAD). */
@@ -1399,6 +1428,8 @@ export class FanOutService {
     workerMode: FanoutWorkerPermissionMode;
     /** Preset row / caller agents[k] (absent = the default agent). */
     agentChoice?: FanoutAgentChoice;
+    /** FanOutRequest.customAgents. */
+    customAgents?: CustomAgent[];
     /** worktree:false — create an output folder in this batch instead of a worktree. */
     output?: { batchDir: string };
     /** Who asked (see FanOutRequest.caller) — the same origin for every task
@@ -1422,7 +1453,7 @@ export class FanOutService {
     /** See FanOutRequest.originPin. */
     originPin?: string;
     /** See FanOutRequest.mayLaunch. */
-    mayLaunch?: () => string | null;
+    mayLaunch?: (task?: { index: number }) => string | null;
     /** See FanOutRequest.awaitLaunchSlot. */
     awaitLaunchSlot?: (task: { taskId: string; title: string }) => Promise<LaunchSlot>;
     /** See FanOutRequest.secretNames. */
@@ -1779,7 +1810,7 @@ export class FanOutService {
     // The caller's last word before anything is launched.
     let refusal: string | null = null;
     try {
-      refusal = ctx.mayLaunch?.() ?? null;
+      refusal = ctx.mayLaunch?.({ index: ctx.index }) ?? null;
     } catch (err) {
       refusal = `the launch check failed: ${String(err)}`;
     }
@@ -1900,7 +1931,9 @@ export class FanOutService {
         initialCommand,
         ...(Object.keys(paneEnv).length > 0 ? { env: paneEnv } : {}),
         ...(ctx.role ? { role: ctx.role } : {}),
+        ...(ctx.roleBinding !== undefined ? { roleBinding: ctx.roleBinding } : {}),
         ...(ctx.agentChoice ? { agentChoice: ctx.agentChoice } : {}),
+        ...(ctx.customAgents ? { customAgents: ctx.customAgents } : {}),
         fanoutTaskOf: ctx.verifiedWorkspaceId,
         ...(ctx.requester ? { fanoutOrigin: ctx.requester } : {}),
         ...(secretGrant ? { secretGrant } : {}),
@@ -2251,11 +2284,18 @@ export class FanOutService {
     const ptyId = base.ptyId;
     if (!port || !ptyId) return;
     // The command the renderer ACTUALLY launched (a role binding may have
-    // swapped the agent). Only claude has these screens. The marker is split
-    // off with the SAME shared constant that attaches it, so the two cannot
-    // drift into a stem this check does not recognise.
+    // swapped the agent); its registry row says what to watch for
+    // (firstRunWatch). The marker is split off with the SAME shared constant
+    // that attaches it, so the two cannot drift into a stem this check does
+    // not recognise.
     const { marker, command: launched } = splitModelEnvMarker(base.initialCommand ?? '');
-    if (launcherStem(launched) !== 'claude') return;
+    const stem = launcherStem(launched);
+    const agent = AGENT_ROWS.find((row) => agentLauncherStem(row) === stem);
+    if (!agent?.firstRunWatch) return;
+    if (agent.firstRunWatch === 'trust') {
+      this.scheduleTrustWatch(base, ownerWorkspaceId, ptyId, port, agent.slug);
+      return;
+    }
     const neutralisedModelEnv = marker.length > 0;
 
     let outcome: Awaited<ReturnType<typeof clearFirstRunPrompts>>;
@@ -2271,13 +2311,43 @@ export class FanOutService {
       // paint, send the first turn and be refused. Look once more, later — and
       // do it off the critical path, because spawnOne is serial and the fan-out
       // must not pay that wait N times over.
-      this.scheduleModelRecheck(base, ownerWorkspaceId, ptyId, port, neutralisedModelEnv);
+      this.scheduleModelRecheck(base, ownerWorkspaceId, ptyId, port, neutralisedModelEnv, agent.slug);
       return;
     }
     base.firstRunPrompt = outcome.headline;
     if (outcome.status !== 'stuck') return;
     base.firstRunStuck = true;
-    await this.markFirstRunStuck(base.taskId, ownerWorkspaceId, outcome, neutralisedModelEnv);
+    await this.markFirstRunStuck(base.taskId, ownerWorkspaceId, outcome, neutralisedModelEnv, agent.slug);
+  }
+
+  /**
+   * The watch for an agent with only a folder-trust dialog to stop at
+   * (firstRunWatch 'trust'), off the critical path like the model recheck:
+   * the dialog can be drawn well after launch, and spawnOne is serial, so a
+   * fan-out must not wait for it per worker. Found, the task's ledger row
+   * says so; the result is already on its way back. Tests await it through
+   * {@link settleFirstRunRechecks}.
+   */
+  private scheduleTrustWatch(
+    base: FanOutTaskResult,
+    ownerWorkspaceId: string,
+    ptyId: string,
+    port: FirstRunPort,
+    agent: AgentSlug,
+  ): void {
+    const { taskId } = base;
+    const run = async (): Promise<void> => {
+      const outcome = await watchFolderTrust(ptyId, port, this.firstRunOptions ?? {});
+      if (outcome.status !== 'stuck') return;
+      await this.markFirstRunStuck(taskId, ownerWorkspaceId, outcome, false, agent);
+    };
+    this.trackRecheck(run().catch(() => { /* best-effort, as the model recheck */ }));
+  }
+
+  /** Keep a late first-run check until it settles, for settleFirstRunRechecks. */
+  private trackRecheck(check: Promise<void>): void {
+    this.pendingRechecks.add(check);
+    void check.finally(() => this.pendingRechecks.delete(check));
   }
 
   /**
@@ -2294,9 +2364,11 @@ export class FanOutService {
     ptyId: string,
     port: FirstRunPort,
     neutralisedModelEnv: boolean,
+    agent: AgentSlug,
   ): void {
     const delay = this.firstRunRecheckMs;
     if (delay < 0) return;
+    const { taskId } = base;
     const run = async (): Promise<void> => {
       if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
       let screen = '';
@@ -2308,13 +2380,14 @@ export class FanOutService {
       const prompt = detectFirstRunPrompt(screen);
       if (prompt?.kind !== 'model-error') return;
       await this.markFirstRunStuck(
-        base.taskId,
+        taskId,
         ownerWorkspaceId,
         { headline: prompt.headline, reason: 'model', ...(prompt.model ? { model: prompt.model } : {}) },
         neutralisedModelEnv,
+        agent,
       );
     };
-    this.pendingRechecks.push(run().catch(() => { /* best-effort — see above */ }));
+    this.trackRecheck(run().catch(() => { /* best-effort — see above */ }));
   }
 
   /**
@@ -2410,9 +2483,7 @@ export class FanOutService {
 
   /** Tests only: settle the deferred model re-checks this run scheduled. */
   async settleFirstRunRechecks(): Promise<void> {
-    const pending = this.pendingRechecks;
-    this.pendingRechecks = [];
-    await Promise.all(pending);
+    await Promise.all([...this.pendingRechecks]);
   }
 
   /** Move a task's ledger row to `input_required` with the reason. Best-effort:
@@ -2422,6 +2493,7 @@ export class FanOutService {
     ownerWorkspaceId: string,
     outcome: { headline: string; reason: 'trust' | 'unanswered' | 'send-failed' | 'model'; model?: string },
     neutralisedModelEnv: boolean,
+    agent: AgentSlug,
   ): Promise<void> {
     if (!taskId) return;
     try {
@@ -2433,7 +2505,7 @@ export class FanOutService {
         status: 'input_required',
         actor: { kind: 'system', workspaceId: ownerWorkspaceId },
         expectedRev: entry.rev,
-        summary: firstRunStuckSummary(outcome, { neutralisedModelEnv }),
+        summary: firstRunStuckSummary(outcome, { neutralisedModelEnv, agent }),
       });
     } catch {
       // best-effort — the result already carries firstRunStuck.
@@ -2753,7 +2825,7 @@ export function firstRunStuckSummary(
     reason: 'trust' | 'unanswered' | 'send-failed' | 'model';
     model?: string;
   },
-  opts: { neutralisedModelEnv?: boolean } = {},
+  opts: { neutralisedModelEnv?: boolean; agent?: AgentSlug } = {},
 ): string {
   if (outcome.reason === 'model') {
     const fix = opts.neutralisedModelEnv
@@ -2764,5 +2836,6 @@ export function firstRunStuckSummary(
       `run /model <model> in the pane — ${fix}`
     );
   }
-  return `worker is waiting on Claude Code's ${outcome.headline}; it needs a keypress in the pane`;
+  // The agent fan-out launched, not one read back off the screen.
+  return `worker is waiting on ${agentSlugToDisplay(opts.agent ?? 'claude')}'s ${outcome.headline}; it needs a keypress in the pane`;
 }

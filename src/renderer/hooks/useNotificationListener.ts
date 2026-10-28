@@ -26,6 +26,7 @@ import { selectBotTaskOwners } from '../components/Sidebar/botTasks';
 import type { FanoutOrigin } from '../../shared/fanoutOrigin';
 import type { BotsWorkerPanel } from '../stores/slices/roomSlice';
 import { notePanePr } from './fanoutCallerNudge';
+import { t } from '../i18n';
 
 /**
  * J3 §4 — cwd가 태스크 worktree 경계 안인지(best-effort, OSC 협조 기반). 정규화
@@ -396,6 +397,8 @@ export interface NotificationHandlerDeps {
     paneFlashEnabled: boolean;
     taskbarFlashEnabled: boolean;
     mutedNotificationCategories: NotificationCategory[];
+    /** A pane's question still waiting on the user (optional for fixtures). */
+    surfacePendingQuestion?: Record<string, string>;
     addNotification: (n: { workspaceId: string; surfaceId?: string; ptyId?: string; type: NotificationType; title: string; body: string; category?: NotificationCategory }) => void;
     pushToast: (t: {
       message: string;
@@ -466,6 +469,9 @@ export function createNotificationHandler(deps: NotificationHandlerDeps) {
     const ctx: PolicyContext = {
       windowFocused: deps.isWindowFocused(),
       isActiveSurface: isActive,
+      // The turn-boundary metadata (pendingQuestion) is broadcast before the
+      // turn's notification, so a turn that ended on a question reads here.
+      asksForYou: data.category === 'agent-turn' && !!ptyId && !!state.surfacePendingQuestion?.[ptyId]?.trim(),
       isMutedWorkspace: ws?.metadata?.notificationsMuted === true,
       // Only a notification the pane itself sent: one without a ptyId is
       // resolved onto the workspace's ACTIVE pane, and muting that pane must
@@ -749,7 +755,7 @@ export function useNotificationListener() {
       // workspace metadata — pull it OUT here, alongside ptyId, so it can never
       // flow into `...rest` and get written into updateWorkspaceMetadata by
       // applyToWorkspace's spread.
-      const { ptyId, workspaceId: payloadWsId, activity, teammatesWorking, subagents, teammates, shellPrompt, pendingQuestion, lastMessage, lastActivity, paneId, paneLabel, paneRole, agentSlug, hookKind, settled, daemonTurnOpen, ...rest } = payload;
+      const { ptyId, workspaceId: payloadWsId, activity, teammatesWorking, subagents, teammates, shellPrompt, pendingQuestion, lastMessage, lastActivity, paneId, paneLabel, paneRole, agentSlug, hookKind, settled, daemonTurnOpen, stalledSince, stallCompactions, ...rest } = payload;
 
       // The orchestrator's own brain pty (the `claude-pty` vendor's embedded
       // Claude Code TUI) is not a fleet agent. The daemon has no idea it is
@@ -851,6 +857,21 @@ export function useNotificationListener() {
         // The daemon's "no turn": withdraws only a latch the daemon opened.
         if (daemonTurnOpen === false) {
           state.closeDaemonTurn(ptyId);
+        }
+        // StallWatch: the pane's Claude turn seems stuck (a number) or moved on
+        // (null). The first edge of a stall also raises a system notification.
+        if (stalledSince === null) {
+          state.setSurfaceStalled(ptyId, null);
+        } else if (typeof stalledSince === 'number') {
+          const fresh = state.surfaceStalledAt[ptyId] === undefined;
+          // A count means a busy turn compacting without editing, not a silent one.
+          const compactions = typeof stallCompactions === 'number' ? stallCompactions : undefined;
+          state.setSurfaceStalled(ptyId, stalledSince, compactions);
+          if (fresh) {
+            handleNotification(ptyId, compactions === undefined
+              ? { type: 'warning', title: t('agentStall.notifyTitle'), body: t('agentStall.notifyBody'), category: 'system' }
+              : { type: 'warning', title: t('agentStall.spinNotifyTitle'), body: t('agentStall.spinNotifyBody', { count: compactions }), category: 'system' });
+          }
         }
         // The surface's own branch (Moa's view pointer): the workspace record
         // above only follows the active pane, and only at the time it arrives.
@@ -1061,7 +1082,7 @@ export function useNotificationListener() {
     // taskPtyRegistry에 등록해 둔 ptyId→태스크로 토스트 + [재발사]. 재발사는 main이
     // prompt.md 실존을 검사(파일 소실 시 사유), 실제 inject는 pty.write. 상태 영속
     // 없음(§3 G8 — 리부트로 토스트 소실 수용).
-    const unsubExhausted = window.electronAPI.notification.onInitialCmdExhausted((ptyId) => {
+    const unsubExhausted = window.electronAPI.notification.onInitialCmdExhausted((ptyId, reason) => {
       if (!ptyId) return;
       const st = useStore.getState();
       const entry = st.taskPtyRegistry[ptyId];
@@ -1073,7 +1094,7 @@ export function useNotificationListener() {
       const canRefire = Boolean(worktreePath && initialCommand);
       st.pushToast({
         level: 'warn',
-        message: `태스크 "${entry.title}": 프롬프트가 발사되지 않았습니다(에이전트 페인이 비어 있을 수 있음).`,
+        message: `태스크 "${entry.title}": 프롬프트가 발사되지 않았습니다${reason ? `: ${reason}` : '(에이전트 페인이 비어 있을 수 있음)'}.`,
         ...(canRefire
           ? {
               action: {

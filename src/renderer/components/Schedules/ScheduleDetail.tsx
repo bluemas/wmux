@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useStore } from '../../stores';
 import { useT } from '../../hooks/useT';
-import { AUTOMATION_DEFAULTS, type Automation, type AutomationLingeringSession, type AutomationRun } from '../../../shared/automation';
+import { AUTOMATION_DEFAULTS, isBreakerPaused, type Automation, type AutomationLingeringSession, type AutomationRun } from '../../../shared/automation';
 import { isLiveRun, isPermissionReset, sortRunsNewestFirst } from '../../stores/selectors/schedules';
 import { surfacePtyIds } from '../../stores/selectors/sidebarSeen';
 import Button from '../ui/Button';
@@ -33,6 +33,9 @@ function report(error: string | undefined, t: ReturnType<typeof useT>, modeLabel
 function runReasonLabel(run: AutomationRun, t: ReturnType<typeof useT>): string {
   if (!run.reason) return '';
   if (run.reason === 'overlap' && run.detail === 'previous_session_open') return t('schedules.reason.overlap_session_open');
+  if (run.reason === 'agent_error' && (run.detail === 'retried_once' || run.detail === 'retry_blocked' || run.detail === 'retry_interrupted')) {
+    return t(`schedules.reason.agent_error_${run.detail}`);
+  }
   return t(`schedules.reason.${run.reason}`);
 }
 
@@ -103,6 +106,7 @@ export default function ScheduleDetail({ automation: a, accounts, onEdit, onDisc
     max: Math.round((a.policy.maxRunMinutes ?? AUTOMATION_DEFAULTS.maxRunMinutes) / 60 * 10) / 10,
   });
   const modeLabel = t(`schedules.mode.${a.permission.mode}`);
+  const streak = a.failureStreak;
   const next = a.enabled && a.nextRunAt !== null
     ? t('schedules.nextRunLabel', { time: formatWhen(a.nextRunAt) })
     : t('schedules.statusOff');
@@ -195,6 +199,18 @@ export default function ScheduleDetail({ automation: a, accounts, onEdit, onDisc
         </div>
       )}
 
+      {/* The switch above is the action: turning the schedule back on clears the streak. */}
+      {streak && isBreakerPaused(a) && (
+        <div className="ui-notice ui-row" data-schedule-failure-paused>
+          <div className="ui-row-text">
+            <p className="ui-row-title">{t('schedules.failurePausedTitle')}</p>
+            <p className="ui-row-detail">
+              {t('schedules.failurePausedNote', { count: streak.count, reason: t(`schedules.reason.${streak.reason}`) })}
+            </p>
+          </div>
+        </div>
+      )}
+
       <section className="wmux-schedule-history">
         <h3 className="wmux-schedule-section-title">{t('schedules.history')}</h3>
         {runs.length === 0 ? (
@@ -248,8 +264,9 @@ function RunRow({ run, automation, showingOutput, onToggleOutput, onCancel }: {
 }) {
   const t = useT();
   const live = isLiveRun(run);
+  const retryIn = useMinutesUntil(live ? run.retryAt : undefined);
   const result = [
-    runStateLabel(run.state),
+    retryIn !== null ? t('schedules.state.retryWaiting', { minutes: retryIn }) : runStateLabel(run.state),
     runReasonLabel(run, t),
     run.trigger === 'test' ? t('schedules.triggerTest') : run.trigger === 'manual' ? t('schedules.triggerManual') : '',
   ].filter(Boolean).join(' · ');
@@ -290,9 +307,26 @@ function RunRow({ run, automation, showingOutput, onToggleOutput, onCancel }: {
           {t(`schedules.detail.${run.detail}`)}
         </p>
       )}
+      {run.browserProfileUnbound && (
+        <p className="ui-note px-[14px] pb-3" data-run-browser-profile-unbound>
+          {t('schedules.detail.browser_profile_unbound')}
+        </p>
+      )}
       {showingOutput && <RunOutput run={run} automation={automation} />}
     </li>
   );
+}
+
+/** Whole minutes (at least 1) until `at`, re-read every 15 s; null without one. */
+function useMinutesUntil(at: number | undefined): number | null {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (at === undefined) return undefined;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 15_000);
+    return () => clearInterval(timer);
+  }, [at]);
+  return at === undefined ? null : Math.max(1, Math.ceil((at - now) / 60_000));
 }
 
 /** Status dot tone: live runs use the accent, outcomes their state colour. */

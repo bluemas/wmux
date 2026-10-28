@@ -240,6 +240,7 @@ JSON backlog fetch (Bearer only).
 | `gate.state` | `{gateEnabled}` — the permission gate was armed or disarmed |
 | `channel.mention` | `{channelId, seq, fromMemberName, text, postedAt, tier}` — a channel message mentioned the operator row; re-fetch `/api/channels` (§9). Recorded, not live-only |
 | `moa` | `{moaSessionId}` — the Moa pane appeared (an id) or went away (`null`); see *Waking Moa from the phone*. Live only |
+| `browser.help` | `{phase, requestId, workspaceId, surfaceId?, deadlineAt, state?}` — a browser help request opened or closed; re-fetch `/api/browser-help`. No prompt. Live only; see *Browser help requests* |
 
 `phase` is `create` / `resolve` / `expire` / `supersede`.
 
@@ -264,7 +265,8 @@ what was true before. It is live-only like the two above — `GET /api/config`
 holds the authoritative value, so read that on reconnect rather than trying to
 replay transitions.
 
-**These three events are the ones that are NOT in the backlog.** Every other
+**These events — the three above, `moa` and `browser.help` — are the ones that
+are NOT in the backlog.** Every other
 kind is recorded, carries `id`/`epoch`, and replays on `?since=<cursor>`. The
 nudge is live-only and deliberately so: a busy pane raises one roughly every
 second, and recording those would push a pending `approval` out of the bounded
@@ -380,7 +382,7 @@ GET /api/events?since=<cursor>     (Bearer)
 GET /api/config    → {allowInput, allowUpload, allowTranscript, inlineImages?, liveActivityPush?,
                       gatedTools, gateEnabled?, fleetSidebar?, moaDelegations?, fleetTickets?, moa?, moaSessionId?, moaWake?,
                       moaWakeBlocked?, factory?, rooms?, channels?, terminalPromptDetail?,
-                      terminalPromptDecline?, protocolVersion, minProtocolVersion,
+                      terminalPromptDecline?, keepAwake?, protocolVersion, minProtocolVersion,
                       serverVersion, hostPlatform}
 GET /api/sessions  → {sessions: [{id, cwd, spawnCwd?, cols, rows, state, agent, lastActivity,
                       workspace?, workspaceId?, shell?, lastDetectedAgent?, agentAlive?, cwdLeaf?,
@@ -499,6 +501,13 @@ shows the agent's own permission dialog as an answerable pending
 ExitPlanMode record), except for a
 lone Esc or a lone Ctrl-C — see
 [`terminal_prompt`](#terminal_prompt--the-agents-own-permission-dialog).
+
+`POST /api/input?session=<id>&launch=<origin>` types a launch line (a resume
+command), not keys. The daemon refuses it with **409
+`{"error":"folder-trust","verdict":"trust"|"unknown","effect":"none"}`** when
+the pane is on an agent's folder-trust prompt, and also when its screen cannot
+rule one out, unless `launch=human` (a person clicked for this line). Any other
+value counts as automated. Plain keys (no `launch`) are not affected.
 
 Phone scrolling has two ownership modes. A terminal's normal buffer is local
 scrollback and must remain local (ordinary shells and Kiro use this path).
@@ -1070,6 +1079,38 @@ differences:
 
 Every refusal is the same `404 {error: 'image not found'}`, and the types and the
 8 MiB cap are unchanged.
+
+### Keep the computer awake — `keepAwake`
+
+The desktop's Settings › General "Keep the computer awake" holds off system
+sleep (never the display). Its default mode, "While working", holds while an
+agent is working **or a paired phone is attached**, and lets go 75 s after
+neither is true. "Always" and "Off" ignore the phone.
+
+```
+GET /api/config → { ..., keepAwake?: { mode: 'off' | 'working' | 'always', active: boolean } }
+```
+
+- `mode` is the desktop's setting. `active` says whether the computer is being
+  kept awake **right now** (the desktop holds its sleep blocker), for any
+  reason: a working agent, an attached phone, "Always", or the 75 s after the
+  last reason ended.
+- The key is **omitted, not `false`**, when no desktop app is attached to the
+  daemon (a headless daemon), and in the moment after a desktop attaches and
+  before it has reported. Absent means "not known"; never draw it as off.
+- The value is the desktop's last report. A phone that just attached (its
+  request counts) may still read the state from just before: the desktop is
+  told and reports back within a moment, so read it again on the next
+  `/api/config` rather than treating one answer as final.
+
+**Attached** means one of your paired devices (a phone, or a device that did
+not say what it is; never another computer paired with this one) holds an SSE
+stream open (`/api/stream` or `/api/events`), or made an authenticated
+request in the last 10 minutes. A revoked device stops counting at once. A
+stream on a socket that died silently (the phone left Wi-Fi or lost its
+signal) counts until the daemon's next heartbeat write fails, so the
+computer may stay awake a few minutes after the phone drops off the network.
+Additive — no protocol version bump.
 
 ---
 
@@ -1852,8 +1893,14 @@ gets the whole prompt as a form:
 ```
 
 Option keys are the digits Claude draws. An option carries `description` when
-Claude draws one under its label (omitted otherwise). `allowOther` is always
-true: Claude adds its "Type something" row to every question. `otherMaxCells`
+Claude draws one under its label (omitted otherwise). `allowOther` is true
+wherever Claude adds its "Type something" row: on every question except a
+single-select one whose options carry a `preview`. That question carries
+`"preview": true` and `"allowOther": false`: Claude draws its option labels
+beside a box holding the focused option's preview, with no "Type something"
+row, so offer no free-text field for it (an `other` there is 400
+`invalid-choice` with nothing typed). Its options keep their `description`,
+which Claude does not draw in that layout. `otherMaxCells`
 is the widest `other` the pane can take now (`cols - 12` cells, a wide
 character counting two); the pane can be resized, so the answer checks the
 width again (`invalid-text` / `too-wide`). A prompt the daemon could not
@@ -1866,7 +1913,10 @@ card above.
 The daemon reads the picker as Claude draws it: each option by its whole
 label then its whole description (a long label wraps onto the next row), the
 "Type something" row last, and under the picker's bottom rule only Claude's
-`Chat about this` row and its key hint. A picker drawn any other way (a label
+`Chat about this` row and its key hint. A `preview: true` question is read
+from the left column only (every row from option 1 to the bottom rule cut at
+the preview box's column, a wide character counting two): each option by its
+whole label, no free-text row. A picker drawn any other way (a label
 cut short, another menu or an input prompt under it) is not the question the
 form describes: the answer is 409 `prompt-changed` with nothing typed.
 
@@ -1877,7 +1927,9 @@ form describes: the answer is 409 `prompt-changed` with nothing typed.
   as checked live on 2.1.288: a single-select option's digit; a
   multi-select's option digits (each toggles its box), then `↓` onto the
   in-question Submit row (labelled `Next` when another question follows) and
-  Enter; typed text as
+  Enter; on a `preview: true` question (measured on 2.1.311, where a digit
+  only moves the cursor) the option's digit, then Enter, or Enter alone for
+  option 1; typed text as
   the "Type something" row's digit, `↓` onto it where needed, one bracketed
   paste and Enter / `↓`. Several questions end on Claude's review screen,
   where the daemon checks that every question lists exactly the answer given
@@ -2597,13 +2649,225 @@ also makes a sound.
 Suppressing the replacement entirely needs Apple's notification-filtering
 entitlement; nothing here depends on it.
 
+### Bot approvals — a bot waiting on the owner
+
+A bot's approval request (`/api/bot-approvals/:requestId`, the `approval`
+card in its Bots conversation) is pushed while it waits, **only to a device
+whose registration listed `capabilities: ["botApprovalPush"]`** (see
+Registering). A device that never listed it receives none of these. Sealed
+plaintext:
+
+```json
+{
+  "title": "Approval needed",
+  "body": "Reviewer: Merge PR #12 in owner/repo",
+  "approvalKind": "bot",
+  "botApprovalId": "apr-…",
+  "workspaceId": "<workspace id>",
+  "threadId": "pr:owner/repo#12",
+  "action": "merge",
+  "botId": "<bot id>",
+  "requiresInAppChoice": true,
+  "risk": "normal"
+}
+```
+
+- **Never an `approvalId`.** That field means a pane approval on
+  `/api/approvals`. Open the Bots conversation named by `workspaceId` and
+  `threadId`, read the request with `GET /api/bot-approvals/<botApprovalId>`,
+  and decide it with `POST …/decision`. `requiresInAppChoice` is always true:
+  there is no lock-screen affirmative.
+- `action` is one of `merge`, `push_default`, `issue_create`, `issue_close`,
+  `comment`, `release`, `pr_close`. A skill proposal, a profile change or a
+  native tool request is decided on its desktop card and is never pushed.
+- `body` is `<bot name>: <summary>`. The summary is built from the request's
+  structured fields (the act, the repository, the PR or issue number), never
+  from text the bot wrote. A bot with no known name reads `A bot`.
+- `risk` is `critical` for an act no rule may approve (`release`,
+  `push_default`), which also rings while the desktop is in use, and `normal`
+  otherwise. Desktop presence holds a `normal` one the way it holds a pane
+  approval.
+- `botId` may be absent.
+- APNs collapse id: `bot-<botApprovalId>`.
+
+When the request stops waiting (decided on any surface, refused, withdrawn or
+expired), a retraction follows under the **same collapse id**, to the same
+devices:
+
+```json
+{
+  "title": "Approval resolved",
+  "body": "No longer waiting — nothing to do.",
+  "kind": "approval_retraction",
+  "retractsBotApprovalId": "apr-…"
+}
+```
+
+It carries neither `approvalId` nor `botApprovalId`. Handle it as a pane
+retraction (above): silent, no category, drop any local card for
+`retractsBotApprovalId`. No retraction is sent for a push that never left
+(presence still held it, or the held push was dropped).
+
+**Known limit: daemon restart.** The daemon does not persist what it pushed. A
+restarted daemon is sent the waiting requests again by the desktop app and
+pushes each once more under its collapse id, so the phone replaces the banner
+rather than stacking a second one. A request that stopped waiting while the
+daemon was down is not retracted.
+
+**A push is a nudge; the app's list is the record.** Open the Bots
+conversation and read what is waiting rather than relying on banners:
+
+- A request is pushed once, when it starts waiting. A device that registers
+  `botApprovalPush` later, or had no reachable registration then, is not sent
+  the requests already waiting; the app shows them when opened.
+- A push presence held and the park queue later evicted (past its cap) is
+  never sent, the same trade pane approvals make.
+- A device that re-registers without `botApprovalPush` gets no retraction for
+  a banner it already has.
+- At most the 200 oldest waiting requests are pushed.
+
+### Bot prompts — a question, a login or a secret a bot is waiting on
+
+A bot's open `question`, `login_request` or `secret_request` card (§ room
+cards) is pushed while it is open, **only to a device whose registration
+listed `capabilities: ["botPromptPush"]`**. Sealed plaintext:
+
+```json
+{
+  "title": "Scout needs you",
+  "body": "Asks for the secret NPM_TOKEN",
+  "approvalKind": "bot_prompt",
+  "promptKind": "secret_request",
+  "botPromptId": "<card id>",
+  "workspaceId": "<workspace id>",
+  "threadId": "general",
+  "botId": "<bot id>",
+  "requiresInAppChoice": true
+}
+```
+
+- **Never an `approvalId`**, and no `botApprovalId`. Open the Bots
+  conversation named by `workspaceId` and `threadId` and answer on the card
+  `botPromptId` names.
+- `promptKind` is `question`, `login_request` or `secret_request`.
+- `title` is `<bot name> needs you` (`A bot needs you` with no known name).
+- `body` is built from structured fields only, never from text the bot wrote:
+  `Has a question for you`; `Asks you to sign in to GitHub` / `… to Claude`;
+  `Asks you to log in to a website` (the URL stays on the card);
+  `Asks for the secret <NAME>`. A secret request names the secret and never
+  carries a value; the card holds none either.
+- No `risk`: presence holds these like a `normal` approval.
+- `botId` may be absent.
+- APNs collapse id: `botprompt-<botPromptId>`.
+
+When the card closes (the question is answered or closed, the login or the
+secret request is resolved), a retraction follows under the same collapse id,
+to the same devices:
+
+```json
+{
+  "title": "Answered",
+  "body": "No longer waiting — nothing to do.",
+  "kind": "approval_retraction",
+  "retractsBotPromptId": "<card id>"
+}
+```
+
+Handle it as the other retractions: silent, no category, drop any local copy
+of the card. The limits of bot approvals (daemon restart, a push is a nudge)
+apply the same way, with `botPromptPush` for the capability.
+
+### Browser help — an agent handing a browser step back to you
+
+A browser help request (*Browser help requests*, `/api/browser-help`) is
+pushed when it opens, **only to a device that can answer it from the app**.
+That is the rule of the decision route, all at once:
+
+1. the server runs with `--allow-transcript` (the request exists because of
+   an agent's prompt, and the list that shows it needs that consent);
+2. the server runs with `--allow-input`;
+3. the attached desktop takes a phone's decision;
+4. the device's registration listed `capabilities: ["browserHelpPush"]`;
+5. the device's input grant is on **and was set explicitly** (a read-only
+   device, or one paired before grants existed, gets nothing).
+
+A push presence held is released only to the devices that still pass this
+rule then, and not at all once the request's deadline has passed. With no such
+device it is not sent, and it is considered again at the desktop's next list.
+
+A request from a brain pane is never pushed: the phone may not answer it, so
+a banner could only dead-end. Sealed plaintext:
+
+```json
+{
+  "title": "Browser help needed",
+  "body": "An agent is waiting for you to finish a step in the browser.",
+  "approvalKind": "browser_help",
+  "browserHelpId": "5d0e9b82-…",
+  "workspaceId": "<workspace id>",
+  "surfaceId": "surf-…",
+  "requiresInAppChoice": true
+}
+```
+
+- `title` and `body` are always this fixed text (English, as every push
+  body; an app may show its own localized words for `approvalKind`
+  `browser_help`). Never the prompt, which is the agent's to write and stays
+  off the lock screen, and never the workspace name.
+- **Never an `approvalId`.** Open the request's card in the app: read it with
+  `GET /api/browser-help` and answer with `POST …/decision`.
+  `requiresInAppChoice` is always true.
+- `surfaceId` is absent when the agent named no tab.
+- No `risk`: presence holds these like a `normal` approval.
+- They never cost an approval its place: when the daemon's push queues are
+  full, a browser help push (or its retraction) is the one dropped, and at
+  most 8 are queued or held at a time.
+- APNs collapse id: `bh-<browserHelpId>`.
+
+When the request closes, however it ended, a retraction follows under the
+same collapse id, **to the devices the push went to** (a device that no longer
+lists `browserHelpPush` is skipped):
+
+```json
+{
+  "title": "Browser help closed",
+  "body": "No longer waiting — nothing to do.",
+  "kind": "approval_retraction",
+  "approvalKind": "browser_help",
+  "retractsApprovalId": "5d0e9b82-…",
+  "workspaceId": "<workspace id>",
+  "resolution": "completed"
+}
+```
+
+- `resolution` is `completed`, `continued` (Done), `cancelled` or
+  `timed_out`. A request the desktop's list dropped without saying how reads
+  `timed_out` past its deadline and `cancelled` before it.
+- `retractsApprovalId` is the request id, not a pane approval's: match it with
+  `approvalKind`. Handle it as the other retractions: silent, no category,
+  drop any local copy of the card. No retraction follows a push that never
+  left (presence still held it, or the held push was dropped).
+
+A request is pushed at most once. When no device could answer it as it
+opened (no grant yet, no server running), it is considered again each time
+the desktop next sends its list, and pushed then if a device qualifies. The
+desktop sending its list again, including after it reconnects, never pushes
+a request a second time. When the desktop app goes away, a banner already
+sent stays: a desktop that returns still listing the request keeps it, one
+that returns without it retracts it, and with no desktop at all it is
+retracted as `timed_out` at the request's deadline. (The `browser.help`
+frames close those requests at once; the list is the record.) The
+daemon-restart limit and "a push is a nudge" of bot approvals apply the same
+way, with `browserHelpPush` for the capability.
+
 ---
 
 ### Registering
 
 ```
 POST /api/push-registration      (device credential, never the operator token)
-  body: {apnsToken, publicKey, apnsEnvironment?: 'development' | 'production'}
+  body: {apnsToken, publicKey, apnsEnvironment?: 'development' | 'production',
+         capabilities?: string[]}
   → 200 {ok: true}
   → 400 {error: 'bad-token' | 'bad-key' | 'bad-apns-environment'}
   → 403 {error: 'push-is-for-devices'}
@@ -2633,6 +2897,14 @@ A registration replaces the previous one wholesale, this field included: leaving
 it out on a later call **clears** a stage the daemon knew, rather than inheriting
 it. That is deliberate — the token now on file belongs to the build that just
 called, not to the one before it.
+
+`capabilities` lists the push kinds this build can open: `"botApprovalPush"`
+(Bot approvals, above), `"botPromptPush"` (Bot prompts, above) and
+`"browserHelpPush"` (Browser help, above). A push that needs a capability goes only to devices
+that listed it. Like the rest of the registration it is replaced wholesale, so
+send the full list every time; leaving it out clears it. Entries that are not
+names (`^[A-Za-z][A-Za-z0-9_]{0,63}$`) are dropped rather than refused, and
+names this daemon does not know are kept.
 
 A `410` from Apple makes the daemon forget your registration, so a reinstalled
 app must register again before it hears anything.
@@ -3340,9 +3612,72 @@ keyboard input after an unconfirmed response; refresh and inspect the page first
 Workspace identity never comes from the HTTP body. Main checks the current CDP
 owner, then calls only existing scoped screenshot/emulation/navigation/input operations.
 No arbitrary JavaScript, headers, cookies, CDP commands or RPC names are accepted.
-The capture envelope permits at most 2 MiB base64 image data; only capture requests
-receive the larger bridge response allowance. A hidden Mac workspace may not
-produce frames; clients show this failure and ask the user to bring it forward.
+The capture's base64 image data is at most 700 KiB (the whole reply is one line on
+the daemon's control pipe, which closes past 1 MiB); a larger first shot is retaken
+once smaller, then refused. Only capture requests receive the larger bridge
+response allowance. A hidden Mac workspace may not produce frames; clients show
+this failure and ask the user to bring it forward.
+
+#### Dedicated-profile Chrome tabs (`browserPreviewChrome`)
+
+`/api/config` carries `browserPreviewChrome: true` when the server runs with
+`--allow-transcript` and the attached desktop announced `browser.chromePreview`.
+OMITTED otherwise (an older desktop announces nothing); the preview then works
+exactly as above.
+
+- **Opt in**: `GET …/browser?chrome=1` (either route). Rows then gain
+  `backend: "builtin" | "chrome"`, and the tabs of a wmux Chrome profile that
+  this workspace opened (`chrome`) follow the builtin panes, 30 rows in all.
+  Without `?chrome=1`, or from a desktop without the flag, the list is the
+  same as before, with no `backend` field. Live Chrome (the user's own
+  browser) is never listed and never driven, and no phone action opens a
+  connection to it.
+- **Which tabs**: tabs of the workspace's own wmux Chrome profile that the
+  desktop recorded under exactly this workspace; a tab with no workspace on
+  record is nobody's. A profile bound to one pane only (a protected pane's,
+  say) is not listed: its policy applies to that pane's calls. Listing never
+  starts Chrome: while it is not running there are no `chrome` rows, nor while
+  the desktop cannot attach to its pages (its tab watcher is off or failed);
+  help rows for those tabs are then `previewable: false`.
+- **The same actions** take a `chrome` row's `id` as `surfaceId`: capture,
+  `navigate`, `type`, `key`, `tap`, `scroll`, with the same checks
+  (`expectedURL`, `geometry`, http(s) only). A Chrome capture has the builtin
+  shape and limit (`data`, `mimeType: "image/jpeg"`, `capturedAt`, `geometry`
+  from Chrome's layout metrics, `pageURL`). `viewport` is `501
+  browser-action-unsupported` on a Chrome tab.
+- **Background tabs**: the desktop never brings a Chrome tab forward on its
+  own. Chrome may stop painting a background tab; a capture, or an input,
+  that does not finish within about 5 s is `409 browser-tab-hidden`. Offer
+  `focus`. Typing uses focus emulation rather than raising the tab. At browser
+  zoom other than 100 % a capture is readable but carries no `geometry`.
+- **`open`** takes an optional `backend: "builtin" | "chrome"` (default
+  `builtin`, the rule above). `chrome` needs the desktop's browser setting to
+  be Chrome and the workspace's profile to be a wmux profile, not Live
+  Chrome (`503 browser-backend-unavailable` otherwise); it may start that
+  profile's Chrome. Any other value is `400`.
+- **`{action:"focus",surfaceId}`** (input permission): brings a builtin pane
+  or a Chrome tab of this workspace forward on the desktop (a Chrome tab's
+  window too). Send it only on the user's tap.
+- **Help-card typing**: `{action:"type",…,helpRequestId}` types only into the
+  tab that open help request is about (*Browser help requests*), and only while
+  that tab is still at the `origin` its row shows. That origin is the one the
+  tab had when the agent asked, and it never changes afterwards. The daemon
+  takes it from its own copy of the request, never from the body. A request
+  made with no known origin is never typed into this way. A tab that navigated
+  since the phone's last capture usually fails first on `expectedURL`
+  (`503 browser-preview-unavailable`). `409 browser-help-origin-changed`
+  covers the case where `expectedURL` matches but that page's origin is not
+  the request's: the tab left the site after the agent asked.
+
+| Response | Meaning |
+| --- | --- |
+| `404 {error:"browser-tab-gone"}` | The Chrome tab closed, was replaced by Chrome, or is not this workspace's. Refresh the list. |
+| `409 {error:"browser-tab-hidden"}` | The Chrome tab did not answer in time, usually because it is in the background. An input that timed out may still have partly applied (a press is always released): refresh before retrying. |
+| `503 {error:"browser-backend-unavailable"}` | No browser to drive: the setting is not Chrome, the workspace uses Live Chrome, or Chrome's connection is not up. |
+| `501 {error:"browser-action-unsupported"}` | The action does not exist for this tab (`viewport` on Chrome, `focus` on a desktop that cannot). |
+| `409 {error:"browser-help-origin-changed"}` | Help-card typing: the tab is no longer at the request's origin, or the request has none. Nothing was typed. |
+| `404 {error:"browser-help-not-found"}` / `409 {error:"browser-help-closed"}` | Help-card typing: no request with that id for this workspace and tab (open or closed), or this tab's request already ended. |
+| `503 {error:"browser-preview-unavailable"}` | Any other failure, as before. Never retry input automatically. |
 
 ### New agent pane launch options
 
@@ -4166,10 +4501,8 @@ anything in its own words, as it can any agent pane.
 
 #### The agent factory (`factory`, `rooms`, `/api/rooms`)
 
-> **Serving: not yet.** This section describes the 5.0 branch (local, not
-> released). No shipped daemon serves any key or route below; a daemon or
-> desktop that predates it omits every one of them, and the Moa sections above
-> describe what it serves.
+A daemon or desktop that predates this section omits every key and route
+below, and the Moa sections above describe what it serves.
 
 In 5.0 the desktop's Moa becomes the HQ bot of an **agent factory**: long-lived
 bots bound to workspaces by role (`lead`, `triage`, `verifier`, `maintainer`,
@@ -4405,7 +4738,7 @@ arrival order (`seq`, increasing; never sort by `at`).
   may be absent (the desktop wrote none, or its value was not of its type).
 - `approvalAction` — on an `approval` card only: the act its request asks
   for — `merge`, `push_default`, `issue_create`, `issue_close`, `comment`,
-  `release`, or `skill` (a skill a bot wrote for itself). A `skill`
+  `release`, `pr_close`, or `skill` (a skill a bot wrote for itself). A `skill`
   approval, and any action the app does not know (any lower-case name may
   come), is approved on the desktop only: show "Approve on the desktop" with
   no buttons. Absent when the desktop no longer has the request.
@@ -4548,7 +4881,7 @@ worded (the values listed); a value not listed means the English `title`.
 | `task.cancelled` | `title` string | `Task cancelled: {title}` | — |
 | `task.stoppedByOwner` | `title` string | `Task cancelled · stopped by owner: {title}` | — |
 | `task.keptFolderCleaned` | `title` string, `days` number, `kind` string | `Removed the kept folder of "{title}"` | A folder kept after the owner stopped the task, removed by wmux after `days` days with no changes. `kind`: `research` for a research task's folder (no branch); absent for a worktree, whose branch stays. |
-| `task.inputRequired` | `title` string, `why` string | `Task needs input: {title}` | `why`: `trustDialog`, `firstRun` or `launchFailed`. |
+| `task.inputRequired` | `title` string, `why` string, `agent` string | `Task needs input: {title}` | `why`: `trustDialog`, `firstRun` or `launchFailed`. `agent`: with `trustDialog`, the agent showing the dialog (`Claude Code`, `Gemini CLI`, `Qwen Code`), the `{agent}` of its words; absent on cards written before, which were Claude Code's. |
 | `pr.merged` | `pr` number, `title` string | `PR #{pr} merged: {title}`<br>`PR #{pr} merged` | The second title when there is no `title`. |
 | `pr.closed` | `pr` number, `title` string | `PR #{pr} closed: {title}`<br>`PR #{pr} closed` | As `pr.merged`. |
 | `verdict.recorded` | `verdict` string, `pr` number, `sha` string, `bot` string | `Verdict {verdict} for #{pr} at {sha} by {bot}` | `verdict`: `pass` or `fail`. |
@@ -4560,9 +4893,8 @@ worded (the values listed); a value not listed means the English `title`.
 
 #### The Bots page (`bots`, `botMessages`, `/api/bots`, `/api/rooms/:workspaceId/messages`)
 
-> **Serving: not yet.** Like *The agent factory* above. Additive: every
-> route and key above is unchanged, and a daemon or desktop that predates
-> this section omits both keys and answers the two routes `404`.
+Additive: every route and key above is unchanged, and a daemon or desktop
+that predates this section omits both keys and answers the two routes `404`.
 
 The desktop's Bots page is a messenger: one conversation per bot (its 1:1,
 `dm:<botId>`) and one per group chat the owner made, across every workspace,
@@ -4852,11 +5184,71 @@ desktop must still keep a card of that room carrying the id.
 | `503 {error:"desktop-unavailable"}` / `503 {error:"rooms-unavailable"}` | No desktop, or one that cannot serve photos. |
 | `504 {error:"desktop-timeout"}` | The desktop did not answer. |
 
+#### Files on bot cards (`roomFiles`)
+
+Additive. When either side predates it, `/api/config` omits the key and no
+card carries `files`. The route then answers by which side is older: a
+daemon that predates the route answers `404`; a newer daemon in front of a
+desktop that cannot serve files (one without `workspaces.roomFile`) answers
+`503 {error:"rooms-unavailable"}`. Neither means the file is missing: without
+`roomFiles`, draw no file chips.
+
+A bot hands the owner files it made (an image, a document, a video, a
+spreadsheet, a report) on its own cards. The desktop keeps a copy of each in
+the room, as long as the card, so the file stays when the bot's work folder
+is gone.
+
+**`/api/config`.** `roomFiles` — `true` when
+`GET /api/rooms/:workspaceId/files/:id` answers here: `--allow-transcript`
+and a desktop that serves files. Draw file chips on cards when it is present.
+Omitted, never `false`, otherwise.
+
+**On cards.** A bot's card (`actor: {kind:"bot"}`) of
+`GET /api/rooms/:workspaceId/cards` may carry:
+
+```
+"files": [ { "id": "9c1e…(32 lowercase hex)", "name": "cardnews.mp4", "mediaType": "video/mp4", "bytes": 4194304 } ]
+```
+
+- At most 8 per card. Cards of other actors never carry it.
+- `name`: the file's own name as the bot made it (no folders), at most 200
+  characters. Show it; never use it as a path.
+- `mediaType`: one of the types the phone may show in place: `image/png`,
+  `image/jpeg`, `image/gif`, `image/webp`, `video/mp4`, `video/quicktime`,
+  `video/webm`, `application/pdf`, `application/json`, `text/plain`,
+  `text/markdown`, `text/csv`, `text/tab-separated-values`, `text/x-diff`.
+  Anything else (unknown, or a type that can run script: HTML, SVG, XML) is
+  `application/octet-stream`: offer it to save or share, never preview it.
+  A card stored before a type was known keeps the type it was given (an
+  older `.mp4` reads `application/octet-stream`).
+- `bytes`: 1 to 10 MiB (10485760).
+- Cards reach the phone only through `GET /api/rooms/:workspaceId/cards`
+  (there is no room event stream), and every page of it carries `files`: the
+  newest page and a forward read (`sinceSeq`) alike. A guest's own read
+  (`/api/guest/v1/messages`) never carries them.
+
+**`GET /api/rooms/:workspaceId/files/:fileId`** — the file's bytes.
+`--allow-transcript`, checked first; no input grant. The desktop must still
+keep a bot's card of that room carrying the id.
+
+| Answer | Meaning |
+|---|---|
+| `200` | The file, streamed. `Content-Type` is exactly the card's `mediaType` (never sniffed from the bytes); `Content-Length` is exactly the card's `bytes`. Also `Content-Disposition: inline; filename*=UTF-8''<the name, percent-encoded>` (`attachment; …` for `application/octet-stream`), `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'none'; sandbox`. No range requests: fetch the whole file, then preview it from the two headers. |
+| `403 {error:"transcript-disabled"}` | The server runs without `--allow-transcript`. |
+| `404 {error:"file-not-found"}` | No bot's card of that room carries the id, or its stored copy is gone or changed. Show the file as unavailable. |
+| `429 {error:"too-many-downloads"}` | This device already has 4 downloads open. `Retry-After: 1`; retry once one ends. |
+| `503 {error:"desktop-unavailable"}` / `503 {error:"rooms-unavailable"}` | No desktop, or one that cannot serve files. |
+| `504 {error:"desktop-timeout"}` | The desktop did not answer. |
+
+A body shorter than `Content-Length` (the connection cut mid-file) is a
+failed download: discard it and retry; never show a partial file. A download
+the phone stops reading is cut after 30 seconds without progress.
+
 #### Bot approvals (`/api/bot-approvals`)
 
-A bot asks the owner before a merge, a push to a default branch, opening or
-closing an issue, a comment or a release; the request shows as an `approval`
-card whose `refs.approvalId` names it. The owner answers it here.
+A bot asks the owner before a merge, a comment, opening or closing an issue,
+closing a pull request without merging, or a release; the request shows as an
+`approval` card whose `refs.approvalId` names it. The owner answers it here.
 
 - **Read** (`GET`): the operator token or any paired device that is not
   revoked. No input grant is needed: the view carries no bot-written text.
@@ -4879,10 +5271,13 @@ this caller may decide; a refused decision answers `403` as below.
 **`GET /api/bot-approvals/:requestId`** — the request now.
 
 **`POST /api/bot-approvals/:requestId/decision`** — body
-`{"decision": "approve" | "deny" | "undo" | "always", "ruleScope"?: "bot" | "workspace"}`
-(`ruleScope` only with `always`; any other field is 400). The decision is the
-desktop card's: an approved merge waits 10 seconds (`executeAfter`) with
-`undo` available, then the desktop re-checks the head and CI and merges;
+`{"decision": "approve" | "deny" | "undo" | "always", "ruleScope"?: "bot" | "workspace", "payloadHash"?: "<64 lowercase hex>"}`
+(`ruleScope` only with `always`, `payloadHash` only with `approve`; any other
+field is 400). The decision is the desktop card's: an approved merge or act
+waits 10 seconds (`executeAfter`) with `undo` available, then the desktop
+carries it out: a merge after re-checking the head and CI; a comment, a new
+issue, closing an issue or a PR, or a release after re-checking what it acts
+on (below).
 `always` approves and remembers a rule for that bot (or its whole workspace)
 and repository, merges only (`canAlwaysAllow`).
 
@@ -4897,13 +5292,125 @@ and repository, merges only (`canAlwaysAllow`).
 ```
 
 - `action`: `merge`, `push_default`, `issue_create`, `issue_close`,
-  `comment`, `release`. Only a merge is carried out; the others are recorded.
+  `comment`, `release`, `pr_close`. The desktop carries out `merge`,
+  `comment`, `issue_create`, `issue_close`, `pr_close` and `release` (on
+  GitHub; on GitLab only a merge); `push_default` is recorded only. A
+  request a desktop older than this one stored is recorded only too (its card
+  says so); it carries no `payloadHash`.
 - `state`: `pending`, `approved`, `denied`, `executed`, `refused`, `expired`
-  (`undo` returns an approved merge to `pending`). `refusal` names why a
-  `refused` one did not merge (`head-moved`: the bot must ask again).
+  (`undo` returns an approved merge or act to `pending`). `refusal` names why
+  a `refused` one was not carried out (`head-moved`: the bot must ask again;
+  the card's text says it in words). A refused act is never tried again: the
+  bot asks with a new request.
+- `payloadHash` — on a request the desktop carries out as an act
+  (`comment`, `issue_create`, `issue_close`, `pr_close`, `release`): see "An
+  act's text on its card" below. Absent on a merge and on a recorded-only
+  request.
+- `headSha` on a `release` is the full SHA of the commit it publishes.
 - `tainted: true` — the work started from outside text (an issue or PR);
   show it on the card. `decidedBy`: `owner` or `rule`.
-- No bot-written text: the reason is the card's `body`.
+- No bot-written text: the reason is the card's `body`, and so is an act's
+  text.
+
+##### An act's text on its card, and the hash an approval echoes
+
+A `comment` or an `issue_create` publishes text a bot wrote, under the
+owner's GitHub login. Its `approval` card's `body` shows that text whole, and
+the phone approves exactly what the card shows:
+
+- **Fences.** Each bot-text field is its own CommonMark fenced code block, in
+  a fixed order: `comment` → [the body with wmux's marker line];
+  `issue_create` → [the title], then [the body with wmux's marker line].
+  A `release` card's payload fences are what it publishes, in one of two
+  orders the card's mode decides: when a workflow at the commit runs on
+  pushing the tag, the desktop pushes the tag alone → [the tag], [the
+  commit's full SHA], [the workflow paths, one per line]; otherwise it
+  publishes the release itself → [the tag], [the commit's full SHA], [the
+  title], [the notes, possibly empty], [`release` or `prerelease`]. The
+  phone needs no mode: it hashes the fences in card order.
+  Fence lines start at column 0, never indented. A fence is a run of
+  backticks longer than any backtick or tilde run inside its text (at least
+  3), so nothing inside closes it.
+- **Info strings.** A payload fence carries the info string `wmux-payload`.
+  A context fence (the target issue's or PR's title as GitHub has it, and
+  similar) carries `text` and is not part of the payload. `issue_close` and
+  `pr_close` cards have context fences only.
+- **The marker.** The body's last line is `<!-- wmux-approval:<requestId> -->`
+  after a blank line (the marker alone for an empty `issue_create` body).
+  GitHub does not render it; it is how the desktop finds the post again after
+  a retry or a restart. It is part of the body's inner text.
+- **Newlines.** `\n` only. The desktop normalises the text when the bot asks
+  (line ends, trailing whitespace at the end) and refuses text with control,
+  bidi or zero-width characters, a stored secret the room would redact, or
+  `wmux-approval` of its own, so the bytes the card shows are the bytes
+  GitHub gets.
+- **`payloadHash`** is the lowercase hex sha256 of the UTF-8 bytes of the
+  `wmux-payload` fences' inner texts, in card order, joined by a single
+  U+0000. The inner text is exactly the lines between the opening and the
+  closing fence line, joined by `\n`, with no trailing newline. For a card
+  with no `wmux-payload` fence (`issue_close`, `pr_close`) it is the sha256
+  of the empty string.
+- **The phone** recomputes the hash from the card it displays and shows
+  Approve only when it equals the request's `payloadHash`; it sends it as the
+  decision's `payloadHash`. payloadHash is required on approve for every
+  request that carries it: `comment`, `issue_create`, `issue_close`,
+  `pr_close` and `release` (for the two closes it is the sha256 of the empty
+  string). The
+  desktop refuses an approval without it (`409 client_update_required`: the
+  app says "Approve on the desktop") and with another one (`409 changed`:
+  read the card again). A request without a `payloadHash` (recorded only,
+  stored by an older build) is approved without one. Deny and undo take no
+  hash.
+- Typed words ("ok") and the desktop's "Approve N pending" chip never approve
+  a `comment`, an `issue_create` or a `release`; a close or a merge they may.
+  No rule ever approves a `release`.
+
+Once approved and past its Undo window, the desktop carries the act out with
+the owner's gh login and re-checks, right before it writes: the login is the
+one the request read, the repository still has the name and id the request
+read, the target is the same issue or PR, still open, and a PR still at the
+head the card showed (`refusal: head-moved` otherwise). A `release` re-checks
+that the default branch is the same, the commit is still on it, the tag and
+any release of it (a draft included) are still absent, every check on the
+commit has passed (or there are none) and each workflow a push to the
+default branch runs there (as read when the bot asked) has a push run on it,
+and the release workflow and those push workflows are still enabled
+(`refusal` `default-branch-changed`, `not-on-default-branch`,
+`tag-taken`, `release-exists`, `checks-failing`, `checks-pending`,
+`checks-not-started`, `workflow-disabled`, `workflow-unreadable`); a release
+published on a tag that was made elsewhere meanwhile ends `refused` with
+`published-other-target`, one published by another login with
+`release-by-other`, and one published with another name or notes than the
+card's with `found-different`. A release whose publish made its tag but
+whose tries ran out with the release still a draft ends `refused` with
+`tag-made-not-published`. A release whose draft was deleted on GitHub before
+it was published ends `refused` with `draft-gone` (nothing is published, and
+no new draft is made), and one whose tag name is also a branch's with
+`tag-name-is-branch`. Any act whose GitHub answer had a shape the desktop
+cannot read ends `refused` with `unreadable-answer`. An act no try of which
+may have reached GitHub (it was never tried, or every try stopped before
+anything was sent: its reads kept failing, say) ends `refused` with
+`approval-stale` on its first try or sweep 24 hours or more after
+`decidedAt`, or once the clock reads more than 24 hours earlier than
+`decidedAt` (a clock less far behind waits, as in the Undo window); nothing was
+sent, and the bot asks again with a new request if it is still wanted. An act a try of which may
+have reached GitHub is not aged out: a read of GitHub settles it.
+
+`refusal` may be a list of codes joined by `, `; show one sentence per code.
+A refused `release` that made a draft adds one last code saying what became
+of it when it stays on GitHub: `draft-kept-tag-made` (its tag is made at the
+commit, so the draft is kept for the owner to publish or delete),
+`draft-kept-unchecked` (the draft could not be checked, or GitHub did not
+answer about it for a day; it may still be there), `draft-kept-changed` (the draft was changed on GitHub since
+wmux made it, so it is the owner's and is kept), or `draft-not-deleted`
+(GitHub refused the delete: the owner deletes it on GitHub). A deleted draft
+adds nothing. When the desktop quit between the refusal and that decision, or
+GitHub did not answer it then, the request is first `refused` without the
+code; once a later sweep makes the decision it gains it, with a new
+`updatedAt` (the room gets one more outcome card).
+While it runs, or
+while it reads GitHub to learn whether an interrupted try went through, the
+request stays `approved`; it ends `executed` or `refused`.
 
 | Answer | Meaning |
 |---|---|
@@ -4915,9 +5422,103 @@ and repository, merges only (`canAlwaysAllow`).
 | `403 {error:"read-only: this device was paired without permission to type", detail}` | A decision from a device without the input grant. |
 | `403 {error:"read-only: this device has no explicit input grant", detail}` | A decision from a device whose grant was never set explicitly (paired before grants existed). The desktop has to set it first. |
 | `404 {error:"approval-not-found"}` | No such request. |
-| `409 {error:"approval-refused", code, message}` | The decision does not apply now: `not_pending`, `too_late` (the merge started), `not_ruleable`, `too_many`, `write_failed`. |
+| `409 {error:"approval-refused", code, message}` | The decision does not apply now: `not_pending`, `too_late` (the desktop has already started it), `not_ruleable`, `too_many`, `write_failed`, `client_update_required` (an act approved without its `payloadHash`), `changed` (a `payloadHash` other than the request's), `not_on_phone` (decided on its desktop card only). |
 | `503 {error:"desktop-unavailable"}` / `503 {error:"approvals-unavailable"}` | No desktop, or one that cannot answer approvals (too old, factory not started). |
 | `504 {error:"desktop-timeout"}` / `502 {error:"desktop-bad-reply"}` | The desktop did not answer, or answered badly. |
+
+#### Browser help requests (`browserHelp`, `/api/browser-help`)
+
+An agent driving a browser can hand one step back to the human
+(`browser_request_help`: a sign-in, a CAPTCHA, a payment confirmation). The
+desktop shows it with Done and Cancel; these routes show the same requests on
+the phone and answer them.
+
+- **Discovery**: `/api/config` carries `browserHelp: true` when the server
+  runs with `--allow-transcript` and the attached desktop announced
+  `browser.help`. OMITTED otherwise (an older desktop announces nothing). It
+  does not say whether this caller may answer; a refused answer is `403`.
+- **Read** (`GET /api/browser-help`): the transcript consent (the prompt is
+  written by the agent) and any caller that authenticates: the operator token
+  or a paired device that is not revoked. No input grant is needed. The list
+  is the daemon's copy of the desktop's open requests, so it answers without
+  asking the desktop.
+- **Answer** (`POST /api/browser-help/:requestId/decision`): the transcript
+  consent, and the rule of a bot approval's decision: the operator token, or
+  a paired device whose input grant is on **and was set explicitly**, on a
+  server started with `--allow-input`. Checked before the body is read and
+  again once it is in, on the credential the request carries (same caller,
+  not revoked, still granted). The request's workspace is the one the
+  daemon's list holds for the id; the body never names one.
+
+**`GET /api/browser-help`** — every open request, oldest first:
+
+```json
+{ "requests": [ { "requestId": "5d0e9b82-…", "workspaceId": "ws-…", "surfaceId": "surf-…",
+                  "prompt": "Sign in to the shop, then press Done.",
+                  "createdAt": 1759600000000, "deadlineAt": 1759600300000,
+                  "backend": "builtin", "previewable": true,
+                  "origin": "https://login.example.com", "sessionId": "pty-…" } ] }
+```
+
+- `prompt`: written by the agent. Render it as plain text, never as markup
+  or a link, and do not put it on the lock screen.
+- `surfaceId`: the tab the request is about; absent when the agent named none.
+- `backend`: `builtin` (a wmux browser pane), `chrome` (a wmux Chrome
+  profile) or `live` (the user's own Chrome, or a tab the desktop cannot
+  tell apart from it).
+- `previewable`: the workspace browser preview (*Workspace browser preview*)
+  can show this tab now: a `builtin` pane of the request's own workspace, or
+  a `chrome` tab that workspace opened; never `live`. A `chrome` row's tab is
+  in the preview list only with `?chrome=1`, so a client that does not send
+  it treats a `chrome` row as not previewable.
+- `origin`: `scheme://host[:port]` of the tab when the agent made the
+  request, pinned for the request's whole life (a later navigation does not
+  change it). Absent when it was not known then: no tab, not an http(s) page,
+  a Chrome that did not answer, or `live`. Absent stays absent.
+- `sessionId`: the `id` in `/api/sessions` of the pane whose agent asked,
+  so a client can link the card to that pane. Present only when
+  `/api/sessions` lists that pane when this list is read: absent when the
+  agent's pane is not known, is an orchestrator brain pane, or has closed.
+  The pane may close between the two reads, so a `sessionId` your sessions
+  list lacks just means no link. Absent on older desktops and daemons. Only
+  in this list: never in a `browser.help` frame or a push.
+- `deadlineAt`: the desktop closes the request as `timed_out` then. A
+  request past it is left out of the list (and answered `409`) even before
+  the desktop's next update says so.
+
+**`POST /api/browser-help/:requestId/decision`** — body
+`{"outcome": "continued" | "cancelled"}` (`continued` is Done). Any other
+field, or any other value, is `400`. `200 {requestId, state}` once the
+desktop settled it. The first answer wins, from any device or the desktop,
+and is never rewritten. An answer to a request past its deadline is `409`;
+the desktop closes it as `timed_out` on its own, and the close frame follows
+separately. **Never retry a decision automatically**: a lost
+reply may have settled it. Read the list again instead.
+
+**`browser.help` on `/api/events`** — one frame per request that opened
+(`phase: "open"`) or closed (`phase: "close"`), with
+`{requestId, workspaceId, surfaceId?, deadlineAt}` and, on a close, `state`
+(`completed`, `continued`, `cancelled` or `timed_out`) when the desktop said
+how it ended. No prompt and no origin: fetch the list for those. Live only
+(§4): never in the backlog and not replayed, so read `GET /api/browser-help`
+on every reconnect. Sent only under `--allow-transcript`. When the desktop
+disconnects, its requests close with no `state`; they open again if it
+returns with them still open.
+
+**Push**: a device that registered `browserHelpPush` and may answer gets a
+push when a request opens and a retraction when it closes (§7, *Browser
+help*).
+
+| Response | Meaning |
+| --- | --- |
+| `403 {error:"browser-help-disabled"}` | The server runs without `--allow-transcript`. |
+| `403 {error:"read-only"}` / `403 {error:"read-only: …"}` | No `--allow-input`, or this device may not answer (see above). |
+| `401 {error:"authorization-expired"}` | The credential stopped authenticating as the same caller while the body was read. |
+| `400 {error:"invalid-decision"}` | The body is not exactly `{outcome}`. |
+| `404 {error:"browser-help-not-found"}` | No open request with that id. |
+| `409 {error:"browser-help-closed"}` | It already ended (answered, timed out or completed). |
+| `503 {error:"desktop-unavailable"}` | No desktop, or none that published its requests. |
+| `504 {error:"desktop-timeout"}` / `502 {error:"desktop-bad-reply"}` | The desktop did not answer, or answered badly. Do not retry; read the list. |
 
 #### Resuming a bot worker (`/api/bot-tasks`)
 
@@ -5107,13 +5708,22 @@ whose app page was not built serves the classic page at `/`.
   rejected promise and is never wired to the daemon. It also installs a
   `window.clipboardAPI` on the browser clipboard (secure contexts only) and
   registers `/sw.js` in a secure context, as the classic page does.
-- No stored credential, a 401, or a browser that cannot run the es2022 bundle
-  (iOS before 16.4) → the page goes to `/classic`. After pairing, the classic
-  page lands on `/` again (and an old browser falls straight back).
+- No stored credential → the page asks `GET /api/config` with no credential.
+  A 200 means a trusted sign-in proxy vouches for it (`wmux web
+  --trust-proxy-*`): the page runs with no token, sends no `Authorization`
+  header, opens streams with no `?token=` or ticket, and uses
+  `redirect: 'manual'`, so an ended sign-in (a redirect to the identity
+  provider) reloads the page through the sign-in. Anything else → `/classic`.
+- A 401 for a stored token goes to `/classic`, unless that same probe now
+  answers 200: then the token is dropped and the page boots again from `/`.
+  A browser that cannot run the es2022 bundle (iOS before 16.4) → `/classic`.
+  After pairing, the classic page lands on `/` again (and an old browser falls
+  straight back).
 - Terminals are the desktop's own `Terminal` component over the web routes:
   - A pane's stream (`GET /api/stream`, with a stream ticket for a device
-    credential — `<deviceId>.<secret>` — and `?token=` for the operator token,
-    which never asks for a ticket) is open only while the pane is shown and its
+    credential — `<deviceId>.<secret>` — `?token=` for the operator token,
+    which never asks for a ticket, and nothing for a proxy session, whose
+    cookies reach the sign-in proxy) is open only while the pane is shown and its
     terminal reports itself visible; it closes on hide. A device credential
     never goes into the URL: no ticket, no stream.
   - Inline images (sixel / iTerm2) are off in the browser: the image decoder
@@ -5656,7 +6266,8 @@ transcript), then the Claude/Codex transcript file — and adds `chat` to every
   readable chat (OpenCode off a session route, OpenCode without the plugin,
   another live agent with no transcript yet): send the user to Terminal. The
   preview is cheap and never enumerates processes, so `shell-has-children` only
-  ever arrives from the launch POST, which re-verifies everything.
+  ever arrives from the launch POST, which re-verifies everything. So does
+  `worker-fence`, which the preview never reads.
 - **`historyEpoch`** is `h1:` (transcript file), `t1:` (OpenCode, a hash — the
   raw plugin epoch never leaves the daemon) or `m1:` (managed). Compare it for
   equality; never parse it. Evicting old rows sets `historyTruncated` and keeps
@@ -5979,6 +6590,7 @@ changes; never persist it. A new agent pane takes the same `mode` and
 | `resume` + `prompt` for an agent that cannot take both, or a bound resume with a `prompt` on a PowerShell pane | 409 | `{error:"resume-prompt-unsupported"}` | `none` |
 | shell not ready | 409 | `{error:"launch-not-ready", reason:"shell-not-empty"\|"shell-busy"\|"approval-pending"\|"not-integrated"}` | `none` |
 | shell cannot launch | 409 | `{error:"launch-unsupported", reason:"unsupported-shell"\|"shell-has-children"}` | `none` |
+| the pane is a fenced unattended worker | 409 | `{error:"launch-unsupported", reason:"worker-fence"}` | `none` |
 | same id, different request | 409 | `{error:"launch-id-conflict"}` | `none` |
 | malformed id or request | 400 | `{error:"invalid-chat-request", detail?}` | `none` |
 | id expired | 400 | `{error:"launch-id-expired"}` | `none` — "check Terminal" |
@@ -5990,6 +6602,10 @@ changes; never persist it. A new agent pane takes the same `mode` and
 | failure once typing started | 502 | `{error:"launch-unconfirmed"}` | `uncertain` |
 
 Every body also carries `clientLaunchId` when the request had one.
+`worker-fence`: the pane is a fenced unattended worker; it can be restarted only
+from the desktop app. An app that does not know the reason shows its generic
+`launch-unsupported` text. Other bot-worker refusals stay `launch-unsupported`
+with no reason.
 `unsupported-shell` means a WSL pane, a Windows host, or a shell other than
 zsh, bash or sh. A shell process that is gone at the idle check reads as
 `launch-not-ready` with `shell-busy` (the pane is being torn down). The launch
@@ -6035,6 +6651,12 @@ computer". The directory is the pane's spawn directory for Claude (never the
 OSC 7 cwd, which pane output can aim), and for Codex the live native thread's
 own cwd when the daemon's relay knows it, else the spawn directory. Names and
 descriptions only; no bodies, no paths.
+
+### Renaming a Claude session
+
+There is no rename route. Send the text `/rename <name>` to the pane as a
+message (`POST /api/sessions/<id>/chat/messages`, or typed input), which
+needs the input grant like any send; Claude Code names the session itself.
 
 ### `chat.blocked` / `chat.unblocked` on `/api/events`
 

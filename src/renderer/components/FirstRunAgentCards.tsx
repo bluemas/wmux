@@ -1,6 +1,7 @@
 /**
  * The first-run wizard's "Agent ready" step: one row per agent with a `setup`
- * row (Claude Code, Codex, Grok, Antigravity) in four states (ready, sign-in
+ * row (Claude Code, Codex, Grok, Antigravity; a `card: 'when-installed'` row
+ * only once found) in four states (ready, sign-in
  * needed, installed with a sign-in wmux cannot check, not installed), plus the
  * corner card the wizard shrinks to while an install or sign-in pane is in use.
  *
@@ -11,7 +12,7 @@
  */
 import { useEffect, useState } from 'react';
 import type { AgentId, AgentSetupStatus } from '../../shared/agentSetup';
-import { AGENT_IDS } from '../../shared/agentSetup';
+import { AGENT_IDS, shownAgentIds } from '../../shared/agentSetup';
 import { agentRow } from '../../shared/agentIdentity';
 import { agentOfficialPage, type AgentInstallVia, type AgentSetupPlan, type AgentSetupPlanInstall, type SetAgentPathResult } from '../../shared/agentInstall';
 import { useT } from '../hooks/useT';
@@ -112,7 +113,7 @@ export function decideAgentPrimary(
   if (Object.values(runs).some((r) => r?.phase === 'running')) return null;
   // The first card whose own action can be the primary (Install, Retry, Log
   // in); a card that only offers "Check again" is never the primary.
-  return AGENT_IDS.find((a) => {
+  return shownAgentIds(statuses).find((a) => {
     const status = agentStatusOf(a, statuses);
     const phase = runs[a]?.phase;
     if (!status || phase === 'not-found' || phase === 'no-tab') return false;
@@ -121,13 +122,39 @@ export function decideAgentPrimary(
 }
 
 /**
+ * The agent rows the group lists before "Other agents" when the wizard opens:
+ * once an agent is signed in, only the signed-in ones and any with a run the
+ * user started; with none signed in yet, every agent, since one of them must
+ * be set up. The wizard decides this once and keeps it, so a row the user is
+ * working in never folds away under them.
+ */
+export function agentRowsToList(
+  statuses: AgentSetupStatus[] | null,
+  runs: Partial<Record<AgentId, AgentRun>>,
+): { listed: AgentId[]; folded: AgentId[] } {
+  const all = shownAgentIds(statuses);
+  if (!statuses?.some((s) => s.readiness === 'ready')) return { listed: all, folded: [] };
+  const keep = (a: AgentId) => agentStatusOf(a, statuses)?.readiness === 'ready' || runs[a] !== undefined;
+  return { listed: all.filter(keep), folded: all.filter((a) => !keep(a)) };
+}
+
+/**
  * The "Agent ready" group: one row per agent. `onShowPane` is called when a
  * card brings a run's terminal tab to the front, so the wizard can step aside
  * (a modal over the pane would keep the user from typing or reading it).
  */
-export function AgentReadyGroup({ primary, onShowPane }: { primary: AgentId | null; onShowPane: (agent: AgentId) => void }) {
+export function AgentReadyGroup({ primary, onShowPane, folded = [], onShowAll }: {
+  primary: AgentId | null;
+  onShowPane: (agent: AgentId) => void;
+  /** Agents listed under "Other agents" until it is pressed. */
+  folded?: readonly AgentId[];
+  onShowAll?: () => void;
+}) {
   const t = useT();
   const { statuses, runs } = useAgentSetup();
+  const all = shownAgentIds(statuses);
+  const rows = all.filter((a) => !folded.includes(a));
+  const hidden = all.length - rows.length;
   return (
     <section className="flex flex-col gap-2" data-testid="first-run-agent-ready">
       <div>
@@ -135,7 +162,7 @@ export function AgentReadyGroup({ primary, onShowPane }: { primary: AgentId | nu
         <p className="ui-row-detail">{t('firstRunWizard.agent.groupHint')}</p>
       </div>
       <div className="ui-group">
-        {AGENT_IDS.map((agent) => (
+        {rows.map((agent) => (
           <AgentCard
             key={agent}
             agent={agent}
@@ -147,6 +174,17 @@ export function AgentReadyGroup({ primary, onShowPane }: { primary: AgentId | nu
           />
         ))}
       </div>
+      {hidden > 0 && onShowAll && (
+        <Button
+          size="sm"
+          variant="ghost"
+          className="self-start"
+          onClick={onShowAll}
+          data-testid="first-run-agent-show-others"
+        >
+          {t('firstRunWizard.agent.otherAgents', { count: hidden })}
+        </Button>
+      )}
     </section>
   );
 }

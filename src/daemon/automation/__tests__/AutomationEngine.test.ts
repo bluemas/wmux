@@ -1,13 +1,26 @@
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AutomationEvent, AutomationRun } from '../../../shared/automation';
 import type { SessionPromptScheduleResult } from '../../../shared/sessionPromptSchedule';
 import { AutomationEngine, screenShowsPrompt, type AutomationAgentView, type AutomationEnginePorts } from '../AutomationEngine';
 import { AUTOMATION_RUNS_FILE, AUTOMATIONS_FILE, snapshotPath } from '../store';
+import { trackedTempDir } from '../../../test-utils/trackedTempDir';
+import { FolderTrustRefusedError } from '../../folderTrustState';
 
 const MIN = 60_000;
+
+// Every engine a case makes is stopped after it (a started one keeps timers
+// that write into its dir), and its queued saves are let finish: a save makes
+// the dir again if it is gone. Only then does trackedTempDir remove the dirs.
+const engines: AutomationEngine[] = [];
+afterEach(async () => {
+  for (const engine of engines.splice(0)) {
+    engine.stop();
+    await engine.whenSaved();
+  }
+});
+const tempDir = (prefix: string): string => trackedTempDir(prefix);
 
 const draft = (over: Record<string, unknown> = {}) => ({
   name: 'Nightly',
@@ -31,7 +44,7 @@ interface Harness {
 }
 
 function harness(opts: { dir?: string; ports?: Partial<AutomationEnginePorts> } = {}): Harness {
-  const dir = opts.dir ?? fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-engine-'));
+  const dir = opts.dir ?? tempDir('wmux-engine-');
   const clock = { t: new Date(2026, 8, 28, 9, 0).getTime() };
   let seq = 0;
   const h: Omit<Harness, 'engine'> = {
@@ -68,7 +81,9 @@ function harness(opts: { dir?: string; ports?: Partial<AutomationEnginePorts> } 
     killTree: async (pid) => { h.killed.push(pid); },
     ...opts.ports,
   };
-  return { ...h, engine: new AutomationEngine(ports) };
+  const engine = new AutomationEngine(ports);
+  engines.push(engine);
+  return { ...h, engine };
 }
 
 const settle = async (): Promise<void> => {
@@ -150,7 +165,7 @@ describe('AutomationEngine — revision & grants', () => {
   });
 
   it('boot: a schedule already holding a stale grant gets one needs-regrant notice', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-engine-'));
+    const dir = tempDir('wmux-engine-');
     fs.writeFileSync(path.join(dir, AUTOMATIONS_FILE), JSON.stringify({
       version: 1,
       automations: [
@@ -292,7 +307,7 @@ describe('AutomationEngine — launch & readiness', () => {
   });
 
   it('a claim that cannot be persisted never spawns', async () => {
-    const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-ro-')), 'not-a-dir');
+    const file = path.join(tempDir('wmux-ro-'), 'not-a-dir');
     fs.writeFileSync(file, 'x');
     const h = harness({ dir: file });
     const run = await startedRun(h);
@@ -311,7 +326,7 @@ describe('AutomationEngine — launch & readiness', () => {
   });
 
   it('boot: a run left launching/running is marked unknown and never relaunched', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-boot-'));
+    const dir = tempDir('wmux-boot-');
     fs.writeFileSync(path.join(dir, AUTOMATIONS_FILE), JSON.stringify({
       version: 1,
       automations: [{ ...draft(), id: 'a1', enabled: false, revision: 1, createdAt: 1 }],
@@ -695,6 +710,13 @@ describe('AutomationEngine — review regressions', () => {
     expect(h.engine.ownsPane(`auto-${res.run.id}`)).toBe(false);
   });
 
+  it('a prompt refused at a folder-trust prompt fails the run as first_run_blocked, with nothing pasted', async () => {
+    const h = harness({ ports: { deliverPrompt: async () => 'folder_trust' } });
+    const run = await startedRun(h);
+    expect(run).toMatchObject({ state: 'failed', reason: 'first_run_blocked' });
+    expect(h.keys).toEqual([]);
+  });
+
   it('a throwing prompt delivery fails the launch instead of escaping', async () => {
     const h = harness({ ports: { deliverPrompt: async () => { throw new Error('boom'); } } });
     const run = await startedRun(h);
@@ -724,6 +746,29 @@ describe('AutomationEngine — review regressions', () => {
       expect(h.keys).toEqual(['\r']);
       expect(run).toMatchObject({ state: 'running', detail: 'submit_retried' });
       expect(h.destroyed).toEqual([]);
+    });
+
+    it('an Enter refused at a folder-trust prompt fails the run as first_run_blocked', async () => {
+      const h = harness();
+      h.engine['ports'].deliverPrompt = pastedThenError(h);
+      h.engine['ports'].sendKey = async () => { throw new FolderTrustRefusedError('trust'); };
+      const run = await startedRun(h);
+      expect(h.keys).toEqual([]);
+      expect(run).toMatchObject({ state: 'failed', reason: 'first_run_blocked', detail: 'submit_unconfirmed' });
+    });
+
+    it('an Enter refused at a screen that cannot rule the prompt out is tried again within the deadline', async () => {
+      const h = harness();
+      h.engine['ports'].deliverPrompt = pastedThenError(h);
+      let refusals = 1;
+      h.engine['ports'].sendKey = async (_id, key) => {
+        if (refusals-- > 0) throw new FolderTrustRefusedError('unknown');
+        h.keys.push(key);
+        h.state.agent = { ...h.state.agent, status: 'running' };
+      };
+      const run = await startedRun(h);
+      expect(h.keys).toEqual(['\r']);
+      expect(run).toMatchObject({ state: 'running', detail: 'submit_retried' });
     });
 
     it('never presses Enter when the prompt is nowhere on screen (prompt_not_in_composer)', async () => {
@@ -1010,5 +1055,676 @@ describe('AutomationEngine — browser identity', () => {
     expect(h.created[0].command).toBe('claude --permission-mode auto --disallowedTools mcp__wmux');
     expect(h.engine.listRuns()[0].browserIdentity).toBeUndefined();
     expect(h.engine.runIdentity(h.engine.listRuns()[0].ptyId).run).toBeNull();
+  });
+});
+
+describe('AutomationEngine — whenSaved', () => {
+  it('resolves only once the saves queued before it are on disk', async () => {
+    const h = harness();
+    await h.engine.start({ timers: false });
+    // Not awaited: create queues its save before its first await.
+    const created = h.engine.create(draft());
+    await h.engine.whenSaved();
+    const onDisk = JSON.parse(fs.readFileSync(path.join(h.dir, AUTOMATIONS_FILE), 'utf8')) as { automations: unknown[] };
+    expect(onDisk.automations).toHaveLength(1);
+    expect((await created).ok).toBe(true);
+  });
+
+  it('after stop, waits for a launch still under way, so nothing is written once it resolves', async () => {
+    const h = harness();
+    await h.engine.start({ timers: false });
+    const created = await h.engine.create(draft());
+    if (!created.ok) throw new Error(created.error);
+    const res = await h.engine.runNow(created.automation.id, 'manual');
+    if (!res.ok) throw new Error(res.error);
+    // runNow returns once the claim is on disk; the launch goes on detached.
+    expect(res.run.state).toBe('launching');
+    h.engine.stop();
+    await h.engine.whenSaved();
+    expect(h.engine.listRuns().some((r) => r.state === 'launching')).toBe(false);
+    const runsFile = path.join(h.dir, AUTOMATION_RUNS_FILE);
+    const written = fs.readFileSync(runsFile, 'utf8');
+    await settle();
+    expect(fs.readFileSync(runsFile, 'utf8')).toBe(written);
+  });
+});
+
+describe('AutomationEngine — failure breaker', () => {
+  interface Breaker {
+    h: Harness;
+    id: string;
+    /** false: the next run fails as launch_failed before any session exists. */
+    folder: { ok: boolean };
+    signedOut: { v: boolean };
+  }
+
+  async function breaker(opts: { dir?: string; ports?: Partial<AutomationEnginePorts>; id?: string } = {}): Promise<Breaker> {
+    const folder = { ok: false };
+    const signedOut = { v: false };
+    const h = harness({
+      dir: opts.dir,
+      ports: { isDirectory: () => folder.ok, signedOut: async () => signedOut.v, ...opts.ports },
+    });
+    await h.engine.start({ timers: false });
+    let id = opts.id;
+    if (!id) {
+      const created = await h.engine.create(draft());
+      if (!created.ok) throw new Error(created.error);
+      id = created.automation.id;
+    }
+    return { h, id, folder, signedOut };
+  }
+
+  const schedule = (b: Breaker) => {
+    const a = b.h.engine.list().automations.find((x) => x.id === b.id);
+    if (!a) throw new Error('schedule gone');
+    return a;
+  };
+  const pausedItems = (b: Breaker) => (b.h.engine.list().pendingAttention ?? []).filter((x) => x.kind === 'failure-paused');
+  const pausedEvents = (b: Breaker) => b.h.events.filter((e) => e.type === 'attention' && e.kind === 'failure-paused');
+  const runById = (b: Breaker, runId: string) => {
+    const run = b.h.engine.listRuns().find((r) => r.id === runId);
+    if (!run) throw new Error('run gone');
+    return run;
+  };
+
+  /** One scheduled occurrence, settled: with the folder missing it ends launch_failed, otherwise it is left running. */
+  async function scheduled(b: Breaker): Promise<AutomationRun> {
+    b.h.clock.t += MIN;
+    const run = await b.h.engine.startRun(schedule(b), b.h.clock.t, 'scheduled');
+    await settleLaunch(b.h);
+    return runById(b, run.id);
+  }
+
+  async function failures(b: Breaker, n: number): Promise<void> {
+    for (let i = 0; i < n; i++) expect(await scheduled(b)).toMatchObject({ state: 'failed', reason: 'launch_failed' });
+  }
+
+  /** A scheduled run that launches fully and is left running. */
+  async function live(b: Breaker): Promise<AutomationRun> {
+    b.folder.ok = true;
+    const run = await scheduled(b);
+    b.folder.ok = false;
+    expect(run.state).toBe('running');
+    return run;
+  }
+
+  async function exit(b: Breaker, run: AutomationRun, code: number | null): Promise<void> {
+    b.h.alive.delete(`auto-${run.id}`);
+    await b.h.engine.onSessionDied(`auto-${run.id}`, code);
+  }
+
+  it('three scheduled failures with one reason turn the schedule off with one reason-bearing notice', async () => {
+    const b = await breaker();
+    await failures(b, 2);
+    expect(schedule(b)).toMatchObject({ enabled: true, failureStreak: { reason: 'launch_failed', count: 2 } });
+    expect(pausedItems(b)).toEqual([]);
+    await failures(b, 1);
+    expect(schedule(b)).toMatchObject({ enabled: false, nextRunAt: null, failureStreak: { reason: 'launch_failed', count: 3 } });
+    expect(pausedItems(b)).toEqual([expect.objectContaining({ automationId: b.id, automationName: 'Nightly', reason: 'launch_failed' })]);
+    expect(pausedEvents(b)).toEqual([{ type: 'attention', automationId: b.id, automationName: 'Nightly', kind: 'failure-paused' }]);
+    const tripped = b.h.events.filter((e) => e.type === 'run-changed' && e.pausedSchedule);
+    expect(tripped).toEqual([expect.objectContaining({ run: expect.objectContaining({ state: 'failed', reason: 'launch_failed' }) })]);
+    // A scheduled run already claimed when the breaker tripped fails later: nothing more.
+    await failures(b, 1);
+    expect(schedule(b)).toMatchObject({ enabled: false, failureStreak: { count: 3 } });
+    expect(pausedItems(b)).toHaveLength(1);
+    expect(pausedEvents(b)).toHaveLength(1);
+  });
+
+  it('a different reason starts the count again', async () => {
+    const b = await breaker();
+    await failures(b, 2);
+    b.signedOut.v = true;
+    expect(await scheduled(b)).toMatchObject({ state: 'failed', reason: 'login_needed' });
+    expect(schedule(b)).toMatchObject({ enabled: true, failureStreak: { reason: 'login_needed', count: 1 } });
+  });
+
+  it('a completed scheduled run resets the streak', async () => {
+    const b = await breaker();
+    await failures(b, 2);
+    const run = await live(b);
+    await exit(b, run, 0);
+    expect(runById(b, run.id).state).toBe('completed');
+    expect(schedule(b).failureStreak).toBeUndefined();
+    await failures(b, 2);
+    expect(schedule(b)).toMatchObject({ enabled: true, failureStreak: { count: 2 } });
+  });
+
+  it('cancelled runs and overlap skips neither count nor break the streak', async () => {
+    const b = await breaker();
+    await failures(b, 2);
+    const run = await live(b);
+    expect(await scheduled(b)).toMatchObject({ state: 'skipped', reason: 'overlap' });
+    await b.h.engine.cancelRun(run.id);
+    expect(runById(b, run.id)).toMatchObject({ state: 'failed', reason: 'cancelled' });
+    expect(schedule(b)).toMatchObject({ enabled: true, failureStreak: { reason: 'launch_failed', count: 2 } });
+    await failures(b, 1);
+    expect(schedule(b)).toMatchObject({ enabled: false, failureStreak: { count: 3 } });
+  });
+
+  it('a flood of missed occurrences that evicts the failures from history does not break the streak', async () => {
+    const b = await breaker();
+    await failures(b, 2);
+    const earlier = b.h.engine.listRuns().map((r) => r.id);
+    // Skips are stamped with the clock, and pruning keeps the newest by end time.
+    b.h.clock.t += 12 * 24 * 60 * MIN;
+    b.h.engine.tick(b.h.clock.t);
+    await settleLaunch(b.h);
+    const runs = b.h.engine.listRuns();
+    expect(runs.filter((r) => r.state === 'skipped').length).toBeGreaterThanOrEqual(9);
+    for (const id of earlier) expect(runs.map((r) => r.id)).not.toContain(id);
+    // The tick also fired the one occurrence still in its grace window: the third failure.
+    expect(runs.filter((r) => r.state === 'failed')).toEqual([expect.objectContaining({ reason: 'launch_failed' })]);
+    expect(schedule(b)).toMatchObject({ enabled: false, failureStreak: { reason: 'launch_failed', count: 3 } });
+    expect(pausedItems(b)).toHaveLength(1);
+  });
+
+  it('unknown ends, live or swept at restart, neither count nor break the streak; the streak survives the restart', async () => {
+    const b = await breaker();
+    await failures(b, 2);
+    const ambiguous = await live(b);
+    await exit(b, ambiguous, null);
+    expect(runById(b, ambiguous.id).state).toBe('unknown');
+    const open = await live(b);
+    b.h.engine.stop();
+    await b.h.engine.whenSaved();
+    let n = 0;
+    const again = await breaker({ dir: b.h.dir, id: b.id, ports: { newId: () => `b${++n}` } });
+    again.h.clock.t = b.h.clock.t;
+    expect(runById(again, open.id)).toMatchObject({ state: 'unknown', reason: 'interrupted' });
+    expect(schedule(again)).toMatchObject({ enabled: true, failureStreak: { reason: 'launch_failed', count: 2 } });
+    await failures(again, 1);
+    expect(schedule(again)).toMatchObject({ enabled: false, failureStreak: { count: 3 } });
+  });
+
+  it('an unanswered wait (await_timeout) neither counts nor breaks the streak', async () => {
+    const b = await breaker();
+    await failures(b, 2);
+    b.h.state.pendingApproval = true;
+    for (let i = 0; i < 3; i++) {
+      const run = await live(b);
+      await b.h.engine.monitorOnce();
+      expect(runById(b, run.id).state).toBe('awaiting');
+      b.h.clock.t += 16 * MIN;
+      await b.h.engine.monitorOnce();
+      expect(runById(b, run.id)).toMatchObject({ state: 'failed', reason: 'await_timeout' });
+    }
+    expect(schedule(b)).toMatchObject({ enabled: true, failureStreak: { reason: 'launch_failed', count: 2 } });
+    expect(pausedItems(b)).toEqual([]);
+  });
+
+  it('a run whose end is reported twice counts once', async () => {
+    const b = await breaker();
+    for (let i = 0; i < 3; i++) {
+      const run = await live(b);
+      await b.h.engine.onAgentEvent(`auto-${run.id}`, { kind: 'agent.stop_failure', status: 'error' });
+      await exit(b, run, 3);
+      if (i === 2) await b.h.engine.monitorOnce();
+      expect(runById(b, run.id)).toMatchObject({ state: 'failed', reason: 'agent_error' });
+    }
+    expect(schedule(b)).toMatchObject({ enabled: false, failureStreak: { reason: 'agent_error', count: 3 } });
+    expect(pausedItems(b)).toHaveLength(1);
+    expect(pausedEvents(b)).toHaveLength(1);
+  });
+
+  it('manual and test runs never touch the streak, and run on a paused schedule', async () => {
+    const b = await breaker();
+    await failures(b, 2);
+    const manual = await b.h.engine.runNow(b.id, 'manual');
+    if (!manual.ok) throw new Error(manual.error);
+    await settleLaunch(b.h);
+    expect(runById(b, manual.run.id)).toMatchObject({ state: 'failed', reason: 'launch_failed' });
+    expect(schedule(b)).toMatchObject({ enabled: true, failureStreak: { count: 2 } });
+    await failures(b, 1);
+    expect(schedule(b).enabled).toBe(false);
+
+    const failedTest = await b.h.engine.runNow(b.id, 'test');
+    expect(failedTest.ok).toBe(true);
+    await settleLaunch(b.h);
+    b.folder.ok = true;
+    const passed = await b.h.engine.runNow(b.id, 'manual');
+    if (!passed.ok) throw new Error(passed.error);
+    await settleLaunch(b.h);
+    await exit(b, runById(b, passed.run.id), 0);
+    expect(runById(b, passed.run.id).state).toBe('completed');
+    expect(schedule(b)).toMatchObject({ enabled: false, failureStreak: { reason: 'launch_failed', count: 3 } });
+    expect(pausedItems(b)).toHaveLength(1);
+  });
+
+  it('turning the schedule back on clears the streak and the notice; one more failure does not trip it', async () => {
+    const b = await breaker();
+    await failures(b, 3);
+    const res = await b.h.engine.setEnabled(b.id, true);
+    expect(res.ok && res.automation.failureStreak).toBeUndefined();
+    expect(schedule(b).enabled).toBe(true);
+    expect(schedule(b).nextRunAt).not.toBeNull();
+    expect(pausedItems(b)).toEqual([]);
+    await failures(b, 1);
+    expect(schedule(b)).toMatchObject({ enabled: true, failureStreak: { count: 1 } });
+  });
+
+  it('a person turning the schedule off mid-streak clears it, and the run in flight raises nothing', async () => {
+    const b = await breaker();
+    await failures(b, 2);
+    const run = await live(b);
+    await b.h.engine.setEnabled(b.id, false);
+    expect(schedule(b).failureStreak).toBeUndefined();
+    await exit(b, run, 3);
+    expect(runById(b, run.id)).toMatchObject({ state: 'failed', reason: 'process_exit' });
+    expect(schedule(b).failureStreak).toBeUndefined();
+    expect(pausedItems(b)).toEqual([]);
+    expect(pausedEvents(b)).toEqual([]);
+  });
+
+  it('a paused schedule stays paused across a restart, with its notice, and nothing is announced again', async () => {
+    const b = await breaker();
+    await failures(b, 3);
+    b.h.engine.stop();
+    await b.h.engine.whenSaved();
+    let n = 0;
+    const again = await breaker({ dir: b.h.dir, id: b.id, ports: { newId: () => `b${++n}` } });
+    expect(schedule(again)).toMatchObject({ enabled: false, nextRunAt: null, failureStreak: { reason: 'launch_failed', count: 3 } });
+    expect(pausedItems(again)).toEqual([expect.objectContaining({ reason: 'launch_failed' })]);
+    again.h.engine.tick(again.h.clock.t + MIN);
+    expect(again.h.events.filter((e) => e.type === 'attention')).toEqual([]);
+  });
+
+  it('an edit to what runs starts the streak over and answers the notice; a time-only edit keeps it', async () => {
+    const b = await breaker();
+    await failures(b, 2);
+    const later = draft({ trigger: { kind: 'schedule', weekdays: [0, 1, 2, 3, 4, 5, 6], time: '09:45', graceMinutes: 60 } });
+    expect((await b.h.engine.update(b.id, later)).ok).toBe(true);
+    expect(schedule(b).failureStreak).toEqual({ reason: 'launch_failed', count: 2 });
+
+    await failures(b, 1);
+    expect(pausedItems(b)).toHaveLength(1);
+    const fixed = draft({ action: { kind: 'launch', cwd: '/work/other', agent: 'claude', prompt: 'do the thing' } });
+    expect((await b.h.engine.update(b.id, fixed)).ok).toBe(true);
+    expect(schedule(b).failureStreak).toBeUndefined();
+    expect(pausedItems(b)).toEqual([]);
+    expect(schedule(b).enabled).toBe(false);
+  });
+
+  it('a run that started before an edit to what runs neither counts nor breaks the new streak', async () => {
+    const b = await breaker();
+    await failures(b, 2);
+    const run = await live(b);
+    const fixed = draft({ action: { kind: 'launch', cwd: '/work/other', agent: 'claude', prompt: 'do the thing' } });
+    expect((await b.h.engine.update(b.id, fixed)).ok).toBe(true);
+    await exit(b, run, 3);
+    expect(runById(b, run.id)).toMatchObject({ state: 'failed', reason: 'process_exit' });
+    expect(schedule(b).failureStreak).toBeUndefined();
+  });
+
+  it('a person turning a paused schedule off answers its notice', async () => {
+    const b = await breaker();
+    await failures(b, 3);
+    expect(pausedItems(b)).toHaveLength(1);
+    await b.h.engine.setEnabled(b.id, false);
+    expect(pausedItems(b)).toEqual([]);
+    expect(schedule(b).failureStreak).toBeUndefined();
+  });
+});
+
+describe('AutomationEngine — one retry after a temporary provider error', () => {
+  /** A harness whose continue port and folder-trust verdict are recorded and settable. */
+  function retryHarness(opts: { dir?: string; trust?: 'trust' | 'clear' | 'unknown' } = {}) {
+    const continues: Array<{ id: string; slug: string; incarnationId: string; wanted: boolean }> = [];
+    const trust = { state: opts.trust ?? 'clear' as 'trust' | 'clear' | 'unknown' };
+    const h = harness({
+      ...(opts.dir ? { dir: opts.dir } : {}),
+      ports: {
+        deliverContinue: async (id, slug, incarnationId, stillWanted) => {
+          continues.push({ id, slug, incarnationId, wanted: stillWanted() });
+          return 'sent';
+        },
+        folderTrustState: async () => trust.state,
+      },
+    });
+    return { ...h, continues, trust };
+  }
+
+  const fail = (h: Harness, run: AutomationRun, extra: Record<string, unknown> = {}) =>
+    h.engine.onAgentEvent(`auto-${run.id}`, { kind: 'agent.stop_failure', status: 'error', ...extra });
+
+  it('holds a network failure, continues once after 5 minutes, and a success completes the run', async () => {
+    const h = retryHarness();
+    const run = await startedRun(h);
+    const failedAt = h.clock.t;
+    await fail(h, run, { transientFailure: true });
+    h.state.agent = { ...h.state.agent, status: 'error' };
+    expect(h.engine.listRuns()[0]).toMatchObject({ state: 'running', retryAt: failedAt + 5 * MIN });
+    expect(h.engine.listRuns()[0].reason).toBeUndefined();
+    // Nothing final reached the event stream, so no failed toast.
+    expect(h.events.some((e) => e.type === 'run-changed' && e.run.state === 'failed')).toBe(false);
+    // A transcript turn end of the failed turn does not complete a held run.
+    h.state.turnEndAt = failedAt + 1;
+    await h.engine.monitorOnce(failedAt + 4 * MIN);
+    expect(h.continues).toEqual([]);
+    expect(h.engine.listRuns()[0].state).toBe('running');
+    h.clock.t = failedAt + 5 * MIN;
+    await h.engine.monitorOnce(h.clock.t);
+    expect(h.continues).toEqual([{ id: `auto-${run.id}`, slug: 'claude', incarnationId: 'inc-1', wanted: true }]);
+    // The original prompt went out once, at launch, and never again.
+    expect(h.delivered).toEqual(['do the thing']);
+    expect(h.engine.listRuns()[0]).toMatchObject({ state: 'running', retried: true });
+    expect(h.engine.listRuns()[0].retryAt).toBeUndefined();
+    // The old turn end is older than the continue: still running.
+    await h.engine.monitorOnce(h.clock.t + 5_000);
+    expect(h.engine.listRuns()[0].state).toBe('running');
+    await h.engine.monitorOnce(h.clock.t + 6 * MIN);
+    expect(h.continues).toHaveLength(1);
+    await h.engine.onAgentEvent(`auto-${run.id}`, { kind: 'agent.stop', status: 'complete' });
+    expect(h.engine.listRuns()[0]).toMatchObject({ state: 'completed', retried: true });
+  });
+
+  it('a second failure after the continue is final, and says it was retried once', async () => {
+    const h = retryHarness();
+    const run = await startedRun(h);
+    await fail(h, run, { transientFailure: true });
+    h.clock.t += 5 * MIN;
+    await h.engine.monitorOnce(h.clock.t);
+    await fail(h, run, { transientFailure: true });
+    expect(h.engine.listRuns()[0]).toMatchObject({ state: 'failed', reason: 'agent_error', detail: 'retried_once', retried: true });
+    // The only failed state the event stream (and so the toast) ever saw is this final one.
+    expect(h.events.filter((e) => e.type === 'run-changed' && e.run.state === 'failed')).toHaveLength(1);
+    await h.engine.monitorOnce(h.clock.t + 10 * MIN);
+    expect(h.continues).toHaveLength(1);
+  });
+
+  it('auth, quota and unknown failures stay final at once', async () => {
+    for (const extra of [{ authFailure: true }, {}] as const) {
+      const h = retryHarness();
+      const run = await startedRun(h);
+      await fail(h, run, extra);
+      const ended = h.engine.listRuns()[0];
+      expect(ended).toMatchObject({ state: 'failed', reason: 'authFailure' in extra ? 'login_needed' : 'agent_error' });
+      expect(ended.retryAt).toBeUndefined();
+      expect(ended.detail).toBeUndefined();
+      await h.engine.monitorOnce(h.clock.t + 10 * MIN);
+      expect(h.continues).toEqual([]);
+    }
+  });
+
+  it('the per-schedule opt-out and the global setting off keep today\'s behaviour, and arm nothing', async () => {
+    const off = retryHarness();
+    const run = await startedRun(off, { policy: { retryTransientErrors: false } });
+    expect(off.engine.list().automations[0].policy.retryTransientErrors).toBe(false);
+    expect(off.engine.armTransientRetry(`auto-${run.id}`)).toBe(false);
+    await fail(off, run, { transientFailure: true });
+    expect(off.engine.listRuns()[0]).toMatchObject({ state: 'failed', reason: 'agent_error' });
+
+    const global = retryHarness();
+    await global.engine.start({ timers: false });
+    expect(global.engine.list().settings).toEqual({ retryTransientErrors: true });
+    expect(await global.engine.setSettings({ retryTransientErrors: false })).toEqual({ ok: true, settings: { retryTransientErrors: false } });
+    const created = await global.engine.create(draft());
+    if (!created.ok) throw new Error(created.error);
+    await global.engine.runNow(created.automation.id, 'manual');
+    await settleLaunch(global);
+    const globalRun = global.engine.listRuns()[0];
+    expect(global.engine.armTransientRetry(`auto-${globalRun.id}`)).toBe(false);
+    await fail(global, globalRun, { transientFailure: true });
+    expect(global.engine.listRuns()[0]).toMatchObject({ state: 'failed', reason: 'agent_error' });
+    await global.engine.monitorOnce(global.clock.t + 10 * MIN);
+    expect([...off.continues, ...global.continues]).toEqual([]);
+    // The setting is the daemon's own and survives a restart.
+    global.engine.stop();
+    await global.engine.whenSaved();
+    const reread = harness({ dir: global.dir });
+    await reread.engine.start({ timers: false });
+    expect(reread.engine.list().settings).toEqual({ retryTransientErrors: false });
+  });
+
+  it('arming is synchronous, so the push gate knows; a later hook delivery of the same failure is ignored', async () => {
+    const h = retryHarness();
+    const run = await startedRun(h);
+    expect(h.engine.armTransientRetry(`auto-${run.id}`, 'veto')).toBe(false);
+    expect(h.engine.armTransientRetry('not-a-run-pane')).toBe(false);
+    expect(h.engine.armTransientRetry(`auto-${run.id}`, 'emit')).toBe(true);
+    expect(h.engine.listRuns()[0].retryAt).toBe(h.clock.t + 5 * MIN);
+    // Armed once only.
+    expect(h.engine.armTransientRetry(`auto-${run.id}`)).toBe(false);
+    await fail(h, run, { transientFailure: true });
+    expect(h.engine.listRuns()[0].state).toBe('running');
+  });
+
+  it('a pane no longer the run\'s, or showing a trust prompt, at retry time gets no write and ends failed at once', async () => {
+    const cases: Array<(h: ReturnType<typeof retryHarness>) => void> = [
+      (h) => { h.state.agent = { ...h.state.agent, incarnationId: 'inc-2' }; },
+      (h) => { h.state.agent = { ...h.state.agent, slug: 'codex' }; },
+      (h) => { h.trust.state = 'trust'; },
+    ];
+    for (const change of cases) {
+      const h = retryHarness();
+      const run = await startedRun(h);
+      await fail(h, run, { transientFailure: true });
+      change(h);
+      h.clock.t += 5 * MIN;
+      await h.engine.monitorOnce(h.clock.t);
+      expect(h.continues).toEqual([]);
+      expect(h.engine.listRuns()[0]).toMatchObject({ state: 'failed', reason: 'agent_error', detail: 'retry_blocked' });
+      expect(h.delivered).toEqual(['do the thing']);
+    }
+  });
+
+  it('a pane that stays busy or unclear past the short grace gets no write and ends failed', async () => {
+    const cases: Array<(h: ReturnType<typeof retryHarness>) => void> = [
+      (h) => { h.state.agent = { ...h.state.agent, status: 'running' }; },
+      (h) => { h.state.agent = { ...h.state.agent, inputQuiet: false }; },
+      (h) => { h.state.pendingApproval = true; },
+      (h) => { h.trust.state = 'unknown'; },
+    ];
+    for (const change of cases) {
+      const h = retryHarness();
+      const run = await startedRun(h);
+      await fail(h, run, { transientFailure: true });
+      change(h);
+      h.clock.t += 5 * MIN;
+      await h.engine.monitorOnce(h.clock.t);
+      // Asked again on the next passes, still held, nothing written.
+      expect(h.engine.listRuns()[0]).toMatchObject({ state: 'running', retryAt: h.clock.t });
+      await h.engine.monitorOnce(h.clock.t + 61_000);
+      expect(h.continues).toEqual([]);
+      expect(h.engine.listRuns()[0]).toMatchObject({ state: 'failed', reason: 'agent_error', detail: 'retry_blocked' });
+      expect(h.delivered).toEqual(['do the thing']);
+    }
+  });
+
+  it('a pane only momentarily not ready gets its continue on a later pass', async () => {
+    const h = retryHarness();
+    const run = await startedRun(h);
+    await fail(h, run, { transientFailure: true });
+    h.state.agent = { ...h.state.agent, inputQuiet: false };
+    h.clock.t += 5 * MIN;
+    await h.engine.monitorOnce(h.clock.t);
+    expect(h.continues).toEqual([]);
+    h.state.agent = { ...h.state.agent, inputQuiet: true };
+    h.clock.t += 5_000;
+    await h.engine.monitorOnce(h.clock.t);
+    expect(h.continues).toHaveLength(1);
+    expect(h.engine.listRuns()[0]).toMatchObject({ state: 'running', retried: true });
+  });
+
+  it('a late first pass still gets the grace, and a verification blip on the same process is not final', async () => {
+    const h = retryHarness();
+    const run = await startedRun(h);
+    await fail(h, run, { transientFailure: true });
+    h.state.agent = { ...h.state.agent, verified: false };
+    // The machine slept through the due time and well past the grace.
+    h.clock.t += 30 * MIN;
+    await h.engine.monitorOnce(h.clock.t);
+    expect(h.engine.listRuns()[0].state).toBe('running');
+    expect(h.continues).toEqual([]);
+    h.state.agent = { ...h.state.agent, verified: true };
+    h.clock.t += 5_000;
+    await h.engine.monitorOnce(h.clock.t);
+    expect(h.continues).toHaveLength(1);
+  });
+
+  it('the session exiting while its continue is being delivered ends the run failed, not completed', async () => {
+    const h = retryHarness();
+    const run = await startedRun(h);
+    const pane = `auto-${run.id}`;
+    h.engine['ports'].deliverContinue = async () => {
+      await h.engine.onSessionDied(pane, 0);
+      return 'sent';
+    };
+    await fail(h, run, { transientFailure: true });
+    h.clock.t += 5 * MIN;
+    await h.engine.monitorOnce(h.clock.t);
+    expect(h.engine.listRuns()[0]).toMatchObject({ state: 'failed', reason: 'agent_error', detail: 'retry_blocked' });
+  });
+
+  it('a continue the delivery keeps refusing ends the run failed, and the session going away while held does too', async () => {
+    const refused = retryHarness();
+    refused.engine['ports'].deliverContinue = async () => 'busy';
+    const run = await startedRun(refused);
+    await fail(refused, run, { transientFailure: true });
+    refused.clock.t += 5 * MIN;
+    await refused.engine.monitorOnce(refused.clock.t);
+    expect(refused.engine.listRuns()[0]).toMatchObject({ state: 'running', retryAt: refused.clock.t });
+    expect(refused.engine.listRuns()[0].retried).toBeUndefined();
+    await refused.engine.monitorOnce(refused.clock.t + 61_000);
+    expect(refused.engine.listRuns()[0]).toMatchObject({ state: 'failed', reason: 'agent_error', detail: 'retry_blocked' });
+
+    const died = retryHarness();
+    const diedRun = await startedRun(died);
+    await fail(died, diedRun, { transientFailure: true });
+    await died.engine.onSessionDied(`auto-${diedRun.id}`, 0);
+    expect(died.engine.listRuns()[0]).toMatchObject({ state: 'failed', reason: 'agent_error', detail: 'retry_blocked' });
+    expect(died.continues).toEqual([]);
+  });
+
+  it('the continued turn failing before its delivery returns still ends the run as retried once', async () => {
+    const h = retryHarness();
+    const run = await startedRun(h);
+    const pane = `auto-${run.id}`;
+    h.engine['ports'].deliverContinue = async () => {
+      expect(h.engine.continuedRunPane(pane)).toBe(true);
+      // The provider is still down: the hook lands while the submit is being confirmed.
+      expect(h.engine.armTransientRetry(pane)).toBe(false);
+      await h.engine.onAgentEvent(pane, { kind: 'agent.stop_failure', status: 'error', transientFailure: true });
+      return 'sent';
+    };
+    await fail(h, run, { transientFailure: true });
+    expect(h.engine.continuedRunPane(pane)).toBe(false);
+    h.clock.t += 5 * MIN;
+    await h.engine.monitorOnce(h.clock.t);
+    expect(h.engine.listRuns()[0]).toMatchObject({ state: 'failed', reason: 'agent_error', detail: 'retried_once', retried: true });
+    expect(h.engine.continuedRunPane(pane)).toBe(false);
+  });
+
+  it('a daemon restart while held closes the run failed with a clear reason, and nothing is sent', async () => {
+    const h = retryHarness();
+    const run = await startedRun(h);
+    await fail(h, run, { transientFailure: true });
+    h.engine.stop();
+    await h.engine.whenSaved();
+    const next = retryHarness({ dir: h.dir });
+    await next.engine.start({ timers: false });
+    const after = next.engine.listRuns().find((r) => r.id === run.id);
+    expect(after).toMatchObject({ state: 'failed', reason: 'agent_error', detail: 'retry_interrupted' });
+    expect(after?.retryAt).toBeUndefined();
+    await next.engine.monitorOnce(next.clock.t + 10 * MIN);
+    expect(next.continues).toEqual([]);
+    expect(next.created).toEqual([]);
+  });
+});
+
+describe('AutomationEngine — usage reserve', () => {
+  it('holds a due scheduled run until the reserve lifts, then starts it for its own occurrence', async () => {
+    let until: number | null = null;
+    const asked: string[] = [];
+    const h = harness({ ports: { reserveHold: (account) => { asked.push(account); return until; } } });
+    await h.engine.start({ timers: false });
+    const a = await h.engine.create(draft());
+    if (!a.ok || a.automation.nextRunAt === null) throw new Error();
+    const due = a.automation.nextRunAt;
+    h.clock.t = due + 10 * MIN;
+    until = h.clock.t + 2 * 60 * MIN;
+    h.engine.tick();
+    h.engine.tick(h.clock.t + MIN);
+    await settle();
+    expect(h.engine.listRuns()).toEqual([]);
+    expect(asked[0]).toBe('default');
+    expect(h.engine.list().automations[0].nextRunAt).toBe(due);
+    expect(h.events.filter((e) => e.type === 'reserve-held')).toEqual([
+      { type: 'reserve-held', automationId: a.automation.id, automationName: 'Nightly', account: 'default', untilMs: until },
+    ]);
+    // Past the reset: started for the occurrence it was held at, beyond its grace.
+    h.clock.t = until + MIN;
+    until = null;
+    h.engine.tick();
+    await settleLaunch(h);
+    expect(h.engine.listRuns()).toMatchObject([{ trigger: 'scheduled', scheduledFor: due, state: 'running' }]);
+  });
+
+  it('when a newer occurrence came due while held, that one runs and the held one is recorded missed', async () => {
+    let until: number | null = null;
+    const h = harness({ ports: { reserveHold: () => until } });
+    await h.engine.start({ timers: false });
+    const a = await h.engine.create(draft());
+    if (!a.ok || a.automation.nextRunAt === null) throw new Error();
+    const due = a.automation.nextRunAt;
+    h.clock.t = due + 10 * MIN;
+    until = h.clock.t + 25 * 60 * MIN;
+    h.engine.tick();
+    const nextDue = due + 24 * 60 * MIN;
+    h.clock.t = nextDue + 10 * MIN;
+    until = null;
+    h.engine.tick();
+    await settleLaunch(h);
+    const runs = h.engine.listRuns();
+    expect(runs.find((r) => r.state !== 'skipped')).toMatchObject({ scheduledFor: nextDue, state: 'running' });
+    expect(runs.find((r) => r.state === 'skipped')).toMatchObject({ scheduledFor: due, reason: 'missed' });
+  });
+
+  it('a held occurrence meets a restart as one that came due while the daemon was down', async () => {
+    const dir = tempDir('wmux-reserve-');
+    let until: number | null = null;
+    const first = harness({ dir, ports: { reserveHold: () => until } });
+    await first.engine.start({ timers: false });
+    const a = await first.engine.create(draft());
+    if (!a.ok || a.automation.nextRunAt === null) throw new Error();
+    const due = a.automation.nextRunAt;
+    first.clock.t = due + 10 * MIN;
+    until = first.clock.t + 10 * 60 * MIN;
+    first.engine.tick();
+    first.engine.stop();
+    await first.engine.whenSaved();
+    const second = harness({ dir });
+    second.clock.t = due + 3 * 60 * MIN; // past its 60 min grace
+    await second.engine.start({ timers: false });
+    second.engine.tick();
+    await settle();
+    expect(second.engine.listRuns()).toMatchObject([{ scheduledFor: due, state: 'skipped', reason: 'daemon_down' }]);
+  });
+
+  it('never holds a run started by hand', async () => {
+    const clock = { t: 0 };
+    const h = harness({ ports: { reserveHold: () => clock.t + 60 * MIN } });
+    clock.t = h.clock.t;
+    const run = await startedRun(h);
+    expect(run).toMatchObject({ trigger: 'manual', state: 'running' });
+    expect(h.events.some((e) => e.type === 'reserve-held')).toBe(false);
+  });
+
+  it('an edit while held drops the held occurrence: the reset starts nothing old', async () => {
+    let until: number | null = null;
+    const h = harness({ ports: { reserveHold: () => until } });
+    await h.engine.start({ timers: false });
+    const a = await h.engine.create(draft());
+    if (!a.ok || a.automation.nextRunAt === null) throw new Error();
+    h.clock.t = a.automation.nextRunAt + 10 * MIN;
+    until = h.clock.t + 60 * MIN;
+    h.engine.tick();
+    await h.engine.setEnabled(a.automation.id, false);
+    await h.engine.setEnabled(a.automation.id, true);
+    h.clock.t = until + MIN;
+    h.engine.tick();
+    await settle();
+    expect(h.engine.listRuns()).toEqual([]);
   });
 });

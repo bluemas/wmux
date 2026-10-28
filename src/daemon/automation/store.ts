@@ -17,15 +17,19 @@ import path from 'node:path';
 import { atomicReadJSONSync, atomicWriteJSON } from '../util/atomicWrite';
 import {
   AUTOMATION_AGENT_CAPS,
+  AUTOMATION_DEFAULT_SETTINGS,
   AUTOMATION_DEFAULTS,
   AUTOMATION_FINAL_RUN_STATES,
+  isFailureReason,
   type Automation,
   type AutomationAttention,
   type AutomationAttentionKind,
+  type AutomationFailureStreak,
   type AutomationRun,
   type AutomationRunDetail,
   type AutomationRunReason,
   type AutomationRunState,
+  type AutomationSettings,
 } from '../../shared/automation';
 import { isPermissionMode, validateAllowedTools, validateBrowserIdentity, validateDraft } from './draft';
 
@@ -38,6 +42,7 @@ export interface AutomationsFileState {
   version: 1;
   automations: Automation[];
   attention: AutomationAttention[];
+  settings: AutomationSettings;
 }
 
 export interface AutomationRunsFileState {
@@ -61,10 +66,29 @@ const RUN_DETAILS: ReadonlySet<string> = new Set<AutomationRunDetail>([
   'browser_policy_denied',
   'browser_consent_unattended',
   'previous_session_open',
+  'retried_once',
+  'retry_blocked',
+  'retry_interrupted',
 ]);
-const ATTENTION_KINDS: ReadonlySet<string> = new Set<AutomationAttentionKind>(['proposed', 'grant-raised', 'needs-regrant']);
+const ATTENTION_KINDS: Record<AutomationAttentionKind, true> = {
+  proposed: true,
+  'grant-raised': true,
+  'needs-regrant': true,
+  'failure-paused': true,
+};
+const isAttentionKind = (v: unknown): v is AutomationAttentionKind =>
+  typeof v === 'string' && Object.prototype.hasOwnProperty.call(ATTENTION_KINDS, v);
 
 const num = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
+
+function coerceFailureStreak(raw: unknown): AutomationFailureStreak | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const o = raw as Record<string, unknown>;
+  const reason = o['reason'];
+  const count = num(o['count']);
+  if (!isFailureReason(reason) || count === undefined || !Number.isInteger(count) || count < 1) return undefined;
+  return { reason, count: Math.min(count, AUTOMATION_DEFAULTS.failureBreakerRuns) };
+}
 
 export function coerceAutomation(raw: unknown): Automation | null {
   if (!raw || typeof raw !== 'object') return null;
@@ -111,6 +135,7 @@ export function coerceAutomation(raw: unknown): Automation | null {
     }
   }
   const nextRunAt = num(o['nextRunAt']);
+  const failureStreak = coerceFailureStreak(o['failureStreak']);
   return {
     id,
     name: draft.value.name,
@@ -125,6 +150,7 @@ export function coerceAutomation(raw: unknown): Automation | null {
     createdAt,
     updatedAt: num(o['updatedAt']) ?? createdAt,
     createdBy: o['createdBy'] === 'mcp-proposal' ? 'mcp-proposal' : 'desktop-ui',
+    ...(failureStreak && { failureStreak }),
   };
 }
 
@@ -144,6 +170,7 @@ export function coerceRun(raw: unknown): AutomationRun | null {
   const agentSessionId = typeof o['agentSessionId'] === 'string' && o['agentSessionId'].length <= 256 ? o['agentSessionId'] : undefined;
   const startedAt = num(o['startedAt']);
   const endedAt = num(o['endedAt']);
+  const retryAt = num(o['retryAt']);
   const runIdentity = o['browserIdentity'] === undefined ? null : validateBrowserIdentity(o['browserIdentity']);
   return {
     id,
@@ -160,6 +187,8 @@ export function coerceRun(raw: unknown): AutomationRun | null {
     ...(startedAt !== undefined ? { startedAt } : {}),
     ...(endedAt !== undefined ? { endedAt } : {}),
     ...(o['hasSnapshot'] === true ? { hasSnapshot: true } : {}),
+    ...(retryAt !== undefined ? { retryAt } : {}),
+    ...(o['retried'] === true ? { retried: true } : {}),
     ...(runIdentity?.ok ? { browserIdentity: runIdentity.value } : {}),
   };
 }
@@ -168,15 +197,18 @@ function coerceAttention(raw: unknown): AutomationAttention | null {
   if (!raw || typeof raw !== 'object') return null;
   const o = raw as Record<string, unknown>;
   const at = num(o['at']);
+  const kind = o['kind'];
+  const reason = o['reason'];
   if (typeof o['id'] !== 'string' || !ID_RE.test(o['id']) || typeof o['automationId'] !== 'string' ||
       typeof o['automationName'] !== 'string' || at === undefined ||
-      typeof o['kind'] !== 'string' || !ATTENTION_KINDS.has(o['kind'])) return null;
+      !isAttentionKind(kind)) return null;
   return {
     id: o['id'],
     automationId: o['automationId'],
     automationName: o['automationName'].slice(0, 120),
-    kind: o['kind'] as AutomationAttentionKind,
+    kind,
     at,
+    ...(kind === 'failure-paused' && isFailureReason(reason) && { reason }),
   };
 }
 
@@ -202,7 +234,12 @@ export function loadAutomations(wmuxDir: string): AutomationsFileState {
     .map(coerceAttention)
     .filter((x): x is AutomationAttention => x !== null)
     .slice(-ATTENTION_CAP);
-  return { version: 1, automations, attention };
+  const rawSettings = raw?.['settings'] && typeof raw['settings'] === 'object' ? raw['settings'] as Record<string, unknown> : {};
+  const settings: AutomationSettings = {
+    retryTransientErrors: typeof rawSettings['retryTransientErrors'] === 'boolean'
+      ? rawSettings['retryTransientErrors'] : AUTOMATION_DEFAULT_SETTINGS.retryTransientErrors,
+  };
+  return { version: 1, automations, attention, settings };
 }
 
 export function loadRuns(wmuxDir: string): AutomationRunsFileState {
