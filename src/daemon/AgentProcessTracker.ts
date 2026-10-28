@@ -52,6 +52,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { AGENT_ROWS, AGENT_SLUG_SET, type AgentSlug } from '../shared/agentIdentity';
+import { customProcessNameForm } from '../shared/customAgents';
 import type { WslAgentLocation, WslReportedAgent, WslWatchedAgent } from './wslAgentProcess';
 
 const execFileAsync = promisify(execFile);
@@ -66,6 +67,10 @@ export interface ProcessTreeEntry {
   /** Full command line (POSIX args / Windows CommandLine) when available —
    *  the input for runtime→agent resolution. */
   cmdline?: string;
+  /** Windows only: the process's creation time (epoch ms), when it could be
+   *  read. Windows never reparents, so a ppid alone can name a dead parent
+   *  whose pid a later process reused; a child is never older than its parent. */
+  created?: number;
 }
 
 /** The watcher surface the tracker needs — ProcessMonitor satisfies it
@@ -80,6 +85,10 @@ export interface PidWatcher {
  *  Membership test uses AGENT_SLUG_SET (ReadonlySet<string>) so raw stems
  *  narrow without a cast dance. */
 const RUNTIME_STEMS: ReadonlySet<string> = new Set(['node', 'bun', 'deno', 'python', 'python3']);
+
+/** Windows images that may hold a Claude conversation when their command
+ *  line cannot be read (processesWithArg). */
+const UNREADABLE_HOLDER_IMAGE = /^(claude|node|bun)(\.exe)?$/i;
 
 /** Package-manager runners: when the script token is one of these (or
  *  python's `-m`), the agent name rides the NEXT non-flag argument
@@ -181,9 +190,34 @@ function lookupForm(token: string): string {
  * unit tests.
  */
 export function resolveAgentSlug(cmdline: string | undefined): AgentSlug | undefined {
-  if (!cmdline) return undefined;
+  for (const c of scriptCandidates(cmdline)) {
+    // Scoped-package spellings never basename-match: `@acme/claude` must not
+    // resolve claude (lookupForm unwraps the scope, so it cannot be trusted
+    // here). Only an exact alias entry may speak for a scoped name.
+    if (isScopedCandidate(c)) {
+      const alias = ALIAS_TO_SLUG.get(c.replace(/\\/g, '/').toLowerCase());
+      if (alias) return alias;
+      continue;
+    }
+    const form = lookupForm(c);
+    if (AGENT_SLUG_SET.has(form)) return form as AgentSlug;
+    const alias = ALIAS_TO_SLUG.get(form);
+    if (alias) return alias;
+  }
+  return undefined;
+}
+
+function isScopedCandidate(c: string): boolean {
+  return c.startsWith('@') || /[/\\]@[^/\\]+[\\/]/.test(c);
+}
+
+/** The tokens of a runtime-hosted command line that may name what it runs,
+ *  under the discipline documented on resolveAgentSlug. Bare script-slot
+ *  names are already dropped. */
+function scriptCandidates(cmdline: string | undefined): string[] {
+  if (!cmdline) return [];
   const argv = tokenizeCmdline(cmdline);
-  if (argv.length < 2) return undefined;
+  if (argv.length < 2) return [];
   const form0 = lookupForm(argv[0]);
   const form1 = lookupForm(argv[1]);
   // Package runners and `python -m`: the agent name rides the next non-flag
@@ -220,43 +254,29 @@ export function resolveAgentSlug(cmdline: string | undefined): AgentSlug | undef
       bare: false,
     });
   }
-  for (const { token: c, bare } of candidates) {
-    if (bare) continue;
-    // Scoped-package spellings never basename-match: `@acme/claude` must not
-    // resolve claude (lookupForm unwraps the scope, so it cannot be trusted
-    // here). Only an exact alias entry may speak for a scoped name.
-    const scoped = c.startsWith('@') || /[/\\]@[^/\\]+[\\/]/.test(c);
-    if (scoped) {
-      const alias = ALIAS_TO_SLUG.get(c.replace(/\\/g, '/').toLowerCase());
-      if (alias) return alias;
-      continue;
-    }
-    const form = lookupForm(c);
-    if (AGENT_SLUG_SET.has(form)) return form as AgentSlug;
-    const alias = ALIAS_TO_SLUG.get(form);
-    if (alias) return alias;
-  }
-  return undefined;
+  return candidates.filter((c) => !c.bare).map((c) => c.token);
 }
 
 /**
- * Parse the normalized `pid|ppid|name|cmdline` lines produced by the Windows
- * enumeration script. CommandLine may itself contain pipes, so everything
- * after the image name joins back into the cmdline. Malformed lines
- * (PowerShell banners, blank tails) are skipped. Pure — exported for tests.
+ * Parse the normalized `pid|ppid|created|name|cmdline` lines produced by the
+ * Windows enumeration script (`created`: epoch ms, empty when unreadable).
+ * CommandLine may itself contain pipes, so everything after the image name
+ * joins back into the cmdline. Malformed lines (PowerShell banners, blank
+ * tails) are skipped. Pure — exported for tests.
  */
 export function parsePipeDelimited(stdout: string): ProcessTreeEntry[] {
   const entries: ProcessTreeEntry[] = [];
   for (const line of stdout.split('\n')) {
-    const m = line.trim().match(/^(\d+)\|(\d+)\|(.+)$/);
+    const m = line.trim().match(/^(\d+)\|(\d+)\|(\d*)\|(.+)$/);
     if (!m) continue;
-    const parts = m[3].split('|');
+    const parts = m[4].split('|');
     const cmdline = parts.slice(1).join('|');
     entries.push({
       pid: parseInt(m[1], 10),
       ppid: parseInt(m[2], 10),
       name: parts[0] ?? '',
       ...(cmdline ? { cmdline } : {}),
+      ...(m[3] ? { created: parseInt(m[3], 10) } : {}),
     });
   }
   return entries;
@@ -279,6 +299,113 @@ export function parsePsOutput(stdout: string): ProcessTreeEntry[] {
     entries.push({ pid: parseInt(m[1], 10), ppid: parseInt(m[2], 10), name: argv0, cmdline });
   }
   return entries;
+}
+
+/** Runtimes and package runners a custom agent may run under
+ *  (`python3.12 /opt/tern.py`, `npx -y tern`), with any version suffix. */
+const SCRIPT_HOST_RE = /^(node|nodejs|bun|deno|python|pythonw|pypy|npx|npx-cli|bunx|yarn|uvx|pipx)[\d.]*$/;
+/** Shells that run a wrapper script (`sh /usr/local/bin/tern`). */
+const SHELL_HOST_RE = /^(sh|bash|zsh|dash|fish)$/;
+
+/** cmd's `/c` program: cmd drops one outer quote pair when the command
+ *  starts with two quotes (`""C:\Program Files\Tern\tern" --fast"`). A quoted
+ *  first word may be a spaced path or a whole command line
+ *  (`/c "C:\Tools\tern.cmd --fast"`): both readings are candidates. */
+function cmdPrograms(cmdline: string): string[] {
+  const m = /\s\/c\s+(.*)$/i.exec(cmdline);
+  if (!m) return [];
+  let rest = m[1].trim();
+  const innerQuoted = rest.startsWith('""') && rest.endsWith('"');
+  if (innerQuoted) rest = rest.slice(1, -1);
+  const first = tokenizeCmdline(rest)[0];
+  if (!first) return [];
+  if (!/\s/.test(first)) return [first];
+  // Whole, only when it reads as a path: inner quotes, or no option in it
+  // (`/c "tail -f /var/log/tern"` is a command line, not a file named tern).
+  const whole = innerQuoted || !/\s[-/]/.test(first) ? [first] : [];
+  return [...whole, first.split(/\s+/)[0]];
+}
+
+/** The tokens a host image's command line may name a custom agent by:
+ *  - a shell's script in PATH form, or the first word of its `-c` command
+ *    (a program, so a PATH name counts);
+ *  - cmd's `/c` program, PowerShell's `-File` script;
+ *  - a runtime's or runner's candidates, under resolveAgentSlug's discipline. */
+function hostedCandidates(stem: string, cmdline: string | undefined): string[] {
+  if (!cmdline) return [];
+  if (stem === 'cmd') return cmdPrograms(cmdline);
+  const argv = tokenizeCmdline(cmdline);
+  if (stem === 'pwsh' || stem === 'powershell') {
+    const at = argv.findIndex((t) => /^-f(ile)?$/i.test(t));
+    return at >= 0 && argv[at + 1] ? [argv[at + 1]] : [];
+  }
+  if (SHELL_HOST_RE.test(stem)) {
+    for (const [i, t] of argv.entries()) {
+      if (i === 0) continue;
+      if (!t.startsWith('-')) break;
+      if (/^-[A-Za-z]*c/.test(t)) return tokenizeCmdline(argv[i + 1] ?? '').slice(0, 1);
+    }
+    return scriptCandidates(cmdline);
+  }
+  return SCRIPT_HOST_RE.test(stem) ? scriptCandidates(cmdline) : [];
+}
+
+/** The custom-agent process name `entry` runs as: its image name, or what a
+ *  shell, cmd, PowerShell or runtime image runs (hostedCandidates). */
+function customNameOf(entry: ProcessTreeEntry, names: ReadonlyMap<string, string>): string | undefined {
+  const stem = customProcessNameForm(entry.name);
+  if (names.has(stem)) return stem;
+  for (const c of hostedCandidates(stem, entry.cmdline)) {
+    if (isScopedCandidate(c)) continue;
+    const form = customProcessNameForm(c);
+    if (names.has(form)) return form;
+  }
+  return undefined;
+}
+
+/**
+ * The shallowest of `shellPid`'s descendants (or the root itself) that runs
+ * one of the operator's custom agents (`names`: process name → display name).
+ * Two different agents at that depth are ambiguous: none. Independent of
+ * selectAgentProcess: a custom agent is a pane label, so a registry agent it
+ * starts is still picked and tracked as that agent. Pure — exported for tests.
+ */
+export function selectCustomAgentProcess(
+  entries: ReadonlyArray<ProcessTreeEntry>,
+  shellPid: number,
+  names: ReadonlyMap<string, string>,
+): { pid: number; name: string } | undefined {
+  if (names.size === 0) return undefined;
+  const byParent = new Map<number, ProcessTreeEntry[]>();
+  for (const e of entries) {
+    const list = byParent.get(e.ppid);
+    if (list) list.push(e);
+    else byParent.set(e.ppid, [e]);
+  }
+  const root = entries.find((e) => e.pid === shellPid);
+  const rootName = root ? customNameOf(root, names) : undefined;
+  if (rootName) return { pid: shellPid, name: rootName };
+  const visited = new Set<number>([shellPid]);
+  let level = [shellPid];
+  while (level.length > 0) {
+    const found: Array<{ pid: number; name: string }> = [];
+    const next: number[] = [];
+    for (const pid of level) {
+      for (const child of byParent.get(pid) ?? []) {
+        if (visited.has(child.pid)) continue;
+        visited.add(child.pid);
+        const name = customNameOf(child, names);
+        if (name) found.push({ pid: child.pid, name });
+        next.push(child.pid);
+      }
+    }
+    if (found.length > 0) {
+      // Compared by agent: two process names of one agent are not a tie.
+      return found.every((f) => names.get(f.name) === names.get(found[0].name)) ? found[0] : undefined;
+    }
+    level = next;
+  }
+  return undefined;
 }
 
 /** The picked process: `pid` always (liveness), `slug` only when the image
@@ -604,9 +731,10 @@ async function enumerateProcesses(): Promise<ProcessTreeEntry[]> {
       [
         '-NoProfile', '-NonInteractive', '-Command',
         // Pipe-delimited to keep the parser trivial (image names never
-        // contain '|'; CommandLine may — the parser rejoins it). Win32_Process
-        // is one WMI query — no per-PID walks.
-        "Get-CimInstance -ClassName Win32_Process | ForEach-Object { '{0}|{1}|{2}|{3}' -f $_.ProcessId, $_.ParentProcessId, $_.Name, $_.CommandLine }",
+        // contain '|'; CommandLine may — the parser rejoins it, so the
+        // creation time goes before the name). Win32_Process is one WMI
+        // query — no per-PID walks. A null CreationDate prints empty.
+        "Get-CimInstance -ClassName Win32_Process | ForEach-Object { '{0}|{1}|{2}|{3}|{4}' -f $_.ProcessId, $_.ParentProcessId, $(if ($_.CreationDate) { ([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds() }), $_.Name, $_.CommandLine }",
       ],
       { encoding: 'utf-8', timeout: 10_000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 },
     );
@@ -670,6 +798,10 @@ export interface TrackedAgentState {
 
 export class AgentProcessTracker {
   private readonly states = new Map<string, TrackedAgent>();
+  /** The custom agent each pane runs, as a label beside `states`: it never
+   *  becomes or replaces the pane's tracked agent. */
+  private readonly customLabels = new Map<string, { pid: number; name: string }>();
+  private customNames: (() => ReadonlyMap<string, string>) | undefined;
   /** In-flight probe per session — coalesces the hook-storm case (a claude
    *  turn can fire several hooks back-to-back) into one enumeration. */
   private readonly inFlight = new Set<string>();
@@ -761,6 +893,43 @@ export class AgentProcessTracker {
       }
     }
     return { ok: true };
+  }
+
+  /** The operator's custom agents, process name → display name
+   *  (CustomAgentNames), read on each probe. */
+  setCustomAgentNames(names: () => ReadonlyMap<string, string>): void {
+    this.customNames = names;
+  }
+
+  /** The display name of the custom agent the pane runs, or undefined. A
+   *  label only: it is never the pane's agent slug, and a registry agent it
+   *  starts is tracked as that agent. Kept from the last process listing
+   *  until that process exits. */
+  customAgentNameFor(sessionId: string): string | undefined {
+    const label = this.customLabels.get(sessionId);
+    return label ? this.customNames?.().get(label.name) : undefined;
+  }
+
+  /** Re-read the pane's custom agent from a fresh listing of its tree. */
+  private noteCustomLabel(sessionId: string, entries: ReadonlyArray<ProcessTreeEntry>, shellPid: number): void {
+    const names = this.customNames?.();
+    const next = names ? selectCustomAgentProcess(entries, shellPid, names) : undefined;
+    const prev = this.customLabels.get(sessionId);
+    if (prev && next && prev.pid === next.pid && prev.name === next.name) return;
+    const key = AgentProcessTracker.customWatchKey(sessionId);
+    if (prev) this.watcher.unwatch(key);
+    if (!next) {
+      this.customLabels.delete(sessionId);
+      return;
+    }
+    this.customLabels.set(sessionId, next);
+    this.watcher.watch(key, next.pid, () => {
+      if (this.customLabels.get(sessionId)?.pid === next.pid) this.customLabels.delete(sessionId);
+    });
+  }
+
+  private static customWatchKey(sessionId: string): string {
+    return `custom-agent:${sessionId}`;
   }
 
   private static watchKey(sessionId: string): string {
@@ -887,6 +1056,7 @@ export class AgentProcessTracker {
         const observedAt = this.snapshotStartedAt;
         const entries = await snapshot;
         if ((this.generation.get(sessionId) ?? 0) !== gen) return; // disarmed meanwhile
+        this.noteCustomLabel(sessionId, entries, shellPid);
         const pick = selectAgentProcess(entries, shellPid);
         let replaced = false;
         if (requireSlug) {
@@ -987,6 +1157,17 @@ export class AgentProcessTracker {
     const launches = this.launchCounter?.(sessionId);
     if (shellPid === undefined || !dead.slug || dead.launchSeq === undefined || launches === undefined || launches <= dead.launchSeq) {
       reportDeath();
+      // A custom wrapper that started this agent may have exec'd away since
+      // (`claude; exec $SHELL`): re-read its label rather than keep it.
+      if (shellPid !== undefined && this.customLabels.has(sessionId)) {
+        const gen = this.generation.get(sessionId) ?? 0;
+        void this.enumerate().then(
+          (entries) => {
+            if ((this.generation.get(sessionId) ?? 0) === gen) this.noteCustomLabel(sessionId, entries, shellPid);
+          },
+          () => undefined,
+        );
+      }
       return;
     }
     const gen = this.generation.get(sessionId) ?? 0;
@@ -995,6 +1176,8 @@ export class AgentProcessTracker {
     void this.enumerate().then(
       (entries) => {
         if ((this.generation.get(sessionId) ?? 0) !== gen || this.states.get(sessionId) !== dead) return; // disarmed, or a probe took over
+        // The pane's custom agent may have outlived this one, or exec'd away.
+        this.noteCustomLabel(sessionId, entries, shellPid);
         const pick = selectAgentProcess(entries, shellPid);
         if (!pick || pick.slug !== dead.slug || pick.pid === pid) {
           reportDeath();
@@ -1169,8 +1352,15 @@ export class AgentProcessTracker {
    *  such agent runs there. A WSL agent (a Linux pid) and an agent that is
    *  the pane's own root are never returned: stopping either is not a stop
    *  of the agent alone. Throws when the process table cannot be read (that
-   *  is not "nothing runs"). */
-  async agentProcessTree(sessionId: string, expectedSlug: AgentSlug): Promise<{ root: ProcessTreeEntry; descendants: ProcessTreeEntry[] } | null> {
+   *  is not "nothing runs").
+   *
+   *  Windows never reparents: a process whose parent died long ago keeps that
+   *  parent's pid as its ppid, and the agent may have reused it. So there a
+   *  process is below the agent only when it started after its parent; an
+   *  older one (and what runs under it) is left out. One started in the same
+   *  millisecond as its parent, or whose age cannot be told, is `uncertain`:
+   *  never signalled, but a stop is not confirmed while it runs. */
+  async agentProcessTree(sessionId: string, expectedSlug: AgentSlug): Promise<{ root: ProcessTreeEntry; descendants: ProcessTreeEntry[]; uncertain: ProcessTreeEntry[] } | null> {
     const s = this.states.get(sessionId);
     const shellPid = this.shellPids.get(sessionId);
     if (!s?.alive || s.wsl || shellPid === undefined || s.pid === shellPid) return null;
@@ -1192,25 +1382,48 @@ export class AgentProcessTracker {
       else byParent.set(e.ppid, [e]);
     }
     const descendants: ProcessTreeEntry[] = [];
+    const uncertain: ProcessTreeEntry[] = [];
+    const dated = this.platform === 'win32';
     const seen = new Set<number>([root.pid, shellPid]);
-    const queue = [root.pid];
+    const queue: Array<{ entry: ProcessTreeEntry; sure: boolean }> = [{ entry: root, sure: true }];
     while (queue.length > 0) {
-      for (const child of byParent.get(queue.shift() as number) ?? []) {
+      const parent = queue.shift() as { entry: ProcessTreeEntry; sure: boolean };
+      for (const child of byParent.get(parent.entry.pid) ?? []) {
         if (seen.has(child.pid)) continue;
+        let sure = parent.sure;
+        if (dated) {
+          const born = child.created;
+          const parentBorn = parent.entry.created;
+          // Older than its parent, or than the agent (below an undated
+          // parent): its ppid names an earlier process that had this pid.
+          if (born !== undefined && ((parentBorn !== undefined && born < parentBorn) ||
+              (root.created !== undefined && born < root.created))) continue;
+          // A tie at millisecond resolution does not tell which came first.
+          sure = sure && born !== undefined && parentBorn !== undefined && born > parentBorn;
+        }
         seen.add(child.pid);
-        descendants.push(child);
-        queue.push(child.pid);
+        (sure ? descendants : uncertain).push(child);
+        queue.push({ entry: child, sure });
       }
     }
     this.treeRoots.set(root, { sessionId, state: s });
-    return { root, descendants };
+    return { root, descendants, uncertain };
   }
 
   /** Every live process whose command line carries `marker` (a conversation
-   *  id), from a fresh table. Throws when the table cannot be read. */
+   *  id), from a fresh table. On Windows also every claude, node or bun
+   *  process whose command line cannot be read (another user's, an elevated
+   *  one): it may carry the marker. Throws when the table cannot be read. */
   async processesWithArg(marker: string): Promise<ProcessTreeEntry[]> {
     if (!marker) return [];
-    return (await this.enumerate()).filter((e) => e.cmdline?.includes(marker) === true && e.pid !== process.pid);
+    const unreadable = (e: ProcessTreeEntry) => this.platform === 'win32' && !e.cmdline && UNREADABLE_HOLDER_IMAGE.test(e.name);
+    return (await this.enumerate()).filter((e) => (e.cmdline?.includes(marker) === true || unreadable(e)) && e.pid !== process.pid);
+  }
+
+  /** One fresh process table (on Windows with creation times), not shared
+   *  with a probe in flight. Throws when it cannot be read. */
+  async processTable(): Promise<ProcessTreeEntry[]> {
+    return this.enumerate();
   }
 
   /** Of `entries`, the ones a fresh process table still shows as the same
@@ -1218,9 +1431,28 @@ export class AgentProcessTracker {
    *  program, or the same program started with other arguments). Throws when
    *  the table cannot be read. */
   async stillRunning(entries: readonly ProcessTreeEntry[]): Promise<ProcessTreeEntry[]> {
-    if (entries.length === 0) return [];
+    const { same, unsure } = await this.liveness(entries);
+    return entries.filter((e) => same.includes(e) || unsure.includes(e));
+  }
+
+  /** stillRunning, split by how sure the match is. On Windows the creation
+   *  time is part of a process's identity too: a different one is another
+   *  process that took the pid (the same program with the same arguments is
+   *  not told apart otherwise), and one missing on either side leaves the
+   *  match `unsure`: still running, but not proven the same process. */
+  async liveness(entries: readonly ProcessTreeEntry[]): Promise<{ same: ProcessTreeEntry[]; unsure: ProcessTreeEntry[] }> {
+    if (entries.length === 0) return { same: [], unsure: [] };
     const table = await this.snapshot();
-    const left = entries.filter((e) => table.some((t) => t.pid === e.pid && t.name === e.name && t.cmdline === e.cmdline));
+    const same: ProcessTreeEntry[] = [];
+    const unsure: ProcessTreeEntry[] = [];
+    for (const e of entries) {
+      const row = table.find((t) => t.pid === e.pid && t.name === e.name && t.cmdline === e.cmdline);
+      if (!row) continue;
+      if (this.platform !== 'win32') same.push(e);
+      else if (row.created === undefined || e.created === undefined) unsure.push(e);
+      else if (row.created === e.created) same.push(e);
+    }
+    const left = [...same, ...unsure];
     // A tree read's root found gone is that tracked agent gone: the launch
     // the read was made for, or one tracked since on the same pid when no
     // process holds that pid any more (a re-probe of the same agent). A
@@ -1232,7 +1464,7 @@ export class AgentProcessTracker {
       if (!cur || cur.wsl) continue;
       if (cur === tracked.state || (cur.pid === e.pid && !table.some((t) => t.pid === e.pid))) this.recordDeath(tracked.sessionId, cur);
     }
-    return left;
+    return { same, unsure };
   }
 
   /** The agent's death edge, recorded by a fresh process table rather than
@@ -1252,8 +1484,10 @@ export class AgentProcessTracker {
   disarm(sessionId: string): void {
     this.generation.set(sessionId, (this.generation.get(sessionId) ?? 0) + 1);
     this.watcher.unwatch(AgentProcessTracker.watchKey(sessionId));
+    this.watcher.unwatch(AgentProcessTracker.customWatchKey(sessionId));
     this.wsl.watcher?.unwatch(AgentProcessTracker.watchKey(sessionId));
     this.states.delete(sessionId);
+    this.customLabels.delete(sessionId);
     this.shellPids.delete(sessionId);
     this.lastFailedAt.delete(sessionId);
     this.lastRearmAt.delete(sessionId);

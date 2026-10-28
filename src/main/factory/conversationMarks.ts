@@ -12,10 +12,12 @@
 //                worker read with the owner's sign-in is in this
 //                conversation. Always tainted too.
 //
-// Readers: memory.update (nothing is saved from a tainted conversation), the
+// Readers: memory.update (nothing is saved from a tainted conversation but
+// on the owner's approval card, ownerAsked.ts), the
 // handoff marks (wakeTaint.ts markSent / markForward: what a bot sends from
 // one is tainted), the standing instructions (routine.set, job_set and
-// workflow.create are refused from a tainted one), the attended check of a
+// workflow.create are refused from a tainted one; a new routine the owner
+// asked for goes to their approval card), the attended check of a
 // bot's commands and file edits (wakeTaint.ts runningWakeAttended), and the
 // ways out of a signed-in one (signedInRefusal: fan-outs, worker messages
 // and resumes but to its signed-in tasks, handoffs, mentions, and posts
@@ -109,7 +111,7 @@ export function signedInRefusal(what: string, botId: string): string {
 
 /** What a bot is told when a tainted conversation asks to save work that
  *  runs later (a routine, a job, a workflow). */
-export const TAINTED_CONVERSATION_SAVES_NOTHING = 'this conversation has taken in outside text, so it saves nothing that runs later, even on the owner\'s words; ask the owner to set it from a new conversation';
+export const TAINTED_CONVERSATION_SAVES_NOTHING = 'this conversation has taken in outside text, so it saves nothing that runs later, even on the owner\'s words; ask the owner to start a new conversation with you (New conversation, on your profile in the Bots page) and to ask for it again there';
 
 /** Told when a mark is set (the runtime saves it with the session record). */
 export function setConversationMarkListener(fn: ((botId: string, marks: ConversationMarks) => void) | null): void {

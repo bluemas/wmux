@@ -36,7 +36,7 @@ import { GuestWorkspaceStore, crossesGuestBoundary, expectGuestWorkspaces, guest
 import { WakeQueue, wakeQueuePath, setWakeQueue } from '../../factory/wakeQueue';
 import { FactorySettingsStore, factorySettingsPath, onFactorySettingsChanged, setFactorySettingsStore } from '../../factory/factorySettings';
 import { BotRuntime, BotSessionStore, botSessionsPath, setBotRuntime } from '../../factory/BotRuntime';
-import { createDefaultBotEngineFactory, runnableDefaultEngine, type BotEngineFactory } from '../../factory/botEngines';
+import { acpEnginesAllowed, createDefaultBotEngineFactory, runnableDefaultEngine, type BotEngineFactory } from '../../factory/botEngines';
 import { recordWorkerEnd } from '../../factory/budget';
 import { workerStopsConfirmed } from '../../factory/workerRunEnds';
 import { botAccountName, botAccountQuota, type ClaudeUsageCache } from '../../factory/botQuota';
@@ -48,8 +48,14 @@ import { BotFanoutReceipts, botFanoutReceiptsPath, setBotFanoutReceipts } from '
 import { installBotFanoutWake } from '../../deck/fanoutCallerNotify';
 import { isVerifyReport } from '../../factory/verifyPreset';
 import { getTaskLedger } from '../../deck/taskLedgerHost';
-import type { WakeTaskSummary } from '../../factory/wakePrompt';
-import { botRepoFromFolder, greetNewBot } from '../../factory/botCreate';
+import { taskIdOfFactId, type WakeTaskFiles, type WakeTaskSummary } from '../../factory/wakePrompt';
+import { getTaskFolderPorts, reportFiles, taskFolderKind, type TaskMission } from '../../factory/taskFolderCleanup';
+import type { LedgerEntry } from '../../../shared/ledger';
+import { ROOM_FILE_LIMITS } from '../../../shared/roomFiles';
+import { botRepoFromFolder, greetNewBot, otherBotsRepo, recordWorkspaceRepo, withWorkspaceRepoLock, workspaceBotsRepo } from '../../factory/botCreate';
+import { normalizeRepoKey } from '../../../shared/repoKey';
+import { sameRepoKey } from '../../../shared/forgeHosts';
+import { WorkspaceRepoStore, getWorkspaceRepoStore, setWorkspaceRepoStore, workspaceReposPath } from '../../factory/workspaceRepos';
 import { DISMISSED_ANSWER, getHandoffRouter } from '../../factory/handoffRouter';
 import { getWakeTaint, guestGateProvenance, type GuestProvenance, type WakeTaint } from '../../factory/wakeTaint';
 import { TAINTED_CONVERSATION_SAVES_NOTHING, conversationTainted } from '../../factory/conversationMarks';
@@ -59,6 +65,7 @@ import type { WakeItem } from '../../../shared/wake';
 import { ROOMS_DIRNAME, getRoomWriter, resolveRoomPorts, runningWake, runningWakeThread, wakeReplyTo } from '../../factory/roomWriter';
 import { getFactoryStopPorts, stopFactoryWork, type FactoryStopPorts, type FactoryStopResult } from '../../factory/factoryStop';
 import { UNKNOWN_ROOT_REFUSAL } from '../../../shared/rpc';
+import { noteBotSetChanged } from '../../phone/BotPromptPushFeed';
 
 type Refusal = FactoryRefusal<'not_authorized' | 'not_started' | 'invalid_argument' | 'not_found' | 'not_running' | 'too_many_bots' | 'dropped' | 'not_owner_words' | 'not_a_repo' | 'repo_untrusted' | 'no_remote' | 'repo_mismatch' | 'stop_failed'>;
 
@@ -315,6 +322,17 @@ export function registerBotRpcHandlers(
     return { ok: true, bot: pipeProfile(r.bot), previous: r.previous, ...(next === r.previous ? { unchanged: true } : {}) };
   });
 
+  // A bot's ACP engine (Hermes, or any ACP command) is picked by the owner in
+  // its profile (FACTORY_BOT_SET_ENGINE, main window only): over the pipe,
+  // bot.create and bot.update neither set nor change one. A test build on
+  // isolated data (acpEnginesAllowed) keeps the pipe route for its smoke.
+  const acpEngineRefusal = (engine: unknown, current?: BotProfile): ReturnType<typeof refuse> | null => {
+    if (acpEnginesAllowed()) return null;
+    const wantsAcp = !!engine && typeof engine === 'object' && (engine as { kind?: unknown }).kind === 'acp';
+    if (!wantsAcp && current?.engine.kind !== 'acp') return null;
+    return refuse('not_authorized', 'a bot\'s ACP engine (Hermes) is picked in the bot\'s profile in wmux, not over the pipe');
+  };
+
   const operatorOnly = (
     method: RpcMethod,
     run: (l: Live, params: Record<string, unknown>) => unknown | Promise<unknown>,
@@ -336,6 +354,8 @@ export function registerBotRpcHandlers(
   operatorOnly(BOT_RPC.create, (l, params) => {
     if (params['avatar'] !== undefined) return refuse('invalid_argument', 'a bot\'s picture is set in Settings, not through bot.create');
     if (params['greet'] !== undefined && typeof params['greet'] !== 'boolean') return refuse('invalid_argument', 'greet must be a boolean');
+    const acpRefused = params['engine'] !== undefined ? acpEngineRefusal(params['engine']) : null;
+    if (acpRefused) return acpRefused;
     const r = l.store.create({
       workspaceId: params['workspaceId'],
       template: params['template'],
@@ -363,19 +383,41 @@ export function registerBotRpcHandlers(
     const raw = params['patch'];
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return refuse('invalid_argument', 'patch must be an object');
     let patch = raw as Record<string, unknown>;
-    // A picked folder becomes the repo as "Add bot" resolves it (botCreate.ts).
-    if ('repoFolder' in patch) {
-      const { repoFolder, ...rest } = patch;
-      if ('repo' in rest) return refuse('invalid_argument', 'send repo or repoFolder, not both');
-      const resolved = await botRepoFromFolder(l.store, botId, repoFolder);
-      if (!resolved.ok) return refuse(resolved.code, resolved.message);
-      patch = { ...rest, repo: resolved.repo };
+    if ('engine' in patch) {
+      const acpRefused = acpEngineRefusal(patch.engine, l.store.get(botId) ?? undefined);
+      if (acpRefused) return acpRefused;
     }
-    const r = l.store.update(botId, patch);
-    if (!r.ok) return refuse(r.code, r.message);
-    l.runtime.profileChanged(botId);
-    if ('job' in patch && r.bot.job) setJobPorts.jobGiven?.(botId);
-    return { ok: true, bot: pipeProfile(r.bot), status: l.runtime.status(botId) };
+    // A repository set here, from a picked folder or as a `repo` itself, is
+    // the workspace's: checked against its other bots' (a workspace works on
+    // one), saved, remembered and given to its bots without one, all under
+    // the workspace's lock (botCreate.ts withWorkspaceRepoLock).
+    const setsRepo = 'repoFolder' in patch || (!!patch.repo && typeof patch.repo === 'object');
+    const apply = async (): Promise<unknown> => {
+      if ('repoFolder' in patch) {
+        // A picked folder becomes the repo as "Add bot" resolves it.
+        const { repoFolder, ...rest } = patch;
+        if ('repo' in rest) return refuse('invalid_argument', 'send repo or repoFolder, not both');
+        const resolved = await botRepoFromFolder(l.store, botId, repoFolder);
+        if (!resolved.ok) return refuse(resolved.code, resolved.message);
+        patch = { ...rest, repo: resolved.repo };
+      } else if (setsRepo) {
+        const key = normalizeRepoKey((patch.repo as { repoKey?: unknown }).repoKey);
+        const current = otherBotsRepo(l.store, botId);
+        if (key && current && !sameRepoKey(current.repoKey, key)) {
+          return refuse('repo_mismatch', `This workspace's other bots work on ${current.repoKey} (${current.repoPath}); the repository given is ${key}. A workspace works on one repository.`);
+        }
+      }
+      // A repository a bot of the workspace already held is not newly chosen:
+      // the bots without one were left so by the owner and stay so.
+      const heldBefore = workspaceBotsRepo(l.store, l.store.get(botId)?.workspaceId) !== null;
+      const r = l.store.update(botId, patch);
+      if (!r.ok) return refuse(r.code, r.message);
+      l.runtime.profileChanged(botId);
+      if (setsRepo && r.bot.repo) recordWorkspaceRepo(l.store, r.bot.workspaceId, r.bot.repo, { profileChanged: (id) => l.runtime.profileChanged(id) }, { fill: !heldBefore });
+      if ('job' in patch && r.bot.job) setJobPorts.jobGiven?.(botId);
+      return { ok: true, bot: pipeProfile(r.bot), status: l.runtime.status(botId) };
+    };
+    return setsRepo ? withWorkspaceRepoLock(l.store.get(botId)?.workspaceId, apply) : apply();
   });
 
   // Removing a bot stops its work first, as Stop does for one bot
@@ -464,8 +506,8 @@ export function registerBotRpcHandlers(
   });
 }
 
-/** A task's ledger row as a wake reports it. */
-function taskSummaries(taskIds: readonly string[]): WakeTaskSummary[] {
+/** A task's ledger row as a wake reports it (exported for tests). */
+export function taskSummaries(taskIds: readonly string[]): WakeTaskSummary[] {
   const ledger = getTaskLedger();
   const out: WakeTaskSummary[] = [];
   for (const id of taskIds) {
@@ -486,6 +528,42 @@ function taskSummaries(taskIds: readonly string[]): WakeTaskSummary[] {
           }
         : {}),
     });
+  }
+  return out;
+}
+
+/**
+ * The files of the woken bot's done tasks it has not settled yet, by task
+ * id, for its wake (exported for tests). Only a `task.done` fact counts, of
+ * a task the bot started whose row still reads done (review_requested or
+ * completed) and was last written by its worker or the system, not by the
+ * bot settling it. The files are read from the task's own folder, as its
+ * mission names it (reportFiles).
+ */
+export async function wakeTaskFiles(
+  botId: string,
+  factIds: readonly string[],
+  folders: ReturnType<typeof getTaskFolderPorts> = getTaskFolderPorts(),
+): Promise<Map<string, WakeTaskFiles>> {
+  const out = new Map<string, WakeTaskFiles>();
+  if (!folders) return out;
+  const ledger = getTaskLedger();
+  const rows: LedgerEntry[] = [];
+  for (const id of factIds) {
+    const taskId = id.startsWith('task.done:') ? taskIdOfFactId(id) : null;
+    const row = taskId ? ledger.get(taskId) : undefined;
+    if (!row || row.dispatch?.origin.kind !== 'bot' || row.dispatch.origin.botId !== botId) continue;
+    if ((row.status !== 'review_requested' && row.status !== 'completed') || row.updatedBy?.kind === 'brain') continue;
+    if (!rows.includes(row)) rows.push(row);
+  }
+  const byOwner = new Map<string, Map<string, TaskMission> | null>();
+  for (const row of rows) {
+    if (!byOwner.has(row.ownerWorkspaceId)) byOwner.set(row.ownerWorkspaceId, await folders.missions(row.ownerWorkspaceId).catch(() => null));
+    const mission = byOwner.get(row.ownerWorkspaceId)?.get(row.id);
+    if (!mission || mission.detached === true || !taskFolderKind(mission.folder, mission.branch, botId, folders.roots)) continue;
+    const { files, leftOut } = reportFiles(row, mission.folder, ROOM_FILE_LIMITS.PER_CARD);
+    if (files.length === 0) continue;
+    out.set(row.id, { files, ...(leftOut > 0 ? { filesLeftOut: leftOut } : {}), ...(row.dispatch?.threadId ? { threadId: row.dispatch.threadId } : {}) });
   }
   return out;
 }
@@ -522,6 +600,9 @@ export function botRuntimeModule(router: FactoryRouter, deps: FactoryHostDeps, o
       setGuestWorkspaceStore(guestWorkspaces);
       const store = new BotStore(botsFilePath(wmuxDir), { defaultEngine: () => runnableDefaultEngine(settings.get().defaultEngine) });
       store.load();
+      const workspaceRepos = new WorkspaceRepoStore({ file: workspaceReposPath(wmuxDir) });
+      workspaceRepos.load();
+      setWorkspaceRepoStore(workspaceRepos);
       const sessions = new BotSessionStore(botSessionsPath(wmuxDir));
       sessions.load();
       const receipts = new BotFanoutReceipts(botFanoutReceiptsPath(wmuxDir));
@@ -579,6 +660,7 @@ export function botRuntimeModule(router: FactoryRouter, deps: FactoryHostDeps, o
         engines: opts.engines ?? createDefaultBotEngineFactory(),
         wmuxDir,
         resolveTasks: taskSummaries,
+        resolveTaskFiles: (botId, factIds) => wakeTaskFiles(botId, factIds),
         onStatus: (status: BotStatus) => send({ type: 'bot.status', status }),
         workerLoad: (botId) => {
           const open = openBotWorkers(botId);
@@ -595,6 +677,7 @@ export function botRuntimeModule(router: FactoryRouter, deps: FactoryHostDeps, o
       });
       setFactorySettingsStore(settings);
       setBotStore(store);
+      noteBotSetChanged();
       setWakeQueue(queue);
       setBotRuntime(runtime);
       setBotFanoutReceipts(receipts);
@@ -605,6 +688,8 @@ export function botRuntimeModule(router: FactoryRouter, deps: FactoryHostDeps, o
           if (!store.get(botId)?.enabled) held.dropFor(botId);
         }
         send({ type: 'bots-changed' });
+        // The phone's copy of what bots are waiting on lists enabled bots only.
+        noteBotSetChanged();
       });
       // Every settings write reschedules: switching the factory off, from any
       // caller, cancels the running turns at once. The window is told too:
@@ -670,9 +755,12 @@ export function botRuntimeModule(router: FactoryRouter, deps: FactoryHostDeps, o
       setHeldFanouts(null);
       setWakeQueue(null);
       setBotStore(null);
+      const workspaceRepos = getWorkspaceRepoStore();
+      setWorkspaceRepoStore(null);
       setGuestWorkspaceStore(null);
       setFactorySettingsStore(null);
       await l?.store.flush().catch(() => undefined);
+      await workspaceRepos?.flush().catch(() => undefined);
     },
   };
 }

@@ -22,6 +22,7 @@ import { createLeadingEdgeThrottle, VETO_TRACE_THROTTLE_MS } from '../pipe/handl
 import { settleConfirmedInterrupt, settleHookTurnToIdle } from '../notification/turnSettle';
 import { InterruptKeystrokeDetector, isEscapeChunk } from '../../shared/hooks/interruptKeystroke';
 import { kittyChunkAsLegacy } from '../../shared/kittyKeyEvents';
+import { stripPassiveInput } from '../../shared/terminal/passiveInput';
 import {
   recentlyResized,
   RESIZE_REDRAW_GUARD_MS,
@@ -298,12 +299,15 @@ export class PTYBridge {
    * recentlyEscaped and the onInterrupted handlers).
    */
   noteInterruptInput(ptyId: string, data: string): void {
+    // A focus report, pure mouse motion or the terminal's reply to a query is
+    // not someone typing (DaemonPTYBridge draws the same line).
+    const typed = stripPassiveInput(data).length > 0;
     if (data.length > 0) {
       this.flushPending(ptyId);
-      this.agentDetectors.get(ptyId)?.invalidateApprovalScreen();
+      if (typed) this.agentDetectors.get(ptyId)?.invalidateApprovalScreen();
     }
     try {
-      markUserInput(ptyId);
+      if (typed) markUserInput(ptyId);
       if (isEscapeChunk(kittyChunkAsLegacy(data))) markEscapeKey(ptyId);
       if (!this.interruptKeystrokes.observe(ptyId, data)) return;
       settleHookTurnToIdle(ptyId, this.getHookRouter?.() ?? null, this.getWindow());
@@ -393,6 +397,20 @@ export class PTYBridge {
         win.webContents.send(IPC.PTY_DATA, ptyId, joined);
       }
     }
+  }
+
+  /**
+   * A grid-only question the flushed output finished (AgentDetector
+   * approvalReady), read only once the renderer has been sent that output: it
+   * applies the chunk before it answers the viewport read. Taken on the batch
+   * timer only: an input path's flush is followed by an invalidation, which
+   * drops the request, and with no window it waits for the next flush.
+   */
+  private recheckFinishedQuestion(ptyId: string): void {
+    const win = this.getWindow();
+    const detector = this.agentDetectors.get(ptyId);
+    if (!win || win.isDestroyed() || !detector?.takeApprovalRecheckRequest()) return;
+    this.recheckQuietApproval(ptyId, detector);
   }
 
   setupDataForwarding(ptyId: string): void {
@@ -959,6 +977,7 @@ export class PTYBridge {
           this.pendingTimers.delete(ptyId);
           try {
             this.flushPending(ptyId);
+            this.recheckFinishedQuestion(ptyId);
           } catch (err) {
             console.error('[PTYBridge] Error processing data:', err);
             // Best-effort: drain any remaining bytes raw to the renderer so

@@ -566,7 +566,15 @@ export type RpcMethod =
   // pushes the whole table on every change; the daemon holds the last one.
   | 'daemon.phone.register'
   | 'daemon.phone.complete'
+  // Main → daemon: "Keep the computer awake" mode and whether the blocker is held.
+  | 'daemon.phone.keepAwake'
   | 'daemon.workspaceFacts.set'
+  // Main → daemon: the bot approval requests waiting on the owner, so the
+  // daemon can push them to the phone (shared/botApprovalPush.ts).
+  | 'daemon.botApprovals.set'
+  // Main → daemon: the bot prompts (question / login / secret cards) waiting
+  // on the owner (shared/botPromptPush.ts).
+  | 'daemon.botPrompts.set'
   // Main → daemon: which daemon session is the Moa (HQ brain) pane, or null.
   // The phone's access to that one brain pane stands only while it does.
   | 'daemon.moa.set'
@@ -922,7 +930,10 @@ export const ALL_RPC_METHODS = [
   'daemon.setResumeBinding',
   'daemon.phone.register',
   'daemon.phone.complete',
+  'daemon.phone.keepAwake',
   'daemon.workspaceFacts.set',
+  'daemon.botApprovals.set',
+  'daemon.botPrompts.set',
   'daemon.moa.set',
   'daemon.inbox.poll',
   'lanlink.status',
@@ -1162,9 +1173,16 @@ export interface DaemonEvent {
     | 'input.typed'
     | 'session.output'
     | 'phone.request'
+    // Daemon → the registered desktop only: whether a paired phone is attached
+    // (sent on each change and right after daemon.phone.register).
+    //   phone.presence → { attached: boolean }
+    | 'phone.presence'
     | 'agent.event'
     // Daemon-owned agent turn, excluding boot paints and bare shell submits.
     | 'agent.turn'
+    // The pane's Claude turn seems stuck (StallWatch). `data` is
+    // `{ stalledSince: number | null }`; null clears it.
+    | 'agent.stall'
     | 'agent.critical'
     // The agent printed its own "turn interrupted" row (Claude Code fires no
     // Stop hook for an interrupted turn). `data` is `{ agent: string }`.
@@ -1229,6 +1247,9 @@ export interface DaemonEvent {
     // LANLINK_SENTINEL_SESSION_ID — no PTY session backs a remote message.
     //   lanlink.remote.received → { seq: number }
     | 'lanlink.remote.received'
+    // LanLink listener state may have changed (a reconcile finished, a network
+    // re-read closed it). A nudge only: re-read `lanlink.status`. `data` is {}.
+    | 'lanlink.status.changed'
     // Cross-host A2A link nudges (`A2aRemoteLinkEvent`, `sessionId` ''): a
     // proposal arrived or a link changed state. Re-read the link list.
     | 'a2a.remote.link.proposed'
@@ -1643,6 +1664,16 @@ export interface A2aRemoteStatus {
   fingerprint256: string | null;
   /** Why the listener is not running although enabled (bind or identity failure). */
   lastError: string | null;
+  /**
+   * The failed bind's error code (EADDRINUSE, EACCES, EADDRNOTAVAIL…) and the
+   * port it tried, so the UI can say what holds the port. Null for an
+   * identity or TLS failure. Absent from an older daemon.
+   */
+  lastErrorCode?: string | null;
+  lastErrorPort?: number | null;
+  /** Epoch ms of the last connection from another machine since the listener started. Absent from an older daemon. */
+  inboundSeenAt?: number | null;
+  inboundCount?: number;
 }
 
 /** `a2a.remote.pair.begin` */

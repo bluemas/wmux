@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import { useT } from '../../hooks/useT';
-import type { ChatV2RunMode } from '../../../shared/chatv2/ipc';
+import { CHATV2_AGENT_CAPS, type ChatV2Agent, type ChatV2RunMode } from '../../../shared/chatv2/ipc';
 import { Composer, setDraft, shortDir } from './Composer';
 import { FindBar } from './FindBar';
 import { groupToolRows, sessionRows, type RowCache, type TranscriptRow } from './rows';
@@ -10,6 +10,8 @@ import { useChatV2 } from './useChatV2';
 import { getChatV2Bridge } from './bridge';
 import { ChatKindBadge } from '../Chat/ChatKindBadge';
 import { ContinueInChat, usePaneMove } from './ContinueInChat';
+import { useStore } from '../../stores';
+import { focusPaneByPtyId } from '../../hooks/useNotificationListener';
 
 const NEAR_BOTTOM_PX = 48;
 
@@ -77,6 +79,13 @@ export default function ChatV2View({ paneId, active, onTerminal, cwd }: {
   const [findId, setFindId] = useState<string | null>(null);
   const [newModel, setNewModel] = useState('');
   const [newMode, setNewMode] = useState<ChatV2RunMode>('default');
+  const [newAgent, setNewAgent] = useState<ChatV2Agent>('claude');
+  // An agent without the Claude models or a bypass mode (Codex) starts on its own default and always asks.
+  const pickAgent = (agent: ChatV2Agent) => {
+    setNewAgent(agent);
+    if (!CHATV2_AGENT_CAPS[agent].claudeModels) setNewModel('');
+    if (!CHATV2_AGENT_CAPS[agent].bypass) setNewMode('default');
+  };
   const [handingOff, setHandingOff] = useState(false);
   const moveError = usePaneMove(paneId).error;
   // Bumped to remount the composer when a draft moved under it.
@@ -155,7 +164,7 @@ export default function ChatV2View({ paneId, active, onTerminal, cwd }: {
         <div className="wmux-chatv2-viewport">
           <div className="wmux-chatv2-column wmux-chatv2-empty">
             <strong>{S.newChat}</strong>
-            <p>{S.newChatHint}</p>
+            <p>{S.newChatHint(S.agentName[newAgent])}</p>
             <RunsIn paneId={paneId} hint={cwd} />
           </div>
         </div>
@@ -164,14 +173,14 @@ export default function ChatV2View({ paneId, active, onTerminal, cwd }: {
           <Composer
             paneId={paneId}
             draftKey={`${paneId}:new`}
-            placeholder={S.placeholderNew}
+            placeholder={S.placeholderNew(S.agentName[newAgent])}
             disabled={false}
             running={false}
             canStop={false}
             canAttach={false}
-            chips={{ model: newModel, effort: '', mode: newMode, editable: true, onModel: setNewModel, onMode: setNewMode }}
+            chips={{ agent: newAgent, model: newModel, effort: '', mode: newMode, editable: true, onModel: setNewModel, onMode: setNewMode, onAgent: pickAgent }}
             onSend={async (text, attachments) => {
-              if (!(await controller.create({ agent: 'claude', mode: newMode, model: newModel }))) return false;
+              if (!(await controller.create({ agent: newAgent, mode: newMode, model: newModel }))) return false;
               setDraft(`${paneId}:new`, '');
               const chatSessionId = controller.current.view?.binding.chatSessionId;
               if (await controller.send(text, attachments)) return true;
@@ -188,6 +197,9 @@ export default function ChatV2View({ paneId, active, onTerminal, cwd }: {
 
   const binding = view.binding;
   const handedOff = binding.status === 'handed-off';
+  // Handed off because a terminal agent in another pane took the conversation.
+  const continuedIn = handedOff ? binding.continuedIn : undefined;
+  const continuedInPane = continuedIn?.paneId;
   const running = !!view.session.busy || binding.status === 'running' || binding.status === 'needs-input';
   const canHandOff = binding.capabilities.toTerminal && !handedOff && !running && binding.status !== 'starting';
   const continueInTerminal = async () => {
@@ -221,8 +233,12 @@ export default function ChatV2View({ paneId, active, onTerminal, cwd }: {
         {error}
         {handedOff ? (
           <div className="wmux-chatv2-notice wmux-chatv2-handed-off">
-            <span>{S.handedOff}</span>
-            <button type="button" className="wmux-chatv2-link" onClick={onTerminal}>{t('chat.openTerminal')}</button>
+            <span>{continuedIn ? t(continuedInPane ? 'chat.continuedInPane' : 'chat.continuedInTerminal') : S.handedOff}</span>
+            {continuedInPane ? (
+              <button type="button" className="wmux-chatv2-link" onClick={() => focusPaneByPtyId(() => useStore.getState(), continuedInPane)}>{t('chat.showPane')}</button>
+            ) : !continuedIn && (
+              <button type="button" className="wmux-chatv2-link" onClick={onTerminal}>{t('chat.openTerminal')}</button>
+            )}
             {/* Shown only while no agent runs in the pane (viewState); the daemon checks again. */}
             <ContinueInChat paneId={paneId} tombstone className="wmux-chatv2-link" />
             <button type="button" className="wmux-chatv2-btn" title={S.startNewChatHint} onClick={() => void controller.close()}>{S.startNewChat}</button>
@@ -233,11 +249,11 @@ export default function ChatV2View({ paneId, active, onTerminal, cwd }: {
             paneId={paneId}
             canAttach={binding.capabilities.images}
             draftKey={`${paneId}:${binding.chatSessionId}`}
-            placeholder={S.placeholder}
+            placeholder={S.placeholder(S.agentName[binding.agent])}
             disabled={!binding.capabilities.send || binding.status === 'failed'}
             running={running}
             canStop={binding.capabilities.interrupt}
-            chips={{ model: binding.model, effort: view.session.modelSettings.effort ?? '', mode: binding.mode, cwd: view.session.cwd, editable: false }}
+            chips={{ agent: binding.agent, model: binding.model, effort: view.session.modelSettings.effort ?? '', mode: binding.mode, cwd: view.session.cwd, editable: false }}
             onSend={(text, attachments) => controller.send(text, attachments)}
             onStop={() => void controller.interrupt()}
             extra={canHandOff ? (

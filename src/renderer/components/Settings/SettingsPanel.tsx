@@ -36,6 +36,7 @@ import type { ChromePreset } from '../../../shared/chromePresets';
 import { ROLE_PRESET_SPECS, applyRolePreset, hasRolePreset, rolePresetApplied, rolePresetSkipsPermissions } from '../../../shared/rolePresets';
 import { NOTIFICATION_CATEGORIES } from '../../../shared/types';
 import { ORCH_ROLES, applyRoleBinding, launcherSupportsModelFlag, type RoleBinding } from '../../../shared/orchestratorRole';
+import { customAgentLaunchLine, customAgentStem, findCustomAgent, type CustomAgent } from '../../../shared/customAgents';
 import {
   DEFAULT_FANOUT_WORKER_PERMISSION_MODE,
   FANOUT_WORKER_PERMISSION_MODES,
@@ -78,7 +79,9 @@ import {
 import { freshContextGrammarFor, launchGrammarFor } from '../../../shared/agentLaunchOptions';
 import { ModelCombobox } from './ModelCombobox';
 import { MULTIVIEW_ARRANGEMENTS } from '../../utils/multiviewGrid';
-import type { NicInfo, LanLinkNic, LanLinkStatus } from '../../../shared/lanlink';
+import type { NicInfo, LanLinkNic, LanLinkStatus, LanLinkStopReason } from '../../../shared/lanlink';
+import { lanLinkStopReasonKey } from '../Remote/lanLinkStopReason';
+import { FirewallNoticeView, ListenProblemView, useFirewall, useListenProblem } from '../Remote/FirewallNotice';
 import type { FirstRunCheckResult } from '../../../shared/firstRun';
 import { FIRST_RUN_REOPEN_EVENT } from '../../../shared/firstRun';
 import { ClaudeIntegrationSection } from './ClaudeIntegrationSection';
@@ -87,6 +90,7 @@ import { McpStatusSection } from './McpStatusSection';
 import { AccountsSection } from './AccountsSection';
 import { AgyAccountsSection } from './AgyAccountsSection';
 import { FanoutPresetsSection } from './FanoutPresetsSection';
+import { CustomAgentsSection } from './CustomAgentsSection';
 import { A2aRemoteSection } from './A2aRemoteSection';
 import { RemoteSpawnSection } from './RemoteSpawnSection';
 import { terminalFontFamilyCss } from '../../utils/terminalFont';
@@ -97,7 +101,7 @@ import { QuickLaunchSection } from './QuickLaunchSection';
 import PairedDevicesModal from '../StatusBar/PairedDevicesModal';
 import { FOCUS_RING } from '../focusRing';
 import { SETTINGS_CATALOG, SETTINGS_NAV_GROUPS, catalogEntryOnPlatform, resolveSettingsTab, type SettingsTabId } from '../../settings/catalog';
-import { windowGlassSupported, type WindowGlassLevel } from '../../utils/windowGlass';
+import { themeBlocksWindowGlass, windowGlassSupported, type WindowGlassLevel } from '../../utils/windowGlass';
 import { matchSettings, tabHitCount } from '../../settings/searchSettings';
 import { CursorShapePicker } from './CursorShapePicker';
 import { SettingsSearchResults } from './SettingsSearchResults';
@@ -686,11 +690,11 @@ const ROLE_BINDING_FIELD_CLASS = 'settings-input font-mono';
 /** The one honest thing to say about a row's current state, or none when the
  *  row does exactly what it appears to. Keeps a mis-set binding from looking
  *  bound while enforcing nothing. */
-export function roleBindingHint(b: RoleBinding):
+export function roleBindingHint(b: RoleBinding, customAgents?: readonly CustomAgent[]):
   | { key: string; params?: Record<string, string> }
   | undefined {
   if (b.model && !b.agent) return { key: 'settings.roleBindingHintNoAgent' };
-  if (b.model && b.agent && !launcherSupportsModelFlag(b.agent)) {
+  if (b.model && b.agent && !launcherSupportsModelFlag(b.agent) && !findCustomAgent(b.agent, customAgents)?.modelFlag) {
     return { key: 'settings.roleBindingHintNoGrammar', params: { agent: b.agent } };
   }
   // #1680 — the checkbox is only offered for an agent with a verified command,
@@ -767,6 +771,8 @@ export interface RoleBindingsViewProps {
   onRefreshModels?: (agent: string) => void;
   /** Ask before a preset that turns on skip permissions (default window.confirm). */
   confirm?: (message: string) => boolean;
+  /** The operator's custom agents, offered after the registry agents. */
+  customAgents?: readonly CustomAgent[];
 }
 
 /** Models to offer for an agent: the discovered list, or claude's static one. */
@@ -796,7 +802,7 @@ export function effortChoicesFor(b: RoleBinding, models: readonly CatalogModel[]
 
 /** Presentational half — the container below owns the store. Split so the view
  *  is renderable (and assertable) without a live store, matching NotificationsView. */
-export function RoleBindingsView({ bindings, onChange, t, catalog, onRefreshModels, confirm }: RoleBindingsViewProps) {
+export function RoleBindingsView({ bindings, onChange, t, catalog, onRefreshModels, confirm, customAgents }: RoleBindingsViewProps) {
   const update = (role: string, patch: Partial<RoleBinding>) => {
     onChange(role, { ...(bindings[role] ?? {}), ...patch });
   };
@@ -805,7 +811,8 @@ export function RoleBindingsView({ bindings, onChange, t, catalog, onRefreshMode
     <SettingsSection id="roles" title={t('settings.roleBindings')} description={t('settings.roleBindingsDesc')} overflowVisible>
       {ORCH_ROLES.map((role) => {
         const b = bindings[role] ?? {};
-        const hint = roleBindingHint(b);
+        const hint = roleBindingHint(b, customAgents);
+        const custom = b.agent ? findCustomAgent(b.agent, customAgents) : undefined;
         const models = modelsFor(b.agent, catalog);
         const efforts = effortChoicesFor(b, models);
         const grammar = launchGrammarFor(b.agent);
@@ -813,7 +820,13 @@ export function RoleBindingsView({ bindings, onChange, t, catalog, onRefreshMode
         const effortValue =
           b.agent === 'agy' ? (b.model ? agyEffortOf(b.model) ?? '' : '') : b.effort ?? '';
         // What a bare launch of the bound agent becomes (machine evidence, mono).
-        const preview = b.agent ? applyRoleBinding(b.agent, b, { spawnedProcess: true }).command : '';
+        // A custom agent launches as the operator typed it.
+        const preview = b.agent
+          ? applyRoleBinding(custom ? customAgentLaunchLine(custom) : b.agent, b, {
+            spawnedProcess: true,
+            ...(custom ? { customAgents } : {}),
+          }).command
+          : '';
         return (
           <div key={role} className="settings-row" data-role-binding-row={role}>
             <div className="flex items-center gap-2">
@@ -827,6 +840,9 @@ export function RoleBindingsView({ bindings, onChange, t, catalog, onRefreshMode
                 <option value="">{t('settings.roleBindingAgentPlaceholder')}</option>
                 {ROLE_BINDING_AGENTS.map((a) => (
                   <option key={a} value={a}>{a}</option>
+                ))}
+                {customAgents?.map((a) => (
+                  <option key={customAgentStem(a)} value={customAgentStem(a)}>{a.name}</option>
                 ))}
               </Select>
               {/* Discovered models (ModelCatalog); free text stays allowed. */}
@@ -895,7 +911,7 @@ export function RoleBindingsView({ bindings, onChange, t, catalog, onRefreshMode
                     {t('settings.roleBindingFreshContext')}
                   </label>
                 )}
-                {onRefreshModels && b.agent !== 'claude' && (
+                {onRefreshModels && b.agent !== 'claude' && !custom && (
                   <UiButton
                     variant="ghost"
                     size="sm"
@@ -978,6 +994,7 @@ function RoleBindingEditor() {
   const t = useT();
   const bindings = useStore((s) => s.orchestratorRoleBindings);
   const setBinding = useStore((s) => s.setOrchestratorRoleBinding);
+  const customAgents = useStore((s) => s.customAgents);
   const [catalog, setCatalog] = useState<Record<string, ModelCatalogResult>>({});
   const load = useCallback((agent: string, refresh = false) => {
     window.electronAPI.agentModels
@@ -1001,6 +1018,7 @@ function RoleBindingEditor() {
       t={t}
       catalog={catalog}
       onRefreshModels={(a) => load(a, true)}
+      customAgents={customAgents}
     />
   );
 }
@@ -1091,6 +1109,14 @@ export interface LanLinkViewProps {
   selectedValue: string;
   onChangeNic: (value: string) => void;
   busy: boolean;
+  /** Why LanLink is on but not listening; null while it listens, is off, or has no NIC. */
+  stopReason: LanLinkStopReason | null;
+  /** Windows: LanLink is gated on the network category. macOS/Linux have none. */
+  hasNetworkCategory: boolean;
+  /** A failed bind explained (who holds the port, Use port N), in place of the listen-failed line. */
+  listenNotice?: ReactNode;
+  /** The firewall check of the open listener. */
+  firewallNotice?: ReactNode;
   t: (key: string) => string;
 }
 
@@ -1105,6 +1131,10 @@ export function LanLinkView({
   selectedValue,
   onChangeNic,
   busy,
+  stopReason,
+  hasNetworkCategory,
+  listenNotice,
+  firewallNotice,
   t,
 }: LanLinkViewProps) {
   return (
@@ -1120,8 +1150,15 @@ export function LanLinkView({
           label={t('settings.lanlinkNic')}
         />
       </SettingRow>
+      {enabled && stopReason && (stopReason !== 'listen-failed' || !listenNotice) && (
+        <SettingNote tone="warning" role="status" data-testid="lanlink-stop-reason">
+          {t(lanLinkStopReasonKey(stopReason))}
+        </SettingNote>
+      )}
+      {enabled && stopReason === 'listen-failed' && listenNotice}
+      {enabled && !stopReason && firewallNotice}
       <SettingNote data-testid="lanlink-warning">
-        {t('settings.lanlinkWarning')}
+        {t(hasNetworkCategory ? 'settings.lanlinkWarning' : 'settings.lanlinkWarningNoCategory')}
       </SettingNote>
       {busy && (
         <SettingNote>{t('settings.lanlinkApplying')}</SettingNote>
@@ -1142,7 +1179,13 @@ function LanLinkSection() {
 
   // Lazily access the API so the component is safe where preload hasn't exposed it.
   const lanlinkApi = (
-    window.electronAPI as unknown as { lanlink?: { status: () => Promise<LanLinkStatus>; configure: (p: { enabled?: boolean; nic?: LanLinkNic | null }) => Promise<LanLinkStatus> } }
+    window.electronAPI as unknown as {
+      lanlink?: {
+        status: () => Promise<LanLinkStatus>;
+        configure: (p: { enabled?: boolean; nic?: LanLinkNic | null; port?: number }) => Promise<LanLinkStatus>;
+        onStatusChanged?: (cb: () => void) => () => void;
+      };
+    }
   ).lanlink;
 
   const refresh = useCallback(async () => {
@@ -1175,11 +1218,13 @@ function LanLinkSection() {
       window.electronAPI as unknown as { daemon?: { onConnected?: (cb: () => void) => () => void } }
     ).daemon;
     const off = daemonApi?.onConnected?.(() => void refresh());
-    return () => { off?.(); };
-  }, [refresh]);
+    // The daemon finished deciding (listening, or why not): re-read.
+    const offStatus = lanlinkApi?.onStatusChanged?.(() => void refresh());
+    return () => { off?.(); offStatus?.(); };
+  }, [refresh, lanlinkApi]);
 
   const apply = useCallback(
-    async (patch: { enabled?: boolean; nic?: LanLinkNic | null }) => {
+    async (patch: { enabled?: boolean; nic?: LanLinkNic | null; port?: number }) => {
       if (!lanlinkApi?.configure) return;
       setBusy(true);
       try {
@@ -1191,6 +1236,15 @@ function LanLinkSection() {
     },
     [ipcInvoke, lanlinkApi],
   );
+
+  // The listener's firewall, checked when it opens or moves (never on a poll),
+  // and a failed bind explained once per distinct failure.
+  const firewall = useFirewall('lanlink', {
+    enabled: status?.listening === true,
+    checkKey: `${status?.effectivePort ?? ''}:${status?.nic?.mac ?? ''}`,
+  });
+  const failed = status?.enabled && status.stopReason === 'listen-failed' && status.listenErrorCode ? status.listenErrorCode : null;
+  const problem = useListenProblem('lanlink', failed ? `${failed}:${status?.effectivePort ?? ''}` : null);
 
   // Local mode / daemon unreachable: the tab is always listed, so render an
   // explanatory placeholder rather than a blank pane. The on-mount probe +
@@ -1226,6 +1280,21 @@ function LanLinkSection() {
         void apply({ nic: picked?.nic ?? null });
       }}
       busy={busy}
+      stopReason={status.stopReason}
+      hasNetworkCategory={window.electronAPI?.platform === 'win32'}
+      listenNotice={failed ? (
+        <ListenProblemView
+          report={problem}
+          fallback={t(lanLinkStopReasonKey('listen-failed'))}
+          onUsePort={(port) => void apply({ port })}
+          busy={busy}
+          repair={false}
+          primary={false}
+          listener="lanlink"
+          t={t}
+        />
+      ) : undefined}
+      firewallNotice={<FirewallNoticeView c={firewall} listener="lanlink" primary={false} t={t} />}
       t={t}
     />
   );
@@ -2173,6 +2242,9 @@ function TabRoles() {
 
       {/* Fan-out presets */}
       <FanoutPresetsSection />
+
+      {/* Custom agents (last: they exist to be picked by the roles and rows above) */}
+      <CustomAgentsSection />
     </div>
   );
 }
@@ -3401,23 +3473,31 @@ function FontFamilyField() {
 
 /**
  * The window glass row. Without a material (Windows before 11 22H2) it reads
- * Off with every level disabled and says why.
+ * Off with every level disabled and says why. When the theme keeps the
+ * window opaque on Windows (`themeBlocked`), the levels stay enabled on the
+ * user's saved level, which applies again on a theme that can keep glass,
+ * and the description says why nothing shows.
  */
 export function WindowGlassSetting({
   supported,
+  themeBlocked = false,
   value,
   onChange,
 }: {
   supported: boolean;
+  themeBlocked?: boolean;
   value: WindowGlassLevel;
   onChange: (level: WindowGlassLevel) => void;
 }) {
   const t = useT();
+  const description = !supported
+    ? t('settings.windowGlassUnsupported')
+    : themeBlocked ? t('settings.windowGlassThemeOpaque') : t('settings.windowGlassDesc');
   return (
     <SettingRow
       id="windowglass"
       label={t('settings.windowGlass')}
-      description={supported ? t('settings.windowGlassDesc') : t('settings.windowGlassUnsupported')}
+      description={description}
     >
       <SegmentedControl
         value={supported ? value : 'off'}
@@ -3491,6 +3571,8 @@ function TabAppearance() {
   const windowGlass = useStore((s) => s.windowGlass);
   const setWindowGlass = useStore((s) => s.setWindowGlass);
   const glassSupported = windowGlassSupported();
+  const windowGlassEffective = useStore((s) => s.windowGlassEffective);
+  const glassThemeBlocked = themeBlocksWindowGlass(window.electronAPI?.platform, windowGlass, windowGlassEffective);
   const setAttentionBlinkFinished = useStore((s) => s.setAttentionBlinkFinished);
   const workspaceSettleIdleDays = useStore((s) => s.workspaceSettle.idleDays);
   const fleetLayout = useStore((s) => s.fleetLayout);
@@ -3613,7 +3695,7 @@ function TabAppearance() {
             reason, so nobody picks a level that changes nothing. Linux has
             no material and no row. */}
         {(window.electronAPI?.platform === 'darwin' || window.electronAPI?.platform === 'win32') && (
-          <WindowGlassSetting supported={glassSupported} value={windowGlass} onChange={setWindowGlass} />
+          <WindowGlassSetting supported={glassSupported} themeBlocked={glassThemeBlocked} value={windowGlass} onChange={setWindowGlass} />
         )}
         <SettingRow id="chrome" label={t('settings.chromePreset')} description={t('settings.chromePresetDesc')}>
           <ChromePresetActionsView onApply={applyChromePresetWithFeedback} />

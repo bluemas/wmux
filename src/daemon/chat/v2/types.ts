@@ -61,6 +61,12 @@ export interface ChatV2DriverStart {
    * the marker the orphan sweep matches.
    */
   providerSession: { id: string; mode: 'new' | 'resume' };
+  /**
+   * The chat record's id (`CHATV2_PROVIDER_SESSION_ID` shape). A driver whose
+   * agent picks its own conversation id (Codex) puts this in argv as the
+   * orphan sweep's marker instead, and reports it as `marker`.
+   */
+  chatSessionId?: string;
 }
 
 /** A user turn as the driver sends it. Attachments are staged paths the host already checked. */
@@ -72,8 +78,9 @@ export interface ChatV2DriverTurn {
 /**
  * A decision the agent is blocked on. The host records it with
  * `ApprovalRegistry.noteNativeDecision({ sessionId: paneId, agent,
- * native: { adapter: agent, requestId, threadId: chatSessionId, relayId:
- * epoch }, form, question, toolName, summary })` before it stamps the
+ * native: { adapter: agent, via: 'chat-v2', requestId: <driver tag>.<requestId>,
+ * threadId: chatSessionId, relayId: epoch, digest: revision }, form, question,
+ * toolName, summary })` before it stamps the
  * matching transcript event, using the same form shapes as the OpenCode
  * adapter:
  *   permission → `{ v: 1, kind: 'permission', actions: [{ id: 'approve',
@@ -86,6 +93,17 @@ export interface ChatV2DriverTurn {
  * and stamps `approval.resolved` / `question.resolved` with `cancelled`.
  * The driver emits `approval.requested` (with the gated tool's `callId`) or
  * `question.asked` with the same `requestId`.
+ *
+ * A permission decision raised again with the same `requestId` means what the
+ * agent asks has changed (a diff that arrived or moved after the card): the
+ * host records it again under the same native key, so the card is replaced
+ * and an answer to the old one is refused.
+ *
+ * A permission decision that carries a `revision` is answered with it: the
+ * host keeps the revision of the card it shows and passes it back as
+ * `NativeDecisionReply.revision`. The driver refuses (`changed`) an approve
+ * whose revision is not the latest raised, so an approve in flight never
+ * lands on a changed request.
  */
 export type ChatV2DriverDecision =
   | {
@@ -96,6 +114,10 @@ export type ChatV2DriverDecision =
       toolName: string;
       /** One line for the card and the phone (command, path, …). */
       summary: string;
+      /** The Deny button's label when denying does more than skip the call (Codex `cancel` also stops the turn). */
+      denyLabel?: string;
+      /** This card's revision, to be passed back with its answer (see above). */
+      revision?: string;
     }
   | {
       kind: 'questions';
@@ -117,6 +139,8 @@ export interface ChatV2Driver {
   readonly agent: HarnessId;
   /** The agent process pid once spawned. */
   readonly pid: number | undefined;
+  /** What the orphan sweep matches in the agent's command line, when it is not the provider session id. */
+  readonly marker?: string;
   /** Spawn and initialize. Rejects when the CLI is missing or fails its startup probe. */
   start(spec: ChatV2DriverStart, sink: ChatV2DriverSink): Promise<void>;
   /** Hand a user turn to the agent. Resolves once written, not when the turn ends. */
@@ -156,6 +180,12 @@ export interface ChatV2StoredRecord {
   model: string;
   /** `active` or the `handed-off` tombstone. */
   state: 'active' | 'handed-off';
+  /**
+   * Set on a tombstone the chat became because a terminal agent in another
+   * pane took the conversation (`terminalHolds`), with that pane's id when the
+   * binding came from the pane itself.
+   */
+  continuedIn?: { paneId?: string };
   providerSessionId: string;
   /**
    * The conversation already exists in the agent (it came from the terminal),
@@ -257,6 +287,14 @@ export interface ChatV2HostDeps {
     isDirectory: (dir: string) => boolean;
     realpath: (p: string) => string;
   };
+  /**
+   * The conversations terminal agents hold right now, checked with
+   * `terminalHolds` once the records are loaded: a binding learned before
+   * then found no chat to yield.
+   */
+  terminalBindings?: () => Array<{ paneId: string; agent: string; sessionId: string; paneExact: boolean }>;
+  /** Panes whose terminal Codex holds thread `threadId` on the shared app-server. */
+  codexThreadOwners?: (threadId: string) => string[];
   /** fromTerminal's waits (transcript quiet, pane free). Tests shorten them. */
   moveTiming?: { quietMs?: number; freeWaitMs?: number };
 }
@@ -264,7 +302,7 @@ export interface ChatV2HostDeps {
 export interface ChatV2Host {
   /** Run one first-party RPC. Params are already validated by `parseChatV2Params`. */
   call<M extends ChatV2Method>(method: M, params: ChatV2ParamsByMethod[M], clientId: string): Promise<ChatV2ResultByMethod[M]>;
-  /** The ApprovalRegistry's `answerNative` entry for `adapter: 'claude'` (phone and desktop answers both land here). */
+  /** The ApprovalRegistry's `answerNative` entry for `via: 'chat-v2'` records (phone and desktop answers both land here). */
   answerNative(native: NativeDecisionRef, reply: NativeDecisionReply, paneId: string): Promise<NativeDecisionOutcome>;
   /** A pipe client went away: drop its subscriptions. */
   clientGone(clientId: string): void;
@@ -281,6 +319,16 @@ export interface ChatV2Host {
   ownsPane(paneId: string): boolean;
   /** The provider session ids of every active (not handed-off) record: a launch line naming one is refused. */
   activeSessionIds(): string[];
+  /**
+   * The terminal agent (`agent`) in pane `paneId` is bound to conversation
+   * `sessionId`. What a person runs in a terminal wins: every active chat in
+   * another pane on that conversation yields, its driver stopped and its
+   * record the `handed-off` tombstone, naming `paneId` only when `paneExact`
+   * (the binding came from that pane itself, not a hook routed to it by its
+   * folder). Never refuses and never throws; the chat's own pane (its
+   * driver's hooks carry it) is ignored.
+   */
+  terminalHolds(paneId: string, agent: string, sessionId: string, paneExact: boolean): void;
   /** In-process listener for every push (phone nudges). Returns an unsubscribe. */
   onPush(listener: (push: ChatV2EventsPush) => void): () => void;
   /** Load records, sweep orphan drivers (identity-matched only), expire their approvals. */

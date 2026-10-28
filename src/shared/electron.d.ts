@@ -34,6 +34,8 @@ import type {
   LanLinkSendArgs,
   LanLinkPeersListResult,
 } from './lanlink';
+import type { FirewallActionResult, FirewallListener, InboundStatusView, NetworkSettingsUri } from './netFirewall';
+import type { ListenProblemReport } from './netListen';
 import type { A2aSpawnAskResult, A2aSpawnOutgoingList, A2aSpawnPolicySetResult, A2aSpawnPolicyV1, A2aSpawnRequestSummary, A2aSpawnUiAsk } from './a2aSpawn';
 import type { RemoteSendResult, RemoteSendSource, RemoteWriteResult } from './remoteUpload';
 import type {
@@ -217,6 +219,8 @@ declare global {
         status: () => Promise<LanLinkStatus>;
         /** PR-3 control plane — apply a partial enable/NIC update; echoes new status. */
         configure: (patch: LanLinkConfigurePatch) => Promise<LanLinkStatus>;
+        /** The listener state may have changed; re-read status. Returns an unsubscribe fn. */
+        onStatusChanged: (callback: () => void) => () => void;
         /** PR-5 pairing — mint a PIN + arm the ≤2min pairing window. */
         pairBegin: () => Promise<LanLinkPairBeginResult>;
         /** PR-5 pairing — read-only poll for the Settings countdown. */
@@ -231,6 +235,20 @@ declare global {
         peersList: () => Promise<LanLinkPeersListResult>;
         /** PR-5 — revoke a peer (live destroy of its AEAD connection). */
         peersRemove: (peerUuid: string) => Promise<{ ok: true }>;
+      };
+      /**
+       * Firewall and port problems of the listeners other PCs reach. `status`
+       * runs the daemon's read-only probe (seconds, so only on a deliberate
+       * event); `fix` / `remove` each show one OS consent prompt.
+       */
+      netFirewall?: {
+        /** `fresh`: a probe that starts now, never one already running. */
+        status: (listener: FirewallListener, fresh?: boolean) => Promise<InboundStatusView>;
+        listenProblem: (listener: FirewallListener) => Promise<ListenProblemReport | null>;
+        fix: (listener: FirewallListener) => Promise<FirewallActionResult>;
+        remove: (listener: FirewallListener) => Promise<FirewallActionResult>;
+        /** `page` (Windows, with 'network'): one of NETWORK_SETTINGS_URIS; main refuses any other. */
+        open: (which: 'firewall' | 'network', page?: NetworkSettingsUri) => Promise<{ ok: boolean }>;
       };
       /** Cross-host A2A control plane (Settings → LAN). Daemon mode only. */
       a2aRemote?: {
@@ -529,8 +547,11 @@ declare global {
        *
        * Callers MUST await and try/catch so the user can be notified and
        * the source selection preserved for retry.
+       *
+       * `keepIfRefused` is read by the browser app only: `false` fails a write
+       * the browser refused at once instead of retrying it on the next gesture.
        */
-      writeText: (text: string) => Promise<void>;
+      writeText: (text: string, options?: { keepIfRefused?: boolean }) => Promise<void>;
       readText: () => Promise<string>;
       readImage: (ptyId?: string) => Promise<string | null>;
       hasImage: () => Promise<boolean>;

@@ -18,6 +18,11 @@
  *   `handed-off` (a tombstone), then types the agent's resume command into
  *   the anchor shell. A `handed-off` record refuses `send` (`handed-off`) and
  *   never restarts on its own; `close` drops it.
+ * - A terminal agent in another pane that binds to a conversation an active
+ *   chat holds (a resume a person typed, the TUI's own `/resume`) wins: the
+ *   host stops that chat's driver and leaves its record `handed-off`, with
+ *   `continuedIn` (naming that pane when the binding came from it). Nothing
+ *   refuses the terminal; lines wmux types itself still refuse a chat-held id.
  * - `fromTerminal` is the other direction (darwin and linux): the host
  *   reserves the pane (no `create`, no launch or resume line typed into it),
  *   checks that the pane's Claude TUI is at rest (no turn, no approval, no
@@ -210,8 +215,30 @@ export const CHATV2_BLOCK_ID = /^[0-9]{1,15}\.[0-9]{1,6}$/;
 // --- shared shapes ------------------------------------------------------
 
 /** Agents v1 creates. The fold model (`HarnessId`) is wider; creation is not. */
-export type ChatV2Agent = Extract<HarnessId, 'claude'>;
-export const CHATV2_AGENTS: readonly ChatV2Agent[] = ['claude'];
+export type ChatV2Agent = Extract<HarnessId, 'claude' | 'codex'>;
+export const CHATV2_AGENTS: readonly ChatV2Agent[] = ['claude', 'codex'];
+
+/**
+ * What each chat-v2 agent can do, read by the host and the composer: a
+ * capability on the agent's row, not a branch on its slug (#1904).
+ */
+export const CHATV2_AGENT_CAPS: Readonly<Record<ChatV2Agent, {
+  /** It has a skip-permissions mode a chat may start in (`bypass`). */
+  bypass: boolean;
+  /** Its conversation moves between a chat and its terminal TUI (handoff.ts, fromTerminal.ts). */
+  terminalHandoff: boolean;
+  /**
+   * A terminal agent holds its conversations on a shared server whose argv
+   * names none (Codex's app-server): a resume asks the pane relays who holds
+   * the thread.
+   */
+  sharedServerThreads: boolean;
+  /** A new chat picks its model from the Claude list; without it the agent starts on its own default. */
+  claudeModels: boolean;
+}>> = {
+  claude: { bypass: true, terminalHandoff: true, sharedServerThreads: false, claudeModels: true },
+  codex: { bypass: false, terminalHandoff: false, sharedServerThreads: true, claudeModels: false },
+};
 
 /** `default` adds no permission flags; `bypass` = the agent's skip-permissions mode. */
 export type ChatV2RunMode = 'default' | 'bypass';
@@ -253,6 +280,11 @@ export interface ChatV2Binding {
   capabilities: ChatV2Capabilities;
   /** Set with `failed`, and on `stopped` after an unexpected exit. */
   error?: ChatV2Error;
+  /**
+   * On `handed-off`: a terminal agent in another pane took the conversation.
+   * `paneId` names it when the binding came from that pane itself.
+   */
+  continuedIn?: { paneId?: string };
 }
 
 /** The session without its blocks. */
