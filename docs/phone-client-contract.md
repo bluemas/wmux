@@ -6180,7 +6180,7 @@ drops both the note and the unwritten grant, and the roster on disk stays author
 ## Native chat
 
 The phone's Chat surface drives the **native conversation already running in the
-pane's terminal** (Claude, Codex, OpenCode): same PTY, same native session id.
+pane's terminal** (Claude, Codex, OpenCode, Hermes Agent): same PTY, same native session id.
 Opening Chat never spawns an agent, creates a native session or sends a prompt.
 Approvals, native permission dialogs and Stop stay in Terminal; there is no file
 undo. The only thing Chat can start is an agent in an empty shell (launch, below).
@@ -6216,8 +6216,8 @@ chat but never gets a composer.
 ### Reading: the `chat` object on `/turns`
 
 `GET /api/sessions/<id>/turns` stays the one reading route. With `chatBinding`
-the daemon resolves the pane the way the desktop Chat does — OpenCode TUI
-plugin first, then a managed record (only with no live agent and no
+the daemon resolves the pane the way the desktop Chat does — the OpenCode TUI
+plugin or Hermes Agent's own session database first, then a managed record (only with no live agent and no
 transcript), then the Claude/Codex transcript file — and adds `chat` to every
 200, including `available:false`:
 
@@ -6268,8 +6268,8 @@ transcript), then the Claude/Codex transcript file — and adds `chat` to every
   preview is cheap and never enumerates processes, so `shell-has-children` only
   ever arrives from the launch POST, which re-verifies everything. So does
   `worker-fence`, which the preview never reads.
-- **`historyEpoch`** is `h1:` (transcript file), `t1:` (OpenCode, a hash — the
-  raw plugin epoch never leaves the daemon) or `m1:` (managed). Compare it for
+- **`historyEpoch`** is `h1:` (transcript file), `t1:` (OpenCode or Hermes, a
+  hash — the raw epoch never leaves the daemon) or `m1:` (managed). Compare it for
   equality; never parse it. Evicting old rows sets `historyTruncated` and keeps
   the epoch.
 
@@ -6289,7 +6289,7 @@ error. A v1 cursor from before the upgrade therefore resets once.
 | `older` | (`dir=back`) prepend ids you do not have |
 
 `reset` is present **only** on the answer to a read that carried a cursor.
-OpenCode (`tui`) and managed reads are full bounded pages every time, so a forward
+OpenCode and Hermes (`tui`) and managed reads are full bounded pages every time, so a forward
 read with a cursor on those always answers `mode:"snapshot", reset:true`; they
 have no back paging (`dir=back` answers an empty `older` page with
 `hasMore:false`). `reset` is a merge instruction only. To tell a refresh from a
@@ -6301,6 +6301,27 @@ conversation change, compare the `chat` you held with the one you got:
 When a pane that had a conversation has none any more, a read with a cursor
 answers `{available:false, reason, reset:true, events:[], chat:{binding:"none", …}}`
 with **no** `cursor`. Drop the rows and read again without one.
+
+**Hermes Agent panes** (`chat.agent: "hermes"`). A pane running the classic
+Hermes REPL is read from Hermes' own session database (`<HERMES_HOME>/state.db`,
+read-only), the way an OpenCode pane is read from its plugin: a full bounded
+page of the newest rows on every read (`t1:` epoch, `mode:"snapshot"`, no back
+paging, `truncatedHead` when older rows are left out). It binds the newest
+interactive (`cli`) Hermes session recorded in the pane's folder since Hermes
+started there, so `/new` moves the binding (a new `agentSessionId`). Hermes
+records a session with its first message: until then the pane is
+`binding:"none"` with `launch.reason:"agent-running"`, so the first message is
+typed in Terminal. Two Hermes panes in one folder, a Hermes started with a
+profile (`-p`) or a `HERMES_HOME` the pane did not start with, and the Ink TUI
+(`--tui`, which records no folder) are not bound. History is read while
+Hermes runs; once it exits the pane reads as any other pane does.
+`capabilities.send` is true only while Hermes waits at its empty prompt:
+during a turn Hermes takes typed text as an interrupt, and in an approval or a
+question as the answer, so `agentStatus` is `running` or `awaiting_input` and
+`send` is `false` there. A send is pasted into the prompt, then Enter; Hermes
+itself turns a paste of five or more lines (or 2,000 characters) into a file
+reference. `cancel`, `queue`, images and `maxSendBytes` are absent or false.
+Tool calls and results are rows; Hermes' reasoning text is not sent.
 
 ### Sending: `POST /api/sessions/<id>/chat/messages`
 
@@ -6319,6 +6340,8 @@ with **no** `cursor`. Drop the rows and read again without one.
   Never POST an entry older than 24 h minus 10 minutes; settle it as
   "check Terminal".
 - `historyEpoch` must equal the current one; a mismatch is `session-changed`.
+  An `agentSessionId` over 256 or a `historyEpoch` over 64 UTF-16 code units is
+  no daemon identity and is refused as `400 invalid-chat-request`.
 - `text`: non-blank, at most 16,000 UTF-16 code units (`String.utf16.count`,
   not graphemes). When `chat.maxSendBytes` is present, also at most that many
   UTF-8 bytes; the daemon's own measurement of the exact OpenCode request stays
@@ -6351,6 +6374,17 @@ stored outcome (`replayed:true`), or answers `202 {state:"pending"}` while the
 first dispatch is still running. It never dispatches twice. A `pending` receipt
 found after a daemon restart is final-uncertain: a re-POST replays
 `{result:"unconfirmed", error:"delivery-unconfirmed", effect:"uncertain"}`.
+
+A send the pane refuses before anything is dispatched (`no-conversation`,
+`chat-unavailable`, `managed-read-only`, `session-changed`) is stored too, as a
+final refusal: its receipt reads `refused`, and a re-POST of the same id replays
+it (`replayed:true`) instead of checking the pane again; a new Send mints a new
+id as usual. Refusals of the request itself (`invalid-chat-request`,
+`text-too-long`, `message-id-*`) and the store's own failures
+(`message-history-full`, `chat-persist-failed`) store nothing; a pane refusal
+the store cannot record answers with that store failure instead. Daemons before
+this stored nothing for those pane refusals either, so their receipt read
+`unknown`. No response field changed.
 
 Two refinements of the draft contract, on purpose:
 
@@ -6444,9 +6478,9 @@ rides on a `submitted` receipt the agent queued behind its running turn.
 | --- | --- |
 | `pending` | dispatch still running; check again in 5 s |
 | `submitted` | final |
-| `refused` | final, `effect:"none"`; text back to the draft |
+| `refused` | final, `effect:"none"`; text back to the draft. Also a send the pane refused before dispatch (see Idempotency) |
 | `uncertain` | final-uncertain; check Terminal. A `pending` found after a daemon restart reads `uncertain` |
-| `unknown` | no receipt for this owner, pane and id: the POST never reached the store. Safe to POST again **with the same id**, only while the id is younger than 24 h and `/turns` still shows the same `agentSessionId` and `historyEpoch` |
+| `unknown` | no receipt for this owner, pane and id: the POST never reached the store, or the request itself was refused (and, on an older daemon, any refusal before dispatch). Safe to POST again **with the same id**, only while the id is younger than 24 h and `/turns` still shows the same `agentSessionId` and `historyEpoch` |
 
 Poll every `unknown` or `pending` entry every 5 s, even with a healthy SSE —
 nothing on `/api/events` names a send. `404` means the pane is gone: settle the

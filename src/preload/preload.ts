@@ -190,7 +190,9 @@ export interface McpRegisterTargetResult {
 
 /** A bot.* call as the operator, with the router's envelope and the
  *  handler's refusal flattened to {ok, message?, code?}: the refusal's code
- *  (repo_mismatch, no_remote…) lets the renderer tell refusals apart. */
+ *  (repo_mismatch, no_remote…) lets the renderer tell refusals apart.
+ *  Each method sent here must be listed in RENDERER_RPC_METHODS
+ *  (src/main/ipc/rpcInvoke.ts). */
 async function factoryBotCall(method: string, params: Record<string, unknown>): Promise<{ ok: boolean; message?: string; code?: string }> {
   const resp = (await ipcRenderer.invoke(IPC.RPC_INVOKE, method, params)) as { ok?: unknown; result?: unknown; error?: unknown } | null;
   if (!resp || resp.ok !== true) return { ok: false, message: typeof resp?.error === 'string' ? resp.error : 'the bot call failed' };
@@ -740,7 +742,9 @@ const electronAPI = {
     // pipe-RPC methods like `events.poll` and `a2a.channel.*`. The
     // result envelope is the same `{ ok: true, ... } | { ok: false,
     // error }` (or method-native shape, e.g. events.poll returns
-    // `{ events, nextCursor, resync? }`) the pipe router returns.
+    // `{ events, nextCursor, resync? }`) the pipe router returns. Main
+    // dispatches only the methods in RENDERER_RPC_METHODS
+    // (src/main/ipc/rpcInvoke.ts) and refuses every other one.
     invoke: (method: string, params: Record<string, unknown>) =>
       ipcRenderer.invoke(IPC.RPC_INVOKE, method, params),
     // Renderer-only channel mutation (D5). Unlike `invoke` (which routes the
@@ -1480,9 +1484,14 @@ const electronAPI = {
     // of the active workspace; rejects when no tab could be opened. Poll
     // factoryHermesReadiness to see it land.
     factoryHermesSetup: () => ipcRenderer.invoke(IPC.FACTORY_HERMES_SETUP) as Promise<void>,
-    // The owner picks a bot's engine: Claude (SDK) or Hermes.
-    setBotEngine: (botId: string, engine: 'claude-sdk' | 'hermes') =>
-      ipcRenderer.invoke(IPC.FACTORY_BOT_SET_ENGINE, { botId, engine }) as Promise<{ ok: boolean; code?: string; message?: string }>,
+    // The owner picks a bot's engine: Claude (SDK), wmux's Hermes, or My
+    // Hermes (the owner's own Hermes profile; main asks in its own confirm).
+    setBotEngine: (botId: string, engine: 'claude-sdk' | 'hermes' | 'my-hermes', hermesProfile?: string) =>
+      ipcRenderer.invoke(IPC.FACTORY_BOT_SET_ENGINE, { botId, engine, ...(hermesProfile !== undefined ? { hermesProfile } : {}) }) as Promise<{ ok: boolean; code?: string; message?: string }>,
+    // The owner's own Hermes profiles, and with `profile` whether it could
+    // serve a bot (read-only). `fresh`: not main's cached answer.
+    factoryMyHermes: (req?: { profile?: string; fresh?: boolean }) =>
+      ipcRenderer.invoke(IPC.FACTORY_MY_HERMES, req) as Promise<import('../shared/hermesEngine').MyHermesStatus>,
     // The engines a bot's workers may run on, and which are installed here.
     workerAgents: () =>
       ipcRenderer.invoke(IPC.FACTORY_WORKER_AGENTS) as Promise<import('../shared/botWorkerAgent').BotWorkerAgentOption[]>,

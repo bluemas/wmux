@@ -945,7 +945,7 @@ export default function CommandPalette() {
   };
 
   const activeShortcut = results[activeIdx]?.shortcut;
-  const setShortcutKeyHint = platform === 'darwin' ? '⌘Enter' : 'Ctrl+Enter';
+  const setShortcutKeyHint = displayCombo('CmdOrCtrl+Enter', platform);
 
   if (!visible) return null;
 
@@ -1003,7 +1003,7 @@ export default function CommandPalette() {
           />
           )}
           <kbd className="ui-kbd shrink-0" {...tokenAttrs('textSub', 'text')}>
-            ESC
+            {displayCombo('Escape', platform)}
           </kbd>
         </div>
 
