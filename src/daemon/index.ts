@@ -145,6 +145,7 @@ import { A2aSpawnStarter, registerSpawnStartRpc } from './a2aRemote/spawnStarter
 import { A2aSpawnRequester, registerSpawnAskRpc } from './a2aRemote/spawnRequester';
 import { SpawnOutgoingStore } from './a2aRemote/spawnOutgoingStore';
 import { A2aContinueReceiver, paneHoldsSession } from './a2aRemote/continueReceiver';
+import { ContinueBundle } from './a2aRemote/continueBundle';
 import { ContinuePolicyStore } from './a2aRemote/continuePolicyStore';
 import { ContinueRequestStore } from './a2aRemote/continueRequestStore';
 import { rootIsRepoTop, rootOriginKey } from './a2aRemote/continueRootGit';
@@ -10396,6 +10397,17 @@ async function main(): Promise<void> {
       if (!git) a2aRootGits.set(rootPath, (git = gitRunner(rootPath, {})));
       return git;
     };
+    // The bytes of such a conversation land in `continue-in/` under the a2a
+    // dir: uploaded by a PC that joined this one, pulled from one this PC joined.
+    const a2aContinueBytes: ContinueBundle = new ContinueBundle({
+      a2aDir,
+      requests: a2aContinueRequests,
+      policy: a2aContinuePolicy,
+      received: (hostId, continueId) => a2aContinue.received(hostId, continueId),
+      receiveFailed: (hostId, continueId) => a2aContinue.receiveFailed(hostId, continueId),
+      fetchFrom: (hostId) => a2aDelivery?.continueFetch(hostId) ?? null,
+      log: a2aLog,
+    });
     const a2aContinue = new A2aContinueReceiver({
       policy: a2aContinuePolicy,
       spawnPolicy: a2aSpawnPolicy,
@@ -10415,6 +10427,7 @@ async function main(): Promise<void> {
         () => transcriptProjector?.transcriptPath(m.id) ?? null,
         sessionId,
       )),
+      bytes: a2aContinueBytes,
       log: a2aLog,
     });
     const a2aForgetHost = forgetHostCascade({ links: a2aLinks, exposures: a2aExposures, offers: a2aOffersRef }, a2aLog);
@@ -10529,6 +10542,7 @@ async function main(): Promise<void> {
         offers: a2aOffersRef,
         spawn: a2aSpawn,
         continue: a2aContinue,
+        continueBytes: a2aContinueBytes,
         ...(a2aStarter ? { spawnLinks: a2aStarter } : {}),
         ...(a2aAsks ? { spawnAsks: a2aAsks } : {}),
         // This build shows and accepts share offers, takes images on
