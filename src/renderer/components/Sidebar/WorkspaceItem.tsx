@@ -1256,7 +1256,7 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumb
           click or a drag hit-test. */}
       {tagColor && (
         <div
-          className="absolute top-[3px] bottom-[3px] w-[3px] rounded-full z-[1] pointer-events-none"
+          className="absolute top-[3px] bottom-[3px] w-[3px] z-[1] pointer-events-none"
           style={{ left: isMultiview ? 2 : 0, background: tagColor }}
           aria-hidden="true"
         />

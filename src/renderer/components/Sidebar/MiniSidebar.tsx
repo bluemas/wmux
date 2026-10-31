@@ -333,7 +333,7 @@ export default function MiniSidebar({ rail = false, collapsed = true }: { rail?:
                   glance. Shifts right of the multiview border when both apply. */}
               {railColor && (
                 <div
-                  className="absolute top-1 bottom-1 w-[3px] rounded-full z-[1] pointer-events-none"
+                  className="absolute top-1 bottom-1 w-[3px] z-[1] pointer-events-none"
                   style={{ left: isMultiview ? 2 : 0, background: railColor }}
                   aria-hidden="true"
                 />
