@@ -11,6 +11,9 @@ description: "How to check a wmux change before calling it done: which typecheck
 npx tsc --noEmit -p .          # must print 0 errors
 ```
 
+On macOS under Node 26 tsc can crash with a V8 stack dump (out of heap); run it with
+Node 22 and `NODE_OPTIONS=--max-old-space-size=8192`.
+
 ## 2. Tests for what you touched
 
 Run the narrowest suites first; widen when the change crosses processes.
