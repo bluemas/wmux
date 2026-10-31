@@ -24,6 +24,7 @@
 
 import path from 'node:path';
 import { summarizeActivity } from '../../shared/activitySummary';
+import type { EntryLink } from './rewind';
 import type {
   AssistantTextEvent,
   CodeBlockRef,
@@ -97,7 +98,43 @@ export function parseTranscriptLineDetailed(
     // Expected on the partial leading line of any mid-file seek.
     return empty;
   }
+  return parseEntryObject(entry, offsetHint);
+}
 
+/**
+ * A main-thread line's place in the conversation tree, for the rewind check
+ * (`rewind.ts`). Undefined for a line without a uuid and for a sidechain
+ * entry, which belongs to a subagent's thread and never takes part. NEVER
+ * throws.
+ */
+export function transcriptLineLink(line: string, offsetHint: number): EntryLink | undefined {
+  let entry: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(line.replace(/^\uFEFF/, '').trim());
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+    entry = parsed as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
+  const uuid = entry['uuid'];
+  if (typeof uuid !== 'string' || !uuid || entry['isSidechain'] === true) return undefined;
+  const parent = entry['parentUuid'];
+  const logical = entry['logicalParentUuid'];
+  const content = asObject(entry['message'])?.['content'];
+  const toolResult = Array.isArray(content) && content.some((block) => asObject(block)?.['type'] === 'tool_result');
+  return {
+    uuid,
+    ...(typeof parent === 'string' && parent ? { parentUuid: parent } : {}),
+    ...(typeof logical === 'string' && logical ? { logicalParentUuid: logical } : {}),
+    // A typed prompt: a `user` entry, not a tool result, that reads as the
+    // operator's own message.
+    prompt: entry['type'] === 'user' && !toolResult &&
+      parseEntryObject(entry, offsetHint).events.some((event) => event.kind === 'user_text'),
+  };
+}
+
+function parseEntryObject(entry: Record<string, unknown>, offsetHint: number): ParsedTranscriptLine {
+  const empty: ParsedTranscriptLine = { events: [], bodies: new Map() };
   const type = typeof entry['type'] === 'string' ? (entry['type'] as string) : '';
   const message = asObject(entry['message']);
   const role = typeof message?.['role'] === 'string' ? (message['role'] as string) : '';
