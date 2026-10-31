@@ -46,6 +46,7 @@ import {
   validateCompletionEvidence,
 } from '../../shared/completionEvidence';
 import { isVerifiedTaskSender } from '../../shared/a2aReopen';
+import { companyCancelRefusal, companyDoneRefusal, isCompanyTask, type CompanySeat } from '../../shared/company';
 import { isReceiverPaneGone } from '../../shared/a2aOrphanedTask';
 import type {
   A2aRemoteMarkPayload,
@@ -164,6 +165,14 @@ export interface TransitionInput {
    * lanes and the headless ClaudeWorker do not set it.
    */
   requirePaneIdentity?: boolean;
+  /** The human's lane or an in-process first-party caller (set by main). */
+  trustedLane?: boolean;
+  /**
+   * The caller's pane (`callerAddr`) seat in its workspace's company, read by
+   * main from the pane tree in the same read as `callerAddr`; absent outside
+   * a company.
+   */
+  callerCompanySeat?: CompanySeat;
   /**
    * Live pane ids of the caller's workspace (stashed included), resolved by
    * main from the pane tree in the same read as `callerAddr` — so it carries
@@ -183,6 +192,10 @@ export interface TransitionInput {
 export interface CancelTaskInput {
   taskId: string;
   callerWorkspaceId: string;
+  /** The caller's pane, resolved by main from its senderPtyId. */
+  callerPaneId?: string;
+  /** The human's lane or an in-process first-party caller (set by main). */
+  trustedLane?: boolean;
   idempotencyKey?: string;
 }
 
@@ -461,8 +474,15 @@ export class A2aTaskService {
       // #1598: a pinned task whose receiver pane no longer exists is adopted by
       // any verified pane of the receiver workspace (checked above), instead of
       // being stuck forever. A live receiver pane keeps the rule.
+      // A company task is marked done by the company's coordinator, which is
+      // not the receiver pane: its done skips this pane check (the workspace
+      // check above still holds).
+      // A seat counts only with the pane it was read for.
+      const callerSeat = input.callerCompanySeat && !input.callerAddr?.paneId ? 'staff' : input.callerCompanySeat;
+      const coordinatorDone = callerSeat === 'coordinator' && input.to === 'completed' && isCompanyTask(task.history);
       if (
-        input.callerAddr && task.metadata.to.paneId && task.metadata.to.paneId !== input.callerAddr.paneId
+        !coordinatorDone
+        && input.callerAddr && task.metadata.to.paneId && task.metadata.to.paneId !== input.callerAddr.paneId
         && !isReceiverPaneGone(task.metadata.to, input.callerWorkspaceId, input.livePaneIds)
       ) {
         return { ok: false, error: 'a2a.task.update: caller pane is not the addressed receiver pane' };
@@ -476,6 +496,21 @@ export class A2aTaskService {
       }
       if (input.requirePaneIdentity && !input.callerAddr && task.metadata.to.paneId) {
         return { ok: false, error: 'a2a.task.update: this task is pinned to a pane; only that pane can update it (no verified pane identity)' };
+      }
+      // A company task ends as canceled only through its creator's cancel.
+      if (input.to === 'canceled') {
+        const refusal = companyCancelRefusal(task, {
+          workspaceId: input.callerWorkspaceId,
+          paneId: input.callerAddr?.paneId,
+          trusted: input.trustedLane === true,
+        });
+        if (refusal) return { ok: false, error: `a2a.task.update: ${refusal}` };
+      }
+      // A company task is marked done by its coordinator or the human, never by
+      // the seat that did the work (it reports with input-required).
+      if (input.to === 'completed') {
+        const refusal = companyDoneRefusal(task, { trusted: input.trustedLane === true, seat: callerSeat });
+        if (refusal) return { ok: false, error: `a2a.task.update: ${refusal}` };
       }
       // §4 멱등: 앞서 커밋된 동일 키면 append 없이 원본 결과. 위치는 authz·soft-defer
       // **뒤**(리뷰 codex 델타: 히트가 authz를 앞지르면 키를 아는 비참여자가 커밋 스냅샷을
@@ -539,8 +574,12 @@ export class A2aTaskService {
       // transition의 행위자 = 수신자(authz가 callerWorkspaceId===to.workspaceId 강제) —
       // principalId를 저장된 to pane 좌표에서 서버 유도(위조 불가).
       const authWs = input.callerWorkspaceId;
+      // The coordinator marking a seat's report done acts as its own pane.
+      const principalId = coordinatorDone && input.callerAddr?.paneId
+        ? panePrincipalId(authWs, input.callerAddr.paneId)
+        : this.derivePrincipalId(task, 'to', authWs);
       const committed = await this.log.append(
-        this.envelope(payload, authWs, this.derivePrincipalId(task, 'to', authWs), input.idempotencyKey),
+        this.envelope(payload, authWs, principalId, input.idempotencyKey),
       );
       if (!committed) {
         return { ok: false, error: 'a2a.task.update: daemon log append failed (uncommitted)' };
@@ -570,6 +609,12 @@ export class A2aTaskService {
       if (!isSender && !isReceiver) {
         return { ok: false, error: `a2a.task.cancel: caller ${input.callerWorkspaceId} is not sender or receiver` };
       }
+      const companyRefusal = companyCancelRefusal(task, {
+        workspaceId: input.callerWorkspaceId,
+        paneId: input.callerPaneId,
+        trusted: input.trustedLane === true,
+      });
+      if (companyRefusal) return { ok: false, error: `a2a.task.cancel: ${companyRefusal}` };
       // §4 멱등: transition과 대칭 — 히트는 authz 뒤(비참여자 키 재생 조회 차단),
       // op 네임스페이스 분리(transition 키로 cancel 결과를 재생하지 못하게 — codex 델타).
       const cached = this.idempotencyHit(input.taskId, input.idempotencyKey, 'cancel');

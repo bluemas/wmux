@@ -8,8 +8,21 @@ import { resolvePtyOwnerWorkspace } from '../../workspace/ptyOwnership';
 import type { ClaudeWorker } from '../../a2a/ClaudeWorker';
 import type { DaemonClient } from '../../DaemonClient';
 import * as fs from 'fs';
+import * as os from 'os';
 import { getPidMapDir } from '../../../shared/constants';
-import { validateMessage } from '../../../shared/types';
+import { validateMessage, type Message } from '../../../shared/types';
+import { isCompanyTask, parseCompanySeat, type CompanySeat } from '../../../shared/company';
+import { configuredForge, forgeHosts } from '../../../shared/forgeHosts';
+import {
+  DONE_PR_CHECK_MAX,
+  companyDonePrDecision,
+  donePrRefs,
+  tooManyDonePrs,
+  withDonePrEvidence,
+  type DonePrOutcome,
+  type DonePrRef,
+} from '../../../shared/companyDonePrCheck';
+import { ghPrReviewService, type GhPrReviewService } from '../../github/GhPrReviewService';
 import { EXECUTE_SEND_MAIN_TIMEOUT_MS } from '../../../shared/executeApprovalBounds';
 import { GATED_DELIVERY_DEADLINE_MARGIN_MS, GATED_NEW_TASK_SEND_MAIN_TIMEOUT_MS, NEW_TASK_SEND_MAIN_TIMEOUT_MS } from '../../../shared/freshContext';
 import { flagOrphanedTask, isPagedTaskQuery, pagedTaskId, shapeTaskQueryResult, summarizeTask, applyTaskQueryView } from '../../../shared/a2aTaskQueryView';
@@ -33,7 +46,7 @@ import {
   type McpParentClass,
 } from '../../../mcp/codexThreadIdentity';
 import type { OwningAnchor } from '../../pty/serverSidePidWalk';
-import { recordSentTask, recordTaskState, reopenedState, stateOfTask, workLinkFromSentTask } from '../../workLink/a2aProducer';
+import { recordSentTask, recordTaskState, reopenedState, stateOfTask, workLinkFromRemoteSend, workLinkFromSentTask } from '../../workLink/a2aProducer';
 import { noteTrackReply } from '../../deck/trackRecordFeed';
 import { A2A_BRAIN_ALIAS, A2A_REMOTE_IMAGE_LIMITS, isRemoteTaskId } from '../../../shared/a2aRemote';
 import {
@@ -71,7 +84,15 @@ type DaemonTaskGate =
 const A2A_DAEMON_SOFT_ERRORS = ['task log unavailable', 'task not found', 'pane-authz deferred'];
 
 
+/** How long main waits on gh for one PR of a company task's done, and on
+ *  the whole check: the caller's MCP request gives up after 10 s. */
+const DONE_PR_READ_DEADLINE_MS = 7_000;
+const DONE_CHECK_BUDGET_MS = 9_000;
+/** PRs read at once for one done. */
+const DONE_PR_READS_AT_ONCE = 3;
+
 const INTERNAL_RENDERER_FIELDS = [
+  'trustedLane',
   'daemonCommitted',
   'committedTask',
   'daemonReopenedTask',
@@ -79,6 +100,7 @@ const INTERNAL_RENDERER_FIELDS = [
   'reopenPreflight',
   'requirePaneIdentity',
   'livePaneIds',
+  'callerCompanySeat',
   'deliveryDeadlineAt',
   'deliveryGuardKey',
   'presetTaskId',
@@ -148,8 +170,9 @@ async function daemonTaskRpc(
 }
 
 type CallerPane =
-  /** `livePaneIds`: every pane of the caller's workspace, from the same read. */
-  | { kind: 'resolved'; paneId: string; livePaneIds: string[] }
+  /** `livePaneIds`: every pane of the caller's workspace, from the same read;
+   *  `companySeat`: the pane's seat when its workspace is a company. */
+  | { kind: 'resolved'; paneId: string; livePaneIds: string[]; companySeat?: CompanySeat }
   /** No senderPtyId, or one that is not a terminal in the caller's own workspace. */
   | { kind: 'absent' }
   /** The pane tree could not be read: keep the daemon's deferral to the renderer. */
@@ -173,7 +196,10 @@ async function resolveCallerPane(
   const livePaneIds = panes.map((pane) => pane.id as string);
   for (const pane of panes) {
     const ptys = Array.isArray(pane.surfacePtyIds) ? pane.surfacePtyIds : [];
-    if (ptys.includes(senderPtyId)) return { kind: 'resolved', paneId: pane.id as string, livePaneIds };
+    if (ptys.includes(senderPtyId)) {
+      const companySeat = parseCompanySeat(pane.companySeat);
+      return { kind: 'resolved', paneId: pane.id as string, livePaneIds, ...(companySeat ? { companySeat } : {}) };
+    }
   }
   return { kind: 'absent' };
 }
@@ -348,10 +374,13 @@ export function registerA2aRpc(
     /** Who spawned a Codex-thread caller, from its ancestors' argv; tests inject one. */
     classifyCodexCaller?: (pid: number) => Promise<McpParentClass>;
     remote?: RemoteA2aRpcDeps;
+    /** The gh reads of a company task's done check; tests inject one. */
+    prReview?: Pick<GhPrReviewService, 'donePrFacts'>;
   } = {},
 ): void {
   const getDaemonClient = opts.getDaemonClient;
   const remote = opts.remote;
+  const prReview = opts.prReview ?? ghPrReviewService;
 
   /**
    * Active links `to` names EXACTLY (no trimming, no partial match): by alias,
@@ -388,6 +417,7 @@ export function registerA2aRpc(
     }
     const images = imagePathsOf(params.images);
     if (images === null) return { error: `a2a.task.send: images must be a list of up to ${IMAGES_MAX} absolute paths` };
+    const title = typeof params.title === 'string' ? params.title : '';
     if (ctx?.commanderWorkspace) {
       // A brain sends only on a brain link of its own workspace: Moa to
       // another PC's Moa. The sender is the token-verified commander binding,
@@ -407,11 +437,14 @@ export function registerA2aRpc(
       const res = await remote!.sendTask({
         linkId: brainLink.linkId,
         from: { workspaceId: hq, name: A2A_BRAIN_ALIAS },
-        title: typeof params.title === 'string' ? params.title : '',
+        title,
         text: message,
         ...(images ? { images } : {}),
       }).catch((err: unknown): RemoteOpResult => ({ ok: false, error: err instanceof Error ? err.message : String(err) }));
       if (!res.ok) return { error: `a2a.task.send: remote send refused (${res.error})` };
+      void recordSentTask(workLinkFromRemoteSend({
+        taskId: res.taskId, linkId: brainLink.linkId, alias: brainLink.alias, requester: { workspaceId: hq }, title, message, fromCommander: true,
+      }));
       return {
         ok: true,
         taskId: res.taskId,
@@ -435,11 +468,15 @@ export function registerA2aRpc(
       // The verified sender pty: a reply from the peer is held if another
       // agent holds this pane by then.
       from: { workspaceId, name: workspaceId, paneId: caller.paneId, ptyId: params.senderPtyId as string },
-      title: typeof params.title === 'string' ? params.title : '',
+      title,
       text: message,
       ...(images ? { images } : {}),
     }).catch((err: unknown): RemoteOpResult => ({ ok: false, error: err instanceof Error ? err.message : String(err) }));
     if (!res.ok) return { error: `a2a.task.send: remote send refused (${res.error})` };
+    // Work link (best-effort, never awaited), as for a local send.
+    void recordSentTask(workLinkFromRemoteSend({
+      taskId: res.taskId, linkId: link.linkId, alias: link.alias, requester: { workspaceId, paneId: caller.paneId }, title, message, fromCommander: false,
+    }));
     return { ok: true, taskId: res.taskId, remote: true, delivery: REMOTE_QUEUED, ...(res.note ? { note: res.note } : {}) };
   }
 
@@ -1240,6 +1277,93 @@ export function registerA2aRpc(
     return shape({ ...(rendererRes as Record<string, unknown>), tasks: finalTasks });
   });
 
+  /** One task in full: the daemon's copy, else the renderer's; null when neither has it. */
+  async function readFullTask(workspaceId: string, taskId: string): Promise<Record<string, unknown> | null> {
+    const query = { workspaceId, view: 'page', taskId };
+    const pick = (res: unknown): Record<string, unknown> | null => {
+      const tasks: unknown[] = isRecord(res) && Array.isArray(res.tasks) ? res.tasks : [];
+      const task = tasks.find((t) => isRecord(t) && t.id === taskId);
+      return isRecord(task) ? task : null;
+    };
+    const [gate, fromRenderer] = await Promise.all([
+      daemonTaskRpc(getDaemonClient, 'a2a.task.query', query, { timeoutMs: PAGED_TASK_QUERY_DAEMON_TIMEOUT_MS }),
+      sendToRenderer(getWindow, 'a2a.task.query', query).then(pick, () => null),
+    ]);
+    const fromDaemon = gate.kind === 'ok' ? pick(gate.result) : null;
+    // As in a2a.task.query: replies live in the renderer's history only, and a
+    // remote task's history grows in the daemon.
+    if (fromDaemon && fromRenderer && !isRemoteTaskId(taskId) && Array.isArray(fromRenderer.history)) {
+      return { ...fromDaemon, history: fromRenderer.history };
+    }
+    return fromDaemon ?? fromRenderer;
+  }
+
+  /**
+   * A company task's done waits on wmux's own read of every GitHub PR the task
+   * names (shared/companyDonePrCheck.ts). Returns the refusal, or null with
+   * each passing PR added to `params.evidence` as a verified inspection. A
+   * task that is not a company task, or names no PR, is left as it is.
+   * Evidence that is missing or not shaped is left to the daemon's evidence
+   * gate, which refuses it; nothing is read for it.
+   */
+  async function companyDonePrRefusal(params: Record<string, unknown>, seat: CompanySeat | undefined): Promise<string | null> {
+    const budgetEnd = Date.now() + DONE_CHECK_BUDGET_MS;
+    const evidence = params.evidence;
+    const items = isRecord(evidence) ? evidence.items : undefined;
+    if (!isRecord(evidence) || typeof evidence.summary !== 'string' || !Array.isArray(items)) return null;
+    const { taskId, workspaceId } = params;
+    if (typeof taskId !== 'string' || !taskId || typeof workspaceId !== 'string' || !workspaceId) return null;
+    const task = await readFullTask(workspaceId, taskId);
+    // The CEO's done waits on the check, so a task wmux cannot read is not let through.
+    if (!task) return seat === 'coordinator' ? `a2a.task.update: wmux could not read task ${taskId} to check the PRs it names; retry` : null;
+    const history: unknown[] = Array.isArray(task.history) ? task.history : [];
+    const brief = history[0];
+    if (!isRecord(brief) || !Array.isArray(brief.parts) || !isCompanyTask(history as Message[])) return null;
+    const status = task.status;
+    const prs = donePrRefs({
+      history,
+      statusMessage: isRecord(status) ? status.message : undefined,
+      message: params.message,
+      evidence,
+    });
+    if (prs.length === 0) return null;
+    if (prs.length > DONE_PR_CHECK_MAX) return tooManyDonePrs(prs.length);
+    const elsewhere = prs.find((pr) => pr.host.toLowerCase() !== 'github.com' && configuredForge(pr.host, forgeHosts()) !== 'github');
+    if (elsewhere) {
+      return `a2a.task.update: wmux checks pull requests on github.com and on hosts gh is signed in to, and ${elsewhere.url} is on neither; `
+        + 'the owner can mark the task done from their own lane.';
+    }
+    // The caller's MCP request gives up after 10 s. A read still running near
+    // then is refused, so a done never commits after the caller saw it fail.
+    const readOne = async (pr: DonePrRef): Promise<DonePrOutcome> => {
+      const wait = Math.min(DONE_PR_READ_DEADLINE_MS, budgetEnd - Date.now());
+      if (wait <= 0) return { pr, read: 'error', message: 'no time left to read it' };
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const late = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`no answer within ${Math.ceil(wait / 1000)} s`)), wait);
+        });
+        const read = await Promise.race([prReview.donePrFacts(os.homedir(), `${pr.host}/${pr.owner}/${pr.repo}`, pr.number), late]);
+        return read.ok ? { pr, read: 'ok', facts: read.value } : { pr, read: 'error', message: read.message };
+      } catch (err) {
+        return { pr, read: 'error', message: err instanceof Error ? err.message : String(err) };
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+    const outcomes: DonePrOutcome[] = [];
+    for (let i = 0; i < prs.length; i += DONE_PR_READS_AT_ONCE) {
+      // eslint-disable-next-line no-await-in-loop -- a few PRs, a few at a time
+      outcomes.push(...await Promise.all(prs.slice(i, i + DONE_PR_READS_AT_ONCE).map(readOne)));
+    }
+    const decision = companyDonePrDecision(outcomes);
+    if (decision.kind === 'refuse') return decision.error;
+    const next = withDonePrEvidence({ ...evidence, items }, decision.items);
+    if (!next.ok) return next.error;
+    params.evidence = next.evidence;
+    return null;
+  }
+
   // task.update — 데몬 정본 게이트 선행(envelope PR4 C12 대칭 경로).
   // 데몬 ok → 렌더러에 daemonCommitted 마커 + committedTask로 verbatim 캐시 적용 +
   // 메시지 배달/이벤트 방출(렌더러 UI 반응성 로직 보존). 데몬 reject → 렌더러
@@ -1270,6 +1394,14 @@ export function registerA2aRpc(
     params.requirePaneIdentity = !trustedLane;
     if (typeof params.status === 'string') {
       const callerPane = await resolveCallerPane(getWindow, params.workspaceId, params.senderPtyId);
+      // A company task is done only once wmux has checked the PRs it names.
+      // The human's lane is exempt, and a staff seat's done is refused by the
+      // daemon anyway.
+      if (params.status === 'completed' && !trustedLane
+        && !(callerPane.kind === 'resolved' && callerPane.companySeat === 'staff')) {
+        const refused = await companyDonePrRefusal(params, callerPane.kind === 'resolved' ? callerPane.companySeat : undefined);
+        if (refused) return { error: refused };
+      }
       const gate = await daemonTaskRpc(getDaemonClient, 'a2a.task.update', {
         taskId: params.taskId,
         workspaceId: params.workspaceId,
@@ -1280,12 +1412,20 @@ export function registerA2aRpc(
         // cache only, and the durable copy stayed `submitted`.
         // #1598: the same read's pane list lets the daemon tell a gone
         // receiver pane (adoptable by this workspace) from a live one.
+        // The same read gives the pane's company seat: who marks a company
+        // task done.
         ...(callerPane.kind === 'resolved'
-          ? { senderPtyId: params.senderPtyId, callerPaneId: callerPane.paneId, livePaneIds: callerPane.livePaneIds }
+          ? {
+            senderPtyId: params.senderPtyId,
+            callerPaneId: callerPane.paneId,
+            livePaneIds: callerPane.livePaneIds,
+            ...(callerPane.companySeat ? { callerCompanySeat: callerPane.companySeat } : {}),
+          }
           : callerPane.kind === 'unknown' && typeof params.senderPtyId === 'string'
             ? { senderPtyId: params.senderPtyId }
             : {}),
         ...(callerPane.kind === 'absent' && !trustedLane ? { requirePaneIdentity: true } : {}),
+        ...(trustedLane ? { trustedLane: true } : {}),
         ...(params.evidence !== undefined ? { evidence: params.evidence } : {}),
         // The status message, checked above, so the daemon's copy keeps it too
         // (and a task with another PC sends it back with the state).
@@ -1497,17 +1637,27 @@ export function registerA2aRpc(
   });
 
   // task.cancel: cancel worker + 데몬 정본 커밋 + 렌더러 캐시/이벤트(envelope PR4).
-  router.register('a2a.task.cancel', async (params) => {
+  router.register('a2a.task.cancel', async (params, ctx) => {
     const taskId = typeof params.taskId === 'string' ? params.taskId : '';
-    if (taskId) claudeWorker.cancel(taskId);
+    // The caller's pane, resolved here as for an update: a company task is
+    // canceled only by the pane that created it (shared/company.ts).
+    const trustedLane = ctx?.operator === true || (ctx?.firstParty === true && !isHostedCaller(ctx));
+    const callerPane = await resolveCallerPane(getWindow, params.workspaceId, params.senderPtyId);
+    // Only fields main sets reach the renderer.
+    const forward = withOperatorOrigin(params, ctx);
+    if (trustedLane) forward.trustedLane = true;
     const gate = await daemonTaskRpc(getDaemonClient, 'a2a.task.cancel', {
       taskId,
       workspaceId: params.workspaceId,
+      ...(callerPane.kind === 'resolved' ? { callerPaneId: callerPane.paneId } : {}),
+      ...(trustedLane ? { trustedLane: true } : {}),
       // §4 멱등(리뷰 codex): update 경로와 대칭 — 파이프 호출자 키를 데몬까지 전달.
       ...(typeof params.idempotencyKey === 'string' ? { idempotencyKey: params.idempotencyKey } : {}),
     });
     if (gate.kind === 'reject') return { error: gate.error };
+    // A background worker stops only once the cancel is allowed.
     if (gate.kind === 'ok') {
+      if (taskId) claudeWorker.cancel(taskId);
       // G(패널 델타): 데몬이 실제로 canceled로 전이했을 때만 렌더러 cancelled 이벤트를
       // 태운다. 이미 종단(completed/failed)인 태스크의 멱등 no-op(데몬 G 수정)은 상태
       // 변화가 없는데, 렌더러 cancel 핸들러는 daemonCommitted 시 무조건 state:'canceled'
@@ -1519,7 +1669,7 @@ export function registerA2aRpc(
       if (committedState === 'canceled') {
         void recordTaskState(taskId, 'canceled');
         const applied = await sendToRenderer(getWindow, 'a2a.task.cancel', {
-          ...params,
+          ...forward,
           daemonCommitted: true,
           committedTask: gate.result.task,
         });
@@ -1528,8 +1678,11 @@ export function registerA2aRpc(
       }
       return { ok: true, taskId };
     }
-    const res = await sendToRenderer(getWindow, 'a2a.task.cancel', params);
-    if (isRecord(res) && res.ok === true) void recordTaskState(taskId, 'canceled');
+    const res = await sendToRenderer(getWindow, 'a2a.task.cancel', forward);
+    if (isRecord(res) && res.ok === true) {
+      if (taskId) claudeWorker.cancel(taskId);
+      void recordTaskState(taskId, 'canceled');
+    }
     return res;
   });
 }

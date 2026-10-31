@@ -36,14 +36,12 @@ const CommandPalette = lazy(() => import('../Palette/CommandPalette'));
 const WorktaskCleanupView = lazy(() => import('../WorkTask/WorktaskCleanupView'));
 const InspectOverlay = lazy(() => import('../Inspect/InspectOverlay'));
 import FileTreePanel from '../FileTree/FileTreePanel';
-import ApprovalDialog from '../Company/ApprovalDialog';
 import ExecuteApprovalDialog from '../A2a/ExecuteApprovalDialog';
 import PermissionApprovalDialogContainer from '../Approval/PermissionApprovalDialogContainer';
 import CloseTabConfirm from '../Pane/CloseTabConfirm';
+import { isWorkSurfaceType } from '../Pane/surfaceKinds';
 import { initAtlasWakeRecovery } from '../../terminal/atlasWakeRecovery';
 import { windowDisplayedStore } from '../../hooks/useWindowDisplayed';
-import CompanyView from '../Company/CompanyView';
-import MessageFeedPanel from '../Company/MessageFeedPanel';
 import OnboardingOverlay from '../Onboarding/OnboardingOverlay';
 import FirstRunWizard from '../FirstRunWizard';
 import KeyboardCheatSheet from '../KeyboardCheatSheet';
@@ -118,6 +116,7 @@ import { isDaemonModeActive, setDaemonModeActive } from '../../daemon/daemonMode
 import { noteDaemonConnected, noteDaemonDisconnected, noteDaemonGaveUp, noteDaemonReconnecting, notePaneReattached, notePaneWriteDropped, setDaemonLinkSurfaceResolver, type DaemonPaneRef } from '../../daemon/daemonLinkNotice';
 import { planAgentCandidateSeed, planLiveAgentSeed, asAgentSlug, markSeedAttempted } from '../../channels/agentCandidateSeed';
 import { agentSlugToDisplay } from '../../../shared/agentIdentity';
+import { applyProcessExits, clearSurfaceAgentOnProcessExit, clearSurfaceAgentsKnownGone, livenessSnapshotRequested, livenessSnapshotSettled } from '../../utils/agentRowLiveness';
 import { RECONCILE_TIMEOUT_MS } from '../../../shared/timeouts';
 import ComposeHost from '../AgentToolbar/ComposeHost';
 import { AgentToolbarStrip } from '../AgentToolbar/ToolbarHost';
@@ -134,28 +133,6 @@ interface ReconcilePtySession extends DeadPaneSessionSnapshot {
   state?: string;
   surfaceId?: string;
   createdAt?: string;
-}
-
-/**
- * #1210 — drop a pane's detected agent identity once we know the TUI is gone.
- * #1463 — `requestedAt` is when the snapshot was asked for: only running
- * evidence older than that is dropped with it, so an agent relaunched while the
- * answer was in flight keeps its stamp. A dead process with a foreground
- * command still running may be a relaunch the tracker has not re-armed for yet,
- * so that case keeps the stamp too.
- */
-function clearSurfaceAgentsKnownGone(
-  agentAlive: Record<string, boolean>,
-  commandRunning: Record<string, boolean>,
-  requestedAt: number,
-): void {
-  const store = useStore.getState();
-  for (const [id, alive] of Object.entries(agentAlive)) {
-    if (alive === false) store.clearSurfaceAgent(id, commandRunning[id] === true ? undefined : requestedAt);
-  }
-  for (const [id, running] of Object.entries(commandRunning)) {
-    if (running === false) store.clearSurfaceAgent(id, requestedAt);
-  }
 }
 
 /** Name panes from the daemon's process truth — see planLiveAgentSeed. */
@@ -398,7 +375,6 @@ function stripLivePorts(metadata: NonNullable<Workspace['metadata']>): Workspace
 /** Build a consistent SessionData snapshot for save operations */
 function buildSessionData(dumped: Map<string, boolean>): SessionData {
   const state = useStore.getState();
-  const companySafe = state.company ? { ...state.company, skipPermissions: undefined } : null;
   return {
     workspaces: state.workspaces.map((ws) => {
       // Private browser tabs never reach the saved session (no restore after
@@ -425,10 +401,6 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
     phoneWorkspaceRequestIds: state.phoneWorkspaceRequestIds,
     sidebarVisible: state.sidebarVisible,
     channelDockVisible: state.channelDockVisible,
-    sidebarMode: state.sidebarMode,
-    company: companySafe,
-    memberCosts: state.memberCosts,
-    sessionStartTime: state.sessionStartTime ?? undefined,
     // User preferences
     theme: state.theme,
     locale: state.locale,
@@ -828,8 +800,6 @@ export default function AppLayout() {
   const sidebarPosition = useStore((s) => s.sidebarPosition);
   const sidebarWidth = useStore((s) => s.sidebarWidth);
   const fileTreeVisible = useStore((s) => s.fileTreeVisible);
-  const companyViewVisible = useStore((s) => s.companyViewVisible);
-  const setCompanyViewVisible = useStore((s) => s.setCompanyViewVisible);
   // PERF (2026-07-13): AppLayout does NOT subscribe to the whole `workspaces`
   // array NOR to `activeWorkspaceId` — those re-rendered its ~1300-line chrome
   // on every pane metadata/surface update (53% CPU at 5 workspaces) and on every
@@ -1156,7 +1126,7 @@ export default function AppLayout() {
 
       const activeSurface = leaf.surfaces.find((s) => s.id === leaf.activeSurfaceId);
       // browser/editor/diff는 PTY가 없어 경로 붙여넣기 대상이 아님(J2 — diff 추가).
-      if (!activeSurface || activeSurface.surfaceType === 'browser' || activeSurface.surfaceType === 'editor' || activeSurface.surfaceType === 'preview' || activeSurface.surfaceType === 'diff') return;
+      if (!activeSurface || isWorkSurfaceType(activeSurface.surfaceType)) return;
       // Another PC's pane: a dropped path names a file on this machine, so the
       // mirror showing it uploads the files to that PC and types their paths there.
       if (activeSurface.surfaceType === 'remote-terminal') {
@@ -1336,7 +1306,7 @@ export default function AppLayout() {
           for (const surface of pane.surfaces) {
             if (signal?.aborted) return;
             // browser/editor/diff는 PTY를 갖지 않음 — 재조정·자가생성 대상에서 제외(J2).
-            if (surface.surfaceType === 'browser' || surface.surfaceType === 'editor' || surface.surfaceType === 'preview' || surface.surfaceType === 'diff' || surface.surfaceType === 'remote-terminal') continue;
+            if (isWorkSurfaceType(surface.surfaceType) || surface.surfaceType === 'remote-terminal') continue;
             if (!surface.ptyId) {
               console.log(`[AppLayout] Surface ${surface.id}: no ptyId, Terminal will self-create`);
               continue;
@@ -1995,7 +1965,7 @@ export default function AppLayout() {
   //     respawn re-derives badges without waiting for the next event.
   useEffect(() => {
     const hydrate = () => {
-      const requestedAt = Date.now();
+      const requestedAt = livenessSnapshotRequested();
       void window.electronAPI.pty.list().then((sessions) => {
         const snapshot: Record<string, { status: 'armed' | 'stopped'; restartCount: number }> = {};
         // X6 ②: resume hints for recovered interactive agent panes.
@@ -2016,6 +1986,7 @@ export default function AppLayout() {
           if (s.commandRunning !== undefined) commandRunningSnapshot[s.id] = s.commandRunning;
           if (s.agentProcessAlive !== undefined) agentAliveSnapshot[s.id] = s.agentProcessAlive;
         }
+        applyProcessExits(agentAliveSnapshot, requestedAt);
         useStore.getState().hydrateSupervision(snapshot);
         useStore.getState().hydrateResume(resumeSnapshot);
         useStore.getState().hydrateResumeBindings(resumeBindingSnapshot);
@@ -2063,7 +2034,8 @@ export default function AppLayout() {
             void useStore.getState().principalRegisterPane(ptyId);
           }).catch(() => { /* best-effort — transient failure; retry allowed on the next connect */ });
         }
-      }).catch(() => { /* best-effort — a transient list failure self-heals on the next connect */ });
+      }).catch(() => { /* best-effort — a transient list failure self-heals on the next connect */ })
+        .finally(() => livenessSnapshotSettled(requestedAt));
     };
     hydrate();
     const offConnected = window.electronAPI.daemon.onConnected(hydrate);
@@ -2073,10 +2045,16 @@ export default function AppLayout() {
     const offRestarted = window.electronAPI.pty.onRestarted((payload) => {
       useStore.getState().bumpSupervisionRestart(payload.ptyId);
     });
+    // The agent's process-death edge drops its row now; the 15 s poll below
+    // stays the backstop for panes the tracker never attributed.
+    const offAgentExit = window.electronAPI.pty.onAgentProcessExit((payload) => {
+      clearSurfaceAgentOnProcessExit(payload.ptyId, payload.slug, Date.now());
+    });
     return () => {
       offConnected();
       offChanged();
       offRestarted();
+      offAgentExit();
     };
   }, []);
 
@@ -2088,7 +2066,7 @@ export default function AppLayout() {
   // note). One in-memory list RPC per 15s; negligible against the daemon idle diet.
   useEffect(() => {
     const refreshBindings = () => {
-      const requestedAt = Date.now();
+      const requestedAt = livenessSnapshotRequested();
       void window.electronAPI.pty.list().then((sessions) => {
         const snapshot: Record<string, ResumeBinding> = {};
         // OSC 133 shell state rides the same poll — keeps the chip's authoritative
@@ -2107,6 +2085,7 @@ export default function AppLayout() {
           if (s.agentProcessAlive !== undefined) agentAliveSnapshot[s.id] = s.agentProcessAlive;
           if (s.resumeAgentOnScreen !== undefined) onScreenSnapshot[s.id] = s.resumeAgentOnScreen;
         }
+        applyProcessExits(agentAliveSnapshot, requestedAt);
         useStore.getState().hydrateResumeBindings(snapshot);
         useStore.getState().hydrateCommandRunning(cmdSnapshot);
         useStore.getState().hydrateAgentAlive(agentAliveSnapshot);
@@ -2115,7 +2094,8 @@ export default function AppLayout() {
         // An agent relaunched after boot (the Resume pill) is attributed by
         // the daemon seconds later; this tick is what brings its row back.
         seedSurfaceAgentsFromProcess(sessions, agentAliveSnapshot, cmdSnapshot);
-      }).catch(() => { /* transient list failure — the next tick self-heals */ });
+      }).catch(() => { /* transient list failure — the next tick self-heals */ })
+        .finally(() => livenessSnapshotSettled(requestedAt));
     };
     const id = window.setInterval(refreshBindings, 15_000);
     return () => window.clearInterval(id);
@@ -2339,7 +2319,6 @@ export default function AppLayout() {
       {/* Fleet, Schedules, Remote or Settings, swapped in by the rail. */}
       <RailPage />
       <NotificationPanel />
-      <MessageFeedPanel />
       {/* Cross-pane search results panel (T-F). Mount-gated on
           searchPanelOpen at this level (I3) so the panel's 6-field zustand
           subscriptions don't run when closed. */}
@@ -2375,7 +2354,6 @@ export default function AppLayout() {
           <Suspense fallback={null}><InspectOverlay /></Suspense>
         </ErrorBoundary>
       )}
-      <ApprovalDialog />
       {!inboxOwnsApprovals && <ExecuteApprovalDialog />}
       {!inboxOwnsApprovals && <PermissionApprovalDialogContainer />}
       <CloseTabConfirm />
@@ -2424,10 +2402,6 @@ export default function AppLayout() {
           the `?` prefix action and Settings › Setup and reset show it. It
           never opens by itself. */}
       {firstRunCompleted && cheatSheetForceShown && <KeyboardCheatSheet />}
-
-      {companyViewVisible && (
-        <CompanyView onClose={() => setCompanyViewVisible(false)} />
-      )}
 
       {/* Visual drag indicator — pointer-events always 'none' so it never
           blocks clicks, scrolling, or keyboard. Drop handling is done entirely

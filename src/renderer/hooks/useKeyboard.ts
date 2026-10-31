@@ -574,7 +574,6 @@ export function useKeyboard() {
       // S-C1 cockpit — every agent, one screen.
       toggleFleetView: () => { store.getState().toggleFleetView(); },
       toggleOfficeView: () => { store.getState().toggleOfficeView(); },
-      toggleCompanyView: () => { store.getState().toggleCompanyView(); },
       toggleBotsView: () => { store.getState().toggleBotsView(); },
       togglePluginsView: () => { store.getState().togglePluginsView(); },
       // Back to single view.
@@ -594,7 +593,6 @@ export function useKeyboard() {
         // A line that already has a bookmark keeps its dot and says nothing.
         if (addScrollbackBookmark(target.term, target.ptyId, store) === 'added') showBookmarkToast();
       },
-      toggleMessageFeed: () => { store.getState().toggleMessageFeed(); },
       toggleFileTree: () => { toggleFileTreePanel(store.getState()); },
       zoomIn: () => { if (!zoomBrowserPage('in')) zoomFont(FONT_SIZE_STEP); },
       zoomOut: () => { if (!zoomBrowserPage('out')) zoomFont(-FONT_SIZE_STEP); },

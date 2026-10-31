@@ -2413,10 +2413,10 @@ final anyway):
 
 | `deliver` | When it is typed |
 | --- | --- |
-| `next-turn` | After the running turn ends, one item per ended turn, as above. The default |
-| `steer` | Claude only: as soon as the pane allows, **during** the running turn. It goes into Claude's own composer queue, which applies it at the next tool boundary, exactly like a message typed into a running Claude in Terminal |
+| `next-turn` | After the running turn ends, one item per ended turn, as above. The default. On Codex it is submitted with Tab, which Codex queues for the next turn if one started meanwhile; a `!` shell command or a `/` command, which Tab does not submit, keeps Enter |
+| `steer` | Claude and Codex: as soon as the pane allows, **during** the running turn. On Claude it goes into Claude's own composer queue, which applies it at the next tool boundary, exactly like a message typed into a running Claude in Terminal. On Codex it is submitted with Enter, which Codex applies to the running turn (codex-cli 0.162.1); a `!` shell command or a `/` command waits for the turn's end instead |
 
-On a Codex or OpenCode pane, `steer` behaves as `next-turn`, and the item
+On an OpenCode pane, `steer` behaves as `next-turn`, and the item
 reads `deliver:"next-turn"` everywhere (send answer, `/turns`, SSE, the PATCH
 answer), so the app can tell that "send now" was not available there.
 
@@ -2429,14 +2429,14 @@ and in `/turns`. When nothing would hold it, it is sent directly, as without
 the capability. Omitted `deliver` is `next-turn`.
 
 **Order.** The queue stays FIFO per pane, with one exception: while a Claude
-turn runs, the oldest `steer` item goes ahead of `next-turn` items, of any
+or Codex turn runs, the oldest `steer` item goes ahead of `next-turn` items, of any
 owner, that wait for the turn's end. A steer item is not held by them, so a
 pane whose queue is blocked by the any-owner rule can be unblocked by
 switching your item to steer. When the turn is not running, the head is
 delivered first, whatever its mode.
 
 **Same safety as a direct send.** A steer item is typed through the same
-guarded paste: bracketed paste, then Enter; only into Claude's empty composer
+guarded paste: bracketed paste, then Enter; only into the agent's empty composer
 on screen (a draft there holds it); never while an approval, a dialog or a
 screen without the composer is up (it is held, as `queued`, and fails as
 `blocked` or `prompt-active` only when its idle lifetime runs out); never while
@@ -2454,7 +2454,7 @@ other body is 400 `invalid-chat-request`. There is no switch back.
 
 | Status | Body |
 | --- | --- |
-| 200 | `{state:"queued", deliver, clientMessageId}`: `deliver:"steer"`, also on a repeat; `deliver:"next-turn"` on Codex/OpenCode (unchanged). The delivery itself follows on SSE `chat.queue` |
+| 200 | `{state:"queued", deliver, clientMessageId}`: `deliver:"steer"`, also on a repeat; `deliver:"next-turn"` on OpenCode (unchanged). The delivery itself follows on SSE `chat.queue` |
 | 409 | `already-delivered` `{state}` |
 | 409 | `delivery-in-progress` `{state}` |
 | 409 | `queue-item-final` `{state, reason}`: `canceled`, `failed` or `uncertain` |
@@ -4890,6 +4890,8 @@ worded (the values listed); a value not listed means the English `title`.
 | `thread.stopped` | `title` string | `Stopped: {title}` | — |
 | `skill.archived` | `skill` string | `Skill archived: {skill}` | `skill`: the skill's name. |
 | `secret.deleted` | `name` string | `Key deleted: {name}` | `name`: the key's name (never its value). |
+| `wake.refused` | `refusal` string | `My Hermes runs only routines you set for it yourself; a bot wrote this one, so it is paused.`<br>`My Hermes runs routines only in its 1:1 chat, so this one is paused.`<br>`wmux could not check that this conversation is clean, so this run of the routine was not sent to My Hermes.`<br>`This conversation has taken in outside text, so wmux paused this routine; start a new conversation with My Hermes, then resume it.`<br>`Another bot or a guest has written in this chat, so wmux no longer sends it to My Hermes. The routine is paused.`<br>`My Hermes answers only your own messages in its 1:1 chat, so this was not sent to it.`<br>`My Hermes talks with you one to one, so a message outside its 1:1 chat was not sent to it.`<br>`wmux could not confirm this message is yours alone, so it was not sent to My Hermes.`<br>`wmux could not read this chat to check who wrote in it, so this was not sent to My Hermes.`<br>`Another bot or a guest has written in this chat, so wmux no longer sends it to My Hermes.` | A bot on My Hermes was not sent a wake. One title per `refusal`, in this order: `routineBotWritten`, `routineOutsideDm`, `routineCleanUnknown`, `routineTainted`, `roomDirtyPaused`, `notOwnerMessage`, `outsideDm`, `notAttended`, `roomUnreadable`, `roomDirty`. |
+| `turn.unsettled` | — | `My Hermes did not stop the last turn cleanly, so wmux closed its connection to Hermes. Your next message reconnects, in a new conversation if this one cannot resume.` | A bot on My Hermes: its stopped turn did not end within wmux's bound, so wmux closed the Hermes process it started for the bot (never the owner's gateway). |
 
 #### The Bots page (`bots`, `botMessages`, `/api/bots`, `/api/rooms/:workspaceId/messages`)
 
@@ -5394,7 +5396,11 @@ anything was sent: its reads kept failing, say) ends `refused` with
 `decidedAt`, or once the clock reads more than 24 hours earlier than
 `decidedAt` (a clock less far behind waits, as in the Undo window); nothing was
 sent, and the bot asks again with a new request if it is still wanted. An act a try of which may
-have reached GitHub is not aged out: a read of GitHub settles it.
+have reached GitHub is not aged out: a read of GitHub settles it. Once its
+reads have failed for 24 hours from its first try (12 failed reads at least),
+nothing more is sent for it: a read that then finds nothing on GitHub ends it
+`refused` with `approval-stale`, and while reads still cannot say it stays
+`approved`, and its thread gets one `status` card saying it may be on GitHub.
 
 `refusal` may be a list of codes joined by `, `; show one sentence per code.
 A refused `release` that made a draft adds one last code saying what became
@@ -6250,7 +6256,7 @@ transcript), then the Claude/Codex transcript file — and adds `chat` to every
   per token) and absent for OpenCode. A `managed` binding has `history:true`
   and every other capability `false` or absent. `cancel` is `false` unless you
   sent the `chat-cancel` capability (see Chat cancel); for OpenCode it also
-  needs a plugin that advertises abort. `queue:true` (live Claude) means a send
+  needs a plugin that advertises abort. `queue:true` (live Claude or Codex) means a send
   during a running turn can be accepted and answered with `queued:true`. A
   `chat-queue` caller sees `queue` for all three agents instead (see Chat queue).
 - **`blocked` is authoritative and computed at read time**: a pending approval

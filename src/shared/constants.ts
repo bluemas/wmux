@@ -58,6 +58,10 @@ export const IPC = {
   // manual rearm/stop). Always forwarded for badge sync; main also raises an
   // OS toast on guard trips only. Payload: { ptyId, status, reason, restartCount }.
   SUPERVISION_CHANGED: 'supervision:changed',
+  // The daemon's agent process-death edge (the tracker saw the pane's agent
+  // exit with no successor). The renderer drops the pane's agent row on it
+  // instead of waiting for its 15 s liveness poll. Payload: { ptyId, slug }.
+  AGENT_PROCESS_EXIT: 'agent:processExit',
   // X8 — renderer → main invoke channels for the supervision control surface
   // (pane context menu rearm / stop). Renderer-only by design: only the user
   // re-arms a tripped guard, never an external MCP/CLI client. Forwarded to
@@ -144,7 +148,7 @@ export const IPC = {
   // Renderer → main: paste a message into a pty and submit it, gated by the
   // raw-input approval guard `input.send` applies, re-checked before the Enter
   // (input.rpc.ts `gatedPasteSubmit`). Used for every non-operator delivery
-  // (A2A, company, channel mention nudges). Renderer-only, not on the pipe.
+  // (A2A, channel mention nudges). Renderer-only, not on the pipe.
   GATED_SUBMIT: 'pty:gated-submit',
   // J1 fan-out — renderer(다이얼로그) → main: 프롬프트 1개 → N 격리 태스크 스폰.
   // main의 FanOutService가 데몬 RPC(mission.start/update/invite)와 렌더러 spawn을
@@ -463,6 +467,8 @@ export const IPC = {
   WORK_LINK_LIST: 'workLink:list',
   WORK_LINK_GET: 'workLink:get',
   WORK_LINK_CHANGED: 'workLink:changed',
+  // Company presets: the launch line (and brief file) of each seat.
+  COMPANY_SEAT_LAUNCHES: 'company:seatLaunches',
   // Moa's track record (src/shared/trackRecord.ts): the weekly retro card and
   // its schedule. The counts themselves are main's and Moa's, not the renderer's.
   TRACK_RECORD_RETRO_GET: 'trackRecord:retro:get',

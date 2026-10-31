@@ -42,7 +42,6 @@ import {
   reattachModelEnvMarker,
   splitModelEnvMarker,
 } from '../../shared/workerLaunch';
-import { handleCompanyRpc } from '../../company/renderer/rpcHandlers';
 import { t } from '../i18n';
 import { parseRemoteSpawnedBy, remoteSpawnToastMessage } from '../utils/remoteSpawnedBy';
 import { formatA2aMessage, formatA2aBroadcast, sanitizeA2aName, type A2aFormatOptions } from '../utils/a2aFormat';
@@ -96,6 +95,7 @@ import { resolveWorkspaceTarget } from './workspaceTargeting';
 import { destroyRemoteSessions, destroySurfaceRemoteSession, destroyWorkspaceRemoteSessions } from '../utils/remoteSessionTeardown';
 import { remoteAgentKey } from '../../shared/remoteHosts';
 import { collectPaneTreeRemoteSessions } from '../../shared/paneUtils';
+import { decideCompanySend, companyCancelRefusal, companyDoneRefusal, companySeatOf, isCompanyTask } from '../../shared/company';
 import { findActivePtyId, buildWorkspaceListEntries } from './workspaceMirrorSnapshot';
 import { buildPhoneSidebarSnapshot } from './phoneSidebarSnapshot';
 import type { MoaPendingDecision } from '../../shared/moa';
@@ -556,10 +556,10 @@ export function useRpcBridge(): void {
     // `electronAPI.rpc.invoke('events.poll', params)` which routes
     // through main into the live pipe RpcRouter → the daemon-side
     // `events.poll` handler registered in `src/main/pipe/handlers/events.rpc.ts`.
-    // The renderer-side `useStore((s) => s.company)?.ceoWorkspaceId` is
-    // injected by the hook as the per-recipient scoping key (see plan
-    // U3); the daemon's per-workspace filter at events.rpc.ts:115-124
-    // admits the renderer's own workspace's events on that basis.
+    // The hook injects the human's reserved workspace (HUMAN_WORKSPACE_ID)
+    // as the per-recipient scoping key (see plan U3); the daemon's
+    // per-workspace filter at events.rpc.ts:115-124 admits the renderer's
+    // own workspace's events on that basis.
     (window as unknown as {
       __wmuxEventsPoll: (params: {
         cursor: number;
@@ -2163,6 +2163,9 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
         active: !isStashed && l.id === ws.activePaneId,
         // Explicit boolean on every row — see surface.list.
         stashed: isStashed,
+        // The pane's seat when the workspace is a company (the coordinator is
+        // shown as the CEO). Main reads it to decide who marks a company task done.
+        ...(ws.company ? { companySeat: companySeatOf(ws.company, l.id) } : {}),
         // The human sees "session ended" in the roster; an agent polling this
         // list must be able to see the same thing, or it will keep addressing a
         // pane whose session is gone.
@@ -3622,6 +3625,26 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
     // send — both are pinned on the task identically (see `to` below).
     const toAnchor = resolvedAddr ?? resolvedFallback;
 
+    // Company mode: a task to a company pane is checked against the receiver
+    // resolved above, so the check and the delivery name the same pane, before
+    // anything is stored (shared/company.ts).
+    const companyDecision = decideCompanySend({
+      workspaces: store.workspaces.map((w) => ({
+        id: w.id,
+        name: w.name,
+        company: w.company,
+        paneIds: getWorkspaceLeafPanes(w).map((leaf) => leaf.id),
+        ptyIds: getWorkspacePtyIds(w),
+      })),
+      targetWorkspaceId: target.id,
+      targetPaneId: toAnchor?.paneId ?? null,
+      senderPtyId,
+      operator: params.operatorOrigin === true,
+      execute: executeRequested,
+      data: params.data,
+    });
+    if (companyDecision.kind === 'refuse') return { error: `a2a.task.send: ${companyDecision.error}` };
+
     const initialMessage: Message = { kind: 'message', messageId: generateId('msg'), role: 'user', parts };
     // A task id main minted for its own operator send (Moa's hand-off names the
     // task in the text it delivers); main keeps it on the operator lane only.
@@ -3900,6 +3923,9 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
     const rawCallerPtyIdUpdate = typeof params.senderPtyId === 'string' ? params.senderPtyId : '';
     const callerPtyIdUpdate = isTerminalPtyInLeaves(callerLeavesUpdate, rawCallerPtyIdUpdate) ? rawCallerPtyIdUpdate : '';
     const callerAddrUpdate = resolveSenderPaneAddress(callerLeavesUpdate, callerPtyIdUpdate);
+    // The caller pane's company seat: who marks a company task done
+    // (shared/company.ts companyDoneRefusal).
+    const callerSeat = companySeatOf(callerWsUpdate?.company, callerAddrUpdate?.paneId);
 
     // ── Apply the status transition ──
     // envelope PR4(§6.M C6): main이 데몬 A2aTaskService에 이미 커밋한 전이는
@@ -3918,6 +3944,24 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
         store.applyDaemonTaskUpdate(committedTask);
         transitioned = true;
       } else {
+        // A company task ends as canceled only through its creator's cancel.
+        const cancelTarget = nextState === 'canceled' ? store.getTask(taskId) : undefined;
+        const refusal = cancelTarget && companyCancelRefusal(cancelTarget, {
+          workspaceId,
+          paneId: callerAddrUpdate?.paneId,
+          trusted: params.requirePaneIdentity !== true,
+        });
+        if (refusal) return { error: `a2a.task.update: ${refusal}` };
+        // A company task is marked done by its coordinator or the human. Main
+        // sets requirePaneIdentity on every call it routes (false: its trusted
+        // lane); a call that skips the router is not trusted here, as in the
+        // daemon.
+        const doneTarget = nextState === 'completed' ? store.getTask(taskId) : undefined;
+        const doneRefusal = doneTarget && companyDoneRefusal(doneTarget, {
+          trusted: params.requirePaneIdentity === false,
+          seat: callerSeat,
+        });
+        if (doneRefusal) return { error: `a2a.task.update: ${doneRefusal}` };
         const result = store.updateTaskStatus(
           taskId, nextState, workspaceId, callerAddrUpdate, undefined, evidence, params.requirePaneIdentity === true,
         );
@@ -3944,7 +3988,10 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
       const adoptedOrphan = !!callerWsUpdate && !!callerAddrUpdate && isReceiverPaneGone(
         task.metadata.to, workspaceId, callerLeavesUpdate.map((l) => l.id),
       );
-      const paneRole = resolvePaneRole(task.metadata, callerAddrUpdate) ?? (adoptedOrphan ? 'agent' : null);
+      // The coordinator that marked a company task done speaks to its receiver.
+      const coordinatorDone = nextState === 'completed' && callerSeat === 'coordinator' && isCompanyTask(task.history);
+      const paneRole = resolvePaneRole(task.metadata, callerAddrUpdate)
+        ?? (adoptedOrphan ? 'agent' : coordinatorDone ? 'user' : null);
       // A fully pane-anchored same-ws task only admits its from/to panes (mirror
       // of the reply branch). A verified non-participant pane is rejected rather
       // than defaulting to the ws-level 'user' role. (A status-only update from a
@@ -4111,6 +4158,20 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
     // read off pre-mutation metadata (cancelTask flips status in place today,
     // but a future GC/eviction could remove the task — capture first).
     const cancelTarget = store.getTask(taskId);
+    // Company mode: a company task is canceled by the pane that created it,
+    // the same rule the daemon applies when it holds the task.
+    if (cancelTarget) {
+      const callerWs = store.workspaces.find((w) => w.id === workspaceId);
+      const callerLeaves = callerWs ? getWorkspaceLeafPanes(callerWs) : [];
+      const rawCallerPtyId = typeof params.senderPtyId === 'string' ? params.senderPtyId : '';
+      const callerPtyId = isTerminalPtyInLeaves(callerLeaves, rawCallerPtyId) ? rawCallerPtyId : '';
+      const refusal = companyCancelRefusal(cancelTarget, {
+        workspaceId,
+        paneId: resolveSenderPaneAddress(callerLeaves, callerPtyId)?.paneId,
+        trusted: params.operatorOrigin === true || params.trustedLane === true,
+      });
+      if (refusal) return { error: `a2a.task.cancel: ${refusal}` };
+    }
     const result = store.cancelTask(taskId, workspaceId);
     if (!result.ok) return { error: `a2a.task.cancel: ${result.error}` };
     // Tee the cancellation onto the bus (cancelled), strictly AFTER the
@@ -4194,15 +4255,6 @@ export async function handleRpcMethod(method: string, params: RpcParams): Promis
     );
     store.setAgentSkills(workspaceId, skills);
     return { ok: true };
-  }
-
-  // -------------------------------------------------------------------------
-  // company.* — Company mode handlers
-  // -------------------------------------------------------------------------
-
-  if (method.startsWith('company.')) {
-    const result = await handleCompanyRpc(method, params, store);
-    if (result !== null) return result;
   }
 
   // -------------------------------------------------------------------------

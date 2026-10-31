@@ -18,6 +18,7 @@ import { contextBridge, ipcRenderer, webFrame, webUtils } from 'electron';
 import { START_POLARITY_STORAGE_KEY, resolveStartPolarity, startPaintCss } from '../shared/windowStartPaint';
 import { startLocaleFromArgv } from '../shared/startLocale';
 import { IPC } from '../shared/constants';
+import { CLAUDE_FILE_SEND_IPC } from '../shared/claudeFileSend';
 import type { A2aSpawnAskResult, A2aSpawnOutgoingList, A2aSpawnPolicySetResult, A2aSpawnPolicyV1, A2aSpawnRequestSummary, A2aSpawnUiAsk } from '../shared/a2aSpawn';
 import type { SleepPreventionMode, SleepWindow } from '../shared/sleepPrevention';
 import { ROOM_EVENT } from '../shared/room';
@@ -492,6 +493,14 @@ const electronAPI = {
         callback(payload);
       ipcRenderer.on(IPC.SUPERVISION_CHANGED, listener);
       return () => { ipcRenderer.removeListener(IPC.SUPERVISION_CHANGED, listener); };
+    },
+    // The pane's agent process died (the daemon tracker's death edge; a
+    // successor process is not a death). Drops the pane's agent row.
+    onAgentProcessExit: (callback: (payload: { ptyId: string; slug: string | null }) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, payload: { ptyId: string; slug: string | null }) =>
+        callback(payload);
+      ipcRenderer.on(IPC.AGENT_PROCESS_EXIT, listener);
+      return () => { ipcRenderer.removeListener(IPC.AGENT_PROCESS_EXIT, listener); };
     },
     // Fires once per attach when the daemon's SessionPipe ring-buffer
     // flush completes. recoveredBytes is the exact byte count replayed
@@ -1605,6 +1614,11 @@ const electronAPI = {
       return () => { ipcRenderer.removeListener(IPC.WORK_LINK_CHANGED, listener); };
     },
   },
+  // Company presets: write each seat's brief file and get its launch line.
+  company: {
+    seatLaunches: (req: import('../main/company/seatLaunch').SeatLaunchRequest) =>
+      ipcRenderer.invoke(IPC.COMPANY_SEAT_LAUNCHES, req) as Promise<import('../main/company/seatLaunch').SeatLaunchResult>,
+  },
   // Fleet's Plan card: Claude's plan dialogs and the answer to one (main window only).
   planApprovals: {
     list: () => ipcRenderer.invoke(IPC.PLAN_APPROVALS_LIST) as Promise<import('../shared/planApproval').PlanApprovalView[]>,
@@ -2021,10 +2035,10 @@ const electronAPI = {
           | 'network-error'
           | 'read-error';
         snapshot: {
-          sessionPct: number;
-          sessionResetEpochSec: number;
-          weeklyPct: number;
-          weeklyResetEpochSec: number;
+          sessionPct?: number;
+          sessionResetEpochSec?: number;
+          weeklyPct?: number;
+          weeklyResetEpochSec?: number;
           fetchedAtMs: number;
           scoped?: Array<{
             kind: string;
@@ -2055,6 +2069,11 @@ const electronAPI = {
       get: () => ipcRenderer.invoke(IPC.USAGE_RESERVE_GET) as Promise<{ enabled: boolean }>,
       set: (enabled: boolean) => ipcRenderer.invoke(IPC.USAGE_RESERVE_SET, enabled) as Promise<{ ok: boolean }>,
     },
+  },
+  /** Whether new panes let Claude send files to the phone (shared/claudeFileSend.ts). */
+  claudeFileSend: {
+    get: () => ipcRenderer.invoke(CLAUDE_FILE_SEND_IPC.GET) as Promise<{ enabled: boolean }>,
+    set: (enabled: boolean) => ipcRenderer.invoke(CLAUDE_FILE_SEND_IPC.SET, enabled) as Promise<{ ok: boolean }>,
   },
   // N4 — agents whose sign-in was lost (shared/agentAuthLost), one entry per
   // agent and account; `loginState` asks the agent's own status for an entry

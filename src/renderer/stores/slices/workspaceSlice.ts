@@ -11,6 +11,7 @@ import type { A2aRemoteSpawnedBy } from '../../../shared/a2aSpawn';
 import { parseRemoteSpawnedBy, type RemoteSpawnedWorkspace } from '../../utils/remoteSpawnedBy';
 import { normalizeRoleBindings } from '../../../shared/orchestratorRole';
 import { getPresetById } from '../../../shared/layoutPresets';
+import { companyPresetTree, companySeatsError, type CompanyWorkspaceInput } from '../../../shared/companyPreset';
 import { setLocale as i18nSetLocale, t as i18nT, detectSupportedLocale, type Locale } from '../../i18n';
 import { applyCustomCssVars, migrateThemeId, migrateCustomThemeColors } from '../../themes';
 import { resetInspectState, extractLayout, buildPaneFromLayout, siteGuidesAutoEnablePatch } from './uiSlice';
@@ -37,6 +38,7 @@ import {
 } from '../shadowWorkspace';
 import { clampFileTreeWidth } from '../../utils/fileTreeLayout';
 import { isSleepPreventionMode } from '../../../shared/sleepPrevention';
+import { parseWorkspaceCompany, type WorkspaceCompany } from '../../../shared/company';
 import { clampSidebarWidth, dropOwnerFoldKeys, movePinned, pinnedFirst, pruneTaskGroupExpanded, resolveSidebarSortMode, sortModeMigratedToAttention, unpinNestedTasks } from '../../utils/sidebarLayout';
 import {
   collectLeafIds,
@@ -68,9 +70,8 @@ function leafCwd(leaf: PaneLeaf): string {
 /**
  * Cold-park convergence helper: drop a workspace's parked / idle-clock entries.
  * Called wherever activeWorkspaceId is assigned OUTSIDE setActiveWorkspace
- * (removeWorkspace, company destroy/removeDept, loadSession) so a promoted-to-
- * visible workspace's park state converges immediately instead of lingering
- * until the next sweep. Guarded for stores/tests without the cold-park maps.
+ * (removeWorkspace, loadSession) so a promoted-to-visible workspace's park
+ * state converges immediately instead of lingering until the next sweep. Guarded for stores/tests without the cold-park maps.
  */
 /** The UI language a session restores to. */
 export function sessionLocaleOf(data: Pick<SessionData, 'locale'>): Locale {
@@ -147,11 +148,11 @@ export function activateLocalWorkspace(
 /**
  * Drop multiview members whose workspace is gone, and disband a group left with
  * fewer than two. Call from every path where workspaces disappear — the same set
- * clearColdParkEntry covers (removeWorkspace, company destroy/removeDept,
- * loadSession) — because they fail the same way: the grid gate counts
- * `multiviewIds` while the tiles are filtered against live workspaces, so one
- * live member plus one stale id renders a one-tile "grid" with full multiview
- * chrome that nothing but Ctrl+Shift+G dismisses (#751).
+ * clearColdParkEntry covers (removeWorkspace, loadSession) — because they fail
+ * the same way: the grid gate counts `multiviewIds` while the tiles are
+ * filtered against live workspaces, so one live member plus one stale id
+ * renders a one-tile "grid" with full multiview chrome that nothing but
+ * Ctrl+Shift+G dismisses (#751).
  * Guarded for stores/tests mounted without uiSlice.
  */
 export function pruneMultiviewMembership(state: {
@@ -273,11 +274,19 @@ export interface WorkspaceSlice {
   addWorkspace: (name?: string, profile?: WorkspaceProfile, requestedId?: string) => void;
   addWorkspaceWithPreset: (presetId: string, name?: string) => void;
   /**
+   * A company workspace from a preset (shared/companyPreset.ts): a pane per
+   * seat in the preset layout, each seeded with its name, what it owns and its
+   * launch line, and the CEO seat set before any agent starts. The seeds land
+   * in the same update as the tree, so the pane funnel never sees a seat
+   * without its seed. False when the input is not a valid company.
+   */
+  addCompanyWorkspace: (input: CompanyWorkspaceInput) => boolean;
+  /**
    * Duplicate an existing workspace's LAYOUT (pane tree, with fresh ids and
    * cleared ptyIds → new panes spawn their own PTYs) and its PROFILE (env +
    * startup command, re-normalized through the save-boundary secret policy).
    * The clone is named "<name> (copy [N])", inserted right after the source, and
-   * activated. Company role/department membership is intentionally NOT copied.
+   * activated. The company record is intentionally NOT copied.
    * No-op if the id is unknown.
    */
   duplicateWorkspace: (id: string) => void;
@@ -325,6 +334,12 @@ export interface WorkspaceSlice {
    * normalizeWorkspaceColor rather than stored.
    */
   setWorkspaceColor: (id: string, color: WorkspaceColorId | undefined) => void;
+  /**
+   * Make the workspace a company, change its seats, or (undefined) dissolve
+   * it. A workspace that already is one keeps its company id, so tasks and
+   * records that name it still match after the CEO or mission changes.
+   */
+  setWorkspaceCompany: (id: string, company: Omit<WorkspaceCompany, 'v' | 'id'> | undefined) => void;
   /** Mark a workspace as started by another PC (remote spawn); kept for its life. */
   setWorkspaceRemoteSpawnedBy: (id: string, by: A2aRemoteSpawnedBy) => void;
   /** `pin` is the drop target's pin state; omitted keeps the row's own. */
@@ -333,8 +348,7 @@ export interface WorkspaceSlice {
   /**
    * Fix 0 fallback action. Clears every ptyId-keyed piece of renderer state
    * in one atomic immer set: terminal surface ptyId across all workspaces +
-   * nested split panes, floatingPanePtyId, terminalBookmarks,
-   * and company member.ptyId. Called from AppLayout startup when scrollback
+   * nested split panes, floatingPanePtyId and terminalBookmarks. Called from AppLayout startup when scrollback
    * restore is off, and from its catch only when no daemon holds sessions
    * (local mode), so Terminal.tsx self-create receives a consistent blank
    * slate and external RPC handlers don't have stale pty-keyed maps lying
@@ -509,6 +523,49 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       if (state.sidebarNewAt) state.sidebarNewAt[ws.id] = Date.now();
       activateLocalWorkspace(state, ws.id);
     }),
+
+    addCompanyWorkspace: (input) => {
+      if (companySeatsError(input.seats, input.ceo, { made: true }) || get().workspaces.some((w: Workspace) => w.id === input.id)) return false;
+      set((state: StoreState) => {
+        const { root, leaves } = companyPresetTree(input.seats.length);
+        // The CEO takes the left pane; the other seats fill the rest in order.
+        const order = [input.ceo, ...input.seats.map((_, i) => i).filter((i) => i !== input.ceo)];
+        const leafOf = (seat: number) => leaves[order.indexOf(seat)];
+        const company = parseWorkspaceCompany({
+          v: 1,
+          id: generateId('co'),
+          coordinatorPaneId: leafOf(input.ceo).id,
+          mission: input.mission?.trim(),
+          standingOrders: input.standingOrders?.trim(),
+        });
+        const wsOrdinal = state.nextWorkspaceOrdinal ?? 1;
+        const ws: Workspace = {
+          id: input.id,
+          name: input.name,
+          rootPane: root,
+          activePaneId: leafOf(input.ceo).id,
+          wsOrdinal,
+          nextPaneOrdinal: assignPaneOrdinals(root, 1),
+          ...(input.cwd ? { profile: { startupCwd: input.cwd } } : {}),
+          ...(company ? { company } : {}),
+        };
+        input.seats.forEach((seat, i) => {
+          const owns = seat.owns.trim();
+          const cwd = seat.cwd ?? input.cwd;
+          state.projectPaneSeed[leafOf(i).id] = {
+            label: seat.label,
+            ...(seat.command ? { command: seat.command } : {}),
+            ...(cwd ? { cwd } : {}),
+            ...(owns ? { role: owns } : {}),
+          };
+        });
+        state.nextWorkspaceOrdinal = wsOrdinal + 1;
+        state.workspaces.push(ws);
+        if (state.sidebarNewAt) state.sidebarNewAt[ws.id] = Date.now();
+        activateLocalWorkspace(state, ws.id);
+      });
+      return true;
+    },
 
     // #1011 — Active → Archived → Deleted. Archiving snapshots the
     // configuration, then delegates the teardown to removeWorkspace so every
@@ -1043,6 +1100,30 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       }
     }),
 
+    setWorkspaceCompany: (id, company) => set((state: StoreState) => {
+      const ws = state.workspaces.find((w: Workspace) => w.id === id);
+      if (!ws) return;
+      if (!company) {
+        delete ws.company;
+        // The board goes with the company; a pane holding nothing else keeps
+        // it, and it says the workspace is no longer a company.
+        for (const leaf of getWorkspaceLeafPanes(ws)) {
+          if (leaf.surfaces.every((s) => s.surfaceType === 'board')) continue;
+          leaf.surfaces = leaf.surfaces.filter((s) => s.surfaceType !== 'board');
+          if (!leaf.surfaces.some((s) => s.id === leaf.activeSurfaceId)) leaf.activeSurfaceId = leaf.surfaces[0].id;
+        }
+        return;
+      }
+      const record = parseWorkspaceCompany({
+        v: 1,
+        id: ws.company?.id ?? generateId('co'),
+        coordinatorPaneId: company.coordinatorPaneId,
+        mission: company.mission?.trim(),
+        standingOrders: company.standingOrders?.trim(),
+      });
+      if (record) ws.company = record;
+    }),
+
     setWorkspaceRemoteSpawnedBy: (id, by) => set((state: StoreState) => {
       const ws = state.workspaces.find((w: Workspace) => w.id === id) as RemoteSpawnedWorkspace | undefined;
       if (ws) ws.remoteSpawnedBy = { ...by };
@@ -1171,12 +1252,12 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       //   call store.clearAllPtyState(), the explicit, logged,
       //   generation-guarded form of the historical wipe.
       //
-      //   Side state (floatingPanePtyId, terminalBookmarks,
-      //   company member.ptyId) is also cleared by
+      //   Side state (floatingPanePtyId, terminalBookmarks) is also
+      //   cleared by
       //   clearAllPtyState — see workspaceSlice.clearAllPtyState
       //   below for the cross-slice fan-out.
       //
-      //   External RPC handlers (useRpcBridge, companyRpcHandlers)
+      //   External RPC handlers (useRpcBridge)
       //   guard on uiSlice.paneGate === 'ready' to prevent
       //   stale-ptyId writes during the pending window.
       //
@@ -1332,6 +1413,14 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
         // main pushes fresh ones as the panes report.
         if (ws.metadata?.pr !== undefined) delete ws.metadata.pr;
         if (ws.metadata?.gitSync !== undefined) delete ws.metadata.gitSync;
+        // The old company mode stamped these; a company is its own record,
+        // so a saved 'ceo' or 'lead' never comes back as one.
+        const legacy = ws as Workspace & { companyRole?: unknown; companyDeptName?: unknown };
+        delete legacy.companyRole;
+        delete legacy.companyDeptName;
+        const company = parseWorkspaceCompany(ws.company);
+        if (company) ws.company = company;
+        else delete ws.company;
       }
 
       state.workspaces = data.workspaces;
@@ -1771,11 +1860,7 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
         state.autoUpdateEnabled = data.autoUpdateEnabled;
         window.electronAPI.settings.setAutoUpdateEnabled(data.autoUpdateEnabled);
       }
-      if (data.sidebarMode) state.sidebarMode = data.sidebarMode;
       if (data.channelDockVisible != null) state.channelDockVisible = data.channelDockVisible;
-      if (data.company !== undefined) state.company = data.company ?? null;
-      if (data.memberCosts) state.memberCosts = data.memberCosts;
-      if (data.sessionStartTime != null) state.sessionStartTime = data.sessionStartTime;
       if (data.onboardingCompleted != null) state.onboardingCompleted = data.onboardingCompleted;
       // First-run wizard + cheat sheet (Plan 1.15 + 1.18). Mirrors onboardingCompleted
       // pattern: only overwrite when the saved field is present, otherwise leave the
@@ -1823,7 +1908,7 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
     // Called from AppLayout startup catch when reconcile aborts or times
     // out. Reproduces the historical loadSession wipe as an explicit
     // fallback, plus the side-state fan-out the original wipe never
-    // covered (floating pane, bookmarks, token data, company members).
+    // covered (floating pane, bookmarks, token data).
     // After this runs, Terminal.tsx self-create sees externalPtyId='' on
     // mount and creates fresh PTYs — the well-tested new-pane path.
     clearSurfacePtyIdByPty: (ptyId: string, recovery?: DeadPaneRecovery) => set((state: StoreState) => {
@@ -1899,15 +1984,6 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       }
       if (state.deadPaneRecoveryOfferByPtyId) state.deadPaneRecoveryOfferByPtyId = {};
       if (state.ptyUnconfirmedById) state.ptyUnconfirmedById = {};
-
-      // 3. companySlice — member.ptyId across all departments.
-      if (state.company) {
-        for (const dept of state.company.departments) {
-          for (const member of dept.members) {
-            member.ptyId = undefined;
-          }
-        }
-      }
     }),
   };
 };
