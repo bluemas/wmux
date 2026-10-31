@@ -347,6 +347,13 @@ export default function MiniSidebar({ rail = false, collapsed = true }: { rail?:
                   aria-hidden="true"
                 />
               )}
+              {isMultiview && (
+                <div
+                  className="absolute top-1 bottom-1 right-0 w-[3px] z-[1] pointer-events-none bg-[var(--accent-blue)]"
+                  data-multiview-bar=""
+                  aria-hidden="true"
+                />
+              )}
               {showIndicator && dropIndicator.side === 'above' && (
                 <div className="absolute top-0 left-0 right-0 h-0.5 bg-[var(--accent-blue)] rounded-full z-10 -translate-y-px" />
               )}
