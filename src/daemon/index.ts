@@ -230,6 +230,7 @@ import { monitorEventLoopDelay, performance as nodePerformance } from 'node:perf
 import { DAEMON_EXIT_ALREADY_RUNNING, ENV_KEYS, dataSuffix, isBrainPty } from '../shared/constants';
 import { toResumeCommand, resumeGrammarFor, resumeOfferForRecovered, mergeResumeBinding, isProvisionalCapture, hasAuthoritativeTranscript, transcriptRelocated, normalizeResumeCwd, isUsableResumeBinding, isPlausibleResumeSessionId } from '../shared/agentResume';
 import type { ResumeBinding } from '../shared/agentResume';
+import { alignResumeCwd } from './alignResumeCwd';
 import { agentDisplayToSlug, agentRow, AGENT_SLUG_SET, isAgentSlug } from '../shared/agentIdentity';
 import type { AgentEventStatus } from '../main/pty/AgentDetector';
 import { DIALOG_RECHECK_MS, HookIngest, identifiedAgentPid, type HookArbitration } from './hooks/HookIngest';
@@ -1640,7 +1641,8 @@ function ingestResumeSpool(
     // never becomes a durable binding.
     const parsed = spoolRecordToBinding(rec);
     if (!parsed) { drop(); continue; }
-    const { ptyId, binding } = parsed;
+    const { ptyId } = parsed;
+    let { binding } = parsed;
 
     const managed = sessionManager.getSession(ptyId);
     if (!managed) {
@@ -1652,6 +1654,7 @@ function ingestResumeSpool(
     // F7: `--resume` is cwd-scoped, so the capture's origin cwd must match the
     // recovered pane's cwd; a mismatch would dead-end (offer --continue instead).
     // Normalized compare so a drive-case / trailing-slash diff isn't a false miss.
+    binding = alignResumeCwd(binding, managed.meta.cwd);
     if (normalizeResumeCwd(binding.cwd) !== normalizeResumeCwd(managed.meta.cwd)) { drop(); continue; }
     const prev = managed.meta.resumeBinding;
     // Never clobber: for a DIFFERENT conversation, only a strictly-newer spool
@@ -2415,7 +2418,7 @@ async function recoverSessions(
         if (persisted.lastDetectedAgentEvidence) managed.meta.lastDetectedAgentEvidence = persisted.lastDetectedAgentEvidence;
       }
       if (persisted.resumeBinding && !managed.meta.resumeBinding) {
-        managed.meta.resumeBinding = persisted.resumeBinding;
+        managed.meta.resumeBinding = alignResumeCwd(persisted.resumeBinding, managed.meta.cwd);
       }
       // Same reason, for the owned-Codex hint: the saved value is read only to
       // build the resume command. When recovery runs without a relay — no
@@ -3653,6 +3656,7 @@ function registerRpcHandlers(
         // conversation this shell has nothing to do with. (The cwd guard below
         // already refuses it; the meta assignment did not.)
         if (!startFresh) {
+          if (session.resumeBinding) session.resumeBinding = alignResumeCwd(session.resumeBinding, promotedSession.meta.cwd);
           promotedSession.meta.resumeBinding = session.resumeBinding;
           promotedSession.meta.lastDetectedAgent = session.lastDetectedAgent;
           promotedSession.meta.lastDetectedAgentEvidence = session.lastDetectedAgentEvidence;
