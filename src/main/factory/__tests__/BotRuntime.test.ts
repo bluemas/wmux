@@ -1699,11 +1699,11 @@ describe('BotRuntime: a bot on My Hermes', () => {
     const r = rig();
     const res = r.store.create({ workspaceId: 'ws-1', name: 'Mine', engine: OWN });
     if (!res.ok) throw new Error(res.message);
-    const notes: Array<{ why: string; threadId?: string }> = [];
+    const notes: Array<{ why: string; code?: string | null; threadId?: string }> = [];
     setBotRuntimePorts({
       wakeAttended: () => opts.attended ?? true,
       ownHermesRoomClean: () => (opts.roomClean === undefined ? true : opts.roomClean),
-      noteOwnHermesRefusal: (_p, item, why) => notes.push({ why, ...(item.threadId ? { threadId: item.threadId } : {}) }),
+      noteOwnHermesRefusal: (_p, item, why, code) => notes.push({ why, code, ...(item.threadId ? { threadId: item.threadId } : {}) }),
       readThreadTail: () => ({ cards: [{ title: 'ROOM HISTORY', body: 'earlier words' } as never], truncated: false }),
     });
     return { ...r, id: res.bot.id, notes };
@@ -1723,19 +1723,20 @@ describe('BotRuntime: a bot on My Hermes', () => {
   });
 
   it('refuses, with a room note and no turn: a message outside its 1:1, an unattended or tainted wake, a room another bot or a guest wrote in, and the Run button', async () => {
-    const cases: Array<[Parameters<typeof ownRig>[0], (r: ReturnType<typeof ownRig>) => void, RegExp]> = [
-      [{}, (r) => { r.runtime.wake(r.id, { text: 'hi', threadId: 'general' }); }, /one to one/],
-      [{ attended: false }, (r) => { r.runtime.wake(r.id, { text: 'hi', threadId: `dm:${r.id}` }); }, /yours alone/],
-      [{ roomClean: false }, (r) => { r.runtime.wake(r.id, { text: 'hi', threadId: `dm:${r.id}` }); }, /Another bot or a guest/],
-      [{ roomClean: null }, (r) => { r.runtime.wake(r.id, { text: 'hi', threadId: `dm:${r.id}` }); }, /could not read this chat/],
-      [{}, (r) => { r.runtime.wake(r.id, { threadId: `dm:${r.id}` }); }, /only your own messages/],
+    const cases: Array<[Parameters<typeof ownRig>[0], (r: ReturnType<typeof ownRig>) => void, RegExp, string]> = [
+      [{}, (r) => { r.runtime.wake(r.id, { text: 'hi', threadId: 'general' }); }, /one to one/, 'outsideDm'],
+      [{ attended: false }, (r) => { r.runtime.wake(r.id, { text: 'hi', threadId: `dm:${r.id}` }); }, /yours alone/, 'notAttended'],
+      [{ roomClean: false }, (r) => { r.runtime.wake(r.id, { text: 'hi', threadId: `dm:${r.id}` }); }, /Another bot or a guest/, 'roomDirty'],
+      [{ roomClean: null }, (r) => { r.runtime.wake(r.id, { text: 'hi', threadId: `dm:${r.id}` }); }, /could not read this chat/, 'roomUnreadable'],
+      [{}, (r) => { r.runtime.wake(r.id, { threadId: `dm:${r.id}` }); }, /only your own messages/, 'notOwnerMessage'],
     ];
-    for (const [opts, wake, why] of cases) {
+    for (const [opts, wake, why, code] of cases) {
       const r = ownRig(opts);
       wake(r);
       await settle();
       expect(r.adapters.flatMap((a) => a.prompts)).toEqual([]);
-      expect(r.notes).toEqual([expect.objectContaining({ why: expect.stringMatching(why) })]);
+      // The note carries its code, so the card is worded in the reader's language.
+      expect(r.notes).toEqual([expect.objectContaining({ why: expect.stringMatching(why), code })]);
       expect(r.store.get(r.id)?.parked).toBeUndefined();
       // Nothing reached Hermes: the turn is not charged.
       expect(r.store.usageOf(r.id).turns).toEqual([]);
@@ -1766,6 +1767,110 @@ describe('BotRuntime: a bot on My Hermes', () => {
     await settle();
     expect(r.adapters.flatMap((a) => a.prompts)).toEqual([]);
     expect(r.notes).toEqual([expect.objectContaining({ why: expect.stringMatching(/yours alone/) })]);
+  });
+
+  describe('an owner routine', () => {
+    type Routine = { routineId: string; title: string; prompt: string; schedule: string; author?: 'owner'; botId?: string; workspaceId?: string; threadId?: `dm:${string}` | 'general' };
+    function routineRig(opts: { routine: (id: string) => Routine; clean?: boolean | null; signedIn?: boolean | 'unknown'; roomClean?: boolean | null }) {
+      const r = ownRig(opts.roomClean !== undefined ? { roomClean: opts.roomClean } : {});
+      const paused: string[] = [];
+      setBotRuntimePorts({
+        resolveRoutine: () => opts.routine(r.id) as never,
+        ownerRoutineClean: (_item, botId) => (opts.clean === undefined ? conversationMarks(botId)?.tainted === false : opts.clean),
+        wakeSignedIn: () => opts.signedIn ?? false,
+        // Paused once: the store answers true only the first time.
+        pauseRefusedRoutine: (_botId, routineId) => {
+          if (paused.includes(routineId)) return false;
+          paused.push(routineId);
+          return true;
+        },
+      });
+      let slot = 0;
+      const fire = (routineId = 'r-aaaaaaaa', botId = r.id) => r.queue.enqueue({ botId, workspaceId: 'ws-1', reason: { kind: 'routine', routineId, dueAt: clock + (slot += 1) }, priority: 2, threadId: `dm:${botId}` });
+      return { ...r, paused, fire };
+    }
+    const owners = (botId: string): Routine => ({ routineId: 'r-aaaaaaaa', title: 'Build', prompt: '/build check', schedule: 'every 60 min', author: 'owner', botId, workspaceId: 'ws-1', threadId: `dm:${botId}` });
+
+    it('runs with the routine\'s own text, though no one is present, when the wake and its conversation are clean', async () => {
+      const r = routineRig({ routine: owners });
+      setBotRuntimePorts({ wakeAttended: () => false });
+      r.fire();
+      await settle(10);
+      expect(r.adapters.flatMap((a) => a.prompts)).toEqual(['\\/build check']);
+      expect(r.notes).toEqual([]);
+    });
+
+    it('a queue item naming another bot\'s owner routine is refused, with no pause and no note', async () => {
+      const r = routineRig({ routine: () => owners('bot-0000000b') });
+      r.fire();
+      await settle(10);
+      expect(r.adapters.flatMap((a) => a.prompts)).toEqual([]);
+      expect(r.paused).toEqual([]);
+      expect(r.notes).toEqual([]);
+      expect(r.store.usageOf(r.id).turns).toEqual([]);
+    });
+
+    it('over a tainted conversation or a signed-in wake it is refused, paused with one note, and not charged', async () => {
+      for (const opts of [{ clean: false }, { signedIn: true }]) {
+        const r = routineRig({ routine: owners, ...opts });
+        r.fire();
+        await settle(10);
+        r.fire();
+        await settle(10);
+        expect(r.adapters.flatMap((a) => a.prompts)).toEqual([]);
+        expect(r.paused).toEqual(['r-aaaaaaaa']);
+        expect(r.notes).toEqual([expect.objectContaining({ why: expect.stringMatching(/outside text/) })]);
+        expect(r.store.usageOf(r.id).turns).toEqual([]);
+        __resetBotRuntimePortsForTesting();
+      }
+    });
+
+    it('what may pass by itself refuses the run without a pause: a check that cannot be made, a chat that cannot be read', async () => {
+      for (const [opts, why] of [[{ signedIn: 'unknown' as const }, /could not check/], [{ clean: null }, /could not check/], [{ roomClean: null }, /could not read this chat/]] as const) {
+        const r = routineRig({ routine: owners, ...opts });
+        r.fire();
+        await settle(10);
+        expect(r.adapters.flatMap((a) => a.prompts)).toEqual([]);
+        expect(r.paused).toEqual([]);
+        expect(r.notes).toEqual([expect.objectContaining({ why: expect.stringMatching(why) })]);
+        expect(r.store.usageOf(r.id).turns).toEqual([]);
+        __resetBotRuntimePortsForTesting();
+      }
+    });
+
+    it('a routine the bot wrote (from before an engine switch) is refused and paused, with one note', async () => {
+      const r = routineRig({ routine: (id) => ({ ...owners(id), author: undefined }) });
+      r.fire();
+      await settle(10);
+      r.fire();
+      await settle(10);
+      expect(r.adapters.flatMap((a) => a.prompts)).toEqual([]);
+      expect(r.paused).toEqual(['r-aaaaaaaa']);
+      expect(r.notes).toEqual([expect.objectContaining({ why: expect.stringMatching(/a bot wrote this one/), threadId: `dm:${r.id}` })]);
+    });
+
+    it('a wake restored from the queue file is checked against the routine as it is when it runs', async () => {
+      const first = routineRig({ routine: owners });
+      first.runtime.dispose();
+      first.queue.enqueue({ botId: first.id, workspaceId: 'ws-1', reason: { kind: 'routine', routineId: 'r-aaaaaaaa', dueAt: clock }, priority: 2, threadId: `dm:${first.id}` });
+      await Promise.all([first.store.flush(), first.queue.flush(), first.sessions.flush()]);
+      const again = rig({ load: true });
+      const notes: string[] = [];
+      setBotRuntimePorts({
+        wakeAttended: () => true,
+        ownHermesRoomClean: () => true,
+        ownerRoutineClean: () => true,
+        wakeSignedIn: () => false,
+        noteOwnHermesRefusal: (_p, _i, why) => notes.push(why),
+        pauseRefusedRoutine: () => true,
+        // Rewritten by an older build since it was queued: no author now.
+        resolveRoutine: () => ({ ...owners(first.id), author: undefined }) as never,
+      });
+      again.runtime.kick();
+      await settle(10);
+      expect(again.adapters.flatMap((a) => a.prompts)).toEqual([]);
+      expect(notes).toEqual([expect.stringMatching(/a bot wrote this one/)]);
+    });
   });
 
   it('a timed-out turn is interrupted but its session kept (the adapter stays blocked until Hermes ends the turn)', async () => {

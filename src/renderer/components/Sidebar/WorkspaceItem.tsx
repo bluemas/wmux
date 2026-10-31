@@ -19,13 +19,14 @@ import { usePrefersReducedMotion } from '../ui/MediaPreview';
 import { workspaceHasUsageLimitWaiting } from '../../stores/slices/usageLimitSlice';
 import { workspaceHasAuthLost } from '../../stores/slices/agentAuthSlice';
 import { selectWorkspaceAttentionClasses } from '../../stores/selectors/fleet';
-import { IconCopy, IconX, IconGear, IconChevron, IconBell, IconFolder, IconTerminal, IconExternalLink, IconCheck, IconGitBranch, IconWorktree, IconWarning, IconFanOut, IconPin, IconBookmark } from '../icons';
+import { IconCopy, IconX, IconGear, IconChevron, IconBell, IconFolder, IconTerminal, IconExternalLink, IconCheck, IconGitBranch, IconWorktree, IconWarning, IconFanOut, IconPin, IconBookmark, IconOrgChart, IconGrid } from '../icons';
 import { tokenAttrs } from '../../themes';
 import { HIT_TARGET_24_CLUSTER, HIT_TARGET_24_IN_CLUSTER } from '../hitArea';
 import { buildWorkspaceMarkdown } from '../../utils/sessionInfoMarkdown';
 import { collectTerminalSurfaces, collectWorkspaceTerminalSurfaces } from '../../utils/paneTraversal';
 import { openUrlInBrowserPane } from '../../utils/browserPaneActions';
 import WorkspaceProfileModal from './WorkspaceProfileModal';
+import CompanyDialog from './CompanyDialog';
 import Popover from '../ui/Popover';
 import Button from '../ui/Button';
 import { placePopover } from '../AgentToolbar/placePopover';
@@ -52,6 +53,8 @@ interface WorkspaceItemProps {
   workspaceId: string;
   isActive: boolean;
   isMultiview: boolean;
+  /** This workspace's multiview group number (utils/multiviewGroups.ts), when it is in one. */
+  multiviewGroup?: number;
   index: number;
   /** The Ctrl+N digit that reaches this row (see workspaceShortcutNumber), or
    *  undefined when no digit does. */
@@ -228,11 +231,15 @@ function useGitLineTier(deps: readonly unknown[]) {
  * latest terminal notification. Renders nothing until metadata arrives —
  * zero-config, no reserved blank space.
  */
-function WorkspaceContextLine({ metadata, onPortClick, actions, metaHiddenOnHover, question, innerTab }: {
+function WorkspaceContextLine({ metadata, onPortClick, actions, metaHiddenOnHover, question, innerTab, company }: {
   metadata: WorkspaceMetadata;
   /** A needs-you row's question: it takes the git line's place, with the
    *  row's actions at its end. */
   question?: string;
+  /** A company row shows its mission where the git line goes, and no git
+   *  line at all: with panes in different worktrees the branch, PR and sync
+   *  are whichever pane reported last. */
+  company?: { mission?: string };
   /** Tab order of the line's own buttons: reachable only once the row has
    *  keyboard focus (roving tabindex). */
   innerTab?: number;
@@ -250,7 +257,9 @@ function WorkspaceContextLine({ metadata, onPortClick, actions, metaHiddenOnHove
   const ports = showPorts ? (metadata.listeningPorts ?? []) : [];
   const hasContext = ports.length > 0;
   const note = metadata.lastNotificationText;
-  if (!question && !metadata.gitBranch && !hasContext && !note) return null;
+  const gitBranch = company ? undefined : metadata.gitBranch;
+  const mission = company?.mission;
+  if (!question && !mission && !gitBranch && !hasContext && !note) return null;
   return (
     <>
       {question && (
@@ -259,18 +268,27 @@ function WorkspaceContextLine({ metadata, onPortClick, actions, metaHiddenOnHove
           {actions}
         </div>
       )}
+      {!question && mission && (
+        <div className="flex items-center gap-2 mt-1 text-[11px] leading-4 text-[color-mix(in_srgb,var(--text-main)_45%,transparent)] min-w-0" data-company-mission>
+          <span className="min-w-0 flex-1 truncate font-sans" title={mission}>
+            <span className="mr-1 inline-flex align-[-2px]" aria-hidden="true"><IconOrgChart size={12} /></span>
+            {mission}
+          </span>
+          {actions}
+        </div>
+      )}
       {/* Git 신호등 행 — 이름 바로 아래 전용 줄(owner 2026-07-20: 행이 위아래로
           두꺼워져도 OK). 브랜치·신호등·PR을 한 줄에, 포트·알림은 다음 줄로. */}
-      {!question && metadata.gitBranch && (
+      {!question && gitBranch && (
         <div ref={lineRef} className="flex items-center gap-2 mt-1 text-[11px] leading-4 tabular-nums text-[color-mix(in_srgb,var(--text-main)_45%,transparent)] min-w-0" data-git-signal-line data-git-line-tier={tier || undefined}>
           <span
             ref={branchRef}
             className="min-w-0 truncate"
-            title={`${t('workspace.gitBranch')}: ${metadata.gitBranch}${metadata.gitIsWorktree ? ` (${t('workspace.gitWorktree')})` : ''}`}
+            title={`${t('workspace.gitBranch')}: ${gitBranch}${metadata.gitIsWorktree ? ` (${t('workspace.gitWorktree')})` : ''}`}
           >
             {/* #1481 — branch and worktree marks are SVG icons, not ⎇ / ⊕. */}
             <span className="mr-1 inline-flex align-[-2px]" aria-hidden="true"><IconGitBranch size={12} /></span>
-            {metadata.gitBranch}
+            {gitBranch}
             {metadata.gitIsWorktree ? <span className="ml-1 inline-flex align-[-1px]" aria-hidden="true"><IconWorktree size={10} /></span> : null}
           </span>
           {metadata.gitSync && tier < 2 && (
@@ -452,7 +470,7 @@ function shortenPath(path: string, maxLen = 25): string {
   return `.../${parts.slice(-2).join('/')}`;
 }
 
-function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumber, onSelect, onCtrlSelect, onRename, onClose, onArchive, onCopyInfo, onDuplicate, onReorder, taskRow = false, shortcutHintHidden = false, nestedTaskIds, renderTask, onCloseTask, tabStop = false }: WorkspaceItemProps) {
+function WorkspaceItem({ workspaceId, isActive, isMultiview, multiviewGroup, index, shortcutNumber, onSelect, onCtrlSelect, onRename, onClose, onArchive, onCopyInfo, onDuplicate, onReorder, taskRow = false, shortcutHintHidden = false, nestedTaskIds, renderTask, onCloseTask, tabStop = false }: WorkspaceItemProps) {
   const t = useT();
   // A1: 자기 ws만 구독 — 배경 ws churn/다른 항목 변경에는 리렌더되지 않는다.
   const workspace = useRowStore(selectWorkspaceById(workspaceId));
@@ -474,6 +492,8 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumb
   const [folderApps, setFolderApps] = useState<{ id: string; name: string }[]>([]);
   const [closeConfirmPos, setCloseConfirmPos] = useState<CloseConfirmAnchor | null>(null);
   const [profileModalOpen, setProfileModalOpen] = useState(false);
+  const [companyDialogOpen, setCompanyDialogOpen] = useState(false);
+  const rowRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const dragStartTimeRef = useRef<number>(0);
 
@@ -483,6 +503,8 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumb
   // Sidebar reorder source index lives in the store, not in dataTransfer.
   // See uiSlice.draggedWorkspaceIndex for why this is out-of-band.
   const setWorkspaceColor = useRowStore((s) => s.setWorkspaceColor);
+  const setWorkspaceCompany = useRowStore((s) => s.setWorkspaceCompany);
+  const openCompanyBoard = useRowStore((s) => s.openCompanyBoard);
   // Browser mirror (wmux web /app): no rename, reorder, context menu or row actions.
   const readOnly = useRowStore((s) => s.readOnly);
   const setDraggedWorkspaceIndex = useRowStore((s) => s.setDraggedWorkspaceIndex);
@@ -1160,7 +1182,8 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumb
   // free of margins of its own. `pointer-events` follow visibility. Focus
   // anywhere on the row line reveals the cluster exactly as hover does, and
   // hides the same metadata, so a Tab into the row never overflows the line.
-  const actionsOnGitLine = !!metadata?.gitBranch || !!question;
+  const company = workspace.company;
+  const actionsOnGitLine = (company ? !!company.mission : !!metadata?.gitBranch) || !!question;
   // A nested task row has no width to spare on its name line (78px of text
   // at the 220px minimum): without a branch, its actions get a line of their
   // own, the height its sibling rows' git line takes, so the row never
@@ -1228,15 +1251,23 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumb
         }
       }}>
       {/* Color tag rail. Sits inside the row's rounded box, so it reads as part
-          of the row rather than as a separate divider. When the workspace is
-          also in multiview it shifts 2px right, clearing the blue multiview
-          border instead of covering it — the two signals mean different things
-          and must both stay visible. pointer-events-none so it never eats a
-          click or a drag hit-test. */}
+          of the row rather than as a separate divider. pointer-events-none so
+          it never eats a click or a drag hit-test. */}
       {tagColor && (
         <div
-          className="absolute top-[3px] bottom-[3px] w-[3px] rounded-full z-[1] pointer-events-none"
-          style={{ left: isMultiview ? 2 : 0, background: tagColor }}
+          className="absolute top-[3px] bottom-[3px] w-[3px] z-[1] pointer-events-none"
+          style={{ left: 0, background: tagColor }}
+          aria-hidden="true"
+        />
+      )}
+
+      {/* Multiview bar: the group on screen also marks its rows with a square
+          bar on the right edge, so the grid's members read as one block down
+          the list. The left edge stays the color tag's. */}
+      {isMultiview && (
+        <div
+          className="absolute top-[3px] bottom-[3px] right-0 w-[3px] z-[1] pointer-events-none bg-[var(--accent-blue)]"
+          data-multiview-bar=""
           aria-hidden="true"
         />
       )}
@@ -1256,7 +1287,6 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumb
         className={`sidebar-row px-2.5 ${taskRow ? 'sidebar-row-task py-1.5' : 'py-2'} cursor-pointer rounded-md select-none ${needsYou ? 'sidebar-row-needs' : ''} ${pulseClass} ${
           isActive ? 'sidebar-row-active' : ''
         }`}
-        style={isMultiview ? { borderLeft: '2px solid var(--accent-blue)' } : undefined}
         onClick={handleClick}
         onDoubleClick={handleDoubleClick}
         onContextMenu={handleContextMenu}
@@ -1279,6 +1309,7 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumb
             tabindex): focus here reveals the same actions hover does, and the
             ring sits on the line, never on the roster below it. */}
         <div
+          ref={rowRef}
           className={`${hover.group} -mx-2.5 -my-2 flex min-w-0 items-start gap-2 px-2.5 py-2`}
           role="treeitem"
           aria-level={taskRow ? 2 : 1}
@@ -1368,6 +1399,24 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumb
                 >
                   {displayName}
                 </span>
+                {/* Which multiview group the row is in. Neutral like the pin;
+                    the group on screen reads in the accent, since being on
+                    screen is a state. */}
+                {multiviewGroup !== undefined && (
+                  <span
+                    className={`flex-none inline-flex items-center gap-0.5 rounded-full px-1 text-[10px] leading-[14px] font-semibold tabular-nums bg-[color-mix(in_srgb,var(--text-main)_8%,transparent)] ${
+                      isMultiview ? 'text-[var(--accent-blue)]' : 'text-[var(--text-muted)]'
+                    }`}
+                    role="img"
+                    aria-label={t('sidebar.multiviewGroup', { n: multiviewGroup })}
+                    title={t('sidebar.multiviewGroup', { n: multiviewGroup })}
+                    data-multiview-group={multiviewGroup}
+                    data-multiview-shown={isMultiview ? '' : undefined}
+                  >
+                    <IconGrid size={8} />
+                    {multiviewGroup}
+                  </span>
+                )}
                 {unseen && (
                   <span
                     className="h-1.5 w-1.5 flex-none rounded-full bg-[var(--text-main)]"
@@ -1517,7 +1566,7 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumb
                 )}
                 </span>
               </div>
-              {(metadata || question) && (
+              {(metadata || question || company?.mission) && (
                 <WorkspaceContextLine
                   metadata={metadata ?? {}}
                   onPortClick={handlePortClick}
@@ -1525,6 +1574,7 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumb
                   metaHiddenOnHover={hover.hideOnHover}
                   question={question}
                   innerTab={innerTab}
+                  company={company}
                 />
               )}
               {actionsOnOwnLine && (
@@ -1594,6 +1644,39 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumb
           >
             {t('workspace.configureProfile')}
           </button>
+          {/* Company mode: a task row rides with its owner, so it is never one. */}
+          {!taskRow && company && (
+            <button
+              className="w-full text-left px-3 py-1.5 text-xs transition-colors hover:bg-[var(--bg-overlay)]"
+              style={{ color: 'var(--text-main)' }}
+              onClick={() => { setMenuPos(null); onSelect(workspaceId); openCompanyBoard(workspaceId); }}
+              data-workspace-action="open-board"
+            >
+              {t('company.openBoard')}
+            </button>
+          )}
+          {!taskRow && (
+            <button
+              className="w-full text-left px-3 py-1.5 text-xs transition-colors hover:bg-[var(--bg-overlay)]"
+              style={{ color: 'var(--text-main)' }}
+              // The menu button unmounts as the dialog opens; with the row
+              // focused first, the dialog hands focus back to it on close.
+              onClick={() => { rowRef.current?.focus(); setMenuPos(null); setCompanyDialogOpen(true); }}
+              data-workspace-action="company"
+            >
+              {company ? t('company.settingsMenu') : t('company.makeMenu')}
+            </button>
+          )}
+          {!taskRow && company && (
+            <button
+              className="w-full text-left px-3 py-1.5 text-xs transition-colors hover:bg-[var(--bg-overlay)]"
+              style={{ color: 'var(--text-main)' }}
+              onClick={() => { setMenuPos(null); setWorkspaceCompany(workspaceId, undefined); }}
+              data-workspace-action="dissolve-company"
+            >
+              {t('company.dissolve')}
+            </button>
+          )}
           <button
             className="w-full text-left px-3 py-1.5 text-xs transition-colors hover:bg-[var(--bg-overlay)]"
             style={{ color: 'var(--text-main)' }}
@@ -1967,6 +2050,9 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumb
       {/* Profile editor modal */}
       {profileModalOpen && (
         <WorkspaceProfileModal workspace={workspace} onClose={() => setProfileModalOpen(false)} />
+      )}
+      {companyDialogOpen && (
+        <CompanyDialog workspace={workspace} onClose={() => setCompanyDialogOpen(false)} />
       )}
     </div>
   );

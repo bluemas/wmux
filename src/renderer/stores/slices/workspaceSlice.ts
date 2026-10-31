@@ -18,6 +18,7 @@ import { sanitizeFontFamily } from '../../utils/terminalFont';
 import { sanitizeTerminalCursorStyle } from '../../../shared/terminalCursor';
 import { sanitizeImagePasteMode } from '../../../shared/imagePaste';
 import { MULTIVIEW_ARRANGEMENTS } from '../../utils/multiviewGrid';
+import { parseMultiviewGroups, promoteMultiviewGroup, pruneSavedMultiviewGroups } from '../../utils/multiviewGroups';
 import { publishWorkspaceMetadataChanged, publishA2aTask } from '../../events/publisher';
 import { retentionMigrationDone, markRetentionMigrationDone } from '../retentionMigration';
 import { decUnread } from './notificationSlice';
@@ -37,6 +38,7 @@ import {
 } from '../shadowWorkspace';
 import { clampFileTreeWidth } from '../../utils/fileTreeLayout';
 import { isSleepPreventionMode } from '../../../shared/sleepPrevention';
+import { parseWorkspaceCompany, type WorkspaceCompany } from '../../../shared/company';
 import { clampSidebarWidth, dropOwnerFoldKeys, movePinned, pinnedFirst, pruneTaskGroupExpanded, resolveSidebarSortMode, sortModeMigratedToAttention, unpinNestedTasks } from '../../utils/sidebarLayout';
 import {
   collectLeafIds,
@@ -68,9 +70,8 @@ function leafCwd(leaf: PaneLeaf): string {
 /**
  * Cold-park convergence helper: drop a workspace's parked / idle-clock entries.
  * Called wherever activeWorkspaceId is assigned OUTSIDE setActiveWorkspace
- * (removeWorkspace, company destroy/removeDept, loadSession) so a promoted-to-
- * visible workspace's park state converges immediately instead of lingering
- * until the next sweep. Guarded for stores/tests without the cold-park maps.
+ * (removeWorkspace, loadSession) so a promoted-to-visible workspace's park
+ * state converges immediately instead of lingering until the next sweep. Guarded for stores/tests without the cold-park maps.
  */
 /** The UI language a session restores to. */
 export function sessionLocaleOf(data: Pick<SessionData, 'locale'>): Locale {
@@ -136,30 +137,39 @@ export function activateLocalWorkspace(
     parkedWorkspaceIds?: Record<string, true>;
     lastVisibleAt?: Record<string, number>;
     activeRemoteKey?: string | null;
+    multiviewIds?: string[];
+    multiviewSavedGroups?: string[][];
   },
   id: string,
 ): void {
   state.activeWorkspaceId = id; // guard-allow — the one legal assignment (see the guard test)
   clearColdParkEntry(state, id);
   clearRemoteSelection(state);
+  // A member of a saved multiview group brings its grid back, however it was
+  // activated (sidebar, Ctrl+N, a notification, an agent).
+  promoteMultiviewGroup(state, id);
 }
 
 /**
  * Drop multiview members whose workspace is gone, and disband a group left with
  * fewer than two. Call from every path where workspaces disappear — the same set
- * clearColdParkEntry covers (removeWorkspace, company destroy/removeDept,
- * loadSession) — because they fail the same way: the grid gate counts
- * `multiviewIds` while the tiles are filtered against live workspaces, so one
- * live member plus one stale id renders a one-tile "grid" with full multiview
- * chrome that nothing but Ctrl+Shift+G dismisses (#751).
+ * clearColdParkEntry covers (removeWorkspace, loadSession) — because they fail
+ * the same way: the grid gate counts `multiviewIds` while the tiles are
+ * filtered against live workspaces, so one live member plus one stale id
+ * renders a one-tile "grid" with full multiview chrome that nothing but
+ * Ctrl+Shift+G dismisses (#751).
  * Guarded for stores/tests mounted without uiSlice.
  */
 export function pruneMultiviewMembership(state: {
   workspaces: Workspace[];
   multiviewIds?: string[];
+  multiviewSavedGroups?: string[][];
 }): void {
+  const liveIds = new Set(state.workspaces.map((w) => w.id));
+  // The saved groups fail the same way once one of them is put on screen.
+  pruneSavedMultiviewGroups(state, liveIds);
   if (!state.multiviewIds || state.multiviewIds.length === 0) return;
-  const live = state.multiviewIds.filter((id) => state.workspaces.some((w) => w.id === id));
+  const live = state.multiviewIds.filter((id) => liveIds.has(id));
   state.multiviewIds = live.length <= 1 ? [] : live;
 }
 
@@ -277,7 +287,7 @@ export interface WorkspaceSlice {
    * cleared ptyIds → new panes spawn their own PTYs) and its PROFILE (env +
    * startup command, re-normalized through the save-boundary secret policy).
    * The clone is named "<name> (copy [N])", inserted right after the source, and
-   * activated. Company role/department membership is intentionally NOT copied.
+   * activated. The company record is intentionally NOT copied.
    * No-op if the id is unknown.
    */
   duplicateWorkspace: (id: string) => void;
@@ -325,6 +335,12 @@ export interface WorkspaceSlice {
    * normalizeWorkspaceColor rather than stored.
    */
   setWorkspaceColor: (id: string, color: WorkspaceColorId | undefined) => void;
+  /**
+   * Make the workspace a company, change its seats, or (undefined) dissolve
+   * it. A workspace that already is one keeps its company id, so tasks and
+   * records that name it still match after the CEO or mission changes.
+   */
+  setWorkspaceCompany: (id: string, company: Omit<WorkspaceCompany, 'v' | 'id'> | undefined) => void;
   /** Mark a workspace as started by another PC (remote spawn); kept for its life. */
   setWorkspaceRemoteSpawnedBy: (id: string, by: A2aRemoteSpawnedBy) => void;
   /** `pin` is the drop target's pin state; omitted keeps the row's own. */
@@ -333,8 +349,7 @@ export interface WorkspaceSlice {
   /**
    * Fix 0 fallback action. Clears every ptyId-keyed piece of renderer state
    * in one atomic immer set: terminal surface ptyId across all workspaces +
-   * nested split panes, floatingPanePtyId, terminalBookmarks,
-   * and company member.ptyId. Called from AppLayout startup when scrollback
+   * nested split panes, floatingPanePtyId and terminalBookmarks. Called from AppLayout startup when scrollback
    * restore is off, and from its catch only when no daemon holds sessions
    * (local mode), so Terminal.tsx self-create receives a consistent blank
    * slate and external RPC handlers don't have stale pty-keyed maps lying
@@ -994,7 +1009,8 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       // multiviewIds is intentionally preserved here. AppLayout renders the
       // grid only when activeWorkspaceId is part of multiviewIds, so switching
       // to a non-multiview workspace shows its single view while the saved
-      // group survives — clicking any member restores the grid. Explicit
+      // group survives — clicking any member restores the grid. A member of
+      // another group swaps that group in (activateLocalWorkspace). Explicit
       // disband still works via the ✕ button or Ctrl+Shift+G (clearMultiview).
     }),
 
@@ -1041,6 +1057,30 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       } else {
         delete ws.color;
       }
+    }),
+
+    setWorkspaceCompany: (id, company) => set((state: StoreState) => {
+      const ws = state.workspaces.find((w: Workspace) => w.id === id);
+      if (!ws) return;
+      if (!company) {
+        delete ws.company;
+        // The board goes with the company; a pane holding nothing else keeps
+        // it, and it says the workspace is no longer a company.
+        for (const leaf of getWorkspaceLeafPanes(ws)) {
+          if (leaf.surfaces.every((s) => s.surfaceType === 'board')) continue;
+          leaf.surfaces = leaf.surfaces.filter((s) => s.surfaceType !== 'board');
+          if (!leaf.surfaces.some((s) => s.id === leaf.activeSurfaceId)) leaf.activeSurfaceId = leaf.surfaces[0].id;
+        }
+        return;
+      }
+      const record = parseWorkspaceCompany({
+        v: 1,
+        id: ws.company?.id ?? generateId('co'),
+        coordinatorPaneId: company.coordinatorPaneId,
+        mission: company.mission?.trim(),
+        standingOrders: company.standingOrders?.trim(),
+      });
+      if (record) ws.company = record;
     }),
 
     setWorkspaceRemoteSpawnedBy: (id, by) => set((state: StoreState) => {
@@ -1171,12 +1211,12 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       //   call store.clearAllPtyState(), the explicit, logged,
       //   generation-guarded form of the historical wipe.
       //
-      //   Side state (floatingPanePtyId, terminalBookmarks,
-      //   company member.ptyId) is also cleared by
+      //   Side state (floatingPanePtyId, terminalBookmarks) is also
+      //   cleared by
       //   clearAllPtyState — see workspaceSlice.clearAllPtyState
       //   below for the cross-slice fan-out.
       //
-      //   External RPC handlers (useRpcBridge, companyRpcHandlers)
+      //   External RPC handlers (useRpcBridge)
       //   guard on uiSlice.paneGate === 'ready' to prevent
       //   stale-ptyId writes during the pending window.
       //
@@ -1332,6 +1372,14 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
         // main pushes fresh ones as the panes report.
         if (ws.metadata?.pr !== undefined) delete ws.metadata.pr;
         if (ws.metadata?.gitSync !== undefined) delete ws.metadata.gitSync;
+        // The old company mode stamped these; a company is its own record,
+        // so a saved 'ceo' or 'lead' never comes back as one.
+        const legacy = ws as Workspace & { companyRole?: unknown; companyDeptName?: unknown };
+        delete legacy.companyRole;
+        delete legacy.companyDeptName;
+        const company = parseWorkspaceCompany(ws.company);
+        if (company) ws.company = company;
+        else delete ws.company;
       }
 
       state.workspaces = data.workspaces;
@@ -1346,8 +1394,11 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
               && isArchivedLayoutNode(a.tree, 0),
           )
         : [];
-      // The previous session's group cannot describe this one's workspaces.
-      pruneMultiviewMembership(state);
+      // The previous session's grid cannot describe this one's workspaces; its
+      // saved groups can, shape-checked against them. Activation then puts the
+      // active workspace's group back on screen.
+      state.multiviewIds = [];
+      state.multiviewSavedGroups = parseMultiviewGroups(data.multiviewGroups, new Set(state.workspaces.map((w) => w.id)));
       activateLocalWorkspace(state, data.activeWorkspaceId);
       state.sidebarVisible = data.sidebarVisible;
 
@@ -1771,11 +1822,7 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
         state.autoUpdateEnabled = data.autoUpdateEnabled;
         window.electronAPI.settings.setAutoUpdateEnabled(data.autoUpdateEnabled);
       }
-      if (data.sidebarMode) state.sidebarMode = data.sidebarMode;
       if (data.channelDockVisible != null) state.channelDockVisible = data.channelDockVisible;
-      if (data.company !== undefined) state.company = data.company ?? null;
-      if (data.memberCosts) state.memberCosts = data.memberCosts;
-      if (data.sessionStartTime != null) state.sessionStartTime = data.sessionStartTime;
       if (data.onboardingCompleted != null) state.onboardingCompleted = data.onboardingCompleted;
       // First-run wizard + cheat sheet (Plan 1.15 + 1.18). Mirrors onboardingCompleted
       // pattern: only overwrite when the saved field is present, otherwise leave the
@@ -1823,7 +1870,7 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
     // Called from AppLayout startup catch when reconcile aborts or times
     // out. Reproduces the historical loadSession wipe as an explicit
     // fallback, plus the side-state fan-out the original wipe never
-    // covered (floating pane, bookmarks, token data, company members).
+    // covered (floating pane, bookmarks, token data).
     // After this runs, Terminal.tsx self-create sees externalPtyId='' on
     // mount and creates fresh PTYs — the well-tested new-pane path.
     clearSurfacePtyIdByPty: (ptyId: string, recovery?: DeadPaneRecovery) => set((state: StoreState) => {
@@ -1899,15 +1946,6 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       }
       if (state.deadPaneRecoveryOfferByPtyId) state.deadPaneRecoveryOfferByPtyId = {};
       if (state.ptyUnconfirmedById) state.ptyUnconfirmedById = {};
-
-      // 3. companySlice — member.ptyId across all departments.
-      if (state.company) {
-        for (const dept of state.company.departments) {
-          for (const member of dept.members) {
-            member.ptyId = undefined;
-          }
-        }
-      }
     }),
   };
 };

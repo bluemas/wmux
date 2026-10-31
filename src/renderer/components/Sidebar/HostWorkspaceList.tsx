@@ -210,7 +210,7 @@ function HostRailAvatar({ hostId, row, position, isActive, disabled, onOpen }: {
   return (
     <div className="relative w-8">
       {tagHex && (
-        <div className="absolute top-1 bottom-1 w-[3px] rounded-full z-[1] pointer-events-none" style={{ left: 0, background: tagHex }} aria-hidden="true" />
+        <div className="absolute top-1 bottom-1 w-[3px] z-[1] pointer-events-none" style={{ left: 0, background: tagHex }} aria-hidden="true" />
       )}
       <button
         type="button"

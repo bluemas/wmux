@@ -36,14 +36,12 @@ const CommandPalette = lazy(() => import('../Palette/CommandPalette'));
 const WorktaskCleanupView = lazy(() => import('../WorkTask/WorktaskCleanupView'));
 const InspectOverlay = lazy(() => import('../Inspect/InspectOverlay'));
 import FileTreePanel from '../FileTree/FileTreePanel';
-import ApprovalDialog from '../Company/ApprovalDialog';
 import ExecuteApprovalDialog from '../A2a/ExecuteApprovalDialog';
 import PermissionApprovalDialogContainer from '../Approval/PermissionApprovalDialogContainer';
 import CloseTabConfirm from '../Pane/CloseTabConfirm';
+import { isWorkSurfaceType } from '../Pane/surfaceKinds';
 import { initAtlasWakeRecovery } from '../../terminal/atlasWakeRecovery';
 import { windowDisplayedStore } from '../../hooks/useWindowDisplayed';
-import CompanyView from '../Company/CompanyView';
-import MessageFeedPanel from '../Company/MessageFeedPanel';
 import OnboardingOverlay from '../Onboarding/OnboardingOverlay';
 import FirstRunWizard from '../FirstRunWizard';
 import KeyboardCheatSheet from '../KeyboardCheatSheet';
@@ -128,6 +126,7 @@ import {
 } from '../../../shared/ptyRecovery';
 import { isChatV2Covering } from '../ChatV2/coverage';
 import { overlayColors } from '../../utils/titlebarOverlay';
+import { multiviewGroupsForSave } from '../../utils/multiviewGroups';
 
 interface ReconcilePtySession extends DeadPaneSessionSnapshot {
   id: string;
@@ -398,7 +397,6 @@ function stripLivePorts(metadata: NonNullable<Workspace['metadata']>): Workspace
 /** Build a consistent SessionData snapshot for save operations */
 function buildSessionData(dumped: Map<string, boolean>): SessionData {
   const state = useStore.getState();
-  const companySafe = state.company ? { ...state.company, skipPermissions: undefined } : null;
   return {
     workspaces: state.workspaces.map((ws) => {
       // Private browser tabs never reach the saved session (no restore after
@@ -425,10 +423,6 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
     phoneWorkspaceRequestIds: state.phoneWorkspaceRequestIds,
     sidebarVisible: state.sidebarVisible,
     channelDockVisible: state.channelDockVisible,
-    sidebarMode: state.sidebarMode,
-    company: companySafe,
-    memberCosts: state.memberCosts,
-    sessionStartTime: state.sessionStartTime ?? undefined,
     // User preferences
     theme: state.theme,
     locale: state.locale,
@@ -504,6 +498,7 @@ function buildSessionData(dumped: Map<string, boolean>): SessionData {
       ? { surfaceDismissedQuestion: state.surfaceDismissedQuestion }
       : {}),
     multiviewArrangement: state.multiviewArrangement,
+    multiviewGroups: multiviewGroupsForSave(state),
     notificationSoundEnabled: state.notificationSoundEnabled,
     toastEnabled: state.toastEnabled,
     notificationRingEnabled: state.notificationRingEnabled,
@@ -828,8 +823,6 @@ export default function AppLayout() {
   const sidebarPosition = useStore((s) => s.sidebarPosition);
   const sidebarWidth = useStore((s) => s.sidebarWidth);
   const fileTreeVisible = useStore((s) => s.fileTreeVisible);
-  const companyViewVisible = useStore((s) => s.companyViewVisible);
-  const setCompanyViewVisible = useStore((s) => s.setCompanyViewVisible);
   // PERF (2026-07-13): AppLayout does NOT subscribe to the whole `workspaces`
   // array NOR to `activeWorkspaceId` — those re-rendered its ~1300-line chrome
   // on every pane metadata/surface update (53% CPU at 5 workspaces) and on every
@@ -1156,7 +1149,7 @@ export default function AppLayout() {
 
       const activeSurface = leaf.surfaces.find((s) => s.id === leaf.activeSurfaceId);
       // browser/editor/diff는 PTY가 없어 경로 붙여넣기 대상이 아님(J2 — diff 추가).
-      if (!activeSurface || activeSurface.surfaceType === 'browser' || activeSurface.surfaceType === 'editor' || activeSurface.surfaceType === 'preview' || activeSurface.surfaceType === 'diff') return;
+      if (!activeSurface || isWorkSurfaceType(activeSurface.surfaceType)) return;
       // Another PC's pane: a dropped path names a file on this machine, so the
       // mirror showing it uploads the files to that PC and types their paths there.
       if (activeSurface.surfaceType === 'remote-terminal') {
@@ -1336,7 +1329,7 @@ export default function AppLayout() {
           for (const surface of pane.surfaces) {
             if (signal?.aborted) return;
             // browser/editor/diff는 PTY를 갖지 않음 — 재조정·자가생성 대상에서 제외(J2).
-            if (surface.surfaceType === 'browser' || surface.surfaceType === 'editor' || surface.surfaceType === 'preview' || surface.surfaceType === 'diff' || surface.surfaceType === 'remote-terminal') continue;
+            if (isWorkSurfaceType(surface.surfaceType) || surface.surfaceType === 'remote-terminal') continue;
             if (!surface.ptyId) {
               console.log(`[AppLayout] Surface ${surface.id}: no ptyId, Terminal will self-create`);
               continue;
@@ -2339,7 +2332,6 @@ export default function AppLayout() {
       {/* Fleet, Schedules, Remote or Settings, swapped in by the rail. */}
       <RailPage />
       <NotificationPanel />
-      <MessageFeedPanel />
       {/* Cross-pane search results panel (T-F). Mount-gated on
           searchPanelOpen at this level (I3) so the panel's 6-field zustand
           subscriptions don't run when closed. */}
@@ -2375,7 +2367,6 @@ export default function AppLayout() {
           <Suspense fallback={null}><InspectOverlay /></Suspense>
         </ErrorBoundary>
       )}
-      <ApprovalDialog />
       {!inboxOwnsApprovals && <ExecuteApprovalDialog />}
       {!inboxOwnsApprovals && <PermissionApprovalDialogContainer />}
       <CloseTabConfirm />
@@ -2424,10 +2415,6 @@ export default function AppLayout() {
           the `?` prefix action and Settings › Setup and reset show it. It
           never opens by itself. */}
       {firstRunCompleted && cheatSheetForceShown && <KeyboardCheatSheet />}
-
-      {companyViewVisible && (
-        <CompanyView onClose={() => setCompanyViewVisible(false)} />
-      )}
 
       {/* Visual drag indicator — pointer-events always 'none' so it never
           blocks clicks, scrolling, or keyboard. Drop handling is done entirely

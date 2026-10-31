@@ -2367,7 +2367,12 @@ server.tool(
   A2A_TASK_CANCEL_SHAPE,
   async ({ task_id, reason }) => {
     const wsId = await requireWorkspaceId();
-    return callRpc('a2a.task.cancel', { workspaceId: wsId, taskId: task_id, reason });
+    const params: Record<string, unknown> = { workspaceId: wsId, taskId: task_id, reason };
+    // The caller's pane, as for an update: a company task is canceled only
+    // by the pane that created it.
+    const senderPtyId = getTaskSenderPtyId();
+    if (senderPtyId) params.senderPtyId = senderPtyId;
+    return callRpc('a2a.task.cancel', params);
   },
 );
 
@@ -2399,9 +2404,8 @@ server.tool(
 // and their jobs are all covered by the workspace-level A2A and channel tools
 // (whoami → a2a_whoami, send → send_message / a2a_task_send, broadcast →
 // a2a_broadcast, ack → channel_ack, inbox → channel_read / channel_unread,
-// status → a2a_discover + workspace_list). Company mode itself is untouched:
-// its renderer UI and the `company.*` RPC handlers behind it stay exactly as
-// they were — only the MCP projection is gone.
+// status → a2a_discover + workspace_list). The `company.*` RPC handlers behind
+// them were removed later with the rest of the old company mode.
 
 // === A2A channel tools ===
 // Ten channel tools plus three WorkTask mission tools expose the

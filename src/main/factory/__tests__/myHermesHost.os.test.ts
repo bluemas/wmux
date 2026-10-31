@@ -32,7 +32,12 @@ vi.mock('node:child_process', async (orig) => {
 import { AcpBrainAdapter } from '../../deck/AcpBrainAdapter';
 import type { BrainEvent } from '../../deck/BrainAdapter';
 import type { MyHermesReadinessDeps } from '../myHermes';
-import { OwnHermesHost, gatewayModeFlags, ownHermesToolAllowed } from '../myHermesHost';
+import { OWN_HERMES_UNSETTLED_TITLE, OwnHermesHost, gatewayModeFlags, noteOwnHermesUnsettled, ownHermesToolAllowed } from '../myHermesHost';
+import { HermesHost } from '../hermesHost';
+import { setApprovalService, type ApprovalService } from '../approvals';
+import { runningWakeAttended, setWakeTaint, type WakeTaint } from '../wakeTaint';
+import { __resetConversationMarksForTesting, startConversation } from '../conversationMarks';
+import type { WakeItem } from '../../../shared/wake';
 
 const WIN = process.platform === 'win32';
 const BINDING = { workspaceId: 'ws-1', botId: 'bot-0000000a', role: 'lead' as const };
@@ -189,6 +194,35 @@ describe.skipIf(WIN)('OwnHermesHost.prepareSpawn', () => {
   });
 });
 
+describe('a cancelled turn that did not end in time', () => {
+  it('tells the owner in the bot\'s 1:1 with a worded card, and runs no Hermes command and signals no process', async () => {
+    const r = rig();
+    r.writeGateway(4245, ['hermes', 'gateway', 'run']);
+    const told: string[] = [];
+    const host = new OwnHermesHost({ profile: 'default', readinessDeps: () => r.deps, holder: () => null, pidAlive: (p) => r.alive.has(p), log: () => undefined, unsettledNotice: (b) => told.push(b.botId) });
+    const kill = vi.spyOn(process, 'kill');
+    await host.policyFor(BINDING).unsettled();
+    expect(told).toEqual([BINDING.botId]);
+    expect(procCalls).toEqual([]);
+    expect(kill).not.toHaveBeenCalled();
+    kill.mockRestore();
+  });
+
+  it('the card: quiet, in the 1:1, coded turn.unsettled; none for a bot that is gone', () => {
+    const drafts: Array<Record<string, unknown>> = [];
+    const ports = { factLog: () => ({ append: (d: Record<string, unknown>) => { drafts.push(d); return { id: 'f-1', ...d } as never; } }), wakes: () => ({ enqueue: () => { throw new Error('a quiet notice wakes no one'); } }) as never };
+    noteOwnHermesUnsettled(BINDING, ports as never, () => false);
+    expect(drafts).toEqual([]);
+    noteOwnHermesUnsettled(BINDING, ports as never, () => true);
+    expect(drafts).toHaveLength(1);
+    expect(drafts[0]).toMatchObject({
+      kind: 'bot.notice',
+      workspaceId: BINDING.workspaceId,
+      payload: { topic: 'turn.unsettled', title: OWN_HERMES_UNSETTLED_TITLE, card: true, threadId: `dm:${BINDING.botId}`, notice: { code: 'turn.unsettled' } },
+    });
+  });
+});
+
 describe('own-mode helpers', () => {
   it('reads the gateway mode flags in any spelling', () => {
     expect(gatewayModeFlags(['hermes', 'gateway', 'run', '--quiet'])).toEqual([]);
@@ -204,3 +238,41 @@ describe('own-mode helpers', () => {
   });
 });
 
+
+describe('a permission request with no one present', () => {
+  const routineWake = { id: 'w-1', botId: BINDING.botId, workspaceId: 'ws-1', reason: { kind: 'routine', routineId: 'r-aaaaaaaa', dueAt: 1 }, threadId: `dm:${BINDING.botId}` } as unknown as WakeItem;
+  const humanWake = { ...routineWake, reason: { kind: 'human', text: 'hi', source: 'desktop' } } as unknown as WakeItem;
+  let running: WakeItem = routineWake;
+  const asks: unknown[] = [];
+  beforeEach(() => {
+    asks.length = 0;
+    __resetConversationMarksForTesting();
+    startConversation(BINDING.botId, { tainted: false, signedIn: false });
+    setWakeTaint({ wakeTainted: () => false } as unknown as WakeTaint, () => ({ item: running }) as never);
+    setApprovalService({ askNativeTool: async (...a: unknown[]) => { asks.push(a); return true; } } as unknown as ApprovalService);
+  });
+  afterEach(() => {
+    setWakeTaint(null);
+    setApprovalService(null);
+    __resetConversationMarksForTesting();
+  });
+
+  it('My Hermes: during a routine run it is denied at once with no card; the owner\'s own message still gets one', async () => {
+    const r = rig();
+    const policy = hostOf(r).policyFor(BINDING);
+    running = routineWake;
+    expect(runningWakeAttended(BINDING.botId)).toBe(false);
+    expect(await policy.askOwner({ title: 'rm -rf build', command: 'rm -rf build' }, new AbortController().signal)).toBe(false);
+    expect(asks).toEqual([]);
+    running = humanWake;
+    expect(await policy.askOwner({ title: 'ls', command: 'ls' }, new AbortController().signal)).toBe(true);
+    expect(asks).toHaveLength(1);
+  });
+
+  it('managed Hermes: unchanged, a card is shown whoever is present', async () => {
+    const host = new HermesHost({ wmuxDir: () => home, resolveExe: () => '/bin/hermes', run: async () => ({ code: 0, stdout: '', stderr: '' }), pidAlive: () => false, log: () => undefined });
+    running = routineWake;
+    expect(await host.policyFor(BINDING).askOwner({ title: 'ls', command: 'ls' }, new AbortController().signal)).toBe(true);
+    expect(asks).toHaveLength(1);
+  });
+});
