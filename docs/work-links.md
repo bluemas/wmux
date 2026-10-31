@@ -54,7 +54,11 @@ The first matching rule wins:
 3. Task canceled: `abandoned`.
 4. One of the link's decisions is pending: `needs-you` (`decision`).
 5. The task's state:
-   - `input-required`: `needs-you` (`input-required`)
+   - `input-required`: `needs-you` (`input-required`), or `running` when the
+     `requester` names a pane: the report or question waits on that pane (a
+     company's CEO, say), not on you. Main cannot see panes and keeps
+     `running`; the renderer's surfaces (Fleet, the company board, the phone,
+     the Git page) put it back on you once that pane has closed
    - `submitted`: `queued`
    - `working`: `running`
    - `failed`: `blocked` (`task-failed`)
@@ -88,7 +92,7 @@ Who acts next, for the Git page row:
 
 | State | Who acts |
 | --- | --- |
-| `queued`, `running`, `blocked` | the agent in `owner` |
+| `queued`, `running`, `blocked` | the agent in `owner`; for a `running` link whose task is `input-required`, the pane in `requester` |
 | `needs-you` | you |
 | `review` | the reviewer (usually you) |
 | `done`, `abandoned` | nobody |
