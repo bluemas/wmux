@@ -1,5 +1,6 @@
 // Adapted from MonoCode (hardbeat920/monocode@6bd432ca, src/app/shell/Sidebar.tsx), MIT License, Copyright (c) 2026 Nick
 import { prepAwaitsReview } from '../../../shared/wmuxProjectConfig';
+import { keepSubmenuInWindow } from '../../utils/keepSubmenuInWindow';
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, memo } from 'react';
 import type { GitSyncStatus, PrStatus, WorkspaceMetadata } from '../../../shared/types';
 import { useStore } from '../../stores';
@@ -480,6 +481,7 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, multiviewGroup, ind
   // An issue / PR from the Git page is held over this row.
   const [handoffOver, setHandoffOver] = useState(false);
   const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
   const [wdOpen, setWdOpen] = useState(false);
   const [owOpen, setOwOpen] = useState(false);
   const [colorOpen, setColorOpen] = useState(false);
@@ -1062,6 +1064,18 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, multiviewGroup, ind
     setMenuPos({ x: e.clientX, y: e.clientY });
   };
 
+  // Keep the context menu inside the window. It opens at the pointer, so on a
+  // row near the bottom (or a narrow window) it would run off the edge and hide
+  // its last items. Measured before paint, so it never flashes at the old spot,
+  // and by offset size, which the scale-in animation does not shrink.
+  useLayoutEffect(() => {
+    const el = menuRef.current;
+    if (!menuPos || !el) return;
+    const { offsetWidth: w, offsetHeight: h } = el;
+    if (menuPos.y + h > window.innerHeight - 4) el.style.top = `${Math.max(4, window.innerHeight - h - 4)}px`;
+    if (menuPos.x + w > window.innerWidth - 4) el.style.left = `${Math.max(4, window.innerWidth - w - 4)}px`;
+  }, [menuPos]);
+
   // Close the context menu on any outside click or Escape.
   useEffect(() => {
     if (!menuPos) return;
@@ -1610,6 +1624,7 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, multiviewGroup, ind
       {/* Right-click context menu */}
       {menuPos && (
         <div
+          ref={menuRef}
           className="fixed z-[var(--z-popover-top)] w-max flex flex-col py-1 rounded-xl shadow-xl sidebar-popover-enter"
           style={{ left: menuPos.x, top: menuPos.y, background: 'var(--bg-surface)', border: '1px solid color-mix(in srgb, var(--bg-overlay) 70%, transparent)' }}
           onMouseDown={(e) => e.stopPropagation()}
@@ -1787,9 +1802,12 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, multiviewGroup, ind
               {snoozeOpen && (
                 <div
                   ref={(el) => {
-                    if (!el || !snoozeFocusFirst.current) return;
-                    snoozeFocusFirst.current = false;
-                    el.querySelector<HTMLButtonElement>('[data-snooze-preset]')?.focus();
+                    const release = keepSubmenuInWindow(el);
+                    if (el && snoozeFocusFirst.current) {
+                      snoozeFocusFirst.current = false;
+                      el.querySelector<HTMLButtonElement>('[data-snooze-preset]')?.focus();
+                    }
+                    return release;
                   }}
                   role="menu"
                   className={`absolute top-0 ${menuPos.x > window.innerWidth * 0.6 ? 'right-full mr-0.5' : 'left-full ml-0.5'} min-w-[140px] py-1 rounded-xl shadow-xl sidebar-popover-enter`}
@@ -1862,6 +1880,7 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, multiviewGroup, ind
             </button>
             {colorOpen && (
               <div
+                ref={keepSubmenuInWindow}
                 className={`absolute top-0 ${menuPos.x > window.innerWidth * 0.6 ? 'right-full mr-0.5' : 'left-full ml-0.5'} py-1.5 px-2 rounded-xl shadow-xl sidebar-popover-enter`}
                 style={{ background: 'var(--bg-surface)', border: '1px solid color-mix(in srgb, var(--bg-overlay) 70%, transparent)' }}
               >
@@ -1928,6 +1947,7 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, multiviewGroup, ind
             </button>
             {owOpen && folderApps.length > 0 && (
               <div
+                ref={keepSubmenuInWindow}
                 className={`absolute top-0 ${menuPos.x > window.innerWidth * 0.6 ? 'right-full mr-0.5' : 'left-full ml-0.5'} min-w-[180px] py-1 rounded-xl shadow-xl sidebar-popover-enter`}
                 style={{ background: 'var(--bg-surface)', border: '1px solid color-mix(in srgb, var(--bg-overlay) 70%, transparent)' }}
               >
@@ -1972,6 +1992,7 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, multiviewGroup, ind
             </button>
             {wdOpen && (
               <div
+                ref={keepSubmenuInWindow}
                 className={`absolute top-0 ${menuPos.x > window.innerWidth * 0.6 ? 'right-full mr-0.5' : 'left-full ml-0.5'} min-w-[240px] max-w-[420px] py-1 rounded-xl shadow-xl sidebar-popover-enter`}
                 style={{ background: 'var(--bg-surface)', border: '1px solid color-mix(in srgb, var(--bg-overlay) 70%, transparent)' }}
               >
