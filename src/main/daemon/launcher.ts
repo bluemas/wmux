@@ -1,6 +1,7 @@
 import * as path from 'path';
 import { app, dialog } from 'electron';
 import { markBoot } from '../util/bootTrace';
+import { stageDaemonRuntime, stagedDaemonScripts } from './daemonRuntimeStage';
 import {
   classifyTasklistOutput,
   classifyKillOutcome,
@@ -120,6 +121,12 @@ async function askUserToRecoverFromStalePid(opts: {
   return response === 0;
 }
 
+/** Where the Windows packaged app copies its daemon runtime; null elsewhere. */
+function daemonStageRoot(): string | null {
+  if (process.platform !== 'win32' || !app.isPackaged || !process.env.LOCALAPPDATA) return null;
+  return path.join(process.env.LOCALAPPDATA, 'wmux-daemon-runtime');
+}
+
 /**
  * Candidate paths for the daemon entry script — production (extraResource),
  * production fallback (old layout), development (esbuild bundle),
@@ -133,6 +140,7 @@ function resolveDaemonScriptCandidates(): string[] {
   const projectRoot = app.getAppPath();
   const resourcesRoot = process.resourcesPath;
   console.log(`[launcher] projectRoot = ${projectRoot}, resourcesPath = ${resourcesRoot}`);
+  const stageRoot = daemonStageRoot();
   return [
     // Production (extraResource) — esbuild bundle
     path.join(resourcesRoot, 'daemon-bundle', 'index.js'),
@@ -144,6 +152,9 @@ function resolveDaemonScriptCandidates(): string[] {
     // Development fallback (tsc output)
     path.join(projectRoot, 'dist', 'daemon', 'daemon', 'index.js'),
     path.join(projectRoot, 'dist', 'daemon', 'index.js'),
+    // Last, so a failed copy falls back to the install, not an older build:
+    // copies stageDaemonRuntime made, listed so the kill gate knows their daemons.
+    ...(stageRoot ? stagedDaemonScripts(stageRoot) : []),
   ];
 }
 
@@ -184,6 +195,17 @@ const electronDeps: DaemonLauncherDeps = {
   // LaunchServices treats as ending its subordinate processes) keeps it alive.
   launchViaLaunchdOnDarwin: true,
   markBoot,
+  stageDaemonRuntime: () => {
+    const stageRoot = daemonStageRoot();
+    if (!stageRoot) return null;
+    return stageDaemonRuntime({
+      appDir: path.dirname(process.execPath),
+      exeName: path.basename(process.execPath),
+      stageRoot,
+      version: app.getVersion(),
+      warn: (msg) => console.warn(msg),
+    });
+  },
 };
 
 /**
