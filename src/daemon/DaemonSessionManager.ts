@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import type { IPty } from 'node-pty';
 import { ptyBackend, type TerminalPty } from '../shared/terminalPty';
 import { spawnPty, spawnPtySync, type SpawnPtyRequest } from '../shared/spawnPty';
+import { applyParentWindow } from '../shared/conptyParentWindow';
 import type { PaneJob } from './paneJob';
 import os from 'node:os';
 import fs from 'node:fs';
@@ -331,7 +332,41 @@ export class DaemonSessionManager extends EventEmitter {
    */
   private spawningCreates = new Set<symbol>();
 
+  /**
+   * The desktop window that owns every pane's console window (Windows; see
+   * shared/conptyParentWindow.ts), as main last reported it. Every spawn reads
+   * it; null until main reports one, and again once main has gone.
+   */
+  private hostWindow: Buffer | null = null;
+
   cancelPendingCreates(): void { this.pendingCreates.clear(); }
+
+  /**
+   * Make `handle` the owner of every live pane's console window, and of each
+   * one spawned from now on. Null only stops handing a window to new panes:
+   * live ones are never sent a NULL owner. A destroyed window stops being
+   * their owner by itself (Windows drops it), and one main merely lost touch
+   * with is still a fine owner. Returns how many live sessions the request
+   * reached.
+   */
+  setHostWindow(handle: Buffer | null): number {
+    // Each reconnect and each adopted window reports again; the same window
+    // changes nothing, so it costs no call per pane.
+    if (handle === this.hostWindow || (handle && this.hostWindow?.equals(handle))) return 0;
+    this.hostWindow = handle;
+    if (!handle) return 0;
+    let reached = 0;
+    let declined = 0;
+    for (const managed of this.sessions.values()) {
+      if (managed.meta.state === 'dead' || managed.meta.state === 'suspended') continue;
+      if (applyParentWindow(managed.ptyProcess, handle)) reached++;
+      else declined++;
+    }
+    if (declined > 0) {
+      console.log(`[DaemonSessionManager] host window: ${declined} session(s) cannot take a console owner (only node-pty on the bundled ConPTY can)`);
+    }
+    return reached;
+  }
 
   /** Preserve retry state; unattempted placeholders retain normal suspended expiry. */
   keepPendingRecovery(session: DaemonSession, error?: string): void {
@@ -818,6 +853,7 @@ export class DaemonSessionManager extends EventEmitter {
         else console.log(line);
       },
       onBackend,
+      parentWindow: () => this.hostWindow,
     };
   }
 

@@ -63,6 +63,7 @@ import { app, BrowserWindow, dialog, ipcMain, powerMonitor } from 'electron';
 import { checkUserDataIsolation, claimPortableDataNotice, mayInstallDarwinCliShim, PORTABLE_DATA_SUFFIX, shouldUsePortableData } from './dataIsolation';
 import { createWindow, loadMainRenderer } from './window/createWindow';
 import { attachDesktopPresenceReporter, reportDesktopPresence } from './window/desktopPresence';
+import { clearHostWindow, hostWindowHandle, reportHostWindow } from './window/conptyHostWindow';
 import { installSleepPrevention } from './power/installSleepPrevention';
 import { PTYManager } from './pty/PTYManager';
 import { PTYBridge } from './pty/PTYBridge';
@@ -2496,6 +2497,8 @@ app.on('ready', async () => {
         .rpc('daemon.client.identify', { role: 'main' })
         .then(() => {
           reportDesktopPresence(() => client, focusedPrimaryWindow() !== null);
+          // After identify: the daemon takes the host window from the app only.
+          reportHostWindow(() => client, mainWindow);
           disposePhoneBridge?.();
           disposePhoneBridge = installPhoneBridge(client,(command,payload) => command === AGENT_ENV_COMMAND
             // A paired PC comparing agent environments: names, versions and hashes.
@@ -3153,6 +3156,11 @@ function adoptMainWindow(win: BrowserWindow): void {
   attachWindowRecovery(win);
   resetPollCacheOnRendererLoad(win);
 
+  // This window owns every pane's console window from now on, so a sign-in
+  // picker a terminal command opens stacks above it (Windows).
+  ptyManager.setHostWindow(hostWindowHandle(win));
+  reportHostWindow(() => daemonClient, win);
+
   // Windows logoff/shutdown/restart. WM_ENDSESSION is a per-window message:
   // Electron emits 'session-end' on the BrowserWindow that received it and
   // never on `app`, so this has to be wired on every main window.
@@ -3165,7 +3173,11 @@ function adoptMainWindow(win: BrowserWindow): void {
   win.on('closed', () => {
     // Guarded: a recovery window may be adopted while the old reference is
     // still being torn down, and only the current one may clear the binding.
-    if (mainWindow === win) mainWindow = null;
+    if (mainWindow !== win) return;
+    mainWindow = null;
+    // Its HWND is gone: stop handing it to panes spawned from now on.
+    ptyManager.setHostWindow(null);
+    clearHostWindow(() => daemonClient);
   });
 
   // Intercept window close — hide to tray instead of destroying, except for

@@ -94,6 +94,7 @@ import { generateSnapshotUnqueued, enqueueSnapshotJob, generateTextSnapshot, gen
 import { queuedScreenText, queuedTextSnapshot } from './queuedSessionText';
 import { FolderTrustRefusedError, folderTrustRefusal, folderTrustState, registerFolderTrustRpc, setFolderTrustTimingLog } from './folderTrustState';
 import { FOLDER_TRUST_DELIVERY_BUDGET_MS } from '../shared/folderTrustWording';
+import { HOST_WINDOW_RPC, createHostWindowRpc } from './hostWindowRpc';
 import type { TerminalPty } from '../shared/terminalPty';
 import { serializeSession } from './sessionSerialize';
 import { AwaitingScreenVerifier, AWAITING_NARROW_DIALOG_COLS, questionInFlight, renderPaneScreen, renderPaneTail } from './AwaitingScreenVerifier';
@@ -9453,6 +9454,14 @@ async function main(): Promise<void> {
   pipeServer.onRpc('daemon.presence.desktop', async (params, ctx) =>
     presenceRpc(params, ctx.clientId),
   );
+  // The window that owns every pane's console window (Windows sign-in pickers).
+  const hostWindowRpc = createHostWindowRpc({
+    isFirstParty: (clientId) => pipeServer.isFirstParty(clientId),
+    setHostWindow: (handle) => sessionManager.setHostWindow(handle),
+    log: (level, msg) => log(level, msg),
+  });
+  pipeServer.onRpc(HOST_WINDOW_RPC, async (params, ctx) => hostWindowRpc.handle(params, ctx.clientId));
+  pipeServer.onClientClose((clientId) => hostWindowRpc.onClientClose(clientId));
   // A desktop that went away is not present, whatever it last reported. Without
   // this, killing the app mid-focus would leave a fresh report standing for the
   // rest of the freshness window and swallow the pushes it was meant to hand off.
