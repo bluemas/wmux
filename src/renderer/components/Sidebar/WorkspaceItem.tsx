@@ -1,6 +1,6 @@
 // Adapted from MonoCode (hardbeat920/monocode@6bd432ca, src/app/shell/Sidebar.tsx), MIT License, Copyright (c) 2026 Nick
 import { prepAwaitsReview } from '../../../shared/wmuxProjectConfig';
-import { keepSubmenuInWindow } from '../../utils/keepSubmenuInWindow';
+import { keepMenuInWindow, keepSubmenuInWindow } from '../../utils/keepSubmenuInWindow';
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo, memo } from 'react';
 import type { GitSyncStatus, PrStatus, WorkspaceMetadata } from '../../../shared/types';
 import { useStore } from '../../stores';
@@ -1065,13 +1065,11 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumb
   // Keep the context menu inside the window. It opens at the pointer, so on a
   // row near the bottom (or a narrow window) it would run off the edge and hide
   // its last items. Measured before paint, so it never flashes at the old spot,
-  // and by offset size, which the scale-in animation does not shrink.
+  // and refitted when rows fill in after opening (the account rows load late).
   useLayoutEffect(() => {
     const el = menuRef.current;
     if (!menuPos || !el) return;
-    const { offsetWidth: w, offsetHeight: h } = el;
-    if (menuPos.y + h > window.innerHeight - 4) el.style.top = `${Math.max(4, window.innerHeight - h - 4)}px`;
-    if (menuPos.x + w > window.innerWidth - 4) el.style.left = `${Math.max(4, window.innerWidth - w - 4)}px`;
+    return keepMenuInWindow(el, menuPos.x, menuPos.y);
   }, [menuPos]);
 
   // Close the context menu on any outside click or Escape.
