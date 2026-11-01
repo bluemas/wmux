@@ -165,12 +165,15 @@ a2a.send            a2a.execute         a2a.read
 
 ui.sidebar          ui.statusbar        ui.pane-decoration
 ui.commands
+
+fs.read
 ```
 
 Notes:
 
 - `notifications.read` opts in to `notification.received` events on `events.poll`. A plugin with a declared capability set that lacks it has notification events filtered out of poll results (they carry terminal-program-controlled text). Callers without a declaration are grandfathered.
 - `browser.read` permits the ordinary browser read RPCs, including scoped target metadata from `browser.cdp.info`; it does **not** grant the raw `cdpPort` or app `shellUrl`. Those attach fields are reserved for the renderer operator, locally source-qualified server-pinned callers, and source-qualified first-party wire clients. This keeps a read grant from bypassing the browser tool layer and its automation lease.
+- `fs.read` permits `fs.list`, `fs.stat` and `fs.readText`: list a local folder, stat one path, and read up to 1 MB of a text file. Paths must be absolute and pass the same check as the app's file tree, so credential folders and files (`~/.ssh`, `~/.aws`, wmux's tokens, ...) and network or device paths answer `unavailable`, exactly like a missing path. It takes no path glob: the glob grammar treats `.` as a separator and cannot scope file paths.
 - `ui.*` capabilities gate the plugin-host UI contribution points (sandboxed sidebar panels, status-bar widgets, pane decorations, palette commands). They are enforced at contribution mount time by the host — the iframe/widget is refused for non-trusted plugins — rather than per-RPC. See `docs/internal/fable-window-schema-freeze.md` §4.
 
 Reserved prefixes (declaring these is always rejected):
