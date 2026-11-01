@@ -3,11 +3,12 @@
  * install root.
  *
  * Squirrel's Setup.exe, run over an existing install, kills every process
- * whose image lives under %LOCALAPPDATA%\wmux and deletes the folder
+ * whose image path starts with %LOCALAPPDATA%\wmux and deletes the folder
  * ("already exists, burning it to the ground"). A daemon running from
  * app-X.Y.Z\wmux.exe died with it, and so did every pane. A daemon running
- * from %LOCALAPPDATA%\wmux-daemon-runtime\<build>\ is outside that folder, so
- * a reinstall leaves it and its panes running.
+ * from ~\.wmux\daemon-runtime\<build>\ is outside that prefix, so a reinstall
+ * leaves it and its panes running. (The match is a bare prefix: a copy in
+ * %LOCALAPPDATA%\wmux-daemon-runtime was killed too.)
  *
  * The copy keeps the install's layout (wmux.exe, resources\daemon-bundle\
  * index.js), so the launcher's image and script checks hold unchanged.

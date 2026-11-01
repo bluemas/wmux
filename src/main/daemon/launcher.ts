@@ -2,6 +2,7 @@ import * as path from 'path';
 import { app, dialog } from 'electron';
 import { markBoot } from '../util/bootTrace';
 import { stageDaemonRuntime, stagedDaemonScripts } from './daemonRuntimeStage';
+import { getWmuxDir } from '../../daemon/config';
 import {
   classifyTasklistOutput,
   classifyKillOutcome,
@@ -121,10 +122,14 @@ async function askUserToRecoverFromStalePid(opts: {
   return response === 0;
 }
 
-/** Where the Windows packaged app copies its daemon runtime; null elsewhere. */
+/**
+ * Where the Windows packaged app copies its daemon runtime; null elsewhere.
+ * Not beside the install: Squirrel kills every process whose path merely
+ * starts with %LOCALAPPDATA%\wmux, so %LOCALAPPDATA%\wmux-<anything> dies too.
+ */
 function daemonStageRoot(): string | null {
-  if (process.platform !== 'win32' || !app.isPackaged || !process.env.LOCALAPPDATA) return null;
-  return path.join(process.env.LOCALAPPDATA, 'wmux-daemon-runtime');
+  if (process.platform !== 'win32' || !app.isPackaged) return null;
+  return path.join(getWmuxDir(), 'daemon-runtime');
 }
 
 /**
