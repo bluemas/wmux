@@ -51,8 +51,6 @@ const STARTUP_DA1_SCAN_BYTES = 64;
  * Code wrote it 0.8 s after the Esc in a live capture.
  */
 const DIALOG_CANCEL_PROBE_MS = 500;
-/** Clock slack between the Esc stamp and the transcript's own timestamp. */
-const DIALOG_CANCEL_SKEW_MS = 1_000;
 
 // eslint-disable-next-line no-control-regex
 const CSI_SEQUENCE = /^\x1b\[[0-?]*[ -/]*[@-~]/;
@@ -362,6 +360,13 @@ export class DaemonPTYBridge extends EventEmitter {
   private lastEscAt = 0;
   /** The `lastEscAt` an idle title already reported as an interrupt (#2264). */
   private titleEdgeEscAt = 0;
+  /**
+   * The lone Esc that closed a dialog (watchDialogCancel) and the episode it
+   * landed in (`turnSeq`). A transcript end recorded after it, inside the Esc
+   * confirm window and in that same episode, is its interrupt. Cleared once
+   * reported.
+   */
+  private dialogCancel: { sessionId: string; escAt: number; turnSeq: number } | null = null;
   /** Pending transcript read after an Esc closed a dialog (watchDialogCancel). */
   private dialogCancelTimer: ReturnType<typeof setTimeout> | null = null;
   /** Latest OSC 0/2 window title (sanitized) and when it arrived (0 = never). */
@@ -647,32 +652,51 @@ export class DaemonPTYBridge extends EventEmitter {
    * hook, and a declined question prints "User declined to answer questions",
    * not the `Interrupted` row, so nothing on screen confirms it. The pane went
    * back to running on the answer and stayed there until the next prompt.
-   * The transcript records the end: read it back inside the Esc confirm
-   * window, and an end written after this Esc settles the turn as the
-   * interrupt it is.
+   * The transcript records the end, and an end written after this Esc settles
+   * the turn as the interrupt it is (noteTranscriptTurnEnd reports it). With a
+   * Chat view open, the append push delivers that end; with none, nothing
+   * pushes it, so it is read back here inside the Esc confirm window.
    */
   private watchDialogCancel(): void {
     const sessionId = this.sessionId;
-    if (!sessionId || !DaemonPTYBridge.transcriptTurnEndProbe) return;
-    if (this.dialogCancelTimer) clearTimeout(this.dialogCancelTimer);
+    if (!sessionId) return;
     const escAt = this.lastEscAt;
+    // Captured after the answer resumed the episode: a Stop hook and a new
+    // prompt before the end lands start another one, which this Esc never touched.
+    this.dialogCancel = { sessionId, escAt, turnSeq: this.turnSeq };
+    if (this.dialogCancelTimer) clearTimeout(this.dialogCancelTimer);
+    this.dialogCancelTimer = null;
+    if (!DaemonPTYBridge.transcriptTurnEndProbe) return;
     const probe = (): void => {
       this.dialogCancelTimer = null;
-      // A later Esc owns its own read; a title edge may already have reported this one.
-      if (this.sessionId !== sessionId || this.lastEscAt !== escAt || this.titleEdgeEscAt === escAt) return;
-      if (!this.turnOpen && !this.turnSoftClosed) return;
+      // Already reported, or a later dialog Esc owns its own read.
+      if (this.dialogCancel?.escAt !== escAt) return;
       const endedAt = DaemonPTYBridge.transcriptTurnEndProbe?.(sessionId);
-      if (endedAt !== undefined && endedAt >= Math.max(this.turnOpenedAt, escAt - DIALOG_CANCEL_SKEW_MS)) {
-        this.titleEdgeEscAt = escAt;
-        this.closeInterruptedTurn();
-        this.emit('turnInterrupted', { sessionId, agent: this.agentDetector?.getLastAgent() || 'Claude Code' });
-        return;
-      }
-      if (Date.now() - escAt + DIALOG_CANCEL_PROBE_MS < ESC_INTERRUPT_CONFIRM_MS) {
+      // An end from before this Esc was recorded behind the dialog: the answer resumed past it.
+      if (endedAt !== undefined && endedAt >= escAt) this.noteTranscriptTurnEnd(endedAt);
+      if (this.dialogCancel?.escAt === escAt && Date.now() - escAt + DIALOG_CANCEL_PROBE_MS < ESC_INTERRUPT_CONFIRM_MS) {
         this.dialogCancelTimer = setTimeout(probe, DIALOG_CANCEL_PROBE_MS);
       }
     };
     this.dialogCancelTimer = setTimeout(probe, DIALOG_CANCEL_PROBE_MS);
+  }
+
+  /**
+   * Whether a transcript end recorded at `at` is the interrupt of the dialog a
+   * lone Esc declined (watchDialogCancel): recorded after that Esc, inside its
+   * confirm window, in the episode it landed in, and not already reported by
+   * the idle title. Consumes the watch when it is.
+   */
+  private takeDialogCancel(at: number): boolean {
+    const watch = this.dialogCancel;
+    if (!watch || watch.sessionId !== this.sessionId || watch.turnSeq !== this.turnSeq) return false;
+    if (watch.escAt !== this.lastEscAt || watch.escAt === this.titleEdgeEscAt) return false;
+    if (at < watch.escAt || Date.now() - watch.escAt >= ESC_INTERRUPT_CONFIRM_MS) return false;
+    this.dialogCancel = null;
+    if (this.dialogCancelTimer) clearTimeout(this.dialogCancelTimer);
+    this.dialogCancelTimer = null;
+    this.titleEdgeEscAt = watch.escAt;
+    return true;
   }
 
   /**
@@ -1388,12 +1412,18 @@ export class DaemonPTYBridge extends EventEmitter {
    * The agent's transcript recorded a turn end (completed or interrupted) at
    * `at`. An interrupt fires no Stop hook, so without this the episode would
    * stay open and the next prompt would join it. Ignored behind a dialog, or
-   * when the end predates the latest turn evidence.
+   * when the end predates the latest turn evidence. An end that follows a lone
+   * Esc which declined a dialog is that Esc's interrupt (watchDialogCancel):
+   * reported as `turnInterrupted`, since a hook-governed pane settles only on that.
    */
   noteTranscriptTurnEnd(at: number): void {
     if ((this.turnOpen || this.turnSoftClosed) && !this.awaitingHuman && at >= this.turnOpenedAt) {
+      const declined = this.takeDialogCancel(at);
       this.closeTurn();
       this.transcriptTurnEndAt = Date.now();
+      if (declined && this.sessionId) {
+        this.emit('turnInterrupted', { sessionId: this.sessionId, agent: this.agentDetector?.getLastAgent() || 'Claude Code' });
+      }
     }
   }
   /**
@@ -2736,6 +2766,7 @@ export class DaemonPTYBridge extends EventEmitter {
     this.resizeGuardTimer = null;
     if (this.dialogCancelTimer) clearTimeout(this.dialogCancelTimer);
     this.dialogCancelTimer = null;
+    this.dialogCancel = null;
 
     // AgentDetector subscriptions: without explicit unsubscribe, recovered
     // sessions or repeated setupDataForwarding calls would accumulate
