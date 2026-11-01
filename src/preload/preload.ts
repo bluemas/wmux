@@ -14,6 +14,7 @@ import type { TerminalCoreSettings, TerminalEngine } from '../shared/terminalCor
 import { CHAT_IPC } from '../shared/transcript/chatIpc';
 import type { ChatBridgeApi } from '../shared/transcript/turnEvents';
 import { CHATV2_IPC, type ChatV2BridgeApi, type ChatV2EventsPush, type ChatV2ResyncPush } from '../shared/chatv2/ipc';
+import { EXTERNAL_SESSIONS_IPC, type ExternalSession, type ExternalSessionsApi } from '../shared/externalSessions';
 import { contextBridge, ipcRenderer, webFrame, webUtils } from 'electron';
 import { START_POLARITY_STORAGE_KEY, resolveStartPolarity, startPaintCss } from '../shared/windowStartPaint';
 import { startLocaleFromArgv } from '../shared/startLocale';
@@ -332,7 +333,7 @@ const electronAPI = {
     // wmux.json leaf — `exec` runs the command as the pane's ROOT process and
     // `supervision` arms the daemon's PaneSupervisor (daemon mode only; the
     // local branch ignores them with a one-time warning toast).
-    create: (options?: { shell?: string; cwd?: string; recoveryCwds?: Pick<DeadPaneRecovery, 'spawnCwd' | 'cwd' | 'sourceSessionId'>; cols?: number; rows?: number; workspaceId?: string; surfaceId?: string; env?: Record<string, string>; wslAccountLoginEnvKey?: 'CLAUDE_CONFIG_DIR' | 'CODEX_HOME'; ignoreAccountBinding?: boolean; initialCommand?: string; exec?: string; supervision?: { restart: 'on-failure' | 'always'; limit?: { burst?: number; healthyUptimeSec?: number }; restorePermissionMode?: boolean }; fanoutTaskOf?: string; fanoutOrigin?: import('../shared/fanoutOrigin').FanoutOrigin; secretGrant?: string; fanoutLaunch?: { taskId: string; gen: number }; remoteSpawnOf?: string }) =>
+    create: (options?: { shell?: string; cwd?: string; wslDistro?: string; recoveryCwds?: Pick<DeadPaneRecovery, 'spawnCwd' | 'cwd' | 'sourceSessionId'>; cols?: number; rows?: number; workspaceId?: string; surfaceId?: string; env?: Record<string, string>; wslAccountLoginEnvKey?: 'CLAUDE_CONFIG_DIR' | 'CODEX_HOME'; ignoreAccountBinding?: boolean; initialCommand?: string; exec?: string; supervision?: { restart: 'on-failure' | 'always'; limit?: { burst?: number; healthyUptimeSec?: number }; restorePermissionMode?: boolean }; fanoutTaskOf?: string; fanoutOrigin?: import('../shared/fanoutOrigin').FanoutOrigin; secretGrant?: string; fanoutLaunch?: { taskId: string; gen: number }; remoteSpawnOf?: string }) =>
       ipcRenderer.invoke(IPC.PTY_CREATE, options),
     write: (id: string, data: string) => {
       ipcRenderer.send(IPC.PTY_WRITE, id, data);
@@ -2118,6 +2119,17 @@ const electronAPI = {
     update: (ptyId: string, patch: PaneUsageLimitPatch) =>
       ipcRenderer.invoke(IPC.USAGE_LIMIT_UPDATE, { ptyId, patch }) as Promise<{ ok: boolean }>,
   },
+  // External sessions (shared/externalSessions.ts): agents running outside
+  // wmux, status only. `onChanged` always carries the full list.
+  externalSessions: {
+    list: () => ipcRenderer.invoke(EXTERNAL_SESSIONS_IPC.list) as Promise<ExternalSession[]>,
+    hide: (id: string) => ipcRenderer.invoke(EXTERNAL_SESSIONS_IPC.hide, id) as Promise<void>,
+    onChanged: (callback: (sessions: ExternalSession[]) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, sessions: ExternalSession[]) => callback(sessions);
+      ipcRenderer.on(EXTERNAL_SESSIONS_IPC.changed, listener);
+      return () => { ipcRenderer.removeListener(EXTERNAL_SESSIONS_IPC.changed, listener); };
+    },
+  } satisfies ExternalSessionsApi,
   // Voice dictation (shared/dictation): the model's state and its one-time
   // download (called only from the owner's consent), the engine's assets,
   // and the microphone's OS access.

@@ -105,8 +105,33 @@ is needed.
 
 ## Observation
 
-`getAppState { app, window?, mode: "ax" | "vision" | "both" }`. `ax` does not
+`getAppState { app, window?, mode?: "ax" | "vision" | "both" }`. `ax` does not
 need screen-recording permission.
+
+**Default: accessibility first.** With no `mode`, main asks the helper for
+`ax` only, so most observations send the model no image. Main
+(`src/main/computer/axFirst.ts`, shared by both OSes) then counts the named
+controls in the tree text: lines whose role is one an agent can act on
+(button, text field, edit, link, list item, row, …) and that carry a name or a
+value. The menu bar and title bar subtrees are skipped, since every app has
+them, and so are macOS's window buttons (close, minimise, zoom, full screen),
+which sit directly under the window there because macOS has no title bar
+element. Fewer than 5 such controls means the tree is thin (canvas apps, games,
+web content that exposes nothing), and main walks the window again in `both`
+mode, so the indexes and the pixels share one snapshot. A `truncated` walk is never
+called thin: its count says nothing about the window, and a second walk would
+double the time it already ran out of.
+
+The result names the mode it was taken in (`mode`), and a thin-tree fallback
+says why (`screenshotAdded: "the accessibility tree has only 2 named
+controls"`), so the agent knows it can ask for `vision` or `both` itself.
+Without Screen Recording permission main skips the second walk, and when the
+second walk fails it keeps the first tree rather than returning an error: in
+both cases the result is the `ax` tree with a `screenshotError` that names the
+thin tree and why no screenshot came. An explicit `mode` is
+taken as given. A missing Accessibility permission does
+not fall back to `vision`: the macOS helper needs Accessibility to find the
+window even for a screenshot, and Windows needs no permission.
 
 **Tree text.** Both helpers render it the same way, in the format of the
 example below. No shared golden fixtures pin it yet; each helper's own tests
@@ -199,16 +224,17 @@ snapshot is the v1.1 token saver.
 - **`click { modifiers }`.** Modifier-down, click and modifier-up go in one
   input batch, and the up events are sent even if the batch fails part-way.
   There is no separate `keyDown` action.
-- **Focus.** Input actions bring the target app forward themselves (helper
-  auto-activation, 2026-10-08), and a pointer action whose point is covered
-  raises the target window first. The helper still re-checks, right before
-  each keyboard batch, that focus is on the target and the screen is not
-  locked, and answers `window_not_focused` when it is not. On Windows an
-  action is first posted to the target window in the background, which
-  does not need the target to be in front or focused; the screen must still
-  be unlocked (the helper checks the input desktop before it posts). Only what
-  cannot be posted goes this way (`docs/computer-use-windows.md`, Background
-  input).
+- **Focus.** The macOS helper sends input to the target window in the
+  background when it can, leaving the user's pointer, frontmost app and Space
+  alone (docs/computer-use-macos.md, Input). On Windows an action is first
+  posted to the target window in the background, which does not need the
+  target to be in front or focused; the screen must still be unlocked (the
+  helper checks the input desktop before it posts) (`docs/computer-use-windows.md`,
+  Background input). Otherwise input actions bring the target app forward
+  themselves (helper auto-activation, 2026-10-08), and a pointer action whose
+  point is covered raises the target window first. The helper still re-checks,
+  right before each keyboard batch, that focus is on the target and the screen
+  is not locked, and answers `window_not_focused` when it is not.
 - **Honest results.** Every action returns
   `{ method: "accessibility" | "synthetic" | "clipboard", verification: "verified" | "unverified", delivery?, disposition, note? }`.
   `verified` means state was read back, for example the value after
@@ -291,12 +317,23 @@ snapshot is the v1.1 token saver.
     per-action order on one app; interleaving of whole action batches
     between two agents on the same app is out of scope.
   - Foreground-certain actions are sent with `foreground: 'allow'`: after
-    their slot they take the lease, at once or `input_busy`. They are, row
-    for row the Windows helper's own refusals: scroll, a button other than
-    left, a click with modifiers or more than one click, a hotkey with
-    modifiers, and `type` text with a control character other than one
-    trailing newline; plus `openApp`, which has no target app before the
-    launch and takes the lease only. `setValue` is a UIA call, not input.
+    their slot they take the lease, at once or `input_busy`. Which actions
+    those are follows the helper's OS (`foregroundCertain(req, os)`), so
+    each list is its own helper's refusals that depend on the action alone:
+    - Windows, row for row the Windows helper's own refusals: scroll, a
+      button other than left, a click with modifiers or more than one
+      click, a hotkey with modifiers, and `type` text with a control
+      character other than one trailing newline.
+    - macOS, the rows of the macOS helper's `foregroundReason` that depend
+      on the action alone: a button other than left, and more than two
+      clicks. A scroll, a double click, a click or hotkey with modifiers
+      and any `type` text go with `refuse`; the helper answers
+      `needs_foreground` when the target needs real input for them (an
+      Electron scroll, a Command shortcut to a Chromium-based app, a
+      window off screen, and the other cases of
+      `docs/computer-use-macos.md`, Input).
+    - Both: `openApp`, which has no target app before the launch and takes
+      the lease only. `setValue` is a UIA or AX call, not input.
   - Everything else is sent with `foreground: 'refuse'`. A helper that
     cannot post it answers `needs_foreground`, and only when nothing was
     sent for that action (no event, posted message, pattern call or focus
@@ -326,10 +363,9 @@ snapshot is the v1.1 token saver.
     assume it runs one request at a time; the Windows helper's server loop
     is single-threaded and also refuses (`internal`, nothing sent) a
     request that arrives while another is in flight.
-  - A helper whose hello lacks `input.deferForeground: true` (the macOS
-    helper today, and older Windows helpers) gets no lanes: every input
-    action takes the lease, exactly as before. The helper process itself
-    still runs one request at a time.
+  - A helper whose hello lacks `input.deferForeground: true` (an older
+    helper) gets no lanes: every input action takes the lease, exactly as
+    before. The helper process itself still runs one request at a time.
 
 ## Errors
 
@@ -601,3 +637,8 @@ Behaviour and UX only:
 - Anthropic computer-use tool docs: screenshot scaling, action set
 - be1st6666/guarded-computer-use-mcp: physical-input-only approvals,
   abort key, rate cap
+- vercel-labs/agent-desktop (Apache-2.0, at `5261b528`): accessibility tree
+  as the default observation with screenshots as a separate, visual fallback
+  for an empty or sparse tree; a count of addressable elements as the
+  thinness signal; and a walk that did not reach the end of the tree never
+  being taken as proof the tree is thin. Behaviour only, no code.
