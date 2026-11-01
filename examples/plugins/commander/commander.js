@@ -185,11 +185,12 @@
     const d = dialog(kind === 'copy' ? 'Copy files' : 'Move files', [node('p', `${entries.length} items to\n${destDir}`), choice], [['Cancel', false], ['Continue', true]]);
     if (!await d.result) return;
     await job(`fs.${kind}`, { sources: entries.map((e) => join(p.path, e.name)), destDir, conflict: choice.value });
+    p.marks.clear(); render();
   }
   async function trash() {
     const p = current(), entries = selected(p); if (!entries.length) return;
     const d = dialog('Move to Trash', [node('p', `${entries.length} items:\n${entries.map((e) => e.name).join('\n')}`)], [['Cancel', false], ['Move to Trash', true]]);
-    if (await d.result) await job('fs.trash', { paths: entries.map((e) => join(p.path, e.name)) });
+    if (await d.result) { await job('fs.trash', { paths: entries.map((e) => join(p.path, e.name)) }); p.marks.clear(); render(); }
   }
   async function job(method, params) {
     const result = await checked(method, params);
@@ -224,8 +225,10 @@
   page.onkeydown = (event) => {
     if (modal) return;
     const key = event.key, p = current(); let action;
-    if (event.ctrlKey && /^[123]$/.test(key)) action = () => layout(Number(key));
-    else if (event.altKey && /^[1-9]$/.test(key)) action = () => quick(Number(key));
+    // event.code, not key: on macOS Option+1 types '¡'.
+    const digit = /^Digit([1-9])$/.exec(event.code)?.[1];
+    if (event.ctrlKey && digit && digit <= '3') action = () => layout(Number(digit));
+    else if (event.altKey && digit) action = () => quick(Number(digit));
     else if (event.ctrlKey && key.toLowerCase() === 'r') action = refresh;
     else if (event.ctrlKey || event.metaKey || event.altKey) return;
     else if (commands[key]) action = commands[key];

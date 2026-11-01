@@ -45,7 +45,7 @@ beforeEach(async () => {
   const event = new MessageEvent('message', { data: { v: 1, kind: 'init' } });
   Object.defineProperty(event, 'source', { value: window.parent }); Object.defineProperty(event, 'ports', { value: [port] });
   window.dispatchEvent(event); await idle();
-  key('2', { ctrlKey: true });
+  key('2', { ctrlKey: true, code: 'Digit2' });
 });
 describe('Commander page over the plugin bridge', () => {
   it('starts both panels at the active cwd, sorts folders first and displays owner modes', () => {
@@ -56,10 +56,10 @@ describe('Commander page over the plugin bridge', () => {
     expect(page().classList.contains('colours')).toBe(false);
   });
   it('switches layouts and active panels and jumps to quick slots', async () => {
-    key('3', { ctrlKey: true }); expect(document.querySelectorAll('.panel')).toHaveLength(3);
+    key('3', { ctrlKey: true, code: 'Digit3' }); expect(document.querySelectorAll('.panel')).toHaveLength(3);
     key('Tab'); expect(document.querySelectorAll('.panel')[1].classList.contains('active')).toBe(true);
     key('Tab', { shiftKey: true }); expect(document.querySelectorAll('.panel')[0].classList.contains('active')).toBe(true);
-    key('1', { altKey: true }); await vi.waitFor(() => expect(document.querySelector('.path')?.textContent).toBe('/first'), { timeout: 5_000 });
+    key('¡', { altKey: true, code: 'Digit1' }); // macOS Option+1 await vi.waitFor(() => expect(document.querySelector('.path')?.textContent).toBe('/first'), { timeout: 5_000 });
   });
   it('marks entries and sends only those sources after copy confirmation', async () => {
     key('Home'); key('ArrowDown'); key(' '); key('F5');
