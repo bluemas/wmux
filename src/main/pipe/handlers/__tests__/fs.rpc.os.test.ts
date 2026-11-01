@@ -40,6 +40,12 @@ describe('validatePathParam', () => {
     expect(validatePathParam(`${root}\0x`)).toBeNull();
     expect(validatePathParam(`/${'a'.repeat(5000)}`)).toBeNull();
   });
+
+  it('expands a leading ~ to the home folder, but not ~user', () => {
+    expect(validatePathParam('~')).toBe(home);
+    expect(validatePathParam('~/work')).toBe(path.join(home, 'work'));
+    expect(validatePathParam('~other/x')).toBeNull();
+  });
 });
 
 describe('fs.list', () => {
