@@ -22,6 +22,7 @@ bits, not an effective-access guarantee.
 - F5/F6: copy/move marks, or the cursor entry, to the next visible panel.
 - F7: create a folder.
 - F8: move marks or the cursor entry to the operating system Trash.
+- F10: go to a folder typed in a prompt (absolute, or relative to the panel).
 - Esc: close the dialog; during a job, request cancellation.
 
 Operations require confirmation in the page. Copy/move offer skip/overwrite

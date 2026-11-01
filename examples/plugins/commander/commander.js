@@ -165,6 +165,16 @@
     const pre = node('pre', content); pre.tabIndex = 0;
     const d = dialog(e.name, [node('p', r.truncated ? 'Too large, first 1 MB shown' : ''), pre], [['Close', true]]); d.box.classList.add('viewer');
   }
+  function handBack(event) {
+    if (!port || ['Control', 'Meta', 'Alt', 'Shift'].includes(event.key)) return;
+    port.postMessage({ v: 1, kind: 'key', key: event.key, code: event.code, ctrlKey: event.ctrlKey, metaKey: event.metaKey, altKey: event.altKey, shiftKey: event.shiftKey, repeat: event.repeat });
+  }
+  async function goTo() {
+    const p = current(), input = await ask('Go to folder', p.path); if (input === null || !input.trim()) return;
+    const value = input.trim();
+    const absolute = value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value) || value.startsWith('\\\\');
+    await load(p, absolute ? value : join(p.path, value));
+  }
   async function rename() {
     const p = current(), e = rows(p)[p.cursor]; if (e.parent) return;
     const name = await ask('Rename', e.name); if (name === null) return;
@@ -219,8 +229,8 @@
     const re = new RegExp('^' + pattern.split('').map((c) => c === '*' ? '.*' : c === '?' ? '.' : c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('') + '$', 'i');
     for (const e of p.entries) if (re.test(e.name)) { if (mark) p.marks.add(e.name); else p.marks.delete(e.name); } render();
   }
-  const commands = { F2: rename, F3: view, F5: () => transfer('copy'), F6: () => transfer('move'), F7: mkdir, F8: trash };
-  for (const [key, label] of [['F2', 'Rename'], ['F3', 'View'], ['F5', 'Copy'], ['F6', 'Move'], ['F7', 'Mkdir'], ['F8', 'Trash']]) document.querySelector('#keys').append(button(`${key} ${label}`, commands[key]));
+  const commands = { F2: rename, F3: view, F5: () => transfer('copy'), F6: () => transfer('move'), F7: mkdir, F8: trash, F10: goTo };
+  for (const [key, label] of [['F2', 'Rename'], ['F3', 'View'], ['F5', 'Copy'], ['F6', 'Move'], ['F7', 'Mkdir'], ['F8', 'Trash'], ['F10', 'Go to']]) document.querySelector('#keys').append(button(`${key} ${label}`, commands[key]));
   page.onkeydown = (event) => {
     if (modal) return;
     const key = event.key, p = current(); let action;
@@ -229,7 +239,9 @@
     if (event.ctrlKey && digit && digit <= '3') action = () => layout(Number(digit));
     else if (event.altKey && digit) action = () => quick(Number(digit));
     else if (event.ctrlKey && key.toLowerCase() === 'r') action = refresh;
-    else if (event.ctrlKey || event.metaKey || event.altKey) return;
+    // A chord this page does not use goes back to wmux, which runs it only
+    // when it is a plugin page shortcut (so this page's own key closes it).
+    else if (event.ctrlKey || event.metaKey || event.altKey) { handBack(event); return; }
     else if (commands[key]) action = commands[key];
     else if (key === 'Tab') action = () => { active = (active + (event.shiftKey ? count - 1 : 1)) % count; render(); };
     else if (key === 'Enter' || key === 'ArrowRight') action = () => open();

@@ -59,7 +59,23 @@ describe('Commander page over the plugin bridge', () => {
     key('3', { ctrlKey: true, code: 'Digit3' }); expect(document.querySelectorAll('.panel')).toHaveLength(3);
     key('Tab'); expect(document.querySelectorAll('.panel')[1].classList.contains('active')).toBe(true);
     key('Tab', { shiftKey: true }); expect(document.querySelectorAll('.panel')[0].classList.contains('active')).toBe(true);
-    key('¡', { altKey: true, code: 'Digit1' }); // macOS Option+1 await vi.waitFor(() => expect(document.querySelector('.path')?.textContent).toBe('/first'), { timeout: 5_000 });
+    key('¡', { altKey: true, code: 'Digit1' }); // macOS Option+1
+    await vi.waitFor(() => expect(document.querySelector('.path')?.textContent).toBe('/first'), { timeout: 5_000 });
+  });
+  it('goes to a typed folder with F10, relative to the panel', async () => {
+    key('F10'); const input = document.querySelector<HTMLInputElement>('.dialog input') as HTMLInputElement;
+    expect(input.value).toBe('/work');
+    input.value = 'folder'; click('OK');
+    await vi.waitFor(() => expect(document.querySelector('.path')?.textContent).toBe('/work/folder'), { timeout: 5_000 });
+    key('F10'); (document.querySelector('.dialog input') as HTMLInputElement).value = '/elsewhere'; click('OK');
+    await vi.waitFor(() => expect(document.querySelector('.path')?.textContent).toBe('/elsewhere'), { timeout: 5_000 });
+  });
+  it('hands an unused chord back to the host', () => {
+    const sent: unknown[] = []; const original = port.postMessage;
+    port.postMessage = (m) => { sent.push(m); };
+    key('f', { ctrlKey: true, altKey: true, code: 'KeyF' }); key('Control', { ctrlKey: true });
+    port.postMessage = original;
+    expect(sent).toEqual([{ v: 1, kind: 'key', key: 'f', code: 'KeyF', ctrlKey: true, metaKey: false, altKey: true, shiftKey: false, repeat: false }]);
   });
   it('marks entries and sends only those sources after copy confirmation', async () => {
     key('Home'); key('ArrowDown'); key(' '); key('F5');
