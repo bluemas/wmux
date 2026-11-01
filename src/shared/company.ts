@@ -126,6 +126,44 @@ export function renderRemoteBrief(message: string, brief: CompanyBriefV1): strin
   return [message.trim(), ...fields, REMOTE_SEAT_FINISH_LINE].join('\n\n');
 }
 
+/** What a seat on another PC is told when it starts. */
+export interface RemoteSeatIntroInput {
+  /** The seat's name: the label the ask gives its link here. */
+  name: string;
+  company: string;
+  mission?: string;
+  owns?: string;
+  /** The CEO pane's name on this PC. */
+  ceo: string;
+  standingOrders?: string;
+}
+
+/**
+ * The first message a seat on another PC gets, sent with the ask that starts
+ * it: who it is and for which company, what it owns, who its CEO is, that
+ * briefs come as tasks with the five brief fields, how it finishes one
+ * (REMOTE_SEAT_FINISH_LINE), and the standing orders. It holds no brief, and
+ * no PC names: the send masks a host name such as `name.local`.
+ */
+export function remoteSeatIntro(input: RemoteSeatIntroInput): string {
+  const mission = input.mission?.trim();
+  const owns = input.owns?.trim().replace(/\.+$/, '');
+  const orders = input.standingOrders?.trim();
+  const headings = BRIEF_FIELDS.map((f) => BRIEF_HEADINGS[f]);
+  const lines = [
+    `You are ${input.name.trim()}, a seat of the company "${input.company.trim()}"${mission ? ` (mission: ${mission})` : ''}.`,
+  ];
+  if (owns) lines.push(`You own: ${owns}.`);
+  lines.push(
+    `Your CEO is ${input.ceo.trim()} on the PC that started you; its briefs come here as tasks with `
+    + `${headings.slice(0, -1).join(', ')} and ${headings[headings.length - 1]}.`,
+  );
+  lines.push(`Each brief ends with how to finish it: ${REMOTE_SEAT_FINISH_LINE}`);
+  if (orders) lines.push(`Standing orders: ${orders}`);
+  lines.push('Wait for a brief.');
+  return lines.join('\n');
+}
+
 /** True when the task's first message carries a brief: a company task. */
 export function isCompanyTask(history: readonly Message[]): boolean {
   const first = history[0];
