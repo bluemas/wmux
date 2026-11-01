@@ -121,7 +121,7 @@ import { setUsageClientVersion, type UsageSnapshot } from './claude/UsageApi';
 import { AccountUsageService } from './account/AccountUsageService';
 import { getAccountRotationService } from './account/AccountRotationService';
 import { getAccountStore } from './account/accountStore';
-import { IPC, getWmuxHomeDir } from '../shared/constants';
+import { IPC, getWmuxHomeDir, dataSuffix } from '../shared/constants';
 import { HookSignalRouter } from './hooks/HookSignalRouter';
 import { SignalLatencyMeter } from './hooks/SignalLatencyMeter';
 import { registerBrowserRpc, type CallerBrowserProtection } from './pipe/handlers/browser.rpc';
@@ -281,6 +281,8 @@ import {
   refreshHookBridgeAtBoot,
   defaultPaths as defaultHooksPaths,
 } from '../cli/commands/setupHooks';
+import { refreshWslHookAtBoot } from '../shared/wslGlobalHook';
+import { findWslClaudeBridge } from '../shared/wslIntegration';
 import { detectStalePluginGates } from './hooks/stalePluginGate';
 import { ProcessMonitor } from '../daemon/ProcessMonitor';
 import { metadataStore } from './metadata/MetadataStore';
@@ -2246,6 +2248,32 @@ app.on('ready', async () => {
       }
     }, 3000);
     refreshTimer.unref();
+  }
+
+  // The global WSL hook (`wmux setup-hooks --wsl`, shared/wslGlobalHook.ts)
+  // runs this runtime and bridge, which an update moves: record them at every
+  // start, and bring an installed hook script up to this build. getWmuxDir()
+  // is suffix-scoped, so an isolated instance writes only into its own data
+  // dir; an unsuffixed dev run writes nothing. Deferred like the refreshes
+  // above: the bridge lookup walks the filesystem, off the ready path.
+  if (process.platform === 'win32') {
+    const wslHookTimer = setTimeout(() => {
+      try {
+        const out = refreshWslHookAtBoot({
+          platform: process.platform,
+          isPackaged: app.isPackaged,
+          suffix: dataSuffix(),
+          hooksDir: path.join(getWmuxDir(), 'hooks'),
+          runtimePath: process.execPath,
+          bridgePath: findWslClaudeBridge(__dirname),
+        });
+        if (out.pointer === 'no-bridge') logLine('warn', 'main', 'wsl hook runtime pointer: no-bridge');
+        else if (out.pointer === 'written' || out.script === 'refreshed') logLine('info', 'main', `wsl hook: pointer ${out.pointer}, script ${out.script}`);
+      } catch (err) {
+        console.warn('[hooks] wsl hook refresh failed (non-fatal):', err);
+      }
+    }, 3000);
+    wslHookTimer.unref();
   }
 
   // #898 — the OTHER copy of the bridge. `refreshHookBridge` above owns

@@ -78,7 +78,7 @@ import { isWslShell, type WslTarget } from '../../../shared/wsl';
 import { resolvePtyCreateCwdForShell, type PtyCwdSource, type ResolvedPtyCwd } from '../../pty/resolvePtyCwd';
 import { FANOUT_TASK_PORT_ENV } from '../../worktask/fanoutEnvironment';
 import { agentDisplayToSlug } from '../../../shared/agentIdentity';
-import { wslDistroArgs, isWslDistroSpawnArgs } from '../../../shared/wslDistro';
+import { wslDistroArgs, isWslDistroSpawnArgs, isValidWslDistroName } from '../../../shared/wslDistro';
 import { getDefaultWslDistro } from '../../pty/defaultWslDistro';
 import { SessionPromptScheduler } from '../../pty/SessionPromptScheduler';
 import { recordFanoutTaskPane, stampFanoutTaskPane, stampRemoteSpawnPane } from '../../worktask/fanoutGuards';
@@ -148,6 +148,13 @@ type PtyCreateOptions = {
   ignoreAccountBinding?: boolean;
   shell?: string;
   cwd?: string;
+  /**
+   * A WSL pane's distribution, for a pane opened where a session started in
+   * WSL outside wmux runs (the external session's "open a pane here"). Used
+   * only with a WSL shell and a valid distro name; otherwise the settings
+   * picker's distro, as for any new pane.
+   */
+  wslDistro?: string;
   /** Dead-session replacement candidates. WSL validates inside its distro;
    * neither value is trusted merely because it came from the renderer. */
   recoveryCwds?: Pick<DeadPaneRecovery, 'spawnCwd' | 'cwd' | 'wslTarget' | 'args' | 'sourceSessionId'>;
@@ -203,6 +210,12 @@ function withWmuxTools(options: PtyCreateOptions | undefined): PtyCreateOptions 
   });
   if (initialCommand !== rest.initialCommand) console.log('[pty:create] wmux tool level applied', { tools: wmuxTools.tools, role: wmuxTools.role });
   return { ...rest, initialCommand };
+}
+
+/** The distro a new WSL pane boots: the caller's, when it names a valid one, else the settings picker's. */
+export function requestedWslDistro(options: Pick<PtyCreateOptions, 'wslDistro'> | undefined): string | null {
+  const requested = options?.wslDistro;
+  return isValidWslDistroName(requested) ? requested : getDefaultWslDistro();
 }
 
 /** The shell a create will spawn (the same default both modes use). */
@@ -694,7 +707,7 @@ export function registerPTYHandlers(
       const trustedRecovery = recoverySessions.find(s => s.id === recoveryId && s.state === 'dead' && isWslShell(s.cmd));
       const wslArgs = isWslDistroSpawnArgs(shell, trustedRecovery?.args)
         ? [...trustedRecovery.args]
-        : wslDistroArgs(shell, getDefaultWslDistro());
+        : wslDistroArgs(shell, requestedWslDistro(options));
 
       // Generate a unique session ID
       const crypto = require('crypto');
@@ -1047,7 +1060,7 @@ export function registerPTYHandlers(
       const { initialCommand, cols, rows, workspaceId, surfaceId, env, spawnKind, wslAccountLoginEnvKey, ignoreAccountBinding } = options ?? {};
       // #1103 — same distro injection as the daemon branch, so both modes
       // boot the same WSL distro for the same setting.
-      const wslArgs = wslDistroArgs(shell, getDefaultWslDistro());
+      const wslArgs = wslDistroArgs(shell, requestedWslDistro(options));
       // #2231 — as the daemon branch: a WSL fan-out task pane's worktree git location.
       const wslTaskGit = (botWorker || options?.fanoutTaskOf) && isWslShell(shell) && safeCwd
         ? await resolveWslWorkerGit(safeCwd, wslArgs?.[1] ?? null).catch(() => null)
