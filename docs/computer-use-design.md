@@ -268,8 +268,68 @@ snapshot is the v1.1 token saver.
   macOS the flags come from private SkyLight calls that change across
   releases; `keyAuth` is the key-event authentication message, from
   macOS 15. The Windows helper sends `{ backgroundPointer: true,
-  focusWithoutRaise: false, keyAuth: true }`. Main drops `input` when
-  Accessibility is not granted.
+  focusWithoutRaise: false, keyAuth: true, deferForeground: true }`. Main
+  drops `input` when Accessibility is not granted.
+  `deferForeground` (optional): the helper honours `foreground: 'refuse'`
+  on input methods (Input lanes, below).
+- **Input lanes** (`src/main/computer/inputLanes.ts`). Several agents can
+  drive different apps at once:
+  - The foreground lease: real input (it moves the user's pointer and front
+    window) is held by one agent session at a time. It stays busy from the
+    moment it is taken until that real-input request settles (result,
+    error or timeout), however long it waits in the helper's queue, and
+    only then counts 15 s of idle time. Another agent gets `input_busy` at
+    once, `not_delivered`; the lease never waits.
+  - Pid lanes: every input action with a target app (every snapshot
+    action) takes that app's slot first, one action at a time per pid, in
+    arrival order. Actions on different apps never wait on each other. The
+    wait happens outside the slot; once it is held, main checks again the
+    stop generation and cooldown, that the stop key is still held, the
+    snapshot (known, not expired, this agent's, its window still that
+    pid's) and consent, without a prompt. A failed check is
+    `not_delivered` and never reaches the helper. The guarantee is
+    per-action order on one app; interleaving of whole action batches
+    between two agents on the same app is out of scope.
+  - Foreground-certain actions are sent with `foreground: 'allow'`: after
+    their slot they take the lease, at once or `input_busy`. They are, row
+    for row the Windows helper's own refusals: scroll, a button other than
+    left, a click with modifiers or more than one click, a hotkey with
+    modifiers, and `type` text with a control character other than one
+    trailing newline; plus `openApp`, which has no target app before the
+    launch and takes the lease only. `setValue` is a UIA call, not input.
+  - Everything else is sent with `foreground: 'refuse'`. A helper that
+    cannot post it answers `needs_foreground`, and only when nothing was
+    sent for that action (no event, posted message, pattern call or focus
+    request; otherwise it ends `delivered_unverified` as before). Main
+    upgrades only a `needs_foreground` whose disposition is
+    `not_delivered`; any other ends the action `delivered_unverified`,
+    never re-sent. The upgrade, still holding the slot, checks the
+    snapshot and the stop again, then takes the lease (`input_busy`,
+    `not_delivered`, when another agent holds it), so a failed check never
+    leaves the lease held, and re-sends once with `foreground: 'allow'`.
+    `needs_foreground` never reaches an agent; a second one ends
+    `internal`.
+  - Lock order is always slot, then lease. An action with no target app
+    takes the lease only, and the lease never waits, so no cycle can form.
+  - The stop key ends every action still queued for a slot with `aborted`,
+    `not_delivered`, before it reaches the helper. The rate cap stays per
+    agent and is charged once the action is about to be sent, so an action
+    that ended while queued costs none.
+  - Main reads `deferForeground` from the hello of the helper the action
+    starts anyway; it sends no extra request for it. A helper that cannot
+    start ends the action there with that error (`not_delivered`), started
+    once, not again by the request.
+  - Every helper request made while a slot is held has the helper's
+    request timeout, after which the helper is killed and replaced, so a
+    helper that never answers releases the slot at that timeout.
+  - The helper's retry-safety answers (dispositions, `needs_foreground`)
+    assume it runs one request at a time; the Windows helper's server loop
+    is single-threaded and also refuses (`internal`, nothing sent) a
+    request that arrives while another is in flight.
+  - A helper whose hello lacks `input.deferForeground: true` (the macOS
+    helper today, and older Windows helpers) gets no lanes: every input
+    action takes the lease, exactly as before. The helper process itself
+    still runs one request at a time.
 
 ## Errors
 
@@ -399,8 +459,10 @@ a person was faster by hand, so the defaults moved:
   - Consent is fail-closed: a prompt nobody answers within 2 minutes refuses
     that call (`timeout`). Only an explicit Deny is remembered; an unanswered,
     withdrawn or unshowable prompt is not, so the next call asks again.
-- **Input lock.** One agent session at a time holds desktop input. Another
-  that tries gets `input_busy`, with the holder's client and workspace name.
+- **Input lock.** One agent session at a time holds real (foreground)
+  input. Another that tries gets `input_busy`, with the holder's client and
+  workspace name. Input posted in the background to one app only waits for
+  that app (Input lanes, above).
 - **Abort.** A global shortcut (default `Ctrl+Alt+Shift+Escape`) cancels the
   in-flight request, releases modifiers, takes down every open consent prompt
   (the calls parked on them fail with `aborted` at once), drops the input lock
