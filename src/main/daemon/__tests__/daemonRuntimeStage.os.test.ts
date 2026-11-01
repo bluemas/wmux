@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { spawn } from 'child_process';
-import { removeDaemonRuntimeStages, stageDaemonRuntime, stagedDaemonScripts, stageKey } from '../daemonRuntimeStage';
+import { isSquirrelInstall, removeDaemonRuntimeStages, stageDaemonRuntime, stagedDaemonScripts, stageKey } from '../daemonRuntimeStage';
 
 describe('daemon runtime staging', () => {
   let root: string;
@@ -22,6 +22,12 @@ describe('daemon runtime staging', () => {
   afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
 
   const stage = () => stageDaemonRuntime({ appDir, exeName: 'wmux.exe', stageRoot, version: '4.13.0' });
+
+  it('recognises a Squirrel install only when Update.exe is in the parent folder', () => {
+    expect(isSquirrelInstall(appDir)).toBe(false);
+    fs.writeFileSync(path.join(root, 'Update.exe'), 'updater');
+    expect(isSquirrelInstall(appDir)).toBe(true);
+  });
 
   it('copies the install out of the install root, keeping its layout', () => {
     const staged = stage();

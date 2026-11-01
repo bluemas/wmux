@@ -1,7 +1,7 @@
 import * as path from 'path';
 import { app, dialog } from 'electron';
 import { markBoot } from '../util/bootTrace';
-import { daemonStageRootIn, stageDaemonRuntime, stagedDaemonScripts } from './daemonRuntimeStage';
+import { daemonStageRootIn, isSquirrelInstall, stageDaemonRuntime, stagedDaemonScripts } from './daemonRuntimeStage';
 import { getWmuxDir } from '../../daemon/config';
 import {
   classifyTasklistOutput,
@@ -202,9 +202,11 @@ const electronDeps: DaemonLauncherDeps = {
   markBoot,
   stageDaemonRuntime: () => {
     const stageRoot = daemonStageRoot();
-    if (!stageRoot) return null;
+    const appDir = path.dirname(process.execPath);
+    // The copy is only needed where Squirrel's Setup.exe would kill a daemon under the install root.
+    if (!stageRoot || !isSquirrelInstall(appDir)) return null;
     return stageDaemonRuntime({
-      appDir: path.dirname(process.execPath),
+      appDir,
       exeName: path.basename(process.execPath),
       stageRoot,
       version: app.getVersion(),

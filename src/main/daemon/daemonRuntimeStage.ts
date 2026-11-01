@@ -27,6 +27,10 @@ export interface StagedDaemon {
 
 const SCRIPT = ['resources', 'daemon-bundle', 'index.js'];
 
+export function isSquirrelInstall(appDir: string): boolean {
+  return fs.existsSync(path.join(appDir, '..', 'Update.exe'));
+}
+
 /** One folder per build: a same-version rebuild still gets a fresh copy. */
 export function stageKey(version: string, scriptMtimeMs: number): string {
   return `${version}-${Math.floor(scriptMtimeMs)}`;
