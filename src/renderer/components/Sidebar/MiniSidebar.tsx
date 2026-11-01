@@ -110,8 +110,10 @@ export default function MiniSidebar({ rail = false, collapsed = true }: { rail?:
     () => multiviewGroupNumbers(workspaces.map((w) => w.id), multiviewIds, multiviewSavedGroups),
     [workspaces, multiviewIds, multiviewSavedGroups],
   );
-  // The grid is on screen only while the active workspace is one of its tiles.
-  const gridShown = multiviewIds.includes(activeWorkspaceId);
+  const activeRemoteKey = useStore((s) => s.activeRemoteKey);
+  // The grid is on screen only while the active workspace is one of its tiles
+  // and no remote mirror covers it (Sidebar's shownGridIds).
+  const gridShown = !activeRemoteKey && multiviewIds.includes(activeWorkspaceId);
   const reorderWorkspace = useStore((s) => s.reorderWorkspace);
   const notifications = useStore((s) => s.notifications);
   const settingsPanelVisible = useStore((s) => s.settingsPanelVisible);
@@ -258,7 +260,8 @@ export default function MiniSidebar({ rail = false, collapsed = true }: { rail?:
             ? t('workspace.agentUnverifiable', { time: formatStaleMinutes(unverifiableMinutes) })
             : attentionClassById[ws.id] === 'needsYou' && (agentStatus === 'waiting' || agentStatus === 'awaiting_input') ? t('workspace.needsYou')
               : agentStatus !== 'idle' ? t(AGENT_STATUS_ICON[agentStatus].labelKey) : undefined;
-          const railName = [ws.name, statusText].filter(Boolean).join(', ');
+          const groupText = multiviewGroup !== undefined ? t('sidebar.multiviewGroup', { n: multiviewGroup }) : undefined;
+          const railName = [ws.name, groupText, statusText].filter(Boolean).join(', ');
 
           const handleClick = (e: React.MouseEvent<HTMLButtonElement>) => {
             // Suppress click that fires immediately after a drag.

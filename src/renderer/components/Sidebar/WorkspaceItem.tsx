@@ -1112,14 +1112,15 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, multiviewGroup, ind
     }, t)
     : undefined;
 
-  // The treeitem's name: the workspace, what it is waiting on, and (for a
-  // question) the question itself, like Fleet's row.
+  // The treeitem's name: the workspace, its multiview group, what it is
+  // waiting on, and (for a question) the question itself, like Fleet's row.
   const statusWord = needsYou ? t('workspace.needsYou')
     : unverifiableMinutes > 0 ? t('workspace.agentUnverifiable', { time: formatStaleMinutes(unverifiableMinutes) })
       : authLost ? t('agentAuth.signedOutShort')
         : markStatus !== 'idle' ? t(AGENT_STATUS_ICON[markStatus].labelKey)
           : usageWaiting ? t('usageLimit.waiting') : undefined;
-  const rowLabel = [displayName, statusWord, question].filter(Boolean).join(', ');
+  const groupWord = multiviewGroup !== undefined ? t('sidebar.multiviewGroup', { n: multiviewGroup }) : undefined;
+  const rowLabel = [displayName, groupWord, statusWord, question].filter(Boolean).join(', ');
 
   // Keys on the row itself (the list moves between rows, Sidebar.tsx): Enter
   // or Space opens it (⌘/Ctrl adds it to the multiview), → opens its agents,
