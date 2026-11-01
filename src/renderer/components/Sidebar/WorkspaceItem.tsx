@@ -1261,17 +1261,6 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, multiviewGroup, ind
         />
       )}
 
-      {/* Multiview bar: the group on screen also marks its rows with a square
-          bar on the right edge, so the grid's members read as one block down
-          the list. The left edge stays the color tag's. */}
-      {isMultiview && (
-        <div
-          className="absolute top-[3px] bottom-[3px] right-0 w-[3px] z-[1] pointer-events-none bg-[var(--accent-blue)]"
-          data-multiview-bar=""
-          aria-hidden="true"
-        />
-      )}
-
       {/* 드롭 인디케이터 - 위. pointer-events-none so it never participates
           in drag hit-testing (codex P3). */}
       {dropIndicator === 'above' && (
