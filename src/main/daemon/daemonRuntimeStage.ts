@@ -56,20 +56,25 @@ export function stageDaemonRuntime(opts: {
   warn?: (msg: string) => void;
 }): StagedDaemon | null {
   const warn = opts.warn ?? (() => { /* silent */ });
+  let partial: string | null = null;
   try {
     const source = path.join(opts.appDir, ...SCRIPT);
     const dir = path.join(opts.stageRoot, stageKey(opts.version, fs.statSync(source).mtimeMs));
     const staged = (): StagedDaemon => ({ script: path.join(dir, ...SCRIPT), nodePath: path.join(dir, opts.exeName), dir });
-    if (!fs.existsSync(staged().script)) {
+    // A prune that removed wmux.exe but not the folder leaves a copy that cannot run.
+    if (!fs.existsSync(staged().script) || !fs.existsSync(staged().nodePath)) {
       // Copied under a temporary name and renamed, so a half copy is never run.
-      const partial = `${dir}.partial-${process.pid}`;
+      partial = `${dir}.partial-${process.pid}`;
       fs.rmSync(partial, { recursive: true, force: true });
       fs.cpSync(opts.appDir, partial, { recursive: true });
+      fs.rmSync(dir, { recursive: true, force: true });
       fs.renameSync(partial, dir);
+      partial = null;
     }
     pruneStages(opts.stageRoot, path.basename(dir), opts.exeName);
     return staged();
   } catch (err) {
+    if (partial) { try { fs.rmSync(partial, { recursive: true, force: true }); } catch { /* left for the next spawn */ } }
     warn(`[launcher] could not copy the daemon runtime out of the install (${err instanceof Error ? err.message : String(err)}); running it from the install`);
     return null;
   }

@@ -57,7 +57,7 @@ describe('daemon runtime staging', () => {
     fs.copyFileSync(path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'PING.EXE'), first.nodePath);
     const running = spawn(first.nodePath, ['-n', '30', '127.0.0.1'], { stdio: 'ignore', windowsHide: true });
     try {
-      await new Promise((r) => setTimeout(r, 300));
+      await new Promise<void>((resolve, reject) => { running.once('spawn', resolve); running.once('error', reject); });
       const later = new Date(Date.now() + 60_000);
       fs.utimesSync(path.join(appDir, 'resources', 'daemon-bundle', 'index.js'), later, later);
       expect(stage()!.dir).not.toBe(first.dir);
@@ -67,6 +67,14 @@ describe('daemon runtime staging', () => {
       running.kill();
       await new Promise((r) => running.once('exit', r));
     }
+  });
+
+  it('rebuilds a copy whose wmux.exe a prune removed', () => {
+    const first = stage()!;
+    fs.rmSync(first.nodePath);
+    const again = stage()!;
+    expect(again.dir).toBe(first.dir);
+    expect(fs.readFileSync(again.nodePath, 'utf8')).toBe('exe');
   });
 
   it('returns null when the install has no daemon script', () => {
