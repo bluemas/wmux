@@ -52,6 +52,7 @@ describe('fs.list', () => {
     expect(res.truncated).toBe(false);
     const byName = Object.fromEntries(res.entries.map((e) => [e.name, e]));
     expect(byName.src.kind).toBe('dir');
+    expect(byName['README.md'].mode).toBe(fs.lstatSync(path.join(root, 'work', 'README.md')).mode & 0o777);
     expect(byName.src.size).toBe(0);
     expect(byName['README.md']).toMatchObject({ kind: 'file', size: 8 });
   });

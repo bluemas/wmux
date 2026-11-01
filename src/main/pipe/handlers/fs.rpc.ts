@@ -30,6 +30,8 @@ export interface FsEntry {
   /** Bytes; 0 for folders. */
   size: number;
   mtimeMs: number;
+  /** POSIX permission bits from lstat, when available. */
+  mode?: number;
   /** What a symlink leads to; `null` when it is broken or unreadable. */
   target?: 'file' | 'dir' | 'other' | null;
 }
@@ -92,7 +94,7 @@ async function entryFor(dir: string, name: string): Promise<FsEntry | null> {
   try {
     const s = await fs.promises.lstat(full);
     const kind = kindOf(s);
-    const entry: FsEntry = { name, kind, size: kind === 'dir' ? 0 : s.size, mtimeMs: s.mtimeMs };
+    const entry: FsEntry = { name, kind, size: kind === 'dir' ? 0 : s.size, mtimeMs: s.mtimeMs, mode: s.mode & 0o777 };
     if (kind === 'symlink') entry.target = await symlinkTarget(full);
     return entry;
   } catch {

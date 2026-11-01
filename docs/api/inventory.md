@@ -169,9 +169,16 @@ Read-only access to local files for a file-manager plugin. Paths must be absolut
 
 | Method | Params | Tier | Notes |
 |---|---|---|---|
-| `fs.list` | `{ path }` | experimental | Capability `fs.read`. `{ ok, path, parent, entries, truncated }`; each entry is `{ name, kind: 'file'\|'dir'\|'symlink'\|'other', size, mtimeMs, target? }`. At most 10,000 entries. |
+| `fs.list` | `{ path }` | experimental | Capability `fs.read`. `{ ok, path, parent, entries, truncated }`; each entry is `{ name, kind: 'file'\|'dir'\|'symlink'\|'other', size, mtimeMs, mode?, target? }`. At most 10,000 entries. |
 | `fs.stat` | `{ path }` | experimental | Capability `fs.read`. `{ ok, path, entry }`. |
 | `fs.readText` | `{ path, maxBytes? }` | experimental | Capability `fs.read`. `{ ok, path, size, text, truncated }`. Reads 256 KB by default, 1 MB at most; a NUL byte in the first 8 KB answers `binary`. |
+| `fs.mkdir` | `{ path }` | experimental | Capability `fs.write`. Nonrecursive; `{ ok, path }`. |
+| `fs.rename` | `{ path, newName }` | experimental | Capability `fs.write`. Same folder; `{ ok, path }`; existing destination refused (`exists`). |
+| `fs.copy` | `{ sources, destDir, conflict }` | experimental | Capability `fs.write`. `{ ok, jobId }`; conflict is `skip`, `overwrite` or `fail`. |
+| `fs.move` | `{ sources, destDir, conflict }` | experimental | Capability `fs.write`. Rename, or copy then remove on EXDEV. |
+| `fs.trash` | `{ paths }` | experimental | Capability `fs.write`. `{ ok, jobId }`; OS Trash only. |
+| `fs.job.status` | `{ jobId }` | experimental | Capability `fs.write`. `{ ok, job: { id, kind, state, totalBytes, doneBytes, totalItems, doneItems, current?, errors } }`. |
+| `fs.job.cancel` | `{ jobId }` | experimental | Capability `fs.write`. `{ ok }`; aborts at next stream chunk and removes partial file. |
 
 The full list lives in `src/shared/rpc.ts` (`ALL_RPC_METHODS`). For the MCP-facing tool names (which are the actual external API for most consumers), see [MCP tools](#mcp-tools).
 
@@ -424,6 +431,7 @@ The capability column below summarises the table. Three sentinels:
 | `hooks.signal` | `wmux.internal` | — | — |
 | `usage.rateLimits` | `wmux.internal` | — | — |
 | `usage.trail` | `wmux.internal` | — | — |
+| `fs.mkdir` / `fs.rename` / `fs.copy` / `fs.move` / `fs.trash` / `fs.job.status` / `fs.job.cancel` | `fs.write` | — | files-write |
 | `fs.list` / `fs.stat` / `fs.readText` | `fs.read` | — | files |
 | `pc.envDiff` | `wmux.internal` | — | — |
 | `commit.origin` | `wmux.internal` | — | — |

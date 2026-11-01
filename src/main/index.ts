@@ -106,6 +106,7 @@ import type { ComputerService } from './computer/ComputerService';
 import { revealStatsAggregator } from './perf/revealStatsAggregator';
 import { registerHooksRpc } from './pipe/handlers/hooks.rpc';
 import { registerUsageRpc, registerUsageTrailRpc } from './pipe/handlers/usage.rpc';
+import { registerFsWriteRpc } from './pipe/handlers/fsWrite.rpc';
 import { registerFsRpc } from './pipe/handlers/fs.rpc';
 import { setToolRefusalSource } from './agents/toolRefusals';
 import { registerCommitOriginRpc } from './pipe/handlers/commitOrigin.rpc';
@@ -1651,6 +1652,7 @@ usagePoller.onStateChange((state) => usageTrail.record('default', state.snapshot
 accountUsageService.onChange((entry) => usageTrail.record(entry.accountId, entry.snapshot));
 // A removed account's history is not served; it ages out of the file.
 registerFsRpc(rpcRouter);
+registerFsWriteRpc(rpcRouter);
 registerUsageTrailRpc(rpcRouter, (account, sinceMs, untilMs) => (
   account === 'default' || getAccountStore().getAccount(account)
     ? usageTrail.read(account, sinceMs, untilMs)
