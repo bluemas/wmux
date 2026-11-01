@@ -172,8 +172,10 @@
   async function goTo() {
     const p = current(), input = await ask('Go to folder', p.path); if (input === null || !input.trim()) return;
     const value = input.trim();
-    const absolute = value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value) || value.startsWith('\\\\');
-    await load(p, absolute ? value : join(p.path, value));
+    // `~` is the home folder; wmux expands it.
+    const absolute = value === '~' || /^~[\\/]/.test(value) || value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value) || value.startsWith('\\\\');
+    try { await load(p, absolute ? value : join(p.path, value)); }
+    catch (e) { notice.textContent = `Cannot open ${value}: ${e.message === 'unavailable' ? 'no such folder, or not allowed' : e.message}`; }
   }
   async function rename() {
     const p = current(), e = rows(p)[p.cursor]; if (e.parent) return;

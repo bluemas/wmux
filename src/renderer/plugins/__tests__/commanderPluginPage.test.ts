@@ -69,6 +69,8 @@ describe('Commander page over the plugin bridge', () => {
     await vi.waitFor(() => expect(document.querySelector('.path')?.textContent).toBe('/work/folder'), { timeout: 5_000 });
     key('F10'); (document.querySelector('.dialog input') as HTMLInputElement).value = '/elsewhere'; click('OK');
     await vi.waitFor(() => expect(document.querySelector('.path')?.textContent).toBe('/elsewhere'), { timeout: 5_000 });
+    key('F10'); (document.querySelector('.dialog input') as HTMLInputElement).value = '~/notes'; click('OK');
+    await vi.waitFor(() => expect(document.querySelector('.path')?.textContent).toBe('~/notes'), { timeout: 5_000 });
   });
   it('hands an unused chord back to the host', () => {
     const sent: unknown[] = []; const original = port.postMessage;

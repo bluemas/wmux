@@ -165,7 +165,7 @@ Desktop computer use ([design](../computer-use-design.md)). Off unless the user 
 
 ### Filesystem surface
 
-Read-only access to local files for a file-manager plugin. Paths must be absolute and pass the same check as the app's file tree (`resolveAccessiblePath`): local paths only, never the blocked credential folders and files, as given or once symlinks resolve. A refused path answers `{ ok: false, reason: 'unavailable' }`, exactly like a missing one. Answers carry the canonical (realpath'd) path. Other failure reasons: `invalid`, `not-a-directory`, `is-a-directory`, `denied`, `binary`, `failed`.
+Read-only access to local files for a file-manager plugin. Paths must be absolute (a leading `~` is the home folder) and pass the same check as the app's file tree (`resolveAccessiblePath`): local paths only, never the blocked credential folders and files, as given or once symlinks resolve. A refused path answers `{ ok: false, reason: 'unavailable' }`, exactly like a missing one. Answers carry the canonical (realpath'd) path. Other failure reasons: `invalid`, `not-a-directory`, `is-a-directory`, `denied`, `binary`, `failed`.
 
 | Method | Params | Tier | Notes |
 |---|---|---|---|

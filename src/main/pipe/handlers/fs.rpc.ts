@@ -13,11 +13,13 @@
 // it refuses answers `unavailable`, the same as one that does not exist, so a
 // caller cannot probe which blocked files are there.
 //
-// Paths must be absolute: main's working directory means nothing to a caller.
+// Paths must be absolute (or start with `~`, the home folder): main's working
+// directory means nothing to a caller.
 // Answers carry the canonical (realpath'd) path, which a caller hands back for
 // the next call.
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import type { RpcRouter } from '../RpcRouter';
 import { resolveAccessiblePath } from '../../ipc/handlers/fs.handler';
@@ -55,12 +57,18 @@ export const MAX_READ_BYTES = 1024 * 1024;
 /** fs.readText calls a file binary when a NUL byte appears this early. */
 const BINARY_SNIFF_BYTES = 8 * 1024;
 
-/** An absolute, bounded, NUL-free path string; null otherwise. */
+/**
+ * An absolute, bounded, NUL-free path string; null otherwise. A leading `~`
+ * (alone, or followed by a separator) is the user's home folder, as a person
+ * types it; `~user` is not expanded.
+ */
 export function validatePathParam(value: unknown): string | null {
   if (typeof value !== 'string' || value.length === 0 || value.length > MAX_PATH_LEN) return null;
   if (value.includes('\0')) return null;
-  if (!path.isAbsolute(value)) return null;
-  return value;
+  const expanded = value === '~' ? os.homedir()
+    : /^~[\\/]/.test(value) ? path.join(os.homedir(), value.slice(2)) : value;
+  if (!path.isAbsolute(expanded)) return null;
+  return expanded;
 }
 
 function failureOf(err: unknown): FsFailure {
