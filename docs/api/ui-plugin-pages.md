@@ -128,3 +128,12 @@ already dispatched before a plugin was disabled.
 
 See the original example at
 [`examples/plugins/agent-state-page`](../../examples/plugins/agent-state-page).
+
+## Theme tokens
+
+After bridge initialization and when the host root theme attributes change,
+frames receive `{v:1, kind:"theme", variables, colorScheme}` on their port.
+`variables` maps CSS custom property names to computed values for page surfaces,
+text, accent/state colors, selection, hover, control lines and the UI font.
+Apply these values to the frame root; keep system color fallbacks until the
+first message. The sandbox prevents reading the parent document directly.
