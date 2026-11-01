@@ -1,7 +1,7 @@
 import * as path from 'path';
 import { app, dialog } from 'electron';
 import { markBoot } from '../util/bootTrace';
-import { stageDaemonRuntime, stagedDaemonScripts } from './daemonRuntimeStage';
+import { daemonStageRootIn, stageDaemonRuntime, stagedDaemonScripts } from './daemonRuntimeStage';
 import { getWmuxDir } from '../../daemon/config';
 import {
   classifyTasklistOutput,
@@ -129,7 +129,7 @@ async function askUserToRecoverFromStalePid(opts: {
  */
 function daemonStageRoot(): string | null {
   if (process.platform !== 'win32' || !app.isPackaged) return null;
-  return path.join(getWmuxDir(), 'daemon-runtime');
+  return daemonStageRootIn(getWmuxDir());
 }
 
 /**

@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { spawn } from 'child_process';
-import { stageDaemonRuntime, stagedDaemonScripts, stageKey } from '../daemonRuntimeStage';
+import { removeDaemonRuntimeStages, stageDaemonRuntime, stagedDaemonScripts, stageKey } from '../daemonRuntimeStage';
 
 describe('daemon runtime staging', () => {
   let root: string;
@@ -81,5 +81,12 @@ describe('daemon runtime staging', () => {
     fs.rmSync(path.join(appDir, 'resources'), { recursive: true });
     expect(stage()).toBeNull();
     expect(stagedDaemonScripts(stageRoot)).toEqual([]);
+  });
+  it('uninstall removes every staged copy', () => {
+    expect(stage()).not.toBeNull();
+    expect(removeDaemonRuntimeStages(stageRoot)).toBe(true);
+    expect(fs.existsSync(stageRoot)).toBe(false);
+    // Nothing staged is fine too.
+    expect(removeDaemonRuntimeStages(stageRoot)).toBe(true);
   });
 });

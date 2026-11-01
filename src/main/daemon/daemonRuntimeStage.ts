@@ -93,3 +93,20 @@ function pruneStages(stageRoot: string, keep: string, exeName: string): void {
     try { fs.rmSync(full, { recursive: true, force: true }); } catch { /* retried on the next spawn */ }
   }
 }
+
+/** Where the staged copies live: beside the user's other wmux data. */
+export function daemonStageRootIn(wmuxDir: string): string {
+  return path.join(wmuxDir, 'daemon-runtime');
+}
+
+/**
+ * Uninstall: removes every staged copy, after the caller has stopped the
+ * daemons running from them. A copy whose wmux.exe is still held stays, as
+ * the prune leaves it; returns whether the whole folder is gone.
+ */
+export function removeDaemonRuntimeStages(stageRoot: string): boolean {
+  try {
+    fs.rmSync(stageRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  } catch { /* a held copy; nothing else to do at uninstall */ }
+  return !fs.existsSync(stageRoot);
+}
