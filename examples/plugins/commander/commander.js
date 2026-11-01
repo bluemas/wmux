@@ -132,7 +132,6 @@
     else if (e.kind === 'dir' || e.target === 'dir') await load(p, join(p.path, e.name));
     else await view();
   }
-  function closeDialog() { if (modal) modal.close(); }
   function dialog(title, content, actions = []) {
     if (modal) throw new Error('Close the current dialog first.');
     const overlay = node('div', undefined, 'overlay'); const box = node('section', undefined, 'dialog');
@@ -144,7 +143,7 @@
     function finish(value) { overlay.remove(); modal = null; resolve(value); page.focus(); }
     for (const [label, value] of actions) actionBar.append(button(label, () => finish(value)));
     overlay.onkeydown = (event) => {
-      if (event.key === 'Escape' || event.key === 'F10') { event.preventDefault(); event.stopPropagation(); state.close(); }
+      if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); state.close(); }
       if (event.key === 'Tab') {
         const focusable = [...box.querySelectorAll('button:not(:disabled),input,select,pre')];
         const i = focusable.indexOf(document.activeElement); event.preventDefault(); focusable[(i + (event.shiftKey ? -1 : 1) + focusable.length) % focusable.length]?.focus();
@@ -220,8 +219,8 @@
     const re = new RegExp('^' + pattern.split('').map((c) => c === '*' ? '.*' : c === '?' ? '.' : c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('') + '$', 'i');
     for (const e of p.entries) if (re.test(e.name)) { if (mark) p.marks.add(e.name); else p.marks.delete(e.name); } render();
   }
-  const commands = { F2: rename, F3: view, F5: () => transfer('copy'), F6: () => transfer('move'), F7: mkdir, F8: trash, F10: closeDialog };
-  for (const [key, label] of [['F2', 'Rename'], ['F3', 'View'], ['F5', 'Copy'], ['F6', 'Move'], ['F7', 'Mkdir'], ['F8', 'Trash'], ['F10', 'Close-dialog']]) document.querySelector('#keys').append(button(`${key} ${label}`, commands[key]));
+  const commands = { F2: rename, F3: view, F5: () => transfer('copy'), F6: () => transfer('move'), F7: mkdir, F8: trash };
+  for (const [key, label] of [['F2', 'Rename'], ['F3', 'View'], ['F5', 'Copy'], ['F6', 'Move'], ['F7', 'Mkdir'], ['F8', 'Trash']]) document.querySelector('#keys').append(button(`${key} ${label}`, commands[key]));
   page.onkeydown = (event) => {
     if (modal) return;
     const key = event.key, p = current(); let action;
