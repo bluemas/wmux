@@ -116,8 +116,9 @@ export function resolveRequiredCapability(
  * like the commander gate in RpcRouter. `computer` reads other apps' windows
  * and injects input into them, so an unapproved named client must never reach
  * it just because a build (or `mcp.mode: "shadow"`) runs the enforcer advisory.
+ * `files` and `files-write` reach any local file outside fsRefusals.ts.
  */
-const ALWAYS_ENFORCED_RISK_CLASSES: ReadonlySet<RiskClass> = new Set<RiskClass>(['computer', 'agent-state', 'agent-state-all']);
+const ALWAYS_ENFORCED_RISK_CLASSES: ReadonlySet<RiskClass> = new Set<RiskClass>(['computer', 'agent-state', 'agent-state-all', 'files', 'files-write']);
 
 /** Whether a non-allow verdict on `method` is refused even in shadow mode. */
 export function isAlwaysEnforcedMethod(method: string): boolean {
@@ -1025,13 +1026,13 @@ export const RISK_CLASS_COPY: Record<RiskClass, RiskClassCopy> = {
   'files-write': {
     severity: 'critical',
     summary: 'Can create, rename, copy, move and move files to Trash',
-    detail: 'The plugin can change local files and folders, overwrite destinations and move items to the operating system Trash. It never permanently deletes files. Credential folders and files are refused. This permission has no path scope.',
+    detail: 'The plugin can change local files and folders, overwrite destinations and move items to the operating system Trash. It never permanently deletes files. The paths the files permission refuses are refused here too, including any folder that holds one. This permission has no path scope.',
   },
   'files': {
-    severity: 'caution',
-    summary: 'Can browse folders and read files on this computer',
+    severity: 'critical',
+    summary: 'Can browse folders and read any text file on this computer',
     detail:
-      'The plugin can list any local folder you can open and read text files up to 1 MB, including source code and documents. wmux still refuses credential folders and files such as ~/.ssh, ~/.aws and its own tokens. It cannot change or delete anything with this permission.',
+      'The plugin can list any local folder and read any text file up to 1 MB outside the list below, including source code, documents and config files. wmux refuses: ~/.ssh, ~/.aws, ~/.gnupg, ~/.kube, ~/.azure, gcloud and Docker credentials, ~/.npmrc, ~/.netrc and ~/.pgpass, ~/.git-credentials, ~/.config/gh, ~/.claude.json and ~/.claude/.credentials.json, ~/.codex/auth.json, wmux\'s own data and tokens, .env and .env.* files, *.pem and *.key files and SSH key files (id_*) anywhere, and shell history files. It cannot change or delete anything with this permission.',
   },
   'internal': {
     severity: 'critical',
