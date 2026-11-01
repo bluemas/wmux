@@ -489,6 +489,16 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumb
   const snoozeTriggerRef = useRef<HTMLButtonElement>(null);
   const snoozeFocusFirst = useRef(false);
   const snoozeSkipFocusOpen = useRef(false);
+  // Stable so React fits the submenu once: re-run on a re-render, the fit would
+  // read the side to open on from its own flipped position and undo the flip.
+  const snoozeSubmenuRef = useCallback((el: HTMLDivElement | null) => {
+    const release = keepSubmenuInWindow(el);
+    if (el && snoozeFocusFirst.current) {
+      snoozeFocusFirst.current = false;
+      el.querySelector<HTMLButtonElement>('[data-snooze-preset]')?.focus();
+    }
+    return release;
+  }, []);
   const [folderApps, setFolderApps] = useState<{ id: string; name: string }[]>([]);
   const [closeConfirmPos, setCloseConfirmPos] = useState<CloseConfirmAnchor | null>(null);
   const [profileModalOpen, setProfileModalOpen] = useState(false);
@@ -1772,14 +1782,7 @@ function WorkspaceItem({ workspaceId, isActive, isMultiview, index, shortcutNumb
               </button>
               {snoozeOpen && (
                 <div
-                  ref={(el) => {
-                    const release = keepSubmenuInWindow(el);
-                    if (el && snoozeFocusFirst.current) {
-                      snoozeFocusFirst.current = false;
-                      el.querySelector<HTMLButtonElement>('[data-snooze-preset]')?.focus();
-                    }
-                    return release;
-                  }}
+                  ref={snoozeSubmenuRef}
                   role="menu"
                   className={`absolute top-0 ${menuPos.x > window.innerWidth * 0.6 ? 'right-full mr-0.5' : 'left-full ml-0.5'} min-w-[140px] py-1 rounded-xl shadow-xl sidebar-popover-enter`}
                   style={{ background: 'var(--bg-surface)', border: '1px solid color-mix(in srgb, var(--bg-overlay) 70%, transparent)' }}

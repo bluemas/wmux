@@ -4,12 +4,18 @@
 // bottom it moves up to fit, and when rows fill in after it opened (the
 // account rows load late) it moves up again.
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createElement, act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import WorkspaceItem from '../WorkspaceItem';
+import { keepSubmenuInWindow } from '../../../utils/keepSubmenuInWindow';
 import { useStore } from '../../../stores';
 import type { Pane, Surface, Workspace } from '../../../../shared/types';
+
+vi.mock('../../../utils/keepSubmenuInWindow', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../utils/keepSubmenuInWindow')>();
+  return { ...actual, keepSubmenuInWindow: vi.fn(actual.keepSubmenuInWindow) };
+});
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -118,5 +124,19 @@ describe('workspace row menu fits the window', () => {
     act(() => { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); });
     expect(menu()).toBeNull();
     expect(observers.some((o) => o.targets.includes(el))).toBe(false);
+  });
+
+  it('fits the snooze submenu once, not again on every re-render', () => {
+    openMenuAt(50, 100);
+    act(() => { container.querySelector<HTMLButtonElement>('[data-workspace-action="snooze"]')!.click(); });
+    const submenu = container.querySelector('[data-snooze-preset]')!.closest('[role="menu"]');
+    const fits = () => vi.mocked(keepSubmenuInWindow).mock.calls.filter(([el]) => el === submenu).length;
+    expect(fits()).toBe(1);
+
+    // A re-run would read the side to open on from its own flipped position
+    // and undo the flip.
+    act(() => { useStore.setState({ workspaces: [{ ...ws, name: 'renamed' }] }); });
+    expect(container.textContent).toContain('renamed');
+    expect(fits()).toBe(1);
   });
 });
