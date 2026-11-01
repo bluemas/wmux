@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { spawn } from 'child_process';
-import { stageDaemonRuntime, stagedDaemonScripts, stageKey } from '../daemonRuntimeStage';
+import { isSquirrelInstall, removeDaemonRuntimeStages, stageDaemonRuntime, stagedDaemonScripts, stageKey } from '../daemonRuntimeStage';
 
 describe('daemon runtime staging', () => {
   let root: string;
@@ -22,6 +22,12 @@ describe('daemon runtime staging', () => {
   afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
 
   const stage = () => stageDaemonRuntime({ appDir, exeName: 'wmux.exe', stageRoot, version: '4.13.0' });
+
+  it('recognises a Squirrel install only when Update.exe is in the parent folder', () => {
+    expect(isSquirrelInstall(appDir)).toBe(false);
+    fs.writeFileSync(path.join(root, 'Update.exe'), 'updater');
+    expect(isSquirrelInstall(appDir)).toBe(true);
+  });
 
   it('copies the install out of the install root, keeping its layout', () => {
     const staged = stage();
@@ -57,7 +63,7 @@ describe('daemon runtime staging', () => {
     fs.copyFileSync(path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'PING.EXE'), first.nodePath);
     const running = spawn(first.nodePath, ['-n', '30', '127.0.0.1'], { stdio: 'ignore', windowsHide: true });
     try {
-      await new Promise((r) => setTimeout(r, 300));
+      await new Promise<void>((resolve, reject) => { running.once('spawn', resolve); running.once('error', reject); });
       const later = new Date(Date.now() + 60_000);
       fs.utimesSync(path.join(appDir, 'resources', 'daemon-bundle', 'index.js'), later, later);
       expect(stage()!.dir).not.toBe(first.dir);
@@ -69,9 +75,24 @@ describe('daemon runtime staging', () => {
     }
   });
 
+  it('rebuilds a copy whose wmux.exe a prune removed', () => {
+    const first = stage()!;
+    fs.rmSync(first.nodePath);
+    const again = stage()!;
+    expect(again.dir).toBe(first.dir);
+    expect(fs.readFileSync(again.nodePath, 'utf8')).toBe('exe');
+  });
+
   it('returns null when the install has no daemon script', () => {
     fs.rmSync(path.join(appDir, 'resources'), { recursive: true });
     expect(stage()).toBeNull();
     expect(stagedDaemonScripts(stageRoot)).toEqual([]);
+  });
+  it('uninstall removes every staged copy', () => {
+    expect(stage()).not.toBeNull();
+    expect(removeDaemonRuntimeStages(stageRoot)).toBe(true);
+    expect(fs.existsSync(stageRoot)).toBe(false);
+    // Nothing staged is fine too.
+    expect(removeDaemonRuntimeStages(stageRoot)).toBe(true);
   });
 });

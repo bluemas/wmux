@@ -27,6 +27,10 @@ export interface StagedDaemon {
 
 const SCRIPT = ['resources', 'daemon-bundle', 'index.js'];
 
+export function isSquirrelInstall(appDir: string): boolean {
+  return fs.existsSync(path.join(appDir, '..', 'Update.exe'));
+}
+
 /** One folder per build: a same-version rebuild still gets a fresh copy. */
 export function stageKey(version: string, scriptMtimeMs: number): string {
   return `${version}-${Math.floor(scriptMtimeMs)}`;
@@ -56,20 +60,25 @@ export function stageDaemonRuntime(opts: {
   warn?: (msg: string) => void;
 }): StagedDaemon | null {
   const warn = opts.warn ?? (() => { /* silent */ });
+  let partial: string | null = null;
   try {
     const source = path.join(opts.appDir, ...SCRIPT);
     const dir = path.join(opts.stageRoot, stageKey(opts.version, fs.statSync(source).mtimeMs));
     const staged = (): StagedDaemon => ({ script: path.join(dir, ...SCRIPT), nodePath: path.join(dir, opts.exeName), dir });
-    if (!fs.existsSync(staged().script)) {
+    // A prune that removed wmux.exe but not the folder leaves a copy that cannot run.
+    if (!fs.existsSync(staged().script) || !fs.existsSync(staged().nodePath)) {
       // Copied under a temporary name and renamed, so a half copy is never run.
-      const partial = `${dir}.partial-${process.pid}`;
+      partial = `${dir}.partial-${process.pid}`;
       fs.rmSync(partial, { recursive: true, force: true });
       fs.cpSync(opts.appDir, partial, { recursive: true });
+      fs.rmSync(dir, { recursive: true, force: true });
       fs.renameSync(partial, dir);
+      partial = null;
     }
     pruneStages(opts.stageRoot, path.basename(dir), opts.exeName);
     return staged();
   } catch (err) {
+    if (partial) { try { fs.rmSync(partial, { recursive: true, force: true }); } catch { /* left for the next spawn */ } }
     warn(`[launcher] could not copy the daemon runtime out of the install (${err instanceof Error ? err.message : String(err)}); running it from the install`);
     return null;
   }
@@ -87,4 +96,21 @@ function pruneStages(stageRoot: string, keep: string, exeName: string): void {
     try { fs.rmSync(path.join(full, exeName), { force: true }); } catch { continue; }
     try { fs.rmSync(full, { recursive: true, force: true }); } catch { /* retried on the next spawn */ }
   }
+}
+
+/** Where the staged copies live: beside the user's other wmux data. */
+export function daemonStageRootIn(wmuxDir: string): string {
+  return path.join(wmuxDir, 'daemon-runtime');
+}
+
+/**
+ * Uninstall: removes every staged copy, after the caller has stopped the
+ * daemons running from them. A copy whose wmux.exe is still held stays, as
+ * the prune leaves it; returns whether the whole folder is gone.
+ */
+export function removeDaemonRuntimeStages(stageRoot: string): boolean {
+  try {
+    fs.rmSync(stageRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  } catch { /* a held copy; nothing else to do at uninstall */ }
+  return !fs.existsSync(stageRoot);
 }
