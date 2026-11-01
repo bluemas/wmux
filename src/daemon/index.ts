@@ -94,6 +94,7 @@ import { generateSnapshotUnqueued, enqueueSnapshotJob, generateTextSnapshot, gen
 import { queuedScreenText, queuedTextSnapshot } from './queuedSessionText';
 import { FolderTrustRefusedError, folderTrustRefusal, folderTrustState, registerFolderTrustRpc, setFolderTrustTimingLog } from './folderTrustState';
 import { FOLDER_TRUST_DELIVERY_BUDGET_MS } from '../shared/folderTrustWording';
+import { HOST_WINDOW_RPC, createHostWindowRpc } from './hostWindowRpc';
 import type { TerminalPty } from '../shared/terminalPty';
 import { serializeSession } from './sessionSerialize';
 import { AwaitingScreenVerifier, AWAITING_NARROW_DIALOG_COLS, questionInFlight, renderPaneScreen, renderPaneTail } from './AwaitingScreenVerifier';
@@ -149,10 +150,13 @@ import { A2aContinueReceiver, paneHoldsSession } from './a2aRemote/continueRecei
 import { ContinueBundle } from './a2aRemote/continueBundle';
 import { ContinuePolicyStore } from './a2aRemote/continuePolicyStore';
 import { ContinueRequestStore } from './a2aRemote/continueRequestStore';
+import { ContinuePlacer } from './a2aRemote/continuePlacer';
+import { registerContinueRpc } from './a2aRemote/continueRpc';
 import { rootIsRepoTop, rootOriginKey } from './a2aRemote/continueRootGit';
 import { gitRunner } from '../main/a2aRemote/spawnWorktree';
 import { linkAlias } from './a2aRemote/outbound';
 import { A2A_SPAWN_EVENT, type A2aSpawnEvent } from '../shared/a2aSpawn';
+import { A2A_CONTINUE_EVENT, isContinueAgent, type A2aContinueEvent } from '../shared/a2aContinue';
 import { A2A_FEATURE_IMAGES, A2A_FEATURE_LINK_OFFER, A2A_FEATURE_SPAWN, A2A_FEATURE_STREAM_PING, isRemoteTaskId, isTailnetIpv4 } from '../shared/a2aRemote';
 import type { A2aRemoteLinkEvent } from '../shared/rpc';
 import { ChannelService, ChannelStateWriter, ChannelWakeWorker, wakeAgentSlug, wrapChannelMessageEnvelope, wrapChannelCatalogEnvelope, stampChannelCaller, type CallerFieldSpec, type ChannelServiceEventLog } from './channels';
@@ -172,7 +176,7 @@ import { listMissionsBatch } from './worktask/missionListBatch';
 import { viewerVisibilityUpdates } from '../shared/viewerVisibilityBatch';
 import { isTaskState, type AgentStatus, type Message, type Task } from '../shared/types';
 import { ProcessMonitor } from './ProcessMonitor';
-import { AgentProcessTracker } from './AgentProcessTracker';
+import { AgentProcessTracker, agentProcessExitEvent } from './AgentProcessTracker';
 import { CustomAgentNames } from './customAgentNames';
 import { liveRecoveryHint, markCwdMissing, namedAgentAlive, recordedTurnStillOpen, recordWasMidTurn, screenShowsLiveAgent, sightedRecoveredAgent } from './recoveryHint';
 import { checkWslAgentRunning, reportedAgentForPane, stopWslAgent, WslPidWatcher } from './wslAgentProcess';
@@ -284,6 +288,7 @@ import { GUEST_BOT_RPC } from '../shared/guestBots';
 import { revokeDeviceAndDisconnect } from './web/deviceRevoke';
 import { withActivity, withViewingSessions } from './web/deviceActivity';
 import { buildWebPaneEnv } from './web/webPaneEnv';
+import { readClaudeFileSend } from './claudeFileSendSetting';
 import { makeChannelPhoneApi, type ChannelPhoneApi } from './web/channelsApi';
 import type { ApprovalDecision, DecisionFormKind, NativeDecisionOutcome, NativeDecisionRef, NativeDecisionReply } from './approvals/types';
 import type { AgentSlug } from '../shared/events';
@@ -306,6 +311,7 @@ import { DaemonPTYBridge } from './DaemonPTYBridge';
 import { createCodexSharedRuntime, runCodexDaemon } from './transcript/codexSharedRuntime';
 import { validChatAttachments } from '../shared/transcript/chatAttachments';
 import { agentStatesFor } from '../shared/agentStateBatch';
+import { parseCompanySeat } from '../shared/company';
 import { ChatSessionService } from './chat/ChatSessionService';
 import { createChatV2Host } from './chat/v2/host';
 import { registerChatV2Rpc } from './chat/v2/rpc';
@@ -7213,8 +7219,10 @@ function registerRpcHandlers(
     // state machine as any transition, with a reason (evidence.summary).
     if (!isTaskState(status)) return { ok: false, error: `a2a.task.update: invalid status "${status}"` };
     // Only the app's main process reads the pane tree; take the list from it
-    // alone. Anything else leaves it unknown (no relaxation).
-    const livePaneIds = pipeServer.isFirstParty(ctx.clientId) ? normalizeLivePaneIds(p.livePaneIds) : undefined;
+    // alone. Anything else leaves it unknown (no relaxation). The same goes
+    // for the other fields main sets (trustedLane, callerCompanySeat).
+    const firstParty = pipeServer.isFirstParty(ctx.clientId);
+    const livePaneIds = firstParty ? normalizeLivePaneIds(p.livePaneIds) : undefined;
     let message: Message | undefined;
     try {
       message = statusMessageFromWire(p.message, randomUUID);
@@ -7234,7 +7242,10 @@ function registerRpcHandlers(
       // can only narrow the workspace-level authz, never widen it.
       ...(typeof p.callerPaneId === 'string' && p.callerPaneId ? { callerAddr: { paneId: p.callerPaneId } } : {}),
       ...(p.requirePaneIdentity === true ? { requirePaneIdentity: true } : {}),
-      ...(p.trustedLane === true ? { trustedLane: true } : {}),
+      ...(firstParty && p.trustedLane === true ? { trustedLane: true } : {}),
+      // Main's read of the caller's pane (same read as callerPaneId): its seat
+      // in its workspace's company, which decides who marks a company task done.
+      ...(firstParty && parseCompanySeat(p.callerCompanySeat) ? { callerCompanySeat: parseCompanySeat(p.callerCompanySeat) } : {}),
       // #1598: main's read of the caller workspace's panes (same read as
       // callerPaneId); lets a verified pane adopt a task whose pane is gone.
       ...(livePaneIds ? { livePaneIds } : {}),
@@ -7250,7 +7261,7 @@ function registerRpcHandlers(
     return moved;
   });
 
-  pipeServer.onRpc('a2a.task.cancel', async (rawParams) => {
+  pipeServer.onRpc('a2a.task.cancel', async (rawParams, ctx) => {
     if (!a2aTaskService) return { ok: false, error: 'a2a.task.cancel: task log unavailable' };
     const p = rawParams as Record<string, unknown>;
     const taskId = typeof p.taskId === 'string' ? p.taskId : '';
@@ -7260,7 +7271,8 @@ function registerRpcHandlers(
       taskId,
       callerWorkspaceId: workspaceId,
       ...(typeof p.callerPaneId === 'string' && p.callerPaneId ? { callerPaneId: p.callerPaneId } : {}),
-      ...(p.trustedLane === true ? { trustedLane: true } : {}),
+      // Main sets this, as on a2a.task.update.
+      ...(pipeServer.isFirstParty(ctx.clientId) && p.trustedLane === true ? { trustedLane: true } : {}),
       ...(typeof p.idempotencyKey === 'string' ? { idempotencyKey: p.idempotencyKey } : {}),
     });
     if (canceled.ok && isRemoteTaskId(taskId)) await a2aDeliveryRef?.syncTask(taskId);
@@ -9453,6 +9465,14 @@ async function main(): Promise<void> {
   pipeServer.onRpc('daemon.presence.desktop', async (params, ctx) =>
     presenceRpc(params, ctx.clientId),
   );
+  // The window that owns every pane's console window (Windows sign-in pickers).
+  const hostWindowRpc = createHostWindowRpc({
+    isFirstParty: (clientId) => pipeServer.isFirstParty(clientId),
+    setHostWindow: (handle) => sessionManager.setHostWindow(handle),
+    log: (level, msg) => log(level, msg),
+  });
+  pipeServer.onRpc(HOST_WINDOW_RPC, async (params, ctx) => hostWindowRpc.handle(params, ctx.clientId));
+  pipeServer.onClientClose((clientId) => hostWindowRpc.onClientClose(clientId));
   // A desktop that went away is not present, whatever it last reported. Without
   // this, killing the app mid-focus would leave a fresh report standing for the
   // rest of the freshness window and swallow the pushes it was meant to hand off.
@@ -9961,8 +9981,12 @@ async function main(): Promise<void> {
       return screenShowsAgentDialog(frame.rows);
     },
   });
-  // app-weight P1-1: cadence from config (default 15 s; clamped 5–120 s).
-  const processMonitor = new ProcessMonitor((config.daemon.livenessIntervalSec ?? 15) * 1000);
+  // app-weight P1-1: cadence from config (default 15 s; clamped 5–120 s), or
+  // 3 s (clamped 2–120 s) while the native process table serves the sweep.
+  const processMonitor = new ProcessMonitor(
+    (config.daemon.livenessIntervalSec ?? 15) * 1000,
+    (config.daemon.nativeLivenessIntervalSec ?? 3) * 1000,
+  );
   // Resume-chip edge trigger: watches the agent process (claude/codex) inside
   // interactive panes so the chip can gate on process truth instead of the
   // decaying activity heuristic. Rides processMonitor's existing batch.
@@ -10193,14 +10217,10 @@ async function main(): Promise<void> {
     // crash) sends no Stop, and byte silence no longer clears a hook-governed
     // pane — so without this broadcast the dot would stay lit until the
     // authority TTL. Sent on the death edge only; `alive:true` is the launch
-    // edge and settles nothing.
-    if (!state.alive) {
-      pipeServer.broadcast({
-        type: 'agent.processExit',
-        sessionId,
-        data: { slug: state.slug ?? null },
-      });
-    }
+    // edge and settles nothing. The renderer also drops the pane's agent row
+    // on it.
+    const exitEvent = agentProcessExitEvent(sessionId, state);
+    if (exitEvent) pipeServer.broadcast(exitEvent);
     // A named agent's launch edge is the process evidence that consumes a
     // recovered pane's resume offer (the banner path leaves it to the process
     // or hook tier). Done here, not left to liveRecoveryHint's next read: an
@@ -10429,6 +10449,12 @@ async function main(): Promise<void> {
       enqueue: (hostId, envelope) => {
         if (!a2aDelivery) throw new Error('messages between PCs are not carried this run');
         a2aDelivery.outbox.enqueue(hostId, envelope);
+        // Each step's answer to the asker also tells main, which starts a request once it is received.
+        const result = envelope.continueResult;
+        if (result) {
+          const event: A2aContinueEvent = { type: A2A_CONTINUE_EVENT, hostId, continueId: result.continueId, code: result.code };
+          pipeServer.broadcast({ type: event.type, sessionId: '', data: event });
+        }
       },
       // The root's own origin, keyed as the asker keys its own; a git that could not be read throws (checked again later).
       originKeyOf: (rootPath) => rootOriginKey(a2aRootGit(rootPath), rootPath),
@@ -10521,6 +10547,17 @@ async function main(): Promise<void> {
       log: a2aLog,
     });
     registerSpawnRpc(onA2aRpc, { policy: a2aSpawnPolicy, requests: a2aSpawnRequests, onSaved: (previous) => a2aSpawn.sendTargets(previous) });
+    // Starting a conversation this PC received: main makes the worktree and the pane, the daemon places the files.
+    registerContinueRpc(onA2aRpc, {
+      receiver: a2aContinue,
+      requests: a2aContinueRequests,
+      placer: new ContinuePlacer({ a2aDir, worktreesRoot: path.join(wmuxDir, 'worktrees'), requests: a2aContinueRequests, log: a2aLog }),
+      hostName: a2aHostName,
+      paneTranscript: (ptyId) => {
+        const bound = sessionManager.getSession(ptyId)?.meta.resumeBinding;
+        return bound && isContinueAgent(bound.agent) && bound.transcriptPath ? bound.transcriptPath : null;
+      },
+    });
     // Link control RPCs. Their handlers are also kept here: the delivery
     // layer's link reconcile reuses `a2a.remote.links.refresh` as is.
     const a2aLinkHandlers = new Map<string, (params: Record<string, unknown>) => Promise<unknown>>();
@@ -10649,6 +10686,7 @@ async function main(): Promise<void> {
   // #2388: a task folder whose removal did not finish takes no new pane,
   // whoever asks (the desktop, a phone, an automation, a recovery).
   sessionManager.setSpawnCwdRefusal((cwd, session) => pendingRemovalRefusalAt(getWmuxDir(), cwd, session));
+  sessionManager.setClaudeFileSend(() => readClaudeFileSend(getWmuxDir()));
 
   // Forward reference — initialised at step 8c after the snapshot runner is
   // wired. RPC handlers that fire before initialisation simply skip the

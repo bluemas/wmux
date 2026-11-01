@@ -858,10 +858,10 @@ export interface UISlice {
       | 'network-error'
       | 'read-error';
     snapshot: {
-      sessionPct: number;
-      sessionResetEpochSec: number;
-      weeklyPct: number;
-      weeklyResetEpochSec: number;
+      sessionPct?: number;
+      sessionResetEpochSec?: number;
+      weeklyPct?: number;
+      weeklyResetEpochSec?: number;
       fetchedAtMs: number;
     } | null;
     lastError: string | null;
@@ -877,10 +877,10 @@ export interface UISlice {
       | 'network-error'
       | 'read-error';
     snapshot: {
-      sessionPct: number;
-      sessionResetEpochSec: number;
-      weeklyPct: number;
-      weeklyResetEpochSec: number;
+      sessionPct?: number;
+      sessionResetEpochSec?: number;
+      weeklyPct?: number;
+      weeklyResetEpochSec?: number;
       fetchedAtMs: number;
     } | null;
     lastError: string | null;

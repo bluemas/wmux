@@ -18,6 +18,7 @@ import { contextBridge, ipcRenderer, webFrame, webUtils } from 'electron';
 import { START_POLARITY_STORAGE_KEY, resolveStartPolarity, startPaintCss } from '../shared/windowStartPaint';
 import { startLocaleFromArgv } from '../shared/startLocale';
 import { IPC } from '../shared/constants';
+import { CLAUDE_FILE_SEND_IPC } from '../shared/claudeFileSend';
 import type { A2aSpawnAskResult, A2aSpawnOutgoingList, A2aSpawnPolicySetResult, A2aSpawnPolicyV1, A2aSpawnRequestSummary, A2aSpawnUiAsk } from '../shared/a2aSpawn';
 import type { SleepPreventionMode, SleepWindow } from '../shared/sleepPrevention';
 import { ROOM_EVENT } from '../shared/room';
@@ -492,6 +493,14 @@ const electronAPI = {
         callback(payload);
       ipcRenderer.on(IPC.SUPERVISION_CHANGED, listener);
       return () => { ipcRenderer.removeListener(IPC.SUPERVISION_CHANGED, listener); };
+    },
+    // The pane's agent process died (the daemon tracker's death edge; a
+    // successor process is not a death). Drops the pane's agent row.
+    onAgentProcessExit: (callback: (payload: { ptyId: string; slug: string | null }) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, payload: { ptyId: string; slug: string | null }) =>
+        callback(payload);
+      ipcRenderer.on(IPC.AGENT_PROCESS_EXIT, listener);
+      return () => { ipcRenderer.removeListener(IPC.AGENT_PROCESS_EXIT, listener); };
     },
     // Fires once per attach when the daemon's SessionPipe ring-buffer
     // flush completes. recoveredBytes is the exact byte count replayed
@@ -1605,6 +1614,11 @@ const electronAPI = {
       return () => { ipcRenderer.removeListener(IPC.WORK_LINK_CHANGED, listener); };
     },
   },
+  // Company presets: write each seat's brief file and get its launch line.
+  company: {
+    seatLaunches: (req: import('../main/company/seatLaunch').SeatLaunchRequest) =>
+      ipcRenderer.invoke(IPC.COMPANY_SEAT_LAUNCHES, req) as Promise<import('../main/company/seatLaunch').SeatLaunchResult>,
+  },
   // Fleet's Plan card: Claude's plan dialogs and the answer to one (main window only).
   planApprovals: {
     list: () => ipcRenderer.invoke(IPC.PLAN_APPROVALS_LIST) as Promise<import('../shared/planApproval').PlanApprovalView[]>,
@@ -1712,11 +1726,14 @@ const electronAPI = {
       ipcRenderer.invoke(IPC.TASK_CREATE_PR, { taskId, verifiedWorkspaceId }) as Promise<
         import('../shared/workTask').CreatePrResultWire
       >,
+    /** `keep`: every folder a live, stashed or archived pane is in; without
+     *  it no company seat folder is listed. */
     scan: (
       verifiedWorkspaceId: string,
       knownOpen?: Array<{ taskId: string; title: string; worktreePath?: string }>,
+      keep?: string[],
     ) =>
-      ipcRenderer.invoke(IPC.WORKTASK_SCAN, { verifiedWorkspaceId, knownOpen }) as Promise<
+      ipcRenderer.invoke(IPC.WORKTASK_SCAN, { verifiedWorkspaceId, knownOpen, ...(keep ? { keep } : {}) }) as Promise<
         import('../shared/workTask').WorktaskScanResultWire
       >,
     // F2 — 재발사: prompt.md 실존 검사 후 원래 initialCommand를 정상 경로와 동일
@@ -1733,6 +1750,19 @@ const electronAPI = {
       >,
     deletePhoneBranch: (repo: string, branch: string) =>
       ipcRenderer.invoke(IPC.WORKTASK_DELETE_PHONE_BRANCH, { repo, branch }) as Promise<{ ok: boolean; error?: string }>,
+    removeCompanySeat: (worktreePath: string, force: boolean) =>
+      ipcRenderer.invoke(IPC.WORKTASK_REMOVE_COMPANY_SEAT, { worktreePath, force }) as Promise<
+        import('../shared/workTask').RemovePhoneWorktreeResultWire
+      >,
+    /** Only `company/<slug>` of that seat folder. */
+    deleteCompanySeatBranch: (worktreePath: string, repo: string, branch: string, oid: string) =>
+      ipcRenderer.invoke(IPC.WORKTASK_DELETE_COMPANY_SEAT_BRANCH, { worktreePath, repo, branch, oid }) as Promise<{ ok: boolean; error?: string }>,
+    /** Remove the company seat worktrees nothing uses any more; `keep`: every
+     *  folder a live, stashed or archived pane is in. */
+    sweepCompanySeats: (keep: string[]) =>
+      ipcRenderer.invoke(IPC.WORKTASK_SWEEP_COMPANY_SEATS, { keep }) as Promise<
+        import('../shared/workTask').CompanySeatSweepResultWire
+      >,
   },
   dialog: {
     pickFolder: () => ipcRenderer.invoke(IPC.DIALOG_PICK_FOLDER) as Promise<string[]>,
@@ -2021,10 +2051,10 @@ const electronAPI = {
           | 'network-error'
           | 'read-error';
         snapshot: {
-          sessionPct: number;
-          sessionResetEpochSec: number;
-          weeklyPct: number;
-          weeklyResetEpochSec: number;
+          sessionPct?: number;
+          sessionResetEpochSec?: number;
+          weeklyPct?: number;
+          weeklyResetEpochSec?: number;
           fetchedAtMs: number;
           scoped?: Array<{
             kind: string;
@@ -2055,6 +2085,11 @@ const electronAPI = {
       get: () => ipcRenderer.invoke(IPC.USAGE_RESERVE_GET) as Promise<{ enabled: boolean }>,
       set: (enabled: boolean) => ipcRenderer.invoke(IPC.USAGE_RESERVE_SET, enabled) as Promise<{ ok: boolean }>,
     },
+  },
+  /** Whether new panes let Claude send files to the phone (shared/claudeFileSend.ts). */
+  claudeFileSend: {
+    get: () => ipcRenderer.invoke(CLAUDE_FILE_SEND_IPC.GET) as Promise<{ enabled: boolean }>,
+    set: (enabled: boolean) => ipcRenderer.invoke(CLAUDE_FILE_SEND_IPC.SET, enabled) as Promise<{ ok: boolean }>,
   },
   // N4 — agents whose sign-in was lost (shared/agentAuthLost), one entry per
   // agent and account; `loginState` asks the agent's own status for an entry
