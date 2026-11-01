@@ -2121,6 +2121,13 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
   toggleMultiviewWorkspace: (wsId) => {
     handOffBeforeLeavingGrid(get(), wsId);
     set((state) => {
+    // A grid the active workspace is not in is not on screen: save it as a
+    // group first, so Ctrl+clicking one of its members from outside takes
+    // that member into a new group with the active workspace (as a member of
+    // any other saved group would be) instead of removing it from the hidden grid.
+    if (!state.multiviewIds.includes(state.activeWorkspaceId)) {
+      saveCurrentMultiviewGroup(state);
+    }
     const idx = state.multiviewIds.indexOf(wsId);
     if (idx >= 0) {
       state.multiviewIds.splice(idx, 1);
