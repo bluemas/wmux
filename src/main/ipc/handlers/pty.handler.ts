@@ -89,6 +89,7 @@ import { localReconnectAnswer } from './localPtyReconnect';
 import { pendingRemovalRefusal } from '../../worktask/pendingWorktreeRemovals';
 import { launchAllowedByChat } from './chatLaunchGuard';
 import { folderTrustLaunchHold, folderTrustLaunchRefusal, forgetFolderTrustPane } from '../../folderTrustCheck';
+import { FOLDER_TRUST_DELIVERY_BUDGET_MS } from '../../../shared/folderTrustWording';
 
 /**
  * Allowed shell basenames (compared case-insensitively).
@@ -832,10 +833,10 @@ export function registerPTYHandlers(
 
       // Workspace profile startup command. Written as shell INPUT (not spawned
       // as the executable) so the allowed-shell check and quoting behavior are
-      // preserved — same pattern company provisioning uses. Gated on the
-      // session's first output (see scheduleInitialCommand) and retried while
-      // the pipe reports "not delivered", which fixes the intermittent
-      // never-ran-the-command race the fixed-delay version had.
+      // preserved. Gated on the session's first output (see
+      // scheduleInitialCommand) and retried while the pipe reports "not
+      // delivered", which fixes the intermittent never-ran-the-command race
+      // the fixed-delay version had.
       //
       // X8: for an exec-style unit the command IS the pane's root process, so
       // there is nothing to type — pass `undefined` so scheduleInitialCommand
@@ -858,8 +859,8 @@ export function registerPTYHandlers(
       let verifying = false;
       const initialCmd = scheduleInitialCommand(botWorker && !isWslShell(shell) ? clearedLaunchLine(typedLine, shell) : typedLine, {
         // A shell rc that starts an agent can put its folder-trust prompt
-        // where the startup line would land.
-        beforeWrite: () => folderTrustLaunchHold(daemonClient, sessionId, 'startup line', { refuseUnknown: true, once: true }),
+        // where the startup line would land. No person waits on the line.
+        beforeWrite: () => folderTrustLaunchHold(daemonClient, sessionId, 'startup line', { refuseUnknown: true, once: true, budgetMs: FOLDER_TRUST_DELIVERY_BUDGET_MS }),
         write: (cmd) => {
           const delivered = writeLaunchLine(cmd);
           if (delivered && verifyTaskLine && !verifying) {
@@ -1199,7 +1200,9 @@ export function registerPTYHandlers(
     // screen; one wmux types on its own (any caller that does not say
     // otherwise) also when the screen cannot rule one out.
     const human = origin === 'human';
-    const trustRefusal = await folderTrustLaunchRefusal(dc, id, human ? 'launch line' : 'automated launch line', { refuseUnknown: !human });
+    // No person waits on an automated line, so the daemon's read may take longer.
+    const trustOpts = human ? { refuseUnknown: false } : { refuseUnknown: true, budgetMs: FOLDER_TRUST_DELIVERY_BUDGET_MS };
+    const trustRefusal = await folderTrustLaunchRefusal(dc, id, human ? 'launch line' : 'automated launch line', trustOpts);
     if (trustRefusal) throw new Error(`PTY_WRITE_LAUNCH: ${trustRefusal}`);
     // Chat v2 owns the pane, or a move into chat holds it: a resume typed now
     // would put a second process on the conversation. The daemon decides.
@@ -2005,6 +2008,7 @@ export function registerPTYHandlers(
         consecutiveFailures: number;
       }) => void)
     | null = null;
+  let onDaemonAgentProcessExit: ((payload: { sessionId: string; slug?: string | null }) => void) | null = null;
   if (useDaemon && daemonClient) {
     onDaemonSessionRestarted = (payload) => {
       // P1-3 ordering rule: the old PTY's trailing output must precede the
@@ -2049,6 +2053,16 @@ export function registerPTYHandlers(
       }
     };
     daemonClient.on('supervision:changed', onDaemonSupervisionChanged);
+
+    // The agent's process-death edge: the renderer drops the pane's agent
+    // row now rather than on its next 15 s liveness poll.
+    onDaemonAgentProcessExit = (payload) => {
+      const win = getWindow?.();
+      if (win && !win.isDestroyed()) {
+        win.webContents.send(IPC.AGENT_PROCESS_EXIT, { ptyId: payload.sessionId, slug: payload.slug ?? null });
+      }
+    };
+    daemonClient.on('session:agentProcessExit', onDaemonAgentProcessExit);
   }
 
   // Cleanup function
@@ -2094,6 +2108,9 @@ export function registerPTYHandlers(
       }
       if (onDaemonSupervisionChanged) {
         daemonClient.removeListener('supervision:changed', onDaemonSupervisionChanged);
+      }
+      if (onDaemonAgentProcessExit) {
+        daemonClient.removeListener('session:agentProcessExit', onDaemonAgentProcessExit);
       }
       if (onDaemonFlushComplete) {
         daemonClient.removeListener('session:flushComplete', onDaemonFlushComplete);

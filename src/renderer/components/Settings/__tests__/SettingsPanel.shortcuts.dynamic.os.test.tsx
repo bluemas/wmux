@@ -32,7 +32,7 @@ function badge(description: string): HTMLButtonElement {
 }
 
 function toggle(description: string): HTMLButtonElement {
-  const el = [...container.querySelectorAll<HTMLButtonElement>('[role="checkbox"]')]
+  const el = [...container.querySelectorAll<HTMLButtonElement>('[role="switch"]')]
     .find((b) => b.getAttribute('aria-label')?.startsWith(`${description} (`));
   if (!el) throw new Error(`no toggle for ${description}`);
   return el;
@@ -76,8 +76,8 @@ afterEach(() => {
 
 describe('Settings → Shortcuts (#1455)', () => {
   it('lists every configurable built-in with its current key', () => {
-    expect(badge(PREV).textContent).toBe('Alt+ArrowUp');
-    expect(badge('Next workspace').textContent).toBe('Alt+ArrowDown');
+    expect(badge(PREV).textContent).toBe('Alt+↑');
+    expect(badge('Next workspace').textContent).toBe('Alt+↓');
     expect(badge('Switch to workspace 3').textContent).toBe('Ctrl+3');
   });
 
@@ -172,7 +172,8 @@ describe('Settings → Shortcuts search', () => {
     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set?.call(search(), value);
     search().dispatchEvent(new Event('input', { bubbles: true }));
   });
-  const shown = () => [...container.querySelectorAll('button[aria-label]')]
+  // The search filters the Shortcuts section only (prefix rows have key buttons too).
+  const shown = () => [...search().closest('section')!.querySelectorAll('button[aria-label]')]
     .map((b) => b.getAttribute('aria-label') ?? '')
     .filter((label) => / \(/.test(label));
 
@@ -191,7 +192,7 @@ describe('Settings → Shortcuts search', () => {
   it('finds macOS symbol combos by modifier name', () => {
     (window as unknown as { electronAPI: { platform: string } }).electronAPI.platform = 'darwin';
     act(() => root.render(createElement(Harness)));
-    expect(badge(PREV).textContent).toBe('⌥+ArrowUp');
+    expect(badge(PREV).textContent).toBe('⌥↑');
     type('option arrowup');
     expect(shown().some((l) => l.startsWith(`${PREV} (`))).toBe(true);
     expect(shown().some((l) => l.startsWith('Next workspace ('))).toBe(false);
@@ -239,7 +240,7 @@ describe('Settings → Shortcuts: keys custom keybindings use (#1885)', () => {
     click(cancel());
     expect(dialog()).toBeNull();
     expect(overrides()).toEqual({});
-    expect(badge(PREV).textContent).toBe('Alt+ArrowUp');
+    expect(badge(PREV).textContent).toBe('Alt+↑');
   });
 
   it('Use anyway moves the built-in onto F7, as before', () => {

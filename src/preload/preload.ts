@@ -18,6 +18,7 @@ import { contextBridge, ipcRenderer, webFrame, webUtils } from 'electron';
 import { START_POLARITY_STORAGE_KEY, resolveStartPolarity, startPaintCss } from '../shared/windowStartPaint';
 import { startLocaleFromArgv } from '../shared/startLocale';
 import { IPC } from '../shared/constants';
+import { CLAUDE_FILE_SEND_IPC } from '../shared/claudeFileSend';
 import type { A2aSpawnAskResult, A2aSpawnOutgoingList, A2aSpawnPolicySetResult, A2aSpawnPolicyV1, A2aSpawnRequestSummary, A2aSpawnUiAsk } from '../shared/a2aSpawn';
 import type { SleepPreventionMode, SleepWindow } from '../shared/sleepPrevention';
 import { ROOM_EVENT } from '../shared/room';
@@ -190,7 +191,9 @@ export interface McpRegisterTargetResult {
 
 /** A bot.* call as the operator, with the router's envelope and the
  *  handler's refusal flattened to {ok, message?, code?}: the refusal's code
- *  (repo_mismatch, no_remote…) lets the renderer tell refusals apart. */
+ *  (repo_mismatch, no_remote…) lets the renderer tell refusals apart.
+ *  Each method sent here must be listed in RENDERER_RPC_METHODS
+ *  (src/main/ipc/rpcInvoke.ts). */
 async function factoryBotCall(method: string, params: Record<string, unknown>): Promise<{ ok: boolean; message?: string; code?: string }> {
   const resp = (await ipcRenderer.invoke(IPC.RPC_INVOKE, method, params)) as { ok?: unknown; result?: unknown; error?: unknown } | null;
   if (!resp || resp.ok !== true) return { ok: false, message: typeof resp?.error === 'string' ? resp.error : 'the bot call failed' };
@@ -491,6 +494,14 @@ const electronAPI = {
       ipcRenderer.on(IPC.SUPERVISION_CHANGED, listener);
       return () => { ipcRenderer.removeListener(IPC.SUPERVISION_CHANGED, listener); };
     },
+    // The pane's agent process died (the daemon tracker's death edge; a
+    // successor process is not a death). Drops the pane's agent row.
+    onAgentProcessExit: (callback: (payload: { ptyId: string; slug: string | null }) => void) => {
+      const listener = (_event: Electron.IpcRendererEvent, payload: { ptyId: string; slug: string | null }) =>
+        callback(payload);
+      ipcRenderer.on(IPC.AGENT_PROCESS_EXIT, listener);
+      return () => { ipcRenderer.removeListener(IPC.AGENT_PROCESS_EXIT, listener); };
+    },
     // Fires once per attach when the daemon's SessionPipe ring-buffer
     // flush completes. recoveredBytes is the exact byte count replayed
     // from the daemon's scrollback before the FLUSH_DONE_MARKER. 0 means
@@ -740,7 +751,9 @@ const electronAPI = {
     // pipe-RPC methods like `events.poll` and `a2a.channel.*`. The
     // result envelope is the same `{ ok: true, ... } | { ok: false,
     // error }` (or method-native shape, e.g. events.poll returns
-    // `{ events, nextCursor, resync? }`) the pipe router returns.
+    // `{ events, nextCursor, resync? }`) the pipe router returns. Main
+    // dispatches only the methods in RENDERER_RPC_METHODS
+    // (src/main/ipc/rpcInvoke.ts) and refuses every other one.
     invoke: (method: string, params: Record<string, unknown>) =>
       ipcRenderer.invoke(IPC.RPC_INVOKE, method, params),
     // Renderer-only channel mutation (D5). Unlike `invoke` (which routes the
@@ -1480,9 +1493,14 @@ const electronAPI = {
     // of the active workspace; rejects when no tab could be opened. Poll
     // factoryHermesReadiness to see it land.
     factoryHermesSetup: () => ipcRenderer.invoke(IPC.FACTORY_HERMES_SETUP) as Promise<void>,
-    // The owner picks a bot's engine: Claude (SDK) or Hermes.
-    setBotEngine: (botId: string, engine: 'claude-sdk' | 'hermes') =>
-      ipcRenderer.invoke(IPC.FACTORY_BOT_SET_ENGINE, { botId, engine }) as Promise<{ ok: boolean; code?: string; message?: string }>,
+    // The owner picks a bot's engine: Claude (SDK), wmux's Hermes, or My
+    // Hermes (the owner's own Hermes profile; main asks in its own confirm).
+    setBotEngine: (botId: string, engine: 'claude-sdk' | 'hermes' | 'my-hermes', hermesProfile?: string) =>
+      ipcRenderer.invoke(IPC.FACTORY_BOT_SET_ENGINE, { botId, engine, ...(hermesProfile !== undefined ? { hermesProfile } : {}) }) as Promise<{ ok: boolean; code?: string; message?: string }>,
+    // The owner's own Hermes profiles, and with `profile` whether it could
+    // serve a bot (read-only). `fresh`: not main's cached answer.
+    factoryMyHermes: (req?: { profile?: string; fresh?: boolean }) =>
+      ipcRenderer.invoke(IPC.FACTORY_MY_HERMES, req) as Promise<import('../shared/hermesEngine').MyHermesStatus>,
     // The engines a bot's workers may run on, and which are installed here.
     workerAgents: () =>
       ipcRenderer.invoke(IPC.FACTORY_WORKER_AGENTS) as Promise<import('../shared/botWorkerAgent').BotWorkerAgentOption[]>,
@@ -1596,6 +1614,11 @@ const electronAPI = {
       return () => { ipcRenderer.removeListener(IPC.WORK_LINK_CHANGED, listener); };
     },
   },
+  // Company presets: write each seat's brief file and get its launch line.
+  company: {
+    seatLaunches: (req: import('../main/company/seatLaunch').SeatLaunchRequest) =>
+      ipcRenderer.invoke(IPC.COMPANY_SEAT_LAUNCHES, req) as Promise<import('../main/company/seatLaunch').SeatLaunchResult>,
+  },
   // Fleet's Plan card: Claude's plan dialogs and the answer to one (main window only).
   planApprovals: {
     list: () => ipcRenderer.invoke(IPC.PLAN_APPROVALS_LIST) as Promise<import('../shared/planApproval').PlanApprovalView[]>,
@@ -1703,11 +1726,14 @@ const electronAPI = {
       ipcRenderer.invoke(IPC.TASK_CREATE_PR, { taskId, verifiedWorkspaceId }) as Promise<
         import('../shared/workTask').CreatePrResultWire
       >,
+    /** `keep`: every folder a live, stashed or archived pane is in; without
+     *  it no company seat folder is listed. */
     scan: (
       verifiedWorkspaceId: string,
       knownOpen?: Array<{ taskId: string; title: string; worktreePath?: string }>,
+      keep?: string[],
     ) =>
-      ipcRenderer.invoke(IPC.WORKTASK_SCAN, { verifiedWorkspaceId, knownOpen }) as Promise<
+      ipcRenderer.invoke(IPC.WORKTASK_SCAN, { verifiedWorkspaceId, knownOpen, ...(keep ? { keep } : {}) }) as Promise<
         import('../shared/workTask').WorktaskScanResultWire
       >,
     // F2 — 재발사: prompt.md 실존 검사 후 원래 initialCommand를 정상 경로와 동일
@@ -1724,6 +1750,19 @@ const electronAPI = {
       >,
     deletePhoneBranch: (repo: string, branch: string) =>
       ipcRenderer.invoke(IPC.WORKTASK_DELETE_PHONE_BRANCH, { repo, branch }) as Promise<{ ok: boolean; error?: string }>,
+    removeCompanySeat: (worktreePath: string, force: boolean) =>
+      ipcRenderer.invoke(IPC.WORKTASK_REMOVE_COMPANY_SEAT, { worktreePath, force }) as Promise<
+        import('../shared/workTask').RemovePhoneWorktreeResultWire
+      >,
+    /** Only `company/<slug>` of that seat folder. */
+    deleteCompanySeatBranch: (worktreePath: string, repo: string, branch: string, oid: string) =>
+      ipcRenderer.invoke(IPC.WORKTASK_DELETE_COMPANY_SEAT_BRANCH, { worktreePath, repo, branch, oid }) as Promise<{ ok: boolean; error?: string }>,
+    /** Remove the company seat worktrees nothing uses any more; `keep`: every
+     *  folder a live, stashed or archived pane is in. */
+    sweepCompanySeats: (keep: string[]) =>
+      ipcRenderer.invoke(IPC.WORKTASK_SWEEP_COMPANY_SEATS, { keep }) as Promise<
+        import('../shared/workTask').CompanySeatSweepResultWire
+      >,
   },
   dialog: {
     pickFolder: () => ipcRenderer.invoke(IPC.DIALOG_PICK_FOLDER) as Promise<string[]>,
@@ -2012,10 +2051,10 @@ const electronAPI = {
           | 'network-error'
           | 'read-error';
         snapshot: {
-          sessionPct: number;
-          sessionResetEpochSec: number;
-          weeklyPct: number;
-          weeklyResetEpochSec: number;
+          sessionPct?: number;
+          sessionResetEpochSec?: number;
+          weeklyPct?: number;
+          weeklyResetEpochSec?: number;
           fetchedAtMs: number;
           scoped?: Array<{
             kind: string;
@@ -2046,6 +2085,11 @@ const electronAPI = {
       get: () => ipcRenderer.invoke(IPC.USAGE_RESERVE_GET) as Promise<{ enabled: boolean }>,
       set: (enabled: boolean) => ipcRenderer.invoke(IPC.USAGE_RESERVE_SET, enabled) as Promise<{ ok: boolean }>,
     },
+  },
+  /** Whether new panes let Claude send files to the phone (shared/claudeFileSend.ts). */
+  claudeFileSend: {
+    get: () => ipcRenderer.invoke(CLAUDE_FILE_SEND_IPC.GET) as Promise<{ enabled: boolean }>,
+    set: (enabled: boolean) => ipcRenderer.invoke(CLAUDE_FILE_SEND_IPC.SET, enabled) as Promise<{ ok: boolean }>,
   },
   // N4 — agents whose sign-in was lost (shared/agentAuthLost), one entry per
   // agent and account; `loginState` asks the agent's own status for an entry

@@ -58,8 +58,8 @@ export const SHORTCUT_ACTION_IDS = [
   'nextSurface', 'prevSurface', 'nextPane', 'prevPane',
   'focusUp', 'focusDown', 'focusLeft', 'focusRight',
   'focusUpAlt', 'focusDownAlt', 'focusLeftAlt', 'focusRightAlt',
-  'toggleSidebar', 'toggleFileTree', 'openSettings', 'toggleFleetView', 'toggleCompanyView', 'toggleBotsView',
-  'clearMultiview', 'openBrowser', 'openPrivateBrowser', 'addBookmark', 'toggleMessageFeed',
+  'toggleSidebar', 'toggleFileTree', 'openSettings', 'toggleFleetView', 'toggleBotsView',
+  'clearMultiview', 'openBrowser', 'openPrivateBrowser', 'addBookmark',
   'zoomIn', 'zoomOut', 'zoomReset',
   'mentionAgent', 'dictatePane',
   // Unbound by default (UNBOUND_SHORTCUTS): command-palette commands a user
@@ -202,15 +202,13 @@ export const WMUX_KEYMAP: readonly KeymapEntry[] = [
   { action: 'toggleFileTree', combo: 'Ctrl+Shift+E', descriptionKey: 'settings.sc.toggleFileTree' },
   { action: 'openSettings', combo: 'Ctrl+,', descriptionKey: 'settings.sc.openSettings' },
   { action: 'toggleFleetView', combo: 'Ctrl+Shift+A', descriptionKey: 'settings.sc.toggleFleetView' },
-  { action: 'toggleCompanyView', combo: 'Ctrl+Shift+O', descriptionKey: 'settings.sc.toggleCompanyView' },
   { action: 'toggleBotsView', combo: 'Ctrl+Shift+J', descriptionKey: 'settings.sc.toggleBotsView' },
   { action: 'clearMultiview', combo: 'Ctrl+Shift+G', descriptionKey: 'settings.sc.clearMultiview' },
   { action: 'openBrowser', combo: 'Ctrl+Shift+L', descriptionKey: 'settings.sc.openBrowser' },
   // Chrome's incognito key (⌘⇧N on macOS).
   { action: 'openPrivateBrowser', combo: 'Ctrl+Shift+N', descriptionKey: 'settings.sc.openPrivateBrowser' },
-  // Bookmark / message-feed convention → literal Ctrl on every OS.
+  // Bookmark convention → literal Ctrl on every OS.
   { action: 'addBookmark', combo: 'Ctrl+M', literalCtrl: true, descriptionKey: 'settings.sc.addBookmark' },
-  { action: 'toggleMessageFeed', combo: 'Ctrl+Shift+M', literalCtrl: true, descriptionKey: 'settings.sc.toggleMessageFeed' },
 
   // Terminal font zoom. These are the combos Electron's default View menu
   // owned as resetZoom / zoomIn / zoomOut, so on macOS they hit webFrame zoom
@@ -279,6 +277,11 @@ export const UNBOUND_SHORTCUTS: readonly { action: ShortcutActionId; description
   // command palette, and a default here would win over that override.
   { action: 'togglePluginsView', descriptionKey: 'settings.sc.togglePluginsView' },
 ];
+
+/** The unbound actions Settings › Shortcuts lists. */
+export function settingsUnboundRows(): ShortcutActionId[] {
+  return UNBOUND_SHORTCUTS.map((e) => e.action);
+}
 
 /** The i18n key (and vars) naming `action` in shortcut lists. */
 export function shortcutDescription(
@@ -666,15 +669,47 @@ export function builtinCombosFor(
   return new Set(effectiveBindings(platform, overrides).map((b) => b.combo));
 }
 
+type DisplayModifier = 'Ctrl' | 'Alt' | 'Shift' | 'Meta';
+
+// Every spelling a combo or an Electron accelerator uses for a modifier.
+const MODIFIER_NAMES: Record<string, DisplayModifier | 'CmdOrCtrl'> = {
+  ctrl: 'Ctrl', control: 'Ctrl',
+  alt: 'Alt', option: 'Alt',
+  shift: 'Shift',
+  meta: 'Meta', cmd: 'Meta', command: 'Meta', super: 'Meta',
+  cmdorctrl: 'CmdOrCtrl', commandorcontrol: 'CmdOrCtrl',
+};
+// macOS lists modifiers ⌃⌥⇧⌘; Windows and Linux list Win, Ctrl, Alt, Shift.
+const MAC_ORDER: readonly DisplayModifier[] = ['Ctrl', 'Alt', 'Shift', 'Meta'];
+const PC_ORDER: readonly DisplayModifier[] = ['Meta', 'Ctrl', 'Alt', 'Shift'];
+const MAC_GLYPH: Record<DisplayModifier, string> = { Ctrl: '⌃', Alt: '⌥', Shift: '⇧', Meta: '⌘' };
+// Combos say ArrowUp / Escape; Electron accelerators say Up / Esc / Return.
+const KEY_LABEL: Record<string, string> = {
+  Escape: 'Esc', ArrowUp: '↑', ArrowDown: '↓', ArrowLeft: '←', ArrowRight: '→',
+  Up: '↑', Down: '↓', Left: '←', Right: '→', Return: 'Enter',
+};
+
 /**
- * Render a concrete combo the way the keyboard labels it: ⌘ and ⌥ on macOS,
- * Win / Super for the Meta key elsewhere.
+ * The one way wmux writes a shortcut. macOS: modifier glyphs in Apple's order
+ * and no separator (`⇧⌘D`, `⌃B`); Windows and Linux: words joined by `+`
+ * (`Ctrl+Shift+D`, `Win+K`). Takes a concrete combo (`Meta+Shift+D`) or an
+ * Electron accelerator (`CommandOrControl+Alt+Escape`).
  */
 export function displayCombo(combo: string, platform: NodeJS.Platform): string {
   const mac = platform === 'darwin';
-  return combo
-    .replace(/(^|\+)Meta(?=\+)/g, `$1${mac ? '⌘' : platform === 'win32' ? 'Win' : 'Super'}`)
-    .replace(/(^|\+)Alt(?=\+)/g, `$1${mac ? '⌥' : 'Alt'}`);
+  const mods = new Set<DisplayModifier>();
+  let rest = combo;
+  // Peel `Mod+` prefixes; what is left is the key (which may itself be `+`).
+  for (let m = /^([A-Za-z]+)\+(?=.)/.exec(rest); m; m = /^([A-Za-z]+)\+(?=.)/.exec(rest)) {
+    const name = MODIFIER_NAMES[m[1].toLowerCase()];
+    if (!name) break;
+    mods.add(name === 'CmdOrCtrl' ? (mac ? 'Meta' : 'Ctrl') : name);
+    rest = rest.slice(m[0].length);
+  }
+  const key = KEY_LABEL[rest] ?? rest;
+  if (mac) return MAC_ORDER.filter((m) => mods.has(m)).map((m) => MAC_GLYPH[m]).join('') + key;
+  const meta = platform === 'win32' ? 'Win' : 'Super';
+  return [...PC_ORDER.filter((m) => mods.has(m)).map((m) => (m === 'Meta' ? meta : m)), key].join('+');
 }
 
 /**
