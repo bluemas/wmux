@@ -49,11 +49,13 @@ import {
   type Modifier,
   type MouseButton,
   type ObservationMode,
+  type ScreenshotStatus,
   type ScrollDirection,
   type WindowInfo,
 } from '../../shared/computer/protocol';
 import { screenshotPointToWindow } from '../../shared/computer/scale';
 import { appBundleSelector } from './appBundleId';
+import { thinTreeReason } from './axFirst';
 import { ForegroundLease, INPUT_LOCK_IDLE_MS, PidLanes, foregroundCertain } from './inputLanes';
 
 export { INPUT_LOCK_IDLE_MS };
@@ -79,6 +81,13 @@ export interface HelperLike {
    */
   defersForeground?(): Promise<boolean>;
 }
+
+/**
+ * What getAppState tells an agent: the helper's state, the mode it was taken
+ * in, and, when the agent named no mode and main added a screenshot to a thin
+ * tree, why.
+ */
+export type ObservedAppState = AppState & { mode: ObservationMode; screenshotAdded?: string };
 
 /** What `capabilities` tells an agent: the helper's answer minus what cannot work. */
 export type AgentCapabilities = HelperCapabilities & { missingPermissions?: Array<'accessibility' | 'screenRecording'> };
@@ -313,11 +322,12 @@ export class ComputerService {
     };
   }
 
-  async getAppState(agent: ComputerAgent, params: { app: string; window?: string; mode?: ObservationMode }): Promise<AppState> {
+  async getAppState(agent: ComputerAgent, params: { app: string; window?: string; mode?: ObservationMode }): Promise<ObservedAppState> {
     const helper = this.ensureReady();
     if (!params.app) fail('invalid_argument', 'app is required');
-    const mode = params.mode ?? 'both';
-    if (!OBSERVATION_MODES.includes(mode)) fail('invalid_argument', `mode must be one of ${OBSERVATION_MODES.join(', ')}`);
+    if (params.mode !== undefined && !OBSERVATION_MODES.includes(params.mode)) {
+      fail('invalid_argument', `mode must be one of ${OBSERVATION_MODES.join(', ')}`);
+    }
 
     const generation = this.generation;
     const target = await helper.request('resolveTarget', { app: params.app, ...(params.window && { window: params.window }) });
@@ -325,6 +335,56 @@ export class ComputerService {
     await this.vet(agent, target.app, target.window, generation);
 
     assertConsistent(target.app, target.window);
+    // No mode named: the tree alone, plus a screenshot only when the tree is
+    // too thin to act on (axFirst.ts). An explicit mode is taken as given.
+    let mode = params.mode ?? 'ax';
+    let state = await this.observe(agent, helper, target, mode, generation);
+    let screenshotAdded: string | undefined;
+    if (params.mode === undefined) {
+      const thin = thinTreeReason(state, { skipWindowButtons: (this.deps.platform ?? process.platform) === 'darwin' });
+      if (thin) {
+        const caps = await helper.request('capabilities', {});
+        this.assertCurrent(generation);
+        if (!caps.permissions.screenRecording) {
+          // Walking again would only return the same tree without an image.
+          state = { ...state, screenshotStatus: screenshotNotAdded(thin, 'permission_missing', 'Screen Recording permission is missing') };
+        } else {
+          // A fresh walk rather than a vision-only call grafted on: indexes and
+          // pixels must come from one snapshot, and a thin tree is quick to walk.
+          try {
+            state = await this.observe(agent, helper, target, 'both', generation);
+            mode = 'both';
+            screenshotAdded = thin;
+          } catch (err) {
+            // A stop by the user ends the call; any other failure keeps the
+            // tree the agent already has rather than turning it into an error.
+            this.assertCurrent(generation);
+            const message = err instanceof Error ? err.message : String(err);
+            state = { ...state, screenshotStatus: screenshotNotAdded(thin, 'screenshot_failed', message) };
+          }
+        }
+      }
+    }
+
+    this.recordSnapshot(state.snapshotId, {
+      agentKey: agent.key,
+      app: state.app,
+      window: state.window,
+      ...(state.screenshot && {
+        image: { width: state.screenshot.width, height: state.screenshot.height, scale: state.screenshot.scale },
+      }),
+      expiresAt: this.now() + SNAPSHOT_TTL_MS,
+    });
+    return { ...state, mode, ...(screenshotAdded && { screenshotAdded }) };
+  }
+
+  private async observe(
+    agent: ComputerAgent,
+    helper: HelperLike,
+    target: { app: AppInfo; window: WindowInfo },
+    mode: ObservationMode,
+    generation: number,
+  ): Promise<AppState> {
     const state = await helper.request('getAppState', {
       app: target.app.id,
       window: target.window.id,
@@ -339,16 +399,6 @@ export class ComputerService {
     // consented app costs no prompt here.
     assertConsistent(state.app, state.window);
     await this.vet(agent, state.app, state.window, generation);
-
-    this.recordSnapshot(state.snapshotId, {
-      agentKey: agent.key,
-      app: state.app,
-      window: state.window,
-      ...(state.screenshot && {
-        image: { width: state.screenshot.width, height: state.screenshot.height, scale: state.screenshot.scale },
-      }),
-      expiresAt: this.now() + SNAPSHOT_TTL_MS,
-    });
     return state;
   }
 
@@ -895,6 +945,11 @@ function needsForegroundAsInternal(err: unknown, sent: { requested: boolean }): 
       : `the computer-use helper asked for real input after it may have sent some (${err.message}); nothing more was sent`,
     nothingSent ? 'not_delivered' : 'delivered_unverified',
   );
+}
+
+/** A thin tree whose screenshot could not be added: the tree stands, the reason rides along. */
+function screenshotNotAdded(thin: string, code: 'permission_missing' | 'screenshot_failed', why: string): ScreenshotStatus {
+  return { status: 'failed', error: { code, message: `${thin}, but no screenshot was added: ${why}` } };
 }
 
 /** A window the helper reports must belong to the app it reports with it. */
