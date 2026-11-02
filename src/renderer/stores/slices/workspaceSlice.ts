@@ -2,7 +2,7 @@ import { isPhoneWorkspaceId, PHONE_WORKSPACE_REQUEST_LIMIT } from '../../../shar
 import type { StateCreator } from 'zustand';
 import { sanitizeClaudeEffort } from '../../../shared/claudeModels';
 import type { StoreState } from '../index';
-import { createWorkspace, clonePaneTreeFresh, assignPaneOrdinals, generateId, BUILTIN_TEMPLATES, DEFAULT_PREFIX_CONFIG, buildDefaultCustomKeybindings, upgradeDefaultKeybindingsForPlatform, TERMINAL_STATES, NOTIFICATION_CATEGORIES, type ArchivedWorkspace, type Pane, type PaneLeaf, type SessionData, type StashedPane, type Workspace, type WorkspaceMetadata, type WorkspaceProfile } from '../../../shared/types';
+import { createWorkspace, clonePaneTreeFresh, assignPaneOrdinals, generateId, BUILTIN_TEMPLATES, DEFAULT_PREFIX_CONFIG, buildDefaultCustomKeybindings, upgradeDefaultKeybindingsForPlatform, TERMINAL_STATES, NOTIFICATION_CATEGORIES, type ArchivedWorkspace, type Pane, type PaneLeaf, type SessionData, type StashedPane, type SurfaceHandoff, type Workspace, type WorkspaceMetadata, type WorkspaceProfile } from '../../../shared/types';
 import { normalizeStarPromptState } from '../../../shared/starPrompt';
 import { normalizeWorkspaceProfile } from '../../../shared/workspaceProfile';
 import { overridesFromDisabledCombos, sanitizeShortcutOverrides } from '../../../shared/keymap';
@@ -292,6 +292,17 @@ export interface WorkspaceSlice {
    */
   addCompanyWorkspace: (input: CompanyWorkspaceInput) => boolean;
   /**
+   * "Add a seat on this PC…": a pane for a seat main has made (hireSeat), split
+   * from the company's last staff pane (the CEO's when it has none) and
+   * seeded with its name, what it owns, its launch line and folder, so the
+   * pane funnel names it and starts its agent as it does a preset seat's. The
+   * company comes forward first: the funnel starts only the active
+   * workspace's panes, and the split then moves the focus to the new pane.
+   * The new pane's id, or false: no company with a CEO pane, or the pane cap
+   * (splitPane says so).
+   */
+  hireCompanySeat: (workspaceId: string, seat: { label: string; owns: string; command: string; cwd?: string; env?: Record<string, string> }) => string | false;
+  /**
    * Duplicate an existing workspace's LAYOUT (pane tree, with fresh ids and
    * cleared ptyIds → new panes spawn their own PTYs) and its PROFILE (env +
    * startup command, re-normalized through the save-boundary secret policy).
@@ -575,6 +586,34 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
         activateLocalWorkspace(state, ws.id);
       });
       return true;
+    },
+
+    hireCompanySeat: (workspaceId, seat) => {
+      const ws = get().workspaces.find((w: Workspace) => w.id === workspaceId);
+      const ceo = ws?.company?.coordinatorPaneId;
+      if (!ws || !ceo) return false;
+      const leaves = collectLeafPanes(ws.rootPane);
+      const staff = leaves.filter((l) => l.id !== ceo);
+      const target = staff[staff.length - 1] ?? leaves.find((l) => l.id === ceo);
+      if (!target) return false;
+      set((state: StoreState) => {
+        activateLocalWorkspace(state, workspaceId);
+      });
+      // Staff stack below one another, right of the CEO, as a preset lays them out.
+      const paneId = get().splitPane(target.id, staff.length > 0 ? 'vertical' : 'horizontal', workspaceId);
+      if (!paneId) return false;
+      // Same tick as the split: the funnel runs after this returns.
+      const owns = seat.owns.trim();
+      set((state: StoreState) => {
+        state.projectPaneSeed[paneId] = {
+          label: seat.label,
+          command: seat.command,
+          ...(seat.cwd ? { cwd: seat.cwd } : {}),
+          ...(seat.env ? { env: seat.env } : {}),
+          ...(owns ? { role: owns } : {}),
+        };
+      });
+      return paneId;
     },
 
     // #1011 — Active → Archived → Deleted. Archiving snapshots the
@@ -1307,6 +1346,18 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
               if (recovery) s.pendingRecovery = recovery;
               else delete s.pendingRecovery;
             }
+            // A handoff record read from disk: times that are numbers, a hex
+            // commit, or no record at all.
+            if (s.handoff !== undefined) {
+              const h = s.handoff as Partial<SurfaceHandoff> | null;
+              if (!h || !Number.isFinite(h.at) || !Number.isFinite(h.resetsAt)) delete s.handoff;
+              else s.handoff = {
+                at: h.at as number,
+                resetsAt: h.resetsAt as number,
+                ...(typeof h.head === 'string' && /^[0-9a-f]{7,64}$/i.test(h.head) ? { head: h.head } : {}),
+                ...(typeof h.noteHead === 'string' && h.noteHead ? { noteHead: h.noteHead.slice(0, 200) } : {}),
+              };
+            }
           }
         } else {
           for (const child of pane.children) sanitizePanes(child);
@@ -1638,6 +1689,9 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       if (typeof data.paneNewTerminalButton === 'boolean') {
         state.paneNewTerminalButton = data.paneNewTerminalButton;
       }
+      // Experimental memory opt-ins: only an explicit true turns them on.
+      if (data.terminalCompactScrollback === true) state.terminalCompactScrollback = true;
+      if (data.terminalSharedWebgl === true) state.terminalSharedWebgl = true;
       if (data.splitInheritsCwd != null) state.splitInheritsCwd = data.splitInheritsCwd;
       if (data.closeTabOnShellExit != null) state.closeTabOnShellExit = data.closeTabOnShellExit;
       if (data.imeResidueGuardEnabled != null) state.imeResidueGuardEnabled = data.imeResidueGuardEnabled;

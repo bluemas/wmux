@@ -470,6 +470,15 @@ export interface UISlice {
   paneNewTerminalButton: boolean;
   setPaneNewTerminalButton: (visible: boolean) => void;
 
+  /** EXPERIMENTAL, default OFF: keep xterm scrollback lines outside the
+   *  viewport compacted in memory. No Settings row yet (dogfood only). */
+  terminalCompactScrollback: boolean;
+  setTerminalCompactScrollback: (enabled: boolean) => void;
+  /** EXPERIMENTAL, default OFF: draw every pane through one shared WebGL
+   *  context instead of one context per pane. No Settings row yet. */
+  terminalSharedWebgl: boolean;
+  setTerminalSharedWebgl: (enabled: boolean) => void;
+
   // Issue #174: split panes inherit the splitting pane's cwd (default on).
   splitInheritsCwd: boolean;
   setSplitInheritsCwd: (enabled: boolean) => void;
@@ -1636,6 +1645,16 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
     state.paneNewTerminalButton = visible;
   }),
 
+  terminalCompactScrollback: false,
+  setTerminalCompactScrollback: (enabled) => set((state) => {
+    state.terminalCompactScrollback = enabled;
+  }),
+
+  terminalSharedWebgl: false,
+  setTerminalSharedWebgl: (enabled) => set((state) => {
+    state.terminalSharedWebgl = enabled;
+  }),
+
   splitInheritsCwd: true,
 
   setSplitInheritsCwd: (enabled) => set((state) => {
@@ -2126,6 +2145,13 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
   toggleMultiviewWorkspace: (wsId) => {
     handOffBeforeLeavingGrid(get(), wsId);
     set((state) => {
+    // A grid the active workspace is not in is not on screen: save it as a
+    // group first, so Ctrl+clicking one of its members from outside takes
+    // that member into a new group with the active workspace (as a member of
+    // any other saved group would be) instead of removing it from the hidden grid.
+    if (!state.multiviewIds.includes(state.activeWorkspaceId)) {
+      saveCurrentMultiviewGroup(state);
+    }
     const idx = state.multiviewIds.indexOf(wsId);
     if (idx >= 0) {
       state.multiviewIds.splice(idx, 1);

@@ -62,6 +62,15 @@ describe('multiview groups', () => {
     expect(store.getState().multiviewSavedGroups).toEqual([ids('A', 'B')]);
   });
 
+  it('a Ctrl+click from outside every group on a member of the last-shown group forms a new group', () => {
+    startSecondGroup();
+    store.getState().setActiveWorkspace(ws.E.id);
+    store.getState().toggleMultiviewWorkspace(ws.D.id);
+    expect(store.getState().multiviewIds).toEqual(ids('E', 'D'));
+    // D left C + D, which dissolves at one member, the same as a saved group.
+    expect(store.getState().multiviewSavedGroups).toEqual([ids('A', 'B')]);
+  });
+
   it('a workspace joining a group leaves its old one, which dissolves at one member', () => {
     startSecondGroup();
     store.getState().toggleMultiviewWorkspace(ws.B.id);
