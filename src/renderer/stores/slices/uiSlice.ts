@@ -1225,6 +1225,14 @@ function handOffBeforeLeavingGrid(state: StoreState, wsId: string): void {
   if (next && next !== wsId) state.setActiveWorkspace?.(next);
 }
 
+/** Fork: the owner's keys, applied when no saved session carries overrides (a fresh install, lost settings). */
+export const OWNER_SHORTCUT_OVERRIDES: ShortcutOverrides = {
+  workspace1: 'Alt+1', workspace2: 'Alt+2', workspace3: 'Alt+3', workspace4: 'Alt+4',
+  workspace5: 'Alt+5', workspace6: 'Alt+6', workspace7: 'Alt+7', workspace8: 'Alt+8',
+  workspace9: 'Alt+0',
+  toggleFleetView: 'Shift+Alt+F', renameWorkspace: 'Shift+Alt+R', renameTab: 'Shift+Alt+T',
+};
+
 export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]], [], UISlice> = (set, get) => ({
   // ─── Startup gate (Fix 0) ─────────────────────────────────────────────
   paneGate: 'pending',
@@ -2291,7 +2299,7 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
     state.customKeybindings = state.customKeybindings.filter((k) => k.id !== id);
   }),
 
-  shortcutOverrides: {},
+  shortcutOverrides: { ...OWNER_SHORTCUT_OVERRIDES },
 
   setShortcutOverride: (action, combo) => set((state) => {
     // Same whitelist the session loader applies (configurable actions, valid

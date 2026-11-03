@@ -59,6 +59,8 @@ beforeEach(() => {
   container = document.createElement('div');
   document.body.appendChild(container);
   root = createRoot(container);
+  // The stock keymap (the fork's store starts on the owner's keys, Alt+1 for workspace 1).
+  useStore.setState({ shortcutOverrides: {} });
 });
 afterEach(() => {
   act(() => root.unmount());

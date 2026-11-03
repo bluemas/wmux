@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { create } from 'zustand';
 import { immer } from 'zustand/middleware/immer';
-import { createUISlice, siteGuidesAutoEnablePatch, fleetChangedSinceSeen, type UISlice } from '../uiSlice';
+import { createUISlice, OWNER_SHORTCUT_OVERRIDES, siteGuidesAutoEnablePatch, fleetChangedSinceSeen, type UISlice } from '../uiSlice';
 import { createSchedulesSlice, type SchedulesSlice } from '../schedulesSlice';
 
 // Mock browser APIs that uiSlice touches
@@ -807,9 +807,12 @@ describe('UISlice — built-in shortcut overrides (#1152, #1455)', () => {
   let store: ReturnType<typeof createTestStore>;
   beforeEach(() => { store = createTestStore(); });
 
-  it('starts on the defaults', () => {
-    expect(store.getState().shortcutOverrides).toEqual({});
+  it("starts on the owner's keys (fork)", () => {
+    expect(store.getState().shortcutOverrides).toEqual(OWNER_SHORTCUT_OVERRIDES);
   });
+
+  describe('from no overrides', () => {
+  beforeEach(() => { store.setState({ shortcutOverrides: {} }); });
 
   it('switches an action off, moves one, and resets each', () => {
     store.getState().setShortcutOverride('prevWorkspace', null);
@@ -824,6 +827,7 @@ describe('UISlice — built-in shortcut overrides (#1152, #1455)', () => {
   it('refuses a combo nobody can press without eating a typed key', () => {
     store.getState().setShortcutOverride('newSurface', 'T');
     expect(store.getState().shortcutOverrides).toEqual({});
+  });
   });
 });
 
