@@ -34,8 +34,9 @@ content, shell execution, network, permanent-delete or file editing API is used.
 
 Permissions: `ui.rail-page`, `pane.read` (workspace pane cwd and active pane),
 `fs.read` (folder listing and text viewing), `fs.write` (local mutations and job
-control). These filesystem grants are not path-scoped. Credential folders,
-credential files and nonlocal paths are refused by the host. Review permissions
+control). These filesystem grants are not path-scoped: the plugin can read any text
+file outside the host's refusal list (credential folders, `.env` files, private
+keys, CLI tokens, shell history, wmux's own data) and nonlocal paths. Review permissions
 before enabling. Symlinks copy as links without traversing folder targets.
 
 MIT licensed; see LICENSE.

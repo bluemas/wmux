@@ -93,6 +93,17 @@ describe('filesystem write jobs', () => {
     expect(await queue.start('copy', { sources: [src], destDir: path.join(home, '.ssh'), conflict: 'fail' })).toMatchObject({ reason: 'unavailable' });
     const result = await queue.start('trash', { paths: [home] }); expect((await finish(result)).state).toBe('failed'); expect(trash).not.toHaveBeenCalled();
   });
+  it('applies the plugin refusal list: .env files, keys, wmux data', async () => {
+    fs.writeFileSync(path.join(src, '.env'), 'TOKEN=1');
+    // Renaming a refused file away from its name would make it readable.
+    expect(await queue.rename({ path: path.join(src, '.env'), newName: 'env.txt' })).toMatchObject({ reason: 'unavailable' });
+    expect(await queue.rename({ path: path.join(src, 'a'), newName: 'server.pem' })).toMatchObject({ reason: 'unavailable' });
+    expect(await queue.mkdir({ path: path.join(home, '.wmux-dev') })).toMatchObject({ reason: 'unavailable' });
+    // A folder holding a refused file is refused whole, before anything changes.
+    const job = await finish(await queue.start('copy', { sources: [src], destDir: dest, conflict: 'fail' }));
+    expect(job.state).toBe('failed');
+    expect(fs.existsSync(path.join(dest, 'src'))).toBe(false);
+  });
   it('trashes canonical paths through the injected OS operation', async () => {
     const job = await finish(await queue.start('trash', { paths: [path.join(src, '..', 'src', 'a')] }));
     expect(job.state).toBe('done'); expect(trash).toHaveBeenCalledWith(path.join(src, 'a'));

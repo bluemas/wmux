@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { shell } from 'electron';
-import { isSensitivePath, resolveAccessiblePath } from '../../ipc/handlers/fs.handler';
+import { isPluginRefusedPath, resolvePluginPath } from './fsRefusals';
 import { validatePathParam } from './fs.rpc';
 import type { RpcRouter } from '../RpcRouter';
 
@@ -54,16 +54,16 @@ async function accessible(input: unknown, missing = false): Promise<string> {
   const p = validatePathParam(input);
   if (!p) return fail('invalid');
   if (!validName(path.basename(p)) && path.dirname(p) !== p) return fail('invalid');
-  const canonical = await resolveAccessiblePath(p);
+  const canonical = await resolvePluginPath(p);
   const stat = await exists(p);
   if (canonical && !stat?.isSymbolicLink()) return canonical;
-  const parent = await resolveAccessiblePath(path.dirname(p));
+  const parent = await resolvePluginPath(path.dirname(p));
   if (!parent) return fail('unavailable');
   const entry = path.join(parent, path.basename(p));
-  if (isSensitivePath(p) || isSensitivePath(entry)) return fail('unavailable');
+  if (isPluginRefusedPath(p) || isPluginRefusedPath(entry)) return fail('unavailable');
   if (stat?.isSymbolicLink()) {
     const target = path.resolve(parent, await fs.promises.readlink(entry));
-    if (isSensitivePath(target) || (!canonical && await exists(target))) return fail('unavailable');
+    if (isPluginRefusedPath(target) || (!canonical && await exists(target))) return fail('unavailable');
     return entry;
   }
   if (!stat && missing) return entry;
@@ -135,12 +135,12 @@ export class FsJobQueue {
       const conflict = params.conflict as Conflict;
       if (kind !== 'trash') {
         if (!['skip', 'overwrite', 'fail'].includes(conflict)) fail('invalid');
-        destDir = await resolveAccessiblePath(await accessible(params.destDir)) ?? fail('unavailable');
+        destDir = await resolvePluginPath(await accessible(params.destDir)) ?? fail('unavailable');
         if (!(await fs.promises.stat(destDir)).isDirectory()) fail('not-a-directory');
         for (const src of sources) {
           const dest = await accessible(path.join(destDir, path.basename(src)), true);
-          const realSource = await resolveAccessiblePath(src);
-          const realDest = await resolveAccessiblePath(dest);
+          const realSource = await resolvePluginPath(src);
+          const realDest = await resolvePluginPath(dest);
           if (src === dest || (realSource && realDest && realSource === realDest)
             || ((await fs.promises.lstat(src)).isDirectory() && overlaps(src, realDest ?? dest))) fail('invalid');
         }

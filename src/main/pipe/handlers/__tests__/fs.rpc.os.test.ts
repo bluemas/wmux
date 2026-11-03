@@ -11,7 +11,8 @@ vi.mock('electron', () => ({
   BrowserWindow: { getFocusedWindow: vi.fn(), getAllWindows: vi.fn(() => []) },
 }));
 
-import { handleFsList, handleFsReadText, handleFsStat, validatePathParam } from '../fs.rpc';
+import { execFileSync } from 'node:child_process';
+import { handleFsList, handleFsReadText, handleFsStat, validatePathParam, wholeUtf8 } from '../fs.rpc';
 
 let root: string;
 let home: string;
@@ -88,6 +89,23 @@ describe('fs.list', () => {
     expect(await handleFsList({ path: path.join(root, 'missing') })).toEqual({ ok: false, reason: 'unavailable' });
   });
 
+  it('answers a link to a refused file as broken', async () => {
+    if (process.platform === 'win32') return;
+    fs.writeFileSync(path.join(root, 'work', '.env'), 'TOKEN=1');
+    fs.symlinkSync(path.join(root, 'work', '.env'), path.join(root, 'work', 'env-link'));
+    fs.symlinkSync(path.join(home, '.ssh', 'id_ed25519'), path.join(root, 'work', 'key-link'));
+    const res = await handleFsList({ path: path.join(root, 'work') });
+    if (!res.ok) throw new Error(res.reason);
+    const byName = Object.fromEntries(res.entries.map((e) => [e.name, e]));
+    expect(byName['env-link']).toMatchObject({ kind: 'symlink', target: null });
+    expect(byName['key-link']).toMatchObject({ kind: 'symlink', target: null });
+  });
+
+  it("refuses wmux's own data folder", async () => {
+    fs.mkdirSync(path.join(home, '.wmux-dev'), { recursive: true });
+    expect(await handleFsList({ path: path.join(home, '.wmux-dev') })).toEqual({ ok: false, reason: 'unavailable' });
+  });
+
   it('says when the path is a file', async () => {
     expect(await handleFsList({ path: path.join(root, 'work', 'README.md') })).toEqual({ ok: false, reason: 'not-a-directory' });
   });
@@ -112,6 +130,17 @@ describe('fs.stat', () => {
 
   it('refuses a credential file', async () => {
     expect(await handleFsStat({ path: path.join(home, '.ssh', 'id_ed25519') })).toEqual({ ok: false, reason: 'unavailable' });
+  });
+});
+
+describe('wholeUtf8', () => {
+  it('drops only an incomplete last character', () => {
+    const b = Buffer.from('a가', 'utf-8');
+    expect(wholeUtf8(b).toString()).toBe('a가');
+    expect(wholeUtf8(b.subarray(0, 3)).toString()).toBe('a');
+    expect(wholeUtf8(b.subarray(0, 2)).toString()).toBe('a');
+    expect(wholeUtf8(Buffer.from('😀', 'utf-8').subarray(0, 3)).length).toBe(0);
+    expect(wholeUtf8(Buffer.from('abc')).toString()).toBe('abc');
   });
 });
 
@@ -141,6 +170,38 @@ describe('fs.readText', () => {
     const file = path.join(root, 'work', 'blob.bin');
     fs.writeFileSync(file, Buffer.from([0x89, 0x50, 0x00, 0x47]));
     expect(await handleFsReadText({ path: file })).toEqual({ ok: false, reason: 'binary' });
+  });
+
+  it('calls a file binary from its first 8 KB whatever maxBytes says', async () => {
+    const file = path.join(root, 'work', 'late-nul.bin');
+    fs.writeFileSync(file, Buffer.from([0x41, 0x42, 0x00, 0x43]));
+    expect(await handleFsReadText({ path: file, maxBytes: 1 })).toEqual({ ok: false, reason: 'binary' });
+  });
+
+  it('does not cut a UTF-8 character in half', async () => {
+    const file = path.join(root, 'work', 'korean.txt');
+    fs.writeFileSync(file, '가나다'); // three bytes each
+    const res = await handleFsReadText({ path: file, maxBytes: 4 });
+    expect(res).toMatchObject({ ok: true, text: '가', truncated: true });
+  });
+
+  it('refuses a FIFO without waiting for a writer', async () => {
+    if (process.platform === 'win32') return;
+    const fifo = path.join(root, 'work', 'pipe');
+    execFileSync('mkfifo', [fifo]);
+    const res = await Promise.race([
+      handleFsReadText({ path: fifo }),
+      new Promise((resolve) => setTimeout(() => resolve('timed out'), 2000)),
+    ]);
+    expect(res).toEqual({ ok: false, reason: 'failed' });
+  });
+
+  it('refuses .env files and private keys anywhere', async () => {
+    for (const name of ['.env', '.env.local', 'server.pem', 'id_rsa']) {
+      const file = path.join(root, 'work', name);
+      fs.writeFileSync(file, 'secret');
+      expect(await handleFsReadText({ path: file }), name).toEqual({ ok: false, reason: 'unavailable' });
+    }
   });
 
   it('refuses a folder', async () => {

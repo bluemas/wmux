@@ -6,12 +6,13 @@
 // text files. It cannot write, run anything or reach the network through
 // these methods.
 //
-// Every path goes through `resolveAccessiblePath` (fs.handler.ts), the check
-// the app's own file tree already uses: local paths only (no UNC or device
-// paths), and never the credential folders and files it blocks (~/.ssh,
-// ~/.aws, ~/.wmux auth tokens, ...), as given or once symlinks resolve. A path
-// it refuses answers `unavailable`, the same as one that does not exist, so a
-// caller cannot probe which blocked files are there.
+// Every path goes through `resolvePluginPath` (fsRefusals.ts): the check the
+// app's own file tree uses (`resolveAccessiblePath`: local paths only, never
+// ~/.ssh, ~/.aws and the like) plus a stricter list for plugins only (wmux's
+// own data, .env files, private keys, CLI tokens, shell history), as given
+// and once symlinks resolve. A refused path answers `unavailable`, the same as
+// one that does not exist, so a caller cannot probe which blocked files are
+// there.
 //
 // Paths must be absolute (or start with `~`, the home folder): main's working
 // directory means nothing to a caller.
@@ -22,7 +23,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { RpcRouter } from '../RpcRouter';
-import { resolveAccessiblePath } from '../../ipc/handlers/fs.handler';
+import { resolvePluginPath } from './fsRefusals';
 
 export type FsEntryKind = 'file' | 'dir' | 'symlink' | 'other';
 
@@ -87,9 +88,12 @@ function kindOf(stat: fs.Stats): FsEntryKind {
   return 'other';
 }
 
+/** A refused target answers null, like a broken link, so a link cannot probe it. */
 async function symlinkTarget(p: string): Promise<FsEntry['target']> {
   try {
-    const s = await fs.promises.stat(p);
+    const target = await resolvePluginPath(p);
+    if (!target) return null;
+    const s = await fs.promises.stat(target);
     return s.isDirectory() ? 'dir' : s.isFile() ? 'file' : 'other';
   } catch {
     return null;
@@ -113,7 +117,7 @@ async function entryFor(dir: string, name: string): Promise<FsEntry | null> {
 export async function handleFsList(params: Record<string, unknown>) {
   const input = validatePathParam(params.path);
   if (!input) return { ok: false as const, reason: 'invalid' as FsFailure };
-  const dir = await resolveAccessiblePath(input);
+  const dir = await resolvePluginPath(input);
   if (!dir) return { ok: false as const, reason: 'unavailable' as FsFailure };
   let names: string[];
   try {
@@ -135,7 +139,7 @@ export async function handleFsList(params: Record<string, unknown>) {
 export async function handleFsStat(params: Record<string, unknown>) {
   const input = validatePathParam(params.path);
   if (!input) return { ok: false as const, reason: 'invalid' as FsFailure };
-  const resolved = await resolveAccessiblePath(input);
+  const resolved = await resolvePluginPath(input);
   if (!resolved) return { ok: false as const, reason: 'unavailable' as FsFailure };
   const entry = await entryFor(path.dirname(resolved), path.basename(resolved));
   if (!entry) return { ok: false as const, reason: 'unavailable' as FsFailure };
@@ -151,32 +155,55 @@ export async function handleFsReadText(params: Record<string, unknown>) {
     return { ok: false as const, reason: 'invalid' as FsFailure };
   }
   const limit = Math.min(typeof maxBytes === 'number' ? maxBytes : DEFAULT_READ_BYTES, MAX_READ_BYTES);
-  const resolved = await resolveAccessiblePath(input);
+  const resolved = await resolvePluginPath(input);
   if (!resolved) return { ok: false as const, reason: 'unavailable' as FsFailure };
   let handle: fs.promises.FileHandle | undefined;
   try {
-    handle = await fs.promises.open(resolved, 'r');
+    // Non-blocking, so a FIFO with no writer cannot hold the call open; only a
+    // regular file is read.
+    handle = await fs.promises.open(resolved, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0));
     const stat = await handle.stat();
     if (stat.isDirectory()) return { ok: false as const, reason: 'is-a-directory' as FsFailure };
     if (!stat.isFile()) return { ok: false as const, reason: 'failed' as FsFailure };
-    const buf = Buffer.alloc(Math.min(limit, stat.size));
+    // The file opened is the one checked: a path swapped for a link between
+    // the check and the open answers `unavailable`.
+    const again = await resolvePluginPath(resolved);
+    const checked = again ? await fs.promises.stat(again).catch(() => null) : null;
+    if (!checked || checked.dev !== stat.dev || checked.ino !== stat.ino) {
+      return { ok: false as const, reason: 'unavailable' as FsFailure };
+    }
+    // The first 8 KB decide binary whatever maxBytes asks for.
+    const buf = Buffer.alloc(Math.min(Math.max(limit, BINARY_SNIFF_BYTES), stat.size));
     const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
-    const bytes = buf.subarray(0, bytesRead);
-    if (bytes.subarray(0, BINARY_SNIFF_BYTES).includes(0)) {
+    const read = buf.subarray(0, bytesRead);
+    if (read.subarray(0, BINARY_SNIFF_BYTES).includes(0)) {
       return { ok: false as const, reason: 'binary' as FsFailure };
     }
+    const cut = read.length > limit || stat.size > read.length;
+    const bytes = cut ? wholeUtf8(read.subarray(0, Math.min(limit, read.length))) : read;
     return {
       ok: true as const,
       path: resolved,
       size: stat.size,
       text: bytes.toString('utf-8'),
-      truncated: stat.size > bytesRead,
+      truncated: stat.size > bytes.length,
     };
   } catch (err) {
     return { ok: false as const, reason: failureOf(err) };
   } finally {
     await handle?.close().catch(() => undefined);
   }
+}
+
+/** `bytes` without a UTF-8 character the cut left incomplete at its end. */
+export function wholeUtf8(bytes: Buffer): Buffer {
+  // Walk back over at most three continuation bytes to the lead byte.
+  let i = bytes.length - 1;
+  while (i >= 0 && bytes.length - i <= 4 && (bytes[i] & 0xc0) === 0x80) i--;
+  if (i < 0 || bytes.length - i > 4) return bytes;
+  const lead = bytes[i];
+  const need = lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : lead >= 0xc0 ? 2 : 1;
+  return bytes.length - i < need ? bytes.subarray(0, i) : bytes;
 }
 
 export function registerFsRpc(router: RpcRouter): void {
