@@ -4598,6 +4598,11 @@ function registerRpcHandlers(
         const event: DaemonEvent = { type: 'agent.teammates', sessionId, data: null };
         pipeServer.broadcast(event);
       },
+      // The pane's Agent Teams teammates by name (the Office view's roster).
+      emitTeammates: (sessionId, teammates) => {
+        const event: DaemonEvent = { type: 'agent.teammateList', sessionId, data: { teammates } };
+        pipeServer.broadcast(event);
+      },
       emitSubagents: (sessionId, count) => {
         const event: DaemonEvent = { type: 'agent.subagents', sessionId, data: { count } };
         pipeServer.broadcast(event);
@@ -4975,6 +4980,9 @@ function registerRpcHandlers(
     // port sets so an already-listening dev server shows up without waiting
     // for it to change.
     if (ok) { try { resyncContextWatchers?.(); } catch { /* best effort */ } }
+    // The same holds for the Office page's teammate rosters: they are sent on
+    // change only, so a fresh app would show none until a list changes.
+    if (ok) { try { transcriptActivity?.resendTeammates(); } catch { /* best effort */ } }
     // Its pane refusals too: it holds none yet.
     if (ok) { try { toolRefusals?.resync(); } catch { /* best effort */ } }
     return { ok };
