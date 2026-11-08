@@ -368,8 +368,9 @@ fn sgr_divergent(params: &str) -> bool {
 
 /// Controls whose parse differs between Alacritty and xterm, so a replay of
 /// Alacritty's grid cannot match xterm's (RustAnsiParity.test.ts measures
-/// each): charset designators other than ASCII, selective erase, SL/SR,
-/// DECIC/DECDC, DECSTR, SU (Alacritty keeps the rows in history), ED 1/2
+/// each): charset designators other than ASCII and DEC line drawing (`0`)
+/// into G0/G1, selective erase, SL/SR,
+/// DECIC/DECDC, DECSTR, SD spelled `CSI ^` (vte ignores it), ED 1/2
 /// spelled other than `CSI 1 J` / `CSI 2 J`, the modes 9, 20, 45, 47, 66,
 /// 1047 and 1048, and SGR 21/53 or malformed colors. `sequence` is complete.
 pub(crate) fn divergent(sequence: &[u8]) -> bool {
@@ -386,7 +387,9 @@ pub(crate) fn divergent(sequence: &[u8]) -> bool {
     }
     match body.split_first() {
         Some((b'[', rest)) => csi_divergent(rest),
-        Some((b'(' | b')', rest)) => rest != b"B",
+        // G0/G1 as ASCII or DEC line drawing replay alike; other national
+        // sets are not parsed by vte, and G2/G3 have no shift in it.
+        Some((b'(' | b')', rest)) => rest != b"B" && rest != b"0",
         Some((b'*' | b'+' | b'-' | b'.' | b'/', _)) => true,
         // DECALN: Alacritty fills the screen but leaves the cursor in place.
         Some((b'#', rest)) => rest == b"8",
@@ -411,8 +414,8 @@ fn csi_divergent(rest: &[u8]) -> bool {
     match (private, intermediates, last) {
         (Some(b'?'), b"", b'J' | b'K') => true,
         (None, b" ", b'@' | b'A') | (None, b"'", b'}' | b'~') | (None, b"!", b'p') => true,
-        // SU keeps rows in Alacritty's history; Alacritty ignores SD as `CSI ^`.
-        (None, b"", b'S' | b'^') => true,
+        // vte does not dispatch SD spelled `CSI ^`, which xterm runs.
+        (None, b"", b'^') => true,
         (Some(b'?'), b"", b'h' | b'l') => {
             let mut modes = params.split(';').map(number);
             // vte leaves a synchronized update only on exactly `CSI ? 2026 l`.
@@ -494,8 +497,10 @@ mod tests {
     use super::serialize;
     use alacritty_terminal::event::VoidListener;
     use alacritty_terminal::grid::Dimensions;
+    use alacritty_terminal::index::{Column, Line};
+    use alacritty_terminal::term::cell::Flags;
     use alacritty_terminal::term::{Config, Term};
-    use alacritty_terminal::vte::ansi::Processor;
+    use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
 
     struct Size(usize, usize);
     impl Dimensions for Size {
@@ -543,10 +548,12 @@ mod tests {
             "\x1bH\x1b[3g\x1b[g",
             "\x1b[5 q\x1b[>0q\x1b[1q\x1b[1\"q",
             "\x1b(B\x1b)B",
+            "\x1b(0\x1b)0",
             "\x1b[55m\x1b[5m",
             "\x1b[38;5;53m\x1b[48;2;53;55;6m\x1b[38:2::53:55:5m",
             "\x1b[?1049h\x1b[?2004h\x1b[?1006h\x1b[4h\x1b[0J\x1b[J\x1b[3J",
             "\x1b[2T\x1b[?2;1S",
+            "\x1b[S\x1b[2S",
         ] {
             assert!(classify(text).iter().all(|d| !d), "{text:?}");
         }
@@ -556,8 +563,6 @@ mod tests {
     #[test]
     fn divergent_controls_stay_on_xterm() {
         for text in [
-            "\x1b(0",
-            "\x1b)0",
             "\x1b(A",
             "\x1b(%5",
             "\x1b*0",
@@ -570,7 +575,6 @@ mod tests {
             "\x1b[2'}",
             "\x1b['~",
             "\x1b[!p",
-            "\x1b[2S",
             "\x1b[20h",
             "\x1b[?9h",
             "\x1b[?1;45h",
@@ -677,16 +681,21 @@ mod tests {
         let out = replay(10, "a\u{4e2d}b\x1b[1;3H\x1b[K").unwrap();
         assert!(out.contains("\x1b[0ma \r\n"), "{out:?}");
         assert!(!out.contains('\u{4e2d}'), "{out:?}");
-        // DCH pulls the second half next to content: refused.
-        let err = replay(10, "a\u{4e2d}b\x1b[1;2H\x1b[P").unwrap_err();
-        assert!(err.starts_with("unsupported-wide-half"));
-        // Next to a blank too: xterm fills it with the erase attribute.
+        // DCH at the first half: the second half it pulls to the cursor is
+        // filled, as xterm's deleteCells does, so it replays as a blank.
+        let out = replay(10, "a\u{4e2d}b\x1b[1;2H\x1b[P").unwrap();
+        assert!(out.contains("a b"), "{out:?}");
+        assert!(!out.contains('\u{4e2d}'), "{out:?}");
+        // Next to a blank too, filled with the erase attribute, as xterm's.
         let mut term = Term::new(Config::default(), &Size(10, 3), VoidListener);
         let mut parser: Processor = Processor::new();
         parser.advance(&mut term, " \u{4e2d}b\x1b[44m\x1b[1;2H\x1b[P".as_bytes());
-        assert!(serialize(&term, false)
-            .unwrap_err()
-            .starts_with("unsupported-wide-half"));
+        let row = &term.grid()[Line(0)];
+        assert!(!row[Column(1)]
+            .flags
+            .intersects(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER));
+        assert_eq!(row[Column(1)].bg, Color::Named(NamedColor::Blue));
+        assert_eq!(row[Column(2)].c, 'b');
     }
 
     #[test]

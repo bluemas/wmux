@@ -1,6 +1,7 @@
 import { TerminalEngineSetting } from './TerminalEngineSetting';
 import { QuickCommandsSection } from './QuickCommandsSection';
 import { SecretHookSetting } from './SecretHookSetting';
+import { CredentialEnvSetting } from './CredentialEnvSetting';
 import { useEffect, useMemo, useRef, useState, useCallback, type ReactNode } from 'react';
 import type { LabsStatus } from '../../../shared/labsSettings';
 import { BROWSER_BACKENDS, isBrowserBackend } from '../../../shared/browserBackend';
@@ -1708,6 +1709,7 @@ function TabGeneral() {
           <Toggle checked={secretGuardEnabled} onChange={setSecretGuardEnabled} label={t('settings.secretGuard')} />
         </SettingRow>
         <SecretHookSetting />
+        <CredentialEnvSetting />
       </SettingsSection>
 
       <SettingsSection title={t('settings.sectionSetupReset')}>
@@ -1764,6 +1766,8 @@ function TabTerminal() {
   const setTerminalFontSize = useStore((s) => s.setTerminalFontSize);
   const terminalCursorStyle = useStore((s) => s.terminalCursorStyle);
   const setTerminalCursorStyle = useStore((s) => s.setTerminalCursorStyle);
+  const terminalOpenFileLinksIn = useStore((s) => s.terminalOpenFileLinksIn);
+  const setTerminalOpenFileLinksIn = useStore((s) => s.setTerminalOpenFileLinksIn);
   const defaultShell = useStore((s) => s.defaultShell);
   const setDefaultShell = useStore((s) => s.setDefaultShell);
   const scrollbackLines = useStore((s) => s.scrollbackLines);
@@ -1776,6 +1780,8 @@ function TabTerminal() {
   const setSplitInheritsCwd = useStore((s) => s.setSplitInheritsCwd);
   const closeTabOnShellExit = useStore((s) => s.closeTabOnShellExit);
   const setCloseTabOnShellExit = useStore((s) => s.setCloseTabOnShellExit);
+  const a2aTerminalNames = useStore((s) => s.a2aTerminalNames);
+  const setA2aTerminalNames = useStore((s) => s.setA2aTerminalNames);
   const plainDragSelectEnabled = useStore((s) => s.plainDragSelectEnabled);
   const setPlainDragSelectEnabled = useStore((s) => s.setPlainDragSelectEnabled);
   const imeResidueGuardEnabled = useStore((s) => s.imeResidueGuardEnabled);
@@ -1908,11 +1914,29 @@ function TabTerminal() {
             label={t('settings.splitInheritsCwd')}
           />
         </SettingRow>
+        <SettingRow id="openfilelinksin" label={t('settings.openFileLinksIn')} description={t('settings.openFileLinksInDesc')}>
+          <SettingSelect
+            label={t('settings.openFileLinksIn')}
+            value={terminalOpenFileLinksIn}
+            onChange={(v) => setTerminalOpenFileLinksIn(v === 'os' ? 'os' : 'wmux')}
+            options={[
+              { value: 'wmux', label: t('settings.openFileLinksInWmux') },
+              { value: 'os', label: t('settings.openFileLinksInOs') },
+            ]}
+          />
+        </SettingRow>
         <SettingRow id="closeonexit" label={t('settings.closeTabOnShellExit')} description={t('settings.closeTabOnShellExitDesc')}>
           <Toggle
             checked={closeTabOnShellExit}
             onChange={setCloseTabOnShellExit}
             label={t('settings.closeTabOnShellExit')}
+          />
+        </SettingRow>
+        <SettingRow id="a2a-terminal-names" label={t('settings.a2aTerminalNames')} description={t('settings.a2aTerminalNamesDesc')}>
+          <Toggle
+            checked={a2aTerminalNames}
+            onChange={setA2aTerminalNames}
+            label={t('settings.a2aTerminalNames')}
           />
         </SettingRow>
       </SettingsSection>
@@ -5138,6 +5162,9 @@ export function TabLabs() {
   const setCompactScrollback = useStore((s) => s.setTerminalCompactScrollback);
   const sharedWebgl = useStore((s) => s.terminalSharedWebgl);
   const setSharedWebgl = useStore((s) => s.setTerminalSharedWebgl);
+  const wongtty = useStore((s) => s.terminalWongtty);
+  const setWongtty = useStore((s) => s.setTerminalWongtty);
+  const wongttyFailure = useStore((s) => s.terminalEngineFailure);
   const [labs, setLabs] = useState<LabsStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState(false);
@@ -5163,6 +5190,10 @@ export function TabLabs() {
       <SettingRow id="labs-shared-webgl" label={t('settings.labsSharedWebgl')} description={t('settings.labsSharedWebglDesc')}>
         <Toggle checked={sharedWebgl} onChange={setSharedWebgl} label={t('settings.labsSharedWebgl')} />
       </SettingRow>
+      <SettingRow id="labs-wongtty" label={t('settings.labsWongtty')} description={t('settings.labsWongttyDesc')}>
+        <Toggle checked={wongtty} onChange={setWongtty} label={t('settings.labsWongtty')} />
+      </SettingRow>
+      {wongtty && wongttyFailure && <SettingNote tone="danger" role="alert">{t('settings.labsWongttyFailed', { message: wongttyFailure.message })}</SettingNote>}
       <SettingRow id="labs-ring-compression" label={t('settings.labsRingCompression')} description={t('settings.labsRingCompressionDesc')}>
         <Toggle
           checked={ringOn}

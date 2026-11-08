@@ -7,14 +7,17 @@ import { warmLoginShellPath } from './claude/resolveClaudeExecutable';
 import { terminalCoreSelection } from '../shared/terminalCoreSettings';
 import { randomUUID as phoneBrowserRequestId } from 'node:crypto';
 import { webContents as phoneWebContents } from 'electron';
-import { withPhoneBrowserInputFocus, dispatchPhoneBrowserScroll, phoneBrowserNativeBounds } from './phone/PhoneBrowserInput';
+import { withPhoneBrowserInputFocus, dispatchPhoneBrowserScroll, phoneBrowserHistoryEntry, phoneBrowserNativeBounds } from './phone/PhoneBrowserInput';
 import { focusBuiltinTab, handlePhoneBrowser } from './phone/PhoneBrowser';
+import { readFocus } from './phone/PhoneBrowserFocus';
+import { presetViewScale } from './phone/PhoneBrowserGeometry';
 import { createPhoneChromeDeps, phoneChromeHelpTabs } from './phone/PhoneBrowserChrome';
 import { validateResolvedNavigationUrl } from './security/navigationPolicy';
 import { navigationPolicyOptions } from '../shared/types';
 import { handlePhoneWorkspaces } from './phone/PhoneWorkspaces';
 import { handlePhoneQuickCommands } from './quickCommands/QuickCommandStore';
 import { installPhoneBridge } from './phone/installPhoneBridge';
+import { createPhoneBrowserStreams, phoneBrowserStreamEnabled } from './phone/PhoneBrowserStream';
 import { installKeepAwakeLink } from './power/keepAwakeLink';
 import { botApprovalPushTable, createBotApprovalPushFeed, setBotApprovalPushFeed } from './phone/BotApprovalPushFeed';
 import { createBotPromptPushFeed, openBotPromptRows, setBotPromptPushFeed } from './phone/BotPromptPushFeed';
@@ -69,6 +72,8 @@ import { PTYManager } from './pty/PTYManager';
 import { PTYBridge } from './pty/PTYBridge';
 import { createLocalApprovalScreenReader } from './pty/localApprovalScreen';
 import { pruneDaemonPidMapAtConnect } from './pty/pidMap';
+import { getUserShellRecord, HELD_START_CONNECTED_WAIT_MS, startHeldUserShells } from './pty/userShellRecord';
+import { WSL_RPC_TIMEOUT_MS } from '../shared/wslTimeouts';
 import { resyncShellPromptsAtConnect } from './shellPrompt/shellPromptMirror';
 import { registerAllHandlers } from './ipc/registerHandlers';
 import { clearEphemeralClipboard } from './ipc/handlers/clipboard.handler';
@@ -99,6 +104,8 @@ import { registerMetaRpc } from './pipe/handlers/meta.rpc';
 import { registerSystemRpc } from './pipe/handlers/system.rpc';
 import { registerCodexRpc } from './pipe/handlers/codex.rpc';
 import { registerPerfRpc } from './pipe/handlers/perf.rpc';
+import { registerMcpSessionsRpc } from './pipe/handlers/mcpSessions.rpc';
+import { McpSessionTracker } from './mcp/mcpSessionTracker';
 import { registerComputerRpc } from './pipe/handlers/computer.rpc';
 import { resolvePtyOwnerWorkspace } from './workspace/ptyOwnership';
 import { createFanoutCallerSubmit } from './deck/fanoutCallerSubmit';
@@ -129,8 +136,9 @@ import { getAccountRotationService } from './account/AccountRotationService';
 import { getAccountStore } from './account/accountStore';
 import { IPC, getWmuxHomeDir, dataSuffix } from '../shared/constants';
 import { HookSignalRouter } from './hooks/HookSignalRouter';
+import { sampleDaemonProcess } from '../shared/daemon/daemonProgress';
 import { SignalLatencyMeter } from './hooks/SignalLatencyMeter';
-import { registerBrowserRpc, type CallerBrowserProtection } from './pipe/handlers/browser.rpc';
+import { activeDevicePreset, registerBrowserRpc, resetDevicePreset, type CallerBrowserProtection } from './pipe/handlers/browser.rpc';
 import { registerA2aRpc } from './pipe/handlers/a2a.rpc';
 import { registerA2aChannelRpc } from './pipe/handlers/a2a.channel.rpc';
 import { registerEventsRpc } from './pipe/handlers/events.rpc';
@@ -213,8 +221,9 @@ import { readDaemonPid } from './updater/installTeardown';
 import { isAltF4Held, isAltF4KeyDown } from './altF4';
 import { McpRegistrar } from './mcp/McpRegistrar';
 import { BrokerSupervisor, isMcpBrokerEnabled } from './mcp/BrokerSupervisor';
+import { setBrokerPidSource } from './pipe/handlers/peerPidShadow';
 import { WebviewCdpManager } from './browser-session/WebviewCdpManager';
-import { claimCdpPort, probeCdpEndpointWithRetry } from './browser-session/cdpPort';
+import { claimCdpPort, dropDebuggingSwitches, probeCdpEndpointWithRetry } from './browser-session/cdpPort';
 import { clearPrivateBrowserSession, trackPrivateBrowserContents } from './browser-session/privateSession';
 import { BrowserBackendStore } from './browser-session/BrowserBackendStore';
 import { registerBrowserPrivateNetworkIpc } from './ipc/handlers/browserPrivateNetwork.handler';
@@ -252,7 +261,7 @@ import { WorkspaceContextRouter } from './metadata/WorkspaceContextRouter';
 import { ensureDaemon, killDaemonByPidFile, describeDaemonKillOutcome, killVerifiedDaemonPid, checkProcessLiveness, isDaemonPipeGone } from './daemon/launcher';
 import { DaemonRespawnController } from './daemon/DaemonRespawnController';
 import { createDaemonExitWatch } from './daemon/daemonExitWatch';
-import { loadConfig, getWmuxDir } from '../daemon/config';
+import { loadConfig, getWmuxDir, isFailClosedConfig } from '../daemon/config';
 import { atomicWriteJSON } from '../daemon/util/atomicWrite';
 import { CLAUDE_FILE_SEND_IPC } from '../shared/claudeFileSend';
 import { claudeFileSendPath, readClaudeFileSend } from '../daemon/claudeFileSendSetting';
@@ -288,8 +297,12 @@ import {
 } from '../cli/commands/setupStatusline';
 import {
   refreshHookBridgeAtBoot,
+  refreshHookBridgeAtBootFor,
+  refreshClaudeNativeAtBootFor,
+  hookTargets,
   defaultPaths as defaultHooksPaths,
 } from '../cli/commands/setupHooks';
+import { claudeConfigDirEnv } from './hooks/claudeConfigDirProbe';
 import { refreshWslHookAtBoot } from '../shared/wslGlobalHook';
 import { findWslClaudeBridge } from '../shared/wslIntegration';
 import { detectStalePluginGates } from './hooks/stalePluginGate';
@@ -301,6 +314,7 @@ import { eventBus } from './events/EventBus';
 import { broadcastMetadataUpdate, currentPrOfPty, getCwd, resetPollCacheOnRendererLoad } from './ipc/handlers/metadata.handler';
 import { broadcastSettledIdle } from './notification/turnSettle';
 import { readOrchRole } from '../shared/orchestratorRole';
+import { selfCheckPeerPid } from '../shared/peerPid';
 import { initLogSink, isBrokenPipeError, logLine, stdioErrorsConsumed } from './util/logSink';
 import { isFencedBotWorkerSession } from './agents/botWorkerMergeGuard';
 import { startScreenReaderMonitor } from './screenReaderService';
@@ -581,9 +595,14 @@ if (process.platform === 'win32' && app.isPackaged) {
 // config. Closing the port is the single largest same-user surface reduction
 // in the app: CDP only needs a loopback socket, unlike other same-user vectors
 // which need filesystem or process control. See docs/SECURITY.md §3.
+dropDebuggingSwitches(app.commandLine);
+const bootConfig = loadConfig();
+// An unusable config.json turns CDP off for the session (failClosedConfig);
+// say that, not "disabled by configuration", which points at a setting.
+const cdpOffForUnusableConfig = process.env.WMUX_DISABLE_CDP !== 'true' && isFailClosedConfig(bootConfig);
 const cdpEnabled =
   process.env.WMUX_DISABLE_CDP !== 'true' &&
-  loadConfig().browser?.cdp?.enabled !== false;
+  bootConfig.browser?.cdp?.enabled !== false;
 let cdpPort = 0;
 if (cdpEnabled) {
   // The port is still drawn at random within the range, to keep it
@@ -603,6 +622,8 @@ if (cdpEnabled) {
       (claim.claimed ? '' : ' (port not claimed exclusively — every port in the range is held)'),
   );
 
+} else if (cdpOffForUnusableConfig) {
+  console.log('[WinMux] CDP off — config.json could not be used (see the warning above); fix it and restart wmux');
 } else {
   console.log('[WinMux] CDP disabled — browser automation will be unavailable (enable via ~/.wmux/config.json browser.cdp.enabled)');
 }
@@ -663,6 +684,8 @@ terminalCoreSelection();
 markBoot('construction-start');
 const ptyManager = new PTYManager();
 let mainWindow: BrowserWindow | null = null;
+/** The daemon process the last connection reached (daemon:connected). */
+let lastConnectedDaemonPid: number | null = null;
 let sleepPrevention: ReturnType<typeof installSleepPrevention> | null = null;
 // Forward-declared: PTYBridge captures this binding by reference and reads it
 // at runtime (after the actual HookSignalRouter is constructed further down
@@ -817,8 +840,16 @@ const mcpRegistrar = new McpRegistrar();
 // be) listening when the first shim spawns — the shim retries connect with
 // backoff, so start order is a latency nicety, not a correctness gate.
 const mcpBrokerSupervisor = new BrokerSupervisor();
+setBrokerPidSource(() => mcpBrokerSupervisor.pid);
 const webviewCdpManager = new WebviewCdpManager(0);
-webviewCdpManager.setCdpFailureReason(cdpEnabled ? 'CDP ownership verification pending' : 'CDP disabled by configuration');
+webviewCdpManager.setCdpFailureReason(
+  cdpEnabled
+    ? 'CDP ownership verification pending'
+    : cdpOffForUnusableConfig
+      ? 'CDP is off because config.json could not be used; fix it and restart wmux'
+      : 'CDP disabled by configuration',
+);
+webviewCdpManager.setCdpDisabled(!cdpEnabled);
 // "Agent is driving" marker + Stop / Take over for in-app browser tabs. Activity
 // is the surface's automation lease count; Stop and Take over end the leases in
 // flight (their holders learn why on the next renew) and stop a navigation.
@@ -1228,6 +1259,14 @@ registerMetaRpc(rpcRouter, () => mainWindow);
 registerSystemRpc(rpcRouter);
 registerCodexRpc(rpcRouter, () => mainWindow, () => daemonClient);
 registerPerfRpc(rpcRouter);
+// One tracker: the router counts into it, the summary RPC reads it.
+const mcpSessionTracker = new McpSessionTracker();
+rpcRouter.setMcpSessionSink(mcpSessionTracker);
+registerMcpSessionsRpc(rpcRouter, {
+  brokerEnabled: isMcpBrokerEnabled,
+  brokerStatus: () => mcpBrokerSupervisor.status(),
+  tracker: mcpSessionTracker,
+});
 // Desktop computer use. Built on first call, so an install that never opts in
 // (Settings › Computer use) never constructs it or spawns a helper. Consent rides
 // the approval queue, which is created further down — hence the late binding.
@@ -1277,6 +1316,8 @@ const chromeRegistry = new ChromeLauncherRegistry({
   // main's filtering proxy (and is restarted when that changes).
   protection: (profile) =>
     browserPolicyStore.protectionPlanFor(profile, { paneBindings: () => chromeProfileStore.getPaneBindings() }),
+  // With the target grant flag, a download in a tab no agent holds lands here, as Chrome's own would.
+  downloadsDir: () => app.getPath('downloads'),
 });
 browserPolicyStore.onChange(() => {
   // #2063: every policy change (an Allow included) starts the recently-blocked
@@ -2302,10 +2343,43 @@ app.on('ready', async () => {
       } catch (err) {
         console.warn('[statusline] script refresh failed (non-fatal):', err);
       }
-      try {
-        const br = refreshHookBridgeAtBoot(defaultHooksPaths());
+      // One bridge file serves every Claude folder; it is refreshed when any
+      // of them references it: ~/.claude and the accounts now, the
+      // CLAUDE_CONFIG_DIR folder once the login-shell probe has answered.
+      // Then the one wmux-claude-hook copy, after the bridge (a new copy pins
+      // the new bridge), judged against whichever folder's entries name it:
+      // at once for ~/.claude and the accounts, and again once the probe has
+      // answered only when none of them named it (the env folder may). Neither
+      // writes settings.
+      const logBridge = (br: ReturnType<typeof refreshHookBridgeAtBoot>) => {
         if (br === 'refreshed' || br === 'isolated') logLine('info', 'main', `hook bridge refresh: ${br}`);
         else if (br === 'failed' || br === 'no-source') logLine('warn', 'main', `hook bridge refresh: ${br}`);
+      };
+      try {
+        const base = defaultHooksPaths();
+        const initial = hookTargets({ action: 'install', env: undefined, wmuxDir: getWmuxDir(), base }).targets;
+        const br = refreshHookBridgeAtBootFor(initial);
+        logBridge(br);
+        const logCopy = (nr: Awaited<ReturnType<typeof refreshClaudeNativeAtBootFor>>) => {
+          if (nr === 'refreshed') logLine('info', 'main', `claude hook copy refresh: ${nr}`);
+          else if (nr === 'kept' || nr === 'stale-bridge') logLine('warn', 'main', `claude hook copy refresh: ${nr}`);
+        };
+        const copyNow = refreshClaudeNativeAtBootFor(initial, br).then((nr) => {
+          logCopy(nr);
+          return nr;
+        });
+        // Asked once per boot, in the background (macOS/Linux; Windows reads
+        // its own env): the in-app install awaits the same answer.
+        void Promise.all([claudeConfigDirEnv(), copyNow]).then(async ([env, copied]) => {
+          if (!env) return;
+          const targets = hookTargets({ action: 'install', env, wmuxDir: getWmuxDir(), base }).targets;
+          let bridge = br;
+          if (br === 'not-installed') {
+            bridge = refreshHookBridgeAtBootFor(targets.filter((t) => t.kind === 'env'));
+            logBridge(bridge);
+          }
+          if (copied === 'not-in-use') logCopy(await refreshClaudeNativeAtBootFor(targets, bridge));
+        }).catch((err: unknown) => console.warn('[hooks] bridge or claude hook copy refresh failed (non-fatal):', err));
       } catch (err) {
         console.warn('[hooks] bridge refresh failed (non-fatal):', err);
       }
@@ -2463,7 +2537,7 @@ app.on('ready', async () => {
         const { targetInfo } = await localDebugger.sendCommand('Target.getTargetInfo');
         const probe = await probeCdpEndpointWithRetry(cdpPort, targetInfo?.targetId ?? '');
         if (probe.ok) {
-          await webviewCdpManager.setCdpPort(cdpPort);
+          webviewCdpManager.setCdpPort(cdpPort);
           console.log(`[WinMux] CDP listening on port ${cdpPort} (${probe.browser})`);
           retry = false;
         } else {
@@ -2590,6 +2664,9 @@ app.on('ready', async () => {
   // `daemon:respawn-exhausted` so UX can show a toast/badge.
   daemonRespawnController = new DaemonRespawnController({
     ensureDaemon,
+    // A daemon that stops answering but still uses CPU is slow (a system short
+    // of memory), not hung: it is not respawned, which would end every PTY it holds.
+    sampleDaemon: sampleDaemonProcess,
     createClient: (pipeName, token) => new DaemonClient(pipeName, token),
     onInstall: async (client) => {
       daemonClient = client;
@@ -2620,13 +2697,32 @@ app.on('ready', async () => {
           // After identify: the daemon takes the host window from the app only.
           reportHostWindow(() => client, mainWindow);
           disposePhoneBridge?.();
-          disposePhoneBridge = installPhoneBridge(client,(command,payload) => command === AGENT_ENV_COMMAND
-            // A paired PC comparing agent environments: names, versions and hashes.
-            ? cachedAgentEnvSummary({ wmuxVersion: app.getVersion() })
-            : command === MOA_WAKE_COMMAND
-            // A failure main learns after the accept goes back on the receipt.
-            ? Promise.resolve(handlePhoneMoaWake(payload))
-            : command.startsWith('browser.') ? handlePhoneBrowser(command,payload,{
+          // The phone's live browser stream (phone/PhoneBrowserStream.ts), per
+          // daemon connection; on unless WMUX_PHONE_BROWSER_STREAM=0.
+          const phoneStreams = phoneBrowserStreamEnabled() ? createPhoneBrowserStreams({
+            push: (params) => client.rpc('daemon.phone.browserStream', params, { timeoutMs: 3_000 }),
+            backend: () => browserBackendStore.get(),
+            chrome: phoneChromeDeps,
+            builtin: {
+              targets: () => webviewCdpManager.listTargets(),
+              contents: id => { const wc = phoneWebContents.fromId(id); return wc && !wc.isDestroyed() ? wc : null; },
+              visible: surfaceId => webviewCdpManager.isVisible(surfaceId),
+              onVisibility: listener => webviewCdpManager.onVisibility(listener),
+              nativeBounds: wc => phoneBrowserNativeBounds(wc),
+              // viewport=mobile on a pane: the phone's own viewport action.
+              viewport: async (surfaceId, workspaceId, mode, refit) => {
+                const reply = await handlePhoneBrowser('browser.viewport', { workspaceId, surfaceId, mode, fill: true, refit: refit === true }, phoneBrowserDeps) as { applied?: unknown } | null;
+                if (reply?.applied !== true) throw new Error('Browser viewport unavailable');
+              },
+              preset: wc => activeDevicePreset(wc),
+              // As the `desktop` viewport action resets, without its page and agent-control checks.
+              reset: async wc => {
+                await resetDevicePreset(wc);
+                await wc.debugger.sendCommand('Emulation.clearDeviceMetricsOverride');
+              },
+            },
+          }) : null;
+          const phoneBrowserDeps: Parameters<typeof handlePhoneBrowser>[2] = {
             backend: () => browserBackendStore.get(),
             clearViewport: async id => {
               const wc = phoneWebContents.fromId(id);
@@ -2638,25 +2734,53 @@ app.on('ready', async () => {
               if (!wc || wc.isDestroyed()) throw new Error('Browser unavailable');
               return phoneBrowserNativeBounds(wc);
             },
+            ...(phoneStreams ? { layoutMetrics: async (id: number) => {
+              const wc = phoneWebContents.fromId(id);
+              if (!wc || wc.isDestroyed()) throw new Error('Browser unavailable');
+              return wc.debugger.sendCommand('Page.getLayoutMetrics');
+            } } : {}),
             scroll: async (id,event) => {
               const wc = phoneWebContents.fromId(id);
               if (!wc || wc.isDestroyed()) throw new Error('Browser unavailable');
               await dispatchPhoneBrowserScroll(wc,event);
             },
+            viewScale: id => {
+              const wc = phoneWebContents.fromId(id);
+              return presetViewScale(wc && !wc.isDestroyed() ? activeDevicePreset(wc) : undefined);
+            },
             targets: () => webviewCdpManager.listTargets(),
             focusBuiltin: (surfaceId, workspaceId) =>
               focusBuiltinTab((method, params) => sendToRenderer(() => mainWindow, method, params), surfaceId, workspaceId),
+            historyEntry: (id, offset) => {
+              const wc = phoneWebContents.fromId(id);
+              if (!wc || wc.isDestroyed()) throw new Error('Browser unavailable');
+              return phoneBrowserHistoryEntry(wc, offset);
+            },
+            // The same desktop navigation policy the Chrome tabs are held to.
+            validateNavigation: phoneChromeDeps.validateNavigation,
             chrome: phoneChromeDeps,
-            input: (id, operation) => {
+            ...(phoneStreams ? { streams: phoneStreams } : {}),
+            input: (id, operation, options) => {
               const wc = phoneWebContents.fromId(id);
               if (!wc || wc.isDestroyed()) return Promise.reject(new Error('Browser unavailable'));
-              return withPhoneBrowserInputFocus(wc,operation);
+              return withPhoneBrowserInputFocus(wc,operation,options);
+            },
+            readFocus: async id => {
+              const wc = phoneWebContents.fromId(id);
+              return wc && !wc.isDestroyed() ? readFocus((method, params) => wc.debugger.sendCommand(method, params)) : undefined;
             },
             page: id => { const wc = phoneWebContents.fromId(id); return wc && !wc.isDestroyed() ? {title:wc.getTitle(),url:wc.getURL()} : null; },
             invoke: (method,params) => rpcRouter.dispatch({id: `phone-browser-${phoneBrowserRequestId()}`,method:method as RpcMethod,params},{operator:true}),
-          }) : command.startsWith('workspaces.') ? handlePhoneWorkspaces(command,payload,() => mainWindow) : command.startsWith('prompts.') ? handlePhoneQuickCommands(command,payload) : handlePhoneAccounts(command,payload,{
+          };
+          disposePhoneBridge = installPhoneBridge(client,(command,payload) => command === AGENT_ENV_COMMAND
+            // A paired PC comparing agent environments: names, versions and hashes.
+            ? cachedAgentEnvSummary({ wmuxVersion: app.getVersion() })
+            : command === MOA_WAKE_COMMAND
+            // A failure main learns after the accept goes back on the receipt.
+            ? Promise.resolve(handlePhoneMoaWake(payload))
+            : command.startsWith('browser.') ? handlePhoneBrowser(command,payload,phoneBrowserDeps) : command.startsWith('workspaces.') ? handlePhoneWorkspaces(command,payload,() => mainWindow) : command.startsWith('prompts.') ? handlePhoneQuickCommands(command,payload) : handlePhoneAccounts(command,payload,{
             store:getAccountStore(),usage:accountUsageService,
-          }));
+          }), phoneStreams);
           // Keep the computer awake while a paired phone is attached. Installed in
           // the same tick as the register above, before the daemon's answer to it.
           disposeKeepAwakeLink?.();
@@ -2706,6 +2830,18 @@ app.on('ready', async () => {
         }, (err: unknown) => {
           logLine('warn', 'main', `pid-map prune failed: ${err instanceof Error ? err.message : String(err)}`);
         });
+      // #3049 — start the restored user shells the daemon holds for main, with
+      // their credentials (pty/userShellRecord.ts); whatever is still held at
+      // the daemon's fallback starts without them. Never rejects: the
+      // daemon:connected below waits on it.
+      const heldStart = startHeldUserShells(client, getUserShellRecord(app.getPath('userData')), {
+        timeoutMs: WSL_RPC_TIMEOUT_MS,
+        log: (line) => logLine('info', 'main', line),
+      }).then((held) => {
+        if (held > 0) logLine('info', 'main', `[env] started ${held} restored user shell(s) held for the app`);
+      }, (err: unknown) => {
+        logLine('warn', 'main', `[env] restored user shells not started: ${err instanceof Error ? err.message : String(err)}`);
+      });
       // Mount the notification router now that we have a live daemon
       // client. PTY data flows through daemon → DaemonClient events,
       // and this router translates them into the same renderer-facing
@@ -2813,8 +2949,21 @@ app.on('ready', async () => {
         // The preceding handler-swap lines + any 'daemon hang detected' /
         // 'respawn attempt' lines above distinguish initial from reconnect.
         logLine('info', 'main', 'emitting daemon:connected → renderer will re-reconcile PTYs');
-        // The pid lets the renderer tell a new daemon (fresh resume offers) from a reconnect.
-        mainWindow.webContents.send('daemon:connected', readDaemonPid(getWmuxDir()));
+      }
+      // Main tells a new daemon (fresh resume offers) from a reconnect: it sees
+      // every connection, including the first, which comes before the renderer
+      // subscribes.
+      // The pid that answered the connect ping; the pid file only when it has none.
+      const daemonPid = daemonRespawnController?.connectedDaemonPid ?? readDaemonPid(getWmuxDir());
+      const replaced = lastConnectedDaemonPid !== null && daemonPid !== null && daemonPid !== lastConnectedDaemonPid;
+      if (daemonPid !== null) lastConnectedDaemonPid = daemonPid;
+      // #3049 — the renderer reads resume offers on daemon:connected, and a
+      // held shell gets its offer only once started: wait for that start, but
+      // never long. A disconnect meanwhile ends this install (onUninstall ran).
+      await Promise.race([heldStart, new Promise<void>((resolve) => { setTimeout(resolve, HELD_START_CONNECTED_WAIT_MS).unref?.(); })]);
+      if (daemonClient !== client) return;
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('daemon:connected', { replaced });
       }
       // Phase A — A7. Run the one-time legacy scrollback migration on
       // the first daemon-healthy transition. Idempotent — subsequent
@@ -2858,11 +3007,14 @@ app.on('ready', async () => {
       // pre-existing scrollback path). Without this, the renderer
       // would still treat itself as daemon-connected and skip the
       // .txt autosave even though no daemon is replaying PTY data.
+      logLine('warn', 'main', 'handler swap (daemon disconnect): cleanup begin');
+      cleanupHandlers();
+      // After the cleanup, which flushes the old pipes' buffered output: that
+      // output reaching the renderer after this would mark the panes ready
+      // again, and an automatic resume would type before the new pipe (#3028).
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('daemon:disconnected');
       }
-      logLine('warn', 'main', 'handler swap (daemon disconnect): cleanup begin');
-      cleanupHandlers();
       logLine('warn', 'main', 'handler swap (daemon disconnect): cleanup done, register begin');
       cleanupHandlers = registerAllHandlers(ptyManager, ptyBridge, () => mainWindow, undefined, {
         ...mcpHandlerOptions,
@@ -2894,7 +3046,8 @@ app.on('ready', async () => {
         // main thread until dismissed; that's harmless here because the
         // daemon-respawn budget exhausted means there is no daemon for the
         // main thread to talk to anyway. Suppress for automated runs.
-        if (process.env.WMUX_NO_DIALOG !== '1') {
+        // A refused start followed a recovery dialog the user declined.
+        if (process.env.WMUX_NO_DIALOG !== '1' && !event.refused) {
           const hint = event.lastError && event.lastError.length > 0
             ? event.lastError
             : 'wmux could not bring the daemon back up after 5 retries.';
@@ -3225,6 +3378,7 @@ app.on('ready', async () => {
     await mcpRegistrar.register(authToken);
   }
   pipeServer.start();
+  void selfCheckPeerPid().then((verdict) => { if (verdict) console.log(`[peer-pid] main: ${verdict}`); });
   void factoryHost.start();
   autoUpdater.start();
   markBoot('ready-end');

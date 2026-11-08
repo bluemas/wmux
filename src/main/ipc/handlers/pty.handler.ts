@@ -1,5 +1,5 @@
 import { applyWmuxToolsToCommand, isWmuxToolsHint, locateWmuxMcpEntry } from '../../agents/toolSurfaceLaunch';
-import { codexConfigPath, codexHasWmuxServer } from '../../../shared/mcpRegistration';
+import { codexConfigPath, codexHasWmuxServer, codexWmuxLauncher } from '../../../shared/mcpRegistration';
 import { WSL_RPC_TIMEOUT_MS } from '../../../shared/wsl';
 import { heldReconnectAnswer, promoteOutcome, promoteStartedSession, suspendedReconnectAction } from '../../../shared/suspendedSession';
 import { app, ipcMain, BrowserWindow } from 'electron';
@@ -36,10 +36,13 @@ import { isScreenReaderOn, launcherVersionsIn } from '../../screenReaderService'
 import { guardBotWorkerSessionText, guardCodexBotWorker } from '../../agents/codexWorkerGuard';
 import { workerFenceSupportFor } from '../../agents/botWorkerFence';
 import { resolveEnvPolicy, type SpawnKind } from '../../../shared/spawnKind';
+import { withholdCredentialsFromAgents } from '../../pty/credentialEnvPrefs';
 import { withheldCredentialNames } from '../../../shared/envFilter';
+import { getUserShellRecord, promoteRecoveredSession } from '../../pty/userShellRecord';
 import { getShellUtf8Locale } from '../../pty/shellLocale';
 import { forgetPtyShell, getPtyShell, recordPtyShell } from '../../pty/ptyShellRegistry';
 import { cmdLaunchPathRefusal, isCmdShellPath, promptFileArgumentForShell } from '../../../shared/promptFileArgument';
+import { withLaunchEnv } from '../../pty/launchEnv';
 import { resolveWslWorkerGit, withWslWorkerGit } from '../../agents/wslWorkerGit';
 import { withDaemonCreateRollback } from './daemonCreateRollback';
 import { getWorkspaceMirror } from '../../workspace/WorkspaceMirror';
@@ -49,6 +52,7 @@ import { probeBotExecSupport } from '../../factory/botExecSandbox';
 import { resolveClaudeExecutable } from '../../claude/resolveClaudeExecutable';
 import { scheduleInitialCommand } from './scheduleInitialCommand';
 import { reconnectSessionPipe } from './reconnectSessionPipe';
+import { createReplayResetGate } from './replayResetGate';
 import { createSessionResync, type SessionResync } from './sessionResync';
 import { verifyLaunchLine, type LaunchLineRead } from './verifyLaunchLine';
 import { LAUNCH_PROBE_CONFIRM_TIMEOUT_MS } from '../../worktask/fanoutLaunchProbe';
@@ -95,6 +99,7 @@ import { pendingRemovalRefusal } from '../../worktask/pendingWorktreeRemovals';
 import { launchAllowedByChat } from './chatLaunchGuard';
 import { folderTrustLaunchHold, folderTrustLaunchRefusal, forgetFolderTrustPane } from '../../folderTrustCheck';
 import { FOLDER_TRUST_DELIVERY_BUDGET_MS } from '../../../shared/folderTrustWording';
+import { attachScrollback } from '../../session/rendererScrollback';
 
 /**
  * Allowed shell basenames (compared case-insensitively).
@@ -167,6 +172,8 @@ type PtyCreateOptions = {
   surfaceId?: string;
   env?: Record<string, string>;
   initialCommand?: string;
+  /** Env for the typed launch line's command only, never the pane's (launchEnv.ts). */
+  launchEnv?: Record<string, string>;
   exec?: string;
   supervision?: PtyCreateSupervisionInput;
   /** 스폰 출처 (실행 컨텍스트 정책). 'user-shell'만 env 투과; exec/supervision이
@@ -210,6 +217,7 @@ function withWmuxTools(options: PtyCreateOptions | undefined): PtyCreateOptions 
   const initialCommand = applyWmuxToolsToCommand(rest.initialCommand, wmuxTools, {
     entry: currentMcpEntry(),
     codexHasWmuxServer: () => codexHasWmuxServer(codexConfigPath(rest.env)),
+    codexLauncher: (entry) => codexWmuxLauncher(codexConfigPath(rest.env), entry),
   });
   if (initialCommand !== rest.initialCommand) console.log('[pty:create] wmux tool level applied', { tools: wmuxTools.tools, role: wmuxTools.role });
   return { ...rest, initialCommand };
@@ -323,10 +331,10 @@ async function openCreateGateway(botWorker: BotWorkerCreate | null, options: Pty
 }
 
 /** A startup line as it is typed: a screen reader's agent flag, read at the
- *  write (the line is scheduled before the shell's first output), then a bot
- *  worker's clear. Nothing stored for a resume carries the flag. */
-function typedStartupLine(line: string, shell: string, botWorker: boolean): string {
-  const flagged = withScreenReaderFlag(line, isScreenReaderOn(), launcherVersionsIn(shell));
+ *  write (the line is scheduled before the shell's first output), its launch
+ *  env, then a bot worker's clear. Nothing stored for a resume carries either. */
+function typedStartupLine(line: string, shell: string, botWorker: boolean, launchEnv: Record<string, string> | undefined): string {
+  const flagged = withLaunchEnv(withScreenReaderFlag(line, isScreenReaderOn(), launcherVersionsIn(shell)), launchEnv, shell);
   return (botWorker && !isWslShell(shell) ? clearedLaunchLine(flagged, shell) : undefined) ?? flagged;
 }
 
@@ -454,6 +462,11 @@ function logCwdResolution(
   console.log(`[pty:create] ${sessionId} cwd in=${incoming ?? '-'} → ${effective} (${why}, source=${source})`);
 }
 
+// Per main process, across handler registrations (daemon generations): a
+// second ring flush of a session reaches the renderer reset-led, so it
+// repaints the pane instead of repeating it (replayResetGate.ts).
+const replayResetGate = createReplayResetGate();
+
 export function registerPTYHandlers(
   ptyManager: PTYManager,
   ptyBridge: PTYBridge,
@@ -505,6 +518,7 @@ export function registerPTYHandlers(
   function forgetCreateState(sessionId: string): void {
     createAttachedPipes.delete(sessionId);
     firstOutputHooks.delete(sessionId);
+    replayResetGate.forget(sessionId);
   }
 
   // One live-pipe re-flush per session, shared by pty:resync and pty:reconnect
@@ -604,6 +618,7 @@ export function registerPTYHandlers(
           payload.sessionId,
           payload.recoveredBytes,
         );
+        replayResetGate.flushed(payload.sessionId);
       }
     };
     daemonClient.on('session:flushComplete', onDaemonFlushComplete);
@@ -810,6 +825,8 @@ export function registerPTYHandlers(
         spawnKind: options?.spawnKind,
         hasExec: execCommand !== undefined,
         hasSupervision: supervisionPolicy !== undefined,
+        isAutomation: !!botWorker || !!options?.fanoutTaskOf,
+        withholdFromAgents: withholdCredentialsFromAgents(),
       });
       // Multi-account (M0): resolve the workspace's bound-account env in MAIN
       // and layer it between baseline and profile. A manual profile
@@ -880,7 +897,7 @@ export function registerPTYHandlers(
         if (isWslShell(shell) && createdCwd) effectiveCwd = createdCwd;
 
         // Attach to the session (makes daemon start the SessionPipe server)
-        await daemonClient.rpc('daemon.attachSession', { id: sessionId });
+        await daemonClient.rpc('daemon.attachSession', { id: sessionId, scrollback: attachScrollback() });
 
         // Daemon sessions have no PTYInstance in this process, so the shell would
         // otherwise be unknowable to main — record it for the clipboard handler's
@@ -890,6 +907,23 @@ export function registerPTYHandlers(
         // Connect session data pipe
         await daemonClient.connectSessionPipe(sessionId);
       });
+
+      // #3049 — a user shell is recorded (ids, never values) so main can start
+      // it with its credentials after a restart; anything else is forgotten,
+      // which covers a recreated id that is no longer a user shell.
+      const created = result as { cmd?: unknown; incarnationId?: unknown } | undefined;
+      if (envPolicy === 'passthrough' && typeof created?.cmd === 'string' && typeof created.incarnationId === 'string') {
+        // #3050 — a pane that is passthrough only because the user turned off
+        // "Withhold credentials from agent panes" is marked, so a restart asks
+        // that setting again instead of restoring it as a user shell.
+        getUserShellRecord(app.getPath('userData')).set(sessionId, {
+          cmd: created.cmd,
+          incarnationId: created.incarnationId,
+          ...(options?.spawnKind !== 'user-shell' ? { viaSetting: true } : {}),
+        });
+      } else {
+        getUserShellRecord(app.getPath('userData')).remove(sessionId);
+      }
 
       // Workspace profile startup command. Written as shell INPUT (not spawned
       // as the executable) so the allowed-shell check and quoting behavior are
@@ -923,7 +957,7 @@ export function registerPTYHandlers(
         // where the startup line would land. No person waits on the line.
         beforeWrite: () => folderTrustLaunchHold(daemonClient, sessionId, 'startup line', { refuseUnknown: true, once: true, budgetMs: FOLDER_TRUST_DELIVERY_BUDGET_MS }),
         write: (line) => {
-          const cmd = typedStartupLine(line, shell, !!botWorker);
+          const cmd = typedStartupLine(line, shell, !!botWorker, options?.launchEnv);
           const delivered = writeLaunchLine(cmd);
           if (delivered && verifyTaskLine && !verifying) {
             verifying = true;
@@ -982,7 +1016,7 @@ export function registerPTYHandlers(
         // P1-3: decode (stateful, upstream of batching) then micro-batch —
         // the batcher's send does the window-alive check at flush time.
         const text = decodeSessionData(sessionId, payload.data);
-        if (text) dataBatcher.push(sessionId, text, payload.replay);
+        if (text) dataBatcher.push(sessionId, replayResetGate.outgoing(sessionId, text, payload.replay), payload.replay);
       };
       setSessionDataListener(sessionId, onSessionData);
       createAttachedPipes.add(sessionId);
@@ -1077,7 +1111,7 @@ export function registerPTYHandlers(
       const wslTaskGit = (botWorker || options?.fanoutTaskOf) && isWslShell(shell) && safeCwd
         ? await resolveWslWorkerGit(safeCwd, wslArgs?.[1] ?? null).catch(() => null)
         : null;
-      const instance = await ptyManager.createAsync({ shell, ...(wslArgs ? { shellArgs: wslArgs } : {}), cols, rows, workspaceId, surfaceId, env, cwd: effectiveCwd, spawnKind, wslAccountLoginEnvKey, ...(ignoreAccountBinding === true ? { ignoreAccountBinding: true } : {}), ...(wslTaskGit ? { wslTaskGit } : {}) });
+      const instance = await ptyManager.createAsync({ shell, ...(wslArgs ? { shellArgs: wslArgs } : {}), cols, rows, workspaceId, surfaceId, env, cwd: effectiveCwd, spawnKind, ...(botWorker || options?.fanoutTaskOf ? { automation: true } : {}), wslAccountLoginEnvKey, ...(ignoreAccountBinding === true ? { ignoreAccountBinding: true } : {}), ...(wslTaskGit ? { wslTaskGit } : {}) });
       logCwdResolution(instance.id, cwdResolution.incomingCwd, safeCwd, cwdResolution.source);
       if (botWorker) {
         const launchTask = botWorkerLaunchTask(botWorker);
@@ -1109,7 +1143,7 @@ export function registerPTYHandlers(
               ptyManager.dispose(instance.id);
               return;
             }
-            ptyManager.write(instance.id, sanitizePtyText(typedStartupLine(line, shell, !!botWorker)) + '\r');
+            ptyManager.write(instance.id, sanitizePtyText(typedStartupLine(line, shell, !!botWorker, options?.launchEnv)) + '\r');
           },
         });
         const disposable = instance.process.onData(() => {
@@ -1487,6 +1521,8 @@ export function registerPTYHandlers(
       // fires for an explicit close — without this, every pane/workspace
       // close leaks its anchor for the OS to recycle into a ghost.
       removePidMapByPtyId(id);
+      // #3049 — a closed pane is no user shell to start again.
+      getUserShellRecord(app.getPath('userData')).remove(id);
       await pruneSessionSchedules(id);
     }));
   } else {
@@ -1661,7 +1697,8 @@ export function registerPTYHandlers(
       // is gone: home instead of the missing directory, the original command
       // instead of a resume. Only ever set by the user pressing that action.
       const fresh = opts?.fresh === true;
-      const res = await daemonClient.rpc('daemon.promoteSession', { id, ...(fresh ? { fresh: true } : {}) }, { timeoutMs: WSL_RPC_TIMEOUT_MS }) as { ok: boolean; error?: { code?: string; message: string } };
+      // #3049 — with a restored user shell's credentials when main grants them.
+      const res = await promoteRecoveredSession(daemonClient, getUserShellRecord(app.getPath('userData')), id, { fresh, timeoutMs: WSL_RPC_TIMEOUT_MS });
       if (res.ok) return { success: true };
       // The renderer branches on this: CWD_MISSING is the one failure Retry
       // cannot clear, so it is the one that offers starting fresh.
@@ -1704,6 +1741,8 @@ export function registerPTYHandlers(
           resumeBinding?: ResumeBinding;
           exec?: unknown;
           supervision?: unknown;
+          incarnationId?: string;
+          startPending?: boolean;
         }>;
         if (!sessions.some(s => s.id === id)) {
           sessions = await daemonClient.rpc('daemon.listSessions', { includeSuspended: true }) as typeof sessions;
@@ -1750,7 +1789,8 @@ export function registerPTYHandlers(
           // reattaches with promote.
           if (action === 'hold') return held('held');
           try {
-            const result = await daemonClient.rpc('daemon.promoteSession', { id, ...(action === 'join-only' ? { joinOnly: true } : {}) }, { timeoutMs: WSL_RPC_TIMEOUT_MS }) as { ok: boolean; alreadyActive?: boolean; joined?: boolean; notInFlight?: boolean; error?: { code?: string; message: string } };
+            // #3049 — with a restored user shell's credentials when main grants them.
+            const result = await promoteRecoveredSession(daemonClient, getUserShellRecord(app.getPath('userData')), session, { joinOnly: action === 'join-only', timeoutMs: WSL_RPC_TIMEOUT_MS });
             const outcome = promoteOutcome(result);
             if (outcome === 'held') return held('join-only, no start in flight');
             // #1305 — carry WHY it stayed pending, not just that it did. The
@@ -1795,7 +1835,7 @@ export function registerPTYHandlers(
           if (!payload.replay) noteFirstOutput(id);
           // P1-3: same decode-then-batch as the create path.
           const text = decodeSessionData(id, payload.data);
-          if (text) dataBatcher.push(id, text, payload.replay);
+          if (text) dataBatcher.push(id, replayResetGate.outgoing(id, text, payload.replay), payload.replay);
         };
         // Consumed here: whatever this reconnect does, the pipe after it is
         // no longer one a later reconnect may keep unasked.
@@ -1805,6 +1845,9 @@ export function registerPTYHandlers(
           ownsCreatePipe,
           resync: resyncOf(daemonClient),
           installListener: () => setSessionDataListener(id, onSessionData),
+          // The old pipe's half code point would decode to U+FFFD at the start
+          // of the new replay; its end went with the old socket.
+          replacingPipe: () => sessionDecoders.delete(id),
         });
         if (pipe.kind === 'pending') return held('pending again at attach');
         if (pipe.kind === 'not-writable') {
@@ -1868,6 +1911,12 @@ export function registerPTYHandlers(
   // `transient` to decide retry-vs-give-up exactly as pty:reconnect does.
   ipcMain.removeHandler(IPC.PTY_RESYNC);
   ipcMain.handle(IPC.PTY_RESYNC, wrapHandler(IPC.PTY_RESYNC, async (_event: Electron.IpcMainInvokeEvent, id: string, opts?: { scrollback?: number }) => {
+    // The e2e of the Labs wongtty switch's repaint fallback (development
+    // builds only): every repaint fails as for a session that is gone.
+    if (!app.isPackaged && process.env.WMUX_E2E_RESYNC === 'session-gone') {
+      console.log(`[wmux:e2e] pty:resync ${id} answered session-gone (WMUX_E2E_RESYNC)`);
+      return { success: false, code: 'session-gone', transient: false };
+    }
     if (!useDaemon || !daemonClient) {
       // Local mode has no daemon SessionPipe to re-flush — the renderer keeps
       // its live buffer as-is (never wrong). Permanent, do not retry.
@@ -1924,22 +1973,26 @@ export function registerPTYHandlers(
   // session. Local mode / legacy daemons return { success: false } so the
   // renderer degrades to "skip this pane" exactly as before the feature.
   ipcMain.removeHandler(IPC.PTY_READ_TEXT);
-  ipcMain.handle(IPC.PTY_READ_TEXT, wrapHandler(IPC.PTY_READ_TEXT, async (_event: Electron.IpcMainInvokeEvent, id: string, opts?: { scrollback?: number }) => {
+  ipcMain.handle(IPC.PTY_READ_TEXT, wrapHandler(IPC.PTY_READ_TEXT, async (_event: Electron.IpcMainInvokeEvent, id: string, opts?: { scrollback?: number; tail?: boolean }) => {
     if (!useDaemon || !daemonClient) {
       return { success: false, code: 'local-mode' };
     }
     const scrollback = opts?.scrollback;
     try {
-      const res = await daemonClient.rpc('daemon.readSessionText', { id, scrollback }, { timeoutMs: DAEMON_RESYNC_RPC_TIMEOUT_MS }) as {
+      const res = await daemonClient.rpc('daemon.readSessionText', { id, scrollback, ...(opts?.tail === true ? { tail: true } : {}) }, { timeoutMs: DAEMON_RESYNC_RPC_TIMEOUT_MS }) as {
         mode: 'rows' | 'unavailable';
         rows?: Array<{ text: string; wrapped: boolean }>;
         bufferType?: 'normal' | 'alternate';
         rowsBelowCursor?: number;
         truncated?: boolean;
         reason?: string;
+        via?: 'tail' | 'full';
       };
       if (res.mode === 'rows') {
-        return { success: true, rows: res.rows ?? [], bufferType: res.bufferType, rowsBelowCursor: res.rowsBelowCursor, truncated: res.truncated === true };
+        return {
+          success: true, rows: res.rows ?? [], bufferType: res.bufferType, rowsBelowCursor: res.rowsBelowCursor, truncated: res.truncated === true,
+          ...(res.via === 'tail' || res.via === 'full' ? { via: res.via } : {}),
+        };
       }
       return { success: false, code: 'unavailable', reason: res.reason };
     } catch (err) {
@@ -1998,6 +2051,8 @@ export function registerPTYHandlers(
       // the process (and a recycled id would inherit the dead pane's shell).
       forgetPtyShell(payload.sessionId);
       forgetFolderTrustPane(payload.sessionId);
+      // #3049 — nor is a dead one; a pane recreated in its place records itself.
+      getUserShellRecord(app.getPath('userData')).remove(payload.sessionId);
     };
     daemonClient.on('session:died', onDaemonSessionDied);
   }

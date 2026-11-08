@@ -92,7 +92,7 @@ import { applyTaskQueryView } from '../shared/a2aTaskQueryView';
 import { normalizeLivePaneIds } from '../shared/a2aOrphanedTask';
 import { WEB_DEFAULT_PORT, webHostIsLoopback, type WebTlsConfig } from '../shared/web';
 import { generateSnapshotUnqueued, enqueueSnapshotJob, generateTextSnapshot, generateTextSnapshotUnqueued, runSmallSnapshotJob, capTextRowsToFrameBudget, MAX_SCROLLBACK } from './HeadlessSnapshot';
-import { queuedScreenText, queuedTextSnapshot } from './queuedSessionText';
+import { queuedScreenTail, queuedScreenText, queuedTextSnapshot, queuedTextTail } from './queuedSessionText';
 import { FolderTrustRefusedError, folderTrustRefusal, folderTrustState, registerFolderTrustRpc, setFolderTrustTimingLog } from './folderTrustState';
 import { FOLDER_TRUST_DELIVERY_BUDGET_MS } from '../shared/folderTrustWording';
 import { HOST_WINDOW_RPC, createHostWindowRpc } from './hostWindowRpc';
@@ -111,10 +111,10 @@ import type { PushTableRouterDeps } from './push/pushTableRouter';
 import { parseBotApprovalPushRows, type BotApprovalPushRow } from '../shared/botApprovalPush';
 import { parseBotPromptPushRows, type BotPromptPushRow } from '../shared/botPromptPush';
 import { readPendingToolUse } from './transcript/pendingToolUse';
-import { STALL_AGENT, StallWatch, lastHumanPrompt, readTranscriptTail, stopAndPrefill } from './transcript/stallWatch';
+import { STALL_AGENT, StallWatch, lastHumanPrompt, readTranscriptTail, spinnerTokenCount, stopAndPrefill } from './transcript/stallWatch';
 import { isClaudeFamilyAgent } from './approvals/terminalPrompt';
 import { StateWriter, scrubPersistedCredentials, detachedTtlHoursFor } from './StateWriter';
-import { stripCredentialValues } from '../shared/envFilter';
+import { sanitizeCredentialEnv, stripCredentialValues } from '../shared/envFilter';
 import { LanLinkInbox } from './lanlink/inbox';
 import { LanLinkController } from './lanlink/controller';
 import { LanLinkServer } from './lanlink/server';
@@ -130,6 +130,7 @@ import { isLoopbackHost } from './net/inboundSeen';
 import { FIREWALL_GROUP, currentRuleUser } from '../shared/netFirewallScripts';
 import { isIpv4, type FirewallListener } from '../shared/netFirewall';
 import { forgetHostCascade, registerA2aRemoteRpc } from './a2aRemote/rpc';
+import type { DiscoverClient } from './a2aRemote/discoverClient';
 import { PeerStore as A2aPeerStore } from './a2aRemote/peerStore';
 import { RemoteHostStore } from './a2aRemote/remoteHostStore';
 import { LinkStore } from './a2aRemote/linkStore';
@@ -190,7 +191,9 @@ import { inspectLaunchPresence } from './launchPresence';
 import { promptLineState } from '../shared/promptLineState';
 import { parseWriteExpectation, writeIfUnchanged } from './writeIfUnchanged';
 import { Watchdog } from './Watchdog';
-import { recoversInBackground, selectRecoverableSessions, startLeftoverShellReaps } from './recoverySelector';
+import { heldForCredentials, recoversInBackground, selectRecoverableSessions, startLeftoverShellReaps } from './recoverySelector';
+import { readUserShellHolds, USER_SHELL_HOLDS_FILE } from '../shared/userShellHolds';
+import { createHeldStartFallback, HELD_START_FALLBACK_MS, promoteNeedsFirstParty, type HeldStartFallback } from './heldUserShellStart';
 import { isShutdownKillExit, SHUTDOWN_KILL_RECLASSIFY_MS } from './shutdownKill';
 import {
   classifyReapIdentity,
@@ -313,6 +316,7 @@ import type { SessionPromptScheduleResult } from '../shared/sessionPromptSchedul
 import { claudeUsageLimitFromStopFailure, USAGE_LIMIT_CONTINUE_PROMPT, type PaneUsageLimitPatch } from '../shared/usageLimit';
 import { chatAgentStatus, confirmedStopAt, transcriptTurnEnd, transcriptTurnState } from './transcript/chatAgentStatus';
 import { DaemonPTYBridge } from './DaemonPTYBridge';
+import { shellChildAgent } from './shellChildAgent';
 import { createCodexSharedRuntime, runCodexDaemon } from './transcript/codexSharedRuntime';
 import { validChatAttachments } from '../shared/transcript/chatAttachments';
 import { agentStatesFor } from '../shared/agentStateBatch';
@@ -325,6 +329,7 @@ import { CHATV2_DISPOSE_TIMEOUT_MS } from '../shared/chatv2/limits';
 import { chatProviders } from './chat/providers';
 import { record as chatRecord } from './chat/adapter';
 import type { ChatInteractionAnswer } from '../shared/transcript/chatSession';
+import { selfCheckPeerPid } from '../shared/peerPid';
 
 // wmux web — read-only-by-default browser terminal. Instantiated lazily in
 // registerRpcHandlers; nothing listens until a `daemon.web.start` RPC arrives
@@ -855,7 +860,7 @@ function createApprovalRegistry(sessionManager: DaemonSessionManager): ApprovalR
       const keyInputRevision = managed.bridge.getKeyInputRevision();
       const incarnation = managed.meta.incarnationId ?? null;
       const cols = managed.ptyProcess.cols ?? managed.meta.cols;
-      const frame = await renderPaneScreen(() => sessionManager.getSession(sessionId), generateTextSnapshot);
+      const frame = await renderPaneScreen(() => sessionManager.getSession(sessionId), generateTextSnapshot, { reuse: true });
       if (!frame) return null;
       return {
         rows: frame.rows,
@@ -2023,6 +2028,48 @@ function releaseLock(): void {
 
 // === Session recovery ===
 
+/**
+ * The end of boot recovery for one pane it respawned, after the spool ingest
+ * (#3049: also the promote of a held user shell, so that shell comes back with
+ * the resume offer boot would have given it). Settles the binding the ingest
+ * may have landed, flags an agent pane for the resume pill with its guarded
+ * exact binding, and keeps the in-flight turn mark only while the agent's
+ * transcript still shows that turn open.
+ */
+function finishRecoveredPane(sessionManager: DaemonSessionManager, recoveredId: string): void {
+  const managed = sessionManager.getSession(recoveredId);
+  if (!managed) return;
+  const m = managed.meta;
+  // Again after the spool ingest, which can land a binding still waiting for
+  // its transcript: the pill must offer the picker, not a dead `--resume`.
+  const settledBinding = settledForReplay(recoveredId, m.resumeBinding, m);
+  if (settledBinding) m.resumeBinding = settledBinding;
+  else delete m.resumeBinding;
+  const offer = resumeOfferForRecovered(m);
+  if (!offer) {
+    delete m.resumeContinuePending;
+    return;
+  }
+  recoveredAgentShellIds.set(recoveredId, offer as AgentSlug);
+  // Surface the EXACT-session binding ONLY when its captured cwd still matches
+  // the recovered session's cwd (F7 — `--resume` is cwd-scoped) AND its origin
+  // transcript still exists (D5 — a purged id is a dead-end). Either miss drops
+  // the pill to the agent's session picker (#1946).
+  if (isUsableResumeBinding(m.resumeBinding) && normalizeResumeCwd(m.resumeBinding.cwd) === normalizeResumeCwd(m.cwd) && bindingTranscriptLives(m.resumeBinding)) {
+    recoveredResumeBindings.set(recoveredId, m.resumeBinding);
+  }
+  // Set from the OLD record in the carry-forward, and kept only while the
+  // agent's own transcript still shows that turn open: a turn the user
+  // interrupted, or one that finished, is not continued.
+  if (m.resumeContinuePending && recordedTurnStillOpen(recoveredResumeBindings.get(recoveredId) ?? m.resumeBinding, m.env)) {
+    recoveredWasRunning.add(recoveredId);
+  } else delete m.resumeContinuePending;
+}
+
+// ConPTY error-87 retries for a recovered session's spawn (see the loop in
+// recoverSessions); a held user shell's promote gets the same budget (#3049).
+const RECOVERY_PTY_RETRIES = 8;
+
 async function recoverSessions(
   stateWriter: StateWriter,
   sessionManager: DaemonSessionManager,
@@ -2039,6 +2086,9 @@ async function recoverSessions(
   const spoolBindings = readResumeSpoolMap();
   // Read before the automation engine starts and rewrites interrupted runs.
   const automationRunPtyIds = recordedRunPtyIds(wmuxDir);
+  // #3049 — the user shells main listed (shared/userShellHolds.ts).
+  const holds = readUserShellHolds(path.join(wmuxDir, USER_SHELL_HOLDS_FILE));
+  let heldCount = 0;
 
   // Detect reboot: if bootId changed, all old PIDs are stale — skip kill attempts
   const currentBootId = await getBootId();
@@ -2187,6 +2237,21 @@ async function recoverSessions(
     // re-evaluated on the next launch.
     if (!recoverableIds.has(session.id)) continue;
 
+    // #3049 — a plain user shell main listed waits, like a WSL placeholder,
+    // for main to start it with its credentials (sessions.json holds none).
+    // Both a suspended record and one a crash left live land here. Its
+    // previous shell is stopped first, and its scrollback is read when it
+    // starts (promoteSession).
+    if (heldForCredentials(session, holds)) {
+      await leftoverShells.get(session.id);
+      session.bufferDumpPath ??= stateWriter.getBufferDumpPath(session.id);
+      session.state = 'suspended';
+      sessionManager.holdForStart(session);
+      heldCount++;
+      changed = true;
+      continue;
+    }
+
     if (session.state === 'suspended' && session.bufferDumpPath) {
       // Attempt to recover suspended session
       try {
@@ -2224,7 +2289,6 @@ async function recoverSessions(
         // before giving up. Recovery runs once per daemon boot, so the
         // worst-case latency hit is only paid by users actually hitting
         // the burst — the happy path still resolves on attempt 1.
-        const RECOVERY_PTY_RETRIES = 8;
         let recovered: ReturnType<typeof sessionManager.createSession> | undefined;
         let lastSpawnErr: unknown;
         for (let attempt = 1; attempt <= RECOVERY_PTY_RETRIES; attempt++) {
@@ -2473,35 +2537,7 @@ async function recoverSessions(
   // markers onto managed.meta, so the live meta is the single source that reflects
   // every capture path. Exec/supervised panes are excluded — they already
   // auto-resume via execLaunchCommand (Feature ①).
-  for (const recoveredId of recoveredIds) {
-    const managed = sessionManager.getSession(recoveredId);
-    if (!managed) continue;
-    const m = managed.meta;
-    // Again after the spool ingest, which can land a binding still waiting for
-    // its transcript: the pill must offer the picker, not a dead `--resume`.
-    const settledBinding = settledForReplay(recoveredId, m.resumeBinding, m);
-    if (settledBinding) m.resumeBinding = settledBinding;
-    else delete m.resumeBinding;
-    const offer = resumeOfferForRecovered(m);
-    if (!offer) {
-      delete m.resumeContinuePending;
-      continue;
-    }
-    recoveredAgentShellIds.set(recoveredId, offer as AgentSlug);
-    // Surface the EXACT-session binding ONLY when its captured cwd still matches
-    // the recovered session's cwd (F7 — `--resume` is cwd-scoped) AND its origin
-    // transcript still exists (D5 — a purged id is a dead-end). Either miss drops
-    // the pill to the agent's session picker (#1946).
-    if (isUsableResumeBinding(m.resumeBinding) && normalizeResumeCwd(m.resumeBinding.cwd) === normalizeResumeCwd(m.cwd) && bindingTranscriptLives(m.resumeBinding)) {
-      recoveredResumeBindings.set(recoveredId, m.resumeBinding);
-    }
-    // Set from the OLD record in the carry-forward above, and kept only while
-    // the agent's own transcript still shows that turn open: a turn the user
-    // interrupted, or one that finished, is not continued.
-    if (m.resumeContinuePending && recordedTurnStillOpen(recoveredResumeBindings.get(recoveredId) ?? m.resumeBinding, m.env)) {
-      recoveredWasRunning.add(recoveredId);
-    } else delete m.resumeContinuePending;
-  }
+  for (const recoveredId of recoveredIds) finishRecoveredPane(sessionManager, recoveredId);
 
   // Clean up orphaned buffer files. Preserve buffers for both the
   // recovered sessions and the cap-skipped suspended ones — the latter
@@ -2513,6 +2549,10 @@ async function recoverSessions(
     }
   }
   stateWriter.cleanOrphanedBuffers(preservedBufferIds);
+
+  if (heldCount > 0) {
+    log('info', `[recovery] holding ${heldCount} restored user shell(s) for the app to start with their credentials`);
+  }
 
   // Completion summary — pairs with the "[recovery] loaded N" line above so the
   // daemon log tells the whole story: N loaded → M respawned. M=0 while N>0 means
@@ -2587,8 +2627,11 @@ async function restartSupervisedSession(
     recovered = await sessionManager.createSessionAsync(replay);
   } catch (err) {
     if (!shuttingDown && !(err instanceof Error && err.message === 'Session creation cancelled')) sessionManager.reinsertSession(managed);
+    else sessionManager.releaseTombstone(managed);
     throw err;
   }
+  // The replacement holds the id now; the dead record is gone for good.
+  sessionManager.releaseTombstone(managed);
 
   // Carry the resume markers onto the recreated session meta. createSession builds
   // FRESH metadata, so without this the saveImmediate below drops the exact binding
@@ -2621,6 +2664,12 @@ async function restartSupervisedSession(
 }
 
 // === RPC handler registration ===
+
+/**
+ * Sessions whose daemon.attachSession is replacing their pipe: a size sent
+ * meanwhile is provisional (setReplayPendingProbe).
+ */
+const attachesInFlight = new Set<string>();
 
 function registerRpcHandlers(
   pipeServer: DaemonPipeServer,
@@ -3085,11 +3134,13 @@ function registerRpcHandlers(
 
   // daemon.attachSession
   pipeServer.onRpc('daemon.attachSession', async (params) => {
-    const p = params as unknown as DaemonSessionIdParams & { promote?: boolean };
+    const p = params as unknown as DaemonSessionIdParams & { promote?: boolean; scrollback?: number };
     if (sessionManager.getPendingRecovery(p.id)) {
       // #2398 — `promote: false` (a pane not on screen) leaves a pending
       // recovery pending: nothing is spawned until the pane is shown.
       if (p.promote === false) return { ok: false, pending: true };
+      // #3049 — a held user shell starts only by main's promote.
+      if (sessionManager.isStartPending(p.id)) return { ok: false, pending: true };
       touchPendingRecovery(p.id);
       const result = await promoteOnce(p.id);
       if (!result.ok) throw new Error(result.error?.message || 'WSL recovery failed; retry after checking the target');
@@ -3109,8 +3160,17 @@ function registerRpcHandlers(
       // Stop existing SessionPipe if still listening (prevents EADDRINUSE on reconnect)
       const existingPipe = sessionPipes.get(p.id);
       if (existingPipe) {
-        await existingPipe.stop().catch(() => undefined);
-        sessionPipes.delete(p.id);
+        // The new viewer's replay is due while the old pipe goes: a size it
+        // sends meanwhile is provisional (setReplayPendingProbe below).
+        attachesInFlight.add(p.id);
+        try {
+          // Input the old client already sent still reaches the PTY (#3073).
+          await existingPipe.releaseClient().catch(() => undefined);
+          await existingPipe.stop().catch(() => undefined);
+          sessionPipes.delete(p.id);
+        } finally {
+          attachesInFlight.delete(p.id);
+        }
       }
 
       // TASK-10: dims provider enables the attach-flush snapshot (large ring
@@ -3124,7 +3184,7 @@ function registerRpcHandlers(
           cols: live?.meta.cols ?? managed.meta.cols ?? 80,
           rows: live?.meta.rows ?? managed.meta.rows ?? 24,
         };
-      }, () => sessionManager.getSession(p.id)?.bridge.outputModes ?? managed.bridge.outputModes);
+      }, () => sessionManager.getSession(p.id)?.bridge.outputModes ?? managed.bridge.outputModes, p.scrollback);
       sessionPipes.set(p.id, pipe);
 
       // #557: demote a stuck-'attached' session to 'detached' if its authed
@@ -3164,6 +3224,10 @@ function registerRpcHandlers(
       // bracketed-paste newlines; only the submitted CR/LF re-arms running.
       pipe.onInput((data: Buffer) => {
         const input = data.toString();
+        // Past the high-water mark (other writers can fill it while this client
+        // is not paused) the chunk waits in SessionPipe's retry slot instead of
+        // the PTY adapter, which drops input past its own bound.
+        if (((managed.ptyProcess as TerminalPty).pendingInputBytes ?? 0) >= 6 * 1024 * 1024) return false;
         try { managed.ptyProcess.write(data); }
         catch (error) {
           if (error instanceof Error && error.message.startsWith('PTY_BACKPRESSURE')) return false;
@@ -3325,13 +3389,17 @@ function registerRpcHandlers(
   // misses. Never resurrects or mutates the session. Works for live, dead, or
   // suspended sessions (it only reads the ring).
   pipeServer.onRpc('daemon.readSessionText', async (params) => {
-    const p = params as unknown as { id: string; scrollback?: number };
+    const p = params as unknown as { id: string; scrollback?: number; tail?: boolean };
     const managed = sessionManager.getSession(p.id);
     if (!managed) {
       throw new Error(`SESSION_NOT_FOUND: ${p.id}`);
     }
     const scrollback = Math.min(typeof p.scrollback === 'number' ? p.scrollback : 5000, MAX_SCROLLBACK);
-    const outcome = await queuedTextSnapshot(sessionManager, p.id, scrollback);
+    // `tail`: a display-only read (Fleet's preview is the one caller that asks),
+    // answered from the ring's newest bytes when that gives the same rows.
+    const outcome = p.tail === true
+      ? await queuedTextTail(sessionManager, p.id, scrollback, 'fleet')
+      : await queuedTextSnapshot(sessionManager, p.id, scrollback);
     if (!outcome) throw new Error(`SESSION_NOT_FOUND: ${p.id}`);
     if (!outcome.ok) {
       log('info', `[readText] session=${p.id} unavailable reason=${outcome.reason}`);
@@ -3346,7 +3414,10 @@ function registerRpcHandlers(
     if (capped.truncated) {
       log('info', `[readText] session=${p.id} response truncated to fit frame budget (${outcome.rows.length} rows)`);
     }
-    return { ok: true, mode: 'rows', rows: capped.rows, bufferType: outcome.bufferType, rowsBelowCursor: outcome.rowsBelowCursor, truncated: capped.truncated };
+    return {
+      ok: true, mode: 'rows', rows: capped.rows, bufferType: outcome.bufferType, rowsBelowCursor: outcome.rowsBelowCursor, truncated: capped.truncated,
+      ...('via' in outcome ? { via: outcome.via } : {}),
+    };
   });
 
   // #2408: how long a session list waits for a recovered pane's screen read.
@@ -3373,7 +3444,7 @@ function registerRpcHandlers(
     }
     const inFlight = sightingReads.get(id);
     if (inFlight || recoveredSighting.get(id)?.at === managed.ringBuffer.totalBytesWritten) return inFlight;
-    const read = renderPaneScreen(() => sessionManager.getSession(id), generateTextSnapshot)
+    const read = renderPaneScreen(() => sessionManager.getSession(id), generateTextSnapshot, { reuse: true })
       .then((frame) => {
         if (frame && sessionManager.getSession(id) === managed && recoveredAgentShellIds.has(id)) {
           recoveredSighting.set(id, { at: frame.mark, onScreen: screenShowsLiveAgent(frame.rows, slug) });
@@ -3438,7 +3509,10 @@ function registerRpcHandlers(
       // 자격증명 값을 뺀 fresh env로 교체 — 데몬 토큰 보유 클라이언트가 RPC로 세션
       // 자격증명을 읽지 못하게. s.env는 live 인메모리 meta.env와 동일 참조라 in-place
       // 수정 금지(스폰이 깨짐); stripCredentialValues는 fresh를 반환하므로 교체만 한다.
-      const base = { ...s, env: stripCredentialValues(s.env) };
+      // #3049 — `startPending`: a held user shell main starts with its
+      // credentials (main's reconnect promotes it, never holds it). On the
+      // reply only; the record never carries it, so it is never persisted.
+      const base = { ...s, env: stripCredentialValues(s.env), ...(sessionManager.isStartPending(s.id) ? { startPending: true as const } : {}) };
       // Capture the durable meta binding before stripping it — reused below to
       // surface a guard-passed binding for LIVE agent panes too, so the per-pane
       // resume affordance (Inspect/pane-header UUID + 복구) works ANY time, not
@@ -3595,6 +3669,16 @@ function registerRpcHandlers(
     // `resumeLaunchCommand` are both written to avoid.
     const startFresh = params['fresh'] === true;
 
+    // #3049 — a user shell boot held for main (recoverySelector
+    // heldForCredentials), and the credential values main passed for it. The
+    // values go to the spawn only (DaemonSessionManager credentialEnv) and are
+    // refused for an exec unit or a supervised session.
+    const heldStart = sessionManager.isStartPending(sessionId);
+    const credentialEnv = params['credentialEnv'] === undefined ? undefined : sanitizeCredentialEnv(params['credentialEnv']);
+    if (credentialEnv === null || (credentialEnv && (session.exec || session.supervision))) {
+      return { ok: false, error: { code: 'INVALID_PARAMS', message: 'credentialEnv is refused for this session' } };
+    }
+
     // createSession enforces the same cap as boot recovery and throws
     // RESOURCE_EXHAUSTED when it is already full.
     try {
@@ -3612,7 +3696,7 @@ function registerRpcHandlers(
       // the pane is recreated, so the exec relaunch and the pill both see the result.
       if (!startFresh) settleStoredBinding(session);
 
-      const PROMOTE_RETRIES = 4;
+      const PROMOTE_RETRIES = heldStart ? RECOVERY_PTY_RETRIES : 4;
       let promoted: ReturnType<typeof sessionManager.createSession> | undefined;
       let lastErr: unknown;
       for (let attempt = 1; attempt <= PROMOTE_RETRIES; attempt++) {
@@ -3627,6 +3711,7 @@ function registerRpcHandlers(
             // aim the NEXT recovery at it again.
             spawnCwd: startFresh ? undefined : session.spawnCwd,
             env: session.env,
+            ...(credentialEnv ? { credentialEnv } : {}),
             cols: session.cols,
             rows: session.rows,
             agent: session.agent,
@@ -3681,6 +3766,15 @@ function registerRpcHandlers(
           promotedSession.meta.lastDetectedAgent = session.lastDetectedAgent;
           promotedSession.meta.lastDetectedAgentEvidence = session.lastDetectedAgentEvidence;
           promotedSession.meta.codexRelayResume = session.codexRelayResume;
+        }
+        if (!startFresh && heldStart) {
+          // #3049 — a held user shell finishes as boot recovery would have
+          // finished it (the turn mark off the old record, the spool, the
+          // offer), so it keeps the resume pill it would have had.
+          if (recordWasMidTurn(session, Date.now())) promotedSession.meta.resumeContinuePending = true;
+          ingestResumeSpool(sessionManager, stateWriter);
+          finishRecoveredPane(sessionManager, sessionId);
+        } else if (!startFresh) {
           const offer = resumeOfferForRecovered(promotedSession.meta);
           if (offer) recoveredAgentShellIds.set(sessionId, offer as AgentSlug);
           // Read off the persisted record and the transcript, as at boot recovery.
@@ -3702,13 +3796,25 @@ function registerRpcHandlers(
       }
 
       log('info', `[promote] Promoted suspended session ${sessionId} in ${cwd}`);
-      return { ok: true, alreadyActive: false };
+      return { ok: true, alreadyActive: false, ...(credentialEnv ? { credentialsApplied: true as const } : {}) };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       log('error', `[promote] Failed to promote session ${sessionId}: ${msg}`);
       if (isWslShell(session.cmd) && !shuttingDown && sessionManager.getPendingRecovery(sessionId)) {
         sessionManager.keepPendingRecovery(session, msg);
         stateWriter.saveImmediate(buildState(sessionManager));
+      }
+      // #3049 — a held user shell that cannot start (the session cap filled
+      // while it was held, a spawn error) is released and kept as an ordinary
+      // pending recovery with its error, as a WSL or cap-skipped pane is: its
+      // record and scrollback stay, and the pane's Retry promotes it again
+      // through main, which still grants its credentials.
+      if (heldStart && !shuttingDown && sessionManager.isStartPending(sessionId)) {
+        const record = sessionManager.dropPendingRecovery(sessionId);
+        if (record) {
+          sessionManager.keepPendingRecovery(record, msg);
+          stateWriter.saveImmediate(buildState(sessionManager));
+        }
       }
       // #1305 — CWD_MISSING is not SPAWN_FAILED with a different sentence: it
       // is the one failure Retry cannot clear, and the renderer offers the
@@ -3720,16 +3826,36 @@ function registerRpcHandlers(
   const promoteOnce = createPromoteOnce((p) => promoteSession(p), (id) => !!sessionManager.getSession(id));
   sessionManager.on('session:died', (payload: { id: string }) => promoteOnce.forget(payload.id));
   sessionManager.on('session:destroyed', (payload: { id: string }) => promoteOnce.forget(payload.id));
-  pipeServer.onRpc('daemon.promoteSession', (params) => {
+  // #3049 — credentials, and a held user shell before the fallback, are
+  // main's alone (heldUserShellStart.ts promoteNeedsFirstParty, which states
+  // the honest scope of that check). The refusal, or null to go ahead.
+  const firstPartyPromoteRefusal = (id: string, credentialEnv: unknown, clientId: string): PromoteResult | null => {
+    const needed = promoteNeedsFirstParty({ credentialEnv: credentialEnv !== undefined, startPending: sessionManager.isStartPending(id), fallbackFired: heldStartFallback?.fired() === true });
+    if (!needed || pipeServer.isFirstParty(clientId)) return null;
+    log('warn', `[promote] refused daemon.promoteSession of ${id} from non-first-party client ${clientId}`);
+    return { ok: false, error: { code: 'FIRST_PARTY_ONLY', message: 'Only the wmux app may start this pane' } };
+  };
+  pipeServer.onRpc('daemon.promoteSession', (params, ctx) => {
     const id = String(params?.id ?? '');
     // #2398 — `joinOnly` (a stop key, a repaint): join an attempt in flight,
     // never start one (see createPromoteOnce for the answer when none is).
     // Not a retry, so the pending entry is not renewed.
     if (params?.['joinOnly'] === true) return promoteOnce(id, false, 'rpc', true);
+    const credentialEnv = params?.['credentialEnv'];
+    const refused = firstPartyPromoteRefusal(id, credentialEnv, ctx.clientId);
+    if (refused) return Promise.resolve(refused);
     // Before the attempt, so an attempt that fails on a path with no save
     // still records that the user is actively retrying this pane (#1305).
     touchPendingRecovery(id);
-    return promoteOnce(id, params?.['fresh'] === true);
+    return promoteOnce(id, params?.['fresh'] === true, 'rpc', false, credentialEnv as Record<string, string> | undefined);
+  });
+  // #3049 — main() fires this a fixed time after the pipe opens: every held
+  // user shell main has not started by then starts without credentials, with
+  // the background origin (the daemon started it, as at boot).
+  heldStartFallback = createHeldStartFallback({
+    heldIds: () => sessionManager.startPendingIds(),
+    start: (id) => promoteOnce(id, false, 'background'),
+    log: (line) => log('warn', line),
   });
   // Defer cold WSL starts until RPC registration/event wiring can finish.
   // Independent panes recover concurrently; foreground attach shares the same
@@ -4631,8 +4757,14 @@ function registerRpcHandlers(
       },
       awaitingHuman: (id) => sessionManager.getSession(id)?.bridge.getAgentStatus() === 'awaiting_input'
         || approvalRegistry?.list().pending.some((r) => r.sessionId === id) === true,
+      // An estimate, not a gate: read from the ring's newest bytes when that
+      // gives the whole ring's rows (guardedTailRead.ts). Its inputs are what
+      // the real-data check compares, by count only.
       readScreen: async (id) => {
-        const outcome = await queuedScreenText(sessionManager, id);
+        const outcome = await queuedScreenTail(sessionManager, id, 'stallwatch', (rows) => ({
+          running: screenShowsRunningTurn(rows, STALL_AGENT),
+          token: spinnerTokenCount(rows),
+        }));
         return outcome?.ok ? outcome.rows.map((r) => r.text) : null;
       },
       titleRunning: (id) => titleShowsRunningTurn(sessionManager.getSession(id)?.bridge.getTitle(), STALL_AGENT, Date.now()),
@@ -4782,6 +4914,13 @@ function registerRpcHandlers(
   pipeServer.onRpc('daemon.phone.complete', async (params,ctx) => {
     if (!firstPartyOnly(ctx.clientId,'daemon.phone.complete')) return {ok:false};
     return {ok:desktopPhoneBridge!.complete(ctx.clientId,params)};
+  });
+  // One push of a phone browser stream: only the registered desktop's, and
+  // checked by the web server before it reaches a phone. `known:false` tells
+  // main to stop that screencast.
+  pipeServer.onRpc('daemon.phone.browserStream', async (params,ctx) => {
+    if (!firstPartyOnly(ctx.clientId,'daemon.phone.browserStream') || !desktopPhoneBridge?.isOwner(ctx.clientId)) return {ok:false,known:false};
+    return webTerminalServer?.browserStreamPush(ctx.clientId,params) ?? {ok:false,known:false};
   });
   pipeServer.onClientClose(id => desktopPhoneBridge?.disconnect(id));
   if (!chatSessions) {
@@ -6116,6 +6255,14 @@ function registerRpcHandlers(
     ['Claude Code', 'Codex CLI'].includes(readDaemonAgentState(id).agentName ?? '')
       ? transcriptTurnEnd(projector.snapshot(id)?.events, 0)?.at
       : undefined;
+  // Windows only: the tracker names a new agent after its OSC 7501 query
+  // (#2838). An agent the pane took is launch evidence: the tracker probes now.
+  if (process.platform === 'win32') {
+    DaemonPTYBridge.shellChildAgentProbe = {
+      read: (pid, since) => shellChildAgent(pid, since),
+      accepted: (sessionId, pid) => agentProcessTracker.rearm(sessionId, pid),
+    };
+  }
   // Versioned method name is a rolling-upgrade safety boundary. An older
   // daemon's v1 handler would ignore the additive incarnationId parameter and
   // write anyway; v2 makes mixed versions fail with Unknown method pre-write.
@@ -7687,7 +7834,7 @@ function wireEvents(
       if (ptyId !== id || sessionManager.getSession(id) !== managed) return null;
       const cols = managed.ptyProcess.cols;
       const rows = managed.ptyProcess.rows;
-      const frame = await renderPaneScreen(() => sessionManager.getSession(id), generateTextSnapshot);
+      const frame = await renderPaneScreen(() => sessionManager.getSession(id), generateTextSnapshot, { reuse: true });
       if (!frame) return null;
       const isCurrent = (): boolean => sessionManager.getSession(id) === managed
         && !managed.bridge.isMuted && managed.ringBuffer.totalBytesWritten === frame.mark
@@ -7701,7 +7848,7 @@ function wireEvents(
     isAwaiting: (id) => sessionManager.getSession(id)?.bridge.isAwaitingHuman() === true,
     eligible: (id) => isClaudeFamilyAgent(paneAgentSlug(id)),
     outputMark: (id) => sessionManager.getSession(id)?.ringBuffer.totalBytesWritten ?? null,
-    render: (id) => renderPaneScreen(() => sessionManager.getSession(id), generateTextSnapshot),
+    render: (id) => renderPaneScreen(() => sessionManager.getSession(id), generateTextSnapshot, { reuse: true }),
     clear: (id) => { sessionManager.getSession(id)?.bridge.clearAwaiting('screen-cleared'); },
     holdsPrompt: (id) => approvalRegistry?.list().pending
       // An agent-held (native) decision is not a dialog on this screen.
@@ -7734,7 +7881,7 @@ function wireEvents(
   // after it. A grid narrower than the dialog's footer wraps it beyond what
   // either test can see (#1901), so it is not judged.
   dialogOnScreen = async (sessionId) => {
-    const frame = await renderPaneScreen(() => sessionManager.getSession(sessionId), generateTextSnapshot);
+    const frame = await renderPaneScreen(() => sessionManager.getSession(sessionId), generateTextSnapshot, { reuse: true });
     if (!frame || frame.rows.every((row) => row.trim().length === 0)) return null;
     if (typeof frame.cols === 'number' && frame.cols < AWAITING_NARROW_DIALOG_COLS) return null;
     return screenShowsActiveDialog(frame.rows) || screenShowsPermissionDialog(frame.rows);
@@ -8748,6 +8895,8 @@ let commitOriginStore: CommitOriginStore | null = null;
 
 /** X8: set in main(); shutdown() cancels pending supervised restarts through it. */
 let paneSupervisorRef: PaneSupervisor | null = null;
+/** #3049 — set in registerRpcHandlers; main() fires it once the pipe has been open a while. */
+let heldStartFallback: HeldStartFallback | null = null;
 // Whether the background recovery pass after boot has settled
 // (startupRecovery.ts); `daemon.listSessions` says it when asked.
 const startupRecovery = createStartupRecovery({ log: (line) => log('info', line) });
@@ -8756,6 +8905,7 @@ const startupRecovery = createStartupRecovery({ log: (line) => log('info', line)
 let lanLinkServerRef: LanLinkServer | null = null;
 // Same for the cross-host A2A listener.
 let a2aServerRef: A2aServer | null = null;
+let a2aDiscoverRef: DiscoverClient | null = null;
 let a2aDeliveryRef: A2aRemoteDelivery | null = null;
 
 // Channels v2 — wake worker handle for shutdown + the emit fast path.
@@ -9004,6 +9154,7 @@ async function shutdown(
   try { lanLinkServerRef?.dispose(); } catch { /* best effort */ }
   try { void a2aDeliveryRef?.stop(); } catch { /* best effort */ }
   try { a2aServerRef?.dispose(); } catch { /* best effort */ }
+  try { a2aDiscoverRef?.dispose(); } catch { /* best effort */ }
   paneSupervisorRef = null;
 
   // Stop X1 context watchers (port poll timer + git fs.watch handles)
@@ -10064,7 +10215,7 @@ async function main(): Promise<void> {
     // person waits on a nudge, so the read may take longer.
     folderTrustVerdict: (id) => folderTrustState({ getSession: (sid) => sessionManager.getSession(sid), timeoutMs: FOLDER_TRUST_DELIVERY_BUDGET_MS }, id),
     screenShowsApproval: async (id) => {
-      const frame = await renderPaneScreen(() => sessionManager.getSession(id), generateTextSnapshot);
+      const frame = await renderPaneScreen(() => sessionManager.getSession(id), generateTextSnapshot, { reuse: true });
       if (!frame || frame.rows.every((row) => !row.trim())) return null;
       return screenShowsAgentDialog(frame.rows);
     },
@@ -10335,7 +10486,7 @@ async function main(): Promise<void> {
     // The bridge validates the observation before retiring a previous owner,
     // so a stale async probe cannot invalidate the replacement launch.
     // The process truth the bridge's running-title path reads.
-    managed.bridge.noteAgentProcess(state);
+    managed.bridge.noteAgentProcess({ ...state, pid: agentProcessTracker.pidFor(sessionId) });
     const screenSlug = managed.bridge.getLastAgent();
     const canonical = canonicalIdentityFor(
       agentProcessTracker,
@@ -10622,11 +10773,15 @@ async function main(): Promise<void> {
       onPeerRevoked: a2aCascade,
       routes: a2aRoutes,
       log: a2aLog,
+      // The tailnet discovery probe tells other PCs this build's version.
+      discoverVersion: () => SPAWNED_BY_VERSION,
     });
     a2aServerRef = a2aServer;
+    // A discovery window ends with the app connection that opened it.
+    pipeServer.onClientClose((clientId) => a2aServer.discovery.clientGone(clientId));
     const onA2aRpc = (method: string, handler: (params: Record<string, unknown>) => Promise<unknown>): void =>
       pipeServer.onRpc(method, handler);
-    registerA2aRemoteRpc(onA2aRpc, {
+    const a2aRemoteRpc = registerA2aRemoteRpc(onA2aRpc, {
       controller: a2aRemoteController,
       server: a2aServer,
       peers: a2aPeers,
@@ -10634,6 +10789,9 @@ async function main(): Promise<void> {
       cascade: a2aCascade,
       log: a2aLog,
     });
+    // An outgoing discovery request ends with the app connection that made it, or with the daemon.
+    a2aDiscoverRef = a2aRemoteRpc.discover;
+    pipeServer.onClientClose((clientId) => a2aRemoteRpc.discover.clientGone(clientId));
     registerSpawnRpc(onA2aRpc, { policy: a2aSpawnPolicy, requests: a2aSpawnRequests, onSaved: (previous) => a2aSpawn.sendTargets(previous) });
     // Starting a conversation this PC received: main makes the worktree and the pane, the daemon places the files.
     registerContinueRpc(onA2aRpc, {
@@ -10771,6 +10929,7 @@ async function main(): Promise<void> {
   // renderer answers the startup DA1 itself; before that the bytes only reach
   // it through the (query-stripped) ring replay, and the daemon answers.
   sessionManager.setLiveRendererProbe((id) => sessionPipes.get(id)?.isFlushed === true);
+  sessionManager.setReplayPendingProbe((id) => attachesInFlight.has(id) || sessionPipes.get(id)?.awaitingReplay === true);
   // #2388: a task folder whose removal did not finish takes no new pane,
   // whoever asks (the desktop, a phone, an automation, a recovery).
   sessionManager.setSpawnCwdRefusal((cwd, session) => pendingRemovalRefusalAt(getWmuxDir(), cwd, session));
@@ -11033,6 +11192,8 @@ async function main(): Promise<void> {
   markDaemonBoot('pre-pipe-start');
   await pipeServer.start();
   markDaemonBoot('pipe-listening');
+  // #3049 — fixed and uncancellable (heldUserShellStart.ts).
+  setTimeout(() => { void heldStartFallback?.fire(); }, HELD_START_FALLBACK_MS).unref?.();
 
   // Write active pipe name so clients know which pipe to connect to
   const activePipeName = pipeServer.getActivePipeName();
@@ -11344,6 +11505,7 @@ async function main(): Promise<void> {
 
   markDaemonBoot('ready');
   log('info', `Daemon ready — pipe: ${activePipeName}`);
+  void selfCheckPeerPid().then((verdict) => { if (verdict) log('info', `[peer-pid] daemon: ${verdict}`); });
   // Boot summary for postmortems. nodeTiming gives the Node/V8 startup split
   // for free (all values are ms relative to nodeTiming's own timeOrigin).
   try {

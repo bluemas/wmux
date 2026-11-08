@@ -147,6 +147,8 @@ type RpcDispatchOptions = (
   signal?: AbortSignal;
   /** Internal lifetime fence, checked after asynchronous authorization reads. */
   isCurrent?: () => boolean;
+  /** The pid the OS reports for the connection's peer (PipeServer, shared/peerPid.ts). */
+  peerPid?: number;
 };
 
 export class RpcRouter {
@@ -155,6 +157,7 @@ export class RpcRouter {
   private legacyTrafficCounter: LegacyTrafficCounter | undefined;
   private trustLookup: TrustLookup | undefined;
   private shadowSink: ShadowRejectionSink | undefined;
+  private mcpSessionSink: { touch(id: unknown): void } | undefined;
   private hostedScopeSink: HostedScopeSink | undefined;
   private readonly botRefusalListeners = new Set<BotRefusalListener>();
   private fencedWorkerPty: ((ptyId: string) => boolean) | undefined;
@@ -234,6 +237,15 @@ export class RpcRouter {
    */
   setShadowRejectionSink(sink: ShadowRejectionSink | undefined): void {
     this.shadowSink = sink;
+  }
+
+  /**
+   * Live bundle-session count for `wmux doctor`. main/index.ts injects the
+   * same tracker the `mcp.sessions.summary` RPC reads; tests pass their own.
+   * Unset, nothing is counted.
+   */
+  setMcpSessionSink(sink: { touch(id: unknown): void } | undefined): void {
+    this.mcpSessionSink = sink;
   }
 
   /**
@@ -325,6 +337,9 @@ export class RpcRouter {
       };
     }
     const firstParty = operator || inProcessFirstParty;
+    // Live bundle-session count for `wmux doctor`. Only PipeServer dispatches
+    // on the external wire, and only after the request passed auth.
+    if (externalWire) this.mcpSessionSink?.touch(request.mcpSession);
 
     // Host-derived workspace (#922). Accepted ONLY from the in-process plugin
     // host lane. A non-firstParty caller that supplies it is the same class of
@@ -385,6 +400,8 @@ export class RpcRouter {
       // means "hosted, but nothing to bind to"; the key is absent for every
       // other dispatch source, and never readable from the envelope.
       ...(hostedWorkspace !== undefined && { hostedWorkspace }),
+      // The connection's peer as the OS reports it, from PipeServer only.
+      ...(opts?.peerPid !== undefined && { peerPid: opts.peerPid }),
       clientName:
         typeof request.clientName === 'string' && request.clientName.trim().length > 0
           ? request.clientName.trim()

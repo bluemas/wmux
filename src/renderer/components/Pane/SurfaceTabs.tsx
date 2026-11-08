@@ -43,6 +43,7 @@ import type { CustomAgent } from '../../../shared/customAgents';
 import { paneHeaderTailGap } from './paneChrome';
 import { RENAME_ACTIVE_TAB_EVENT } from '../../utils/commandActions';
 import { isTerminalSurfaceType } from './surfaceKinds';
+import { ComputerUseDot } from '../shared/ComputerUseDots';
 
 export { isTerminalSurfaceType };
 
@@ -339,6 +340,14 @@ function SurfaceTabStatusDot({ ptyId, active }: { ptyId?: string; active: boolea
   );
 }
 
+/** The tab's computer-use colour, once its agent has used computer use. Its
+ *  own component for the same reason as the status dot: each tab subscribes
+ *  to its own entry. Shown on the active tab too: identity, not attention. */
+function SurfaceTabMarkerDot({ ptyId }: { ptyId?: string }) {
+  const color = useStore((s) => (ptyId ? s.agentMarkers[ptyId] : undefined));
+  return color ? <ComputerUseDot color={color} /> : null;
+}
+
 interface SurfaceTabsProps {
   surfaces: Surface[];
   activeSurfaceId: string;
@@ -627,7 +636,7 @@ export default function SurfaceTabs({
   // it, so the user's name sticks. Mirrors the workspace double-click rename.
   // Also reachable from the header menu and the renameTab action. An empty
   // name gives the tab back to the shell (resetSurfaceTitle).
-  const updateSurfaceTitle = useStore((s) => s.updateSurfaceTitle);
+  const renameSurface = useStore((s) => s.renameSurface);
   const resetSurfaceTitle = useStore((s) => s.resetSurfaceTitle);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState('');
@@ -659,7 +668,7 @@ export default function SurfaceTabs({
       return;
     }
     const trimmed = editName.trim();
-    if (trimmed) updateSurfaceTitle(surfaceId, trimmed);
+    if (trimmed) renameSurface(surfaceId, trimmed);
     else resetSurfaceTitle(surfaceId);
     setEditingId(null);
   };
@@ -1175,6 +1184,7 @@ export default function SurfaceTabs({
               <IconLock size={12} />
             </span>
           )}
+          <SurfaceTabMarkerDot ptyId={s.ptyId} />
           {editingId === s.id ? (
             <input
               ref={inputRef}

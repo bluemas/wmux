@@ -295,6 +295,9 @@ export const METHOD_CAPABILITY: Record<RpcMethod, RequiredCapability> = {
   //     undeclared plugin must not receive it (PR #470 codex review). The CLI
   //     (`wmux doctor`) is unaffected — it rides the WMUX_CLI_METHODS tier.
   'perf.status':         { capability: 'pane.read' },
+  // --- Live MCP counts (`wmux doctor`). No plugin needs them; the CLI reaches
+  //     the method through the WMUX_CLI_METHODS tier.
+  'mcp.sessions.summary': { capability: 'wmux.internal' },
 
   // --- Desktop computer use. Observation and input are separate grants: a
   // screenshot of another app is sensitive, but injecting input into it is a
@@ -348,6 +351,10 @@ export const METHOD_CAPABILITY: Record<RpcMethod, RequiredCapability> = {
   'browser.screenshot':        { capability: 'browser.screenshot', riskClass: 'browser' },
   'browser.evaluate':          { capability: 'browser.evaluate',   riskClass: 'browser' },
   'browser.console.get':       { capability: 'browser.read',       riskClass: 'browser' },
+  'browser.frames.tree':       { capability: 'browser.read',       riskClass: 'browser' },
+  // The frame listing rewrites data-wmux-ref in each frame, as the top
+  // listing does through browser.evaluate: the same capability.
+  'browser.frames.read':       { capability: 'browser.evaluate',   riskClass: 'browser' },
   'browser.lifecycle.get':     { capability: 'browser.read',       riskClass: 'browser' },
   'browser.network.get':       { capability: 'browser.read',       riskClass: 'browser' },
   'browser.responseBody.get':  { capability: 'browser.read',       riskClass: 'browser' },
@@ -355,7 +362,11 @@ export const METHOD_CAPABILITY: Record<RpcMethod, RequiredCapability> = {
   'browser.click.cdp':         { capability: 'browser.click', riskClass: 'browser' },
   'browser.hover.cdp':         { capability: 'browser.click', riskClass: 'browser' },
   'browser.drag.cdp':          { capability: 'browser.click', riskClass: 'browser' },
+  // Its own capability: it hands the page files from disk, which no click,
+  // keystroke or page script can do.
+  'browser.upload.cdp':        { capability: 'browser.upload', riskClass: 'browser' },
   'browser.press.cdp':         { capability: 'browser.type',  riskClass: 'browser' },
+  'browser.dialog.arm':        { capability: 'browser.click', riskClass: 'browser' },
   // State tools (#111 packaged RPC fallback). resize stays under
   // `browser.evaluate`: a caller that can already run arbitrary JS can resize the
   // viewport through the page, so it grants nothing beyond what browser.evaluate
@@ -434,6 +445,7 @@ export const METHOD_CAPABILITY: Record<RpcMethod, RequiredCapability> = {
   'daemon.phone.register': { capability: 'wmux.internal' },
   'daemon.phone.complete': { capability: 'wmux.internal' },
   'daemon.phone.keepAwake': { capability: 'wmux.internal' },
+  'daemon.phone.browserStream': { capability: 'wmux.internal' },
   'daemon.ping':             { capability: 'wmux.internal' },
   'daemon.shutdown':         { capability: 'wmux.internal' },
   'daemon.compact':          { capability: 'wmux.internal' },
@@ -491,6 +503,17 @@ export const METHOD_CAPABILITY: Record<RpcMethod, RequiredCapability> = {
   'a2a.remote.hosts.remove': { capability: 'wmux.internal' },
   'a2a.remote.peers.list':  { capability: 'wmux.internal' },
   'a2a.remote.peers.revoke': { capability: 'wmux.internal' },
+  // Tailnet discovery: wmux.internal keeps MCP and plugins out. Like pair.begin,
+  // any same-user process holding the daemon auth token can still call them.
+  'a2a.remote.discover.open': { capability: 'wmux.internal' },
+  'a2a.remote.discover.close': { capability: 'wmux.internal' },
+  'a2a.remote.discover.status': { capability: 'wmux.internal' },
+  'a2a.remote.discover.decide': { capability: 'wmux.internal' },
+  'a2a.remote.discover.scan': { capability: 'wmux.internal' },
+  'a2a.remote.discover.connect': { capability: 'wmux.internal' },
+  'a2a.remote.discover.outgoing.status': { capability: 'wmux.internal' },
+  'a2a.remote.discover.outgoing.cancel': { capability: 'wmux.internal' },
+  'a2a.remote.discover.outgoing.confirm': { capability: 'wmux.internal' },
   // Exposure and pane links: the same posture — only the app's own human
   // exposes panes or accepts a link, never a plugin or an agent.
   'a2a.remote.exposure.publish': { capability: 'wmux.internal' },
@@ -792,6 +815,7 @@ export const CAPABILITY_RISK_CLASS: Record<string, RiskClass> = {
   'browser.read':      'browser',
   'browser.cookies':   'browser',
   'browser.emulate':   'browser',
+  'browser.upload':    'browser',
   // Desktop computer use
   'computer.observe':  'computer',
   'computer.control':  'computer',
@@ -894,6 +918,7 @@ export const CAPABILITY_EFFECT: Record<string, 'read' | 'write'> = {
   'computer.observe':  'read',
   'computer.control':  'write',
   'browser.emulate':   'write',
+  'browser.upload':    'write',
   // A2A
   'a2a.send':    'write',
   'a2a.execute': 'write',
@@ -1029,13 +1054,13 @@ export const RISK_CLASS_COPY: Record<RiskClass, RiskClassCopy> = {
   'files-write': {
     severity: 'critical',
     summary: 'Can create, rename, copy, move and move files to Trash',
-    detail: 'The plugin can change local files and folders, overwrite destinations and move items to the operating system Trash. It never permanently deletes files. The paths the files permission refuses are refused here too, including any folder that holds one. This permission has no path scope.',
+    detail: 'The plugin can change local files and folders, overwrite destinations and move items to the operating system Trash. It has no delete call, but overwriting a file replaces it for good, and a move between drives removes the originals once the copy finishes. The paths the files permission refuses are refused here too, including any folder that holds one. This permission has no path scope.',
   },
   'files': {
     severity: 'critical',
     summary: 'Can browse folders and read any text file on this computer',
     detail:
-      'The plugin can list any local folder and read any text file up to 1 MB outside the list below, including source code, documents and config files. wmux refuses: ~/.ssh, ~/.aws, ~/.gnupg, ~/.kube, ~/.azure, gcloud and Docker credentials, ~/.npmrc, ~/.netrc and ~/.pgpass, ~/.git-credentials, ~/.config/gh, ~/.claude.json and ~/.claude/.credentials.json, ~/.codex/auth.json, wmux\'s own data and tokens, .env and .env.* files, *.pem and *.key files and SSH key files (id_*) anywhere, and shell history files. It cannot change or delete anything with this permission.',
+      'The plugin can list any local folder and read any text file up to 1 MB outside the list below, including source code, documents and config files. wmux refuses: ~/.ssh, ~/.aws, ~/.gnupg, ~/.kube, ~/.azure, gcloud and Docker credentials, ~/.npmrc, ~/.netrc and ~/.pgpass, ~/.git-credentials, GitHub CLI tokens, ~/.claude.json and ~/.claude/.credentials.json, ~/.codex/auth.json, wmux\'s own data and tokens, .env and .env.* files, *.pem and *.key files and SSH key files (id_*) anywhere, shell history files, and WSL distro files. It cannot change or delete anything with this permission.',
   },
   'internal': {
     severity: 'critical',

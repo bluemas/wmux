@@ -1,14 +1,16 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import * as http from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { WebSocketServer } from 'ws';
 import type { Browser, Page } from 'playwright-core';
 import { ChromeLauncher, type ChromeProtectionPlan } from '../ChromeLauncher';
+import { openDownloadPass } from '../dangerousActionConsent';
 import { compileHostPolicy, type HostPolicy } from '../../../shared/browserHostPolicy';
 import { requiredOnThisRunner } from '../../../test-utils/realBrowserHarness';
+import { accountDownloads } from '../../../test-utils/chromeDownloads';
+import { CHROME_TEARDOWN_TIMEOUT_MS, stopChrome, tempChromeProfile, type TempChromeProfile } from '../../../test-utils/chromeProfile';
 
 // ---------------------------------------------------------------------------
 // Protected Chrome profiles against a REAL Chrome, launched by the production
@@ -73,6 +75,18 @@ function serve(req: http.IncomingMessage, res: http.ServerResponse): void {
     case '/file.bin':
       res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-disposition': 'attachment; filename="file.bin"' });
       return void res.end('PAYLOAD');
+    case '/slow.bin': {
+      // About 2 s, so a second download can begin while this one runs.
+      res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-disposition': 'attachment; filename="slow.bin"' });
+      let n = 0;
+      const tick = setInterval(() => {
+        res.write('PAYLOAD\n');
+        if (++n >= 20) { clearInterval(tick); res.end(); }
+      }, 100);
+      return;
+    }
+    case '/two-downloads':
+      return html('<a id="d" href="/slow.bin">slow</a><a id="e" href="/file.bin">file</a>');
     default:
       return html(`${host}${req.url}`);
   }
@@ -87,6 +101,7 @@ interface Rig {
   hosts: HostPolicy;
   browser: Browser | null;
   dir: string;
+  profile: TempChromeProfile;
 }
 
 function plan(rig: Rig): ChromeProtectionPlan {
@@ -98,8 +113,9 @@ function plan(rig: Rig): ChromeProtectionPlan {
 }
 
 function makeRig(allow: string[]): Rig {
-  const dir = mkdtempSync(join(tmpdir(), 'wmux-protected-chrome-'));
-  const rig: Rig = { launcher: null as unknown as ChromeLauncher, hosts: { mode: 'allowlist', allow, block: [] }, browser: null, dir };
+  const profile = tempChromeProfile('wmux-protected-chrome-');
+  const dir = profile.dir;
+  const rig: Rig = { launcher: null as unknown as ChromeLauncher, hosts: { mode: 'allowlist', allow, block: [] }, browser: null, dir, profile };
   rig.launcher = new ChromeLauncher(dir, {
     portEnvVar: null,
     profileName: `protected-${allow.join('-') || 'none'}`,
@@ -137,35 +153,39 @@ const settle = (ms = 800) => new Promise((r) => setTimeout(r, ms));
 let rigA: Rig;
 let rigB: Rig;
 let skipReason: string | null = null;
-const realUserProfile = process.env.WMUX_TEST_REAL_HOME;
+/** What the fixture serves as downloads; the account's real Downloads folder is checked for these, read only. */
+const SERVED_FILES = ['file.bin', 'slow.bin'];
+let accountBefore = new Set<string>();
 
 beforeAll(async () => {
+  accountBefore = accountDownloads(SERVED_FILES);
   server = http.createServer(serve);
   const wss = new WebSocketServer({ server });
   wss.on('connection', (_s, req) => hits.push(`${hostOf(req)} ws-connected`));
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   port = (server.address() as AddressInfo).port;
-  // Chrome under the isolate setup's temp USERPROFILE refuses remote
-  // debugging on Windows (see realProfileBrowserEnv); give it the real one.
-  const savedProfile = process.env.USERPROFILE;
-  if (process.platform === 'win32' && realUserProfile) process.env.USERPROFILE = realUserProfile;
   try {
     rigA = makeRig(['a.test']);
     rigB = makeRig(['b.test']);
     await attach(rigA);
   } catch (err) {
     skipReason = `Chrome could not be launched here: ${err instanceof Error ? err.message.split('\n')[0] : String(err)}`;
-  } finally {
-    if (process.platform === 'win32') process.env.USERPROFILE = savedProfile;
   }
 }, 120_000);
 
 afterAll(async () => {
   await rigA?.browser?.close().catch(() => undefined);
   await rigB?.browser?.close().catch(() => undefined);
-  await Promise.all([rigA?.launcher.dispose(), rigB?.launcher.dispose()]);
+  await Promise.all([stopChrome(rigA?.launcher), stopChrome(rigB?.launcher)]);
   server?.close();
-});
+  try {
+    // Every download went to a temp folder: nothing new in the account's own.
+    expect([...accountDownloads(SERVED_FILES)].filter((name) => !accountBefore.has(name))).toEqual([]);
+  } finally {
+    // After Chrome has gone, launched or not.
+    await Promise.all([rigA?.profile.remove(), rigB?.profile.remove()]);
+  }
+}, CHROME_TEARDOWN_TIMEOUT_MS);
 
 function skipUnless(ctx: { skip: (note?: string) => void }): boolean {
   if (!skipReason) return false;
@@ -240,15 +260,100 @@ describe('protected Chrome profile (real Chrome)', { timeout: CASE_TIMEOUT_MS },
     await p.close();
   });
 
+  // Best effort on the port: the guard denies a client's context on its next
+  // re-assert, so a download in one created less than a tick ago may still run.
+  it('denies a download in a client-created context once a re-assert has passed', async (ctx) => {
+    if (skipUnless(ctx)) return;
+    const own = await (rigA.browser ?? (await attach(rigA))).newContext({ acceptDownloads: true });
+    const p = await own.newPage();
+    await p.goto(`http://a.test:${port}/download`);
+    await settle(600);
+    const started = p.waitForEvent('download', { timeout: 5_000 }).catch(() => null);
+    await p.click('#d');
+    const download = await started;
+    if (download) expect(await download.failure()).toBe('canceled');
+    await own.close();
+  });
+
+  describe('an approved download (consent) with other connections attached', () => {
+    /** What a wmux browser engine does on a protected pane: connectOverCDP, then a browser session that holds deny. */
+    async function engine(): Promise<Browser> {
+      const { chromium } = await import('playwright-core');
+      const b = await chromium.connectOverCDP(`http://127.0.0.1:${rigA.launcher.currentPort()}`);
+      const s = await b.newBrowserCDPSession();
+      await s.send('Browser.setDownloadBehavior', { behavior: 'deny' });
+      return b;
+    }
+    async function targetIdOf(p: Page): Promise<string> {
+      const s = await p.context().newCDPSession(p);
+      const { targetInfo } = (await s.send('Target.getTargetInfo')) as { targetInfo: { targetId: string } };
+      await s.detach();
+      return targetInfo.targetId;
+    }
+    async function pass(p: Page) {
+      const guard = rigA.launcher.consentDownloadGuard();
+      if (!guard) throw new Error('no download guard');
+      const dir = rigA.profile.scratch('wmux-consent-');
+      return openDownloadPass(guard, {
+        frameId: await targetIdOf(p),
+        approvedHost: 'a.test',
+        hostOf: (u) => { try { return new URL(u).hostname; } catch { return null; } },
+        dir,
+        startTimeoutMs: 8_000,
+        finishTimeoutMs: 15_000,
+        join: (d, n) => join(d, n),
+      });
+    }
+    const finished = (d: { path: string }) => existsSync(d.path) && readFileSync(d.path, 'utf8').includes('PAYLOAD');
+
+    for (const how of ['stays', 'leaves']) it(`an approved download finishes when another connection attaches and ${how}`, async (ctx) => {
+      if (skipUnless(ctx)) return;
+      const p = await newPage(rigA);
+      await p.goto(`http://a.test:${port}/download`);
+      const approved = await pass(p);
+      const other = await engine();
+      if (how === 'leaves') await other.close();
+      // One re-assert tick for the pass's own behaviour to be back.
+      await settle(600);
+      await p.click('#d');
+      expect(finished(await approved.done)).toBe(true);
+      if (how === 'stays') await other.close();
+      await p.close();
+    });
+
+    it('a second download during the pass is cancelled, the approved one still finishes, and deny is back after', async (ctx) => {
+      if (skipUnless(ctx)) return;
+      const p = await newPage(rigA);
+      await p.goto(`http://a.test:${port}/two-downloads`);
+      const stray = await newPage(rigA);
+      await stray.goto(`http://a.test:${port}/download`);
+      const approved = await pass(p);
+      const other = await engine();
+      await settle(600);
+      const first = p.waitForEvent('download', { timeout: 5_000 });
+      await p.click('#d');
+      expect((await first).url()).toContain('/slow.bin');
+      // While the approved one runs: one more from the same tab, and one from another tab.
+      const again = p.waitForEvent('download', { timeout: 5_000 }).catch(() => null);
+      await p.click('#e');
+      const fromOther = stray.waitForEvent('download', { timeout: 5_000 }).catch(() => null);
+      await stray.click('#d');
+      for (const d of [await again, await fromOther]) if (d) expect(await d.failure()).toBe('canceled');
+      expect(finished(await approved.done)).toBe(true);
+      // The pass is over: deny again.
+      const after = p.waitForEvent('download', { timeout: 5_000 }).catch(() => null);
+      await p.click('#e');
+      const late = await after;
+      if (late) expect(await late.failure()).toBe('canceled');
+      await other.close();
+      await stray.close();
+      await p.close();
+    });
+  });
+
   it('runs two protected profiles side by side, each held to its own hosts', async (ctx) => {
     if (skipUnless(ctx)) return;
-    const savedProfile = process.env.USERPROFILE;
-    if (process.platform === 'win32' && realUserProfile) process.env.USERPROFILE = realUserProfile;
-    try {
-      await attach(rigB);
-    } finally {
-      if (process.platform === 'win32') process.env.USERPROFILE = savedProfile;
-    }
+    await attach(rigB);
     expect(rigA.launcher.currentPort()).not.toBe(rigB.launcher.currentPort());
     const pb = await newPage(rigB);
     await pb.goto(`http://b.test:${port}/mine`);

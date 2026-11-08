@@ -608,6 +608,23 @@ describe('DaemonSessionManager', () => {
     expect(session?.meta.rows).toBe(40);
   });
 
+  it("records a size as provisional only while an attached viewer's replay is not out", () => {
+    manager.createSession({ id: 'rsz-prov', cmd: 'cmd.exe', cwd: '.', cols: 80, rows: 24 });
+    const ring = manager.getSession('rsz-prov')!.ringBuffer;
+    const note = vi.spyOn(ring, 'noteGeometry');
+    let pending = true;
+    manager.setReplayPendingProbe((id) => id === 'rsz-prov' && pending);
+
+    manager.resizeSession('rsz-prov', 120, 40);
+    expect(note).toHaveBeenLastCalledWith(120, 40, false);
+    expect(ring.geometryPending).toBe(true);
+
+    pending = false;
+    manager.resizeSession('rsz-prov', 100, 30);
+    expect(note).toHaveBeenLastCalledWith(100, 30, true);
+    expect(ring.geometryPending).toBe(false);
+  });
+
   it('throws when resizing non-existent session', () => {
     expect(() => manager.resizeSession('nope', 80, 24)).toThrow("Session 'nope' not found");
   });
@@ -1800,6 +1817,56 @@ describe('DaemonSessionManager', () => {
         manager.createSession({ id: 'live-guard', cmd: 'pwsh.exe', cwd: '.' });
         const live = manager.getSession('live-guard')!;
         expect(() => manager.reinsertSession(live)).toThrow(/not 'dead'/);
+      });
+
+      // The dead pane's last screen lives in its ring (serializeSession,
+      // readSessionText). A restart whose spawn fails puts the record back,
+      // so the ring must survive the unlink and the undo.
+      it('keeps the tombstone ring replayable through a restart whose create fails', async () => {
+        manager.createSession({ id: 'other', cmd: 'pwsh.exe', cwd: '.' });
+        manager.createSession({ id: 'keep', cmd: 'pwsh.exe', cwd: '.', exec: { command: 'claude /loop' } });
+        lastMockPty?.simulateData('last screen\r\n');
+        lastMockPty?.simulateExit(1);
+        const managed = manager.getSession('keep')!;
+        expect(managed.ringBuffer.readAll().toString()).toContain('last screen');
+
+        // One live pane under a cap of one: the restart's create is refused.
+        const cfg = createDefaultConfig();
+        cfg.session.maxSessions = 1;
+        manager.setConfig(cfg);
+        manager.removeTombstone('keep');
+        // Still readable while the replacement is pending.
+        expect(managed.ringBuffer.readAll().toString()).toContain('last screen');
+        await expect(
+          manager.createSessionAsync({ id: 'keep', cmd: 'pwsh.exe', cwd: '.', exec: { command: 'claude /loop' } }),
+        ).rejects.toThrow(/Cannot create new terminal/);
+        manager.reinsertSession(managed);
+
+        const back = manager.getSession('keep')!;
+        expect(back.ringBuffer.readAll().toString()).toContain('last screen');
+        expect(() => back.ringBuffer.noteGeometry(100, 30)).not.toThrow();
+      });
+
+      it('releases the old ring exactly once, after the replacement exists', async () => {
+        manager.createSession({ id: 'swap', cmd: 'pwsh.exe', cwd: '.', exec: { command: 'claude /loop' } });
+        lastMockPty?.simulateData('old screen\r\n');
+        lastMockPty?.simulateExit(1);
+        const old = manager.getSession('swap')!;
+        const dispose = vi.spyOn(old.ringBuffer, 'dispose');
+
+        manager.removeTombstone('swap');
+        const pending = manager.createSessionAsync({ id: 'swap', cmd: 'pwsh.exe', cwd: '.', exec: { command: 'claude /loop' } });
+        // The create is pending: the old scrollback is still there to replay.
+        expect(old.ringBuffer.readAll().toString()).toContain('old screen');
+        await pending;
+        expect(dispose).not.toHaveBeenCalled();
+
+        manager.releaseTombstone(old);
+        expect(dispose).toHaveBeenCalledTimes(1);
+        // Only an unlinked record can be released: never the live replacement.
+        const fresh = manager.getSession('swap')!;
+        expect(() => manager.releaseTombstone(fresh)).toThrow(/still in the session map/);
+        expect(() => fresh.ringBuffer.noteGeometry(100, 30)).not.toThrow();
       });
     });
   });

@@ -21,8 +21,8 @@
  * Terminal missed is replayed over it by the daemon's live re-flush.
  */
 import type { DaemonClient } from '../../DaemonClient';
-import { SNAPSHOT_MAX_SCROLLBACK } from '../../../shared/terminal/attachSnapshot';
 import type { SessionResync } from './sessionResync';
+import { attachScrollback } from '../../session/rendererScrollback';
 
 export type ReconnectPipeClient = Pick<DaemonClient, 'rpc' | 'connectSessionPipe' | 'isSessionPipeWritable' | 'sessionPipeFlushPending'>;
 
@@ -50,9 +50,45 @@ export interface ReconnectPipeOptions {
   resync: SessionResync;
   /** Install this reconnect's session:data forwarder (replace semantics). */
   installListener: () => void;
+  /**
+   * The session's pipe was just replaced (a full attach, never a kept pipe),
+   * before the new one delivered anything: what main holds of the old pipe's
+   * stream, such as the first bytes of a UTF-8 code point split at a chunk
+   * end, will never be completed.
+   */
+  replacingPipe?: () => void;
 }
 
-export async function reconnectSessionPipe(
+// One pipe step per session at a time. Two Terminals can reattach the same
+// pane at once (a split remounts it while the first mount's reconnect is still
+// in flight): run together, each attach stops the pipe the other just
+// connected, so one of them answers not-writable (or its connect finds no
+// socket) and its renderer retries a full attach later, after the other's
+// pipe already delivered live output. Chained, the second runs on the state
+// the first left: it attaches after the first has finished, never under it.
+const pipeSteps = new Map<string, Promise<unknown>>();
+
+export function reconnectSessionPipe(
+  client: ReconnectPipeClient,
+  id: string,
+  opts: ReconnectPipeOptions,
+): Promise<ReconnectPipeOutcome> {
+  // A stored tail never rejects, so the next step always runs.
+  const run = (pipeSteps.get(id) ?? Promise.resolve()).then(() => attachSessionPipe(client, id, opts));
+  const tail = run.then(() => undefined, () => undefined);
+  pipeSteps.set(id, tail);
+  void tail.then(() => {
+    if (pipeSteps.get(id) === tail) pipeSteps.delete(id);
+  });
+  return run;
+}
+
+/** Test seam: sessions with a pipe step queued or running. */
+export function __pipeStepsInFlightForTests(): number {
+  return pipeSteps.size;
+}
+
+async function attachSessionPipe(
   client: ReconnectPipeClient,
   id: string,
   opts: ReconnectPipeOptions,
@@ -83,9 +119,12 @@ export async function reconnectSessionPipe(
   // #2398 — the attach promotes only as `promote` says: a daemon that
   // restarted since the list holds a WSL session as a pending recovery
   // again, and a caller that may not start it leaves it pending (held).
-  const attached = await client.rpc('daemon.attachSession', { id, promote: opts.promote }) as { pending?: boolean } | undefined;
+  const attached = await client.rpc('daemon.attachSession', { id, promote: opts.promote, scrollback: attachScrollback() }) as { pending?: boolean } | undefined;
   if (attached?.pending) return { kind: 'pending' };
   await client.connectSessionPipe(id, { forceFresh: true });
+  // The old socket is gone now (connectSessionPipe destroys it synchronously,
+  // and its late data is dropped), and the new one has delivered nothing yet.
+  opts.replacingPipe?.();
 
   // Health probe: confirm the freshly connected pipe is actually
   // writable before reporting success. A truthy reconnect that
@@ -116,9 +155,9 @@ async function keepCreatePipe(
   // re-flush in progress also reads as a pending flush; it is joined below.)
   if (client.sessionPipeFlushPending(id) && !opts.resync.inFlight(id)) return { kind: 'kept', replay: 'initial-flush' };
   // The same live re-flush a reveal asks for, joined if one is running, at
-  // the attach flush's scrollback bound (it replaces that flush). The socket
-  // stays up, so input keeps flowing while the screen is replayed.
-  const res = await opts.resync(id, SNAPSHOT_MAX_SCROLLBACK);
+  // the attach flush's scrollback (it replaces that flush). The socket stays
+  // up, so input keeps flowing while the screen is replayed.
+  const res = await opts.resync(id, attachScrollback());
   if (res.success) return { kind: 'kept', replay: 'reflush' };
   // No live scanner on the pipe, no re-flush the daemon could give (it has no
   // flushed client on this pipe: stopped, its close not seen here yet), or no

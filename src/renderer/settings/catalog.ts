@@ -132,7 +132,9 @@ export const SETTINGS_CATALOG: SettingsCatalogEntry[] = [
   { id: 'shell', tab: 'terminal', labelKey: 'settings.defaultShell', synonyms: 'zsh bash powershell pwsh fish 셸' },
   { id: 'startdir', tab: 'terminal', labelKey: 'settings.startupDirectory', descKey: 'settings.startupDirectoryDesc', synonyms: 'cwd home folder path' },
   { id: 'splitcwd', tab: 'terminal', labelKey: 'settings.splitInheritsCwd', descKey: 'settings.splitInheritsCwdDesc', synonyms: 'cwd split inherit' },
+  { id: 'openfilelinksin', tab: 'terminal', labelKey: 'settings.openFileLinksIn', descKey: 'settings.openFileLinksInDesc', synonyms: 'file path link click editor tab os opener system default app 파일 링크 편집기 열기' },
   { id: 'closeonexit', tab: 'terminal', labelKey: 'settings.closeTabOnShellExit', descKey: 'settings.closeTabOnShellExitDesc', synonyms: 'exit close tab shell ctrl+d' },
+  { id: 'a2a-terminal-names', tab: 'terminal', labelKey: 'settings.a2aTerminalNames', descKey: 'settings.a2aTerminalNamesDesc', synonyms: 'a2a name terminal title osc agent rename sender' },
   { id: 'plaindragselect', tab: 'terminal', labelKey: 'settings.plainDragSelect', descKey: 'settings.plainDragSelectDesc', synonyms: 'mouse drag select selection copy highlight codex tracking shift option alt 드래그 선택 마우스' },
   { id: 'ime', tab: 'terminal', labelKey: 'settings.imeResidueGuard', descKey: 'settings.imeResidueGuardDesc', synonyms: 'ime korean cjk hangul 한글 입력' },
   { id: 'retention', tab: 'terminal', labelKey: 'settings.hiddenPaneRetention', descKey: 'settings.hiddenPaneRetentionDesc', synonyms: 'hidden render cpu park' },
@@ -168,6 +170,7 @@ export const SETTINGS_CATALOG: SettingsCatalogEntry[] = [
   { id: 'wsprwake', tab: 'notifications', labelKey: 'settings.prWake', descKey: 'settings.prWakeDesc', synonyms: 'pull request ci checks review comment conflict nudge agent' },
   { id: 'labs-compact-scrollback', tab: 'labs', labelKey: 'settings.labsCompactScrollback', descKey: 'settings.labsCompactScrollbackDesc', synonyms: 'labs experimental memory ram scrollback compress 실험 메모리 압축 스크롤백' },
   { id: 'labs-shared-webgl', tab: 'labs', labelKey: 'settings.labsSharedWebgl', descKey: 'settings.labsSharedWebglDesc', synonyms: 'labs experimental gpu webgl renderer atlas memory 실험 그래픽 메모리' },
+  { id: 'labs-wongtty', tab: 'labs', labelKey: 'settings.labsWongtty', descKey: 'settings.labsWongttyDesc', synonyms: 'labs experimental wongtty rust wasm webassembly xterm front end renderer memory 실험 러스트 메모리' },
   { id: 'labs-ring-compression', tab: 'labs', labelKey: 'settings.labsRingCompression', descKey: 'settings.labsRingCompressionDesc', synonyms: 'labs experimental daemon buffer compress memory 실험 데몬 버퍼 압축 메모리' },
 
   { id: 'quicklaunch', tab: 'shortcuts', labelKey: 'settings.quickLaunch', descKey: 'settings.quickLaunchDesc', synonyms: 'quick launch global shortcut hotkey composer spotlight launcher prompt 빠른 실행 전역 단축키' },

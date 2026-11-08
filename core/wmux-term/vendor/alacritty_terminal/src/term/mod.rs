@@ -286,9 +286,6 @@ pub struct Term<T> {
     /// primary grid. Otherwise it is the alternate screen buffer.
     inactive_grid: Grid<Cell>,
 
-    /// Index into `charsets`, pointing to what ASCII is currently being mapped to.
-    active_charset: CharsetIndex,
-
     /// Tabstops.
     tabs: TabStops,
 
@@ -432,7 +429,6 @@ impl<T> Term<T> {
             tabs,
             inactive_keyboard_mode_stack: Default::default(),
             keyboard_mode_stack: Default::default(),
-            active_charset: Default::default(),
             vi_mode_cursor: Default::default(),
             cursor_style: Default::default(),
             colors: color::Colors::default(),
@@ -681,6 +677,11 @@ impl<T> Term<T> {
         let is_alt = self.mode.contains(TermMode::ALT_SCREEN);
         self.grid.resize(!is_alt, num_lines, num_cols);
         self.inactive_grid.resize(is_alt, num_lines, num_cols);
+        // wmux: the alternate screen is cleared before it is shown again, so
+        // its kept cells (grid/row.rs `hidden`) are not kept while it is not.
+        if !is_alt {
+            self.inactive_grid.drop_kept_cells();
+        }
 
         // Invalidate selection and tabs only when necessary.
         if old_cols != num_cols {
@@ -723,6 +724,7 @@ impl<T> Term<T> {
 
             // Drop information about the primary screens saved cursor.
             self.grid.saved_cursor = self.grid.cursor.clone();
+            self.grid.cursor_saved = true;
 
             // Reset alternate screen contents.
             self.inactive_grid.reset_region(..);
@@ -735,6 +737,10 @@ impl<T> Term<T> {
 
         mem::swap(&mut self.grid, &mut self.inactive_grid);
         self.mode ^= TermMode::ALT_SCREEN;
+        // wmux: left the alternate screen: its kept cells are never shown again.
+        if !self.mode.contains(TermMode::ALT_SCREEN) {
+            self.inactive_grid.drop_kept_cells();
+        }
         self.selection = None;
         self.mark_fully_damaged();
     }
@@ -790,6 +796,23 @@ impl<T> Term<T> {
         let line = &mut self.vi_mode_cursor.point.line;
         if (top <= *line) && region.end > *line {
             *line = cmp::max(*line - lines, top);
+        }
+        self.mark_fully_damaged();
+    }
+
+    /// wmux: the region from `origin` moves up in place, as xterm.js's
+    /// deleteLines and scrollUp run; unlike `scroll_up_relative`, nothing
+    /// enters history when the region starts at the top row.
+    fn scroll_up_in_place(&mut self, origin: Line, lines: usize) {
+        let lines = cmp::min(lines, (self.scroll_region.end - origin).0 as usize);
+        let region = origin..self.scroll_region.end;
+
+        self.selection = self.selection.take().and_then(|s| s.rotate(self, &region, lines as i32));
+        self.grid.scroll_up_in_place(&region, lines);
+
+        let line = &mut self.vi_mode_cursor.point.line;
+        if region.start <= *line && region.end > *line {
+            *line = cmp::max(*line - lines, region.start);
         }
         self.mark_fully_damaged();
     }
@@ -987,7 +1010,8 @@ impl<T> Term<T> {
     /// Write `c` to the cell at the cursor position.
     #[inline(always)]
     fn write_at_cursor(&mut self, c: char) {
-        let c = self.grid.cursor.charsets[self.active_charset].map(c);
+        // wmux: xterm.js's DEC graphics table has no `_`, so it prints as is.
+        let c = if c == '_' { c } else { self.grid.cursor.charsets[self.grid.cursor.active_charset].map(c) };
         let fg = self.grid.cursor.template.fg;
         let bg = self.grid.cursor.template.bg;
         let flags = self.grid.cursor.template.flags;
@@ -1094,35 +1118,44 @@ impl<T: EventListener> Handler for Term<T> {
             self.wrapline();
         }
 
-        // If in insert mode, first shift cells to the right.
         let columns = self.columns();
-        if self.mode.contains(TermMode::INSERT) && self.grid.cursor.point.column + width < columns {
-            let line = self.grid.cursor.point.line;
-            let col = self.grid.cursor.point.column;
-            let row = &mut self.grid[line][..];
 
-            for col in (col.0..(columns - width)).rev() {
-                row.swap(col + width, col);
+        // wmux: a wide glyph that does not fit wraps (or is dropped) before
+        // insert mode shifts anything, as xterm does.
+        if width == 2 && self.grid.cursor.point.column + 1 >= columns {
+            if self.mode.contains(TermMode::LINE_WRAP) {
+                // Insert placeholder before wide char if glyph does not fit in this row.
+                self.grid.cursor.template.flags.insert(Flags::LEADING_WIDE_CHAR_SPACER);
+                self.write_at_cursor(' ');
+                self.grid.cursor.template.flags.remove(Flags::LEADING_WIDE_CHAR_SPACER);
+                self.wrapline();
+            } else {
+                // Prevent out of bounds crash when linewrapping is disabled.
+                self.grid.cursor.input_needs_wrap = true;
+                return;
             }
+        }
+
+        // If in insert mode, first shift cells to the right.
+        if self.mode.contains(TermMode::INSERT) {
+            // wmux: over the physical line, as xterm's insertCells: on a row
+            // that keeps cells past a narrower width, into them. A wide glyph
+            // shifted into the last visible column cannot stay whole there:
+            // xterm blanks that cell (the spacer past it stays, as xterm's).
+            let line = self.grid.cursor.point.line;
+            let col = self.grid.cursor.point.column.0;
+            let bg = self.grid.cursor.template.bg;
+            self.grid[line].with_physical(|cells| {
+                insert_cells(cells, col, width, || bg.into());
+                if cells[columns - 1].flags.contains(Flags::WIDE_CHAR) {
+                    cells[columns - 1] = bg.into();
+                }
+            });
         }
 
         if width == 1 {
             self.write_at_cursor(c);
         } else {
-            if self.grid.cursor.point.column + 1 >= columns {
-                if self.mode.contains(TermMode::LINE_WRAP) {
-                    // Insert placeholder before wide char if glyph does not fit in this row.
-                    self.grid.cursor.template.flags.insert(Flags::LEADING_WIDE_CHAR_SPACER);
-                    self.write_at_cursor(' ');
-                    self.grid.cursor.template.flags.remove(Flags::LEADING_WIDE_CHAR_SPACER);
-                    self.wrapline();
-                } else {
-                    // Prevent out of bounds crash when linewrapping is disabled.
-                    self.grid.cursor.input_needs_wrap = true;
-                    return;
-                }
-            }
-
             // Write full width glyph to current cursor cell.
             self.grid.cursor.template.flags.insert(Flags::WIDE_CHAR);
             self.write_at_cursor(c);
@@ -1146,11 +1179,21 @@ impl<T: EventListener> Handler for Term<T> {
     fn decaln(&mut self) {
         trace!("Decalnning");
 
+        let columns = self.columns();
         for line in (0..self.screen_lines()).map(Line::from) {
-            for column in 0..self.columns() {
+            for column in 0..columns {
                 let cell = &mut self.grid[line][Column(column)];
                 *cell = Cell::default();
                 cell.c = 'E';
+            }
+            // wmux: xterm fills the whole physical line, kept cells included.
+            if self.grid[line].hidden_len() > 0 {
+                self.grid[line].with_physical(|cells| {
+                    for cell in &mut cells[columns..] {
+                        *cell = Cell::default();
+                        cell.c = 'E';
+                    }
+                });
             }
         }
 
@@ -1190,30 +1233,13 @@ impl<T: EventListener> Handler for Term<T> {
 
     #[inline]
     fn insert_blank(&mut self, count: usize) {
-        let cursor = &self.grid.cursor;
-        let bg = cursor.template.bg;
-
-        // Ensure inserting within terminal bounds
-        let count = cmp::min(count, self.columns() - cursor.point.column.0);
-
-        let source = cursor.point.column;
-        let destination = cursor.point.column.0 + count;
-        let num_cells = self.columns() - destination;
-
-        let line = cursor.point.line;
+        // wmux: over the physical line, as xterm's insertCells: on a row that
+        // keeps cells past a narrower width, the visible end moves into them.
+        let bg = self.grid.cursor.template.bg;
+        let line = self.grid.cursor.point.line;
+        let col = self.grid.cursor.point.column.0;
         self.damage.damage_line(line.0 as usize, 0, self.columns() - 1);
-
-        let row = &mut self.grid[line][..];
-
-        for offset in (0..num_cells).rev() {
-            row.swap(destination + offset, source.0 + offset);
-        }
-
-        // Cells were just moved out toward the end of the line;
-        // fill in between source and dest with blanks.
-        for cell in &mut row[source.0..destination] {
-            *cell = bg.into();
-        }
+        self.grid[line].with_physical(|cells| insert_cells(cells, col, count, || bg.into()));
     }
 
     #[inline]
@@ -1378,7 +1404,7 @@ impl<T: EventListener> Handler for Term<T> {
         while self.grid.cursor.point.column < self.columns() && count != 0 {
             count -= 1;
 
-            let c = self.grid.cursor.charsets[self.active_charset].map('\t');
+            let c = self.grid.cursor.charsets[self.grid.cursor.active_charset].map('\t');
             let cell = self.grid.cursor_cell();
             if cell.c == ' ' {
                 cell.c = c;
@@ -1429,7 +1455,8 @@ impl<T: EventListener> Handler for Term<T> {
         trace!("Linefeed");
         let next = self.grid.cursor.point.line + 1;
         if next == self.scroll_region.end {
-            self.scroll_up(1);
+            // wmux: not `scroll_up`, which is SU's in-place scroll.
+            self.scroll_up_relative(self.scroll_region.start, 1);
         } else if next < self.screen_lines() {
             self.damage_cursor();
             self.grid.cursor.point.line += 1;
@@ -1488,14 +1515,20 @@ impl<T: EventListener> Handler for Term<T> {
 
     #[inline]
     fn scroll_up(&mut self, lines: usize) {
+        // wmux: SU (`CSI S`) scrolls the region in place, as xterm.js's
+        // scrollUp does; only a linefeed moves rows into history.
         let origin = self.scroll_region.start;
-        self.scroll_up_relative(origin, lines);
+        self.scroll_up_in_place(origin, lines);
     }
 
     #[inline]
     fn scroll_down(&mut self, lines: usize) {
+        // wmux: SD (`CSI T`) fills with default attributes, as xterm.js's
+        // scrollDown does; IL and RI keep the erase colour.
+        let template = mem::take(&mut self.grid.cursor.template);
         let origin = self.scroll_region.start;
         self.scroll_down_relative(origin, lines);
+        self.grid.cursor.template = template;
     }
 
     #[inline]
@@ -1516,7 +1549,7 @@ impl<T: EventListener> Handler for Term<T> {
         trace!("Deleting {lines} lines");
 
         if lines > 0 && self.scroll_region.contains(&origin) {
-            self.scroll_up_relative(origin, lines);
+            self.scroll_up_in_place(origin, lines);
         }
     }
 
@@ -1532,11 +1565,13 @@ impl<T: EventListener> Handler for Term<T> {
         // Cleared cells have current background color set.
         let bg = self.grid.cursor.template.bg;
         let line = cursor.point.line;
-        self.damage.damage_line(line.0 as usize, start.0, end.0);
-        let row = &mut self.grid[line];
-        for cell in &mut row[start..end] {
-            *cell = bg.into();
-        }
+
+        // wmux: up to the physical end, as xterm's replaceCells: into the
+        // cells a row keeps past a narrower width.
+        self.damage.damage_line(line.0 as usize, start.0.saturating_sub(1), end.0);
+        self.grid[line].with_physical(|cells| {
+            replace_cells(cells, start.0, start.0.saturating_add(count), || bg.into())
+        });
     }
 
     #[inline]
@@ -1545,27 +1580,14 @@ impl<T: EventListener> Handler for Term<T> {
         let cursor = &self.grid.cursor;
         let bg = cursor.template.bg;
 
-        // Ensure deleting within terminal bounds.
-        let count = cmp::min(count, columns);
-
-        let start = cursor.point.column.0;
-        let end = cmp::min(start + count, columns - 1);
-        let num_cells = columns - end;
-
+        // wmux: over the physical line, as xterm's deleteCells: only cells
+        // from the cursor on move (upstream cleared from `columns - count`,
+        // left of the cursor for a large count); on a row that keeps cells
+        // past a narrower width, they move into view.
         let line = cursor.point.line;
-        self.damage.damage_line(line.0 as usize, 0, self.columns() - 1);
-        let row = &mut self.grid[line][..];
-
-        for offset in 0..num_cells {
-            row.swap(start + offset, end + offset);
-        }
-
-        // Clear last `count` cells in the row. If deleting 1 char, need to delete
-        // 1 cell.
-        let end = columns - count;
-        for cell in &mut row[end..] {
-            *cell = bg.into();
-        }
+        let col = cursor.point.column.0;
+        self.damage.damage_line(line.0 as usize, 0, columns - 1);
+        self.grid[line].with_physical(|cells| delete_cells(cells, col, count, || bg.into()));
     }
 
     #[inline]
@@ -1625,6 +1647,7 @@ impl<T: EventListener> Handler for Term<T> {
         trace!("Saving cursor position");
 
         self.grid.saved_cursor = self.grid.cursor.clone();
+        self.grid.cursor_saved = true;
     }
 
     #[inline]
@@ -1632,7 +1655,13 @@ impl<T: EventListener> Handler for Term<T> {
         trace!("Restoring cursor position");
 
         self.damage_cursor();
+        let charsets = self.grid.cursor.charsets;
         self.grid.cursor = self.grid.saved_cursor.clone();
+        // wmux: with nothing saved, xterm.js keeps the designations (and
+        // returns to G0, as the default cursor does).
+        if !self.grid.cursor_saved {
+            self.grid.cursor.charsets = charsets;
+        }
         self.damage_cursor();
     }
 
@@ -1765,7 +1794,7 @@ impl<T: EventListener> Handler for Term<T> {
                 // If clearing more than one line.
                 if cursor.line > 1 {
                     // Fully clear all lines before the current line.
-                    self.grid.reset_region(..cursor.line);
+                    self.grid.reset_region_keep_width(..cursor.line);
                 }
 
                 // Clear up to the current column in the current line.
@@ -1784,7 +1813,7 @@ impl<T: EventListener> Handler for Term<T> {
                 }
 
                 if (cursor.line.0 as usize) < screen_lines - 1 {
-                    self.grid.reset_region((cursor.line + 1)..);
+                    self.grid.reset_region_keep_width((cursor.line + 1)..);
                 }
 
                 let range = cursor.line..Line(screen_lines as i32);
@@ -1792,7 +1821,7 @@ impl<T: EventListener> Handler for Term<T> {
             },
             ansi::ClearMode::All => {
                 if self.mode.contains(TermMode::ALT_SCREEN) {
-                    self.grid.reset_region(..);
+                    self.grid.reset_region_keep_width(..);
                 } else {
                     let old_offset = self.grid.display_offset();
 
@@ -1841,7 +1870,6 @@ impl<T: EventListener> Handler for Term<T> {
         if self.mode.contains(TermMode::ALT_SCREEN) {
             mem::swap(&mut self.grid, &mut self.inactive_grid);
         }
-        self.active_charset = Default::default();
         self.cursor_style = None;
         self.grid.reset();
         self.inactive_grid.reset();
@@ -1867,7 +1895,8 @@ impl<T: EventListener> Handler for Term<T> {
         trace!("Reversing index");
         // If cursor is at the top.
         if self.grid.cursor.point.line == self.scroll_region.start {
-            self.scroll_down(1);
+            // wmux: not `scroll_down`, which is SD's default-attribute fill.
+            self.scroll_down_relative(self.scroll_region.start, 1);
         } else {
             self.damage_cursor();
             self.grid.cursor.point.line = cmp::max(self.grid.cursor.point.line - 1, Line(0));
@@ -2203,7 +2232,7 @@ impl<T: EventListener> Handler for Term<T> {
     #[inline]
     fn set_active_charset(&mut self, index: CharsetIndex) {
         trace!("Setting active charset {index:?}");
-        self.active_charset = index;
+        self.grid.cursor.active_charset = index;
     }
 
     #[inline]
@@ -2292,6 +2321,87 @@ enum ModeState {
 impl From<bool> for ModeState {
     fn from(value: bool) -> Self {
         if value { Self::Set } else { Self::Reset }
+    }
+}
+
+/// wmux: xterm's `BufferLine.insertCells` over a physical line: `n` cells
+/// from `fill` at `pos`, the end dropped. As xterm, a wide glyph cut at
+/// `pos` or pushed to the end loses its first cell to `fill`.
+fn insert_cells(cells: &mut [Cell], pos: usize, n: usize, fill: impl Fn() -> Cell) {
+    let len = cells.len();
+    if pos >= len {
+        return;
+    }
+    if pos > 0 && cells[pos - 1].flags.contains(Flags::WIDE_CHAR) {
+        cells[pos - 1] = fill();
+    }
+    insert_shift(cells, pos, n, &fill);
+    if cells[len - 1].flags.contains(Flags::WIDE_CHAR) {
+        cells[len - 1] = fill();
+    }
+}
+
+fn insert_shift(cells: &mut [Cell], pos: usize, n: usize, fill: &impl Fn() -> Cell) {
+    let len = cells.len();
+    if n < len - pos {
+        for i in (pos + n..len).rev() {
+            cells.swap(i, i - n);
+        }
+        for cell in &mut cells[pos..pos + n] {
+            *cell = fill();
+        }
+    } else {
+        for cell in &mut cells[pos..] {
+            *cell = fill();
+        }
+    }
+}
+
+/// wmux: xterm's `BufferLine.deleteCells` over a physical line: `n` cells
+/// at `pos` removed, the end filled from `fill`. As xterm, a wide glyph cut
+/// at `pos` loses its first cell, and a bare spacer left at `pos` is filled.
+fn delete_cells(cells: &mut [Cell], pos: usize, n: usize, fill: impl Fn() -> Cell) {
+    let len = cells.len();
+    if pos >= len {
+        return;
+    }
+    if n < len - pos {
+        for i in pos..len - n {
+            cells.swap(i, i + n);
+        }
+        for cell in &mut cells[len - n..] {
+            *cell = fill();
+        }
+    } else {
+        for cell in &mut cells[pos..] {
+            *cell = fill();
+        }
+    }
+    if pos > 0 && cells[pos - 1].flags.contains(Flags::WIDE_CHAR) {
+        cells[pos - 1] = fill();
+    }
+    if cells[pos].flags.contains(Flags::WIDE_CHAR_SPACER) && cells[pos].c == ' ' {
+        cells[pos] = fill();
+    }
+}
+
+/// wmux: xterm's `BufferLine.replaceCells` over a physical line: the cells
+/// from `start` to `end` set from `fill`. As xterm, a wide glyph cut at
+/// `start` loses its first cell, and one whose first cell is the last
+/// replaced loses its spacer.
+fn replace_cells(cells: &mut [Cell], start: usize, end: usize, fill: impl Fn() -> Cell) {
+    let len = cells.len();
+    if start >= len {
+        return;
+    }
+    if start > 0 && cells[start - 1].flags.contains(Flags::WIDE_CHAR) {
+        cells[start - 1] = fill();
+    }
+    if end < len && end > start && cells[end - 1].flags.contains(Flags::WIDE_CHAR) {
+        cells[end] = fill();
+    }
+    for cell in &mut cells[start..cmp::min(end, len)] {
+        *cell = fill();
     }
 }
 

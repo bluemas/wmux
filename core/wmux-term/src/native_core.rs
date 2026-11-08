@@ -3,7 +3,7 @@
 
 use crate::native_output::NativeOutputChunk;
 use alacritty_terminal::event::VoidListener;
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Grid, GridCell};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Osc52, Term, TermMode};
@@ -17,12 +17,12 @@ use std::sync::{Arc, Mutex};
 
 /// Loader contract for the opt-in daemon text backend. Bump on incompatible
 /// changes to the exposed snapshot shape or required compatibility policy.
-#[napi]
+#[napi(catch_unwind)]
 pub fn native_core_abi_version() -> u32 {
     1
 }
 
-#[napi]
+#[napi(catch_unwind)]
 pub fn native_core_capabilities() -> Vec<String> {
     vec![
         "text-v1".into(),
@@ -34,12 +34,14 @@ pub fn native_core_capabilities() -> Vec<String> {
         "ansi-v2".into(),
         "ansi-v3".into(),
         "console-owner-v1".into(),
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
         "process-table-v1".into(),
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        "listen-sockets-v1".into(),
     ]
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 #[napi(object)]
 pub struct NativeProcessRow {
     pub pid: u32,
@@ -49,11 +51,11 @@ pub struct NativeProcessRow {
     pub cmdline: Option<String>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub struct ProcessTableTask {
     with_command_lines: bool,
 }
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 impl Task for ProcessTableTask {
     type Output = Vec<crate::process_table::ProcessRow>;
     type JsValue = Vec<NativeProcessRow>;
@@ -74,12 +76,74 @@ impl Task for ProcessTableTask {
     }
 }
 
-/// Windows process table off the JS thread. With `with_command_lines`, each
+/// The process table off the JS thread. With `with_command_lines`, each
 /// row also carries its creation time and command line where readable.
-#[cfg(windows)]
-#[napi]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+#[napi(catch_unwind)]
 pub fn process_table(with_command_lines: bool) -> AsyncTask<ProcessTableTask> {
     AsyncTask::new(ProcessTableTask { with_command_lines })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[napi(object)]
+pub struct NativeListenSocket {
+    pub pid: u32,
+    pub port: u32,
+    pub address: String,
+    /// 4 or 6.
+    pub family: u32,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[napi(object)]
+pub struct NativePortSnapshot {
+    pub processes: Vec<NativeProcessRow>,
+    pub sockets: Vec<NativeListenSocket>,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub struct PortSnapshotTask;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl Task for PortSnapshotTask {
+    type Output = crate::process_table::PortSnapshot;
+    type JsValue = NativePortSnapshot;
+    fn compute(&mut self) -> Result<Self::Output> {
+        crate::process_table::port_snapshot().map_err(Error::from_reason)
+    }
+    fn resolve(&mut self, _env: Env, snap: Self::Output) -> Result<Self::JsValue> {
+        Ok(NativePortSnapshot {
+            processes: snap
+                .processes
+                .into_iter()
+                .map(|r| NativeProcessRow {
+                    pid: r.pid,
+                    ppid: r.ppid,
+                    name: r.name,
+                    created: r.created,
+                    cmdline: r.cmdline,
+                })
+                .collect(),
+            sockets: snap
+                .sockets
+                .into_iter()
+                .map(|r| NativeListenSocket {
+                    pid: r.pid,
+                    port: r.port.into(),
+                    address: r.address,
+                    family: r.family.into(),
+                })
+                .collect(),
+        })
+    }
+}
+
+/// PortWatcher's snapshot off the JS thread: the process walk and every
+/// listening TCP socket this user can read, with the pid holding it, from
+/// one walk.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[napi(catch_unwind)]
+pub fn port_snapshot() -> AsyncTask<PortSnapshotTask> {
+    AsyncTask::new(PortSnapshotTask)
 }
 
 struct Size {
@@ -135,6 +199,27 @@ pub struct NativeTerminal {
     refusal: Option<&'static str>,
 }
 
+/// Whether a resize to `cols` reflows a row below the cursor's paragraph on
+/// this grid: a soft-wrapped row there, either way, or narrower, a row with
+/// content past the new width.
+fn reflows_below_cursor<T: GridCell>(grid: &Grid<T>, cols: usize) -> bool {
+    let old = grid.columns();
+    if cols == old {
+        return false;
+    }
+    let last = Column(old - 1);
+    let lines = grid.screen_lines() as i32;
+    let mut y = grid.cursor.point.line.0;
+    while y + 1 < lines && grid[Line(y)][last].flags().contains(Flags::WRAPLINE) {
+        y += 1;
+    }
+    ((y + 1)..lines).any(|y| {
+        let row = &grid[Line(y)];
+        row[last].flags().contains(Flags::WRAPLINE)
+            || (cols < old && (cols..old).any(|x| !row[Column(x)].is_empty()))
+    })
+}
+
 /// The longest unfinished sequence `feed_xterm` holds for its next bytes.
 const MAX_HELD: usize = 256;
 /// The longest unfinished string re-shipped after a snapshot, in UTF-16
@@ -154,8 +239,12 @@ struct XtermFeed {
     tail: Vec<u8>,
     tail_units: usize,
     tail_overflow: bool,
-    /// DECSTBM margins in effect (MarginTracker).
-    margins: bool,
+    /// DECSTBM margins in effect on the main and the alternate screen, kept
+    /// per screen as xterm does (MarginTracker).
+    main_margins: bool,
+    alt_margins: bool,
+    /// xterm's alternate screen is active (?47, ?1047, ?1049).
+    alt_screen: bool,
     /// DECTCEM off (CursorVisibilityTracker).
     cursor_hidden: bool,
     /// SGR-pixels mouse encoding, ?1016 (SgrMouseEncodingTracker). Alacritty
@@ -253,7 +342,8 @@ impl XtermFeed {
         }
     }
 
-    fn track(&mut self, sequence: &[u8]) {
+    /// `rows`: the screen height the sequence is parsed at.
+    fn track(&mut self, sequence: &[u8], rows: usize) {
         // C0 controls inside a sequence execute and are not part of it.
         let filtered: Vec<u8>;
         let sequence = if sequence[1..].iter().any(|&b| b < 0x20) {
@@ -267,10 +357,13 @@ impl XtermFeed {
             sequence
         };
         let numeric = |params: &[u8]| params.iter().all(|&b| b.is_ascii_digit() || b == b';');
-        if sequence == b"\x1bc" || sequence == b"\x1b[!p" {
-            self.margins = false;
+        if sequence == b"\x1b[!p" {
+            self.set_margins(false);
         }
         if sequence == b"\x1bc" {
+            self.main_margins = false;
+            self.alt_margins = false;
+            self.alt_screen = false;
             self.sgr_pixels = false;
             self.sgr_mouse = false;
             self.mouse = 0;
@@ -283,7 +376,7 @@ impl XtermFeed {
             .and_then(|s| s.strip_suffix(b"r"))
         {
             if numeric(params) {
-                self.margins = params.iter().any(u8::is_ascii_digit);
+                self.scroll_region(params, rows);
             }
         }
         if let Some((&last, params)) = sequence
@@ -305,6 +398,22 @@ impl XtermFeed {
                         Some(1006) => self.sgr_mouse = set,
                         Some(protocol @ (9 | 1000 | 1002 | 1003)) => {
                             self.mouse = if set { protocol } else { 0 };
+                        }
+                        Some(47 | 1047 | 1049) => {
+                            if set && !self.alt_screen {
+                                // xterm's alternate screen starts with its own
+                                // full region; Alacritty keeps one region, so
+                                // the alternate screen inherits the main one's.
+                                self.divergent |= self.main_margins;
+                            }
+                            if !set && self.alt_screen {
+                                // xterm clears the alternate screen's region on
+                                // leaving it; Alacritty keeps one region for
+                                // both screens, so the main screen inherits it.
+                                self.divergent |= self.alt_margins;
+                                self.alt_margins = false;
+                            }
+                            self.alt_screen = set;
                         }
                         _ => {}
                     }
@@ -377,7 +486,7 @@ impl XtermFeed {
                 // Alacritty repeats whatever was printed last.
                 self.divergent |=
                     crate::native_serialize::divergent(sequence) || (is_rep(sequence) && !printed);
-                self.track(sequence);
+                self.track(sequence, term.screen_lines());
                 next = Some(at + len);
             }
             printed = false;
@@ -385,6 +494,49 @@ impl XtermFeed {
         // A held sequence or an unfinished string ends the stream so far.
         self.printed = printed && self.held.is_empty() && !self.in_string;
         parser.advance(term, &data[from..]);
+    }
+
+    /// DECSTBM as xterm's setScrollRegion reads it (MarginTracker): top
+    /// defaults to 1, bottom to the rows, 0 is the default, a bottom past the
+    /// screen is the screen, and a region whose bottom is not below its top
+    /// is ignored. Only a region narrower than the screen is active.
+    fn scroll_region(&mut self, params: &[u8], rows: usize) {
+        let mut values = params.split(|&b| b == b';').map(|digits| {
+            digits.iter().fold(0usize, |n, &d| {
+                n.saturating_mul(10).saturating_add(usize::from(d - b'0'))
+            })
+        });
+        let first = values.next().unwrap_or(0);
+        let second = values.next().unwrap_or(0);
+        let top = first.max(1);
+        let bottom = if second == 0 || second > rows {
+            rows
+        } else {
+            second
+        };
+        if bottom > top {
+            self.set_margins(top != 1 || bottom != rows);
+        } else {
+            // xterm ignores it; Alacritty keeps a bottom past the screen
+            // (saturated to u16) and applies any top above it.
+            let cap = usize::from(u16::MAX);
+            self.divergent |= second > rows && top.min(cap) < second.min(cap);
+        }
+    }
+
+    /// Set the active screen's margins.
+    fn set_margins(&mut self, narrowed: bool) {
+        if self.alt_screen {
+            self.alt_margins = narrowed;
+        } else {
+            self.main_margins = narrowed;
+        }
+    }
+
+    /// A region narrower than the screen on either screen: the snapshot
+    /// restores neither.
+    fn margins(&self) -> bool {
+        self.main_margins || self.alt_margins
     }
 
     /// The bytes that leave a replaying parser where this one is: the
@@ -414,11 +566,13 @@ fn erase_like_xterm(parser: &mut Processor, term: &mut Term<VoidListener>, all: 
         parser.stop_sync(term);
     }
     let grid = term.grid_mut();
+    // Whole lines over their physical width: an alternate-screen row keeps
+    // cells past a narrower width, and xterm erases those too.
     if all {
-        grid.reset_region(..);
+        grid.reset_region_keep_width(..);
     } else {
         let cursor = grid.cursor.point;
-        grid.reset_region(..cursor.line);
+        grid.reset_region_keep_width(..cursor.line);
         let bg = grid.cursor.template.bg;
         let end = (cursor.column.0 + 1).min(grid.columns());
         for cell in &mut grid[cursor.line][..Column(end)] {
@@ -432,7 +586,7 @@ fn erase_like_xterm(parser: &mut Processor, term: &mut Term<VoidListener>, all: 
 
 #[napi]
 impl NativeTerminal {
-    #[napi(constructor)]
+    #[napi(constructor, catch_unwind)]
     pub fn new(cols: u32, rows: u32, scrollback: u32) -> Result<Self> {
         let size = dimensions(cols, rows)?;
         if scrollback > 100_000 || (rows as u64 + scrollback as u64) * cols as u64 > 4_000_000 {
@@ -454,7 +608,7 @@ impl NativeTerminal {
         })
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn feed(&mut self, bytes: Uint8Array) -> Result<()> {
         let term = self
             .term
@@ -471,7 +625,7 @@ impl NativeTerminal {
     /// already refused, so the caller can stop parsing: a control Alacritty
     /// parses differently, or a history past this terminal's cap when the
     /// request asked for more.
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn feed_xterm(&mut self, bytes: Uint8Array, requested_scrollback: u32) -> Result<bool> {
         let term = self
             .term
@@ -494,7 +648,7 @@ impl NativeTerminal {
     }
 
     /// Replay an immutable native ring copy without a full JS Buffer round trip.
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn feed_frozen(&mut self, source: &NativeFrozenRing, start: u32, end: u32) -> Result<()> {
         let bytes = source
             .bytes
@@ -508,7 +662,7 @@ impl NativeTerminal {
         Ok(())
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn resize(&mut self, cols: u32, rows: u32) -> Result<()> {
         let size = dimensions(cols, rows)?;
         if (rows as u64 + self.scrollback as u64) * cols as u64 > 4_000_000 {
@@ -520,38 +674,58 @@ impl NativeTerminal {
             .term
             .as_mut()
             .ok_or_else(|| Error::from_reason("Terminal disposed"))?;
-        // Rows a narrower reflow adds above the cursor go into Alacritty's
-        // history even with room below; xterm moves the cursor down instead.
-        let before = |term: &Term<VoidListener>| {
-            [term.grid(), term.inactive_grid()].map(|grid| {
-                let room = grid.cursor.point.line.0 + 1 < grid.screen_lines() as i32;
-                (grid.history_size(), room)
-            })
-        };
         // vte holds bytes back inside a synchronized update; xterm parsed them
         // at the old size. Apply them first, then re-enter the update.
         let synchronized = self.parser.sync_timeout().pending_timeout();
         if synchronized {
             self.parser.stop_sync(term);
         }
-        let start = before(term);
+        // xterm never reflows or cuts the alternate screen: its rows keep
+        // their cells and wrap flags across a resize. The vendored grid keeps
+        // a row's cells past a narrower width and shows them again when it
+        // widens, as xterm's does (vendor/alacritty_terminal WMUX-PATCH.md),
+        // but a width change with a soft-wrapped row on screen loses the flags.
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            let grid = term.grid();
+            let old = grid.columns();
+            if old != cols as usize
+                && (0..grid.screen_lines() as i32).any(|y| {
+                    grid[Line(y)][Column(old - 1)]
+                        .flags
+                        .contains(Flags::WRAPLINE)
+                })
+            {
+                self.refusal.get_or_insert(
+                    "unsupported-reflow: the alternate screen changed width, which xterm leaves uncut",
+                );
+            }
+        }
+        // A paragraph below the cursor's that reflows: xterm moves its cursor
+        // row by the rows that adds or removes as if they were above it, off
+        // the cursor's content, where Alacritty keeps the cursor on it.
+        let primary = if term.mode().contains(TermMode::ALT_SCREEN) {
+            term.inactive_grid()
+        } else {
+            term.grid()
+        };
+        if reflows_below_cursor(primary, cols as usize) {
+            self.refusal.get_or_insert(
+                "unsupported-reflow: a paragraph below the cursor reflows, which moves xterm's cursor off its row",
+            );
+        }
+        // Both terminals reset the margins of both screens on a size change.
+        if term.columns() != size.columns() || term.screen_lines() != size.screen_lines() {
+            self.feed.main_margins = false;
+            self.feed.alt_margins = false;
+        }
         term.resize(size);
-        let end = before(term);
         if synchronized {
             self.parser.advance(term, b"\x1b[?2026h");
-        }
-        if start
-            .iter()
-            .zip(end.iter())
-            .any(|(&(history, room), &(after, _))| room && after > history)
-        {
-            self.refusal
-                .get_or_insert("unsupported-reflow: a resize scrolled rows xterm keeps on screen");
         }
         Ok(())
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn text_snapshot(&mut self, undimmed: bool) -> Result<NativeTextSnapshot> {
         let term = self
             .term
@@ -621,7 +795,7 @@ impl NativeTerminal {
     /// `requested_scrollback` above this terminal's own limit means the
     /// caller capped the history to bound memory: a history that reached the
     /// cap may have dropped rows the request would have kept.
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn ansi_snapshot(&mut self, requested_scrollback: Option<u32>) -> Result<Buffer> {
         let term = self
             .term
@@ -645,7 +819,7 @@ impl NativeTerminal {
             ));
         }
         // xterm's SerializeAddon drops margins: both paths replay raw then.
-        if self.feed.margins {
+        if self.feed.margins() {
             return Err(Error::from_reason("margins"));
         }
         let tail = self.feed.pending_tail().map_err(Error::from_reason)?;
@@ -675,7 +849,7 @@ impl NativeTerminal {
         Ok(payload.into())
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn dispose(&mut self) {
         self.term = None;
         self.parser = Processor::new();
@@ -709,7 +883,7 @@ pub struct NativePty {
 
 #[napi]
 impl NativePty {
-    #[napi(constructor)]
+    #[napi(constructor, catch_unwind)]
     pub fn new(
         command: String,
         args: Vec<String>,
@@ -777,12 +951,12 @@ impl NativePty {
         Ok(result)
     }
 
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn pid(&self) -> u32 {
         self.pid
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn read(&mut self) -> Result<NativePtyRead> {
         let receiver = self
             .receiver
@@ -815,7 +989,7 @@ impl NativePty {
 
     /// Small control writes only. A production adapter must move potentially
     /// blocking writes off Node's event loop and implement node-pty's contract.
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn write(&mut self, bytes: Uint8Array) -> Result<()> {
         if bytes.len() > 4096 {
             return Err(Error::from_reason(
@@ -829,7 +1003,7 @@ impl NativePty {
             .map_err(|e| Error::from_reason(e.to_string()))
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn resize(&self, cols: u32, rows: u32) -> Result<()> {
         dimensions(cols, rows)?;
         self.master
@@ -844,7 +1018,7 @@ impl NativePty {
             .map_err(|e| Error::from_reason(e.to_string()))
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn try_wait(&mut self) -> Result<Option<u32>> {
         let child = self
             .child
@@ -860,7 +1034,7 @@ impl NativePty {
             .map_err(|e| Error::from_reason(e.to_string()))
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn kill(&mut self) -> Result<AsyncTask<KillPty>> {
         let child = self
             .child
@@ -871,7 +1045,7 @@ impl NativePty {
         }))
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn close(&mut self) {
         self.receiver.take();
         self.writer.take();
@@ -956,23 +1130,23 @@ pub struct NativeFrozenRing {
 }
 #[napi]
 impl NativeFrozenRing {
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn size(&self) -> u32 {
         self.bytes.len() as u32
     }
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn written_at(&self) -> f64 {
         self.written_at as f64
     }
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn geometry(&self) -> Option<NativeReplayGeometry> {
         replay_geometry(&self.geometry, self.written_at - self.bytes.len() as u64)
     }
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn read_all(&self) -> Buffer {
         self.bytes.clone().into()
     }
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn dispose(&mut self) {
         self.bytes = Vec::new();
         self.geometry.clear();
@@ -1005,11 +1179,13 @@ pub struct NativeRing {
     write_pos: usize,
     total_written: u64,
     geometry: Vec<GeometryMark>,
+    /// The newest mark is provisional: the next mark replaces it.
+    geometry_tail_provisional: bool,
 }
 
 #[napi]
 impl NativeRing {
-    #[napi(constructor)]
+    #[napi(constructor, catch_unwind)]
     pub fn new(capacity: u32) -> Result<Self> {
         if capacity == 0 || capacity > 256 * 1024 * 1024 {
             return Err(Error::from_reason("Ring capacity must be 1..256MiB"));
@@ -1021,25 +1197,26 @@ impl NativeRing {
             write_pos: 0,
             total_written: 0,
             geometry: Vec::new(),
+            geometry_tail_provisional: false,
         })
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn write(&mut self, bytes: Uint8Array) -> Result<()> {
         self.write_bytes(&bytes)
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn write_chunk(&mut self, chunk: &NativeOutputChunk) -> Result<()> {
         self.write_bytes(&chunk.bytes)
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn read_all(&self) -> Buffer {
         self.copy_bytes().into()
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn freeze(&mut self) -> NativeFrozenRing {
         self.prune_geometry();
         NativeFrozenRing {
@@ -1049,21 +1226,21 @@ impl NativeRing {
         }
     }
 
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn size(&self) -> u32 {
         self.length as u32
     }
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn allocated_bytes(&self) -> u32 {
         self.bytes.len() as u32
     }
 
-    #[napi(getter)]
+    #[napi(getter, catch_unwind)]
     pub fn total_bytes_written(&self) -> f64 {
         self.total_written as f64
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn clear(&mut self) -> Result<()> {
         if self.capacity == 0 {
             return Err(Error::from_reason("Ring disposed"));
@@ -1074,38 +1251,71 @@ impl NativeRing {
         Ok(())
     }
 
-    #[napi]
-    pub fn note_geometry(&mut self, cols: u32, rows: u32) -> Result<()> {
+    /// The same rules as RingBuffer.noteGeometry (TS): an applied mark is
+    /// kept even with no bytes at it; a provisional one (`applied` false) is
+    /// replaced by the next mark unless it is the window's only size; an
+    /// applied repeat of a provisional tail makes it applied; a run of marks
+    /// with no bytes between them keeps the one with the fewest rows and the
+    /// newest. `applied` defaults to true.
+    #[napi(catch_unwind)]
+    pub fn note_geometry(&mut self, cols: u32, rows: u32, applied: Option<bool>) -> Result<()> {
         if self.capacity == 0 {
             return Err(Error::from_reason("Ring disposed"));
         }
         if cols == 0 || rows == 0 {
             return Ok(());
         }
+        let applied = applied.unwrap_or(true);
         if let Some(last) = self.geometry.last() {
             if last.cols == cols && last.rows == rows {
+                if applied {
+                    self.geometry_tail_provisional = false;
+                }
                 return Ok(());
             }
-            if last.at == self.total_written {
+        }
+        if self.geometry_tail_provisional {
+            self.prune_geometry();
+            if self.geometry.len() > 1 {
                 self.geometry.pop();
+                self.geometry_tail_provisional = false;
+                if let Some(last) = self.geometry.last() {
+                    if last.cols == cols && last.rows == rows {
+                        return Ok(());
+                    }
+                }
             }
+            self.geometry_tail_provisional = false;
         }
         self.geometry.push(GeometryMark {
             at: self.total_written,
             cols,
             rows,
         });
+        self.geometry_tail_provisional = !applied;
+        self.compact_geometry_run();
         self.prune_geometry();
         Ok(())
     }
 
-    #[napi(getter)]
+    /// A viewer's replay is out: a provisional newest mark is kept.
+    #[napi(catch_unwind)]
+    pub fn settle_geometry(&mut self) {
+        self.geometry_tail_provisional = false;
+    }
+
+    #[napi(getter, catch_unwind)]
+    pub fn geometry_tail_provisional(&self) -> bool {
+        self.geometry_tail_provisional && !self.geometry.is_empty()
+    }
+
+    #[napi(getter, catch_unwind)]
     pub fn has_geometry_changes(&mut self) -> bool {
         self.prune_geometry();
         self.geometry.len() > 1
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn read_all_with_geometry(&mut self) -> NativeRingSnapshot {
         self.prune_geometry();
         let start = self.total_written - self.length as u64;
@@ -1132,13 +1342,14 @@ impl NativeRing {
         }
     }
 
-    #[napi]
+    #[napi(catch_unwind)]
     pub fn dispose(&mut self) {
         self.bytes = Vec::new();
         self.capacity = 0;
         self.length = 0;
         self.write_pos = 0;
         self.geometry.clear();
+        self.geometry_tail_provisional = false;
     }
 }
 
@@ -1198,6 +1409,31 @@ impl NativeRing {
         result
     }
 
+    /// A run of marks at the newest mark's offset keeps the one with the
+    /// fewest rows and the newest (RingBuffer.compactGeometryRun).
+    fn compact_geometry_run(&mut self) {
+        let Some(at) = self.geometry.last().map(|m| m.at) else {
+            return;
+        };
+        let end = self.geometry.len() - 1;
+        let mut start = end;
+        while start > 0 && self.geometry[start - 1].at == at {
+            start -= 1;
+        }
+        if end - start < 2 {
+            return;
+        }
+        let mut keep = start;
+        for i in start + 1..end {
+            let (m, k) = (&self.geometry[i], &self.geometry[keep]);
+            if m.rows < k.rows || (m.rows == k.rows && m.cols < k.cols) {
+                keep = i;
+            }
+        }
+        let kept = self.geometry[keep].clone();
+        self.geometry.splice(start..end, [kept]);
+    }
+
     fn prune_geometry(&mut self) {
         let start = self.total_written - self.length as u64;
         let keep = self
@@ -1208,17 +1444,44 @@ impl NativeRing {
         if keep > 0 {
             self.geometry.drain(..keep);
         }
+        // Past the cap, the oldest marks after the first go: the first is the
+        // size the window's first bytes were written at.
         if self.geometry.len() > 256 {
-            self.geometry.drain(..self.geometry.len() - 256);
+            let excess = self.geometry.len() - 256;
+            self.geometry.drain(1..1 + excess);
         }
     }
+}
+
+/// Test hook for the per-reason parity modules (parity_support.rs): `chunks`
+/// fed the way a snapshot feeds the ring, then whether the feed met a
+/// divergent control.
+#[cfg(test)]
+pub(crate) fn fed_for_test(
+    cols: usize,
+    rows: usize,
+    history: usize,
+    chunks: &[&[u8]],
+) -> (Term<VoidListener>, bool) {
+    let config = Config {
+        scrolling_history: history,
+        ..Config::default()
+    };
+    let mut term = Term::new(config, &Size { cols, rows }, VoidListener);
+    let mut parser: Processor = Processor::new();
+    let mut feed = XtermFeed::default();
+    for chunk in chunks {
+        feed.feed(&mut parser, &mut term, chunk);
+    }
+    parser.advance(&mut term, &feed.held);
+    (term, feed.divergent)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Size, XtermFeed};
     use alacritty_terminal::event::VoidListener;
-    use alacritty_terminal::grid::Dimensions;
+    use alacritty_terminal::grid::{Dimensions, Grid, GridCell};
     use alacritty_terminal::index::{Column, Line};
     use alacritty_terminal::term::{Config, Term};
     use alacritty_terminal::vte::ansi::{Processor, Timeout};
@@ -1284,11 +1547,11 @@ mod tests {
 
     #[test]
     fn a_split_divergent_control_is_seen() {
-        let (_, _, feed) = feed_with(&["hello\x1b(", "0q"]);
+        let (_, _, feed) = feed_with(&["hello\x1b(", "A#"]);
         assert!(feed.divergent);
-        let (_, _, feed) = feed_with(&["\x1b]0;\x1b(0 in a title\x07"]);
+        let (_, _, feed) = feed_with(&["\x1b]0;\x1b(A in a title\x07"]);
         assert!(feed.divergent, "ESC ends the string, then designates");
-        let (_, _, feed) = feed_with(&["\x1b]0;(0 in a title\x07ok"]);
+        let (_, _, feed) = feed_with(&["\x1b]0;(A in a title\x07ok"]);
         assert!(!feed.divergent);
     }
 
@@ -1364,13 +1627,83 @@ mod tests {
     fn margins_and_cursor_follow_the_stream_trackers() {
         let state = |chunks: &[&str]| {
             let (_, _, feed) = feed_with(chunks);
-            (feed.margins, feed.cursor_hidden)
+            (feed.margins(), feed.cursor_hidden)
         };
         assert_eq!(state(&["\x1b[2;4r"]), (true, false));
         assert_eq!(state(&["\x1b[2;4r\x1b[r"]), (false, false));
         assert_eq!(state(&["\x1b[2;4r\x1bc"]), (false, false));
+        // xterm's setScrollRegion over 3 rows: 0 reads as the default, a
+        // bottom past the screen is the screen, an empty region is ignored.
+        for reset in [
+            "\x1b[0;0r",
+            "\x1b[0r",
+            "\x1b[1r",
+            "\x1b[;3r",
+            "\x1b[1;9r",
+            "\x1b[1;3;2r",
+        ] {
+            assert_eq!(state(&["\x1b[2;4r", reset]), (false, false), "{reset:?}");
+        }
+        for region in ["\x1b[2r", "\x1b[1;2r", "\x1b[0;2r"] {
+            assert_eq!(state(&[region]), (true, false), "{region:?}");
+        }
+        assert_eq!(state(&["\x1b[3;2r"]), (false, false));
+        assert_eq!(state(&["\x1b[2;4r\x1b[3;2r"]), (true, false));
         assert_eq!(state(&["\x1b[?1;25l"]), (false, true));
         assert_eq!(state(&["\x1b[?25l\x1b[?25h"]), (false, false));
+    }
+
+    #[test]
+    fn margins_follow_xterm_per_screen() {
+        let margins = |chunks: &[&str]| feed_with(chunks).2.margins();
+        // The main screen's region outlives an alternate screen that resets its own.
+        assert!(margins(&["\x1b[2;3r\x1b[?1049h\x1b[r\x1b[?1049l"]));
+        assert!(margins(&["\x1b[2;3r\x1b[?1049h\x1b[r"]));
+        // The alternate screen's region goes with it.
+        assert!(margins(&["\x1b[?1049h\x1b[2;3r"]));
+        assert!(!margins(&["\x1b[?1049h\x1b[2;3r", "\x1b[?1049l"]));
+        assert!(!margins(&["\x1b[2;3r\x1b[?1049h\x1b[1;2r\x1bc\x1b[?1049l"]));
+    }
+
+    #[test]
+    fn alacritty_keeps_the_alternate_region_on_the_main_screen() {
+        // xterm leaves the main screen's full region in place; Alacritty has
+        // one region, so main-screen output keeps scrolling inside rows 1-2.
+        let chunks = ["\x1b[?1049h\x1b[1;2r\x1b[?1049l\x1b[Ha\r\nb\r\nc\r\nd"];
+        let (term, _, feed) = feed_with(&chunks);
+        assert_eq!(
+            (row(&term, 0), row(&term, 1), row(&term, 2)),
+            ("c".into(), "d".into(), String::new())
+        );
+        assert!(feed.divergent);
+    }
+
+    #[test]
+    fn alacritty_carries_the_main_region_into_the_alternate_screen() {
+        // xterm's alternate screen scrolls in full and ends with a, b, c;
+        // Alacritty keeps rows 1-2 as the region, so LF on row 3 stays there.
+        let chunks = ["\x1b[1;2r\x1b[?1049h\x1b[3;1Ha\r\nb\r\nc"];
+        let (term, _, feed) = feed_with(&chunks);
+        assert_eq!(
+            (row(&term, 0), row(&term, 1), row(&term, 2)),
+            (String::new(), String::new(), "c".into())
+        );
+        assert!(feed.divergent);
+        // A region the alternate screen sets for itself is no divergence.
+        assert!(!feed_with(&["\x1b[?1049h\x1b[1;2r"]).2.divergent);
+        // Nor is the full region it starts with when the main screen has one.
+        assert!(!feed_with(&["\x1b[1;3r\x1b[?1049h"]).2.divergent);
+    }
+
+    #[test]
+    fn a_region_only_alacritty_applies_is_divergent() {
+        let divergent = |chunks: &[&str]| feed_with(chunks).2.divergent;
+        // Top at or past the last of 3 rows: xterm ignores it, Alacritty
+        // keeps the bottom it was given and homes the cursor.
+        assert!(divergent(&["ab\x1b[3;9r"]));
+        assert!(divergent(&["ab\x1b[4;9r"]));
+        assert!(!divergent(&["ab\x1b[3;3r"]), "both ignore it");
+        assert!(!divergent(&["ab\x1b[2;9r"]), "both apply it");
     }
 
     #[test]
@@ -1380,5 +1713,480 @@ mod tests {
         assert!(!pixels(&["\x1b[?1016h\x1b[?1016l"]));
         assert!(!pixels(&["\x1b[?1016h\x1bc"]));
         assert!(pixels(&["\x1b[?10", "16h"]), "split across chunks");
+    }
+}
+
+/// The alternate screen's cells past a narrower width, against xterm.js
+/// (headless, the daemon's options): a 20x4 alternate screen narrowed to 10,
+/// driven, then widened. Each expectation is what xterm showed.
+#[cfg(test)]
+mod alt_kept_cells_tests {
+    use super::{Size, XtermFeed};
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::grid::Dimensions;
+    use alacritty_terminal::index::{Column, Line};
+    use alacritty_terminal::term::cell::Flags;
+    use alacritty_terminal::term::{Config, Term};
+    use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
+
+    enum Step {
+        Out(&'static str),
+        Size(usize, usize),
+    }
+    use Step::{Out, Size as To};
+
+    const N: Step = To(10, 4);
+    const W: Step = To(20, 4);
+    const R0: &str = "0000000000ABCDEFGHIJ";
+    const R1: &str = "1111111111KLMNOPQRST";
+    const R2: &str = "2222222222abcdefghij";
+    const R3: &str = "3333333333klmnopqrst";
+    const BLANK: &str = "....................";
+
+    /// Rows as text ('.' for a blank, a wide char's spacer skipped), and the
+    /// columns of each row with a red background (base 36).
+    /// The terminal after `steps`, from the 20x4 alternate screen.
+    fn run_term(steps: &[Step]) -> (Term<VoidListener>, ()) {
+        let mut term = Term::new(Config::default(), &Size { cols: 20, rows: 4 }, VoidListener);
+        let mut parser: Processor = Processor::new();
+        let mut feed = XtermFeed::default();
+        let start = format!("\x1b[?1049h\x1b[H{R0}\r\n{R1}\r\n{R2}\r\n{R3}");
+        feed.feed(&mut parser, &mut term, start.as_bytes());
+        for step in steps {
+            match step {
+                Out(bytes) => feed.feed(&mut parser, &mut term, bytes.as_bytes()),
+                To(cols, rows) => {
+                    parser.advance(&mut term, &std::mem::take(&mut feed.held));
+                    term.resize(Size {
+                        cols: *cols,
+                        rows: *rows,
+                    });
+                }
+            }
+        }
+        parser.advance(&mut term, &feed.held);
+        (term, ())
+    }
+
+    fn run(steps: &[Step]) -> (Vec<String>, Vec<String>) {
+        let (term, _) = run_term(steps);
+        let grid = term.grid();
+        let mut text = Vec::new();
+        let mut red = Vec::new();
+        for y in 0..grid.screen_lines() {
+            let row = &grid[Line(y as i32)];
+            let mut line = String::new();
+            let mut bg = String::new();
+            for x in 0..grid.columns() {
+                let cell = &row[Column(x)];
+                if cell.bg == Color::Named(NamedColor::Red) {
+                    bg.push(std::char::from_digit(x as u32, 36).unwrap());
+                }
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                line.push(if cell.c == ' ' { '.' } else { cell.c });
+            }
+            text.push(line);
+            red.push(bg);
+        }
+        (text, red)
+    }
+
+    fn rows(steps: &[Step]) -> Vec<String> {
+        run(steps).0
+    }
+
+    /// Rows as cells: '_' for a wide glyph's spacer (xterm's width-0 cell).
+    fn cells(steps: &[Step]) -> Vec<String> {
+        let (term, _) = run_term(steps);
+        let grid = term.grid();
+        (0..grid.screen_lines())
+            .map(|y| {
+                let row = &grid[Line(y as i32)];
+                (0..grid.columns())
+                    .map(|x| {
+                        let cell = &row[Column(x)];
+                        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                            '_'
+                        } else if cell.c == ' ' {
+                            '.'
+                        } else {
+                            cell.c
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_large_dch_clears_from_the_cursor_only_with_or_without_kept_cells() {
+        assert_eq!(
+            rows(&[Out("\x1b[1;6H\x1b[999P")])[0],
+            "00000..............."
+        );
+        assert_eq!(
+            rows(&[N, Out("\x1b[1;6H\x1b[999P"), W])[0],
+            "00000..............."
+        );
+    }
+
+    #[test]
+    fn insert_mode_wraps_a_wide_glyph_before_it_shifts_anything() {
+        let shown = cells(&[N, Out("\x1b[4h\x1b[2;10H\u{4e2d}\x1b[4l"), W]);
+        assert_eq!(shown[1], "111111111.KLMNOPQRST");
+        assert_eq!(shown[2], "\u{4e2d}_2222222222abcdefgh");
+        // With autowrap off the glyph is dropped, and nothing shifts.
+        assert_eq!(
+            cells(&[
+                N,
+                Out("\x1b[?7l\x1b[4h\x1b[2;10H\u{4e2d}\x1b[4l\x1b[?7h"),
+                W
+            ]),
+            all([R0, R1, R2, R3])
+        );
+    }
+
+    #[test]
+    fn insert_mode_blanks_a_wide_glyph_shifted_into_the_last_visible_column() {
+        assert_eq!(
+            cells(&[N, Out("\x1b[1;8H\u{4e2d}\x1b[4h\x1b[1;1Hxy\x1b[4l"), W])[0],
+            "xy0000000._0ABCDEFGH"
+        );
+        assert_eq!(
+            cells(&[Out("\x1b[1;18H\u{4e2d}\x1b[4h\x1b[1;1Hxy\x1b[4l")])[0],
+            "xy0000000000ABCDEFG."
+        );
+    }
+
+    #[test]
+    fn insert_and_delete_at_a_wide_glyph_cut_it_as_xterm_does() {
+        for narrowed in [true, false] {
+            let around = |edit: &'static str| {
+                let mut steps = vec![];
+                if narrowed {
+                    steps.push(To(10, 4));
+                }
+                steps.push(Out("\x1b[1;3H\u{4e2d}\x1b[1;4H"));
+                steps.push(Out(edit));
+                if narrowed {
+                    steps.push(To(20, 4));
+                }
+                cells(&steps)[0].clone()
+            };
+            assert_eq!(
+                around("\x1b[1@"),
+                "00.._000000ABCDEFGHI",
+                "ICH at the spacer, narrowed={narrowed}"
+            );
+            assert_eq!(
+                around("\x1b[1P"),
+                "00.000000ABCDEFGHIJ.",
+                "DCH at the spacer, narrowed={narrowed}"
+            );
+        }
+        assert_eq!(
+            cells(&[Out("\x1b[1;19H\u{4e2d}"), N, Out("\x1b[1;1H\x1b[1@"), W])[0],
+            ".0000000000ABCDEFGH.",
+            "pushed off the physical end"
+        );
+    }
+
+    #[test]
+    fn erase_at_a_wide_glyph_cuts_it_as_xterm_does() {
+        for narrowed in [true, false] {
+            let around = |glyph: &'static str, edit: &'static str| {
+                let mut steps = vec![Out(glyph)];
+                if narrowed {
+                    steps.insert(0, To(10, 4));
+                }
+                steps.push(Out(edit));
+                if narrowed {
+                    steps.push(To(20, 4));
+                }
+                (cells(&steps)[0].clone(), run(&steps).1[0].clone())
+            };
+            let glyph = "\x1b[1;3H\u{4e2d}";
+            assert_eq!(
+                around(glyph, "\x1b[1;4H\x1b[1X").0,
+                "00..000000ABCDEFGHIJ",
+                "ECH at the spacer, narrowed={narrowed}"
+            );
+            assert_eq!(
+                around(glyph, "\x1b[1;2H\x1b[2X").0,
+                "0...000000ABCDEFGHIJ",
+                "ECH ending on the lead, narrowed={narrowed}"
+            );
+            assert_eq!(
+                around(glyph, "\x1b[1;3H\x1b[2X").0,
+                "00..000000ABCDEFGHIJ",
+                "ECH over the glyph, narrowed={narrowed}"
+            );
+            assert_eq!(
+                around(glyph, "\x1b[1;4H\x1b[41m\x1b[1X\x1b[m"),
+                ("00..000000ABCDEFGHIJ".to_string(), "23".to_string()),
+                "the cut lead takes the fill, narrowed={narrowed}"
+            );
+        }
+        assert_eq!(
+            cells(&[Out("\x1b[1;13H\u{4e2d}"), N, Out("\x1b[1;9H\x1b[5X"), W])[0],
+            "00000000......EFGHIJ",
+            "ECH into kept cells, ending on a kept lead"
+        );
+    }
+
+    #[test]
+    fn the_alternate_screen_keeps_no_cells_while_it_is_not_shown() {
+        let (term, _) = run_term(&[N, Out("\x1b[?1049l"), To(8, 4)]);
+        let alt = term.inactive_grid();
+        assert!((0..alt.screen_lines()).all(|y| alt[Line(y as i32)].hidden_len() == 0));
+        let (term, _) = run_term(&[N, Out("\x1b[?1049l")]);
+        let alt = term.inactive_grid();
+        assert!((0..alt.screen_lines()).all(|y| alt[Line(y as i32)].hidden_len() == 0));
+    }
+
+    fn all(rows: [&str; 4]) -> Vec<String> {
+        rows.iter().map(|r| r.to_string()).collect()
+    }
+
+    #[test]
+    fn a_widen_shows_the_cells_a_narrow_kept() {
+        assert_eq!(rows(&[N, W]), all([R0, R1, R2, R3]));
+        assert_eq!(
+            rows(&[N, To(5, 4), W]),
+            all([R0, R1, R2, R3]),
+            "narrows never cut"
+        );
+        let wide: Vec<String> = [R0, R1, R2, R3]
+            .iter()
+            .map(|r| format!("{r}.........."))
+            .collect();
+        assert_eq!(rows(&[N, To(30, 4)]), wide);
+    }
+
+    #[test]
+    fn a_partial_widen_drops_what_lies_past_it() {
+        assert_eq!(
+            rows(&[N, To(15, 4), W]),
+            all([
+                "0000000000ABCDE.....",
+                "1111111111KLMNO.....",
+                "2222222222abcde.....",
+                "3333333333klmno....."
+            ])
+        );
+    }
+
+    #[test]
+    fn printing_and_line_erase_touch_the_visible_cells_only() {
+        assert_eq!(
+            rows(&[N, Out("\x1b[1;6Hxyz"), W])[0],
+            "00000xyz00ABCDEFGHIJ"
+        );
+        let wrapped = rows(&[N, Out("\x1b[1;9Hxyzw"), W]);
+        assert_eq!(
+            wrapped[..2],
+            [
+                "00000000xyABCDEFGHIJ".to_string(),
+                "zw11111111KLMNOPQRST".to_string()
+            ]
+        );
+        assert_eq!(
+            rows(&[N, Out("\x1b[1;6H\x1b[K"), W])[0],
+            "00000.....ABCDEFGHIJ"
+        );
+        assert_eq!(
+            rows(&[N, Out("\x1b[1;6H\x1b[1K"), W])[0],
+            "......0000ABCDEFGHIJ"
+        );
+        assert_eq!(
+            rows(&[N, Out("\x1b[1;6H\x1b[2K"), W])[0],
+            "..........ABCDEFGHIJ"
+        );
+        assert_eq!(rows(&[N, Out("\x1b[1;20Hz"), W])[0], "000000000zABCDEFGHIJ");
+        assert_eq!(
+            rows(&[Out("\x1b[1;16H"), N, Out("Z"), W])[0],
+            "000000000ZABCDEFGHIJ"
+        );
+        assert_eq!(
+            rows(&[N, Out("\x1b[1;1H\t\t\tq"), W])[0],
+            "000000000qABCDEFGHIJ"
+        );
+        assert_eq!(
+            rows(&[N, Out("\x1b[1;3Ha\x1b[15b"), W])[..2],
+            [
+                "00aaaaaaaaABCDEFGHIJ".to_string(),
+                "aaaaaaaa11KLMNOPQRST".to_string()
+            ]
+        );
+        assert_eq!(
+            rows(&[N, Out("\x1b[1;10HQ\x1b[K"), W])[0],
+            "000000000QABCDEFGHIJ",
+            "a pending wrap"
+        );
+    }
+
+    #[test]
+    fn display_erase_fills_whole_lines_and_the_current_one_visibly() {
+        assert_eq!(
+            rows(&[N, Out("\x1b[2;6H\x1b[J"), W]),
+            all([R0, "11111.....KLMNOPQRST", BLANK, BLANK])
+        );
+        assert_eq!(
+            rows(&[N, Out("\x1b[2;6H\x1b[1J"), W]),
+            all([BLANK, "......1111KLMNOPQRST", R2, R3])
+        );
+        assert_eq!(
+            rows(&[N, Out("\x1b[2J"), W]),
+            all([BLANK, BLANK, BLANK, BLANK])
+        );
+        assert_eq!(rows(&[N, Out("\x1b[3J"), W]), all([R0, R1, R2, R3]));
+    }
+
+    #[test]
+    fn character_insert_delete_and_erase_run_over_the_physical_line() {
+        assert_eq!(
+            rows(&[N, Out("\x1b[1;3H\x1b[3@"), W])[0],
+            "00...00000000ABCDEFG"
+        );
+        assert_eq!(
+            rows(&[N, Out("\x1b[1;3H\x1b[3P"), W])[0],
+            "0000000ABCDEFGHIJ..."
+        );
+        assert_eq!(
+            rows(&[N, Out("\x1b[1;3H\x1b[15X"), W])[0],
+            "00...............HIJ"
+        );
+        assert_eq!(
+            rows(&[N, Out("\x1b[1;9H\x1b[3X"), W])[0],
+            "00000000...BCDEFGHIJ"
+        );
+        assert_eq!(
+            rows(&[N, Out("\x1b[1;3H\x1b[30X"), W])[0],
+            "00.................."
+        );
+        assert_eq!(
+            rows(&[N, Out("\x1b[4h\x1b[1;3Hxy\x1b[4l"), W])[0],
+            "00xy00000000ABCDEFGH",
+            "insert mode"
+        );
+        assert_eq!(
+            rows(&[N, Out("\x1b[1;3H\x1b[3P"), To(15, 4), W])[0],
+            "0000000ABCDEFGH....."
+        );
+        assert_eq!(
+            rows(&[
+                N,
+                Out("\x1b[1;3H\x1b[3@"),
+                To(5, 4),
+                Out("\x1b[1;1H\x1b[2@"),
+                W
+            ])[0],
+            "..00...00000000ABCDE"
+        );
+    }
+
+    #[test]
+    fn lines_move_with_their_kept_cells_and_new_lines_take_the_current_width() {
+        assert_eq!(rows(&[N, Out("\x1b[4;1H\n"), W]), all([R1, R2, R3, BLANK]));
+        assert_eq!(
+            rows(&[N, Out("\x1b[1;1H\x1bM"), W]),
+            all([BLANK, R0, R1, R2])
+        );
+        assert_eq!(
+            rows(&[N, Out("\x1b[2;1H\x1b[L"), W]),
+            all([R0, BLANK, R1, R2])
+        );
+        assert_eq!(
+            rows(&[N, Out("\x1b[2;1H\x1b[M"), W]),
+            all([R0, R2, R3, BLANK])
+        );
+        assert_eq!(rows(&[N, Out("\x1b[S"), W]), all([R1, R2, R3, BLANK]));
+        assert_eq!(rows(&[N, Out("\x1b[T"), W]), all([BLANK, R0, R1, R2]));
+        assert_eq!(
+            rows(&[N, Out("\x1b[2;3r\x1b[S\x1b[r"), W]),
+            all([R0, R2, BLANK, R3])
+        );
+        assert_eq!(
+            rows(&[N, Out("\x1b[2;3r\x1b[3;1H\n\x1b[r"), W]),
+            all([R0, R2, BLANK, R3])
+        );
+        assert_eq!(rows(&[To(10, 3), To(20, 4)]), all([R1, R2, R3, BLANK]));
+        assert_eq!(rows(&[To(10, 6), To(20, 4)]), all([R0, R1, R2, R3]));
+        let grown = rows(&[To(10, 6), Out("\x1b[6;1Hsixth"), To(20, 6)]);
+        assert_eq!(grown[..4], all([R0, R1, R2, R3])[..]);
+        assert_eq!(
+            grown[4..],
+            [
+                "....................".to_string(),
+                "sixth...............".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn decaln_fills_the_physical_line() {
+        assert_eq!(
+            rows(&[N, Out("\x1b#8"), W]),
+            all(["EEEEEEEEEEEEEEEEEEEE"; 4])
+        );
+    }
+
+    #[test]
+    fn leaving_the_alternate_screen_or_a_reset_drops_the_kept_cells() {
+        assert_eq!(
+            rows(&[N, Out("\x1b[?1049l"), W, Out("\x1b[?1049h")]),
+            all([BLANK; 4])
+        );
+        // ?47 and ?1047 are divergent controls (native_serialize): a stream
+        // with them never gets a native snapshot.
+        assert_eq!(rows(&[N, Out("\x1bc"), W]), all([BLANK; 4]));
+    }
+
+    #[test]
+    fn a_wide_char_cut_at_the_narrow_edge_comes_back_whole() {
+        assert_eq!(
+            rows(&[Out("\x1b[1;10H\u{4e2d}"), N, W])[0],
+            "000000000\u{4e2d}BCDEFGHIJ"
+        );
+    }
+
+    #[test]
+    fn the_erase_background_reaches_kept_cells_as_xterm_s_does() {
+        let red = |steps: &[Step]| run(steps).1;
+        let full = "0123456789abcdefghij".to_string();
+        assert_eq!(
+            red(&[N, Out("\x1b[41m\x1b[2J\x1b[0m"), W]),
+            vec![full.clone(); 4]
+        );
+        assert_eq!(
+            red(&[N, Out("\x1b[41m\x1b[2;6H\x1b[J\x1b[0m"), W]),
+            vec!["".into(), "56789".into(), full.clone(), full.clone()]
+        );
+        assert_eq!(
+            red(&[N, Out("\x1b[41m\x1b[1;6H\x1b[K\x1b[0m"), W])[0],
+            "56789"
+        );
+        assert_eq!(
+            red(&[N, Out("\x1b[41m\x1b[1;3H\x1b[3P\x1b[0m"), W])[0],
+            "hij"
+        );
+        assert_eq!(
+            red(&[N, Out("\x1b[41m\x1b[1;3H\x1b[3@\x1b[0m"), W])[0],
+            "234"
+        );
+        assert_eq!(
+            red(&[N, Out("\x1b[41m\x1b[1;3H\x1b[15X\x1b[0m"), W])[0],
+            "23456789abcdefg"
+        );
+        assert_eq!(
+            red(&[N, Out("\x1b[41m\x1b[4;1H\n\x1b[0m"), W])[3],
+            "0123456789"
+        );
+        assert_eq!(
+            red(&[N, Out("\x1b[41m\x1b[2;1H\x1b[L\x1b[0m"), W])[1],
+            "0123456789"
+        );
     }
 }

@@ -7,7 +7,7 @@
 
 # wmux API Reference (generated)
 
-> **Generated from wmux v4.13.0 sources.** This file is produced by
+> **Generated from wmux v4.15.0-beta.1 sources.** This file is produced by
 > `scripts/gen-api-reference.mjs` directly from the code — it lists every
 > RPC method, event type, required capability, and the key event-bus
 > constants exactly as the running daemon sees them. For the hand-curated
@@ -26,7 +26,7 @@ returns `EPERM`. Wire framing: newline-delimited JSON, one object per line.
 
 ## RPC methods
 
-Total: **306** methods (`ALL_RPC_METHODS` in
+Total: **321** methods (`ALL_RPC_METHODS` in
 `src/shared/rpc.ts`). Capability and risk class are read from
 `src/main/mcp/methodCapabilityMap.ts`:
 
@@ -108,6 +108,7 @@ Total: **306** methods (`ALL_RPC_METHODS` in
 | `mcp.claimWorkspace` | `workspace.claim` | `workspace` |
 | `mcp.identify` | `null` |  |
 | `mcp.declarePermissions` | `null` |  |
+| `mcp.sessions.summary` | `wmux.internal` |  |
 
 ### `system`
 
@@ -142,6 +143,8 @@ Total: **306** methods (`ALL_RPC_METHODS` in
 | `browser.screenshot` | `browser.screenshot` | `browser` |
 | `browser.evaluate` | `browser.evaluate` | `browser` |
 | `browser.console.get` | `browser.read` | `browser` |
+| `browser.frames.tree` | `browser.read` | `browser` |
+| `browser.frames.read` | `browser.evaluate` | `browser` |
 | `browser.lifecycle.get` | `browser.read` | `browser` |
 | `browser.network.get` | `browser.read` | `browser` |
 | `browser.responseBody.get` | `browser.read` | `browser` |
@@ -149,7 +152,9 @@ Total: **306** methods (`ALL_RPC_METHODS` in
 | `browser.click.cdp` | `browser.click` | `browser` |
 | `browser.hover.cdp` | `browser.click` | `browser` |
 | `browser.drag.cdp` | `browser.click` | `browser` |
+| `browser.upload.cdp` | `browser.upload` | `browser` |
 | `browser.press.cdp` | `browser.type` | `browser` |
+| `browser.dialog.arm` | `browser.click` | `browser` |
 | `browser.cookies` | `browser.cookies` | `browser` |
 | `browser.resize` | `browser.evaluate` | `browser` |
 | `browser.emulate` | `browser.emulate` | `browser` |
@@ -200,6 +205,15 @@ Total: **306** methods (`ALL_RPC_METHODS` in
 | `a2a.remote.hosts.remove` | `wmux.internal` |  |
 | `a2a.remote.peers.list` | `wmux.internal` |  |
 | `a2a.remote.peers.revoke` | `wmux.internal` |  |
+| `a2a.remote.discover.open` | `wmux.internal` |  |
+| `a2a.remote.discover.close` | `wmux.internal` |  |
+| `a2a.remote.discover.status` | `wmux.internal` |  |
+| `a2a.remote.discover.decide` | `wmux.internal` |  |
+| `a2a.remote.discover.scan` | `wmux.internal` |  |
+| `a2a.remote.discover.connect` | `wmux.internal` |  |
+| `a2a.remote.discover.outgoing.status` | `wmux.internal` |  |
+| `a2a.remote.discover.outgoing.cancel` | `wmux.internal` |  |
+| `a2a.remote.discover.outgoing.confirm` | `wmux.internal` |  |
 | `a2a.remote.exposure.publish` | `wmux.internal` |  |
 | `a2a.remote.exposure.get` | `wmux.internal` |  |
 | `a2a.remote.exposure.list` | `wmux.internal` |  |
@@ -312,6 +326,7 @@ Total: **306** methods (`ALL_RPC_METHODS` in
 | `daemon.phone.register` | `wmux.internal` |  |
 | `daemon.phone.complete` | `wmux.internal` |  |
 | `daemon.phone.keepAwake` | `wmux.internal` |  |
+| `daemon.phone.browserStream` | `wmux.internal` |  |
 | `daemon.workspaceFacts.set` | `wmux.internal` |  |
 | `daemon.botApprovals.set` | `wmux.internal` |  |
 | `daemon.botPrompts.set` | `wmux.internal` |  |

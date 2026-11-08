@@ -106,11 +106,12 @@ export function composePaneClassName(opts: {
   // rather than the hole. Contained, the scale inside a pane is purely local
   // and no future pane-internal element can express the collision at all.
   //
-  // Safe only because nothing inside a pane needs to escape it any more. The
-  // agent toolbar's popovers used to and were the stated blocker, but the bar
-  // moved out to the workspace column on 2026-08-18 (DESIGN.md) and now sits
-  // in ToolbarHost's own `absolute z-20` context; the terminal context menu
-  // was the last one, and it portals to document.body as of this change.
+  // Safe only because what must escape a pane does so on its own. The agent
+  // toolbar's popovers used to be the stated blocker, but the bar moved out
+  // to the workspace column on 2026-08-18 (DESIGN.md) and now sits in
+  // ToolbarHost's own `absolute z-20` context; the terminal context menu
+  // portals to document.body; and every ui/Dialog a pane opens renders into
+  // the dialog host PaneContainer keeps beside the panes (ui/dialogHost).
   const classes = ['flex', 'flex-col', 'h-full', 'w-full', 'relative', 'isolate', 'box-border'];
   if (hasUnread) classes.push('notification-ring');
   if (completeBlink) {
@@ -806,7 +807,7 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
   }, [splitMode]);
   const lastWorkIdRef = useRef<string | undefined>(undefined);
   const { shownTerminalId, shownWorkId } = pickSplitShownSurfaces(
-    splitTerminals, splitWorks, pane.activeSurfaceId, lastWorkIdRef.current,
+    splitTerminals, splitWorks, pane.activeSurfaceId, lastWorkIdRef.current, pane.splitTerminalId,
   );
   useEffect(() => { lastWorkIdRef.current = shownWorkId; }, [shownWorkId]);
   const workFocused = splitWorks.some((s) => s.id === pane.activeSurfaceId);
@@ -1780,6 +1781,8 @@ function SplitSurfaceView({
         <EditorPanel
           key={surface.id}
           filePath={surface.editorFilePath || ''}
+          line={surface.editorLine}
+          lineSeq={surface.editorLineSeq}
           isActive={drawn}
           surfaceId={surface.id}
         />

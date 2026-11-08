@@ -474,10 +474,33 @@ export interface UISlice {
    *  viewport compacted in memory. No Settings row yet (dogfood only). */
   terminalCompactScrollback: boolean;
   setTerminalCompactScrollback: (enabled: boolean) => void;
+  /** Where a clicked terminal file path or `file:` link opens: wmux's own
+   *  read-only editor / preview tab (default) or the OS default app. */
+  terminalOpenFileLinksIn: 'wmux' | 'os';
+  setTerminalOpenFileLinksIn: (target: 'wmux' | 'os') => void;
   /** EXPERIMENTAL, default OFF: draw every pane through one shared WebGL
    *  context instead of one context per pane. No Settings row yet. */
   terminalSharedWebgl: boolean;
   setTerminalSharedWebgl: (enabled: boolean) => void;
+  /** EXPERIMENTAL, default OFF: build terminals with the wongtty front end
+   *  (wongtty/xterm, Rust/WebAssembly) instead of xterm.js. The REQUESTED
+   *  engine, saved in session.json; terminalEngine is the one in use. */
+  terminalWongtty: boolean;
+  setTerminalWongtty: (enabled: boolean) => void;
+  /** EXPERIMENTAL, default OFF: let an agent terminal's own title (OSC 0/2)
+   *  read as its A2A party name, after the `userName` set by a wmux rename.
+   *  Any program writing to that terminal can set the title, so this is the
+   *  operator's opt-in to that; while off, no OSC-derived name is used. */
+  a2aTerminalNames: boolean;
+  setA2aTerminalNames: (enabled: boolean) => void;
+  /** The engine every useTerminal pane runs now. Not saved: it starts as
+   *  'xterm' and only the engine controller (terminal/wongtty/engineController)
+   *  writes it, once wongtty has loaded for an on request. */
+  terminalEngine: 'xterm' | 'wongtty';
+  setTerminalEngine: (engine: 'xterm' | 'wongtty') => void;
+  /** Why wongtty could not load or build a pane, while the switch is on. */
+  terminalEngineFailure: { message: string } | null;
+  setTerminalEngineFailure: (failure: { message: string } | null) => void;
 
   // Issue #174: split panes inherit the splitting pane's cwd (default on).
   splitInheritsCwd: boolean;
@@ -1653,6 +1676,11 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
     state.paneNewTerminalButton = visible;
   }),
 
+  terminalOpenFileLinksIn: 'wmux',
+  setTerminalOpenFileLinksIn: (target) => set((state) => {
+    state.terminalOpenFileLinksIn = target;
+  }),
+
   terminalCompactScrollback: false,
   setTerminalCompactScrollback: (enabled) => set((state) => {
     state.terminalCompactScrollback = enabled;
@@ -1661,6 +1689,31 @@ export const createUISlice: StateCreator<StoreState, [['zustand/immer', never]],
   terminalSharedWebgl: false,
   setTerminalSharedWebgl: (enabled) => set((state) => {
     state.terminalSharedWebgl = enabled;
+  }),
+
+  terminalWongtty: false,
+  setTerminalWongtty: (enabled) => {
+    set((state) => {
+      state.terminalWongtty = enabled;
+    });
+    // A quit right after the toggle keeps the new value.
+    saveSessionNow();
+  },
+  a2aTerminalNames: false,
+  setA2aTerminalNames: (enabled) => {
+    set((state) => {
+      state.a2aTerminalNames = enabled;
+    });
+    // A quit right after the toggle keeps the new value.
+    saveSessionNow();
+  },
+  terminalEngine: 'xterm',
+  setTerminalEngine: (engine) => set((state) => {
+    state.terminalEngine = engine;
+  }),
+  terminalEngineFailure: null,
+  setTerminalEngineFailure: (failure) => set((state) => {
+    state.terminalEngineFailure = failure;
   }),
 
   splitInheritsCwd: true,

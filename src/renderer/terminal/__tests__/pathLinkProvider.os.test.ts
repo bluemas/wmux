@@ -142,13 +142,9 @@ describe('findPathMatches', () => {
       ]);
     });
 
-    it('does not match the path component of a file:// URI', () => {
-      // POSIX matcher's lookbehind requires whitespace / quote / paren /
-      // angle before the `/`. The `:` in `file:` falls outside that set,
-      // so we expect zero hits — the URI is left for WebLinksAddon to
-      // handle if it recognises file://.
+    it('matches a file:// URI whole, not just its path component', () => {
       const matches = findPathMatches('see file:///etc/hosts please', 'linux');
-      expect(matches).toHaveLength(0);
+      expect(matches.map((m) => m.text)).toEqual(['file:///etc/hosts']);
     });
   });
 
@@ -190,9 +186,61 @@ describe('findPathMatches', () => {
       expect(findPathMatches('C:', 'win32')).toEqual([]);
     });
 
-    it('does not match a relative path', () => {
-      expect(findPathMatches('foo/bar.txt', 'linux')).toEqual([]);
-      expect(findPathMatches('./foo/bar.txt', 'linux')).toEqual([]);
+    it('matches a prefixed or dir/name.ext relative path', () => {
+      expect(findPathMatches('see ./foo/bar.txt now', 'linux').map((m) => m.text)).toEqual(['./foo/bar.txt']);
+      expect(findPathMatches('foo/bar.txt', 'linux').map((m) => m.text)).toEqual(['foo/bar.txt']);
+      expect(findPathMatches('edit ../up.md', 'linux').map((m) => m.text)).toEqual(['../up.md']);
+    });
+
+    it('does not match prose that only looks relative', () => {
+      expect(findPathMatches('and/or', 'linux')).toEqual([]);
+      expect(findPathMatches('visit example.com/index.html today', 'linux')).toEqual([]);
+      expect(findPathMatches('http://example.com/a/b.html', 'linux')).toEqual([]);
+    });
+  });
+
+  describe('file URLs and line locations', () => {
+    it('matches a file URL', () => {
+      const m = findPathMatches('open file:///tmp/x.md please', 'linux');
+      expect(m).toHaveLength(1);
+      expect(m[0].text).toBe('file:///tmp/x.md');
+    });
+
+    it('extends the link range over :line and :line:col but not trailing punctuation', () => {
+      const line = 'x /src/a.ts:42 y';
+      const [a] = findPathMatches(line, 'linux');
+      expect(line.slice(a.start, a.end)).toBe('/src/a.ts:42');
+      const wrapped = '(see /src/a.ts:42:10).';
+      const [b] = findPathMatches(wrapped, 'linux');
+      expect(wrapped.slice(b.start, b.end)).toBe('/src/a.ts:42:10');
+      const win = 'C:\\Temp\\t.txt:42';
+      const [c] = findPathMatches(win, 'win32');
+      expect(win.slice(c.start, c.end)).toBe(win);
+    });
+
+    it('reports :line and :line:col separately from the path text', () => {
+      const [a] = findPathMatches('/src/a.ts:42', 'linux');
+      expect(a).toMatchObject({ text: '/src/a.ts', line: 42 });
+      expect(a.col).toBeUndefined();
+      const [b] = findPathMatches('(see /src/a.ts:42:10)', 'linux');
+      expect(b).toMatchObject({ text: '/src/a.ts', line: 42, col: 10 });
+    });
+
+    it('does not read a semver trailer as a line', () => {
+      const [m] = findPathMatches('/foo.ts:1.2.3', 'linux');
+      expect(m.text).toBe('/foo.ts');
+      expect(m.line).toBeUndefined();
+    });
+
+    it('passes the location to the open callback', () => {
+      const open = vi.fn();
+      const term = {
+        buffer: { active: { getLine: () => ({ isWrapped: false, translateToString: () => '/a/b.ts:7:2' }) } },
+      };
+      let links: any[] = [];
+      createPathLinkProvider(term as any, open, 'linux').provideLinks(1, (l) => { links = l ?? []; });
+      links[0].activate({ button: 0 } as MouseEvent);
+      expect(open).toHaveBeenCalledWith('/a/b.ts', { line: 7, col: 2 });
     });
   });
 });
@@ -204,7 +252,7 @@ describe('createPathLinkProvider', () => {
    * `getLine(n).isWrapped`, so a stub is faster + clearer than mocking
    * the full xterm interface.
    */
-  function makeTerminal(lines: { text: string; wrapped?: boolean }[]) {
+  function makeTerminal(lines: { text: string; wrapped?: boolean; padded?: boolean; wideEnd?: boolean }[]) {
     return {
       buffer: {
         active: {
@@ -214,6 +262,18 @@ describe('createPathLinkProvider', () => {
             return {
               translateToString: () => l.text,
               isWrapped: !!l.wrapped,
+              // `padded`: the last cell was left empty by a wide character
+              // that moved to the next row (xterm prints it as a space).
+              // `wideEnd`: a wide character fills the last two cells; the
+              // last is its empty width-0 right half (not in `text`).
+              length: l.text.length + (l.wideEnd ? 1 : 0),
+              getCell: (x: number) => {
+                const half = l.wideEnd && x === l.text.length;
+                return {
+                  getChars: () => (half || (l.padded && x === l.text.length - 1) ? '' : l.text[x]),
+                  getWidth: () => (half ? 0 : 1),
+                };
+              },
             };
           },
         },
@@ -239,14 +299,75 @@ describe('createPathLinkProvider', () => {
     expect(links[0].text).toBe('/etc/hosts');
   });
 
-  it('skips wrapped continuation lines so paths do not double-match', () => {
+  it('reads a soft-wrapped path whole, from either of its rows', () => {
+    // A narrow pane wrapped the path after "AppData/L".
     const terminal = makeTerminal([
-      { text: '/etc/hosts continuation row body', wrapped: true },
+      { text: 'see /mnt/c/Users/me/AppData/L' },
+      { text: 'ocal/x.txt', wrapped: true },
+    ]);
+    const openPath = vi.fn();
+    const provider = createPathLinkProvider(terminal, openPath, 'linux');
+    for (const row of [1, 2]) {
+      const cb = vi.fn();
+      provider.provideLinks(row, cb);
+      const links = cb.mock.calls[0][0];
+      expect(links).toHaveLength(1);
+      expect(links[0].text).toBe('/mnt/c/Users/me/AppData/Local/x.txt');
+      expect(links[0].range).toEqual({ start: { x: 5, y: 1 }, end: { x: 10, y: 2 } });
+    }
+    const cb = vi.fn();
+    provider.provideLinks(2, cb);
+    cb.mock.calls[0][0][0].activate({ button: 0 } as MouseEvent);
+    expect(openPath).toHaveBeenCalledWith('/mnt/c/Users/me/AppData/Local/x.txt');
+  });
+
+  it('does not match the tail of a wrapped path as a path of its own', () => {
+    const terminal = makeTerminal([
+      { text: 'x /var/lo' },
+      { text: 'g/system.log /etc/hosts', wrapped: true },
     ]);
     const provider = createPathLinkProvider(terminal, vi.fn(), 'linux');
     const cb = vi.fn();
-    provider.provideLinks(1, cb);
-    expect(cb).toHaveBeenCalledWith(undefined);
+    provider.provideLinks(2, cb);
+    expect(cb.mock.calls[0][0].map((l: { text: string }) => l.text)).toEqual(['/var/log/system.log', '/etc/hosts']);
+  });
+
+  it('drops the empty cell a wide character left at the end of a wrapped row', () => {
+    const terminal = makeTerminal([
+      { text: 'see /tmp/漢 ', padded: true },
+      { text: '字/x.txt', wrapped: true },
+    ]);
+    const provider = createPathLinkProvider(terminal, vi.fn(), 'linux');
+    const cb = vi.fn();
+    provider.provideLinks(2, cb);
+    expect(cb.mock.calls[0][0].map((l: { text: string }) => l.text)).toEqual(['/tmp/漢字/x.txt']);
+  });
+
+  it('keeps a wide character that fills the last two cells of a wrapped row', () => {
+    const terminal = makeTerminal([
+      { text: 'see /tmp/漢', wideEnd: true },
+      { text: '字/x.txt', wrapped: true },
+    ]);
+    const provider = createPathLinkProvider(terminal, vi.fn(), 'linux');
+    const cb = vi.fn();
+    provider.provideLinks(2, cb);
+    expect(cb.mock.calls[0][0].map((l: { text: string }) => l.text)).toEqual(['/tmp/漢字/x.txt']);
+  });
+
+  it('reads a line longer than the row limit one row at a time, from every row', () => {
+    // 41 rows: past the limit, so no row joins its neighbours, and a path
+    // cut at a row edge reads the same (cut) from the rows on both sides.
+    const rows: { text: string; wrapped?: boolean }[] = [{ text: 'x /opt/fir' }, { text: 'st.txt ', wrapped: true }];
+    for (let i = 0; i < 39; i++) rows.push({ text: `/opt/r${String(i).padStart(2, '0')}.txt `, wrapped: true });
+    const provider = createPathLinkProvider(makeTerminal(rows), vi.fn(), 'linux');
+    const textsAt = (row: number): string[] => {
+      const cb = vi.fn();
+      provider.provideLinks(row, cb);
+      return (cb.mock.calls[0][0] ?? []).map((l: { text: string }) => l.text);
+    };
+    expect(textsAt(1)).toEqual(['/opt/fir']);
+    expect(textsAt(2)).toEqual([]);
+    expect(textsAt(41)).toEqual(['/opt/r38.txt']);
   });
 
   it('passes undefined when the line is empty', () => {

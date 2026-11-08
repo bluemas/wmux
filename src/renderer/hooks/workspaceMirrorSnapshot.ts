@@ -18,6 +18,7 @@ import type {
 } from '../../shared/workspaceMirror';
 import { normalizeRoleBinding } from '../../shared/orchestratorRole';
 import { isShadowWorkspaceId } from '../../shared/pcRail';
+import { paneTag } from '../utils/paneNaming';
 import type { StoreState } from '../stores';
 import { selectFleetPanes, surfaceAttentionStatus, type FleetPane, type FleetSelectorState } from '../stores/selectors/fleet';
 
@@ -167,8 +168,9 @@ export function buildFleetSnapshots(state: FleetSnapshotState, ts: number): Flee
   // completion gate would wait on a session this desktop cannot end. The
   // callers hand this function the whole live store, so withholding
   // `remoteWorkspaces` has to be explicit — a type that merely omits the field
-  // does not strip it at runtime.
-  const localOnly = { ...state, remoteWorkspaces: undefined };
+  // does not strip it at runtime. The rail's down rule goes with it: this
+  // view never resolved a remote row, so it keeps them as it always has.
+  const localOnly = { ...state, remoteWorkspaces: undefined, downHostIds: undefined, outdatedRemoteKeys: undefined, pcRailHostStatus: undefined, pcRailFeeds: undefined };
   for (const p of selectFleetPanes(localOnly)) derivedByPane.set(p.paneId, p);
   // Attention-stripped base status per leaf: the same selector with no retained
   // attention statuses collapses each pane to running/idle (its non-attention
@@ -355,6 +357,15 @@ export function buildPanePtys(workspaces: Workspace[]): Record<string, string> {
   return out;
 }
 
+/** paneId → auto tag (`#w1-2`) for every pane, stashed panes included (see `paneTags`). */
+export function buildPaneTags(workspaces: Workspace[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const w of workspaces) {
+    for (const leaf of getWorkspaceLeafPanes(w)) out[leaf.id] = paneTag(w, leaf);
+  }
+  return out;
+}
+
 /** Every pane id in the layout, stashed panes included (see `paneIds`). */
 export function buildPaneIds(workspaces: Workspace[]): string[] {
   return workspaces.flatMap((w) => getWorkspaceLeafPanes(w).map((leaf) => leaf.id));
@@ -378,6 +389,7 @@ export function buildWorkspaceMirrorPayload(
     roleBindings: buildRoleBindings(state),
     panePtys: buildPanePtys(state.workspaces),
     paneIds: buildPaneIds(state.workspaces),
+    paneTags: buildPaneTags(state.workspaces),
     sessionRestored: state.sessionRestored === true,
     pinnedIds: [...(state.sidebarPinnedIds ?? [])],
     viewed: buildViewed(state),

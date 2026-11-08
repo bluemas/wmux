@@ -7,7 +7,10 @@
  *   • path.normalize is applied (so `..` collapses before isAbsolute check)
  *   • openPath returning an error string triggers showItemInFolder fallback
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 // ── Module mocks (hoisted; cannot reference outer test variables) ──────────
 
@@ -90,9 +93,17 @@ describe('shell.handler — SHELL_OPEN_PATH', () => {
   it('forwards a Windows drive path on a Windows host', async () => {
     if (process.platform !== 'win32') return;
     const handler = getHandler(IPC.SHELL_OPEN_PATH);
-    const result = await handler(fakeEvent, 'C:\\Users\\rizz\\file.txt');
-    expect(openPath).toHaveBeenCalledWith('C:\\Users\\rizz\\file.txt');
-    expect(result).toEqual({ ok: true, error: undefined });
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'openpath-win-'));
+    const input = path.join(dir, 'file.txt');
+    fs.writeFileSync(input, 'x');
+    try {
+      expect(input).toMatch(/^[A-Za-z]:\\/);
+      const result = await handler(fakeEvent, input);
+      expect(openPath).toHaveBeenCalledWith(input);
+      expect(result).toEqual({ ok: true, error: undefined });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('rejects a non-string argument', async () => {
@@ -129,19 +140,38 @@ describe('shell.handler — SHELL_OPEN_PATH', () => {
 
   it('normalizes the path before forwarding (collapses `..`)', async () => {
     const handler = getHandler(IPC.SHELL_OPEN_PATH);
-    const input = process.platform === 'win32' ? 'C:\\foo\\..\\bar' : '/foo/../bar';
-    const expected = process.platform === 'win32' ? 'C:\\bar' : '/bar';
-    await handler(fakeEvent, input);
-    expect(openPath).toHaveBeenCalledWith(expected);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-open-'));
+    fs.writeFileSync(path.join(dir, 'bar.txt'), 'x');
+    try {
+      await handler(fakeEvent, `${dir}${path.sep}foo${path.sep}..${path.sep}bar.txt`);
+      expect(openPath).toHaveBeenCalledWith(path.join(dir, 'bar.txt'));
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
-  it('falls back to showItemInFolder when openPath returns an error', async () => {
+  it('falls back to showItemInFolder when openPath fails on a path that exists', async () => {
     openPath.mockResolvedValueOnce('Failed to open path');
+    const handler = getHandler(IPC.SHELL_OPEN_PATH);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wmux-open-'));
+    const input = path.join(dir, 'notes.txt');
+    fs.writeFileSync(input, 'x');
+    try {
+      const result = await handler(fakeEvent, input);
+      expect(showItemInFolder).toHaveBeenCalledWith(input);
+      expect(result).toEqual({ ok: false, error: 'Failed to open path' });
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('says NOT_FOUND for a path that does not exist, without opening it or revealing a folder', async () => {
     const handler = getHandler(IPC.SHELL_OPEN_PATH);
     const input = process.platform === 'win32' ? 'C:\\does-not-exist' : '/does-not-exist';
     const result = await handler(fakeEvent, input);
-    expect(showItemInFolder).toHaveBeenCalledWith(input);
-    expect(result).toEqual({ ok: false, error: 'Failed to open path' });
+    expect(openPath).not.toHaveBeenCalled();
+    expect(showItemInFolder).not.toHaveBeenCalled();
+    expect(result).toEqual({ ok: false, error: 'NOT_FOUND' });
   });
 
   describe('executable extension blocklist', () => {
@@ -158,12 +188,20 @@ describe('shell.handler — SHELL_OPEN_PATH', () => {
       '.command', '.app', '.tool', '.terminal', '.workflow', '.sh',
     ];
 
+    // The files exist: a missing one is NOT_FOUND whatever its extension.
+    let dir = '';
+    beforeAll(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'openpath-blocked-')); });
+    afterAll(() => { fs.rmSync(dir, { recursive: true, force: true }); });
+    const existing = (name: string): string => {
+      const file = path.join(dir, name);
+      fs.writeFileSync(file, 'x');
+      return file;
+    };
+
     for (const ext of blockedSamples) {
       it(`blocks ${ext} extension and reveals folder`, async () => {
         const handler = getHandler(IPC.SHELL_OPEN_PATH);
-        const input = process.platform === 'win32'
-          ? `C:\\Users\\rizz\\evil${ext}`
-          : `/home/rizz/evil${ext}`;
+        const input = existing(`evil${ext}`);
         const result = await handler(fakeEvent, input);
         expect(openPath).not.toHaveBeenCalled();
         expect(showItemInFolder).toHaveBeenCalledWith(expectNormalized(input));
@@ -173,26 +211,147 @@ describe('shell.handler — SHELL_OPEN_PATH', () => {
 
     it('matches blocked extension case-insensitively', async () => {
       const handler = getHandler(IPC.SHELL_OPEN_PATH);
-      const input = process.platform === 'win32' ? 'C:\\foo.EXE' : '/foo.EXE';
+      const input = existing('foo.EXE');
       const result = await handler(fakeEvent, input);
       expect(openPath).not.toHaveBeenCalled();
       expect(result).toEqual({ ok: false, error: 'BLOCKED_EXTENSION' });
     });
 
+    it('a missing file with a blocked extension is NOT_FOUND, and reveals no folder', async () => {
+      const handler = getHandler(IPC.SHELL_OPEN_PATH);
+      const result = await handler(fakeEvent, path.join(dir, 'missing.sh'));
+      expect(openPath).not.toHaveBeenCalled();
+      expect(showItemInFolder).not.toHaveBeenCalled();
+      expect(result).toEqual({ ok: false, error: 'NOT_FOUND' });
+    });
+
     it('allows non-executable extensions', async () => {
       const handler = getHandler(IPC.SHELL_OPEN_PATH);
-      const input = process.platform === 'win32' ? 'C:\\foo.txt' : '/foo.txt';
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'openpath-txt-'));
+      const input = path.join(dir, 'foo.txt');
+      fs.writeFileSync(input, 'x');
+      try {
+        const result = await handler(fakeEvent, input);
+        expect(openPath).toHaveBeenCalledWith(input);
+        expect(result).toEqual({ ok: true, error: undefined });
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('refuses a sensitive path without opening or revealing it', async () => {
+      const handler = getHandler(IPC.SHELL_OPEN_PATH);
+      const input = path.join(os.homedir(), '.ssh', 'id_rsa');
       const result = await handler(fakeEvent, input);
-      expect(openPath).toHaveBeenCalledWith(input);
-      expect(result).toEqual({ ok: true, error: undefined });
+      expect(openPath).not.toHaveBeenCalled();
+      expect(showItemInFolder).not.toHaveBeenCalled();
+      expect(result).toEqual({ ok: false, error: 'BLOCKED_SENSITIVE' });
+    });
+
+    it('refuses a symlink whose real path is sensitive', async () => {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'openpath-home-'));
+      try {
+        vi.spyOn(os, 'homedir').mockReturnValue(home);
+        fs.mkdirSync(path.join(home, '.ssh'));
+        fs.writeFileSync(path.join(home, '.ssh', 'id_rsa'), 'secret');
+        const link = path.join(home, 'innocent.txt');
+        fs.symlinkSync(path.join(home, '.ssh', 'id_rsa'), link);
+        const result = await getHandler(IPC.SHELL_OPEN_PATH)(fakeEvent, link);
+        expect(openPath).not.toHaveBeenCalled();
+        expect(result).toEqual({ ok: false, error: 'BLOCKED_SENSITIVE' });
+      } finally {
+        vi.restoreAllMocks();
+        fs.rmSync(home, { recursive: true, force: true });
+      }
+    });
+
+    it('refuses to open a credential folder with Open with', async () => {
+      const result = await getHandler(IPC.SHELL_OPEN_WITH)(fakeEvent, { appId: 'explorer', folderPath: path.join(os.homedir(), '.ssh') });
+      expect(openPath).not.toHaveBeenCalled();
+      expect(result).toEqual({ ok: false, error: 'BLOCKED_SENSITIVE' });
+    });
+
+    // A folder the user cannot search: realpath fails with EACCES, not ENOENT.
+    it.skipIf(process.platform === 'win32')('refuses when the real path cannot be resolved for a reason other than a missing file', async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'openpath-locked-'));
+      const locked = path.join(dir, 'locked');
+      try {
+        fs.mkdirSync(locked);
+        fs.writeFileSync(path.join(locked, 'notes.md'), 'x');
+        fs.chmodSync(locked, 0o000);
+        const result = await getHandler(IPC.SHELL_OPEN_PATH)(fakeEvent, path.join(locked, 'notes.md'));
+        expect(openPath).not.toHaveBeenCalled();
+        expect(result).toEqual({ ok: false, error: 'BLOCKED_SENSITIVE' });
+      } finally {
+        fs.chmodSync(locked, 0o755);
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it.skipIf(process.platform === 'win32')('refuses a link whose target has a blocked extension', async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'openpath-ext-'));
+      try {
+        fs.writeFileSync(path.join(dir, 'tool.exe'), 'x');
+        fs.symlinkSync(path.join(dir, 'tool.exe'), path.join(dir, 'readme.txt'));
+        const result = await getHandler(IPC.SHELL_OPEN_PATH)(fakeEvent, path.join(dir, 'readme.txt'));
+        expect(openPath).not.toHaveBeenCalled();
+        expect(result).toEqual({ ok: false, error: 'BLOCKED_EXTENSION' });
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('opens the spelling it was given, once its real path is checked', async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'openpath-real-'));
+      try {
+        fs.writeFileSync(path.join(dir, 'notes.md'), 'x');
+        fs.symlinkSync(path.join(dir, 'notes.md'), path.join(dir, 'link.md'));
+        await getHandler(IPC.SHELL_OPEN_PATH)(fakeEvent, path.join(dir, 'link.md'));
+        // A mapped drive must stay a drive letter for the app it opens in.
+        expect(openPath).toHaveBeenCalledWith(path.join(dir, 'link.md'));
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('refuses a missing path inside a linked credential folder, without revealing it', async () => {
+      const home = fs.mkdtempSync(path.join(os.tmpdir(), 'openpath-home-'));
+      try {
+        vi.spyOn(os, 'homedir').mockReturnValue(home);
+        fs.mkdirSync(path.join(home, '.ssh'));
+        const link = path.join(home, 'keys');
+        fs.symlinkSync(path.join(home, '.ssh'), link);
+        const missing = path.join(link, 'gone', 'id_rsa');
+        const opened = await getHandler(IPC.SHELL_OPEN_PATH)(fakeEvent, missing);
+        const openedWith = await getHandler(IPC.SHELL_OPEN_WITH)(fakeEvent, { appId: 'explorer', folderPath: link });
+        expect(openPath).not.toHaveBeenCalled();
+        expect(showItemInFolder).not.toHaveBeenCalled();
+        expect(opened).toEqual({ ok: false, error: 'BLOCKED_SENSITIVE' });
+        expect(openedWith).toEqual({ ok: false, error: 'BLOCKED_SENSITIVE' });
+      } finally {
+        vi.restoreAllMocks();
+        fs.rmSync(home, { recursive: true, force: true });
+      }
+    });
+
+    // A share path is absolute only on Windows.
+    it.runIf(process.platform === 'win32')('refuses a WSL share path into ~/.ssh', async () => {
+      const handler = getHandler(IPC.SHELL_OPEN_PATH);
+      const result = await handler(fakeEvent, '\\\\wsl$\\Ubuntu\\home\\me\\.ssh\\id_rsa');
+      expect(openPath).not.toHaveBeenCalled();
+      expect(result).toEqual({ ok: false, error: 'BLOCKED_SENSITIVE' });
     });
 
     it('allows extension-less paths (folders)', async () => {
       const handler = getHandler(IPC.SHELL_OPEN_PATH);
-      const input = process.platform === 'win32' ? 'C:\\Users\\rizz' : '/home/rizz';
-      const result = await handler(fakeEvent, input);
-      expect(openPath).toHaveBeenCalledWith(input);
-      expect(result).toEqual({ ok: true, error: undefined });
+      const input = fs.mkdtempSync(path.join(os.tmpdir(), 'openpath-dir-'));
+      try {
+        const result = await handler(fakeEvent, input);
+        expect(openPath).toHaveBeenCalledWith(input);
+        expect(result).toEqual({ ok: true, error: undefined });
+      } finally {
+        fs.rmSync(input, { recursive: true, force: true });
+      }
     });
   });
 });

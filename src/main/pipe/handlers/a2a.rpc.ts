@@ -3,6 +3,7 @@ import { refuseHandoffMarker } from '../handoffMarkerTripwire';
 import type { RpcRouter } from '../RpcRouter';
 import type { RpcContext } from '../../../shared/rpc';
 import { isHostedCaller } from '../../../shared/rpc';
+import { a2aCallerWorkspace } from './a2aCaller';
 import { sendToRenderer } from './_bridge';
 import { resolvePtyOwnerWorkspace } from '../../workspace/ptyOwnership';
 import type { ClaudeWorker } from '../../a2a/ClaudeWorker';
@@ -52,6 +53,7 @@ import { recordSentTask, recordTaskState, reopenedState, stateOfTask, workLinkFr
 import { getHandOutStore, type HandOutStore } from '../../handOut/handOutStore';
 import { isHandOutId } from '../../../shared/handOut';
 import { noteTrackReply } from '../../deck/trackRecordFeed';
+import { notePeerPidClaim } from './peerPidShadow';
 import { A2A_BRAIN_ALIAS, A2A_REMOTE_BODY_MAX, A2A_REMOTE_IMAGE_LIMITS, isRemoteTaskId } from '../../../shared/a2aRemote';
 import {
   isRemoteWorkspaceId,
@@ -866,7 +868,7 @@ export function registerA2aRpc(
   // restore while the shell process (and its frozen WMUX_WORKSPACE_ID env)
   // lives on. Storing the workspace id at create time and trusting it forever
   // is exactly what produced stale identities ("no workspace found for ws-…").
-  router.register('a2a.resolve.identity', async (params) => {
+  router.register('a2a.resolve.identity', async (params, ctx) => {
     // PROPER multi-agent fix: a caller that can't walk its own process tree —
     // Codex sandboxes the per-hop PowerShell spawn and strips the env hints —
     // sends its OWN pid as `callerPid`. We then walk the tree HERE (main, where
@@ -882,6 +884,7 @@ export function registerA2aRpc(
     // client name (before #1111 it did not even need that) — so this is a
     // reliability mechanism, not a new security boundary.
     const callerPid = normalizeCallerPid((params as { callerPid?: unknown }).callerPid);
+    notePeerPidClaim('callerPid', callerPid, ctx);
     // Start the snapshot CONCURRENTLY and bound the wait (at the walk below) to the
     // RPC budget: it feeds only the final walk, so it must never delay — or, past
     // the client's ~10s RPC deadline, SINK — the legacy mappings/entries fallback
@@ -1142,7 +1145,9 @@ export function registerA2aRpc(
     const codexThreadId = (params as { codexThreadId?: unknown }).codexThreadId;
     let threadClaim: ReturnType<typeof resolveCodexThreadClaim> = null;
     if (codexThreadId !== undefined) {
-      const sharedServerChild = await isSharedServerChild(normalizeCallerPid((params as { codexCallerPid?: unknown }).codexCallerPid));
+      const codexCallerPid = normalizeCallerPid((params as { codexCallerPid?: unknown }).codexCallerPid);
+      notePeerPidClaim('codexCallerPid', codexCallerPid, ctx);
+      const sharedServerChild = await isSharedServerChild(codexCallerPid);
       const confirmed = await confirmEntriesConnection();
       if (stillConfirmed(confirmed)) threadClaim = resolveCodexThreadClaim(codexThreadId, entries, sharedServerChild);
     }
@@ -1309,7 +1314,9 @@ export function registerA2aRpc(
     const out = entries.length ? { ...res, agents: [...agents, ...entries] } : res;
     return remotePeers.length ? { ...out, remotePeers } : out;
   });
-  router.register('a2a.broadcast', async (params, ctx) =>
+  // A broadcast is delivered under its sender's workspace name, so its caller
+  // is taken from the server side too.
+  registerAsCaller('a2a.broadcast', async (params, ctx) =>
     refuseHandoffMarker('a2a.broadcast', params.message, ctx)
     ?? sendToRenderer(getWindow, 'a2a.broadcast', withOperatorOrigin(params, ctx), { timeoutMs: A2A_PASTE_MAIN_TIMEOUT_MS }));
   router.register('meta.setSkills', (params) => sendToRenderer(getWindow, 'meta.setSkills', params));
@@ -1323,7 +1330,19 @@ export function registerA2aRpc(
   // 더 최신이면 status/updatedAt만 데몬 값으로 덮고, 렌더러 전용 증분(history·
   // artifacts)은 보존한다(§6.F — 증분 히스토리는 아직 데몬 비내구). 데몬-only
   // id(재시작 생존분)는 추가. 데몬 미가용이면 현행 렌더러-only와 동일.
-  router.register('a2a.task.query', async (rawParams, ctx) => {
+  /** A method whose caller's workspace is taken from the server side (a2aCaller.ts). */
+  function registerAsCaller(
+    method: 'a2a.task.query' | 'a2a.task.update' | 'a2a.task.send' | 'a2a.task.cancel' | 'a2a.broadcast',
+    handler: (params: Record<string, unknown>, ctx: RpcContext | undefined) => Promise<unknown>,
+  ): void {
+    router.register(method, async (params, ctx) => {
+      const caller = await a2aCallerWorkspace(getWindow, method, params, ctx);
+      if (!caller.ok) return { error: caller.error };
+      return handler(caller.trusted ? params : { ...params, workspaceId: caller.workspaceId }, ctx);
+    });
+  }
+
+  registerAsCaller('a2a.task.query', async (rawParams, ctx) => {
     // Reading one remote task by id is what the sender's `read` receipt means.
     // The daemon checks the caller is the task's receiving workspace.
     const readId = typeof rawParams.taskId === 'string' ? rawParams.taskId : '';
@@ -1715,7 +1734,7 @@ export function registerA2aRpc(
   // 미접촉 반환(재판정 금지). 데몬 unavailable → 현행 렌더러-검증 경로 폴백.
   // A working slot a message took (it hands a reported company task back) is
   // released once the call is over, the task `working` in the daemon by then.
-  router.register('a2a.task.update', async (rawParams, ctx) => {
+  registerAsCaller('a2a.task.update', async (rawParams, ctx) => {
     const taken: { release?: () => void } = {};
     try {
       return await updateTask(rawParams, ctx, taken);
@@ -1889,7 +1908,7 @@ export function registerA2aRpc(
   // await — 이후 전이(working/completed)가 데몬 게이트에서 태스크를 찾도록.
   // A working slot the send took is released once it is over, its task in the
   // daemon's record by then (or never stored).
-  router.register('a2a.task.send', async (params, ctx) => {
+  registerAsCaller('a2a.task.send', async (params, ctx) => {
     const taken: { release?: () => void; handOut?: () => void } = {};
     try {
       return await sendTask(params, ctx, taken);
@@ -2169,7 +2188,7 @@ export function registerA2aRpc(
   }
 
   // task.cancel: cancel worker + 데몬 정본 커밋 + 렌더러 캐시/이벤트(envelope PR4).
-  router.register('a2a.task.cancel', cancelTask);
+  registerAsCaller('a2a.task.cancel', cancelTask);
 
   async function cancelTask(params: Record<string, unknown>, ctx: RpcContext | undefined): Promise<unknown> {
     const taskId = typeof params.taskId === 'string' ? params.taskId : '';

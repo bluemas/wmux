@@ -82,7 +82,21 @@ export function registerComputerRpc(
   router.register('computer.listWindows', wrap('computer.listWindows', (params, agent) =>
     getService().listWindows(agent, typeof params.app === 'string' ? params.app : undefined), 'optional'));
 
-  router.register('computer.getAppState', wrap('computer.getAppState', (params, agent) => {
+  router.register('computer.getAppState', wrap('computer.getAppState', (params, agent): Promise<unknown> => {
+    // The `desktop` action: a read-only agent-desktop command, observed under
+    // this method's name so every rule keyed on it applies unchanged.
+    if (params.desktop !== undefined) {
+      const desktop = params.desktop as { command?: unknown; args?: unknown } | null;
+      if (typeof desktop !== 'object' || desktop === null || Array.isArray(desktop)) {
+        throw new ComputerError('invalid_argument', 'desktop must be an object with command and args');
+      }
+      return getService().desktop(agent, {
+        command: desktop.command,
+        args: desktop.args,
+        ...(typeof params.app === 'string' && params.app.length > 0 && { app: params.app }),
+        ...(typeof params.window === 'string' && { window: params.window }),
+      });
+    }
     if (typeof params.app !== 'string' || params.app.length === 0) {
       throw new ComputerError('invalid_argument', 'app is required');
     }
@@ -94,6 +108,17 @@ export function registerComputerRpc(
   }, 'required'));
 
   router.register('computer.act', wrap('computer.act', (params, agent): Promise<unknown> => {
+    // A desktop ref action: the `desktop` field is read first and travels
+    // alone (besides the identity), so no other control field can ride on it.
+    if (params.desktop !== undefined) {
+      const desktop = params.desktop as { command?: unknown; args?: unknown } | null;
+      if (typeof desktop !== 'object' || desktop === null || Array.isArray(desktop)) {
+        throw new ComputerError('invalid_argument', 'desktop must be an object with command and args');
+      }
+      const extra = Object.keys(params).filter((k) => k !== 'desktop' && k !== 'senderPtyId' && k !== 'callerInstance' && params[k] !== undefined);
+      if (extra.length > 0) throw new ComputerError('invalid_argument', `a desktop action takes no ${extra.join(', ')}`);
+      return getService().desktopAct(agent, { command: desktop.command, args: desktop.args });
+    }
     if (typeof params.action !== 'string' || !isControlAction(params.action)) {
       throw new ComputerError('invalid_argument', `action must be one of ${COMPUTER_CONTROL_ACTIONS.join(', ')}`);
     }
@@ -212,15 +237,23 @@ async function callerAgent(
   // What the person (consent prompt) and other agents (input_busy) see: the
   // client name and the workspace by its name. The key carries pane and
   // workspace ids and stays internal.
-  const inWorkspace = (workspaceId: string, role = 'in') => {
+  const nameOf = (workspaceId: string): string => {
     let shown: string | undefined;
     try {
       shown = workspaceName(workspaceId);
     } catch {
       shown = undefined;
     }
-    const clean = shown ? quotable(shown) : '';
+    return shown ? quotable(shown) : '';
+  };
+  const inWorkspace = (workspaceId: string, role = 'in') => {
+    const clean = nameOf(workspaceId);
     return clean ? `${name} ${role} workspace "${clean}"` : `${name} ${role} a wmux workspace`;
+  };
+  // What the agent's on-screen marker is named by (agentMarkers.ts).
+  const markerName = (workspaceId?: string) => {
+    const clean = workspaceId ? nameOf(workspaceId) : '';
+    return { client: quotable(name), ...(clean && { workspaceName: clean }) };
   };
   const claim = ctx?.workspaceClaim;
   if (claim?.kind === 'stale') {
@@ -240,12 +273,13 @@ async function callerAgent(
     if (claim?.kind === 'bound' && claim.workspaceId !== ws) {
       throw new ComputerError('invalid_argument', 'this agent\'s pane and workspace claim disagree');
     }
-    return { key: `${name} @ ${ws}/${ptyId}`, label: inWorkspace(ws) };
+    return { key: `${name} @ ${ws}/${ptyId}`, label: inWorkspace(ws), ptyId, ...markerName(ws) };
   }
   if (ctx?.commanderWorkspace) {
     return {
       key: `${name} @ ${ctx.commanderWorkspace}/commander`,
       label: inWorkspace(ctx.commanderWorkspace, 'orchestrating'),
+      ...markerName(ctx.commanderWorkspace),
     };
   }
   const instance = typeof params.callerInstance === 'string' ? params.callerInstance : '';
@@ -258,5 +292,6 @@ async function callerAgent(
   return {
     key: `${name} ${where} #${createHash('sha256').update(instance).digest('hex').slice(0, 12)}`,
     label: claim?.kind === 'bound' ? inWorkspace(claim.workspaceId) : `${name} (outside wmux panes)`,
+    ...markerName(claim?.kind === 'bound' ? claim.workspaceId : undefined),
   };
 }

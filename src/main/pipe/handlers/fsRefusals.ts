@@ -10,6 +10,8 @@
 //
 // Keep the list here, and keep one test per rule in fsRefusals.test.ts.
 
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { homeRoots, isSensitivePath, resolveAccessiblePath } from '../../ipc/handlers/fs.handler';
 
@@ -29,19 +31,38 @@ const SHELL_HISTORY = new Set([
   '.bash_history', '.zsh_history', '.sh_history', '.history', 'fish_history', 'consolehost_history.txt',
 ]);
 
-/** The folder Electron keeps each wmux profile's userData in, relative to home. */
-function userDataRoots(): string[] {
-  if (process.platform === 'darwin') return ['library/application support'];
-  if (process.platform === 'win32') return ['appdata/roaming'];
-  const xdg = process.env.XDG_CONFIG_HOME;
+/** The user config folder for XDG tools (gh), relative to home: ~/.config and $XDG_CONFIG_HOME. */
+function configRoots(): string[] {
   const roots = ['.config'];
+  const xdg = xdgConfigHome();
   if (xdg) {
     for (const home of homeRoots()) {
-      const rel = relBelow(xdg.replace(/\\/g, '/').toLowerCase(), home);
+      const rel = relBelow(xdg, home);
       if (rel) roots.push(rel);
     }
   }
   return roots;
+}
+
+/** $XDG_CONFIG_HOME, absolute, lowercase and `/`-separated; null when unset. */
+function xdgConfigHome(): string | null {
+  const xdg = process.env.XDG_CONFIG_HOME;
+  return xdg ? path.resolve(xdg).replace(/\\/g, '/').toLowerCase().replace(/\/+$/, '') : null;
+}
+
+/** gh tokens and wmux's userData under an $XDG_CONFIG_HOME outside home. */
+function underXdgConfig(normalized: string): boolean {
+  const xdg = xdgConfigHome();
+  if (!xdg || !normalized.startsWith(`${xdg}/`)) return false;
+  const first = normalized.slice(xdg.length + 1).split('/')[0];
+  return first === 'gh' || first.startsWith('wmux');
+}
+
+/** The folder Electron keeps each wmux profile's userData in, relative to home. */
+function userDataRoots(): string[] {
+  if (process.platform === 'darwin') return ['library/application support'];
+  if (process.platform === 'win32') return ['appdata/roaming'];
+  return configRoots();
 }
 
 export const PLUGIN_FS_REFUSALS: readonly Rule[] = [
@@ -60,7 +81,11 @@ export const PLUGIN_FS_REFUSALS: readonly Rule[] = [
   // so source files such as id_map.ts stay readable.
   { what: 'SSH key files (id_*), at any depth', test: anySegment((n) => /^id_[^.]+(\.pub)?$/.test(n)) },
   { what: '~/.git-credentials', test: underHome('.git-credentials') },
-  { what: '~/.config/gh (GitHub CLI tokens)', test: underHome('.config/gh') },
+  {
+    what: 'GitHub CLI tokens: ~/.config/gh, $XDG_CONFIG_HOME/gh and %APPDATA%\\GitHub CLI',
+    test: (s, rel) => configRoots().some((root) => underHome(`${root}/gh`)(s, rel)) || underHome('appdata/roaming/github cli')(s, rel),
+  },
+  { what: 'gcloud credentials on Windows: %APPDATA%\\gcloud', test: underHome('appdata/roaming/gcloud') },
   { what: '~/.claude/.credentials.json and ~/.claude.json', test: underHome('.claude/.credentials.json', '.claude.json') },
   { what: '~/.codex/auth.json', test: underHome('.codex/auth.json') },
   { what: '~/.pgpass', test: underHome('.pgpass') },
@@ -87,9 +112,26 @@ export function pluginFsRefusal(p: string): Rule | null {
   return null;
 }
 
+/** A WSL distro's files (\\wsl.localhost\<distro>, \\wsl$\<distro>): their home is not one
+ *  the rules know, so a plugin never reaches them. */
+const WSL_SHARE = /^(?:[\\/]{2}\?[\\/]unc[\\/]|[\\/]{2})(?:wsl\.localhost|wsl\$)(?:[\\/]|$)/i;
+
+/** macOS also reaches the data volume as /System/Volumes/Data/<path>, a
+ *  firmlink realpath keeps as written: check the plain spelling. */
+function plainSpelling(p: string): string {
+  if (process.platform !== 'darwin') return p;
+  let plain = path.resolve(p);
+  // The kernel's /.nofollow prefix also reaches the same files; strip both, in any order.
+  for (let m; (m = /^\/(?:\.nofollow|system\/volumes\/data)(?=\/|$)/i.exec(plain));) plain = plain.slice(m[0].length) || '/';
+  return plain === path.resolve(p) ? p : plain;
+}
+
 /** Whether a plugin's `fs.*` call must refuse `p`: the file tree's list or this one. */
 export function isPluginRefusedPath(p: string): boolean {
-  return isSensitivePath(p) || pluginFsRefusal(p) !== null;
+  if (WSL_SHARE.test(p)) return true;
+  const plain = plainSpelling(p);
+  const normalized = path.resolve(plain).replace(/\\/g, '/').toLowerCase().replace(/\/+$/, '');
+  return isSensitivePath(plain) || pluginFsRefusal(plain) !== null || underXdgConfig(normalized);
 }
 
 /**
@@ -97,8 +139,237 @@ export function isPluginRefusedPath(p: string): boolean {
  * once symlinks resolve. Null when refused, missing or not local.
  */
 export async function resolvePluginPath(input: string): Promise<string | null> {
-  if (pluginFsRefusal(input)) return null;
+  if (isPluginRefusedPath(input) || await onWslDrive(input)) return null;
   const canonical = await resolveAccessiblePath(input);
-  if (!canonical || pluginFsRefusal(canonical)) return null;
+  if (!canonical || isPluginRefusedPath(canonical) || await insideRefusedByIdentity(canonical)) return null;
   return canonical;
+}
+
+/** The refused folders and files that sit at known places, as absolute paths.
+ *  The rules above match by spelling; these are also matched by identity
+ *  (insideRefusedByIdentity), so another spelling of the same folder (a
+ *  /.nofollow prefix, a symlinked dotfiles folder, a moved AppData) is refused
+ *  too. */
+async function refusedRoots(): Promise<string[]> {
+  const home = os.homedir();
+  const roots = [
+    '.ssh', '.aws', '.gnupg', '.gpg', '.config/gcloud', '.azure', '.kube', '.docker/config.json',
+    '.npmrc', '.netrc', '.pgpass', '.git-credentials', '.claude.json', '.claude/.credentials.json',
+    '.codex/auth.json', '.zsh_sessions', 'AppData/Roaming/GitHub CLI', 'AppData/Roaming/gcloud',
+    ...configRoots().map((root) => `${root}/gh`),
+  ].map((rel) => path.join(home, rel));
+  const xdg = process.env.XDG_CONFIG_HOME;
+  if (xdg) roots.push(path.join(xdg, 'gh'));
+  const appData = process.env.APPDATA;
+  if (appData) roots.push(path.join(appData, 'GitHub CLI'), path.join(appData, 'gcloud'));
+  for (const env of ['GH_CONFIG_DIR', 'CLOUDSDK_CONFIG']) {
+    const dir = process.env[env];
+    if (dir && path.isAbsolute(dir)) roots.push(dir);
+  }
+  // wmux's own data (~/.wmux*) and each profile's userData (wmux*).
+  const parents: Array<[string, string]> = [[home, '.wmux']];
+  for (const root of userDataRoots()) parents.push([path.join(home, root), 'wmux']);
+  if (appData) parents.push([appData, 'wmux']);
+  if (xdg) parents.push([xdg, 'wmux']);
+  for (const [dir, prefix] of parents) {
+    const names = await fs.promises.readdir(dir).catch(() => [] as string[]);
+    for (const name of names) if (name.toLowerCase().startsWith(prefix)) roots.push(path.join(dir, name));
+  }
+  return roots;
+}
+
+/** How long a read of the refused roots' identities is reused: a scan checks every entry. */
+const IDENTITY_TTL_MS = 2_000;
+interface IdentityCache {
+  at: number;
+  key: string;
+  ids: Promise<Set<string>>;
+  reals: Promise<RootPath[]>;
+  roots: Promise<string[]>;
+  /** Every link the refused roots' spellings go through, or null when one could
+   *  not be followed. Read only by a trash of a link, so made on first use. */
+  links?: Promise<Set<string> | null>;
+}
+let identities: IdentityCache | null = null;
+
+/** A path's identity as an entry of its folder: the folder's device and inode
+ *  plus the lowercase name. It holds for a file that is replaced (a new inode)
+ *  and for one that does not exist yet. */
+async function entryKey(p: string): Promise<string | null> {
+  const parent = await fs.promises.stat(path.dirname(p), { bigint: true }).catch(() => null);
+  return parent ? `${parent.dev}:${parent.ino}/${path.basename(p).toLowerCase()}` : null;
+}
+
+function refusedIdentities(): Promise<Set<string>> {
+  return identityCache().ids;
+}
+
+/** A refused root as given or once symlinks resolve: `key` for a prefix compare, `path` to look it up. */
+interface RootPath { key: string; path: string }
+
+/** The refused roots as given and once symlinks resolve. */
+function refusedRootPaths(): Promise<RootPath[]> {
+  return identityCache().reals;
+}
+
+/** Whether `p` is there. Only ENOENT and ENOTDIR say it is not: any other
+ *  error (a privacy refusal, an unreadable mount) counts as there. */
+async function present(p: string): Promise<boolean> {
+  try {
+    await fs.promises.lstat(p);
+    return true;
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    return code !== 'ENOENT' && code !== 'ENOTDIR';
+  }
+}
+
+/** How many links one resolution may follow before it counts as a loop (as ELOOP). */
+const MAX_LINK_HOPS = 40;
+
+/**
+ * Resolve the absolute `p` the way the kernel does, component by component:
+ * a link is followed before a `..` after it, so `..` is never collapsed as
+ * text. Adds each link it goes through to `out` (normalized). Returns the
+ * resolved path, or null when a part cannot be looked up or the links loop.
+ */
+async function resolveThroughLinks(p: string, out: Set<string>, hops = { left: MAX_LINK_HOPS }): Promise<string | null> {
+  const { root } = path.parse(p);
+  let cur = root;
+  for (const name of p.slice(root.length).split(/[\\/]+/).filter(Boolean)) {
+    // `cur` is resolved, so joining a `..` onto it steps up from where the links led.
+    const next = path.join(cur, name);
+    const st = await fs.promises.lstat(next).catch(() => null);
+    if (!st) return null;
+    if (!st.isSymbolicLink()) { cur = next; continue; }
+    if (--hops.left < 0) return null;
+    out.add(normalizedPath(next));
+    const target = await fs.promises.readlink(next).catch(() => null);
+    if (target === null) return null;
+    const real = await resolveThroughLinks(path.isAbsolute(target) ? target : `${cur}${path.sep}${target}`, out, hops);
+    if (real === null) return null;
+    cur = real;
+  }
+  return cur;
+}
+
+function identityCache(): IdentityCache {
+  const now = Date.now();
+  const env = process.env;
+  const key = JSON.stringify([os.homedir(), env.XDG_CONFIG_HOME, env.APPDATA, env.GH_CONFIG_DIR, env.CLOUDSDK_CONFIG]);
+  if (identities && identities.key === key && now - identities.at < IDENTITY_TTL_MS) return identities;
+  const roots = refusedRoots();
+  const ids = roots.then(async (list) => {
+    const set = new Set<string>();
+    await Promise.all(list.map(async (root) => {
+      const st = await fs.promises.stat(root, { bigint: true }).catch(() => null);
+      if (st) set.add(`${st.dev}:${st.ino}`);
+      const entry = await entryKey(root);
+      if (entry) set.add(entry);
+    }));
+    return set;
+  });
+  identities = { at: now, key, ids, reals: roots.then(rootPathsOf), roots };
+  return identities;
+}
+
+/** The roots as given and once symlinks resolve. */
+async function rootPathsOf(list: string[]): Promise<RootPath[]> {
+  const out = new Map<string, RootPath>();
+  await Promise.all(list.map(async (root) => {
+    out.set(normalizedPath(root), { key: normalizedPath(root), path: root });
+    const real = await fs.promises.realpath(root).catch(() => null);
+    if (real) out.set(normalizedPath(real), { key: normalizedPath(real), path: real });
+  }));
+  return [...out.values()];
+}
+
+/** Every link the roots that are there go through, or null when one could not be followed. */
+async function linksOf(list: string[]): Promise<Set<string> | null> {
+  const out = new Set<string>();
+  const resolved = await Promise.all(list.map(async (root) =>
+    !await present(root) || await resolveThroughLinks(root, out) !== null));
+  return resolved.every(Boolean) ? out : null;
+}
+
+/** Every link the refused roots' spellings go through, or null when that
+ *  cannot be told: one could not be followed, or on Windows, where a junction
+ *  is reported as a link and the Recycle Bin's handling of one is not pinned
+ *  down. */
+async function linksThroughRoots(fresh: boolean): Promise<Set<string> | null> {
+  if (process.platform === 'win32') return null;
+  if (fresh) return linksOf(await refusedRoots());
+  const cache = identityCache();
+  cache.links ??= cache.roots.then(linksOf);
+  return cache.links;
+}
+
+// NFC: APFS and NTFS take the composed and decomposed spellings of a name as one entry.
+const normalizedPath = (p: string) => path.resolve(plainSpelling(p)).normalize('NFC').replace(/\\/g, '/').toLowerCase().replace(/\/+$/, '');
+
+/**
+ * What an operation does to a link: `kept` (a copy recreates it and leaves it
+ * in place) or `removed` from its path (a trash, move or rename takes only the
+ * link, not where it points). A copy also checks each folder it reads as
+ * `kept`: nothing is taken from it.
+ */
+export type LinkFate = 'kept' | 'removed';
+
+/** Whether moving, renaming or trashing `p` would carry a refused folder or file
+ *  with it: one is there at or below `p`, as spelled or once links resolve. A
+ *  link or junction above a refused folder is never traversed by the
+ *  preflight, so this is what keeps it from being renamed out of the way.
+ *  A refused path that is not there has nothing to carry (#3030); it is looked
+ *  up on each call, so one that appears is seen at once. Nor may it take away
+ *  a link a refused root's own spelling goes through: without it the root
+ *  would no longer resolve, and the folder it reached would no longer be
+ *  refused by identity.
+ *
+ *  `link` says `p` is a link and what the operation does to it. Then where it
+ *  points does not count (#3030, #3095): a link to the home folder or a
+ *  config folder can be copied, trashed, moved or renamed. Without `link`,
+ *  where `p` points counts too.
+ *
+ *  `fresh` reads the refused roots and their links again instead of the copy
+ *  kept for IDENTITY_TTL_MS: for the check just before a change. */
+export async function holdsRefusedRoot(p: string, link?: LinkFate, fresh = false): Promise<boolean> {
+  const spelled = normalizedPath(p);
+  const atOrUnder = (key: string) => key === spelled || key.startsWith(`${spelled}/`);
+  const spellings = [spelled];
+  let followLink = link === undefined;
+  if (link !== 'kept') {
+    const through = await linksThroughRoots(fresh);
+    if (through === null) followLink = true; // The roots' links cannot be told: check where it points.
+    else if ([...through].some(atOrUnder)) return true;
+  }
+  if (followLink) {
+    const real = await fs.promises.realpath(p).catch(() => null);
+    if (real) spellings.push(normalizedPath(real));
+  }
+  const roots = fresh ? await rootPathsOf(await refusedRoots()) : await refusedRootPaths();
+  const under = roots.filter((r) => spellings.some((s) => r.key === s || r.key.startsWith(`${s}/`)));
+  for (const r of under) if (await present(r.path)) return true;
+  return false;
+}
+
+/** Whether `canonical` (a resolved path, or one about to be created) is a
+ *  refused folder or file or lies inside one, by identity rather than by
+ *  spelling. */
+export async function insideRefusedByIdentity(canonical: string): Promise<boolean> {
+  const ids = await refusedIdentities();
+  if (ids.size === 0) return false;
+  for (let p = canonical; ; p = path.dirname(p)) {
+    const st = await fs.promises.stat(p, { bigint: true }).catch(() => null);
+    if (st && ids.has(`${st.dev}:${st.ino}`)) return true;
+    const entry = await entryKey(p);
+    if (entry && ids.has(entry)) return true;
+    if (path.dirname(p) === p) return false;
+  }
+}
+
+/** A drive letter mapped to a WSL distro share (net use, subst) is that share. */
+async function onWslDrive(input: string): Promise<boolean> {
+  if (process.platform !== 'win32' || !/^[a-z]:/i.test(input)) return false;
+  const root = await fs.promises.realpath(`${input.slice(0, 2)}\\`).catch(() => null);
+  return root !== null && WSL_SHARE.test(root);
 }

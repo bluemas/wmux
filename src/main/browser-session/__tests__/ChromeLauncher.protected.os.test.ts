@@ -28,6 +28,8 @@ const { spawnMock, state, sockets } = vi.hoisted(() => ({
     probeDelayMs: 0,
     reportErrorPage: false,
     onBrowserClose: null as (() => void) | null,
+    /** What Target.getBrowserContexts lists: the contexts clients created. */
+    browserContexts: [] as string[],
   },
   sockets: [] as Array<{ sent: Array<{ method: string; params: unknown }>; closed: boolean }>,
 }));
@@ -67,6 +69,7 @@ vi.mock('../CdpSocket', () => ({
     async send(method: string, params: unknown = {}) {
       this.rec.sent.push({ method, params });
       if (method === 'Browser.close') state.onBrowserClose?.();
+      if (method === 'Target.getBrowserContexts') return { browserContextIds: [...state.browserContexts] };
       if (method === 'Browser.setDownloadBehavior' && state.onGuardArm) {
         const hook = state.onGuardArm;
         state.onGuardArm = null;
@@ -172,14 +175,18 @@ beforeEach(() => {
   state.holdList = null;
   state.holdPut = null;
   state.onlyRestored = false;
+  state.browserContexts = [];
   sockets.length = 0;
   dead.clear();
   nextPort = 18001;
   fetchMock.mockClear();
   vi.stubGlobal('fetch', fetchMock);
+  // These fakes are a Chrome on a DevTools port, whatever the default transport is.
+  vi.stubEnv('WMUX_CHROME_TRANSPORT', 'port');
 });
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
 });
 
 describe('ChromeLauncher — protected profiles', () => {
@@ -229,6 +236,38 @@ describe('ChromeLauncher — protected profiles', () => {
     expect(sockets[0].sent.map((s) => s.method)).toContain('Browser.close');
     expect(spawnMock).toHaveBeenCalledTimes(1);
     expect(launcher.currentPort()).toBe(18001);
+    await launcher.dispose({ immediate: true });
+  });
+
+  it('leaves a browser alone that answers on the recorded port but did not write the record', async () => {
+    // The file says /devtools/browser/mine; whatever answers on that port now
+    // says /devtools/browser/x (the default fake): another browser took the port.
+    state.portFiles['/tmp/prot-foreign'] = '17997\n/devtools/browser/mine\n';
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    spawnWritesPortFile(makeChild());
+    const launcher = new ChromeLauncher('/tmp/prot-foreign', { protection: () => denyAll });
+    await launcher.ensureRunning();
+    expect(sockets.some((s) => s.sent.some((m) => m.method === 'Browser.close' || m.method === 'SystemInfo.getProcessInfo'))).toBe(false);
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('answers for another browser'));
+    warn.mockRestore();
+    await launcher.dispose({ immediate: true });
+  });
+
+  it('leaves alone a server on the recorded port that names no browser, and launches', async () => {
+    // A stale file whose port some other HTTP server took: waiting on it would hold every launch.
+    state.portFiles['/tmp/prot-unnamed'] = '17996\n/devtools/browser/mine\n';
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    // It answers (any HTTP answer will do), and names no browser endpoint.
+    const notChrome = async () => ({ ok: true, text: async () => '<html></html>', json: async () => ({}) });
+    fetchMock.mockImplementationOnce(notChrome).mockImplementationOnce(notChrome);
+    spawnWritesPortFile(makeChild());
+    const launcher = new ChromeLauncher('/tmp/prot-unnamed', { protection: () => denyAll });
+    await launcher.ensureRunning();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('answers for another browser'));
+    expect(sockets.some((x) => x.sent.some((m) => m.method === 'Browser.close' || m.method === 'SystemInfo.getProcessInfo'))).toBe(false);
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
     await launcher.dispose({ immediate: true });
   });
 
@@ -310,6 +349,43 @@ describe('ChromeLauncher — protected profiles', () => {
     expect(launcher.isProtected()).toBe(true);
     await launcher.dispose({ immediate: true });
   }, 15_000);
+
+  it('the download guard also denies each context a client created, on its own session, on each re-assert', async () => {
+    state.browserContexts = ['CTX-1'];
+    spawnWritesPortFile(makeChild());
+    const launcher = new ChromeLauncher('/tmp/prot-ctx', { protection: () => denyAll });
+    await launcher.ensureRunning();
+    const guard = sockets.find((x) => x.sent[0]?.method === 'Browser.setDownloadBehavior');
+    const contextDenies = () => (guard?.sent ?? []).filter((m) => m.method === 'Browser.setDownloadBehavior' && (m.params as { browserContextId?: string }).browserContextId);
+    await vi.waitFor(() => expect(contextDenies().length).toBeGreaterThan(0), { timeout: 5_000 });
+    expect(contextDenies()).toContainEqual(
+      { method: 'Browser.setDownloadBehavior', params: { behavior: 'deny', browserContextId: 'CTX-1', eventsEnabled: true } },
+    );
+    // A context created later is denied on a later re-assert.
+    state.browserContexts = ['CTX-1', 'CTX-2'];
+    await vi.waitFor(() => expect(contextDenies().some((m) => (m.params as { browserContextId: string }).browserContextId === 'CTX-2')).toBe(true), { timeout: 5_000 });
+    // All of it on the guard's own session: no other socket asked for the contexts.
+    expect(sockets.filter((x) => x !== guard && x.sent.some((m) => m.method === 'Target.getBrowserContexts'))).toEqual([]);
+    await launcher.dispose({ immediate: true });
+  });
+
+  it('while a consent pass holds the guard, the tick re-asserts the pass\'s behaviour instead of its own deny', async () => {
+    spawnWritesPortFile(makeChild());
+    const launcher = new ChromeLauncher('/tmp/prot-claim', { protection: () => denyAll });
+    await launcher.ensureRunning();
+    const guard = sockets.find((x) => x.sent[0]?.method === 'Browser.setDownloadBehavior');
+    const reassert = vi.fn(async () => undefined);
+    const release = launcher.consentDownloadGuard()?.claim(() => false, reassert);
+    const denies = () => (guard?.sent ?? []).filter((m) => m.method === 'Browser.setDownloadBehavior').length;
+    const before = denies();
+    await vi.waitFor(() => expect(reassert.mock.calls.length).toBeGreaterThanOrEqual(2), { timeout: 5_000 });
+    expect(denies()).toBe(before);
+    release?.();
+    const calls = reassert.mock.calls.length;
+    await vi.waitFor(() => expect(denies()).toBeGreaterThan(before), { timeout: 5_000 });
+    expect(reassert.mock.calls.length).toBe(calls);
+    await launcher.dispose({ immediate: true });
+  });
 
   it('concurrent callers re-arm one download guard, not two', async () => {
     spawnWritesPortFile(makeChild());

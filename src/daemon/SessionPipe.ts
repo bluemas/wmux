@@ -35,6 +35,9 @@ export const ATTACH_TAIL_SNAPSHOT_BYTES = 1024 * 1024;
  *  parses in about 0.25 s at the measured ~4 MB/s. */
 export const ATTACH_TAIL_SNAPSHOT_BUDGET_MS = 1500;
 
+/** How long releaseClient waits for the client to close its side (#3073). */
+export const CLIENT_RELEASE_MS = 500;
+
 /**
  * Per-session data pipe for raw byte streaming.
  * Created on attach, destroyed on detach.
@@ -46,6 +49,13 @@ export const ATTACH_TAIL_SNAPSHOT_BUDGET_MS = 1500;
  * Output: PTY stdout -> writeToClient() -> client socket
  * Input:  client socket -> onInput callback -> PTY stdin
  */
+/**
+ * How long after an attach a size counts as provisional (awaiting the
+ * viewer's replay) while no client has connected: an attach whose renderer
+ * never connects must not keep every later size provisional.
+ */
+export const REPLAY_CONNECT_GRACE_MS = 5_000;
+
 export class SessionPipe {
   private server: net.Server | null = null;
   private client: net.Socket | null = null;
@@ -53,6 +63,16 @@ export class SessionPipe {
   private pendingInput: Buffer | null = null;
   private inputDrainDispose?: () => void;
   private flushed = false;
+  /**
+   * A viewer attached and its replay is not out yet: from the attach (this
+   * pipe is made for one) until the flush finishes, and again on a new
+   * client. A client that goes away ends it, and so does no client within
+   * REPLAY_CONNECT_GRACE_MS of the attach. Sizes taken meanwhile are
+   * provisional in the ring's geometry history (RingBuffer.noteGeometry). A
+   * reflush does not: its viewer is live and applies every size.
+   */
+  private replayPending = true;
+  private replayPendingSince = Date.now();
   private reflushInFlight = false;
   private socketPeakQueuedBytes = 0;
   private resyncQueuedBytes = 0;
@@ -91,9 +111,20 @@ export class SessionPipe {
      * older call sites) replays the ring as-is.
      */
     private readonly getOutputModes?: () => Pick<OutputModeTracker, 'preamble'> | null,
+    /**
+     * Rows of history the attach flush snapshots: the renderer's own
+     * scrollback, which main passes on attach. Absent (an older main, tests)
+     * is the lossless ceiling, MAX_SCROLLBACK.
+     */
+    attachScrollback?: number,
   ) {
     this.markers = createSessionPipeMarkers(authToken);
+    this.attachScrollback = typeof attachScrollback === 'number' && Number.isFinite(attachScrollback) && attachScrollback > 0
+      ? Math.min(MAX_SCROLLBACK, Math.floor(attachScrollback))
+      : MAX_SCROLLBACK;
   }
+
+  private readonly attachScrollback: number;
 
   /** Get the platform-specific pipe name for this session.
    * P7: Unix 소켓은 ~/.wmux{suffix}/ 하위 — shared 헬퍼가 클라이언트
@@ -193,6 +224,8 @@ export class SessionPipe {
         this.pendingInput = null;
         this.client = socket;
         this.flushed = false;
+        this.replayPending = true;
+        this.replayPendingSince = Date.now();
         this.handleClient(socket);
       });
 
@@ -312,12 +345,13 @@ export class SessionPipe {
         // shifted past the preamble by readRingWithModesAndGeometry.
         initial: replay,
         geometry,
-        // This layer has no renderer config, and the renderer's xterm scrollback
-        // is user-configurable (default 10k) above the snapshot DEFAULT (5k). A
-        // successful snapshot would otherwise truncate history the raw replay
-        // preserved, so request the lossless upper bound — the headless terminal
-        // is per-snapshot and disposed.
-        scrollback: MAX_SCROLLBACK,
+        // As many rows as the renderer keeps (main passes its setting on
+        // attach), else the lossless ceiling. A snapshot shorter than the
+        // renderer's scrollback would truncate history the raw replay kept.
+        // One no deeper than it lets the native snapshot serve the attach: a
+        // ceiling past the native grid's cap is refused and parsed again by
+        // @xterm/headless, about ten times slower.
+        scrollback: this.attachScrollback,
       });
       if (socket.destroyed || this.client !== socket) return; // client left mid-parse
       if (!outcome.ok && outcome.reason === 'budget') {
@@ -341,7 +375,7 @@ export class SessionPipe {
           rows: dims.rows,
           initial: tail.replay,
           geometry: tail.geometry,
-          scrollback: MAX_SCROLLBACK,
+          scrollback: this.attachScrollback,
           budgetMs: ATTACH_TAIL_SNAPSHOT_BUDGET_MS,
         });
         if (socket.destroyed || this.client !== socket) return;
@@ -405,7 +439,7 @@ export class SessionPipe {
       this.writeOutput(socket, payload);
     }
     this.writeOutput(socket, this.markers.flushDone);
-    this.flushed = true;
+    this.replayDone();
   }
 
   /** Write PTY output data to the connected client. */
@@ -452,9 +486,33 @@ export class SessionPipe {
     this.inputDrainDispose?.(); this.inputDrainDispose = dispose;
   }
 
+  /**
+   * Let the client go before this pipe is replaced (daemon.attachSession)
+   * without dropping input it already sent (#3073). Destroying the socket
+   * discards bytes this end has not read yet, so the daemon ends its side
+   * instead and keeps forwarding input until the client closes. main's
+   * socket does not allow half-open (Node's default), so it ends its own side
+   * right after what it already wrote (a Windows named pipe has no half-close
+   * and closes at once). Output from here on stays in the ring,
+   * for the next pipe's flush. A client that has not closed by `timeoutMs` is
+   * destroyed by stop() as before.
+   */
+  async releaseClient(timeoutMs = CLIENT_RELEASE_MS): Promise<void> {
+    const client = this.client;
+    if (!client || client.destroyed) return;
+    this.flushed = false;
+    this.replayPending = false;
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, timeoutMs);
+      client.once('close', () => { clearTimeout(timer); resolve(); });
+      client.end();
+    });
+  }
+
   /** Stop the session pipe and clean up. */
   async stop(): Promise<void> {
     this.pendingInput = null;
+    this.replayPending = false;
     this.inputDrainDispose?.(); this.inputDrainDispose = undefined;
     if (this.client) {
       this.client.destroy();
@@ -496,6 +554,25 @@ export class SessionPipe {
   /** Whether the connected client has completed its initial flush (live mode). */
   get isFlushed(): boolean {
     return this.isConnected && this.flushed;
+  }
+
+  /** A viewer attached and its replay is not out yet (see `replayPending`). */
+  get awaitingReplay(): boolean {
+    return this.replayPending && (this.client !== null || Date.now() - this.replayPendingSince < REPLAY_CONNECT_GRACE_MS);
+  }
+
+  /** The client socket is gone: no live mode, and no replay due. */
+  private dropClient(): void {
+    this.client = null;
+    this.flushed = false;
+    this.replayPending = false;
+  }
+
+  /** The replay is out: live mode, and the size the viewer now holds is applied. */
+  private replayDone(): void {
+    this.flushed = true;
+    this.replayPending = false;
+    this.ringBuffer.settleGeometry();
   }
 
   /**
@@ -649,7 +726,7 @@ export class SessionPipe {
         this.writeOutput(socket, RIS);
         this.writeOutput(socket, outcome.payload);
         this.writeOutput(socket, this.markers.flushDone);
-        this.flushed = true;
+        this.replayDone();
         if (tailRaw && tailRaw.length > 0) {
           this.writeOutput(socket, tailRaw);
         }
@@ -669,7 +746,7 @@ export class SessionPipe {
       this.writeOutput(socket, RIS);
       this.writeOutput(socket, raw);
       this.writeOutput(socket, this.markers.flushDone);
-      this.flushed = true;
+      this.replayDone();
       // A3 rollout metric: fallback-rate by reason.
       // eslint-disable-next-line no-console
       console.log(
@@ -691,8 +768,7 @@ export class SessionPipe {
       if (!authenticated) {
         socket.destroy();
         if (this.client === socket) {
-          this.client = null;
-          this.flushed = false;
+          this.dropClient();
         }
       }
     }, 5_000);
@@ -708,8 +784,7 @@ export class SessionPipe {
           clearTimeout(authTimeout);
           socket.destroy();
           if (this.client === socket) {
-            this.client = null;
-            this.flushed = false;
+            this.dropClient();
           }
         }
         return;
@@ -724,8 +799,7 @@ export class SessionPipe {
         socket.write('AUTH_FAILED\n');
         socket.destroy();
         if (this.client === socket) {
-          this.client = null;
-          this.flushed = false;
+          this.dropClient();
         }
         return;
       }
@@ -759,8 +833,7 @@ export class SessionPipe {
     socket.on('close', () => {
       clearTimeout(authTimeout);
       if (this.client === socket) {
-        this.client = null;
-        this.flushed = false;
+        this.dropClient();
         // Notify only for an authed client that vanished without a detach RPC
         // (GUI crash / kill). Pre-auth churn must not demote the session.
         if (authenticated) this.onClientGone?.();
@@ -771,8 +844,7 @@ export class SessionPipe {
       clearTimeout(authTimeout);
       if (this.client === socket) {
         socket.destroy();
-        this.client = null;
-        this.flushed = false;
+        this.dropClient();
         if (authenticated) this.onClientGone?.();
       }
     });

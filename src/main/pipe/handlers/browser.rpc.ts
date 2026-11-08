@@ -8,6 +8,10 @@ import { logNotificationFailure } from '../../notification/notificationFailure';
 import { osToastsAllowed } from '../../notification/osToastGate';
 import { IPC } from '../../../shared/constants';
 import { HelpRequests } from '../../browser-session/HelpRequests';
+import { FrameTarget, FrameWorlds, evaluateInFrame, listChildFrames, type CdpSend, type Point as FramePoint } from '../../browser-session/frameAccess';
+import { buildDomSnapshotExpression, readDomSnapshotPayload } from '../../../mcp/playwright/dom-intelligence';
+import type { RefDescriptor } from '../../../mcp/playwright/refDescriptors';
+import { RPC_FRAME_CAP, isFrameGoneError, type RpcFrameAnswer } from '../../../mcp/playwright/rpcFrames';
 import {
   buildHelpHighlightExpression,
   buildHelpProbeExpression,
@@ -84,6 +88,10 @@ const activePreset = new WeakMap<
     hasTouch: boolean;
     screenWidth?: number;
     screenHeight?: number;
+    /** The view drawn this many times larger than the layout (CDP `scale`): a phone layout filling a wider pane. */
+    scale?: number;
+    /** Set by the phone stream's own fill (PhoneBrowser.ts `viewport` with `fill`): the stream adopts only a preset carrying it. */
+    fill?: true;
   }
 >();
 
@@ -144,6 +152,18 @@ import { isLocalExternalWireContext } from '../../mcp/rpcProvenance';
 import type { BrowserAgentControl } from '../../browser-session/BrowserAgentControl';
 import { heldBrowserSurfaceRefusal } from './surface.rpc';
 import { agentControlRefusal } from '../../../shared/browserAgentControl';
+import { getWmuxDir } from '../../../daemon/config';
+import { randomBytes } from 'node:crypto';
+import { topWorld } from '../../phone/PhoneBrowserFocus';
+import {
+  DEFAULT_FILE_INPUT_SELECTOR,
+  UPLOAD_MAX_TIMEOUT_MS,
+  checkUploadPath,
+  uploadLookupExpression,
+  uploadRootIn,
+  type UploadPathRefusal,
+} from '../../../shared/browserUpload';
+import { withDeadline } from '../../pty/portWatch';
 
 type GetWindow = () => BrowserWindow | null;
 
@@ -174,6 +194,129 @@ const PROTECTED_GATE_EXEMPT: ReadonlySet<string> = new Set([
   'browser.navigationPolicy.get',
 ]);
 
+/** Most files one upload may set, and the longest selector it takes. */
+const UPLOAD_MAX_FILES = 64;
+const UPLOAD_MAX_SELECTOR_CHARS = 2048;
+
+/** How long the page may take to take the files: the default, and the cap. */
+const UPLOAD_DEFAULT_TIMEOUT_MS = 120_000;
+
+/** The isolated world the file input is looked up in. */
+const UPLOAD_WORLD = 'wmux-upload';
+
+/** Why main will not hand a path to the page, worded for the RPC caller. */
+function uploadRefusalText(input: unknown, refusal: UploadPathRefusal): string {
+  const shown = typeof input === 'string' ? JSON.stringify(input) : 'a path';
+  switch (refusal.reason) {
+    case 'empty':
+      return 'empty path';
+    case 'aliased':
+      return `${shown} has a name Windows opens as a different file`;
+    case 'missing':
+      return `${shown} does not exist`;
+    case 'not-a-file':
+      return `${shown} is not a regular file`;
+    case 'unresolvable':
+      return `${shown} exists but its real path cannot be resolved`;
+    default:
+      return `${shown} is outside the upload root`;
+  }
+}
+
+/**
+ * What an upload into one guest came to. `missing` means nothing was sent to
+ * the page: the selector matched nothing (`match`), a ref's mark is on more
+ * than one element (`ambiguous`), no input is near the anchor (`near`), the
+ * selector is not CSS the page can parse (`invalid`), or the page did not
+ * answer the lookup in time (`unanswered`, with the wait that actually ran:
+ * the caller's ask, capped).
+ */
+export type UploadOutcome =
+  | { uploaded: true; count: number }
+  | { uploaded: false; missing: 'match' | 'ambiguous' | 'near' | 'invalid'; detail?: string }
+  | { uploaded: false; missing: 'unanswered'; waitedMs: number };
+
+/**
+ * Set a file input's files in one guest, by path.
+ *
+ * The guest's debugger is shared with capture, the phone stream and the focus
+ * watcher, so this changes no state any of them depends on: no DOM agent
+ * (DOM.getDocument would enable it), no domain enable or disable, no attach or
+ * detach. The input is looked up in an isolated world — page script cannot
+ * answer the lookup there — and handed to DOM.setFileInputFiles as a remote
+ * object, which needs no DOM agent. The remote objects live in a group of
+ * this call's own, so a concurrent call's release cannot take them away. Top
+ * frame only, as the selector route and data-wmux-ref tags always were.
+ *
+ * `near`: the selector names a ref's anchor (usually the visible upload
+ * button). It must match exactly one element, and the input is the one
+ * findFileInputNearElement finds around it, also in the isolated world.
+ *
+ * `timeoutMs` bounds the whole call. Expiring before the files were sent is a
+ * miss (`unanswered`, nothing happened); expiring after is an error, since the
+ * page may still take them.
+ */
+export async function setFilesInIsolatedWorld(
+  send: CdpSend,
+  files: string[],
+  selector: string,
+  near: boolean,
+  timeoutMs: number = UPLOAD_DEFAULT_TIMEOUT_MS,
+): Promise<UploadOutcome> {
+  const group = `wmux-upload-${randomBytes(8).toString('hex')}`;
+  let sent = false;
+  // Set when the wait runs out. The caller may already have been told nothing
+  // was set, so a lookup that lands after that must not set anything either.
+  let gaveUp = false;
+  const run = async (): Promise<UploadOutcome> => {
+    let contextId: number | undefined;
+    try {
+      contextId = await topWorld(send, UPLOAD_WORLD);
+    } catch {
+      contextId = undefined;
+    }
+    if (contextId === undefined) throw new Error('browser.upload.cdp: the page has no context to upload into');
+    const expression = uploadLookupExpression(selector, near);
+    try {
+      const reply = (await send('Runtime.evaluate', { expression, contextId, objectGroup: group })) as {
+        result?: { objectId?: string; subtype?: string; value?: unknown };
+        exceptionDetails?: { exception?: { description?: string }; text?: string };
+      } | null;
+      if (reply?.exceptionDetails) {
+        const why = (reply.exceptionDetails.exception?.description ?? reply.exceptionDetails.text ?? '').split('\n')[0];
+        if (why.startsWith('SyntaxError')) return { uploaded: false, missing: 'invalid', detail: why };
+        throw new Error(`browser.upload.cdp: ${why || 'lookup failed'}`);
+      }
+      const result = reply?.result;
+      if (!result?.objectId || result.subtype !== 'node') {
+        const value = result?.value;
+        return { uploaded: false, missing: value === 'anchor' ? 'near' : value === 'many' ? 'ambiguous' : 'match' };
+      }
+      if (gaveUp) return { uploaded: false, missing: 'unanswered', waitedMs: timeoutMs };
+      sent = true;
+      await send('DOM.setFileInputFiles', { files, objectId: result.objectId });
+      return { uploaded: true, count: files.length };
+    } finally {
+      await send('Runtime.releaseObjectGroup', { objectGroup: group }).catch(() => undefined);
+    }
+  };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<'expired'>((resolve) => {
+    timer = setTimeout(() => {
+      gaveUp = true;
+      resolve('expired');
+    }, timeoutMs);
+  });
+  try {
+    const outcome = await Promise.race([run(), expired]);
+    if (outcome !== 'expired') return outcome;
+    if (!sent) return { uploaded: false, missing: 'unanswered', waitedMs: timeoutMs };
+    throw new Error(`browser.upload.cdp: the page did not take the files within ${timeoutMs} ms`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Methods a protected pane may not call at all, with the reason. Agent-authored
  * page code (evaluate) waits for the consent grant in PR B; profile-wide cookie
@@ -184,9 +327,20 @@ const PROTECTED_GATE_EXEMPT: ReadonlySet<string> = new Set([
  */
 const PROTECTED_DENIED_METHODS: ReadonlyMap<string, string> = new Map([
   ['browser.evaluate', 'running page scripts needs a consent grant on a protected pane'],
+  ['browser.frames.read', 'a protected pane has no builtin browser target'],
   ['browser.cookies', 'cookies of a protected pane are reachable only through browser_cookies, limited to its allowed hosts'],
   ['browser.cdp.target', 'a protected pane has no builtin browser target'],
+  ['browser.dialog.arm', 'a protected pane has no builtin browser target'],
   ['browser.siteGuides.match', 'site guides are off on a protected pane'],
+  ['browser.upload.cdp', 'a protected pane has no builtin browser target'],
+]);
+
+/** Agent input that can raise a page dialog on the RPC lane. */
+const DIALOG_RAISING_METHODS: ReadonlySet<string> = new Set([
+  'browser.click.cdp',
+  'browser.type.cdp',
+  'browser.press.cdp',
+  'browser.drag.cdp',
 ]);
 
 /**
@@ -298,6 +452,29 @@ function navigationRefusal(reason: Exclude<NavigationVerdict, { allowed: true }>
   if (reason === 'scheme') return 'only http(s) pages on the allowed hosts can be opened in a protected pane';
   if (reason === 'invalid-url') return 'the address is not a valid URL';
   return "that host is not on this pane's allowed list";
+}
+
+/**
+ * A tab opened after its caller hung up (#3085). The MCP client drops the
+ * connection when its RPC deadline passes, so that caller never learns the
+ * tab's id, and a retry opens another. It is closed rather than left behind,
+ * and the call fails (to nobody). A tab another caller adopted while it was
+ * opening (browser.surface.adopt, which claims only an unclaimed tab, and
+ * this call notes its own opener only after this) is theirs, and stays.
+ */
+async function keepForCaller<T extends { surfaceId: string }>(
+  opened: T,
+  client: Pick<ChromeBackendClient, 'closeSurface'>,
+  ctx: RpcContext | undefined,
+  method: string,
+): Promise<T> {
+  if (!ctx?.signal?.aborted) return opened;
+  if (surfaceOpeners.get(opened.surfaceId) !== undefined) {
+    throw new Error(`${method}: the caller left before the tab opened; another caller adopted it`);
+  }
+  const closed = await client.closeSurface(opened.surfaceId).catch(() => false);
+  if (!closed) console.warn(`[browser.rpc] ${method}: could not close tab ${opened.surfaceId}, opened after its caller left`);
+  throw new Error(`${method}: the caller left before the tab opened, so it was ${closed ? 'closed' : 'left open'}`);
 }
 
 async function validateUrl(url: string, method: string, policy: NavigationPolicyOptions): Promise<void> {
@@ -778,9 +955,164 @@ function touchPresetActive(wc: WebContents): boolean {
   return activePreset.get(wc)?.hasTouch === true;
 }
 
+// Read the page's own numbers rather than reporting back what was asked
+// for. Best-effort: a page that cannot be evaluated must not fail the
+// emulation this describes.
+async function probeDevice(
+  send: (method: string, p?: Record<string, unknown>) => Promise<unknown>,
+): Promise<
+  { w: number; h: number; dpr: number; touch: number } | undefined
+> {
+  try {
+    const res = (await send('Runtime.evaluate', {
+      expression: DEVICE_PROBE_EXPRESSION,
+      returnByValue: true,
+    })) as { result?: { value?: { w?: number; h?: number; dpr?: number; touch?: number } } };
+    const v = res?.result?.value;
+    return typeof v?.w === 'number' && typeof v.h === 'number'
+      ? { w: v.w, h: v.h, dpr: v.dpr ?? 0, touch: v.touch ?? 0 }
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Takes the device preset off `wc`, as browser.emulate `deviceReset` does,
+ * and says what it did. No page or agent-control check: the phone browser
+ * stream undoes its own preset with it on any page, the caller's checks done.
+ */
+export async function resetDevicePreset(wc: WebContents): Promise<string[]> {
+  const send = (method: string, p?: Record<string, unknown>): Promise<unknown> =>
+    wc.debugger.sendCommand(method, p);
+  const applied: string[] = [];
+  // Actually undo the preset over CDP: drop the device metrics override and
+  // restore the real user agent. Without this, a packaged caller who switches
+  // to a phone preset and then resets stays on the mobile UA/metrics for every
+  // subsequent page. CDP has no "clear UA override" command, so re-apply the
+  // WebContents' own UA to shed the mobile one set by the preset above.
+  activePreset.delete(wc);
+  const remembered = prePresetViewport.get(wc);
+  prePresetViewport.delete(wc);
+  await send('Emulation.clearDeviceMetricsOverride');
+  // The touch points the preset installed outlive clearDeviceMetricsOverride,
+  // so a reset that skipped this left a desktop UA reporting a touchscreen.
+  let touchDisabled = true;
+  // No maxTouchPoints — CDP refuses 0 even when disabling, and the catch
+  // below turned that refusal into a silent no-op (#1357).
+  await send('Emulation.setTouchEmulationEnabled', { enabled: false })
+    .catch(() => {
+      // Swallowing this was how a reset could report success while
+      // navigator.maxTouchPoints stayed at the preset's value (#1357).
+      // The metrics are still cleared; say what did not happen.
+      touchDisabled = false;
+    });
+  try {
+    const ua = typeof wc.getUserAgent === 'function' ? wc.getUserAgent() : undefined;
+    // Restore the metadata alongside the string: re-applying the real UA
+    // while the preset's Client Hints stayed in place would leave exactly
+    // the mismatch the preset path now avoids.
+    if (ua) {
+      await send(
+        'Emulation.setUserAgentOverride',
+        buildUserAgentOverride(ua) as unknown as Record<string, unknown>,
+      );
+    }
+  } catch {
+    /* getUserAgent / UA override unavailable on this transport; metrics still cleared */
+  }
+  // Restore the viewport the preset replaced. Clearing the override alone
+  // left the caller to guess the desktop size back, and a page still at the
+  // phone width keeps matching the preset's media queries (#1357).
+  let viewportNote: string;
+  if (remembered) {
+    await send('Emulation.setDeviceMetricsOverride', {
+      width: remembered.width,
+      height: remembered.height,
+      deviceScaleFactor: 0,
+      mobile: false,
+    });
+    viewportNote = `viewport ${remembered.width}x${remembered.height} restored`;
+  } else {
+    viewportNote = 'viewport from surface bounds (no pre-preset viewport recorded)';
+  }
+  // The page's media queries and `ontouchstart` checks already ran under the
+  // preset, so their results cannot be trusted without a fresh evaluation.
+  let reloaded = true;
+  try {
+    wc.reload();
+  } catch {
+    reloaded = false;
+  }
+  applied.push(`device=reset (${viewportNote}, ${reloaded ? 'reloaded' : 'reload failed'})`);
+  if (!touchDisabled) applied.push('touch=could not be disabled');
+  const after = await probeDevice(send);
+  if (after) applied.push(`probe=${after.w}x${after.h} dpr=${after.dpr} maxTouchPoints=${after.touch}`);
+  return applied;
+}
+
+/**
+ * The device preset browser.emulate last set on `wc`, while it holds: a new
+ * object for each preset, and none once one is reset. The phone browser
+ * stream reverts its own mobile preset only while this is still the one it set.
+ */
+export function activeDevicePreset(wc: WebContents): { readonly mobile: boolean; readonly scale?: number; readonly fill?: true } | undefined {
+  return activePreset.get(wc);
+}
+
 /** The debugger, in the shape the shared touch dispatch asks for. */
+/**
+ * CDP Input points are in the drawn view's pixels. Under a preset that draws
+ * the page larger than its layout (`scale`: a phone filling the pane), a CSS
+ * point is that many times further out; every handler here measures in CSS.
+ */
+function viewInput(wc: WebContents, method: string, params?: Record<string, unknown>): Record<string, unknown> | undefined {
+  const scale = activePreset.get(wc)?.scale;
+  if (!scale || !params) return params;
+  const at = (p: Record<string, unknown>) => (typeof p.x === 'number' && typeof p.y === 'number' ? { ...p, x: p.x * scale, y: p.y * scale } : p);
+  if (method === 'Input.dispatchMouseEvent') return at(params);
+  if (method === 'Input.dispatchTouchEvent' && Array.isArray(params.touchPoints)) {
+    return { ...params, touchPoints: (params.touchPoints as Array<Record<string, unknown>>).map(at) };
+  }
+  return params;
+}
+
+interface PixelRect { x: number; y: number; width: number; height: number }
+
+/**
+ * A rect in the page's CSS pixels, in the drawn view's pixels instead: the
+ * space webContents.capturePage crops in. The page zoom (Cmd +/-) and a
+ * preset's scale both stretch CSS pixels on screen.
+ */
+function viewRect(wc: WebContents, rect: PixelRect): PixelRect {
+  return scaleRect(rect, pageZoom(wc) * (activePreset.get(wc)?.scale ?? 1));
+}
+
+/** The guest's page zoom (Cmd +/-); 1 when it can't be read. */
+function pageZoom(wc: WebContents): number {
+  const zoom = wc.getZoomFactor?.();
+  return typeof zoom === 'number' && zoom > 0 ? zoom : 1;
+}
+
+/** `rect` times `scale`, rounded outward to whole pixels. */
+function scaleRect(rect: PixelRect, scale: number): PixelRect {
+  const x = Math.floor(rect.x * scale);
+  const y = Math.floor(rect.y * scale);
+  return {
+    x,
+    y,
+    width: Math.ceil((rect.x + rect.width) * scale) - x,
+    height: Math.ceil((rect.y + rect.height) * scale) - y,
+  };
+}
+
+/** Sends one CDP Input event, its points in CSS pixels (viewInput). */
+function sendInput(wc: WebContents, method: string, params: Record<string, unknown>): Promise<unknown> {
+  return wc.debugger.sendCommand(method, viewInput(wc, method, params));
+}
+
 function touchSenderFor(wc: WebContents): TouchSender {
-  return { send: (method: string, params?: unknown) => wc.debugger.sendCommand(method, params as Record<string, unknown>) };
+  return { send: (method: string, params?: unknown) => wc.debugger.sendCommand(method, viewInput(wc, method, params as Record<string, unknown>)) };
 }
 
 /**
@@ -806,6 +1138,209 @@ async function touchTargetPoint(
   );
 }
 
+// ── In-process frames on the builtin webview lane ──────────────────────────
+// One FrameWorlds per guest: its worlds live as long as the guest's documents.
+const frameWorldsByGuest = new WeakMap<WebContents, FrameWorlds>();
+
+function cdpSendOf(wc: WebContents): CdpSend {
+  return (method, params) => wc.debugger.sendCommand(method, params) as Promise<unknown>;
+}
+
+function frameWorldsOf(wc: WebContents): FrameWorlds {
+  let worlds = frameWorldsByGuest.get(wc);
+  if (!worlds) {
+    worlds = new FrameWorlds(cdpSendOf(wc));
+    frameWorldsByGuest.set(wc, worlds);
+  }
+  return worlds;
+}
+
+/** The frame a call names, from its params, or undefined for the top document. */
+function frameParam(params: Record<string, unknown>): { frameId: string; loaderId?: string } | undefined {
+  const frameId = params['frameId'];
+  if (frameId === undefined) return undefined;
+  if (typeof frameId !== 'string' || !frameId) throw new Error('"frameId" must be a non-empty string');
+  // Absent means "the frame's current document"; present must name one, so a
+  // blank value cannot quietly turn the document check off.
+  const loaderId = params['loaderId'];
+  if (loaderId !== undefined && (typeof loaderId !== 'string' || !loaderId)) {
+    throw new Error('"loaderId" must be a non-empty string');
+  }
+  return { frameId, ...(loaderId !== undefined ? { loaderId } : {}) };
+}
+
+/**
+ * How long one browser.frames.read keeps starting frame reads: well inside the
+ * client's 10 s RPC timeout, so a call never outlives the snapshot that asked.
+ */
+export const FRAMES_READ_DEADLINE_MS = 6000;
+/** Earlier refs one frame may name, and the longest role or name in them. */
+const FRAME_PRIOR_CAP = 5000;
+const FRAME_PRIOR_TEXT_CAP = 1000;
+
+interface FramesReadRequest {
+  frames: Array<{ frameId: string; loaderId: string; prior: RefDescriptor[] }>;
+  seed: number;
+  filter?: 'interactive';
+  /** UTF-8 bytes of listing text after which no further frame is read. */
+  budget?: number;
+}
+
+const isCount = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 0;
+const isBoundedText = (v: unknown): v is string => typeof v === 'string' && v.length <= FRAME_PRIOR_TEXT_CAP;
+
+/**
+ * browser.frames.read's params, checked field by field. It reads with the one
+ * listing expression main builds; a caller's `expression` is refused, here or
+ * on a frame, so the method can never become a way to run page code.
+ */
+function framesReadParams(params: Record<string, unknown>): FramesReadRequest {
+  const bad = (what: string) => new Error(`browser.frames.read: ${what}`);
+  const noCode = bad('takes no expression; it reads with the listing main builds');
+  if ('expression' in params) throw noCode;
+  const frames = params['frames'];
+  if (!Array.isArray(frames) || frames.length === 0) throw bad('"frames" must be a non-empty array');
+  if (frames.length > RPC_FRAME_CAP) throw bad(`at most ${RPC_FRAME_CAP} frames per call`);
+  if (!isCount(params['seed'])) throw bad('"seed" must be a non-negative integer');
+  const filter = params['filter'];
+  if (filter !== undefined && filter !== 'interactive') throw bad('"filter" must be "interactive" when given');
+  const budget = params['budget'];
+  if (budget !== undefined && !(isCount(budget) && budget > 0)) throw bad('"budget" must be a positive integer when given');
+  return {
+    seed: params['seed'],
+    ...(filter ? { filter } : {}),
+    ...(budget !== undefined ? { budget } : {}),
+    frames: frames.map((raw: unknown) => {
+      if (raw === null || typeof raw !== 'object') throw bad('each frame is {frameId, loaderId, prior?}');
+      const f = raw as Record<string, unknown>;
+      if ('expression' in f) throw noCode;
+      if (typeof f['frameId'] !== 'string' || !f['frameId']) throw bad('"frameId" must be a non-empty string');
+      // Always the document the snapshot listed: the check cannot be left off here.
+      if (typeof f['loaderId'] !== 'string' || !f['loaderId']) throw bad('"loaderId" must be a non-empty string');
+      const prior = f['prior'] ?? [];
+      if (!Array.isArray(prior) || prior.length > FRAME_PRIOR_CAP) throw bad(`"prior" must be an array of at most ${FRAME_PRIOR_CAP}`);
+      return {
+        frameId: f['frameId'],
+        loaderId: f['loaderId'],
+        prior: prior.map((p: unknown) => {
+          const d = (p ?? {}) as Record<string, unknown>;
+          if (!isCount(d['ref']) || !isCount(d['kindIndex']) || !isBoundedText(d['role']) || !isBoundedText(d['name'])) {
+            throw bad('each prior entry is {ref, role, name, kindIndex}');
+          }
+          return { ref: d['ref'], role: d['role'], name: d['name'], kindIndex: d['kindIndex'] };
+        }),
+      };
+    }),
+  };
+}
+
+/**
+ * List each frame's document in its own isolated world, in order, each one
+ * numbering its new elements on from where the previous one stopped. An error
+ * is reduced to its kind: a read's error text can carry page content. Reading
+ * stops at the byte budget, at the deadline, or when the caller has hung up
+ * (an abandoned snapshot must not go on stamping numbers into frames); the
+ * frames left are answered `unread`.
+ */
+async function readFrameListings(
+  wc: WebContents,
+  req: FramesReadRequest,
+  signal: AbortSignal | undefined,
+): Promise<{ frames: RpcFrameAnswer[]; nextRef: number }> {
+  const send = cdpSendOf(wc);
+  const worlds = frameWorldsOf(wc);
+  const deadline = Date.now() + FRAMES_READ_DEADLINE_MS;
+  let seed = req.seed;
+  let spent = 0;
+  const frames: RpcFrameAnswer[] = [];
+  for (const f of req.frames) {
+    if (req.budget !== undefined && spent >= req.budget) {
+      frames.push({ unread: 'budget' });
+      continue;
+    }
+    if (signal?.aborted || Date.now() >= deadline) {
+      frames.push({ unread: 'time' });
+      continue;
+    }
+    // Bounded by the deadline: Chrome stops the script then, the wait ends
+    // then, and a listing that only starts after it touches nothing.
+    const expression = buildDomSnapshotExpression(undefined, {
+      ...(req.filter ? { filter: req.filter } : {}),
+      frame: { seed, prior: f.prior, notAfter: deadline },
+      withEntries: true,
+    });
+    try {
+      const answer = await evaluateInFrame(send, worlds, f.frameId, expression, f.loaderId, deadline - Date.now());
+      if ('unreachable' in answer) {
+        frames.push({ unreachable: true });
+        continue;
+      }
+      if (answer.value === null) {
+        frames.push({ unread: 'time' });
+        continue;
+      }
+      const payload = readDomSnapshotPayload(answer.value);
+      for (const e of payload.entries) if (e.ref + 1 > seed) seed = e.ref + 1;
+      spent += Buffer.byteLength(payload.text, 'utf8');
+      frames.push({ value: answer.value });
+    } catch (err) {
+      frames.push(isFrameGoneError(err) ? { gone: true } : Date.now() >= deadline ? { unread: 'time' } : { failed: true });
+    }
+  }
+  return { frames, nextRef: seed };
+}
+
+/**
+ * Where to press on `selector` inside a frame, after checking the hit.
+ *
+ * The same contract as approachElement, with the check made BEFORE the pointer
+ * moves as well as after: a point that is not on the target is refused rather
+ * than pressed, and one re-resolution is allowed when the target moved while
+ * the pointer walked. `approach: false` (a touchscreen) skips the walk.
+ */
+async function frameTargetPoint(
+  wc: WebContents,
+  webContentsId: number,
+  frame: { frameId: string; loaderId?: string },
+  selector: string,
+  method: string,
+  approach: boolean,
+): Promise<FramePoint> {
+  const send = cdpSendOf(wc);
+  const resolveOnce = async (): Promise<{ target: FrameTarget; point: FramePoint }> => {
+    const target = await FrameTarget.resolve(send, frameWorldsOf(wc), frame.frameId, frame.loaderId, selector);
+    if (target === null) throw new Error(`Element not found in the frame: ${selector}`);
+    if (!(target instanceof FrameTarget)) throw new Error(`${method}: the frame cannot be reached (${target.unreachable})`);
+    const point = await target.point();
+    if (!point) {
+      await target.release();
+      throw new Error(`Element not found in the frame: ${selector} has no area`);
+    }
+    return { target, point };
+  };
+  const refuse = (point: FramePoint) => new Error(
+    `${method}: ${selector} in the frame is not the element at (${Math.round(point.x)}, ${Math.round(point.y)}) ` +
+    `— it is moving, or something is covering it. Refusing to click what is there instead.`,
+  );
+  let { target, point } = await resolveOnce();
+  try {
+    if (!(await target.hits(point))) throw refuse(point);
+    if (!approach) return point;
+    await movePointerTo(wc, webContentsId, point.x, point.y);
+    if (await target.hits(point)) return point;
+  } finally {
+    await target.release();
+  }
+  ({ target, point } = await resolveOnce());
+  try {
+    await movePointerTo(wc, webContentsId, point.x, point.y);
+    if (!(await target.hits(point))) throw refuse(point);
+    return point;
+  } finally {
+    await target.release();
+  }
+}
+
 /** The intermediate points between two positions, step count from the distance. */
 function pointerPath(from: Point, to: Point): Point[] {
   return approachPath(from, to);
@@ -823,14 +1358,15 @@ async function movePointerTo(
 ): Promise<void> {
   const from = pointerPositions.get(webContentsId) ?? defaultStartPoint();
   for (const point of pointerPath(from, { x, y })) {
-    await wc.debugger.sendCommand('Input.dispatchMouseEvent', {
+    await sendInput(wc, 'Input.dispatchMouseEvent', {
       type: 'mouseMoved', x: point.x, y: point.y,
     });
   }
   setPointerPosition(wc, webContentsId, { x, y });
 }
 // CDP event capture for browser_console / browser_network / browser_response_body
-// in packaged builds (#106). Lazy: enables domains on first drain call.
+// on the RPC lane, which serves whenever the engine holds no Playwright Page for
+// the guest (#106). Lazy: enables domains on first drain call.
 const captureManager = new BrowserCaptureManager();
 
 /**
@@ -891,6 +1427,120 @@ const HELP_EVALUATE_TIMEOUT_MS = 2_000;
 const HELP_REVEAL_TIMEOUT_MS = 2_000;
 // Bound for the capturePage fallback — it can hang on exactly the same guests.
 const CAPTURE_PAGE_TIMEOUT_MS = 1_500;
+
+// Bound for measuring the element: an open dialog or a long task blocks it.
+const ELEMENT_MEASURE_TIMEOUT_MS = 2_000;
+
+/** Where one element sits, measured after scrolling it into view. CSS px. */
+interface ElementCaptureBox {
+  /** In the viewport. */
+  rect: PixelRect;
+  /** The same box in document coordinates, which is what a CDP clip takes. */
+  page: PixelRect;
+  /** The viewport, CSS px. */
+  viewport: PixelRect;
+  /** Whether the whole box is in the viewport. */
+  inViewport: boolean;
+}
+
+function contains(outer: PixelRect, inner: PixelRect): boolean {
+  return inner.x >= outer.x && inner.y >= outer.y
+    && inner.x + inner.width <= outer.x + outer.width && inner.y + inner.height <= outer.y + outer.height;
+}
+
+async function measureElementForCapture(wc: WebContents, selector: string): Promise<ElementCaptureBox> {
+  const answer = await withDeadline(
+    (wc.debugger.sendCommand('Runtime.evaluate', {
+      expression: `(() => {
+        const el = document.querySelector(${JSON.stringify(selector)});
+        if (!el) return { missing: true };
+        el.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' });
+        const r = el.getBoundingClientRect();
+        if (!(r.width > 0 && r.height > 0)) return { empty: true };
+        return { x: r.x, y: r.y, width: r.width, height: r.height,
+          scrollX: window.scrollX, scrollY: window.scrollY,
+          vw: window.innerWidth, vh: window.innerHeight };
+      })()`,
+      returnByValue: true,
+    }) as Promise<{
+      result?: { value?: { missing?: true; empty?: true; x?: number; y?: number; width?: number; height?: number;
+        scrollX?: number; scrollY?: number; vw?: number; vh?: number } };
+      exceptionDetails?: { exception?: { description?: string }; text?: string };
+    }>).then((res) => ({ res }), (error: unknown) => ({ error })),
+    ELEMENT_MEASURE_TIMEOUT_MS,
+    null,
+  );
+  if (!answer) {
+    throw new Error(
+      `browser.screenshot: the page did not answer while ${selector} was measured (an open dialog or a busy page blocks it). ` +
+      'Retry once the page is idle, or omit ref to capture the viewport.',
+    );
+  }
+  if ('error' in answer) throw answer.error;
+  const res = answer.res;
+  if (res.exceptionDetails) {
+    throw new Error(`browser.screenshot: invalid selector ${selector}: ${res.exceptionDetails.exception?.description ?? res.exceptionDetails.text ?? 'error'}`);
+  }
+  const v = res.result?.value;
+  if (!v || v.missing) {
+    throw new Error(`browser.screenshot: no element matches ${selector} — the ref may be stale; take a new browser_snapshot.`);
+  }
+  if (v.empty) throw new Error(`browser.screenshot: the element ${selector} has no area to capture.`);
+  const rect = { x: v.x ?? 0, y: v.y ?? 0, width: v.width ?? 0, height: v.height ?? 0 };
+  const viewport = { x: 0, y: 0, width: v.vw ?? 0, height: v.vh ?? 0 };
+  return {
+    rect,
+    page: { ...rect, x: rect.x + (v.scrollX ?? 0), y: rect.y + (v.scrollY ?? 0) },
+    viewport,
+    inViewport: contains(viewport, rect),
+  };
+}
+
+/**
+ * One element's pixels, cropped to its box. Never the viewport: a crop that no
+ * capture path can produce is an error, not a wider picture.
+ */
+async function captureElement(
+  wc: WebContents,
+  selector: string,
+  encode: { jpeg: boolean; quality: number; scale: number },
+): Promise<{ data: string; mimeType?: string }> {
+  const box = await measureElementForCapture(wc, selector);
+  const shot = await withDeadline(
+    wc.debugger.sendCommand('Page.captureScreenshot', {
+      format: 'png',
+      // In zoomed pixels: under page zoom the clip is not in CSS px.
+      clip: { ...scaleRect(box.page, pageZoom(wc)), scale: 1 },
+      // Only for an element that doesn't fit: it resizes the viewport to the
+      // document, which moves fixed and sticky elements and reflows 100vh.
+      ...(!box.inViewport && { captureBeyondViewport: true }),
+    }) as Promise<{ data?: unknown }>,
+    CDP_SCREENSHOT_TIMEOUT_MS,
+    null,
+  );
+  if (shot && typeof shot.data === 'string') {
+    return encode.jpeg ? reencodeCapture(Buffer.from(shot.data, 'base64'), encode.quality, encode.scale) : { data: shot.data };
+  }
+  // #529: the CDP capture hung or failed. capturePage reads back only what is
+  // on screen, so it can stand in only for a box that is entirely there,
+  // judged in the drawn pixels it crops in.
+  const drawn = viewRect(wc, box.rect);
+  const drawnViewport = viewRect(wc, box.viewport);
+  if (!contains(drawnViewport, drawn)) {
+    throw new Error(
+      `browser.screenshot: the capture did not answer and ${selector} does not fit on screen, so it cannot be cropped from the visible area. ` +
+      'Bring the workspace to front and retry, or omit ref to capture the viewport.',
+    );
+  }
+  const image = await withDeadline(wc.capturePage(drawn), CAPTURE_PAGE_TIMEOUT_MS, null);
+  if (image && !image.isEmpty()) {
+    return encode.jpeg ? reencodeNativeImage(image, encode.quality, encode.scale) : { data: image.toPNG().toString('base64') };
+  }
+  throw new Error(
+    'browser.screenshot: the guest is not producing frames (its pane is likely in a hidden workspace — #529). ' +
+    'Bring the workspace to front (workspace.focus / pane_focus) and retry.',
+  );
+}
 /** Longest a browser.lease.renew may park on its lease (`waitMs`), well inside
  *  the lease TTL so the parked call is itself the renewal. */
 const LEASE_WATCH_MAX_MS = 8_000;
@@ -1743,6 +2393,7 @@ export function registerBrowserRpc(
   // already in the buffer by the time it asks. ensure() is idempotent, so the
   // dom-ready re-registration is a no-op. Fire-and-forget: registration must
   // not wait on (or fail with) the CDP domain enable.
+  webviewCdpManager.setDialogNoteSink?.((webContentsId, note) => captureManager.noteDialog(webContentsId, note));
   webviewCdpManager.setCaptureAttach((webContentsId) => {
     void captureManager.ensure(webContentsId).catch(() => {
       // A guest that cannot be captured still automates fine; the drain
@@ -1803,6 +2454,7 @@ export function registerBrowserRpc(
       params: Record<string, unknown>,
       scope: string | undefined,
       chrome: () => Promise<ChromeCaller>,
+      ctx?: RpcContext,
     ) => Promise<unknown>,
   ): void => {
     router.register(method, async (params, ctx) => {
@@ -1833,12 +2485,22 @@ export function registerBrowserRpc(
           throw new Error(EXTERNAL_BACKEND_UNSUPPORTED_MESSAGE);
         }
         if (backend() === 'chrome') {
-          if (chromeFallback) return chromeFallback(params, scope, chrome);
+          if (chromeFallback) return chromeFallback(params, scope, chrome, ctx);
           throw new Error(CHROME_BACKEND_RPC_UNSUPPORTED_MESSAGE);
         }
         return handler(params, scope, ctx);
       }
-      return webviewCdpManager.withAutomationLease(resolved, () => handler(params, scope, ctx));
+      return webviewCdpManager.withAutomationLease(resolved, async () => {
+        // A dialog this input raises may use the answer the agent armed for it.
+        const endDispatch = DIALOG_RAISING_METHODS.has(method)
+          ? webviewCdpManager.beginDialogDispatch?.(resolved)
+          : undefined;
+        try {
+          return await handler(params, scope, ctx);
+        } finally {
+          endDispatch?.();
+        }
+      });
     });
   };
 
@@ -2660,7 +3322,7 @@ export function registerBrowserRpc(
           }
         }
         try {
-          const opened = await launcher.openTab(url ?? 'about:blank', workspaceId);
+          const opened = await keepForCaller(await launcher.openTab(url ?? 'about:blank', workspaceId), launcher, ctx, 'browser.tabs');
           // Before the descriptor is built, so the reply already reports this
           // caller as the opener of the tab it just asked for.
           if (caller.openerKey) surfaceOpeners.note(opened.surfaceId, caller.openerKey, chrome.callerPtyId);
@@ -2985,7 +3647,7 @@ export function registerBrowserRpc(
       // NEW tab, so there is no reuse question to answer on this backend.
       const { client: launcher, callerPtyId } = await resolveChromeClient('browser.open', ctx, workspaceId);
       if (url) await validateUrl(url, 'browser.open', navigationPolicy());
-      const opened = await launcher.openTab(url ?? 'about:blank', workspaceId);
+      const opened = await keepForCaller(await launcher.openTab(url ?? 'about:blank', workspaceId), launcher, ctx, 'browser.open');
       if (openerKey) surfaceOpeners.note(opened.surfaceId, openerKey, callerPtyId);
       // The launcher's stable surfaceId keeps the engine's auto-open→pin
       // contract AND survives Chrome swapping the target behind the tab.
@@ -3187,11 +3849,21 @@ export function registerBrowserRpc(
       }
       // No surfaceId: close this workspace's most recently opened tab. There
       // is no "active" chrome tab to fall back on, so closing all of them (or
-      // an arbitrary one) would both be worse than one explicit pick.
+      // an arbitrary one) would both be worse than one explicit pick. A caller
+      // that says who it is closes its own newest, else the newest nobody
+      // claims, and never another connection's (a tab its page opened is
+      // that connection's too). One that does not keeps the newest.
       const own = await launcher.listTargets(scope);
-      const newest = own[own.length - 1];
+      const openerKey = openerKeyOf(params);
+      const who = openerCaller(openerKey, caller);
+      const newestWhere = (verdict: 'mine' | undefined) => [...own].reverse().find((t) => surfaceOpeners.verdict(t.surfaceId, who) === verdict);
+      const newest = openerKey ? newestWhere('mine') ?? newestWhere(undefined) : own[own.length - 1];
       if (!newest) {
-        throw new Error('browser.close: this workspace has no open wmux Chrome tab to close.');
+        throw new Error(
+          own.length > 0
+            ? 'browser.close: every wmux Chrome tab in this workspace belongs to another agent; name one by surfaceId to close it.'
+            : 'browser.close: this workspace has no open wmux Chrome tab to close.',
+        );
       }
       await launcher.closeSurface(newest.surfaceId);
       surfaceOpeners.forget(newest.surfaceId);
@@ -3370,7 +4042,7 @@ export function registerBrowserRpc(
   // Chrome backend + no builtin surface: pinned-tab navigation rides the
   // engine's Playwright path and never lands here; a bare navigate opens a
   // tracked tab like browser.open does.
-  async (params, scope, chrome) => {
+  async (params, scope, chrome, ctx) => {
     // A pinned surfaceId reaching this fallback means the caller wanted to
     // navigate an EXISTING chrome tab through the RPC lane — opening a new
     // tab here would report success while the agent keeps reading the old
@@ -3386,7 +4058,8 @@ export function registerBrowserRpc(
     await validateUrl(navUrl, 'browser.navigate', navigationPolicy());
     // Owner = the caller-verified scope, never a body-supplied workspaceId
     // (#810 scope-coverage guard).
-    const opened = await (await chrome()).client.openTab(navUrl, scope);
+    const { client } = await chrome();
+    const opened = await keepForCaller(await client.openTab(navUrl, scope), client, ctx, 'browser.navigate');
     return { ok: true, backend: 'chrome', surfaceId: opened.surfaceId, url: opened.url };
   });
 
@@ -3558,9 +4231,10 @@ export function registerBrowserRpc(
         profile: status.profile,
         partition: null,
         persistent: null,
-        // A protected pane's CDP port is never shown to an agent: the port is
-        // an attach primitive that would skip every check the lane applies.
-        port: protectedDecisionOf(ctx) ? null : status.cdpPort,
+        // The port is an attach primitive that would skip every check the lane
+        // applies, so it follows browser.cdp.info's disclosure rule, and a
+        // protected pane never sees it.
+        port: protectedDecisionOf(ctx) || !canDiscloseBrowserAttachInfo(ctx) ? null : status.cdpPort,
         running: status.running,
         // Only the live profile sets liveAttach (running there = remote-debugging
         // reachable), so the agent reads running:false as "enable it at
@@ -3657,6 +4331,11 @@ export function registerBrowserRpc(
    * server-pinned callers, and source-qualified first-party wire clients.
    * Approved third-party and legacy callers still receive target metadata, but
    * not the primitive that bypasses the tool-layer capability and lease checks.
+   *
+   * A dedicated Chrome on a debugging pipe has no port: a caller that may
+   * attach and asks with `relay: true` (the engine, only when it is about to
+   * connect) gets `relay`, the relay's endpoint and a one-time token for it,
+   * minted for this caller on every such call.
    */
   router.register('browser.cdp.info', async (params, ctx) => {
     // Refuse before disclosing anything, including whether CDP is enabled.
@@ -3678,9 +4357,24 @@ export function registerBrowserRpc(
       // match; a random user tab still never becomes the default pin).
       const chromeTargets = await launcher.cdpInfoTargets(callerWorkspaceId || undefined);
       const disclose = canDiscloseBrowserAttachInfo(ctx);
+      const decision = protectedDecisionOf(ctx);
+      const relay = disclose && ep.piped && params.relay === true && launcher.relayGrant
+        ? await launcher.relayGrant({
+          ...(callerWorkspaceId && { workspaceId: callerWorkspaceId }),
+          profile: chrome.profile,
+          ...(decision && { protectedEpoch: decision.epoch }),
+          // The operator lane: with grants (C3b), every target, as on the port. From the
+          // authenticated caller only, never from params.
+          ...(ctx?.operator === true && { everyTarget: true }),
+        })
+        : undefined;
       return {
         ...(disclose && ep.cdpPort !== undefined && { cdpPort: ep.cdpPort }),
         ...(disclose && ep.wsEndpoint && { wsEndpoint: ep.wsEndpoint }),
+        ...(relay && { relay }),
+        // Reached through the relay: an engine checking a live connection asks
+        // again with relay: true only when this is set.
+        ...(disclose && ep.piped && { piped: true }),
         ...(callerWorkspaceId && { targetsScoped: true }),
         workspaceBackend: 'chrome' as const,
         // The profile this caller resolved to (its pane's own, its workspace's,
@@ -3690,7 +4384,7 @@ export function registerBrowserRpc(
         // Protected panes: the policy epoch this connection is good for. The
         // engine drops its connection (and every cached Page) when it moves,
         // which is how a rebind or a protection change reaches the MCP lane.
-        ...(protectedDecisionOf(ctx) && { protected: true, policyEpoch: protectedDecisionOf(ctx)?.epoch }),
+        ...(decision && { protected: true, policyEpoch: decision.epoch }),
         // Live only: the write-scope policy in force, so the MCP lane can apply
         // the SAME gate on the writes it drives over CDP without main seeing
         // them. Disclosed unconditionally, unlike wsEndpoint/cdpPort — it is a
@@ -3717,14 +4411,16 @@ export function registerBrowserRpc(
       };
     }
 
-    const cdpPort = webviewCdpManager.getCdpPort();
-    if (cdpPort <= 0) {
+    // The user's off switch, not a missing port: with no port up yet, targets
+    // are still real and callers work over the RPC lane.
+    if (webviewCdpManager.isCdpDisabled?.()) {
       throw new Error(
         'CDP remote debugging is unavailable: ' + (webviewCdpManager.getCdpFailureReason?.() ?? 'disabled') + '. ' +
           'Enable it via ~/.wmux/config.json (browser.cdp.enabled = true) and restart wmux, ' +
           'or unset the WMUX_DISABLE_CDP environment variable.',
       );
     }
+    const cdpPort = webviewCdpManager.getCdpPort();
     const discloseAttachInfo = canDiscloseBrowserAttachInfo(ctx);
 
     const listRelevantTargets = () => {
@@ -3771,7 +4467,7 @@ export function registerBrowserRpc(
     }
 
     return {
-      ...(discloseAttachInfo && { cdpPort }),
+      ...(discloseAttachInfo && cdpPort > 0 && { cdpPort }),
       ...(discloseAttachInfo && shellUrl && { shellUrl }),
       // Lets a scoped caller tell "I own no live targets" (empty + scoped) from
       // "legacy main that can't scope" (empty + unscoped). The engine gates its
@@ -3796,12 +4492,19 @@ export function registerBrowserRpc(
 
   /**
    * browser.screenshot
-   * Capture a screenshot of the webview.
-   * params: { surfaceId?: string, fullPage?: boolean }
+   * Capture a screenshot of the webview, or of one element cropped to its box.
+   * params: { surfaceId?: string, fullPage?: boolean, selector?: string }
    */
   registerLeased('browser.screenshot', async (params, scope) => {
     const surfaceId = typeof params['surfaceId'] === 'string' ? params['surfaceId'] : undefined;
     const fullPage = params['fullPage'] === true;
+    const selector = params['selector'];
+    if (selector !== undefined && (typeof selector !== 'string' || selector.length === 0 || selector.length > 2048)) {
+      throw new Error('browser.screenshot: "selector" must be a non-empty CSS selector');
+    }
+    if (selector !== undefined && fullPage) {
+      throw new Error('browser.screenshot: "selector" and "fullPage" cannot be combined');
+    }
     // Re-encode knobs (browser_screenshot's downscale ladder). Pixels for this
     // lane exist only here, so the shrink has to happen in the main process;
     // the caller gets mimeType back and treats a missing/png answer as "this
@@ -3815,6 +4518,10 @@ export function registerBrowserRpc(
 
     const wc = webContents.fromId(target.webContentsId);
     if (!wc || wc.isDestroyed()) throw new Error('browser.screenshot: WebContents unavailable');
+
+    if (typeof selector === 'string') {
+      return captureElement(wc, selector, { jpeg: wantsJpeg, quality, scale });
+    }
 
     // CDP first — it is the only path that supports captureBeyondViewport.
     // But its compositor-path capture is unreliable for <webview> guests
@@ -3889,6 +4596,12 @@ export function registerBrowserRpc(
     const wc = webContents.fromId(target.webContentsId);
     if (!wc || wc.isDestroyed()) throw new Error('browser.evaluate: WebContents unavailable');
 
+    // A frame is read in its own isolated world, never in the top document:
+    // no executeJavaScript fallback here, which would run in the wrong one.
+    // An unreachable frame (another process) is an answer, not an error.
+    const frame = frameParam(params);
+    if (frame) return evaluateInFrame(cdpSendOf(wc), frameWorldsOf(wc), frame.frameId, expression, frame.loaderId);
+
     // Use CDP Runtime.evaluate for reliable execution (executeJavaScript can fail silently)
     try {
       const cdpResult = await wc.debugger.sendCommand('Runtime.evaluate', {
@@ -3918,9 +4631,46 @@ export function registerBrowserRpc(
   });
 
   /**
+   * browser.frames.tree
+   * The guest's in-process child frames, to depth 5, in tree order: frameId,
+   * loaderId (the document a later call must still find), parent, depth and
+   * origin. The name attribute is the page's own text.
+   * params: { surfaceId?: string }
+   */
+  registerLeased('browser.frames.tree', async (params, scope) => {
+    const surfaceId = typeof params['surfaceId'] === 'string' ? params['surfaceId'] : undefined;
+    const target = webviewCdpManager.getTarget(surfaceId, scope);
+    if (!target) throw noTargetError('browser.frames.tree', surfaceId, scope);
+    const wc = webContents.fromId(target.webContentsId);
+    if (!wc || wc.isDestroyed()) throw new Error('browser.frames.tree: WebContents unavailable');
+    return { frames: await listChildFrames(cdpSendOf(wc)) };
+  });
+
+  /**
+   * browser.frames.read
+   * List in-process frames' documents for the RPC lane's snapshot, all in one
+   * call: each frame is read in its own isolated world with the DOM listing's
+   * frame mode, which main builds (no caller code runs). An element `prior`
+   * names keeps its number; new ones are numbered on from `seed`, frame after
+   * frame. Each answer is the listing, or unreachable, gone (navigated or
+   * removed) or failed, with no error text, or unread when the byte `budget`
+   * or main's deadline was spent first. At most 20 frames per call.
+   * params: { frames: [{ frameId, loaderId, prior? }], seed, filter?, budget?, surfaceId? }
+   */
+  registerLeased('browser.frames.read', async (params, scope, ctx) => {
+    const req = framesReadParams(params);
+    const surfaceId = typeof params['surfaceId'] === 'string' ? params['surfaceId'] : undefined;
+    const target = webviewCdpManager.getTarget(surfaceId, scope);
+    if (!target) throw noTargetError('browser.frames.read', surfaceId, scope);
+    const wc = webContents.fromId(target.webContentsId);
+    if (!wc || wc.isDestroyed()) throw new Error('browser.frames.read: WebContents unavailable');
+    return readFrameListings(wc, req, ctx?.signal);
+  });
+
+  /**
    * browser.console.get
-   * Drain captured console messages for the webview (packaged-build fallback for
-   * the MCP browser_console tool, #106). Capture is enabled when the guest
+   * Drain captured console messages for the webview (the RPC lane of the MCP
+   * browser_console tool, #106). Capture is enabled when the guest
    * registers (#1081); ensure() here only covers a guest that registered before
    * the hook existed, or one whose debugger was stolen and dropped.
    * Also returns the collection window (since / missedBefore) so an empty
@@ -4048,7 +4798,9 @@ export function registerBrowserRpc(
   /**
    * browser.click.cdp
    * Click at coordinates or on the focused element via CDP Input events.
-   * params: { x?: number, y?: number, selector?: string, surfaceId?: string }
+   * With frameId (and the loaderId the snapshot saw), the selector is found in
+   * that in-process frame's document and the press point is hit-checked first.
+   * params: { x?: number, y?: number, selector?: string, frameId?: string, loaderId?: string, surfaceId?: string }
    */
   registerLeased('browser.click.cdp', async (params, scope) => {
     const surfaceId = typeof params['surfaceId'] === 'string' ? params['surfaceId'] : undefined;
@@ -4067,7 +4819,13 @@ export function registerBrowserRpc(
     // pointer to walk to the target first.
     const touch = touchPresetActive(wc);
 
-    if (selector) {
+    const frame = frameParam(params);
+    if (frame && !selector) throw new Error('browser.click.cdp: "frameId" needs a "selector"');
+    if (frame && selector) {
+      const point = await frameTargetPoint(wc, target.webContentsId, frame, selector, 'browser.click.cdp', !touch);
+      x = point.x;
+      y = point.y;
+    } else if (selector) {
       // Walk the pointer to the target before pressing. A single mouseMoved
       // onto the exact spot, from a pointer that has never been anywhere else,
       // is not what a page sees from a person. The intermediate moves also keep
@@ -4096,16 +4854,54 @@ export function registerBrowserRpc(
       }
     }
 
-    await wc.debugger.sendCommand('Input.dispatchMouseEvent', {
+    await sendInput(wc, 'Input.dispatchMouseEvent', {
       // `buttons` is the bitmask of what is held DURING the event; a press with
       // buttons:0 says the left button is down and simultaneously not down.
       type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1,
     });
-    await wc.debugger.sendCommand('Input.dispatchMouseEvent', {
+    await sendInput(wc, 'Input.dispatchMouseEvent', {
       type: 'mouseReleased', x, y, button: 'left', buttons: 0, clickCount: 1,
     });
 
     return { ok: true, x, y, dispatch: 'mouse' };
+  });
+
+  /**
+   * browser.upload.cdp
+   * Set a file input's files by path, so an upload works without a Playwright
+   * page. Main checks every path itself and hands the page only what that
+   * check returned; what the caller checked is not relied on.
+   * params: { files: string[], selector?: string, near?: boolean, timeoutMs?: number, surfaceId?: string }
+   * returns UploadOutcome
+   */
+  registerLeased('browser.upload.cdp', async (params, scope) => {
+    const files = params['files'];
+    if (!Array.isArray(files) || files.length === 0 || files.length > UPLOAD_MAX_FILES) {
+      throw new Error(`browser.upload.cdp: "files" must hold 1 to ${UPLOAD_MAX_FILES} paths`);
+    }
+    const root = uploadRootIn(getWmuxDir());
+    const safe = files.map((file: unknown) => {
+      const checked = checkUploadPath(file, root);
+      if (!checked.ok) throw new Error(`browser.upload.cdp blocked: ${uploadRefusalText(file, checked)}`);
+      return checked.path;
+    });
+    const selector =
+      typeof params['selector'] === 'string' && params['selector'] ? params['selector'] : DEFAULT_FILE_INPUT_SELECTOR;
+    if (selector.length > UPLOAD_MAX_SELECTOR_CHARS) throw new Error('browser.upload.cdp: "selector" is too long');
+    const surfaceId = typeof params['surfaceId'] === 'string' ? params['surfaceId'] : undefined;
+    const asked = params['timeoutMs'];
+    const timeoutMs =
+      typeof asked === 'number' && Number.isFinite(asked) && asked >= 1
+        ? Math.min(Math.floor(asked), UPLOAD_MAX_TIMEOUT_MS)
+        : UPLOAD_DEFAULT_TIMEOUT_MS;
+    const wc = resolveWc(surfaceId, 'browser.upload.cdp', scope);
+    return setFilesInIsolatedWorld(
+      (method, cmdParams) => wc.debugger.sendCommand(method, cmdParams),
+      safe,
+      selector,
+      params['near'] === true,
+      timeoutMs,
+    );
   });
 
   /**
@@ -4185,22 +4981,36 @@ export function registerBrowserRpc(
       }
     }
 
-    await wc.debugger.sendCommand('Input.dispatchMouseEvent', {
+    await sendInput(wc, 'Input.dispatchMouseEvent', {
       type: 'mousePressed', x: from.x, y: from.y, button: 'left', buttons: 1, clickCount: 1,
     });
     // Held-button moves: the drag itself, not a hover, so the button is named
     // on every intermediate event.
     for (const point of pointerPath(from, to)) {
-      await wc.debugger.sendCommand('Input.dispatchMouseEvent', {
+      await sendInput(wc, 'Input.dispatchMouseEvent', {
         type: 'mouseMoved', x: point.x, y: point.y, button: 'left', buttons: 1,
       });
     }
-    await wc.debugger.sendCommand('Input.dispatchMouseEvent', {
+    await sendInput(wc, 'Input.dispatchMouseEvent', {
       type: 'mouseReleased', x: to.x, y: to.y, button: 'left', buttons: 0, clickCount: 1,
     });
     setPointerPosition(wc, target.webContentsId, to);
 
     return { ok: true, from, to, dispatch: 'mouse' };
+  });
+
+  /**
+   * browser.dialog.arm
+   * The answer for the next dialog an input of the agent's raises on this tab.
+   * params: { accept: boolean, text?: string, surfaceId?: string }
+   */
+  registerLeased('browser.dialog.arm', async (params, scope) => {
+    const surfaceId = typeof params['surfaceId'] === 'string' ? params['surfaceId'] : undefined;
+    const target = webviewCdpManager.getTarget(surfaceId, scope);
+    if (!target) throw noTargetError('browser.dialog.arm', surfaceId, scope);
+    const text = typeof params['text'] === 'string' ? params['text'] : undefined;
+    webviewCdpManager.armDialog(target.surfaceId, params['accept'] === true, text);
+    return { armed: true };
   });
 
   /**
@@ -4274,10 +5084,12 @@ export function registerBrowserRpc(
     };
   });
 
-  // ── State handlers (packaged RPC fallback for browser_cookies / _resize /
-  //    _emulate, #111). On packaged builds playwright-core cannot hand the guest
-  //    <webview> back as a Playwright Page, so these tools fall through to CDP
-  //    over the page debugger — the same route browser.evaluate already uses.
+  // ── State handlers (RPC lane for browser_cookies / _resize / _emulate, #111).
+  //    playwright-core hands a guest <webview> back as a Page only when its
+  //    connection predates the guest (the target attaches as a page and turns
+  //    into a webview after); that is attach order, not dev versus packaged.
+  //    Usually there is none, so these tools fall through to CDP over the page
+  //    debugger — the same route browser.evaluate already uses.
   //    browser_storage needs no handler here: it routes through browser.evaluate.
 
   /**
@@ -4367,6 +5179,14 @@ export function registerBrowserRpc(
         screenHeight: preset.screenHeight,
       }),
     });
+    // A size of the caller's own replaces a phone drawn larger to fill the
+    // pane: the preset loses its scale, and is no longer the one that drew it.
+    if (preset?.scale !== undefined || preset?.fill) {
+      const rest = { ...preset };
+      delete rest.scale;
+      delete rest.fill;
+      activePreset.set(wc, rest);
+    }
     return { ok: true, width, height };
   });
 
@@ -4389,25 +5209,7 @@ export function registerBrowserRpc(
     const send = (method: string, p?: Record<string, unknown>): Promise<unknown> =>
       wc.debugger.sendCommand(method, p);
     const applied: string[] = [];
-    // Read the page's own numbers rather than reporting back what was asked
-    // for. Best-effort: a page that cannot be evaluated must not fail the
-    // emulation this describes.
-    const probe = async (): Promise<
-      { w: number; h: number; dpr: number; touch: number } | undefined
-    > => {
-      try {
-        const res = (await send('Runtime.evaluate', {
-          expression: DEVICE_PROBE_EXPRESSION,
-          returnByValue: true,
-        })) as { result?: { value?: { w?: number; h?: number; dpr?: number; touch?: number } } };
-        const v = res?.result?.value;
-        return typeof v?.w === 'number' && typeof v.h === 'number'
-          ? { w: v.w, h: v.h, dpr: v.dpr ?? 0, touch: v.touch ?? 0 }
-          : undefined;
-      } catch {
-        return undefined;
-      }
-    };
+    const probe = () => probeDevice(send);
 
     if (typeof params['offline'] === 'boolean') {
       await send('Network.enable');
@@ -4439,7 +5241,7 @@ export function registerBrowserRpc(
         // Overriding the coordinates is not enough on its own: navigator.geolocation
         // stays blocked unless the page also holds the geolocation permission. The
         // Playwright path grants it explicitly (context.grantPermissions); mirror
-        // that so the packaged fallback actually emulates location for the common
+        // that so the RPC fallback actually emulates location for the common
         // permission-gated flow. Browser.grantPermissions is a browser-target
         // command and may be unavailable on Electron's page-level debugger, so this
         // is best-effort — the coordinate override still applies if it throws.
@@ -4490,8 +5292,9 @@ export function registerBrowserRpc(
     if (params['deviceMetrics'] && typeof params['deviceMetrics'] === 'object') {
       const dm = params['deviceMetrics'] as {
         width: number; height: number; deviceScaleFactor?: number; mobile?: boolean;
-        hasTouch?: boolean; screenWidth?: number; screenHeight?: number;
+        hasTouch?: boolean; screenWidth?: number; screenHeight?: number; scale?: number; fill?: boolean;
       };
+      const scale = typeof dm.scale === 'number' && Number.isFinite(dm.scale) && dm.scale > 0 && dm.scale !== 1 ? dm.scale : undefined;
       // Remember what the preset is about to replace so `deviceReset` can put
       // it back (#1357). Only the first preset in a chain records: two presets
       // in a row must still reset to the pre-emulation desktop size.
@@ -4505,6 +5308,7 @@ export function registerBrowserRpc(
         ...(dm.screenWidth !== undefined && dm.screenHeight !== undefined
           ? { screenWidth: dm.screenWidth, screenHeight: dm.screenHeight }
           : {}),
+        ...(scale !== undefined ? { scale } : {}),
       });
       if (dm.hasTouch !== undefined) {
         // navigator.maxTouchPoints stayed 0 under a phone preset, contradicting
@@ -4548,6 +5352,8 @@ export function registerBrowserRpc(
           screenWidth: dm.screenWidth,
           screenHeight: dm.screenHeight,
         }),
+        ...(scale !== undefined && { scale }),
+        ...(dm.fill === true && { fill: true as const }),
       });
       const label = typeof params['deviceLabel'] === 'string' ? params['deviceLabel'] : `${dm.width}x${dm.height}`;
       applied.push(`device=${label}`);
@@ -4555,68 +5361,7 @@ export function registerBrowserRpc(
       const after = await probe();
       if (after) applied.push(`probe=${after.w}x${after.h} dpr=${after.dpr} maxTouchPoints=${after.touch}`);
     } else if (params['deviceReset'] === true) {
-      // Actually undo the preset over CDP: drop the device metrics override and
-      // restore the real user agent. Without this, a packaged caller who switches
-      // to a phone preset and then resets stays on the mobile UA/metrics for every
-      // subsequent page. CDP has no "clear UA override" command, so re-apply the
-      // WebContents' own UA to shed the mobile one set by the preset above.
-      activePreset.delete(wc);
-      const remembered = prePresetViewport.get(wc);
-      prePresetViewport.delete(wc);
-      await send('Emulation.clearDeviceMetricsOverride');
-      // The touch points the preset installed outlive clearDeviceMetricsOverride,
-      // so a reset that skipped this left a desktop UA reporting a touchscreen.
-      let touchDisabled = true;
-      // No maxTouchPoints — CDP refuses 0 even when disabling, and the catch
-      // below turned that refusal into a silent no-op (#1357).
-      await send('Emulation.setTouchEmulationEnabled', { enabled: false })
-        .catch(() => {
-          // Swallowing this was how a reset could report success while
-          // navigator.maxTouchPoints stayed at the preset's value (#1357).
-          // The metrics are still cleared; say what did not happen.
-          touchDisabled = false;
-        });
-      try {
-        const ua = typeof wc.getUserAgent === 'function' ? wc.getUserAgent() : undefined;
-        // Restore the metadata alongside the string: re-applying the real UA
-        // while the preset's Client Hints stayed in place would leave exactly
-        // the mismatch the preset path now avoids.
-        if (ua) {
-          await send(
-            'Emulation.setUserAgentOverride',
-            buildUserAgentOverride(ua) as unknown as Record<string, unknown>,
-          );
-        }
-      } catch {
-        /* getUserAgent / UA override unavailable on this transport; metrics still cleared */
-      }
-      // Restore the viewport the preset replaced. Clearing the override alone
-      // left the caller to guess the desktop size back, and a page still at the
-      // phone width keeps matching the preset's media queries (#1357).
-      let viewportNote: string;
-      if (remembered) {
-        await send('Emulation.setDeviceMetricsOverride', {
-          width: remembered.width,
-          height: remembered.height,
-          deviceScaleFactor: 0,
-          mobile: false,
-        });
-        viewportNote = `viewport ${remembered.width}x${remembered.height} restored`;
-      } else {
-        viewportNote = 'viewport from surface bounds (no pre-preset viewport recorded)';
-      }
-      // The page's media queries and `ontouchstart` checks already ran under the
-      // preset, so their results cannot be trusted without a fresh evaluation.
-      let reloaded = true;
-      try {
-        wc.reload();
-      } catch {
-        reloaded = false;
-      }
-      applied.push(`device=reset (${viewportNote}, ${reloaded ? 'reloaded' : 'reload failed'})`);
-      if (!touchDisabled) applied.push('touch=could not be disabled');
-      const after = await probe();
-      if (after) applied.push(`probe=${after.w}x${after.h} dpr=${after.dpr} maxTouchPoints=${after.touch}`);
+      applied.push(...await resetDevicePreset(wc));
     }
 
     return { applied };

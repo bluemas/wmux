@@ -22,8 +22,8 @@
  * the section verdicts without spawning a daemon or touching the real FS.
  */
 
-import { readFileSync, openSync, fstatSync, readSync, closeSync } from 'fs';
-import { join } from 'path';
+import { readFileSync, readdirSync, openSync, fstatSync, readSync, closeSync } from 'fs';
+import { join, dirname } from 'path';
 import * as os from 'os';
 import { sendRequest, sendDaemonRequest } from '../client';
 import {
@@ -49,6 +49,14 @@ import {
   type AppMemoryDiagnostics, type DaemonMemoryDiagnostics,
 } from '../../shared/memoryDiagnostics';
 import { collectProcessMemory, renderMemoryDiagnostics } from '../memoryDiagnostics';
+import { readAllTargetStatuses, type TargetRegStatus } from '../../shared/mcpRegistration';
+import { NATIVE_SELF_TEST_LINE } from '../../shared/mcpLauncher';
+import { fileSha256, probeKey, recordedProbe } from '../../shared/probedNative';
+import { BROKER_TOOL_NAME_RE, type McpSessionsSummary } from '../../shared/mcpSessions';
+import { homeRelative } from '../../shared/homeRelative';
+import { EDGE_SIGNED_IN_HINT, edgeAccountSignedIn, edgeProfileDirs } from './edgeProfileSignin';
+import { claudeHookRuntimeReport, defaultPaths as defaultHooksPaths, type ClaudeHookRuntimeReport } from './setupHooks';
+import { claudeSelfTestLine, selfTestClaudeCopy, type ClaudeSelfTestResult } from '../../shared/hooks/claudeNativeHook';
 
 // --- public report model -----------------------------------------------------
 
@@ -95,6 +103,10 @@ export interface DoctorReport {
   };
   avHint: { verdict: Verdict; lines: CheckLine[] };
   logs: { verdict: Verdict; lines: CheckLine[] };
+  /** Present when the run was given MCP deps (the CLI always is). */
+  mcp?: { verdict: Verdict; lines: CheckLine[] };
+  /** How the Claude hook entries run; present when the run was given it. */
+  hooks?: { verdict: Verdict; lines: CheckLine[] };
 }
 
 // --- injected dependencies (the seam unit tests substitute) ------------------
@@ -149,6 +161,30 @@ export interface DoctorDeps {
   tailReadTextFile: (path: string, maxBytes: number) => string | null;
   /** Process env snapshot — only WMUX_DATA_SUFFIX is consulted today. */
   env: Record<string, string | undefined>;
+  /**
+   * wmux's own browser profile folders (the dedicated profile and each named
+   * one), as `[name, dir]`. Each one's `Default/Preferences` is read with
+   * readTextFile to tell whether Edge signed it in to an account. Absent: no check.
+   */
+  browserProfiles?: (env: Record<string, string | undefined>) => Array<[name: string, dir: string]>;
+  /** The MCP section's inputs; the section is left out without them. */
+  mcp?: McpDoctorDeps;
+  /** How the Claude hook entries run (setupHooks' claudeHookRuntimeReport). */
+  hooks?: () => ClaudeHookRuntimeReport;
+  /** Runs the copy native entries name once (`--self-test`) against this
+   *  build's line; null when that line cannot be read. Doctor alone runs it. */
+  hookSelfTest?: (copy: string) => Promise<ClaudeSelfTestResult | null>;
+}
+
+export interface McpDoctorDeps {
+  /** The user's home, shown as `~` so pasted output names no account. */
+  home: string;
+  /** Registration state per agent config, read from disk (works with the app down). */
+  targets: () => TargetRegStatus[];
+  /** The app's recorded self-test verdict for a native launcher's bytes. */
+  recordedVerdict: (binary: string) => 'pass' | 'fail' | undefined;
+  /** The main pipe's `mcp.sessions.summary`. */
+  sessions: () => Promise<RpcResponse>;
 }
 
 // --- thresholds (single source so tests assert the exact boundary) -----------
@@ -209,6 +245,8 @@ export async function buildDoctorReport(deps: DoctorDeps): Promise<DoctorReport>
   const bootPhases = buildBootPhases(deps, ping);
   const avHint = buildAvHint(bootPhases);
   const logs = buildLogs(deps);
+  const mcp = deps.mcp ? await buildMcpSection(deps.mcp, appPipeReachable) : undefined;
+  const hooks = deps.hooks ? await buildHooksSection(deps.hooks(), deps.hookSelfTest) : undefined;
 
   const overall = worst([
     environment.verdict,
@@ -216,9 +254,38 @@ export async function buildDoctorReport(deps: DoctorDeps): Promise<DoctorReport>
     bootPhases.verdict,
     avHint.verdict,
     logs.verdict,
+    ...(mcp ? [mcp.verdict] : []),
+    ...(hooks ? [hooks.verdict] : []),
   ]);
 
-  return { overall, environment, daemon, bootPhases, avHint, logs };
+  return { overall, environment, daemon, bootPhases, avHint, logs, ...(mcp ? { mcp } : {}), ...(hooks ? { hooks } : {}) };
+}
+
+const HOOK_RUNTIME_VERDICT: Record<ClaudeHookRuntimeReport['severity'], Verdict> = { ok: 'OK', warn: 'WARN', fail: 'FAIL' };
+
+async function buildHooksSection(
+  report: ClaudeHookRuntimeReport,
+  selfTest?: (copy: string) => Promise<ClaudeSelfTestResult | null>,
+): Promise<{ verdict: Verdict; lines: CheckLine[] }> {
+  const lines: CheckLine[] = [{ label: 'claude hook runtime', value: report.state, verdict: HOOK_RUNTIME_VERDICT[report.severity], hint: report.detail }];
+  // A recorded pass says nothing about today (a home turned noexec): run the
+  // copy once, here and nowhere else.
+  if (selfTest && report.copy && report.state !== 'copy-missing') lines.push(selfTestLine(await selfTest(report.copy)));
+  return { verdict: worst(lines.map((l) => l.verdict)), lines };
+}
+
+const REPROBE = 'run `wmux setup-hooks --reprobe`';
+
+function selfTestLine(result: ClaudeSelfTestResult | null): CheckLine {
+  const label = 'claude hook self-test';
+  if (!result) return { label, value: 'not run', verdict: 'SKIP', hint: 'no bridge could be read, beside the copy or in this build' };
+  switch (result.outcome) {
+    case 'pass': return { label, value: 'passed', verdict: 'OK' };
+    case 'other-pin': return { label, value: 'runs, pins another bridge', verdict: 'WARN', hint: 'each run hands over to node; `wmux setup-hooks` brings the copy and the bridge in step' };
+    case 'fail': return { label, value: 'failed', verdict: 'FAIL', hint: `the copy printed ${JSON.stringify(result.printed)}, not the expected line; ${REPROBE}` };
+    case 'unstartable': return { label, value: 'failed', verdict: 'FAIL', hint: `the copy could not start (${result.error}); ${REPROBE}` };
+    case 'timeout': return { label, value: 'no answer in 5 s', verdict: 'WARN', hint: 'a slow antivirus scan is no evidence; run `wmux doctor` again' };
+  }
 }
 
 function buildEnvironment(
@@ -267,6 +334,21 @@ function buildEnvironment(
       ? 'Instance-isolation suffix is set; this is a dev/isolated build, not the packaged install.'
       : undefined,
   });
+
+  // Shown only when a profile is signed in: profile names, never the account.
+  // Every profile folder of each user-data-dir (Local State's info_cache), not only Default.
+  const signedIn = (deps.browserProfiles?.(deps.env) ?? [])
+    .filter(([, dir]) => edgeProfileDirs(deps.readTextFile(join(dir, 'Local State')))
+      .some((folder) => edgeAccountSignedIn(deps.readTextFile(join(dir, folder, 'Preferences')))))
+    .map(([name]) => name);
+  if (signedIn.length > 0) {
+    lines.push({
+      label: 'Edge profile account',
+      value: `signed in (${signedIn.join(', ')})`,
+      verdict: 'WARN',
+      hint: EDGE_SIGNED_IN_HINT,
+    });
+  }
 
   return { verdict: worst(lines.map((l) => l.verdict)), lines };
 }
@@ -450,6 +532,155 @@ function buildLogs(deps: DoctorDeps): DoctorReport['logs'] {
   return { verdict: worst(lines.map((l) => l.verdict)), lines };
 }
 
+// --- mcp section ----------------------------------------------------------------
+
+function launcherKind(registered: string): 'native' | 'node-shim' | 'bundle' | 'other node script' {
+  const base = registered.split(/[\\/]/).pop() ?? '';
+  if (/^wmux-native(?:\.exe)?$/.test(base)) return 'native';
+  if (base === 'shim.js') return 'node-shim';
+  if (base === 'index.js') return 'bundle';
+  return 'other node script';
+}
+
+function registeredLine(t: TargetRegStatus, deps: McpDoctorDeps, verdictOf: (binary: string) => 'pass' | 'fail' | undefined): CheckLine {
+  const label = `registered (${t.id})`;
+  // An agent without wmux registered is a choice, not a fault.
+  if (!t.wmux.registered || !t.wmux.path) return { label, value: 'not registered', verdict: 'OK' };
+  const kind = launcherKind(t.wmux.path);
+  const where = kind === 'other node script' ? null : homeRelative(t.wmux.path, deps.home);
+  const value = `${kind}, ${t.wmux.profile ?? 'full'}${where ? ` (${where})` : ''}`;
+  if (kind === 'native' && verdictOf(t.wmux.path) === 'fail') {
+    return {
+      label,
+      value,
+      verdict: 'WARN',
+      hint: 'This copy is recorded as failing its self-test; the app registers the Node launcher on its next start.',
+    };
+  }
+  return { label, value, verdict: 'OK' };
+}
+
+function isSessionsSummary(v: unknown): v is McpSessionsSummary {
+  const o = v as { broker?: Record<string, unknown>; bundle?: Record<string, unknown> } | null;
+  const b = o?.broker;
+  const n = o?.bundle;
+  if (!b || typeof b !== 'object' || !n || typeof n !== 'object') return false;
+  const nums = (rec: Record<string, unknown>, keys: string[]) => keys.every((k) => typeof rec[k] === 'number');
+  return typeof b.enabled === 'boolean' && typeof b.running === 'boolean' && typeof b.standingDown === 'boolean'
+    && (b.downReason === null || typeof b.downReason === 'string')
+    && nums(b, ['connections', 'crashExits', 'spawnFailures', 'standDowns'])
+    && (b.pid === null || typeof b.pid === 'number')
+    && (b.uptimeS === null || typeof b.uptimeS === 'number')
+    && typeof n.capped === 'boolean' && nums(n, ['recent', 'ttlS']);
+}
+
+/** The tool calls the broker's last crash cut off, names only, as a hint sentence. */
+function lastCrash(b: McpSessionsSummary['broker']): string | undefined {
+  const names = (Array.isArray(b.lastCrashTools) ? b.lastCrashTools : [])
+    .filter((n): n is string => typeof n === 'string' && BROKER_TOOL_NAME_RE.test(n));
+  return names.length > 0 ? `Last crash during: ${names.join(', ')}.` : undefined;
+}
+
+/** What each kind of registered agent does while the broker is down. */
+function downConsequences(kinds: ReadonlySet<string>): string[] {
+  const out: string[] = [];
+  if (kinds.has('native')) out.push('Agents on the native launcher start the full bundle themselves meanwhile.');
+  if (kinds.has('node-shim')) out.push('Agents on the Node shim cannot start a session until it runs.');
+  return out;
+}
+
+/**
+ * The broker line. A down broker is described only as far as its state is
+ * known: a restart is promised only when one is scheduled, and a state this
+ * doctor cannot name gets no hint at all.
+ */
+function brokerLine(b: McpSessionsSummary['broker'], kinds: ReadonlySet<string>): CheckLine {
+  if (!b.enabled) return { label: 'broker', value: 'off', verdict: 'OK' };
+  if (b.running) {
+    return {
+      label: 'broker',
+      value: `running pid ${b.pid}, up ${formatUptime(b.uptimeS ?? undefined)}, connections ${b.connections}, ` +
+        `crash exits ${b.crashExits}, spawn failures ${b.spawnFailures}, stand-downs ${b.standDowns}`,
+      verdict: 'OK',
+    };
+  }
+  if (b.standingDown) {
+    return { label: 'broker', value: `served by another wmux instance's broker (stand-downs ${b.standDowns})`, verdict: 'OK' };
+  }
+  const known: Record<string, { value: string; next?: string }> = {
+    restarting: {
+      value: `not running: restarting after an exit (crash exits ${b.crashExits}, spawn failures ${b.spawnFailures})`,
+      next: ['The app restarts it with a backoff.', lastCrash(b)].filter(Boolean).join(' '),
+    },
+    'crash-loop': {
+      value: `not running: it kept failing (crash exits ${b.crashExits}, spawn failures ${b.spawnFailures}), off until wmux restarts`,
+      next: lastCrash(b),
+    },
+    'script-missing': { value: 'not running: this build has no broker script', next: 'It will not start in this session.' },
+    stopped: { value: 'not running: stopped by the app' },
+  };
+  const state = typeof b.downReason === 'string' ? known[b.downReason] : undefined;
+  if (!state) return { label: 'broker', value: 'not running', verdict: 'WARN' };
+  const hint = [state.next, ...downConsequences(kinds)].filter(Boolean).join(' ');
+  return { label: 'broker', value: state.value, verdict: 'WARN', ...(hint ? { hint } : {}) };
+}
+
+/**
+ * The self-test verdict the app recorded for the launcher at `binary`, read
+ * under the key approvedInstalledNative uses: these bytes and the self-test
+ * line (shared/probedNative.ts).
+ */
+export function recordedNativeVerdict(binary: string): 'pass' | 'fail' | undefined {
+  const hash = fileSha256(binary);
+  return hash ? recordedProbe(dirname(binary), probeKey(hash, NATIVE_SELF_TEST_LINE)) : undefined;
+}
+
+export async function buildMcpSection(
+  deps: McpDoctorDeps,
+  appPipeReachable = true,
+): Promise<{ verdict: Verdict; lines: CheckLine[] }> {
+  const targets = deps.targets();
+  // Agents usually share one native copy: hash it once per run.
+  const verdicts = new Map<string, 'pass' | 'fail' | undefined>();
+  const verdictOf = (binary: string) => {
+    if (!verdicts.has(binary)) verdicts.set(binary, deps.recordedVerdict(binary));
+    return verdicts.get(binary);
+  };
+  const lines = targets.map((t) => registeredLine(t, deps, verdictOf));
+  const kinds = new Set(targets.flatMap((t) => (t.wmux.registered && t.wmux.path ? [launcherKind(t.wmux.path)] : [])));
+  let summary: McpSessionsSummary | null = null;
+  let skipReason = 'the app is not running';
+  // The probe reached the app, so a failure here is the app's answer, or its
+  // silence, not its absence. Only an unknown method means an older app.
+  const notAnswered = (why: string) => `the app did not answer: ${why.replace(/\s+/g, ' ').slice(0, 120)}`;
+  if (appPipeReachable) {
+    try {
+      const resp = await deps.sessions();
+      if (!resp.ok) {
+        skipReason = /^Unknown method\b/.test(resp.error) ? 'this app version does not report them' : notAnswered(resp.error);
+      } else if (isSessionsSummary(resp.result)) {
+        summary = resp.result;
+      } else {
+        skipReason = 'the app answered in a shape this doctor does not read';
+      }
+    } catch (err) {
+      skipReason = notAnswered(err instanceof Error ? err.message : String(err));
+    }
+  }
+  if (summary) {
+    lines.push(brokerLine(summary.broker, kinds));
+    const minutes = Math.round(summary.bundle.ttlS / 60);
+    lines.push({
+      label: `bundle sessions (last ${minutes} min)`,
+      value: summary.bundle.capped ? `≥${summary.bundle.recent}` : String(summary.bundle.recent),
+      verdict: 'OK',
+    });
+  } else {
+    lines.push({ label: 'live sessions', value: `unavailable (${skipReason})`, verdict: 'SKIP' });
+  }
+  return { verdict: worst(lines.map((l) => l.verdict)), lines };
+}
+
 // --- performance section (--performance, P0-5c) -------------------------------
 
 /** Wire shape of the `perf.status` RPC result (src/main/pipe/handlers/perf.rpc.ts). */
@@ -606,6 +837,19 @@ function getFallbackVersion(): string {
  *   - Linux:   ~/.config/<appName><suffix>/logs/main-YYYY-MM-DD.log
  * The Windows path is the dogfood-verified one; the others are best-effort.
  */
+/**
+ * Electron's userData for this instance: productName `wmux` plus
+ * WMUX_DATA_SUFFIX, under APPDATA (Windows), Application Support (macOS) or
+ * XDG_CONFIG_HOME (elsewhere). An empty variable counts as unset, as in
+ * resolveMainLogPath.
+ */
+export function resolveUserDataDir(env: Record<string, string | undefined>, platform: string, home: string): string {
+  const name = `wmux${env.WMUX_DATA_SUFFIX || ''}`;
+  if (platform === 'win32') return join(env.APPDATA || join(home, 'AppData', 'Roaming'), name);
+  if (platform === 'darwin') return join(home, 'Library', 'Application Support', name);
+  return join(env.XDG_CONFIG_HOME || join(home, '.config'), name);
+}
+
 export function resolveMainLogPath(date: string): string {
   const appName = 'wmux';
   const suffix = dataSuffix();
@@ -632,6 +876,22 @@ export function resolveDaemonLogPath(date: string): string {
 /** UTC date in YYYY-MM-DD — matches logSink's `todayUtc()`. */
 export function todayUtc(now: Date = new Date()): string {
   return now.toISOString().slice(0, 10);
+}
+
+/**
+ * wmux's browser profile folders under the app's userData (main's
+ * ChromeLauncherRegistry): `chrome-agent-profile` is the default profile and
+ * `chrome-profiles/<name>` the named ones.
+ */
+function wmuxBrowserProfiles(env: Record<string, string | undefined>): Array<[string, string]> {
+  const userData = resolveUserDataDir(env, process.platform, os.homedir());
+  const out: Array<[string, string]> = [['default', join(userData, 'chrome-agent-profile')]];
+  try {
+    for (const entry of readdirSync(join(userData, 'chrome-profiles'), { withFileTypes: true })) {
+      if (entry.isDirectory()) out.push([entry.name, join(userData, 'chrome-profiles', entry.name)]);
+    }
+  } catch { /* no named profiles */ }
+  return out;
 }
 
 function readTextFileSafe(path: string): string | null {
@@ -743,6 +1003,8 @@ export function renderReport(report: DoctorReport): string {
   }
   out.push('');
 
+  if (report.mcp) section('mcp', report.mcp.verdict, report.mcp.lines);
+  if (report.hooks) section('hooks', report.hooks.verdict, report.hooks.lines);
   section('antivirus tax hint', report.avHint.verdict, report.avHint.lines);
   section('logs', report.logs.verdict, report.logs.lines);
 
@@ -781,6 +1043,20 @@ export async function handleDoctor(args: string[], jsonMode: boolean): Promise<v
     readTextFile: readTextFileSafe,
     tailReadTextFile: tailReadTextFileSafe,
     env: process.env,
+    browserProfiles: wmuxBrowserProfiles,
+    mcp: {
+      home: os.homedir(),
+      targets: () => readAllTargetStatuses(os.homedir()),
+      recordedVerdict: recordedNativeVerdict,
+      sessions: () => sendRequest('mcp.sessions.summary', {}),
+    },
+    hooks: () => claudeHookRuntimeReport(defaultHooksPaths()),
+    // Held to the bridge beside the copy, the one its runs hand over to;
+    // this build's when none is there.
+    hookSelfTest: async (copy) => {
+      const line = claudeSelfTestLine(join(dirname(copy), 'wmux-bridge.mjs')) ?? claudeSelfTestLine(defaultHooksPaths().bridgeSource);
+      return line ? selfTestClaudeCopy(copy, line) : null;
+    },
   };
 
   const report = await buildDoctorReport(deps);

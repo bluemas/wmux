@@ -2,6 +2,7 @@
 // normalize boundary in ./workspaceColors, so the values and the type cannot
 // drift apart.
 import type { WorkspaceColorId } from './workspaceColors';
+import type { WorkspaceGroup } from './workspaceGroups';
 // Type-only import (erased at build). AgentSlug is canonically declared in
 // ./events; the reverse type-only edge (events → types) makes this a type-level
 // cycle, which TypeScript resolves without any runtime import.
@@ -52,6 +53,10 @@ export interface Surface {
   browserUrl?: string;
   browserPartition?: string;
   editorFilePath?: string;
+  /** `editor` surfaces only: 1-based line to scroll to when the tab was opened from `path:line`. */
+  editorLine?: number;
+  /** `editor` surfaces only: bumped each time a link re-targets the open tab, so the same line can be re-shown. */
+  editorLineSeq?: number;
   /** `preview` surfaces only (#2150): the image or PDF the tab shows. */
   previewFilePath?: string;
   /**
@@ -120,6 +125,15 @@ export interface Surface {
    *  Not refreshed from OSC titles while locked — an agent retitles its tab
    *  many times a second, and each refresh would be a store write. */
   autoTitle?: string;
+  /**
+   * The name the user deliberately gave this terminal through wmux's own
+   * rename (the tab rename UI). Written only by that rename path — never by
+   * an OSC title, and never by the code paths that lock a title for their own
+   * reason (account login, GitHub connect). This is the A2A party name's
+   * highest-precedence source; a title (`title`) set by a program is the
+   * separate, setting-gated source.
+   */
+  userName?: string;
   /** "Continue in another agent": the tab this one's work went on in, and on
    *  that tab, the held one it came from. Each tab's tooltip names the other. */
   continuedIn?: string;
@@ -162,6 +176,14 @@ export interface PaneLeaf {
    * so it persists via the `...pane` spread. undefined === false.
    */
   notificationsMuted?: boolean;
+  /**
+   * The terminal-kind tab that last gave up the focus in this leaf. While a
+   * work tab (editor, browser…) holds the focus, the split's terminal column
+   * keeps drawing this tab, so a file opened from the second tab stays beside
+   * it. Layout state like `ordinal`; read only through `splitShownTerminal`,
+   * which ignores it unless it names a terminal-kind tab still in this leaf.
+   */
+  splitTerminalId?: string;
 }
 
 // === Pane Metadata: optional descriptive labels for external tooling ===
@@ -275,6 +297,12 @@ export interface Workspace {
    * tag, which is the default and renders exactly as today.
    */
   color?: WorkspaceColorId;
+  /**
+   * Optional sidebar group (#3069, shared/workspaceGroups.ts): the id of one of
+   * the session's `workspaceGroups`. Display-only — it decides which header
+   * the row is listed under and nothing else. Undefined = top level.
+   */
+  groupId?: string;
   /**
    * P2 — stable workspace number for the `w<wsOrdinal>` prefix of pane auto
    * names. Allocated from the global high-water `nextWorkspaceOrdinal` at
@@ -717,6 +745,16 @@ export function buildDefaultCustomKeybindings(platform?: string): CustomKeybindi
       command: 'claude --dangerously-skip-permissions',
       sendEnter: true,
     },
+    // F7's resume twin, on the next key for the same reasons (Mac: Ctrl+8).
+    // An existing user gets it on load only if neither its id nor its key is
+    // already taken by a saved binding (workspaceSlice back-fill).
+    {
+      id: 'kb-default-f8',
+      key: isMac ? 'Ctrl+8' : 'F8',
+      label: 'Claude (skip permissions, resume)',
+      command: 'claude --dangerously-skip-permissions --resume',
+      sendEnter: true,
+    },
   ];
 }
 
@@ -951,8 +989,14 @@ export interface SessionData {
   paneNewTerminalButton?: boolean;
   /** Experimental opt-in; absent means off. See uiSlice.terminalCompactScrollback. */
   terminalCompactScrollback?: boolean;
+  /** Where a clicked terminal file path opens; absent means `wmux`. See uiSlice.terminalOpenFileLinksIn. */
+  terminalOpenFileLinksIn?: 'wmux' | 'os';
   /** Experimental opt-in; absent means off. See uiSlice.terminalSharedWebgl. */
   terminalSharedWebgl?: boolean;
+  /** Experimental opt-in; absent means off. See uiSlice.terminalWongtty. */
+  terminalWongtty?: boolean;
+  /** Experimental opt-in; absent means off. See uiSlice.a2aTerminalNames. */
+  a2aTerminalNames?: boolean;
   scrollbackLines?: number;
   /**
    * Issue #174: whether a pane created by splitting inherits the splitting
@@ -1068,6 +1112,10 @@ export interface SessionData {
   /** Bookmarked workspaces: a mark the sidebar filter can narrow to. Unlike a
    *  pin it never changes the order. */
   sidebarBookmarkedIds?: string[];
+  /** #3069 — user-defined sidebar groups, in display order. Normalized on load
+   *  (shared/workspaceGroups.ts); a workspace's `groupId` naming no group here
+   *  is dropped. */
+  workspaceGroups?: WorkspaceGroup[];
   /** #1481 — expanded sidebar width in px. Clamped on load. */
   sidebarWidth?: number;
   /** The file tree column, opposite the sidebar: shown, and its width in px (clamped on load). */
@@ -1331,11 +1379,15 @@ export interface WmuxTaskMetadata {
   // `from.ptyId` (optional): cross-host A2A only — the sender pane's pty when a
   // remote task was sent, so a reply from the other host is held instead of
   // landing on a different agent that took the pane since.
-  from: { workspaceId: string; name: string; paneId?: string; surfaceId?: string; ptyId?: string };
+  // `displayName` (optional, both sides): display only — the A2A party name
+  // (`<workspace>.<terminal>`, a2aPartyName) at send time, so a reader of the
+  // task sees the same name the delivered message showed. Never an address;
+  // `name` stays the workspace name.
+  from: { workspaceId: string; name: string; paneId?: string; surfaceId?: string; ptyId?: string; displayName?: string };
   // `to.ptyId` (optional) is a delivery-time pty SNAPSHOT — channel-mention
   // autoresponse stores it so a deferred flush can fail closed if the pane
   // restarted (successor agent now holds the paneId) before delivery.
-  to: { workspaceId: string; name: string; paneId?: string; surfaceId?: string; ptyId?: string };
+  to: { workspaceId: string; name: string; paneId?: string; surfaceId?: string; ptyId?: string; displayName?: string };
   createdAt: string; // ISO 8601
   updatedAt: string; // ISO 8601
   [key: string]: unknown;

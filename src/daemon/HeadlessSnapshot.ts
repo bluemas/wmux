@@ -47,6 +47,7 @@
  * everything before that marker.
  */
 
+import { noteSnapshotJobEnd, noteSnapshotJobStart } from './screenReadCache';
 import { Terminal } from '@xterm/headless';
 import { SerializeAddon } from '@xterm/addon-serialize';
 import { applyUnicodeWidthModel } from '../shared/terminalUnicode';
@@ -150,10 +151,13 @@ export function enqueueSnapshotJob<T>(job: () => Promise<T>, coalesceKey?: strin
     const waiting = waitingByKey.get(coalesceKey);
     if (waiting) return waiting as Promise<T>;
   }
+  const queuedAt = performance.now();
   const run: Promise<T> = queueTail.then(() => {
     // Its turn: from here a new request for the key queues afresh.
     if (coalesceKey !== undefined && waitingByKey.get(coalesceKey) === run) waitingByKey.delete(coalesceKey);
-    return job();
+    const startedAt = performance.now();
+    noteSnapshotJobStart(startedAt - queuedAt);
+    return Promise.resolve(job()).finally(() => noteSnapshotJobEnd(performance.now() - startedAt));
   });
   if (coalesceKey !== undefined) waitingByKey.set(coalesceKey, run);
   // The queue must survive a rejected job (a defensive catch keeps one bug
@@ -433,6 +437,8 @@ async function generateXtermInner(req: SnapshotRequest): Promise<SnapshotOutcome
 
     const partialTail = new PartialSequenceTracker();
     const margins = new MarginTracker();
+    // Fires only on a real size change, as xterm then resets the margins.
+    terminal.onResize(() => margins.resize());
     const sgrMouse = new SgrMouseEncodingTracker();
     const cursor = new CursorVisibilityTracker();
     // Bytes at a chunk tail that form an incomplete UTF-8 char — carried into
@@ -471,7 +477,7 @@ async function generateXtermInner(req: SnapshotRequest): Promise<SnapshotOutcome
         if (slice.length === 0) continue;
         const text = slice.toString('utf8');
         partialTail.feed(text);
-        margins.feed(text);
+        margins.feed(text, terminal.rows);
         sgrMouse.feed(text);
         cursor.feed(text);
         // Await the parse callback: backpressure AND an event-loop yield per

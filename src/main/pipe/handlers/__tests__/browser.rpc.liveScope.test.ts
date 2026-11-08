@@ -62,7 +62,6 @@ const TARGET = {
   surfaceId: 'surface-1',
   webContentsId: 42,
   targetId: 'target-1',
-  wsUrl: 'ws://127.0.0.1/devtools/page/target-1',
   workspaceId: 'ws-1',
 };
 
@@ -208,6 +207,7 @@ const WRITE_CALLS: Array<[string, Record<string, unknown>]> = [
   ['browser.press.cdp', { key: 'Enter' }],
   ['browser.hover.cdp', { x: 10, y: 10 }],
   ['browser.drag.cdp', { fromX: 1, fromY: 1, toX: 9, toY: 9 }],
+  ['browser.upload.cdp', { files: ['/tmp/x'] }],
   ['browser.evaluate', { expression: '1 + 1' }],
   ['browser.cookies', { action: 'set', cookies: [{ name: 'a', value: 'b' }] }],
   ['browser.cookies', { action: 'clear' }],

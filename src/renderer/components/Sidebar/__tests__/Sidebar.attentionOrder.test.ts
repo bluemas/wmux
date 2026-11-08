@@ -25,7 +25,10 @@ const itemSrc = readFileSync(resolve(SIDEBAR_DIR, 'WorkspaceItem.tsx'), 'utf8');
 describe('Sidebar — ordering wiring (#1481: manual / needs-you-first / recent)', () => {
 
   it('builds the rendered tree from the ordered list, not the filtered one', () => {
-    expect(sidebarSrc).toMatch(/buildSidebarTree\(\s*orderedWorkspaces,/);
+    // #3069 — the ordered list is first split into the user's groups; each
+    // part keeps that order and is built into its own tree.
+    expect(sidebarSrc).toMatch(/partitionWorkspaceGroups\(\s*orderedWorkspaces,/);
+    expect(sidebarSrc).toMatch(/buildSidebarTree\(\s*split\.rest,/);
     expect(sidebarSrc).not.toContain('filteredWorkspaces.map(');
   });
 
@@ -43,8 +46,11 @@ describe('MiniSidebar — ordering wiring', () => {
     expect(miniSrc).not.toMatch(/\{workspaces\.map\(/);
   });
 
-  it('labels and tooltips the rail with the unfiltered position', () => {
-    expect(miniSrc).toContain('const railIndex = workspaces.indexOf(ws);');
+  it('labels and tooltips the rail with the stored-order position among the rows the filter keeps', () => {
+    // The sidebar numbers its filtered rows (Sidebar.tsx `numbered`), so the
+    // rail indexes the same narrowed list, never the display order.
+    expect(miniSrc).toContain('const railIndex = shownWorkspaces.indexOf(ws);');
+    expect(miniSrc).toContain('workspaceShortcutNumber(railIndex, shownWorkspaces.length)');
     expect(miniSrc).toContain('${railIndex + 1}');
     expect(miniSrc).not.toContain('${i + 1}');
   });

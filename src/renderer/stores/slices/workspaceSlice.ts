@@ -5,8 +5,9 @@ import type { StoreState } from '../index';
 import { createWorkspace, clonePaneTreeFresh, assignPaneOrdinals, generateId, BUILTIN_TEMPLATES, DEFAULT_PREFIX_CONFIG, buildDefaultCustomKeybindings, upgradeDefaultKeybindingsForPlatform, TERMINAL_STATES, NOTIFICATION_CATEGORIES, type ArchivedWorkspace, type Pane, type PaneLeaf, type SessionData, type StashedPane, type SurfaceHandoff, type Workspace, type WorkspaceMetadata, type WorkspaceProfile } from '../../../shared/types';
 import { normalizeStarPromptState } from '../../../shared/starPrompt';
 import { normalizeWorkspaceProfile } from '../../../shared/workspaceProfile';
-import { overridesFromDisabledCombos, sanitizeShortcutOverrides } from '../../../shared/keymap';
+import { builtinOwning, effectiveBindings, overridesFromDisabledCombos, sanitizeShortcutOverrides } from '../../../shared/keymap';
 import { normalizeWorkspaceColor, type WorkspaceColorId } from '../../../shared/workspaceColors';
+import { normalizeWorkspaceGroups, resolveWorkspaceGroupId } from '../../../shared/workspaceGroups';
 import type { A2aRemoteSpawnedBy } from '../../../shared/a2aSpawn';
 import { parseRemoteSpawnedBy, type RemoteSpawnedWorkspace } from '../../utils/remoteSpawnedBy';
 import { normalizeRoleBindings } from '../../../shared/orchestratorRole';
@@ -301,7 +302,7 @@ export interface WorkspaceSlice {
    * The new pane's id, or false: no company with a CEO pane, or the pane cap
    * (splitPane says so).
    */
-  hireCompanySeat: (workspaceId: string, seat: { label: string; owns: string; command: string; cwd?: string; env?: Record<string, string> }) => string | false;
+  hireCompanySeat: (workspaceId: string, seat: { label: string; owns: string; command: string; cwd?: string; launchEnv?: Record<string, string> }) => string | false;
   /**
    * Duplicate an existing workspace's LAYOUT (pane tree, with fresh ids and
    * cleared ptyIds → new panes spawn their own PTYs) and its PROFILE (env +
@@ -577,6 +578,7 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
             label: seat.label,
             ...(seat.command ? { command: seat.command } : {}),
             ...(cwd ? { cwd } : {}),
+            ...(seat.command && seat.launchEnv ? { launchEnv: seat.launchEnv } : {}),
             ...(owns ? { role: owns } : {}),
           };
         });
@@ -609,7 +611,7 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
           label: seat.label,
           command: seat.command,
           ...(seat.cwd ? { cwd: seat.cwd } : {}),
-          ...(seat.env ? { env: seat.env } : {}),
+          ...(seat.launchEnv ? { launchEnv: seat.launchEnv } : {}),
           ...(owns ? { role: owns } : {}),
         };
       });
@@ -738,6 +740,8 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
         // alias the source's.
         nextPaneOrdinal: assignPaneOrdinals(rootPane, 1),
         ...(profile ? { profile } : {}),
+        // #3069 — the copy is listed next to its source, under the same group.
+        ...(src.groupId ? { groupId: src.groupId } : {}),
         // `color` is deliberately NOT carried over (owner decision, 2026-08-17).
         // The tag exists to tell workspaces apart; handing the copy the same one
         // would make the two rows identical at the exact moment they sit next to
@@ -1689,9 +1693,15 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       if (typeof data.paneNewTerminalButton === 'boolean') {
         state.paneNewTerminalButton = data.paneNewTerminalButton;
       }
+      // Where a clicked terminal file link opens; an unknown value keeps the default.
+      if (data.terminalOpenFileLinksIn === 'os' || data.terminalOpenFileLinksIn === 'wmux') {
+        state.terminalOpenFileLinksIn = data.terminalOpenFileLinksIn;
+      }
       // Experimental memory opt-ins: only an explicit true turns them on.
       if (data.terminalCompactScrollback === true) state.terminalCompactScrollback = true;
       if (data.terminalSharedWebgl === true) state.terminalSharedWebgl = true;
+      if (data.terminalWongtty === true) state.terminalWongtty = true;
+      if (data.a2aTerminalNames === true) state.a2aTerminalNames = true;
       if (data.splitInheritsCwd != null) state.splitInheritsCwd = data.splitInheritsCwd;
       if (data.closeTabOnShellExit != null) state.closeTabOnShellExit = data.closeTabOnShellExit;
       if (data.imeResidueGuardEnabled != null) state.imeResidueGuardEnabled = data.imeResidueGuardEnabled;
@@ -1809,6 +1819,19 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
           unpinNestedTasks(state);
         }
       }
+      // #3069 — sidebar groups: well-formed entries only, and a workspace keeps
+      // its groupId only while that group exists (a hand-edited or stale id
+      // drops the row back to the top level instead of hiding it).
+      state.workspaceGroups = normalizeWorkspaceGroups(data.workspaceGroups);
+      state.workspaceGroupRenamingId = null;
+      {
+        const groupIds = new Set(state.workspaceGroups.map((g) => g.id));
+        for (const ws of state.workspaces) {
+          const groupId = resolveWorkspaceGroupId(ws.groupId, groupIds);
+          if (groupId) ws.groupId = groupId;
+          else delete ws.groupId;
+        }
+      }
       state.sidebarAttentionFirst = state.sidebarSortMode === 'attention';
       if (data.sidebarWidth !== undefined) state.sidebarWidth = clampSidebarWidth(data.sidebarWidth);
       if (typeof data.fileTreeVisible === 'boolean') state.fileTreeVisible = data.fileTreeVisible;
@@ -1886,6 +1909,15 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
       if (data.fleetLayout === 'list' || data.fleetLayout === 'board') {
         state.fleetLayout = data.fleetLayout;
       }
+      // Whitelisted like everything else a hand-editable, cross-version
+      // session file carries: only configurable actions (they have a Settings
+      // row to undo the change from) and combos the matcher can press.
+      if (data.shortcutOverrides !== undefined) {
+        state.shortcutOverrides = sanitizeShortcutOverrides(data.shortcutOverrides);
+      } else if (Array.isArray(data.disabledShortcuts)) {
+        // #1152 sessions stored switched-off built-ins as a combo list.
+        state.shortcutOverrides = overridesFromDisabledCombos(data.disabledShortcuts);
+      }
       if (data.customKeybindings) {
         // Merge saved keybindings with current built-in defaults (mirrors the
         // layoutTemplates merge below). Built-in defaults (id 'kb-default-*')
@@ -1910,19 +1942,15 @@ export const createWorkspaceSlice: StateCreator<StoreState, [['zustand/immer', n
         const savedKeys = new Set(migrated.map((k) => k.key));
         // 플랫폼별 기본값으로 백필 — Mac은 Ctrl+7, 그 외 F7. 저장된 기본값은
         // id/key 매칭에 걸려 아래 filter에서 제외되므로 중복 추가되지 않는다.
+        // A key the user moved a built-in onto is theirs too: built-ins are
+        // dispatched first, so a default there would never fire (the
+        // overrides are loaded above).
+        const builtins = effectiveBindings(platform === 'darwin' || platform === 'linux' ? platform : 'win32', state.shortcutOverrides ?? {});
+        const prefixKey = data.prefixConfig?.key ?? DEFAULT_PREFIX_CONFIG.key;
         const missingDefaults = buildDefaultCustomKeybindings(platform).filter(
-          (k) => !savedIds.has(k.id) && !savedKeys.has(k.key),
+          (k) => !savedIds.has(k.id) && !savedKeys.has(k.key) && builtinOwning(k.key, builtins, prefixKey) === null,
         );
         state.customKeybindings = [...migrated, ...missingDefaults.map((k) => ({ ...k }))];
-      }
-      // Whitelisted like everything else a hand-editable, cross-version
-      // session file carries: only configurable actions (they have a Settings
-      // row to undo the change from) and combos the matcher can press.
-      if (data.shortcutOverrides !== undefined) {
-        state.shortcutOverrides = sanitizeShortcutOverrides(data.shortcutOverrides);
-      } else if (Array.isArray(data.disabledShortcuts)) {
-        // #1152 sessions stored switched-off built-ins as a combo list.
-        state.shortcutOverrides = overridesFromDisabledCombos(data.disabledShortcuts);
       }
       if (data.autoUpdateEnabled != null) {
         state.autoUpdateEnabled = data.autoUpdateEnabled;

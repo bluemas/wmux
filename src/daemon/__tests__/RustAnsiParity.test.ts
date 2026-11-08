@@ -1,120 +1,17 @@
 /**
- * Rendered parity of the Rust ANSI snapshot against xterm's. Each payload is
- * replayed into a fresh @xterm/headless (the renderer's parser) and the
- * cells, cursor, modes and wrap flags are compared, then again after live
- * bytes continue the stream and after leaving the alternate screen.
- *
- * Accepted deviation: Alacritty cannot tell a printed space from an erased
- * cell, so trailing blanks replay as empty cells. A restored row may drop
- * trailing printed spaces from its copied text; it never gains any, except
- * inside a soft-wrapped paragraph, where copy and reflow ignore the edge, and
- * left of the cursor, where blanks replay as printed (a shell prompt's space).
+ * Rendered parity of the Rust ANSI snapshot against xterm's, per control
+ * class (the comparison and its accepted deviations are in _rustParity.ts).
  *
  * Runs where the native module is built (the rust-engine lane builds it).
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Terminal } from '@xterm/headless';
-import { nativeCorePath } from '../../shared/nativeTerminalCore';
 import { getAnsiSnapshotBackendDiagnostics } from '../AnsiSnapshotBackend';
 import { generateSnapshotUnqueued, type SnapshotRequest } from '../HeadlessSnapshot';
 import { generateRustSnapshot } from '../RustSnapshot';
-import { snapshotTestTerminal, writeTerminal } from '../snapshotFingerprint';
 import { CLAUDE_WRAPPED_REPLY_80x30 } from '../../renderer/terminal/__tests__/fixtures/claudeWrappedReply';
-
-const modulePath = nativeCorePath();
-const available = fs.existsSync(modulePath);
-if (!available && process.env.WMUX_REQUIRE_RUST_CORE) throw new Error(`native core missing: ${modulePath}`);
-
-interface Row { wrapped: boolean; text: string; cells: string }
-interface State { head: string; rows: Row[]; cursorRow: number }
-
-function capture(t: Terminal): State {
-  const rows: Row[] = [];
-  const head: unknown[] = [t.cols, t.rows, t.buffer.active.type, t.modes];
-  let cursorRow = -1;
-  for (const buffer of [t.buffer.normal, t.buffer.alternate]) {
-    if (buffer.type === 'alternate' && t.buffer.active.type !== 'alternate') continue;
-    if (buffer.type === t.buffer.active.type) cursorRow = rows.length + buffer.baseY + buffer.cursorY;
-    head.push([buffer.type, buffer.baseY, buffer.cursorX, buffer.cursorY, buffer.length]);
-    for (let y = 0; y < buffer.length; y++) {
-      const line = buffer.getLine(y)!;
-      const cells: unknown[] = [];
-      for (let x = 0; x < t.cols; x++) {
-        const c = line.getCell(x)!;
-        const chars = c.getChars() || ' ';
-        // A blank shows its background and lines, not its foreground, weight,
-        // slant or blink (reflow leaves those on xterm's empty cells at random).
-        const glyph = chars.trim() ? [c.getFgColor(), c.getFgColorMode(), c.isBold(), c.isDim(), c.isItalic(), c.isBlink(), c.isInvisible()] : [];
-        cells.push([chars, c.getWidth(), c.getBgColor(), c.getBgColorMode(), c.isUnderline(), c.isInverse(), c.isStrikethrough(), c.isOverline(), ...glyph]);
-      }
-      rows.push({ wrapped: line.isWrapped, text: line.translateToString(true), cells: JSON.stringify(cells) });
-    }
-  }
-  return { head: JSON.stringify(head), rows, cursorRow };
-}
-
-/** The client after replaying `payload`, or with no payload the live
- * terminal: the raw stream parsed at its recorded sizes. */
-async function replay(req: SnapshotRequest, payload?: Buffer): Promise<State[]> {
-  const t = snapshotTestTerminal(payload ? req.cols : req.geometry?.start.cols ?? req.cols,
-    payload ? req.rows : req.geometry?.start.rows ?? req.rows, req.scrollback ?? 5000);
-  try {
-    if (payload) await writeTerminal(t, payload);
-    else {
-      let offset = 0;
-      for (const change of req.geometry?.changes ?? []) {
-        await writeTerminal(t, req.initial.subarray(offset, change.offset));
-        offset = change.offset;
-        t.resize(change.cols, change.rows);
-      }
-      await writeTerminal(t, req.initial.subarray(offset));
-      t.resize(req.cols, req.rows);
-    }
-    const states = [capture(t)];
-    // Live bytes continue after the snapshot: wrap-pending, SGR and parser
-    // state must match too. Then the saved primary screen and cursor.
-    for (const probe of ['\x1b[?2026lZ한\r\n', '\x1b[?1049lX']) { await writeTerminal(t, probe); states.push(capture(t)); }
-    return states;
-  } finally { t.dispose(); }
-}
-
-/**
- * Rust must match xterm's payload, or, where xterm's own payload loses
- * something (a colored erase below the last written row, a link), the live
- * terminal: never less faithful than xterm.
- */
-async function parity(req: SnapshotRequest, rust: Buffer, xterm: Buffer): Promise<string | undefined> {
-  const restored = await replay(req, rust);
-  const fromXterm = difference(restored, await replay(req, xterm));
-  return fromXterm && difference(restored, await replay(req)) && fromXterm;
-}
-
-/** First difference, or undefined. Trailing printed spaces may be dropped. */
-function difference(rust: State[], ref: State[]): string | undefined {
-  for (let i = 0; i < ref.length; i++) {
-    if (rust[i].head !== ref[i].head) return `state ${i}: ${rust[i].head} != ${ref[i].head}`;
-    for (let y = 0; y < ref[i].rows.length; y++) {
-      const a = rust[i].rows[y], b = ref[i].rows[y];
-      // A soft-wrapped row is copied and reflowed with its full width, so
-      // its trailing blanks are unobservable either way.
-      const continued = ref[i].rows[y + 1]?.wrapped && rust[i].rows[y + 1]?.wrapped;
-      // Blanks left of the cursor replay as printed (a prompt's space).
-      const cursor = y === ref[i].cursorRow;
-      const text = a.text === b.text || (continued || cursor ? a.text.trimEnd() === b.text.trimEnd()
-        : b.text.startsWith(a.text) && b.text.slice(a.text.length).trim() === '');
-      if (a.wrapped !== b.wrapped || a.cells !== b.cells || !text) {
-        return `state ${i} row ${y}: ${JSON.stringify([a.wrapped, a.text])} != ${JSON.stringify([b.wrapped, b.text])}`;
-      }
-    }
-  }
-  return undefined;
-}
-
-type Case = { name: string; req: SnapshotRequest; backend: 'rust' | 'xterm' };
-const synthetic = (name: string, text: string, backend: 'rust' | 'xterm' = 'rust', cols = 20): Case =>
-  ({ name, backend, req: { cols, rows: 6, scrollback: 100, initial: Buffer.from(text) } });
+import { available, expectParity, expectRustAloneDiverges, modulePath, parity, resized, synthetic, type Case } from './_rustParity';
 
 // One or more cases per control class the selector used to refuse wholesale.
 const accepted: Case[] = [
@@ -133,6 +30,28 @@ const accepted: Case[] = [
   synthetic('osc8-styles', '\x1b]8;;http://x\x07\x1b[1mbold\x1b[0mplain\x1b]8;;\x07 no'),
   synthetic('osc8-open-tail', 'a\x1b]8;id=k;http://y\x07open'),
   synthetic('osc8-alt', '\x1b]8;;http://n\x07nn\x1b[?1049h\x1b]8;;http://a\x07aa'),
+  // DEC line drawing in G0/G1, as xterm.js maps it (`_` stays itself).
+  synthetic('designate-dec', '\x1b(0' + Array.from({ length: 32 }, (_, i) => String.fromCharCode(0x5f + i)).join('') + '\x1b(B', 'rust', 40),
+  synthetic('smacs-box', '\x1b(0lqqk\x1b(B\r\n\x1b(0x\x1b(B  \x1b(0x\x1b(B\r\n\x1b(0mqqj\x1b(B'),
+  synthetic('smacs-open-at-end', 'ab\x1b(0lqk'),
+  synthetic('dec-sgr', '\x1b[31m\x1b(0lqk\x1b(B\x1b[0m'),
+  synthetic('dec-wide', '\x1b(0q\ud55cq\x1b(B'),
+  synthetic('dec-wrap', '\x1b(0' + 'q'.repeat(24) + '\x1b(B'),
+  synthetic('rep-after-dec', '\x1b(0q\x1b[3b\x1b(Bx'),
+  synthetic('tab-under-dec', '\x1b(0a\tb\x1b(B'),
+  synthetic('designate-dec-twice', '\x1b(0\x1b(0q\x1b(B\x1b(Bq'),
+  synthetic('ris-dec', '\x1b(0q\x1bcq'),
+  synthetic('so-si-dec', '\x1b)0\x0elqk\x0fabc'),
+  synthetic('so-open-at-end', '\x1b)0\x0elqk'),
+  synthetic('g1-designate-only', '\x1b)0qx'),
+  // DECSC/DECRC and the alternate screen save the designations and the shift.
+  synthetic('so-dec-decsc', '\x1b)0\x0e\x1b7\x0fq\x1b8q'),
+  synthetic('decsc-designation', '\x1b(0\x1b7\x1b(Bq\x1b8q'),
+  synthetic('decrc-unsaved-dec', '\x1b(0\x1b8q'),
+  synthetic('decrc-unsaved-so', '\x1b)0\x0e\x1b8q'),
+  synthetic('alt-1049-designation', '\x1b(0\x1b[?1049hq\x1b(Bq\x1b[?1049lq'),
+  synthetic('alt-1049-so', '\x1b)0\x1b[?1049h\x0eq\x1b[?1049lq'),
+  synthetic('alt-1049-si-inside', '\x1b)0\x0e\x1b[?1049hq\x0fq\x1b[?1049lq'),
   // SO/SI and ASCII designation: with only ASCII designated, shifts are no-ops.
   synthetic('so-si', '\x0eabc\x0fdef'),
   synthetic('designate-ascii', '\x1b(B\x1b)Babc\x0e\x1b[mx\x0f'),
@@ -186,29 +105,32 @@ const accepted: Case[] = [
   synthetic('mouse-embedded-c0', '\x1b[?100\r0hx'),
   synthetic('mouse-leading-zeros', '\x1b[?01002;01006hx'),
   synthetic('colon-rgb-colorspace', '\x1b[38:2::10:20:30mx\x1b[48:5:3my'),
+  // DCH at a fullwidth glyph's first half: the spacer it pulls to the cursor
+  // is filled with the erase attribute, as xterm's deleteCells does
+  // (vendor/alacritty_terminal WMUX-PATCH.md).
+  synthetic('wide-dch-first-half', 'a中b\x1b[1;2H\x1b[P'),
+  synthetic('wide-dch-second-half-blank', ' 中b\x1b[44m\x1b[1;2H\x1b[P'),
+  // ECH at either half of a fullwidth glyph erases the whole glyph, as
+  // xterm's replaceCells does.
+  synthetic('wide-ech-second-half', 'a中b\x1b[44m\x1b[1;3H\x1b[X'),
+  synthetic('wide-ech-ending-on-first-half', 'a中b\x1b[44m\x1b[1;1H\x1b[2X'),
 ];
 
 // Classes that stay on xterm because Alacritty parses them differently.
 const refused: Case[] = [
-  // Half a fullwidth glyph next to content (DCH pulls the second half left).
-  synthetic('wide-dch-first-half', 'a\u4e2db\x1b[1;2H\x1b[P', 'xterm'),
   synthetic('sync-mixed-params', 'a\x1b[?2026hb\x1b[?2026;1lc', 'xterm'),
   synthetic('deccolm', 'abc\x1b[?3hd', 'xterm'),
   synthetic('colon-rgb-no-colorspace', '\x1b[38:2:10:20:30mx', 'xterm'),
   synthetic('colon-indexed-no-operand', '\x1b[31m\x1b[38:5mx', 'xterm'),
   synthetic('colon-rgb-short', '\x1b[38:2::10:20mx', 'xterm'),
-  // A DCH orphan: xterm fills it with the erase attribute.
-  synthetic('wide-dch-second-half-blank', ' \u4e2db\x1b[44m\x1b[1;2H\x1b[P', 'xterm'),
   synthetic('alt-1047-leading-zero', 'n\x1b[?01047ha', 'xterm'),
   synthetic('rep-after-control', 'X\r\x1b[3b', 'xterm'),
   synthetic('rep-after-sgr', 'X\x1b[31m\x1b[3b', 'xterm'),
   synthetic('decaln', 'ab\x1b[2;3H\x1b#8', 'xterm'),
   synthetic('sd-caret', '1\r\n2\r\n3\x1b[1^x', 'xterm'),
   synthetic('ed2-embedded-c0', '1\r\n2\r\n3\x1b[2\x00Jx', 'xterm'),
-  synthetic('designate-dec', '\x1b(0' + Array.from({ length: 32 }, (_, i) => String.fromCharCode(0x5f + i)).join('') + '\x1b(B', 'xterm', 40),
   synthetic('designate-uk', '\x1b(A#x\x1b(B#', 'xterm'),
   synthetic('designate-g2', '\x1b*0\x1bnlq\x1b(Bz', 'xterm'),
-  synthetic('so-dec-decsc', '\x1b)0\x0e\x1b7\x0fq\x1b8q', 'xterm'),
   synthetic('overline', '\x1b[53mover\x1b[55mno', 'xterm'),
   synthetic('sgr-21', '\x1b[21mx\x1b[24my', 'xterm'),
   synthetic('c1', 'a\u009b31mred', 'xterm'),
@@ -217,7 +139,6 @@ const refused: Case[] = [
   synthetic('sl', 'abcdef\x1b[2 @', 'xterm'),
   synthetic('decic', 'abcdef\x1b[1;2H\x1b[2\'}', 'xterm'),
   synthetic('decstr', 'ab\x1b[4h\x1b[!pcd', 'xterm'),
-  synthetic('su', '1\r\n2\r\n3\x1b[2S\x1b[1T', 'xterm'),
   synthetic('ed2-spelled-02', '1\r\n2\r\n3\x1b[02Jx', 'xterm'),
   synthetic('lnm', '\x1b[20ha\nb', 'xterm'),
   synthetic('mode-x10', '\x1b[?9hx', 'xterm'),
@@ -239,7 +160,33 @@ const others: Case[] = [
   synthetic('cnl-cpl', 'a\r\nb\x1b[Fc\x1b[2Ed'),
   synthetic('hpa-vpa', '\x1b[5`a\x1b[3db'),
   synthetic('ich-dch-ech', 'abcdef\x1b[1;2H\x1b[2@\x1b[1P\x1b[2X'),
+  // DCH past the line end clears from the cursor only (xterm.js deleteChars).
+  synthetic('dch-past-line-end', 'abcdef\x1b[1;5H\x1b[44m\x1b[30P\x1b[0m'),
+  synthetic('dch-past-line-end-full-row', 'abcdefghijklmnopqrst\x1b[1;18H\x1b[9P'),
   synthetic('il-dl', '1\r\n2\r\n3\x1b[2;1H\x1b[L\x1b[2M'),
+  // SD fills with default attributes in xterm; IL and RI with the erase colour.
+  synthetic('sd-bg', '1\r\n2\r\n3\x1b[44m\x1b[1T\x1b[0mx'),
+  synthetic('sd-region-bg', '1\r\n2\r\n3\r\n4\x1b[2;4r\x1b[44m\x1b[2T\x1b[0m\x1b[rx'),
+  synthetic('il-bg', '1\r\n2\x1b[44m\x1b[H\x1b[L\x1b[0mx'),
+  synthetic('ri-top-bg', '1\r\n2\x1b[44m\x1b[H\x1bM\x1b[0mx'),
+  // SU scrolls the region in place: xterm keeps nothing in history.
+  synthetic('su', '1\r\n2\r\n3\x1b[2S\x1b[1T'),
+  synthetic('su-full-screen', '1\r\n2\r\n3\r\n4\r\n5\r\n6\x1b[2Sx'),
+  synthetic('su-with-history', '0\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\x1b[3Sx'),
+  synthetic('su-default-and-zero', '1\r\n2\r\n3\x1b[S\x1b[0Sx'),
+  synthetic('su-past-screen', '1\r\n2\r\n3\x1b[44m\x1b[99S\x1b[0mx'),
+  synthetic('su-bg', '1\r\n2\r\n3\x1b[44m\x1b[2S\x1b[0mx'),
+  synthetic('su-region-top', '1\r\n2\r\n3\r\n4\r\n5\x1b[1;4r\x1b[2S\x1b[rx'),
+  synthetic('su-region-middle', '1\r\n2\r\n3\r\n4\r\n5\x1b[2;5r\x1b[2S\x1b[rx'),
+  synthetic('su-alt', 'n\x1b[?1049h1\r\n2\r\n3\x1b[2Sx'),
+  synthetic('su-then-linefeed', 'a\x1b[S\x1b[6;1Hb\r\nc\r\nd'),
+  // top: a region scrolled up while the header stays (ncurses `indn`).
+  synthetic('su-top-like', `${Array.from({ length: 6 }, (_, i) => `row ${i}`).join('\r\n')}\x1b[3;6r\x1b[6;1H\x1b[2S\x1b[5;1Hnew a\x1b[6;1Hnew b\x1b[r\x1b[1;1HPID`),
+  // DL on the top row deletes in place: xterm keeps nothing in history.
+  synthetic('dl-row0', '1\r\n2\r\n3\x1b[H\x1b[Mx'),
+  synthetic('dl-row0-history', '0\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\x1b[H\x1b[2Mx'),
+  synthetic('dl-row0-past-screen', '1\r\n2\r\n3\x1b[H\x1b[44m\x1b[9M\x1b[0mx'),
+  synthetic('dl-row0-region', '1\r\n2\r\n3\r\n4\x1b[1;3r\x1b[H\x1b[M\x1b[rx'),
   synthetic('ed3', '1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n8\x1b[3J'),
   // ED 2 erases in place in xterm; Alacritty scrolls the screen into history.
   synthetic('ed2-primary', '1\r\n2\r\n3\x1b[2Jx'),
@@ -260,20 +207,14 @@ const others: Case[] = [
   synthetic('scroll-history', Array.from({ length: 50 }, (_, i) => `\x1b[3${i % 8}mline${i}\x1b[0m`).join('\r\n')),
 ];
 
-/** Written at `from` columns, then the pane resized to `to`. */
-const resized = (name: string, text: string, from: [number, number], to: [number, number], backend: 'rust' | 'xterm' = 'rust'): Case => {
-  const initial = Buffer.from(text);
-  return { name, backend, req: { cols: to[0], rows: to[1], scrollback: 100, initial,
-    geometry: { start: { cols: from[0], rows: from[1] }, changes: [{ offset: initial.length, cols: to[0], rows: to[1] }] } } };
-};
 const box = Array.from({ length: 3 }, (_, k) => `${`[frame ${k}]`.padEnd(70, '=')}\r\n${`[body ${k}]`.padEnd(70, '.')}\r\n${k < 2 ? '\x1b[2A\r' : ''}`).join('');
 const many = Array.from({ length: 30 }, (_, i) => `row ${i} ${'x'.repeat(i % 50)}`).join('\r\n');
 const resizes: Case[] = [
   // vte holds bytes inside a synchronized update; xterm parsed them at 80.
   resized('resize-in-sync-update', '\x1b[?2026h\x1b[1;70HX', [80, 12], [40, 12]),
-  // Refused by the native terminal: Alacritty's reflow scrolls rows above the
-  // cursor into history where xterm moves the cursor down.
-  resized('narrow-cursor-high', `line before the box\r\n${box}`, [80, 12], [40, 12], 'xterm'),
+  // Rows a narrower reflow adds above the cursor with no history: xterm moves
+  // the cursor down into the room below, and so does the native terminal.
+  resized('narrow-cursor-high', `line before the box\r\n${box}`, [80, 12], [40, 12]),
   resized('narrow-cursor-low', many, [80, 12], [40, 12]),
   resized('widen-after-wrap', many, [40, 12], [80, 12]),
   resized('fewer-rows', many, [80, 12], [80, 6]),
@@ -310,15 +251,8 @@ describe.skipIf(!available)('Rust ANSI snapshot rendered parity', { timeout: 30_
   beforeEach(() => vi.stubEnv('WMUX_RUST_SNAPSHOT_MODULE', modulePath));
   afterEach(() => vi.unstubAllEnvs());
 
-  it.each([...accepted, ...refused, ...others, ...resizes, ...corpus(), claude].map(c => [c.name, c] as const))('%s', async (_name, { req, backend }) => {
-    vi.stubEnv('WMUX_RUST_SNAPSHOT', 'off');
-    const reference = await generateSnapshotUnqueued(req);
-    vi.stubEnv('WMUX_RUST_SNAPSHOT', 'ansi');
-    const selected = await generateSnapshotUnqueued(req);
-    expect(reference.ok && selected.ok, JSON.stringify([reference, selected])).toBe(true);
-    if (!reference.ok || !selected.ok) return;
-    expect(getAnsiSnapshotBackendDiagnostics().last?.backend).toBe(backend);
-    expect(await parity(req, selected.payload, reference.payload)).toBeUndefined();
+  it.each([...accepted, ...refused, ...others, ...resizes, ...corpus(), claude].map(c => [c.name, c] as const))('%s', async (_name, c) => {
+    await expectParity(c);
   });
 
   it('takes an attach-sized request and refuses a history past the native cap', async () => {
@@ -341,7 +275,7 @@ describe.skipIf(!available)('Rust ANSI snapshot rendered parity', { timeout: 30_
   });
 
   it('refuses a divergent control that arrives on the live tee, split from the history', async () => {
-    const tee = () => { const queue = [[Buffer.from('0lqk')], [Buffer.from('\x1b(Bok')]]; return () => queue.shift() ?? []; };
+    const tee = () => { const queue = [[Buffer.from('A#')], [Buffer.from('\x1b(Bok')]]; return () => queue.shift() ?? []; };
     const req: SnapshotRequest = { cols: 20, rows: 6, scrollback: 100, initial: Buffer.from('hello\x1b(') };
     vi.stubEnv('WMUX_RUST_SNAPSHOT', 'off');
     const reference = await generateSnapshotUnqueued({ ...req, drainQueue: tee() });
@@ -365,12 +299,7 @@ describe.skipIf(!available)('Rust ANSI snapshot rendered parity', { timeout: 30_
   });
 
   // Evidence for each refusal: without it the Rust payload would diverge.
-  it.each(refused.map(c => [c.name, c] as const))('Rust alone diverges on %s', async (_name, { req }) => {
-    vi.stubEnv('WMUX_RUST_SNAPSHOT', 'off');
-    const reference = await generateSnapshotUnqueued(req);
-    const native = await generateRustSnapshot(req, 'ansi');
-    if (!reference.ok) throw new Error('reference failed');
-    if (!native.ok) return expect(native.detail).toMatch(/^unsupported-/);
-    expect(await parity(req, native.payload, reference.payload)).toBeDefined();
+  it.each(refused.map(c => [c.name, c] as const))('Rust alone diverges on %s', async (_name, c) => {
+    await expectRustAloneDiverges(c);
   });
 });
