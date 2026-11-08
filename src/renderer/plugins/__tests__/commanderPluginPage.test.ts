@@ -53,7 +53,7 @@ describe('Commander page over the plugin bridge', () => {
     expect([...document.querySelectorAll('.path')].map((p) => p.textContent)).toEqual(['/work', '/work']);
     expect([...document.querySelectorAll('.panel:first-child .name')].map((p) => p.textContent)).toEqual(['..', 'folder', 'alpha.txt', 'zeta.bin']);
     expect(document.querySelectorAll('.permissions')[1].textContent).toBe('drwx');
-    expect(page().classList.contains('colours')).toBe(false);
+    expect([...document.querySelectorAll('#toolbar button')].map((b) => b.textContent)).not.toContain('MDIR');
   });
   it('switches layouts and active panels and jumps to quick slots', async () => {
     key('3', { ctrlKey: true, code: 'Digit3' }); expect(document.querySelectorAll('.panel')).toHaveLength(3);

@@ -12,14 +12,14 @@
 .columns { height: 26px; color: var(--text-muted); font-size: 11px; } .rows { flex: 1; overflow: auto; position: relative; font: 11px ui-monospace,monospace; }
 .row { height: 26px; cursor: default; } .row>span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; } .row:hover { background: var(--hover-fill); }
 .row.cursor { background: var(--selection); } .row.marked { color: var(--accent); } .size { text-align: right; }
-.colours .row.dir:not(.marked) { color: var(--accent); } .colours .row.image:not(.marked) { color: var(--accent-green); } .colours .row.archive:not(.marked) { color: var(--accent-yellow); } .colours .row.executable:not(.marked) { color: var(--accent-red); }
+.row.dir:not(.marked) { color: var(--accent); } .row.image:not(.marked) { color: var(--accent-green); } .row.archive:not(.marked) { color: var(--accent-yellow); } .row.executable:not(.marked) { color: var(--accent-red); }
 .summary { padding: 6px 8px; min-height: 28px; font-size: 11px; color: var(--text-sub); }
 #toolbar { width: 42px; flex-shrink: 0; display: flex; flex-direction: column; gap: 3px; padding: 6px 3px; overflow: auto; background: var(--bg-mantle); }
 button,input,select { font: inherit; color: var(--text-main); background: var(--bg-surface); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
 button { cursor: pointer; } button:hover { background: var(--hover-fill); } button:disabled { opacity: .4; cursor: default; } button[aria-pressed="true"] { background: var(--selection); }
 button:focus-visible,input:focus-visible,select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 #toolbar button { min-height: 27px; padding: 3px; } #toolbar .layout-start { margin-top: auto; }
-#toolbar .layout { display: flex; justify-content: center; align-items: center; gap: 2px; } #toolbar .layout span { width: 6px; height: 11px; border: 1px solid currentColor; border-radius: 1px; }
+#toolbar .layout { display: flex; justify-content: center; align-items: center; } #toolbar .layout .frame { display: flex; width: 20px; height: 13px; border: 1.5px solid currentColor; border-radius: 2px; } #toolbar .layout .frame span { flex: 1; } #toolbar .layout .frame span + span { border-left: 1.5px solid currentColor; }
 footer { display: flex; gap: 4px; flex-wrap: wrap; padding: 6px; background: var(--bg-mantle); } footer button { flex: 1; white-space: nowrap; font-size: 11px; }
 #notice { padding: 0 8px; font-size: 11px; color: var(--text-sub); }
 .overlay { position: fixed; inset: 0; background: color-mix(in srgb, var(--bg-base) 80%, transparent); display: grid; place-items: center; padding: 24px; }

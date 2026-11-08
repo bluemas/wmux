@@ -5,7 +5,7 @@
   const host = document.querySelector('#panels');
   const notice = document.querySelector('#notice');
   const panels = Array.from({ length: 3 }, () => ({ path: '', parent: null, entries: [], cursor: 0, marks: new Set(), scroll: 0, sort: 0, revision: 0 }));
-  let count = 2, active = 0, colours = false, panes = [], port, serial = 0, modal = null, epoch = 0;
+  let count = 2, active = 0, panes = [], port, serial = 0, modal = null, epoch = 0;
   let prefix = '', prefixTime = 0;
   const pending = new Map();
   const ROW = 26;
@@ -88,7 +88,7 @@
     list.replaceChildren(fragment);
   }
   function render() {
-    host.replaceChildren(); page.classList.toggle('colours', colours);
+    host.replaceChildren();
     for (let i = 0; i < count; i++) {
       const p = panels[i];
       const panel = node('section', undefined, `panel${active === i ? ' active' : ''}`);
@@ -112,9 +112,8 @@
     const copy = button('▷', () => transfer('copy'), 'Copy to next panel · F5'); copy.disabled = count < 2;
     const move = button('◁', () => transfer('move'), 'Move to next panel · F6'); move.disabled = count < 2;
     bar.append(copy, move);
-    // Drawn boxes, not '▯': the UI font has no such glyph and Windows falls back to a broken one.
-    for (let n = 1; n <= 3; n++) { const b = button('', () => layout(n), `${n} panels · Ctrl+${n}`); b.setAttribute('aria-label', b.title); for (let i = 0; i < n; i++) b.append(node('span')); b.setAttribute('aria-pressed', String(count === n)); b.className = n === 1 ? 'layout layout-start' : 'layout'; bar.append(b); }
-    const colour = button('MDIR', () => { colours = !colours; render(); }, 'MDIR colours (optional file type colours)'); colour.setAttribute('aria-pressed', String(colours)); bar.append(colour);
+    // One window split into n columns, drawn: the UI font has no panel glyph, and loose boxes read as missing-glyph tofu.
+    for (let n = 1; n <= 3; n++) { const b = button('', () => layout(n), `${n} panels · Ctrl+${n}`); b.setAttribute('aria-label', b.title); const frame = node('span', undefined, 'frame'); for (let i = 0; i < n; i++) frame.append(node('span')); b.append(frame); b.setAttribute('aria-pressed', String(count === n)); b.className = n === 1 ? 'layout layout-start' : 'layout'; bar.append(b); }
     return bar;
   }
   function layout(n) { count = n; active = Math.min(active, count - 1); render(); }

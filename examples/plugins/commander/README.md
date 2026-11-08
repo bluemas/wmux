@@ -7,8 +7,8 @@ open its rail item. No build step or external resources are needed.
 The default two panels start at the active terminal pane's working directory.
 Use Ctrl+1/2/3 for one, two or three panels, Tab/Shift+Tab to change panel,
 and Alt+1–9 to jump to a workspace pane's folder. The toolbar swaps the first
-two panels and offers the same quick slots and layout controls. MDIR file type
-colours are optional and off by default. Theme tokens follow the host.
+two panels and offers the same quick slots and layout controls. File types are coloured
+the MDIR way. Theme tokens follow the host.
 
 Arrow keys, PageUp/PageDown, Home/End, Enter and Backspace navigate. Space or
 Insert toggles a mark and moves down; `*` inverts marks and `+`/`-` select by
