@@ -1360,11 +1360,11 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
         // cwd), so a stale recovered cwd is visible before the click.
         const runCwd = paneCwdCandidates[0] || '';
 
-        // Paste WITHOUT a trailing \r. The user presses Enter to run — so bypass
-        // is re-granted only by an explicit keystroke, never automatically (D6).
+        // A staged first click types without Enter; the click that types the
+        // whole line also submits it (fork: the click is the explicit act, D6).
         // Resolves false when main refused the line: the pill then stays as it was.
-        const type = (text: string): Promise<boolean> =>
-          window.electronAPI.pty.writeLaunch(ptyId, text, false, 'human').then(
+        const type = (text: string, submit = false): Promise<boolean> =>
+          window.electronAPI.pty.writeLaunch(ptyId, text, submit, 'human').then(
             () => true,
             (err: unknown) => {
               console.warn('[wmux:resume] the resume line was not typed', String(err));
@@ -1373,7 +1373,7 @@ export default function PaneComponent({ pane, workspace, isActive, isWorkspaceVi
             },
           );
         const typeAndClear = (text: string): Promise<boolean> =>
-          type(text).then((ok) => {
+          type(text, true).then((ok) => {
             if (ok) useStore.getState().clearResumeHint(ptyId);
             return ok;
           });
